@@ -1,4 +1,4 @@
-use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
+use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability, ScriptRunOptions};
 use std::{collections::BTreeMap, env, error::Error, time::Instant};
 
 const CREATE_SCHEMA: &str = r#"
@@ -39,15 +39,17 @@ direct[from, to, relation, evidence] :=
 direct[from, to, relation, evidence] :=
     *observation{view: $view, from, relation, to, evidence},
     $view != 'main'
+"#;
 
-path[from, to, nodes, relations, evidence] :=
-    direct[from, to, relation, proof],
-    nodes = [from, to],
+const PATH_RULES: &str = r#"
+path[to, nodes, relations, evidence] :=
+    direct[$from, to, relation, proof],
+    nodes = [$from, to],
     relations = [relation],
     evidence = [proof]
 
-path[from, to, nodes, relations, evidence] :=
-    path[from, via, previous_nodes, previous_relations, previous_evidence],
+path[to, nodes, relations, evidence] :=
+    path[via, previous_nodes, previous_relations, previous_evidence],
     direct[via, to, relation, proof],
     not is_in(to, previous_nodes),
     nodes = append(previous_nodes, to),
@@ -95,8 +97,8 @@ fn trace(db: &DbInstance, from: &str, to: &str) -> Result<NamedRows, Box<dyn Err
     query(
         db,
         &format!(
-            "{RULES}\n?[nodes, relations, evidence, hops] := \
-             path[$from, $to, nodes, relations, evidence], hops = length(relations)\n\
+            "{RULES}\n{PATH_RULES}\n?[nodes, relations, evidence, hops] := \
+             path[$to, nodes, relations, evidence], hops = length(relations)\n\
              :order hops\n:limit 1"
         ),
         [("from", from.into()), ("to", to.into())],
@@ -106,8 +108,8 @@ fn trace(db: &DbInstance, from: &str, to: &str) -> Result<NamedRows, Box<dyn Err
 fn impact(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
-        &format!("{RULES}\n?[affected] := path[$entity, affected, _, _, _]\n:order affected"),
-        [("entity", entity.into())],
+        &format!("{RULES}\n{PATH_RULES}\n?[affected] := path[affected, _, _, _]\n:order affected"),
+        [("from", entity.into())],
     )
 }
 
@@ -115,25 +117,46 @@ fn dependencies(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Erro
     query(
         db,
         &format!(
-            "{RULES}\n?[dependency, min(hops)] := \
-             path[$entity, dependency, _, relations, _], hops = length(relations)\n\
+            "{RULES}\n{PATH_RULES}\n?[dependency, min(hops)] := \
+             path[dependency, _, relations, _], hops = length(relations)\n\
              :order dependency"
         ),
-        [("entity", entity.into())],
+        [("from", entity.into())],
     )
 }
 
-fn benchmark(db: &DbInstance, entities: i64, fanout: i64) -> Result<String, Box<dyn Error>> {
+fn benchmark(
+    db: &DbInstance,
+    topology: &str,
+    entities: i64,
+    fanout: i64,
+    depth: i64,
+) -> Result<String, Box<dyn Error>> {
     let started = Instant::now();
     db.run_script(
         "?[id] := id in int_range($entities) :create benchmark_entity {id: Int}",
         BTreeMap::from([("entities".into(), entities.into())]),
         ScriptMutability::Mutable,
     )?;
+    let edge_query = match topology {
+        "linear" => {
+            "?[from, to, evidence] := from in int_range($entities - 1), to = from + 1, evidence = from \
+             :create benchmark_edge {from: Int, to: Int => evidence: Int}"
+        }
+        "tree" => {
+            "?[from, to, evidence] := from in int_range($entities), offset in int_range(1, $fanout + 1), \
+             to = from * $fanout + offset, to < $entities, evidence = from * $fanout + offset \
+             :create benchmark_edge {from: Int, to: Int => evidence: Int}"
+        }
+        "dag" => {
+            "?[from, to, evidence] := from in int_range($entities), offset in int_range(1, $fanout + 1), \
+             to = from + offset, to < $entities, evidence = from * $fanout + offset \
+             :create benchmark_edge {from: Int, to: Int => evidence: Int}"
+        }
+        _ => return Err("topology must be linear, tree, or dag".into()),
+    };
     db.run_script(
-        "?[from, to] := from in int_range($entities), offset in int_range(1, $fanout + 1), \
-         to = (from + offset) % $entities \
-         :create benchmark_edge {from: Int, to: Int}",
+        edge_query,
         BTreeMap::from([
             ("entities".into(), entities.into()),
             ("fanout".into(), fanout.into()),
@@ -142,27 +165,80 @@ fn benchmark(db: &DbInstance, entities: i64, fanout: i64) -> Result<String, Box<
     )?;
     let loaded_in = started.elapsed();
 
-    let started = Instant::now();
-    let reachable = db.run_script(
-        "reachable[to] := *benchmark_edge{from: 0, to}\n\
-         reachable[to] := reachable[from], *benchmark_edge{from, to}\n\
-         ?[count_unique(to)] := reachable[to]",
-        BTreeMap::new(),
-        ScriptMutability::Immutable,
-    )?;
+    let params = BTreeMap::from([
+        ("depth".into(), depth.into()),
+        ("target".into(), depth.min(entities - 1).into()),
+    ]);
+    let rules = "path[to, nodes, evidence, hops] := \
+                     *benchmark_edge{from: 0, to, evidence: proof}, \
+                     nodes = [0, to], evidence = [proof], hops = 1\n\
+                 path[to, nodes, evidence, hops] := \
+                     path[via, previous_nodes, previous_evidence, previous_hops], \
+                     previous_hops < $depth, *benchmark_edge{from: via, to, evidence: proof}, \
+                     not is_in(to, previous_nodes), nodes = append(previous_nodes, to), \
+                     evidence = append(previous_evidence, proof), hops = previous_hops + 1";
+
+    let closure = timed_query(
+        db,
+        "reachable[to, hops] := *benchmark_edge{from: 0, to}, hops = 1\n\
+         reachable[to, hops] := reachable[from, previous_hops], previous_hops < $depth, \
+             *benchmark_edge{from, to}, hops = previous_hops + 1\n\
+         ?[count_unique(to)] := reachable[to, _]",
+        params.clone(),
+    );
+    let trace = timed_query(
+        db,
+        &format!(
+            "{rules}\n?[nodes, evidence, hops] := path[$target, nodes, evidence, hops]\n\
+             :order hops\n:limit 1"
+        ),
+        params.clone(),
+    );
+    let impact = timed_query(
+        db,
+        &format!("{rules}\n?[count_unique(to)] := path[to, _, _, _]"),
+        params,
+    );
 
     Ok(format!(
-        "{entities} entities, {} relationships; loaded in {loaded_in:?}; recursive query in {:?}; {reachable:?}",
-        entities * fanout,
-        started.elapsed()
+        "mode={}, topology={topology}, entities={entities}, fanout={fanout}, depth={depth}, load={loaded_in:?}, closure={closure}, trace={trace}, impact={impact}",
+        if cfg!(feature = "parallel") {
+            "parallel"
+        } else {
+            "single"
+        },
     ))
+}
+
+fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue>) -> String {
+    let started = Instant::now();
+    match db.run_script_with_options(
+        script,
+        params,
+        ScriptMutability::Immutable,
+        ScriptRunOptions::new().with_timeout(5.0),
+    ) {
+        Ok(rows) => format!("{:?} (rows={})", started.elapsed(), rows.rows.len()),
+        Err(error) => format!("{:?} ({error})", started.elapsed()),
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let db = database()?;
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if args == ["benchmark"] {
-        println!("{}", benchmark(&db, 100_000, 10)?);
+    if let [command, topology, entities, fanout, depth] = args.as_slice()
+        && command == "benchmark"
+    {
+        println!(
+            "{}",
+            benchmark(
+                &db,
+                topology,
+                entities.parse()?,
+                fanout.parse()?,
+                depth.parse()?
+            )?
+        );
         return Ok(());
     }
     let result =
@@ -173,7 +249,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             [command, entity] if command == "dependencies" => dependencies(&db, entity)?,
             [] => trace(&db, "web/CheckoutPage", "cache/update_price")?,
             _ => return Err(
-                "usage: beholder benchmark | <context|impact|dependencies> <entity> | <trace|why> <from> <to>"
+                "usage: beholder benchmark <linear|tree|dag> <entities> <fanout> <depth> | <context|impact|dependencies> <entity> | <trace|why> <from> <to>"
                     .into(),
             ),
         };
@@ -213,8 +289,8 @@ mod tests {
         assert!(feature.contains("pricing/get_price_v2"));
         assert!(!feature.contains("pricing/get_price\""));
 
-        let benchmark = benchmark(&db, 100, 10).unwrap();
-        assert!(benchmark.contains("100 entities, 1000 relationships"));
-        assert!(benchmark.contains("100]]"));
+        let benchmark = benchmark(&db, "linear", 100, 1, 10).unwrap();
+        assert!(benchmark.contains("topology=linear"));
+        assert!(!benchmark.contains("query_timeout"));
     }
 }
