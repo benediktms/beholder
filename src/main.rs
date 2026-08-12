@@ -64,6 +64,23 @@ fn database() -> Result<DbInstance, Box<dyn Error>> {
     Ok(db)
 }
 
+fn benchmark_database(storage: &str, path: Option<&str>) -> Result<DbInstance, Box<dyn Error>> {
+    #[cfg(not(feature = "sqlite"))]
+    let _ = path;
+    match storage {
+        "mem" => Ok(DbInstance::new("mem", "", Default::default())?),
+        #[cfg(feature = "sqlite")]
+        "sqlite" => Ok(DbInstance::new(
+            "sqlite",
+            path.ok_or("sqlite benchmark requires a database path")?,
+            Default::default(),
+        )?),
+        #[cfg(not(feature = "sqlite"))]
+        "sqlite" => Err("build with --features sqlite to benchmark SQLite".into()),
+        _ => Err("storage must be mem or sqlite".into()),
+    }
+}
+
 fn query(
     db: &DbInstance,
     script: &str,
@@ -153,7 +170,16 @@ fn benchmark(
              to = from + offset, to < $entities, evidence = from * $fanout + offset \
              :create benchmark_edge {from: Int, to: Int => evidence: Int}"
         }
-        _ => return Err("topology must be linear, tree, or dag".into()),
+        "corpus" => {
+            "?[from, to, evidence] := from in int_range($entities - 1), to = from + 1, evidence = from\n\
+             ?[from, to, evidence] := from in int_range($entities - 2), from % 2 == 0, to = from + 2, evidence = from\n\
+             ?[from, to, evidence] := from in int_range($entities - 7), from % 10 == 0, \
+                 offset in int_range(3, 8), to = from + offset, evidence = from * 10 + offset\n\
+             ?[from, to, evidence] := from in int_range($entities - 158), from % 1000 == 0, \
+                 offset in int_range(8, 158), to = from + offset, evidence = from * 1000 + offset\n\
+             :create benchmark_edge {from: Int, to: Int => evidence: Int}"
+        }
+        _ => return Err("topology must be linear, tree, dag, or corpus".into()),
     };
     db.run_script(
         edge_query,
@@ -165,6 +191,18 @@ fn benchmark(
     )?;
     let loaded_in = started.elapsed();
 
+    Ok(format!(
+        "mode={}, topology={topology}, entities={entities}, fanout={fanout}, depth={depth}, load={loaded_in:?}, {}",
+        if cfg!(feature = "parallel") {
+            "parallel"
+        } else {
+            "single"
+        },
+        benchmark_queries(db, topology, entities, depth)
+    ))
+}
+
+fn benchmark_queries(db: &DbInstance, _topology: &str, entities: i64, depth: i64) -> String {
     let params = BTreeMap::from([
         ("depth".into(), depth.into()),
         ("target".into(), depth.min(entities - 1).into()),
@@ -186,6 +224,11 @@ fn benchmark(
          ?[count_unique(to)] := reachable[to, _]",
         params.clone(),
     );
+    let context = timed_query(
+        db,
+        "?[count(to)] := *benchmark_edge{from: 0, to}",
+        BTreeMap::new(),
+    );
     let trace = timed_query(
         db,
         &format!(
@@ -200,14 +243,7 @@ fn benchmark(
         params,
     );
 
-    Ok(format!(
-        "mode={}, topology={topology}, entities={entities}, fanout={fanout}, depth={depth}, load={loaded_in:?}, closure={closure}, trace={trace}, impact={impact}",
-        if cfg!(feature = "parallel") {
-            "parallel"
-        } else {
-            "single"
-        },
-    ))
+    format!("context={context}, closure={closure}, trace={trace}, impact={impact}")
 }
 
 fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue>) -> String {
@@ -224,11 +260,19 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let db = database()?;
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if let [command, topology, entities, fanout, depth] = args.as_slice()
+    if let [
+        command,
+        storage,
+        topology,
+        entities,
+        fanout,
+        depth,
+        rest @ ..,
+    ] = args.as_slice()
         && command == "benchmark"
     {
+        let db = benchmark_database(storage, rest.first().map(String::as_str))?;
         println!(
             "{}",
             benchmark(
@@ -241,6 +285,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
+    if let [command, storage, topology, entities, depth, path] = args.as_slice()
+        && command == "benchmark-query"
+    {
+        let db = benchmark_database(storage, Some(path))?;
+        println!(
+            "{}",
+            benchmark_queries(&db, topology, entities.parse()?, depth.parse()?)
+        );
+        return Ok(());
+    }
+    let db = database()?;
     let result =
         match args.as_slice() {
             [command, entity] if command == "context" => context(&db, entity)?,
@@ -249,7 +304,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             [command, entity] if command == "dependencies" => dependencies(&db, entity)?,
             [] => trace(&db, "web/CheckoutPage", "cache/update_price")?,
             _ => return Err(
-                "usage: beholder benchmark <linear|tree|dag> <entities> <fanout> <depth> | <context|impact|dependencies> <entity> | <trace|why> <from> <to>"
+                "usage: beholder benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> | <trace|why> <from> <to>"
                     .into(),
             ),
         };

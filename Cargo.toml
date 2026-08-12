@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 parallel = ["cozo/rayon"]
+sqlite = ["cozo/storage-sqlite", "cozo/storage-sqlite-src"]
 
 [dependencies]
 cozo = { package = "mnestic", version = "0.14.0", default-features = false }
