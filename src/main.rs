@@ -180,7 +180,20 @@ fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<(String, usize)>
     }
 }
 
-fn rust_observations(source: &str, path: &Path) -> Result<Vec<[String; 5]>, Box<dyn Error>> {
+fn repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
+    // ponytail: directory name is the local-only fallback; canonical Git remotes come with registration.
+    root.canonicalize()?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("cannot derive repository identity from {}", root.display()).into())
+}
+
+fn rust_observations(
+    repository: &str,
+    source: &str,
+    path: &Path,
+) -> Result<Vec<[String; 5]>, Box<dyn Error>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let tree = parser
@@ -199,8 +212,7 @@ fn rust_observations(source: &str, path: &Path) -> Result<Vec<[String; 5]>, Box<
         .with_extension("")
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
-    // ponytail: fixed identity is enough for self-indexing; workspace registration will supply it.
-    let source_id = format!("repo://beholder/rust/{module}");
+    let source_id = format!("repo://{repository}/rust/{module}");
     // ponytail: simple names cover this fixture; qualify impl methods when Rust support expands.
     let definitions = functions
         .iter()
@@ -256,8 +268,10 @@ fn store_observations(
     Ok(())
 }
 
-fn source_fingerprint(sources: &[(std::path::PathBuf, String)]) -> String {
+fn source_fingerprint(repository: &str, sources: &[(std::path::PathBuf, String)]) -> String {
     let mut digest = Sha256::new();
+    digest.update((repository.len() as u64).to_le_bytes());
+    digest.update(repository.as_bytes());
     for (path, source) in sources {
         let path = path.to_string_lossy();
         digest.update((path.len() as u64).to_le_bytes());
@@ -308,12 +322,13 @@ fn publish_observations(
 
 fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dyn Error>> {
     let sources = vec![(path.to_path_buf(), fs::read_to_string(path)?)];
-    let fingerprint = source_fingerprint(&sources);
+    let repository = repository_identity(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let fingerprint = source_fingerprint(&repository, &sources);
     let db = persistent_database(database_path, true)?;
     if fingerprint_matches(&db, &fingerprint)? {
         return Ok((0, false));
     }
-    let observations = rust_observations(&sources[0].1, path)?;
+    let observations = rust_observations(&repository, &sources[0].1, path)?;
     publish_observations(&db, &observations, &fingerprint)?;
     Ok((observations.len(), true))
 }
@@ -357,7 +372,8 @@ fn index_rust_repository(
             Ok((relative_path, fs::read_to_string(path)?))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    let fingerprint = source_fingerprint(&sources);
+    let repository = repository_identity(root)?;
+    let fingerprint = source_fingerprint(&repository, &sources);
     let db = persistent_database(database_path, true)?;
     if fingerprint_matches(&db, &fingerprint)? {
         return Ok((0, false));
@@ -365,7 +381,7 @@ fn index_rust_repository(
 
     let mut all_observations = Vec::new();
     for (path, source) in &sources {
-        all_observations.extend(rust_observations(source, path)?);
+        all_observations.extend(rust_observations(&repository, source, path)?);
     }
     publish_observations(&db, &all_observations, &fingerprint)?;
     Ok((all_observations.len(), true))
@@ -760,8 +776,12 @@ mod tests {
         assert!(dag_benchmark.contains("algorithm=bounded-distance"));
         assert!(!dag_benchmark.contains("query_timeout"));
 
-        let observations = rust_observations(include_str!("main.rs"), Path::new("src/main.rs"))
-            .expect("Beholder should parse its own Rust source");
+        let observations = rust_observations(
+            "beholder",
+            include_str!("main.rs"),
+            Path::new("src/main.rs"),
+        )
+        .expect("Beholder should parse its own Rust source");
         assert!(observations.iter().any(|row| {
             row[1] == "repo://beholder/rust/main/trace"
                 && row[2] == "calls"
