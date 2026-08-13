@@ -301,7 +301,22 @@ async fn stop_for_service_change() -> Result<(), Box<dyn Error>> {
 
 async fn install_daemon_service() -> Result<(), Box<dyn Error>> {
     stop_for_service_change().await?;
-    let outcome = service::install(&service::installed_daemon_path()?, &state_dir()?)?;
+    let state = state_dir()?;
+    let outcome = service::install(&service::installed_daemon_path()?, &state)?;
+    if std::env::var("BEHOLDER_LAUNCHER").as_deref() != Ok("fake") {
+        for _ in 0..50 {
+            if get_status().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        get_status().await.map_err(|_| {
+            format!(
+                "installed beholderd did not become ready; see {}",
+                state.join("beholderd.log").display()
+            )
+        })?;
+    }
     println!(
         "installed {} ({})",
         outcome.manifest_path.display(),
