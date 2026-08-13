@@ -1,4 +1,4 @@
-use beholder_domain::{GitClone, GitTopology, LogicalRepository, WorkingTree};
+use beholder_domain::{GitClone, GitTopology, LogicalRepository, RepositoryState, WorkingTree};
 use gix::bstr::ByteSlice;
 use sha2::{Digest, Sha256};
 use std::{error::Error, path::Path};
@@ -48,10 +48,40 @@ fn local_repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
         .ok_or_else(|| format!("cannot derive repository identity from {}", root.display()).into())
 }
 
-pub fn source_fingerprint(repository: &str, sources: &[(std::path::PathBuf, String)]) -> String {
+pub fn repository_state(
+    root: &Path,
+    sources: &[(std::path::PathBuf, String)],
+) -> Result<RepositoryState, Box<dyn Error>> {
+    let (repository, head) = match gix::discover(root) {
+        Ok(git) => (
+            repository_identity_from(&git, root)?,
+            git.head_id().ok().map(|id| id.to_string()),
+        ),
+        Err(_) => (local_repository_identity(root)?, None),
+    };
+
+    Ok(RepositoryState {
+        fingerprint: state_fingerprint(&repository, head.as_deref(), sources),
+        repository: LogicalRepository {
+            identity: repository,
+        },
+        head,
+    })
+}
+
+fn state_fingerprint(
+    repository: &str,
+    head: Option<&str>,
+    sources: &[(std::path::PathBuf, String)],
+) -> String {
     let mut digest = Sha256::new();
     digest.update((repository.len() as u64).to_le_bytes());
     digest.update(repository.as_bytes());
+    digest.update([u8::from(head.is_some())]);
+    if let Some(head) = head {
+        digest.update((head.len() as u64).to_le_bytes());
+        digest.update(head.as_bytes());
+    }
     for (path, source) in sources {
         let path = path.to_string_lossy();
         digest.update((path.len() as u64).to_le_bytes());
@@ -207,6 +237,22 @@ mod tests {
             .filter_map(|worktree| worktree.branch.as_deref())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(branches, ["feature", "main"].into());
+
+        let source = |root: &Path| -> Result<Vec<(std::path::PathBuf, String)>, std::io::Error> {
+            Ok(vec![(
+                std::path::PathBuf::from("README.md"),
+                fs::read_to_string(root.join("README.md"))?,
+            )])
+        };
+        let main_state = repository_state(&main, &source(&main)?)?;
+        let linked_state = repository_state(&linked, &source(&linked)?)?;
+        assert_eq!(main_state, linked_state);
+
+        fs::write(linked.join("README.md"), "dirty fixture")?;
+        let dirty_state = repository_state(&linked, &source(&linked)?)?;
+        assert_eq!(dirty_state.repository, linked_state.repository);
+        assert_eq!(dirty_state.head, linked_state.head);
+        assert_ne!(dirty_state.fingerprint, linked_state.fingerprint);
         Ok(())
     }
 }

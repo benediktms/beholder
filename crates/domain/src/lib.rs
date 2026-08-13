@@ -8,6 +8,13 @@ pub struct LogicalRepository {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryState {
+    pub repository: LogicalRepository,
+    pub head: Option<String>,
+    pub fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitClone {
     pub common_directory: PathBuf,
 }

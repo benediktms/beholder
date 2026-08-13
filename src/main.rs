@@ -1,18 +1,17 @@
-use beholder_adapters_git::{repository_identity, source_fingerprint};
+use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, source_files};
 use std::{env, error::Error, fs, path::Path};
 
 fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dyn Error>> {
     let sources = vec![(path.to_path_buf(), fs::read_to_string(path)?)];
-    let repository = repository_identity(path.parent().unwrap_or_else(|| Path::new(".")))?;
-    let fingerprint = source_fingerprint(&repository, &sources);
+    let state = repository_state(path.parent().unwrap_or_else(|| Path::new(".")), &sources)?;
     let store = SemanticStore::persistent(database_path, true)?;
-    if store.fingerprint_matches(&fingerprint)? {
+    if store.fingerprint_matches(&state.fingerprint)? {
         return Ok((0, false));
     }
-    let observations = observations(&repository, &sources[0].1, path)?;
-    store.publish(&observations, &fingerprint)?;
+    let observations = observations(&state.repository.identity, &sources[0].1, path)?;
+    store.publish(&observations, &state.fingerprint)?;
     Ok((observations.len(), true))
 }
 
@@ -34,19 +33,18 @@ fn index_rust_repository(
             Ok((relative_path, fs::read_to_string(path)?))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    let repository = repository_identity(root)?;
-    let fingerprint = source_fingerprint(&repository, &sources);
+    let state = repository_state(root, &sources)?;
     let store = SemanticStore::persistent(database_path, true)?;
-    if store.fingerprint_matches(&fingerprint)? {
+    if store.fingerprint_matches(&state.fingerprint)? {
         return Ok((0, false));
     }
 
     let mut all_observations = Vec::new();
     for (path, source) in &sources {
-        all_observations.extend(observations(&repository, source, path)?);
+        all_observations.extend(observations(&state.repository.identity, source, path)?);
     }
     resolve_repository_calls(&mut all_observations);
-    store.publish(&all_observations, &fingerprint)?;
+    store.publish(&all_observations, &state.fingerprint)?;
     Ok((all_observations.len(), true))
 }
 
