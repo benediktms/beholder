@@ -123,6 +123,7 @@ name = "beholder"
 version = "0.1.0"
 dependencies = [
  "mnestic",
+ "sha2",
  "tree-sitter",
  "tree-sitter-rust",
 ]

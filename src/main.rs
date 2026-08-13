@@ -1,6 +1,7 @@
 use cozo::{
     DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions,
 };
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, env, error::Error, fs, path::Path, time::Instant};
 use tree_sitter::{Node, Parser};
 
@@ -22,6 +23,14 @@ const CREATE_REVISION_SCHEMA: &str = r#"
     view: String,
     =>
     revision: Int,
+}
+"#;
+
+const CREATE_FINGERPRINT_SCHEMA: &str = r#"
+:create analysis_fingerprint {
+    view: String,
+    =>
+    fingerprint: String,
 }
 "#;
 
@@ -114,6 +123,24 @@ fn persistent_database(path: &Path, initialize: bool) -> Result<DbInstance, Box<
         db.run_script(
             "?[view, revision] <- [['main', 0]] \
              :put analysis_revision {view => revision}",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("analysis_fingerprint"))
+    {
+        db.run_script(
+            CREATE_FINGERPRINT_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+        db.run_script(
+            "?[view, fingerprint] <- [['main', '']] \
+             :put analysis_fingerprint {view => fingerprint}",
             BTreeMap::new(),
             ScriptMutability::Mutable,
         )?;
@@ -229,9 +256,32 @@ fn store_observations(
     Ok(())
 }
 
+fn source_fingerprint(sources: &[(std::path::PathBuf, String)]) -> String {
+    let mut digest = Sha256::new();
+    for (path, source) in sources {
+        let path = path.to_string_lossy();
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update((source.len() as u64).to_le_bytes());
+        digest.update(source.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn fingerprint_matches(db: &DbInstance, fingerprint: &str) -> Result<bool, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[matches] := *analysis_fingerprint{view: 'main', fingerprint: stored}, \
+             matches = stored == $fingerprint",
+        BTreeMap::from([("fingerprint".into(), fingerprint.into())]),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(rows.rows.first().is_some_and(|row| row[0] == true.into()))
+}
+
 fn publish_observations(
     db: &DbInstance,
     observations: &[[String; 5]],
+    fingerprint: &str,
 ) -> Result<(), Box<dyn Error>> {
     let transaction = db.multi_transaction(true);
     transaction.run_script(
@@ -247,15 +297,25 @@ fn publish_observations(
          :put analysis_revision {view => revision}",
         BTreeMap::new(),
     )?;
+    transaction.run_script(
+        "?[view, fingerprint] <- [['main', $fingerprint]] \
+         :put analysis_fingerprint {view => fingerprint}",
+        BTreeMap::from([("fingerprint".into(), fingerprint.into())]),
+    )?;
     transaction.commit()?;
     Ok(())
 }
 
-fn index_rust(path: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>> {
-    let observations = rust_observations(&fs::read_to_string(path)?, path)?;
+fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dyn Error>> {
+    let sources = vec![(path.to_path_buf(), fs::read_to_string(path)?)];
+    let fingerprint = source_fingerprint(&sources);
     let db = persistent_database(database_path, true)?;
-    publish_observations(&db, &observations)?;
-    Ok(observations.len())
+    if fingerprint_matches(&db, &fingerprint)? {
+        return Ok((0, false));
+    }
+    let observations = rust_observations(&sources[0].1, path)?;
+    publish_observations(&db, &observations, &fingerprint)?;
+    Ok((observations.len(), true))
 }
 
 fn rust_source_files(
@@ -274,7 +334,10 @@ fn rust_source_files(
     Ok(())
 }
 
-fn index_rust_repository(root: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>> {
+fn index_rust_repository(
+    root: &Path,
+    database_path: &Path,
+) -> Result<(usize, bool), Box<dyn Error>> {
     let source_root = root.join("src");
     if !source_root.is_dir() {
         return Err(format!(
@@ -287,17 +350,25 @@ fn index_rust_repository(root: &Path, database_path: &Path) -> Result<usize, Box
     rust_source_files(&source_root, &mut files)?;
     files.sort();
 
-    let mut count = 0;
-    let mut all_observations = Vec::new();
-    for path in files {
-        let relative_path = path.strip_prefix(root)?;
-        let observations = rust_observations(&fs::read_to_string(&path)?, relative_path)?;
-        count += observations.len();
-        all_observations.extend(observations);
-    }
+    let sources = files
+        .into_iter()
+        .map(|path| {
+            let relative_path = path.strip_prefix(root)?.to_path_buf();
+            Ok((relative_path, fs::read_to_string(path)?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let fingerprint = source_fingerprint(&sources);
     let db = persistent_database(database_path, true)?;
-    publish_observations(&db, &all_observations)?;
-    Ok(count)
+    if fingerprint_matches(&db, &fingerprint)? {
+        return Ok((0, false));
+    }
+
+    let mut all_observations = Vec::new();
+    for (path, source) in &sources {
+        all_observations.extend(rust_observations(source, path)?);
+    }
+    publish_observations(&db, &all_observations, &fingerprint)?;
+    Ok((all_observations.len(), true))
 }
 
 fn query(
@@ -320,7 +391,10 @@ fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
 
 fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
     Ok(db.run_script(
-        "?[view, revision] := *analysis_revision{view, revision}\n:order view",
+        "?[view, revision, fingerprint] := \
+             *analysis_revision{view, revision}, \
+             *analysis_fingerprint{view, fingerprint}\n\
+         :order view",
         BTreeMap::new(),
         ScriptMutability::Immutable,
     )?)
@@ -526,15 +600,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let [command, source, path] = args.as_slice()
         && command == "index-rust"
     {
-        let count = index_rust(Path::new(source), Path::new(path))?;
-        println!("indexed {count} Rust observations");
+        let (count, published) = index_rust(Path::new(source), Path::new(path))?;
+        println!(
+            "{}",
+            if published {
+                format!("indexed {count} Rust observations")
+            } else {
+                "unchanged; kept current analysis revision".into()
+            }
+        );
         return Ok(());
     }
     if let [command, root, path] = args.as_slice()
         && command == "index-rust-repo"
     {
-        let count = index_rust_repository(Path::new(root), Path::new(path))?;
-        println!("indexed {count} Rust observations");
+        let (count, published) = index_rust_repository(Path::new(root), Path::new(path))?;
+        println!(
+            "{}",
+            if published {
+                format!("indexed {count} Rust observations")
+            } else {
+                "unchanged; kept current analysis revision".into()
+            }
+        );
         return Ok(());
     }
     if let [command, subject, path] = args.as_slice()
@@ -682,7 +770,12 @@ mod tests {
 
         let path = env::temp_dir().join(format!("beholder-dogfood-{}.db", std::process::id()));
         let _ = fs::remove_file(&path);
-        assert!(index_rust_repository(Path::new("."), &path).unwrap() > 0);
+        let (count, published) = index_rust_repository(Path::new("."), &path).unwrap();
+        assert!(published && count > 0);
+        assert_eq!(
+            index_rust_repository(Path::new("."), &path).unwrap(),
+            (0, false)
+        );
         let indexed = persistent_database(&path, false).unwrap();
         let context = context(&indexed, "repo://beholder/rust/main/trace").unwrap();
         assert!(format!("{context:?}").contains("repo://beholder/rust/main/query"));
@@ -694,7 +787,7 @@ mod tests {
 
         let source = env::temp_dir().join(format!("beholder-dogfood-{}.rs", std::process::id()));
         fs::write(&source, "fn first() { second(); } fn second() {}").unwrap();
-        index_rust(&source, &path).unwrap();
+        assert!(index_rust(&source, &path).unwrap().1);
         let indexed = persistent_database(&path, false).unwrap();
         assert!(
             !inspect_observations(&indexed, Some("calls"))
@@ -705,7 +798,8 @@ mod tests {
         drop(indexed);
 
         fs::write(&source, "fn first() {}").unwrap();
-        index_rust(&source, &path).unwrap();
+        assert!(index_rust(&source, &path).unwrap().1);
+        assert_eq!(index_rust(&source, &path).unwrap(), (0, false));
         let indexed = persistent_database(&path, false).unwrap();
         assert!(
             inspect_observations(&indexed, Some("calls"))
