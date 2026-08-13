@@ -1,95 +1,101 @@
-use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, source_files};
 use beholder_daemon_client::{ADDRESS, state_dir};
-use beholder_domain::{RepositoryState, WorkspaceView};
 use beholder_protocol::v1::{
     EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest,
     IndexRustWorkspaceResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
     QueryResult, RegisterWorkspaceRequest, RegisterWorkspaceResponse, StopRequest, StopResponse,
     daemon_server::{Daemon, DaemonServer},
 };
-use std::{error::Error, fs, net::SocketAddr, path::Path, path::PathBuf, sync::Mutex};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use std::{
+    collections::BTreeSet,
+    error::Error,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status, transport::Server};
 
+mod indexing;
 mod single_instance;
 mod workspace_registry;
 
+use indexing::IndexScheduler;
 use workspace_registry::WorkspaceRegistry;
 
 struct BeholderDaemon {
-    store: SemanticStore,
-    workspaces: Mutex<WorkspaceRegistry>,
+    store: Arc<SemanticStore>,
+    workspaces: Arc<Mutex<WorkspaceRegistry>>,
+    scheduler: Arc<IndexScheduler>,
+    watcher: Mutex<RecommendedWatcher>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
+
+type DaemonParts = (BeholderDaemon, oneshot::Receiver<()>, Arc<IndexScheduler>);
 
 fn daemon(
     store: SemanticStore,
     workspaces: WorkspaceRegistry,
-) -> (BeholderDaemon, oneshot::Receiver<()>) {
+) -> Result<DaemonParts, Box<dyn Error>> {
     let (shutdown, stopped) = oneshot::channel();
-    (
+    let workspaces = Arc::new(Mutex::new(workspaces));
+    let scheduler = Arc::new(IndexScheduler::new());
+    let callback_workspaces = workspaces.clone();
+    let callback_scheduler = scheduler.clone();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        callback_scheduler.add_event(event, &callback_workspaces);
+    })?;
+    let registered = workspaces
+        .lock()
+        .map_err(|_| "workspace registry lock poisoned")?
+        .list();
+    for workspace in &registered {
+        watch_workspace(&mut watcher, workspace)?;
+    }
+    for workspace in registered {
+        scheduler.mark(workspace.name);
+    }
+    Ok((
         BeholderDaemon {
-            store,
-            workspaces: Mutex::new(workspaces),
+            store: Arc::new(store),
+            workspaces,
+            scheduler: scheduler.clone(),
+            watcher: Mutex::new(watcher),
             shutdown: Mutex::new(Some(shutdown)),
         },
         stopped,
-    )
+        scheduler,
+    ))
 }
 
-type RustSources = Vec<(PathBuf, String)>;
-
-fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources), Box<dyn Error>> {
-    if !root.is_dir() {
-        return Err(format!("repository does not exist: {}", root.display()).into());
+fn watch_workspace(
+    watcher: &mut RecommendedWatcher,
+    workspace: &beholder_domain::Workspace,
+) -> notify::Result<()> {
+    for repository in &workspace.repositories {
+        watcher.watch(repository, RecursiveMode::Recursive)?;
     }
-    let mut files = Vec::new();
-    source_files(root, &mut files)?;
-    files.sort();
-    let sources = files
+    Ok(())
+}
+
+fn update_workspace_watch(
+    watcher: &mut RecommendedWatcher,
+    previous: Option<&beholder_domain::Workspace>,
+    workspace: &beholder_domain::Workspace,
+) -> notify::Result<()> {
+    let previous = previous
         .into_iter()
-        .map(|path| {
-            let relative_path = path.strip_prefix(root)?.to_path_buf();
-            Ok((relative_path, fs::read_to_string(path)?))
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    Ok((repository_state(root, &sources)?, sources))
-}
-
-fn index_rust_workspace(
-    store: &SemanticStore,
-    workspace: &str,
-    roots: &[PathBuf],
-) -> Result<(usize, bool), Box<dyn Error>> {
-    if roots.is_empty() {
-        return Err("workspace must contain a repository".into());
+        .flat_map(|workspace| &workspace.repositories)
+        .collect::<BTreeSet<_>>();
+    let current = workspace.repositories.iter().collect::<BTreeSet<_>>();
+    for repository in previous.difference(&current) {
+        watcher.unwatch(repository)?;
     }
-    let repositories = roots
-        .iter()
-        .map(|root| rust_repository_sources(root))
-        .collect::<Result<Vec<_>, _>>()?;
-    let view = WorkspaceView::new(
-        workspace,
-        repositories
-            .iter()
-            .map(|(state, _)| state.clone())
-            .collect(),
-    )?;
-    if store.view_matches(&view)? {
-        return Ok((0, false));
+    for repository in current.difference(&previous) {
+        watcher.watch(repository, RecursiveMode::Recursive)?;
     }
-
-    let mut all_observations = Vec::new();
-    for (state, sources) in repositories {
-        for (path, source) in sources {
-            all_observations.extend(observations(&state.repository.identity, &source, &path)?);
-        }
-    }
-    resolve_repository_calls(&mut all_observations);
-    store.publish(&view, &all_observations)?;
-    Ok((all_observations.len(), true))
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -144,9 +150,10 @@ impl Daemon for BeholderDaemon {
             .ok_or_else(|| {
                 Status::not_found(format!("workspace not registered: {workspace_name}"))
             })?;
-        let (observation_count, published) =
-            index_rust_workspace(&self.store, &workspace.name, &workspace.repositories)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (observation_count, published) = self
+            .scheduler
+            .index(&self.store, &workspace)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(IndexRustWorkspaceResponse {
             observation_count: observation_count
                 .try_into()
@@ -175,19 +182,31 @@ impl Daemon for BeholderDaemon {
         request: Request<RegisterWorkspaceRequest>,
     ) -> Result<Response<RegisterWorkspaceResponse>, Status> {
         let request = request.into_inner();
-        let workspace = self
-            .workspaces
+        let (previous, workspace) = {
+            let mut workspaces = self
+                .workspaces
+                .lock()
+                .map_err(|_| Status::internal("workspace registry lock poisoned"))?;
+            let previous = workspaces.get(&request.name).cloned();
+            let workspace = workspaces
+                .register(
+                    request.name,
+                    request
+                        .repositories
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .collect(),
+                )
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            (previous, workspace)
+        };
+        let mut watcher = self
+            .watcher
             .lock()
-            .map_err(|_| Status::internal("workspace registry lock poisoned"))?
-            .register(
-                request.name,
-                request
-                    .repositories
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect(),
-            )
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            .map_err(|_| Status::internal("filesystem watcher lock poisoned"))?;
+        update_workspace_watch(&mut watcher, previous.as_ref(), &workspace)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        self.scheduler.mark(workspace.name.clone());
         Ok(Response::new(RegisterWorkspaceResponse {
             workspace: Some(workspace.into()),
         }))
@@ -238,10 +257,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let _lock = single_instance::acquire(&state_dir)?;
-    let (service, stopped) = daemon(
+    let (service, stopped, index_scheduler) = daemon(
         SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
         WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
-    );
+    )?;
+    let watcher_task =
+        tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
     Server::builder()
         .add_service(DaemonServer::new(service))
         .serve_with_shutdown(ADDRESS.parse::<SocketAddr>()?, async {
@@ -251,6 +272,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         })
         .await?;
+    watcher_task.abort();
     Ok(())
 }
 
@@ -261,7 +283,7 @@ mod tests {
         EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest, ListWorkspacesRequest,
         PathRequest, RegisterWorkspaceRequest, StopRequest, daemon_client::DaemonClient,
     };
-    use std::{env, fs, net::TcpListener, time::Duration};
+    use std::{env, fs, net::TcpListener, path::Path, time::Duration};
 
     #[tokio::test]
     async fn workspace_smoke() {
@@ -287,10 +309,13 @@ mod tests {
         );
         let _ = fs::remove_file(&database);
         let registry_path = workspace_registry::registry_path(&state);
-        let (service, stopped) = daemon(
+        let (service, stopped, index_scheduler) = daemon(
             SemanticStore::persistent(&database, true).unwrap(),
             WorkspaceRegistry::open(registry_path.clone()).unwrap(),
-        );
+        )
+        .unwrap();
+        let watcher_task =
+            tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(DaemonServer::new(service))
@@ -323,6 +348,8 @@ mod tests {
         fs::create_dir_all(second.join("src")).unwrap();
         fs::write(first.join("src/lib.rs"), "fn caller() { helper(); }").unwrap();
         fs::write(second.join("src/lib.rs"), "fn helper() {}").unwrap();
+        let caller = "repo://repo-a/rust/lib/caller";
+        let helper = "repo://repo-b/rust/lib/helper";
         let repository = |path: &Path| path.to_str().unwrap().to_owned();
         let registered = client
             .register_workspace(RegisterWorkspaceRequest {
@@ -345,14 +372,24 @@ mod tests {
                 .len(),
             1
         );
-        let indexed = client
-            .index_rust_workspace(IndexRustWorkspaceRequest {
-                workspace: "main".into(),
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(indexed.published && indexed.observation_count > 0);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let context = client
+                    .context(EntityRequest {
+                        workspace: "main".into(),
+                        entity: caller.into(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if format!("{context:?}").contains(helper) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("registered workspace was not indexed");
         let unchanged = client
             .index_rust_workspace(IndexRustWorkspaceRequest {
                 workspace: "main".into(),
@@ -373,16 +410,6 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(
-            client
-                .index_rust_workspace(IndexRustWorkspaceRequest {
-                    workspace: "secondary".into(),
-                })
-                .await
-                .unwrap()
-                .into_inner()
-                .published
-        );
         let isolated = "repo://repo-c/rust/lib/isolated";
         assert!(
             client
@@ -396,21 +423,26 @@ mod tests {
                 .rows
                 .is_empty()
         );
-        assert!(
-            !client
-                .context(EntityRequest {
-                    workspace: "secondary".into(),
-                    entity: isolated.into(),
-                })
-                .await
-                .unwrap()
-                .into_inner()
-                .rows
-                .is_empty()
-        );
-
-        let caller = "repo://repo-a/rust/lib/caller";
-        let helper = "repo://repo-b/rust/lib/helper";
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !client
+                    .context(EntityRequest {
+                        workspace: "secondary".into(),
+                        entity: isolated.into(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .rows
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("secondary workspace was not indexed");
         assert!(
             format!(
                 "{:?}",
@@ -473,6 +505,27 @@ mod tests {
                 .is_empty()
         );
 
+        fs::write(first.join("src/lib.rs"), "fn caller() { replacement(); }").unwrap();
+        fs::write(second.join("src/lib.rs"), "fn replacement() {}").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let context = client
+                    .context(EntityRequest {
+                        workspace: "main".into(),
+                        entity: caller.into(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if format!("{context:?}").contains("repo://repo-b/rust/lib/replacement") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("filesystem change was not indexed");
+
         assert!(
             client
                 .stop(StopRequest {})
@@ -482,11 +535,14 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
+        watcher_task.abort();
         let reloaded = WorkspaceRegistry::open(registry_path).unwrap();
         assert!(reloaded.get("main").is_some());
         assert!(reloaded.get("secondary").is_some());
         let indexed = SemanticStore::persistent(&database, false).unwrap();
-        assert_eq!(indexed.inspect_revisions().unwrap().rows.len(), 3);
+        assert!(indexed.inspect_revisions().unwrap().rows.iter().any(|row| {
+            row[0].as_str() == Some("main") && row[1].as_i64().is_some_and(|revision| revision >= 2)
+        }));
         assert!(
             format!(
                 "{:?}",
@@ -494,7 +550,7 @@ mod tests {
                     .context("main", "repo://repo-a/rust/lib/caller")
                     .unwrap()
             )
-            .contains("repo://repo-b/rust/lib/helper")
+            .contains("repo://repo-b/rust/lib/replacement")
         );
         drop(indexed);
         drop(lock);
