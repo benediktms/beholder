@@ -51,7 +51,7 @@ what does the resulting workspace look like?
 
 The project should remain generic enough to become useful outside its initial environment, while prioritising the real architecture and conventions of the environment in which it is developed.
 
-The initial implementation will be written in **Rust** and will use **Cozo** as its semantic fact store and inference engine.
+The initial implementation will be written in **Rust** and will use **Mnestic** as its semantic fact store and inference engine.
 
 ---
 
@@ -259,7 +259,7 @@ Concretely:
              Semantic facts
                   │
                   ▼
-                 Cozo
+                 Mnestic
                   │
                   │ resolves and derives
                   ▼
@@ -277,9 +277,9 @@ This keeps parsing, protocol semantics, organisation-specific conventions and gl
 
 ---
 
-# 6. Why Cozo
+# 6. Why Mnestic
 
-Cozo is not merely Beholder's persistence layer.
+Mnestic is not merely Beholder's persistence layer.
 
 It serves as:
 
@@ -329,7 +329,7 @@ dependency(A, C) :-
     dependency(B, C)
 ```
 
-The project deliberately uses Cozo as an opportunity to test whether **relational facts plus Datalog inference** provide a better foundation for static analysis than constructing a property graph first and implementing all semantics through imperative graph traversal.
+The project deliberately uses Mnestic as an opportunity to test whether **relational facts plus Datalog inference** provide a better foundation for static analysis than constructing a property graph first and implementing all semantics through imperative graph traversal.
 
 The analysis database is derived state and must remain rebuildable, so the project can tolerate greater experimentation with this architectural choice than would be appropriate for primary business data.
 
@@ -360,9 +360,9 @@ specialised graph algorithms
 daemon orchestration
 ```
 
-## 7.2 Cozo owns
+## 7.2 Mnestic owns
 
-Cozo should handle semantic relations and declarative inference.
+Mnestic should handle semantic relations and declarative inference.
 
 Examples:
 
@@ -382,7 +382,7 @@ workspace-wide dependency analysis
 
 Not every analysis should be forced into Datalog.
 
-Specialised algorithms may be implemented in Rust and exposed to Cozo where appropriate.
+Specialised algorithms may be implemented in Rust and exposed to Mnestic where appropriate.
 
 Potential examples:
 
@@ -853,7 +853,7 @@ Conceptually:
                               parallel analysis
                                       │
                                       ▼
-                                   Cozo
+                                   Mnestic
                                       │
                                       ▼
                             AnalysisRevision
@@ -870,7 +870,7 @@ filesystem watching
 hashing
 index scheduling
 worker coordination
-Cozo write coordination
+Mnestic write coordination
 query execution
 analysis revision publication
 ```
@@ -920,7 +920,7 @@ Reindex
 SubscribeWorkspace
 ```
 
-The protocol should expose Beholder domain concepts rather than raw Cozo operations.
+The protocol should expose Beholder domain concepts rather than raw Mnestic operations.
 
 ---
 
@@ -1198,9 +1198,9 @@ V1 should prefer **latest completed** consistency rather than blocking every que
 
 ---
 
-# 32. Cozo Write Coordination
+# 32. Mnestic Write Coordination
 
-The initial Cozo configuration should use its SQLite-backed embedded storage.
+The initial Mnestic configuration should use its SQLite-backed embedded storage.
 
 Parsing and extraction can occur concurrently, but writes should be coordinated through a single workspace commit path.
 
@@ -1221,7 +1221,7 @@ Conceptually:
                Commit Coordinator
                         │
                         ▼
-                      Cozo
+                      Mnestic
 ```
 
 This separates analysis concurrency from persistence semantics.
@@ -1543,25 +1543,25 @@ Possible layout:
 rules/
 
     core/
-        dependency.cozo
-        impact.cozo
-        symbols.cozo
+        dependency.datalog
+        impact.datalog
+        symbols.datalog
 
     protocols/
-        grpc.cozo
-        kafka.cozo
-        graphql.cozo
+        grpc.datalog
+        kafka.datalog
+        graphql.datalog
 
     contracts/
-        protobuf.cozo
-        avro.cozo
+        protobuf.datalog
+        avro.datalog
 
     languages/
-        rust.cozo
-        elixir.cozo
+        rust.datalog
+        elixir.datalog
 
     integrations/
-        internal.cozo
+        internal.datalog
 ```
 
 Rule packs should be independently testable.
@@ -1659,7 +1659,7 @@ FileDescriptorSet
      ↓
 Rust contract frontend
      ↓
-Cozo facts
+Mnestic facts
 ```
 
 Entities should include:
@@ -2007,14 +2007,14 @@ resolver versions
 rule versions
 ```
 
-It must always be possible to reconstruct Cozo state from these inputs.
+It must always be possible to reconstruct Mnestic state from these inputs.
 
 This allows the project to tolerate:
 
 ```text
 schema evolution
 analysis model redesign
-Cozo upgrades
+Mnestic upgrades
 storage experiments
 ```
 
@@ -2049,7 +2049,7 @@ relationships
 evidence
 ```
 
-Cozo should not become Beholder's job queue.
+Mnestic should not become Beholder's job queue.
 
 ---
 
@@ -2142,9 +2142,9 @@ Explainability is a core feature.
 
 ---
 
-# 54. Cozo Time Travel
+# 54. Mnestic Time Travel
 
-Cozo time-travel functionality is **not part of V1**.
+Mnestic time-travel functionality is **not part of V1**.
 
 The authoritative state model is:
 
@@ -2156,7 +2156,7 @@ AnalysisRevision
 
 This correctly represents Git branches and simultaneously valid worktree states.
 
-Cozo temporal relations may later be useful for longitudinal analysis of a canonical workspace lineage such as `main` or `master`.
+Mnestic temporal relations may later be useful for longitudinal analysis of a canonical workspace lineage such as `main` or `master`.
 
 Potential future questions include:
 
@@ -2179,22 +2179,23 @@ A likely early layout is:
 ```text
 Cargo.toml
 Cargo.lock
+mise.toml
 rust-toolchain.toml
 
 .moon/
     workspace.yml
-    toolchains.yml
-    tasks/
+
+moon.yml
 
 crates/
-    core/
-    store-cozo/
-    daemon/
-    rules/
-    treesitter/
-    language-rust/
-    analysis/
-    cli/
+    domain/
+    dto/
+    adapters-git/
+    adapters-mnestic/
+    adapters-treesitter-rust/
+
+src/
+    main.rs
 
 proto/
     beholder/v1/
@@ -2205,6 +2206,24 @@ rules/
 This structure should remain pragmatic.
 
 Do not create a separate crate for every conceptual module unless a meaningful dependency or compilation boundary exists.
+
+The workspace follows pragmatic hexagonal architecture:
+
+```text
+CLI and future daemon composition roots
+                 │
+                 ▼
+        domain and DTO contracts
+                 ▲
+                 │
+   Git / Mnestic / language adapters
+```
+
+Third-party dependencies should be declared by the crate that owns them. Only broad, genuinely workspace-wide utilities such as `serde`, `tracing` or `tokio` should be versioned at workspace scope.
+
+The Mnestic boundary is deliberately opaque. Mnestic handles, values, queries and transactions must remain inside `adapters-mnestic`; other crates communicate through Beholder-owned domain and DTO types.
+
+Application, ports, daemon and additional adapter crates should be introduced only when a real dependency seam requires them.
 
 ---
 
@@ -2224,7 +2243,7 @@ perfect compiler semantics
 dynamic binary plugins
 dozens of programming languages
 complete macro expansion
-Cozo time travel
+Mnestic time travel
 automatic view composition
 automatic Git merges
 full CFG/PDG analysis
@@ -2238,7 +2257,7 @@ The initial goal is:
 
 # 57. Phase 0 — Architecture Spike
 
-Before implementing broad language support, validate the Cozo/Datalog architectural bet.
+Before implementing broad language support, validate the Mnestic/Datalog architectural bet.
 
 Create a synthetic workspace containing:
 
@@ -2296,13 +2315,13 @@ workspace-view filtering
 
 Beholder is comfortable treating:
 
-> **Cozo relations plus Datalog inference as the foundation of the semantic analysis engine.**
+> **Mnestic relations plus Datalog inference as the foundation of the semantic analysis engine.**
 
 If this assumption proves wrong, Phase 0 is deliberately early enough to replace it.
 
 ### Outcome — accepted 2026-08-13
 
-Cozo relations and Datalog inference are accepted as the semantic-engine foundation.
+Mnestic relations and Datalog inference are accepted as the semantic-engine foundation.
 
 The spike established these operating constraints:
 
@@ -2310,7 +2329,7 @@ The spike established these operating constraints:
 * anchor recursive rules at the requested source;
 * bound interactive traversal depth;
 * infer minimum distance before expanding path evidence;
-* parallelise independent ingestion and queries above Cozo rather than relying on intra-query parallelism;
+* parallelise independent ingestion and queries above Mnestic rather than relying on intra-query parallelism;
 * batch or incrementally ingest larger corpora to limit construction-time memory.
 
 At approximately 9.8 million synthetic relationships, the SQLite database occupied 1.3 GB, loaded in 19 seconds and served bounded context, trace and impact queries below 10 milliseconds. Bulk construction peaked at 4.37 GB RSS, making ingestion memory the first scaling constraint.
@@ -2332,7 +2351,7 @@ repository states
 workspace views
 analysis revisions
 
-Cozo schema
+Mnestic schema
 rule loading
 
 beholderd lifecycle
@@ -2637,7 +2656,7 @@ Automatic agent-view composition and Git merging are outside the initial scope.
 
 # 71. Future — Historical Architecture
 
-Cozo time travel may later preserve historical relationships for the canonical workspace lineage.
+Mnestic time travel may later preserve historical relationships for the canonical workspace lineage.
 
 Potential queries:
 
@@ -2673,7 +2692,7 @@ These capabilities may combine:
 ```text
 Rust algorithms
 Datalog
-Cozo fixed rules
+Mnestic fixed rules
 ```
 
 ---
@@ -2747,7 +2766,7 @@ The architecture is successful when:
 
 7. Frontends emit observations rather than directly constructing arbitrary global dependencies.
 
-8. Cozo persists semantic facts and Datalog derives useful architectural relationships.
+8. Mnestic persists semantic facts and Datalog derives useful architectural relationships.
 
 9. New languages can be added without redesigning contract analysis.
 

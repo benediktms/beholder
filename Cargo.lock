@@ -122,12 +122,45 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "beholder"
 version = "0.1.0"
 dependencies = [
+ "beholder-adapters-git",
+ "beholder-adapters-mnestic",
+ "beholder-adapters-treesitter-rust",
+ "beholder-dto",
+]
+
+[[package]]
+name = "beholder-adapters-git"
+version = "0.1.0"
+dependencies = [
  "gix-url",
- "mnestic",
  "sha2",
+]
+
+[[package]]
+name = "beholder-adapters-mnestic"
+version = "0.1.0"
+dependencies = [
+ "beholder-domain",
+ "beholder-dto",
+ "mnestic",
+]
+
+[[package]]
+name = "beholder-adapters-treesitter-rust"
+version = "0.1.0"
+dependencies = [
+ "beholder-domain",
  "tree-sitter",
  "tree-sitter-rust",
 ]
+
+[[package]]
+name = "beholder-domain"
+version = "0.1.0"
+
+[[package]]
+name = "beholder-dto"
+version = "0.1.0"
 
 [[package]]
 name = "bincode"

@@ -1,16 +1,35 @@
-[package]
-name = "beholder"
+[workspace]
+members = [
+    "crates/adapters-mnestic",
+    "crates/adapters-git",
+    "crates/adapters-treesitter-rust",
+    "crates/domain",
+    "crates/dto",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
+[workspace.dependencies]
+beholder-adapters-mnestic = { path = "crates/adapters-mnestic", default-features = false }
+beholder-adapters-git = { path = "crates/adapters-git" }
+beholder-adapters-treesitter-rust = { path = "crates/adapters-treesitter-rust" }
+beholder-domain = { path = "crates/domain" }
+beholder-dto = { path = "crates/dto" }
+
+[package]
+name = "beholder"
+version.workspace = true
+edition.workspace = true
+
 [features]
 default = ["sqlite"]
-parallel = ["cozo/rayon"]
-sqlite = ["cozo/storage-sqlite", "cozo/storage-sqlite-src"]
+parallel = ["beholder-adapters-mnestic/parallel"]
+sqlite = ["beholder-adapters-mnestic/sqlite"]
 
 [dependencies]
-cozo = { package = "mnestic", version = "0.14.0", default-features = false }
-gix-url = "0.36.1"
-sha2 = "0.10.9"
-tree-sitter = "0.26.12"
-tree-sitter-rust = "0.24.2"
+beholder-adapters-mnestic.workspace = true
+beholder-adapters-git.workspace = true
+beholder-adapters-treesitter-rust.workspace = true
+beholder-dto.workspace = true
