@@ -2,7 +2,9 @@ use cozo::{
     DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions,
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, env, error::Error, fs, path::Path, time::Instant};
+use std::{
+    collections::BTreeMap, env, error::Error, fs, path::Path, process::Command, time::Instant,
+};
 use tree_sitter::{Node, Parser};
 
 const MAX_HOPS: i64 = 32;
@@ -180,7 +182,54 @@ fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<(String, usize)>
     }
 }
 
+fn canonical_git_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    let (host, path) = if let Some((_, address)) = remote.split_once("://") {
+        let (authority, path) = address.split_once('/')?;
+        (authority.rsplit('@').next()?, path)
+    } else if let Some((authority, path)) = remote.split_once(':') {
+        if !authority.contains('@') {
+            return None;
+        }
+        (authority.rsplit('@').next()?, path)
+    } else {
+        return None;
+    };
+    let path = path
+        .trim_start_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path);
+    (!host.is_empty() && !path.is_empty()).then(|| format!("{host}/{path}"))
+}
+
+fn git_output(root: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 fn repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
+    let remote = git_output(root, &["remote", "get-url", "origin"]).or_else(|| {
+        let remotes = git_output(root, &["remote"])?;
+        let mut remotes = remotes.lines();
+        let only = remotes.next()?;
+        remotes
+            .next()
+            .is_none()
+            .then(|| git_output(root, &["remote", "get-url", only]))
+            .flatten()
+    });
+    if let Some(identity) = remote.as_deref().and_then(canonical_git_remote) {
+        return Ok(identity);
+    }
     // ponytail: directory name is the local-only fallback; canonical Git remotes come with registration.
     root.canonicalize()?
         .file_name()
@@ -766,6 +815,19 @@ mod tests {
 
     #[test]
     fn answers_phase_zero_queries_and_applies_view_overrides() {
+        assert_eq!(
+            canonical_git_remote("git@github.com:company/payments.git"),
+            Some("github.com/company/payments".into())
+        );
+        assert_eq!(
+            canonical_git_remote("https://github.com/company/payments.git"),
+            Some("github.com/company/payments".into())
+        );
+        assert_eq!(
+            canonical_git_remote("ssh://git@github.com/company/payments.git"),
+            Some("github.com/company/payments".into())
+        );
+
         let db = database().unwrap();
 
         let trace = trace(&db, "web/CheckoutPage", "cache/update_price").unwrap();
