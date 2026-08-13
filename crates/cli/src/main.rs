@@ -1,17 +1,22 @@
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, source_files};
-use std::{env, error::Error, fs, path::Path};
+use beholder_domain::{RepositoryState, WorkspaceView};
+use std::{env, error::Error, fs, path::Path, path::PathBuf};
+
+const MAIN_VIEW: &str = "main";
+type RustSources = Vec<(PathBuf, String)>;
 
 fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dyn Error>> {
     let sources = vec![(path.to_path_buf(), fs::read_to_string(path)?)];
     let state = repository_state(path.parent().unwrap_or_else(|| Path::new(".")), &sources)?;
+    let view = WorkspaceView::new(MAIN_VIEW, vec![state.clone()])?;
     let store = SemanticStore::persistent(database_path, true)?;
-    if store.fingerprint_matches(&state.fingerprint)? {
+    if store.view_matches(&view)? {
         return Ok((0, false));
     }
     let observations = observations(&state.repository.identity, &sources[0].1, path)?;
-    store.publish(&observations, &state.fingerprint)?;
+    store.publish(&view, &observations)?;
     Ok((observations.len(), true))
 }
 
@@ -19,6 +24,10 @@ fn index_rust_repository(
     root: &Path,
     database_path: &Path,
 ) -> Result<(usize, bool), Box<dyn Error>> {
+    index_rust_workspace(&[root.to_path_buf()], database_path)
+}
+
+fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources), Box<dyn Error>> {
     if !root.is_dir() {
         return Err(format!("repository does not exist: {}", root.display()).into());
     }
@@ -34,17 +43,40 @@ fn index_rust_repository(
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let state = repository_state(root, &sources)?;
+    Ok((state, sources))
+}
+
+fn index_rust_workspace(
+    roots: &[PathBuf],
+    database_path: &Path,
+) -> Result<(usize, bool), Box<dyn Error>> {
+    if roots.is_empty() {
+        return Err("workspace must contain a repository".into());
+    }
+    let repositories = roots
+        .iter()
+        .map(|root| rust_repository_sources(root))
+        .collect::<Result<Vec<_>, _>>()?;
+    let view = WorkspaceView::new(
+        MAIN_VIEW,
+        repositories
+            .iter()
+            .map(|(state, _)| state.clone())
+            .collect(),
+    )?;
     let store = SemanticStore::persistent(database_path, true)?;
-    if store.fingerprint_matches(&state.fingerprint)? {
+    if store.view_matches(&view)? {
         return Ok((0, false));
     }
 
     let mut all_observations = Vec::new();
-    for (path, source) in &sources {
-        all_observations.extend(observations(&state.repository.identity, source, path)?);
+    for (state, sources) in repositories {
+        for (path, source) in sources {
+            all_observations.extend(observations(&state.repository.identity, &source, &path)?);
+        }
     }
     resolve_repository_calls(&mut all_observations);
-    store.publish(&all_observations, &state.fingerprint)?;
+    store.publish(&view, &all_observations)?;
     Ok((all_observations.len(), true))
 }
 
@@ -68,6 +100,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         && command == "index-rust-repo"
     {
         let (count, published) = index_rust_repository(Path::new(root), Path::new(path))?;
+        println!(
+            "{}",
+            if published {
+                format!("indexed {count} Rust observations")
+            } else {
+                "unchanged; kept current analysis revision".into()
+            }
+        );
+        return Ok(());
+    }
+    if let [command, path, roots @ ..] = args.as_slice()
+        && command == "index-rust-workspace"
+        && !roots.is_empty()
+    {
+        let roots = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let (count, published) = index_rust_workspace(&roots, Path::new(path))?;
         println!(
             "{}",
             if published {
@@ -159,7 +207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         [command, entity] if command == "dependencies" => store.dependencies(entity)?,
         [] => store.trace("web/CheckoutPage", "cache/update_price")?,
         _ => return Err(
-            "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | inspect <relations|revisions|observations> [relation] <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
+            "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | index-rust-workspace <database-path> <repository>... | inspect <relations|revisions|observations> [relation] <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
                 .into(),
         ),
     };
@@ -211,6 +259,43 @@ mod tests {
                 .all(|row| row[2].as_str() == Some("calls"))
         );
         drop(indexed);
+
+        let multi_root =
+            env::temp_dir().join(format!("beholder-multi-repository-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&multi_root);
+        let first = multi_root.join("repo-a");
+        let second = multi_root.join("repo-b");
+        fs::create_dir_all(first.join("src")).unwrap();
+        fs::create_dir_all(second.join("src")).unwrap();
+        fs::write(first.join("src/lib.rs"), "fn caller() { helper(); }").unwrap();
+        fs::write(second.join("src/lib.rs"), "fn helper() {}").unwrap();
+        let multi_database = multi_root.join("beholder.db");
+        assert!(
+            index_rust_workspace(&[first.clone(), second.clone()], &multi_database)
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            index_rust_workspace(&[second.clone(), first.clone()], &multi_database).unwrap(),
+            (0, false)
+        );
+        let indexed = SemanticStore::persistent(&multi_database, false).unwrap();
+        assert_eq!(indexed.inspect_revisions().unwrap().rows.len(), 2);
+        assert!(
+            format!(
+                "{:?}",
+                indexed.context("repo://repo-a/rust/lib/caller").unwrap()
+            )
+            .contains("repo://repo-b/rust/lib/helper")
+        );
+        drop(indexed);
+        assert!(
+            index_rust_workspace(&[first.clone(), first], &multi_database)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate repository repo-a")
+        );
+        fs::remove_dir_all(multi_root).unwrap();
 
         let source = env::temp_dir().join(format!("beholder-dogfood-{}.rs", std::process::id()));
         fs::write(&source, "fn first() { second(); } fn second() {}").unwrap();

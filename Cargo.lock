@@ -161,6 +161,7 @@ dependencies = [
  "beholder-adapters-git",
  "beholder-adapters-mnestic",
  "beholder-adapters-treesitter-rust",
+ "beholder-domain",
  "beholder-dto",
 ]
 

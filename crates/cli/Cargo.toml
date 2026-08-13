@@ -16,4 +16,5 @@ sqlite = ["beholder-adapters-mnestic/sqlite"]
 beholder-adapters-mnestic.workspace = true
 beholder-adapters-git.workspace = true
 beholder-adapters-treesitter-rust.workspace = true
+beholder-domain.workspace = true
 beholder-dto.workspace = true

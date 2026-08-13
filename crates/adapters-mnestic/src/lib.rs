@@ -1,4 +1,4 @@
-use beholder_domain::Observation;
+use beholder_domain::{Observation, RepositoryState, WorkspaceView};
 use beholder_dto::{QueryResult, QueryValue};
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, Num, ScriptMutability, ScriptRunOptions,
@@ -30,16 +30,16 @@ impl SemanticStore {
         })
     }
 
-    pub fn fingerprint_matches(&self, fingerprint: &str) -> Result<bool, Box<dyn Error>> {
-        fingerprint_matches(&self.db, fingerprint)
+    pub fn view_matches(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
+        view_matches(&self.db, view)
     }
 
     pub fn publish(
         &self,
+        view: &WorkspaceView,
         observations: &[Observation],
-        fingerprint: &str,
     ) -> Result<(), Box<dyn Error>> {
-        publish_observations(&self.db, observations, fingerprint)
+        publish_observations(&self.db, view, observations)
     }
 
     pub fn inspect_relations(&self) -> Result<QueryResult, Box<dyn Error>> {
@@ -137,6 +137,25 @@ const CREATE_FINGERPRINT_SCHEMA: &str = r#"
     view: String,
     =>
     fingerprint: String,
+}
+"#;
+
+const CREATE_REPOSITORY_STATE_SCHEMA: &str = r#"
+:create repository_state {
+    fingerprint: String,
+    =>
+    repository: String,
+    head: String,
+}
+"#;
+
+const CREATE_REVISION_STATE_SCHEMA: &str = r#"
+:create analysis_revision_state {
+    view: String,
+    revision: Int,
+    repository: String,
+    =>
+    state: String,
 }
 "#;
 
@@ -251,20 +270,45 @@ fn persistent_database(path: &Path, initialize: bool) -> Result<DbInstance, Box<
             ScriptMutability::Mutable,
         )?;
     }
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("repository_state"))
+    {
+        db.run_script(
+            CREATE_REPOSITORY_STATE_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("analysis_revision_state"))
+    {
+        db.run_script(
+            CREATE_REVISION_STATE_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
     Ok(db)
 }
 
 fn store_observations(
     transaction: &MultiTransaction,
+    view: &str,
     observations: &[Observation],
 ) -> Result<(), Box<dyn Error>> {
     // ponytail: one transaction, per-row writes; batch when ingestion throughput matters.
-    for [view, from, relation, to, evidence] in observations {
+    for [from, relation, to, evidence] in observations {
         transaction.run_script(
             "?[view, from, relation, to, evidence] <- [[$view, $from, $relation, $to, $evidence]]\n\
              :put observation {view, from, relation, to => evidence}",
             BTreeMap::from([
-                ("view".into(), view.clone().into()),
+                ("view".into(), view.into()),
                 ("from".into(), from.clone().into()),
                 ("relation".into(), relation.clone().into()),
                 ("to".into(), to.clone().into()),
@@ -275,11 +319,14 @@ fn store_observations(
     Ok(())
 }
 
-fn fingerprint_matches(db: &DbInstance, fingerprint: &str) -> Result<bool, Box<dyn Error>> {
+fn view_matches(db: &DbInstance, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
     let rows = db.run_script(
-        "?[matches] := *analysis_fingerprint{view: 'main', fingerprint: stored}, \
+        "?[matches] := *analysis_fingerprint{view: $view, fingerprint: stored}, \
              matches = stored == $fingerprint",
-        BTreeMap::from([("fingerprint".into(), fingerprint.into())]),
+        BTreeMap::from([
+            ("view".into(), view.name.clone().into()),
+            ("fingerprint".into(), view.fingerprint().into()),
+        ]),
         ScriptMutability::Immutable,
     )?;
     Ok(rows.rows.first().is_some_and(|row| row[0] == true.into()))
@@ -287,29 +334,66 @@ fn fingerprint_matches(db: &DbInstance, fingerprint: &str) -> Result<bool, Box<d
 
 fn publish_observations(
     db: &DbInstance,
+    view: &WorkspaceView,
     observations: &[Observation],
-    fingerprint: &str,
 ) -> Result<(), Box<dyn Error>> {
+    let params = BTreeMap::from([
+        ("view".into(), view.name.clone().into()),
+        ("fingerprint".into(), view.fingerprint().into()),
+    ]);
     let transaction = db.multi_transaction(true);
     transaction.run_script(
-        "?[view, from, relation, to] := *observation{view, from, relation, to}\n\
+        "?[view, from, relation, to] := *observation{view, from, relation, to}, view == $view\n\
          :rm observation {view, from, relation, to}",
-        BTreeMap::new(),
+        params.clone(),
     )?;
-    store_observations(&transaction, observations)?;
+    store_observations(&transaction, &view.name, observations)?;
     transaction.run_script(
         "?[view, revision] := \
-             *analysis_revision{view: 'main', revision: previous}, \
-             view = 'main', revision = previous + 1\n\
+             *analysis_revision{view: $view, revision: previous}, \
+             view = $view, revision = previous + 1\n\
          :put analysis_revision {view => revision}",
-        BTreeMap::new(),
+        params.clone(),
     )?;
     transaction.run_script(
-        "?[view, fingerprint] <- [['main', $fingerprint]] \
+        "?[view, fingerprint] <- [[$view, $fingerprint]] \
          :put analysis_fingerprint {view => fingerprint}",
-        BTreeMap::from([("fingerprint".into(), fingerprint.into())]),
+        params,
     )?;
+    store_repository_states(&transaction, view)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn store_repository_states(
+    transaction: &MultiTransaction,
+    view: &WorkspaceView,
+) -> Result<(), Box<dyn Error>> {
+    for RepositoryState {
+        repository,
+        head,
+        fingerprint,
+    } in &view.repository_states
+    {
+        let params = BTreeMap::from([
+            ("view".into(), view.name.clone().into()),
+            ("repository".into(), repository.identity.clone().into()),
+            ("head".into(), head.clone().unwrap_or_default().into()),
+            ("state".into(), fingerprint.clone().into()),
+        ]);
+        transaction.run_script(
+            "?[fingerprint, repository, head] <- [[$state, $repository, $head]]\n\
+             :put repository_state {fingerprint => repository, head}",
+            params.clone(),
+        )?;
+        transaction.run_script(
+            "?[view, revision, repository, state] := \
+                 *analysis_revision{view: $view, revision}, \
+                 view = $view, repository = $repository, state = $state\n\
+             :put analysis_revision_state {view, revision, repository => state}",
+            params,
+        )?;
+    }
     Ok(())
 }
 
@@ -333,10 +417,12 @@ fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
 
 fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
     Ok(db.run_script(
-        "?[view, revision, fingerprint] := \
+        "?[view, revision, fingerprint, repository, head, state] := \
              *analysis_revision{view, revision}, \
-             *analysis_fingerprint{view, fingerprint}\n\
-         :order view",
+             *analysis_fingerprint{view, fingerprint}, \
+             *analysis_revision_state{view, revision, repository, state}, \
+             *repository_state{fingerprint: state, repository, head}\n\
+         :order view, repository",
         BTreeMap::new(),
         ScriptMutability::Immutable,
     )?)

@@ -68,7 +68,6 @@ pub fn observations(
     for (name, function) in functions {
         let function_id = definitions[&name].clone();
         observations.push([
-            "main".into(),
             source_id.clone(),
             "defines".into(),
             function_id.clone(),
@@ -78,7 +77,6 @@ pub fn observations(
         collect_calls(function, source_bytes, &mut calls);
         for (callee, line) in calls {
             observations.push([
-                "main".into(),
                 function_id.clone(),
                 "calls".into(),
                 definitions
@@ -94,24 +92,24 @@ pub fn observations(
 
 pub fn resolve_repository_calls(observations: &mut [Observation]) {
     let mut definitions = BTreeMap::<String, Option<String>>::new();
-    for row in observations.iter().filter(|row| row[2] == "defines") {
-        let Some(name) = row[3].rsplit('/').next() else {
+    for row in observations.iter().filter(|row| row[1] == "defines") {
+        let Some(name) = row[2].rsplit('/').next() else {
             continue;
         };
         definitions
             .entry(name.to_owned())
             .and_modify(|candidate| {
-                if candidate.as_deref() != Some(row[3].as_str()) {
+                if candidate.as_deref() != Some(row[2].as_str()) {
                     *candidate = None;
                 }
             })
-            .or_insert_with(|| Some(row[3].clone()));
+            .or_insert_with(|| Some(row[2].clone()));
     }
-    for row in observations.iter_mut().filter(|row| row[2] == "calls") {
-        if let Some(name) = row[3].strip_prefix("rust-call://")
+    for row in observations.iter_mut().filter(|row| row[1] == "calls") {
+        if let Some(name) = row[2].strip_prefix("rust-call://")
             && let Some(Some(target)) = definitions.get(name)
         {
-            row[3] = target.clone();
+            row[2] = target.clone();
         }
     }
 }
@@ -147,28 +145,25 @@ mod tests {
         )
         .unwrap();
         assert!(observations.iter().any(|row| {
-            row[1] == "repo://beholder/rust/lib/first"
-                && row[2] == "calls"
-                && row[3] == "repo://beholder/rust/lib/second"
+            row[0] == "repo://beholder/rust/lib/first"
+                && row[1] == "calls"
+                && row[2] == "repo://beholder/rust/lib/second"
         }));
 
         let mut ambiguous = vec![
             [
-                "main".into(),
                 "repo://beholder/rust/caller".into(),
                 "calls".into(),
                 "rust-call://helper".into(),
                 "src/lib.rs:1".into(),
             ],
             [
-                "main".into(),
                 "repo://beholder/rust/one".into(),
                 "defines".into(),
                 "repo://beholder/rust/one/helper".into(),
                 "src/one.rs:1".into(),
             ],
             [
-                "main".into(),
                 "repo://beholder/rust/two".into(),
                 "defines".into(),
                 "repo://beholder/rust/two/helper".into(),
@@ -176,6 +171,6 @@ mod tests {
             ],
         ];
         resolve_repository_calls(&mut ambiguous);
-        assert_eq!(ambiguous[0][3], "rust-call://helper");
+        assert_eq!(ambiguous[0][2], "rust-call://helper");
     }
 }
