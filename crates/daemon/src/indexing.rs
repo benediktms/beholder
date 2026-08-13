@@ -86,6 +86,25 @@ impl IndexScheduler {
         }
     }
 
+    pub fn clear_cache(&self) -> Result<(), Box<dyn Error>> {
+        let _indexing = self
+            .indexing
+            .lock()
+            .map_err(|_| "index coordinator lock poisoned")?;
+        self.rust_cache
+            .lock()
+            .map_err(|_| "Rust frontend cache lock poisoned")?
+            .clear();
+        self.repository_cache
+            .lock()
+            .map_err(|_| "repository cache lock poisoned")?
+            .clear();
+        if self.cache_dir.exists() {
+            fs::remove_dir_all(&self.cache_dir)?;
+        }
+        Ok(())
+    }
+
     pub fn index(
         &self,
         store: &SemanticStore,
@@ -543,8 +562,10 @@ mod tests {
                 .1,
             CacheStatus::Miss
         );
-        drop(scheduler);
-        fs::remove_dir_all(cache).unwrap();
+        scheduler.clear_cache().unwrap();
+        assert!(scheduler.rust_cache.lock().unwrap().is_empty());
+        assert!(scheduler.repository_cache.lock().unwrap().is_empty());
+        assert!(!cache.exists());
     }
 
     #[tokio::test]

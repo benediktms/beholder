@@ -1,9 +1,10 @@
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{address, state_dir};
 use beholder_protocol::v1::{
-    EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest,
-    IndexRustWorkspaceResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
-    QueryResult, RegisterWorkspaceRequest, RegisterWorkspaceResponse, StopRequest, StopResponse,
+    ClearCacheRequest, ClearCacheResponse, EntityRequest, GetStatusRequest, GetStatusResponse,
+    IndexRustWorkspaceRequest, IndexRustWorkspaceResponse, ListWorkspacesRequest,
+    ListWorkspacesResponse, PathRequest, QueryResult, RegisterWorkspaceRequest,
+    RegisterWorkspaceResponse, StopRequest, StopResponse,
     daemon_server::{Daemon, DaemonServer},
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -101,6 +102,16 @@ fn update_workspace_watch(
 
 #[tonic::async_trait]
 impl Daemon for BeholderDaemon {
+    async fn clear_cache(
+        &self,
+        _request: Request<ClearCacheRequest>,
+    ) -> Result<Response<ClearCacheResponse>, Status> {
+        self.scheduler
+            .clear_cache()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(ClearCacheResponse {}))
+    }
+
     async fn context(
         &self,
         request: Request<EntityRequest>,
@@ -304,8 +315,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest, ListWorkspacesRequest,
-        PathRequest, RegisterWorkspaceRequest, StopRequest, daemon_client::DaemonClient,
+        ClearCacheRequest, EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest,
+        ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, StopRequest,
+        daemon_client::DaemonClient,
     };
     use std::{env, fs, net::TcpListener, path::Path, time::Duration};
 
@@ -424,6 +436,8 @@ mod tests {
             .into_inner();
         assert!(!unchanged.published);
         assert_eq!(unchanged.observation_count, 0);
+        client.clear_cache(ClearCacheRequest {}).await.unwrap();
+        assert!(!state.join("frontend-cache").exists());
 
         let third = state.join("repo-c");
         fs::create_dir_all(third.join("src")).unwrap();

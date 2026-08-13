@@ -1,9 +1,9 @@
 use beholder_domain::Workspace;
 use beholder_dto::QueryResult;
 use beholder_protocol::v1::{
-    EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest,
-    ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, StopRequest,
-    daemon_client::DaemonClient,
+    ClearCacheRequest, EntityRequest, GetStatusRequest, GetStatusResponse,
+    IndexRustWorkspaceRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
+    StopRequest, daemon_client::DaemonClient,
 };
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,14 @@ pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error
         .get_status(GetStatusRequest {})
         .await?
         .into_inner())
+}
+
+pub async fn clear_cache() -> Result<(), Box<dyn std::error::Error>> {
+    DaemonClient::connect(endpoint())
+        .await?
+        .clear_cache(ClearCacheRequest {})
+        .await?;
+    Ok(())
 }
 
 pub async fn context(

@@ -3,6 +3,7 @@ syntax = "proto3";
 package beholder.v1;
 
 service Daemon {
+  rpc ClearCache(ClearCacheRequest) returns (ClearCacheResponse);
   rpc Context(EntityRequest) returns (QueryResult);
   rpc Dependencies(EntityRequest) returns (QueryResult);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
@@ -14,6 +15,10 @@ service Daemon {
   rpc Trace(PathRequest) returns (QueryResult);
   rpc Why(PathRequest) returns (QueryResult);
 }
+
+message ClearCacheRequest {}
+
+message ClearCacheResponse {}
 
 message EntityRequest {
   string entity = 1;

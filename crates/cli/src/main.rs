@@ -2,7 +2,7 @@ use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::observations;
 use beholder_daemon_client::{
-    context as daemon_context, dependencies as daemon_dependencies, get_status,
+    clear_cache, context as daemon_context, dependencies as daemon_dependencies, get_status,
     impact as daemon_impact, index_rust_workspace as daemon_index_workspace, list_workspaces,
     register_workspace, state_dir, stop, trace as daemon_trace, why as daemon_why,
 };
@@ -70,6 +70,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Manage disposable analysis caches.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Inspect persisted Mnestic state through Beholder DTOs.
     Inspect {
         /// Persisted data to display.
@@ -131,6 +136,12 @@ enum Command {
     Trace(QueryPath),
     /// Explain why one entity depends on another.
     Why(QueryPath),
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Clear in-memory and persistent analysis caches.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -395,6 +406,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("{}\t{}", workspace.name, workspace.repositories.len());
             }
         }
+        Some(Command::Cache {
+            command: CacheCommand::Clear,
+        }) => {
+            clear_cache().await?;
+            println!("cleared analysis cache");
+        }
         Some(Command::Inspect {
             subject,
             database,
@@ -472,6 +489,14 @@ mod tests {
     #[test]
     fn workspace_smoke() {
         assert!(Cli::try_parse_from(["beholder"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "cache", "clear"])
+                .unwrap()
+                .command,
+            Some(Command::Cache {
+                command: CacheCommand::Clear
+            })
+        ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "daemon", "install"])
                 .unwrap()
