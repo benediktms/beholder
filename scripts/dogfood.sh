@@ -18,7 +18,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo 'Building beholder and beholderd...' >&2
 cargo build -p beholder-cli -p beholder-daemon
+echo 'Starting isolated beholderd...' >&2
 target/debug/beholderd >"$state/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -35,17 +37,21 @@ done
 target/debug/beholder daemon status >/dev/null
 target/debug/beholder workspace register main "$root" >/dev/null
 
+echo 'Indexing Beholder...' >&2
+target/debug/beholder index-rust-workspace main >/dev/null
+
 caller='repo://beholder/rust/crates/daemon/src/main/main'
 callee='repo://beholder/rust/crates/daemon-client/src/lib/state_dir'
-for _ in {1..600}; do
-    if result="$(target/debug/beholder why --workspace main "$caller" "$callee" 2>/dev/null)" \
-        && grep -Fq "$callee" <<<"$result"; then
-        break
-    fi
-    sleep 0.05
-done
-
-grep -Fq "$callee" <<<"${result:-}"
+echo 'Checking main -> state_dir...' >&2
+result="$(target/debug/beholder context --workspace main "$caller")"
+if ! grep -Fq "$callee" <<<"$result"; then
+    printf 'expected %s in context:\n%s\n' "$callee" "$result" >&2
+    exit 1
+fi
+echo 'Checking completed revision...' >&2
 revision="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
-grep -Fq 'String("main")' <<<"$revision"
-echo "dogfood smoke passed: indexed Beholder and resolved main -> state_dir"
+if ! grep -Fq '"main"' <<<"$revision"; then
+    printf 'expected main revision:\n%s\n' "$revision" >&2
+    exit 1
+fi
+echo "dogfood smoke passed: indexed Beholder and resolved main -> state_dir" >&2
