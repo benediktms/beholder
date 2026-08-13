@@ -1,0 +1,14 @@
+language: 'rust'
+layer: 'library'
+
+dependsOn:
+  - 'beholder-domain'
+
+workspace:
+  inheritedTasks:
+    include:
+      - 'check'
+      - 'test'
+      - 'smoke'
+      - 'lint'
+      - 'format'

@@ -1,0 +1,19 @@
+[package]
+name = "beholder-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "beholder"
+path = "src/main.rs"
+
+[features]
+default = ["sqlite"]
+parallel = ["beholder-adapters-mnestic/parallel"]
+sqlite = ["beholder-adapters-mnestic/sqlite"]
+
+[dependencies]
+beholder-adapters-mnestic.workspace = true
+beholder-adapters-git.workspace = true
+beholder-adapters-treesitter-rust.workspace = true
+beholder-dto.workspace = true

@@ -1,5 +1,8 @@
 [workspace]
+resolver = "3"
+default-members = ["crates/cli"]
 members = [
+    "crates/cli",
     "crates/adapters-mnestic",
     "crates/adapters-git",
     "crates/adapters-treesitter-rust",
@@ -17,19 +20,3 @@ beholder-adapters-git = { path = "crates/adapters-git" }
 beholder-adapters-treesitter-rust = { path = "crates/adapters-treesitter-rust" }
 beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }
-
-[package]
-name = "beholder"
-version.workspace = true
-edition.workspace = true
-
-[features]
-default = ["sqlite"]
-parallel = ["beholder-adapters-mnestic/parallel"]
-sqlite = ["beholder-adapters-mnestic/sqlite"]
-
-[dependencies]
-beholder-adapters-mnestic.workspace = true
-beholder-adapters-git.workspace = true
-beholder-adapters-treesitter-rust.workspace = true
-beholder-dto.workspace = true

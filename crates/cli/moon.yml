@@ -1,0 +1,21 @@
+language: 'rust'
+layer: 'application'
+
+dependsOn:
+  - 'beholder-adapters-git'
+  - 'beholder-adapters-mnestic'
+  - 'beholder-adapters-treesitter-rust'
+  - 'beholder-dto'
+
+workspace:
+  inheritedTasks:
+    include:
+      - 'check'
+      - 'test'
+      - 'smoke'
+      - 'lint'
+      - 'format'
+
+tasks:
+  dogfood:
+    extends: 'smoke'

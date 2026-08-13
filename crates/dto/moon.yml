@@ -1,0 +1,11 @@
+language: 'rust'
+layer: 'library'
+
+workspace:
+  inheritedTasks:
+    include:
+      - 'check'
+      - 'test'
+      - 'smoke'
+      - 'lint'
+      - 'format'

@@ -193,13 +193,11 @@ mod tests {
         );
 
         let path = env::temp_dir().join(format!("beholder-dogfood-{}.db", std::process::id()));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let _ = fs::remove_file(&path);
-        let (count, published) = index_rust_repository(Path::new("."), &path).unwrap();
+        let (count, published) = index_rust_repository(&root, &path).unwrap();
         assert!(published && count > 0);
-        assert_eq!(
-            index_rust_repository(Path::new("."), &path).unwrap(),
-            (0, false)
-        );
+        assert_eq!(index_rust_repository(&root, &path).unwrap(), (0, false));
         let indexed = SemanticStore::persistent(&path, false).unwrap();
         let entity = "repo://beholder/rust/crates/adapters-mnestic/src/lib/trace";
         assert!(format!("{:?}", indexed.context(entity).unwrap()).contains("query"));

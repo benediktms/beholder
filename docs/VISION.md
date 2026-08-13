@@ -1950,8 +1950,8 @@ moon run :test
 moon run :lint
 
 moon run proto:generate
-moon run beholder:dogfood
-moon run beholder:benchmark
+moon run beholder-cli:dogfood
+moon run beholder-cli:benchmark
 ```
 
 The dogfooding task should eventually:
@@ -2184,18 +2184,18 @@ rust-toolchain.toml
 
 .moon/
     workspace.yml
-
-moon.yml
+    tasks/
+        rust.yml
 
 crates/
+    cli/
     domain/
     dto/
     adapters-git/
     adapters-mnestic/
     adapters-treesitter-rust/
 
-src/
-    main.rs
+    */moon.yml
 
 proto/
     beholder/v1/
