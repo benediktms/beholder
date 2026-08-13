@@ -6,13 +6,16 @@ state="$(mktemp -d "${TMPDIR:-/tmp}/beholder-dogfood.XXXXXX")"
 # ponytail: PID-derived port can collide; accept BEHOLDER_ADDRESS when parallel dogfood makes that real.
 export BEHOLDER_ADDRESS="${BEHOLDER_ADDRESS:-127.0.0.1:$((49152 + $$ % 10000))}"
 export BEHOLDER_STATE_DIR="$state"
-daemon_pid=""
 
 cleanup() {
-    if [[ -n "$daemon_pid" ]]; then
-        target/debug/beholder daemon stop >/dev/null 2>&1 || true
-        kill "$daemon_pid" >/dev/null 2>&1 || true
-        wait "$daemon_pid" 2>/dev/null || true
+    target/debug/beholder daemon stop >/dev/null 2>&1 || true
+    for _ in {1..100}; do
+        [[ ! -s "$state/daemon/beholderd.pid" ]] && break
+        sleep 0.05
+    done
+    if [[ -s "$state/daemon/beholderd.pid" ]]; then
+        echo 'isolated beholderd did not stop' >&2
+        return 1
     fi
     rm -rf "$state"
 }
@@ -21,19 +24,7 @@ trap cleanup EXIT
 echo 'Building beholder and beholderd...' >&2
 cargo build -p beholder-cli -p beholder-daemon
 echo 'Starting isolated beholderd...' >&2
-target/debug/beholderd >"$state/daemon.log" 2>&1 &
-daemon_pid=$!
-
-for _ in {1..200}; do
-    if target/debug/beholder daemon status >/dev/null 2>&1; then
-        break
-    fi
-    if ! kill -0 "$daemon_pid" 2>/dev/null; then
-        cat "$state/daemon.log" >&2
-        exit 1
-    fi
-    sleep 0.05
-done
+target/debug/beholder daemon start >/dev/null
 target/debug/beholder daemon status >/dev/null
 target/debug/beholder workspace register main "$root" >/dev/null
 

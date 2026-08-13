@@ -4,11 +4,17 @@ use beholder_adapters_treesitter_rust::observations;
 use beholder_daemon_client::{
     context as daemon_context, dependencies as daemon_dependencies, get_status,
     impact as daemon_impact, index_rust_workspace as daemon_index_workspace, list_workspaces,
-    register_workspace, stop, trace as daemon_trace, why as daemon_why,
+    register_workspace, state_dir, stop, trace as daemon_trace, why as daemon_why,
 };
 use beholder_domain::WorkspaceView;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::{error::Error, fs, path::Path, path::PathBuf};
+use std::{
+    error::Error,
+    fs::{self, OpenOptions},
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
+    time::Duration,
+};
 
 const MAIN_VIEW: &str = "main";
 
@@ -126,6 +132,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DaemonCommand {
+    /// Start the daemon in the background.
+    Start,
+    /// Run the daemon in the foreground.
+    Run,
     /// Report daemon readiness, PID, and protocol version.
     Status,
     /// Gracefully stop the daemon. Succeeds when it is already stopped.
@@ -193,9 +203,78 @@ fn database_argument(database: Option<&Path>) -> Result<Option<&str>, Box<dyn Er
         .transpose()
 }
 
+fn daemon_binary() -> Result<PathBuf, Box<dyn Error>> {
+    let binary = std::env::current_exe()?.with_file_name(if cfg!(windows) {
+        "beholderd.exe"
+    } else {
+        "beholderd"
+    });
+    if binary.is_file() {
+        Ok(binary)
+    } else {
+        Err(format!("beholderd not found next to CLI at {}", binary.display()).into())
+    }
+}
+
+async fn start_daemon() -> Result<(), Box<dyn Error>> {
+    if let Ok(status) = get_status().await {
+        println!("already running (pid {})", status.pid);
+        return Ok(());
+    }
+    let state = state_dir()?;
+    fs::create_dir_all(&state)?;
+    let log_path = state.join("beholderd.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let mut child = ProcessCommand::new(daemon_binary()?)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()?;
+    for _ in 0..50 {
+        if let Ok(status) = get_status().await {
+            println!("started (pid {})", status.pid);
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(
+                format!("beholderd exited with {status}; see {}", log_path.display()).into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(format!("beholderd did not become ready; see {}", log_path.display()).into())
+}
+
+fn run_daemon() -> Result<(), Box<dyn Error>> {
+    let binary = daemon_binary()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(ProcessCommand::new(binary).exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = ProcessCommand::new(binary).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("beholderd exited with {status}").into())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Some(Command::Daemon {
+            command: DaemonCommand::Start,
+        }) => start_daemon().await?,
+        Some(Command::Daemon {
+            command: DaemonCommand::Run,
+        }) => run_daemon()?,
         Some(Command::Daemon {
             command: DaemonCommand::Status,
         }) => {
@@ -310,6 +389,22 @@ mod tests {
 
     #[test]
     fn workspace_smoke() {
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "daemon", "start"])
+                .unwrap()
+                .command,
+            Some(Command::Daemon {
+                command: DaemonCommand::Start
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "daemon", "run"])
+                .unwrap()
+                .command,
+            Some(Command::Daemon {
+                command: DaemonCommand::Run
+            })
+        ));
         assert!(matches!(
             Cli::try_parse_from([
                 "beholder",
