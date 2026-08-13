@@ -1,4 +1,6 @@
-use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability, ScriptRunOptions};
+use cozo::{
+    DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions,
+};
 use std::{collections::BTreeMap, env, error::Error, fs, path::Path, time::Instant};
 use tree_sitter::{Node, Parser};
 
@@ -12,6 +14,14 @@ const CREATE_SCHEMA: &str = r#"
     to: String,
     =>
     evidence: String,
+}
+"#;
+
+const CREATE_REVISION_SCHEMA: &str = r#"
+:create analysis_revision {
+    view: String,
+    =>
+    revision: Int,
 }
 "#;
 
@@ -88,6 +98,25 @@ fn persistent_database(path: &Path, initialize: bool) -> Result<DbInstance, Box<
     let db = benchmark_database("sqlite", path.to_str())?;
     if is_new {
         db.run_script(CREATE_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)?;
+    }
+    let relations = db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("analysis_revision"))
+    {
+        db.run_script(
+            CREATE_REVISION_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+        db.run_script(
+            "?[view, revision] <- [['main', 0]] \
+             :put analysis_revision {view => revision}",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
     }
     Ok(db)
 }
@@ -179,10 +208,13 @@ fn rust_observations(source: &str, path: &Path) -> Result<Vec<[String; 5]>, Box<
     Ok(observations)
 }
 
-fn store_observations(db: &DbInstance, observations: &[[String; 5]]) -> Result<(), Box<dyn Error>> {
-    // ponytail: dogfooding writes directly; revision batching will replace stale facts.
+fn store_observations(
+    transaction: &MultiTransaction,
+    observations: &[[String; 5]],
+) -> Result<(), Box<dyn Error>> {
+    // ponytail: one transaction, per-row writes; batch when ingestion throughput matters.
     for [view, from, relation, to, evidence] in observations {
-        db.run_script(
+        transaction.run_script(
             "?[view, from, relation, to, evidence] <- [[$view, $from, $relation, $to, $evidence]]\n\
              :put observation {view, from, relation, to => evidence}",
             BTreeMap::from([
@@ -192,16 +224,37 @@ fn store_observations(db: &DbInstance, observations: &[[String; 5]]) -> Result<(
                 ("to".into(), to.clone().into()),
                 ("evidence".into(), evidence.clone().into()),
             ]),
-            ScriptMutability::Mutable,
         )?;
     }
+    Ok(())
+}
+
+fn publish_observations(
+    db: &DbInstance,
+    observations: &[[String; 5]],
+) -> Result<(), Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    transaction.run_script(
+        "?[view, from, relation, to] := *observation{view, from, relation, to}\n\
+         :rm observation {view, from, relation, to}",
+        BTreeMap::new(),
+    )?;
+    store_observations(&transaction, observations)?;
+    transaction.run_script(
+        "?[view, revision] := \
+             *analysis_revision{view: 'main', revision: previous}, \
+             view = 'main', revision = previous + 1\n\
+         :put analysis_revision {view => revision}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
 fn index_rust(path: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>> {
     let observations = rust_observations(&fs::read_to_string(path)?, path)?;
     let db = persistent_database(database_path, true)?;
-    store_observations(&db, &observations)?;
+    publish_observations(&db, &observations)?;
     Ok(observations.len())
 }
 
@@ -234,14 +287,16 @@ fn index_rust_repository(root: &Path, database_path: &Path) -> Result<usize, Box
     rust_source_files(&source_root, &mut files)?;
     files.sort();
 
-    let db = persistent_database(database_path, true)?;
     let mut count = 0;
+    let mut all_observations = Vec::new();
     for path in files {
         let relative_path = path.strip_prefix(root)?;
         let observations = rust_observations(&fs::read_to_string(&path)?, relative_path)?;
-        store_observations(&db, &observations)?;
         count += observations.len();
+        all_observations.extend(observations);
     }
+    let db = persistent_database(database_path, true)?;
+    publish_observations(&db, &all_observations)?;
     Ok(count)
 }
 
@@ -261,6 +316,14 @@ fn query(
 
 fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
     Ok(db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?)
+}
+
+fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
+    Ok(db.run_script(
+        "?[view, revision] := *analysis_revision{view, revision}\n:order view",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?)
 }
 
 fn inspect_observations(
@@ -480,8 +543,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         let db = persistent_database(Path::new(path), false)?;
         let result = match subject.as_str() {
             "relations" => inspect_relations(&db)?,
+            "revisions" => inspect_revisions(&db)?,
             "observations" => inspect_observations(&db, None)?,
-            _ => return Err("inspect subject must be relations or observations".into()),
+            _ => {
+                return Err("inspect subject must be relations, revisions, or observations".into());
+            }
         };
         println!("{result:#?}");
         return Ok(());
@@ -557,7 +623,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             [command, entity] if command == "dependencies" => dependencies(&db, entity)?,
             [] => trace(&db, "web/CheckoutPage", "cache/update_price")?,
             _ => return Err(
-                "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | inspect <relations|observations> [relation] <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
+                "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | inspect <relations|revisions|observations> [relation] <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
                     .into(),
             ),
         };
@@ -625,6 +691,34 @@ mod tests {
         assert!(!calls.rows.is_empty());
         assert!(calls.rows.iter().all(|row| row[2] == "calls".into()));
         drop(indexed);
+
+        let source = env::temp_dir().join(format!("beholder-dogfood-{}.rs", std::process::id()));
+        fs::write(&source, "fn first() { second(); } fn second() {}").unwrap();
+        index_rust(&source, &path).unwrap();
+        let indexed = persistent_database(&path, false).unwrap();
+        assert!(
+            !inspect_observations(&indexed, Some("calls"))
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        drop(indexed);
+
+        fs::write(&source, "fn first() {}").unwrap();
+        index_rust(&source, &path).unwrap();
+        let indexed = persistent_database(&path, false).unwrap();
+        assert!(
+            inspect_observations(&indexed, Some("calls"))
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(
+            inspect_revisions(&indexed).unwrap().rows[0][1],
+            DataValue::from(3_i64)
+        );
+        drop(indexed);
+        fs::remove_file(source).unwrap();
         fs::remove_file(path).unwrap();
     }
 }
