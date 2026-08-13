@@ -1,13 +1,5 @@
 projects:
-  beholder-cli: 'crates/cli'
-  beholder-daemon: 'crates/daemon'
-  beholder-daemon-client: 'crates/daemon-client'
-  beholder-protocol: 'crates/protocol'
-  beholder-domain: 'crates/domain'
-  beholder-dto: 'crates/dto'
-  beholder-adapters-git: 'crates/adapters-git'
-  beholder-adapters-mnestic: 'crates/adapters-mnestic'
-  beholder-adapters-treesitter-rust: 'crates/adapters-treesitter-rust'
+  beholder: '.'
 
 versionConstraint: '>=2.4.6'
 

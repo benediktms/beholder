@@ -1921,9 +1921,7 @@ Rust build semantics
 
 Moonrepo
     ↓
-repository project structure
-task orchestration
-task dependencies
+repository task entry points
 caching
 CI workflows
 developer commands
@@ -1931,7 +1929,9 @@ developer commands
 
 Cargo remains authoritative for the Rust workspace.
 
-Moonrepo provides repository-level development orchestration.
+Moonrepo provides a thin repository-level task runner. Beholder is one Moon project;
+Moon must not mirror Cargo's crate dependency graph or launch one Cargo process per
+crate. Cargo owns package scheduling and build concurrency.
 
 Moon should standardise tasks such as:
 
@@ -1950,13 +1950,11 @@ dogfood
 Possible commands include:
 
 ```text
-moon run :check
-moon run :test
-moon run :lint
+moon run beholder:check
+moon run beholder:test
+moon run beholder:lint
 
-moon run proto:generate
-moon run beholder-cli:dogfood
-moon run beholder-cli:benchmark
+moon run beholder:smoke
 ```
 
 The dogfooding task should eventually:
@@ -2189,8 +2187,8 @@ rust-toolchain.toml
 
 .moon/
     workspace.yml
-    tasks/
-        rust.yml
+
+moon.yml
 
 crates/
     cli/
@@ -2202,8 +2200,6 @@ crates/
     adapters-git/
     adapters-mnestic/
     adapters-treesitter-rust/
-
-    */moon.yml
 
 proto/
     beholder/v1/

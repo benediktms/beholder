@@ -1,0 +1,39 @@
+language: 'rust'
+layer: 'application'
+
+fileGroups:
+  sources:
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'crates/**/*.rs'
+    - 'crates/**/Cargo.toml'
+    - 'proto/**/*.proto'
+
+tasks:
+  check:
+    command: 'cargo check --workspace'
+    inputs:
+      - '@group(sources)'
+
+  test:
+    command: 'cargo test --workspace'
+    inputs:
+      - '@group(sources)'
+
+  lint:
+    command: 'cargo clippy --workspace --all-targets -- -D warnings'
+    inputs:
+      - '@group(sources)'
+
+  format:
+    command: 'cargo fmt --all -- --check'
+    inputs:
+      - '@group(sources)'
+
+  smoke:
+    command: 'bash scripts/dogfood.sh'
+    inputs:
+      - '@group(sources)'
+      - 'scripts/dogfood.sh'
+    options:
+      cache: false
