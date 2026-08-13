@@ -2300,6 +2300,21 @@ Beholder is comfortable treating:
 
 If this assumption proves wrong, Phase 0 is deliberately early enough to replace it.
 
+### Outcome — accepted 2026-08-13
+
+Cozo relations and Datalog inference are accepted as the semantic-engine foundation.
+
+The spike established these operating constraints:
+
+* use SQLite persistence by default;
+* anchor recursive rules at the requested source;
+* bound interactive traversal depth;
+* infer minimum distance before expanding path evidence;
+* parallelise independent ingestion and queries above Cozo rather than relying on intra-query parallelism;
+* batch or incrementally ingest larger corpora to limit construction-time memory.
+
+At approximately 9.8 million synthetic relationships, the SQLite database occupied 1.3 GB, loaded in 19 seconds and served bounded context, trace and impact queries below 10 milliseconds. Bulk construction peaked at 4.37 GB RSS, making ingestion memory the first scaling constraint.
+
 ---
 
 # 58. Phase 1 — Daemon, Core Infrastructure and Rust Dogfooding
