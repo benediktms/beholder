@@ -39,6 +39,12 @@ if ! grep -Fq "$callee" <<<"$result"; then
     printf 'expected %s in context:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
+echo 'Checking state_dir impact reaches main...' >&2
+result="$(target/debug/beholder impact --workspace main "$callee")"
+if ! grep -Fq "$caller" <<<"$result"; then
+    printf 'expected %s in impact result:\n%s\n' "$caller" "$result" >&2
+    exit 1
+fi
 echo 'Checking why main reaches state_dir...' >&2
 result="$(target/debug/beholder why --workspace main "$caller" "$callee")"
 if ! grep -Fq "$callee" <<<"$result"; then

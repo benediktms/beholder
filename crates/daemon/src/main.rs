@@ -470,16 +470,18 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            !client
-                .impact(EntityRequest {
-                    workspace: "main".into(),
-                    entity: caller.into()
-                })
-                .await
-                .unwrap()
-                .into_inner()
-                .rows
-                .is_empty()
+            format!(
+                "{:?}",
+                client
+                    .impact(EntityRequest {
+                        workspace: "main".into(),
+                        entity: helper.into()
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+            )
+            .contains(caller)
         );
         let path = || PathRequest {
             workspace: "main".into(),

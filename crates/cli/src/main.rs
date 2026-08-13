@@ -442,7 +442,7 @@ mod tests {
                 .unwrap()
                 .rows
                 .len(),
-            3
+            4
         );
         assert_eq!(
             store

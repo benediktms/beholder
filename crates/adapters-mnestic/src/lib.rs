@@ -491,7 +491,12 @@ fn impact(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dy
         db,
         view,
         &format!(
-            "{RULES}\n{DISTANCE_RULES}\nstart[] <- [[$from]]\n\
+            "{RULES}\n\
+             distance[node, min(hops)] := start[node], hops = 0\n\
+             distance[from, min(hops)] := distance[to, previous_hops], \
+                 previous_hops < $max_hops, direct[from, to, _, _], \
+                 hops = previous_hops + 1\n\
+             start[] <- [[$from]]\n\
              ?[affected] := distance[affected, hops], hops > 0\n:order affected"
         ),
         [("from", entity.into()), ("max_hops", MAX_HOPS.into())],
@@ -623,6 +628,26 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn impact_traverses_dependants() {
+        let store = SemanticStore::memory().unwrap();
+        let result = store.impact("main", "rpc/Pricing.GetPrice").unwrap();
+        assert!(
+            result
+                .rows
+                .iter()
+                .flatten()
+                .any(|value| { value.as_str() == Some("web/CheckoutPage") })
+        );
+        assert!(
+            !result
+                .rows
+                .iter()
+                .flatten()
+                .any(|value| { value.as_str() == Some("pricing/get_price") })
+        );
+    }
 
     #[test]
     fn trace_chooses_a_string_predecessor() {
