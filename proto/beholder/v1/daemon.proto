@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package beholder.v1;
+
+service Daemon {
+  rpc Context(EntityRequest) returns (QueryResult);
+  rpc Dependencies(EntityRequest) returns (QueryResult);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc Impact(EntityRequest) returns (QueryResult);
+  rpc IndexRustWorkspace(IndexRustWorkspaceRequest) returns (IndexRustWorkspaceResponse);
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+  rpc Trace(PathRequest) returns (QueryResult);
+  rpc Why(PathRequest) returns (QueryResult);
+}
+
+message EntityRequest {
+  string entity = 1;
+  string workspace = 2;
+}
+
+message PathRequest {
+  string from = 1;
+  string to = 2;
+  string workspace = 3;
+}
+
+message QueryResult {
+  repeated string headers = 1;
+  repeated QueryRow rows = 2;
+  optional QueryResult next = 3;
+}
+
+message QueryRow {
+  repeated QueryValue values = 1;
+}
+
+message QueryValue {
+  oneof value {
+    bool null = 1;
+    bool boolean = 2;
+    sint64 integer = 3;
+    double float = 4;
+    string text = 5;
+    bytes bytes = 6;
+    QueryList list = 7;
+    string other = 8;
+  }
+}
+
+message QueryList {
+  repeated QueryValue values = 1;
+}
+
+message IndexRustWorkspaceRequest {
+  reserved 1;
+  string workspace = 2;
+}
+
+message IndexRustWorkspaceResponse {
+  uint64 observation_count = 1;
+  bool published = 2;
+}
+
+message Workspace {
+  string name = 1;
+  repeated string repositories = 2;
+}
+
+message RegisterWorkspaceRequest {
+  string name = 1;
+  repeated string repositories = 2;
+}
+
+message RegisterWorkspaceResponse {
+  Workspace workspace = 1;
+}
+
+message ListWorkspacesRequest {}
+
+message ListWorkspacesResponse {
+  repeated Workspace workspaces = 1;
+}
+
+message StopRequest {}
+
+message StopResponse {
+  bool accepted = 1;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  string status = 1;
+  uint32 protocol_version = 2;
+  uint32 pid = 3;
+}

@@ -1,11 +1,27 @@
-[package]
-name = "beholder"
+[workspace]
+resolver = "3"
+default-members = ["crates/cli"]
+members = [
+    "crates/cli",
+    "crates/daemon",
+    "crates/daemon-client",
+    "crates/protocol",
+    "crates/adapters-mnestic",
+    "crates/adapters-git",
+    "crates/adapters-treesitter-rust",
+    "crates/domain",
+    "crates/dto",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[features]
-parallel = ["cozo/rayon"]
-sqlite = ["cozo/storage-sqlite", "cozo/storage-sqlite-src"]
-
-[dependencies]
-cozo = { package = "mnestic", version = "0.14.0", default-features = false }
+[workspace.dependencies]
+beholder-adapters-mnestic = { path = "crates/adapters-mnestic", default-features = false }
+beholder-adapters-git = { path = "crates/adapters-git" }
+beholder-adapters-treesitter-rust = { path = "crates/adapters-treesitter-rust" }
+beholder-domain = { path = "crates/domain" }
+beholder-dto = { path = "crates/dto" }
+beholder-daemon-client = { path = "crates/daemon-client" }
+beholder-protocol = { path = "crates/protocol" }

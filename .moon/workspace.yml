@@ -1,0 +1,7 @@
+projects:
+  beholder: '.'
+
+versionConstraint: '>=2.4.6'
+
+vcs:
+  defaultBranch: 'main'

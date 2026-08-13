@@ -1,0 +1,22 @@
+[package]
+name = "beholder-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "beholderd"
+path = "src/main.rs"
+
+[dependencies]
+beholder-adapters-git.workspace = true
+beholder-adapters-mnestic = { workspace = true, features = ["sqlite"] }
+beholder-adapters-treesitter-rust.workspace = true
+beholder-daemon-client.workspace = true
+beholder-domain.workspace = true
+beholder-dto.workspace = true
+beholder-protocol.workspace = true
+notify = "8.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = "0.14.6"

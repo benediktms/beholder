@@ -1,0 +1,9 @@
+[package]
+name = "beholder-adapters-git"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+beholder-domain.workspace = true
+gix = { version = "0.86.0", default-features = false, features = ["sha1"] }
+sha2 = "0.10.9"

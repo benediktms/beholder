@@ -1,0 +1,75 @@
+language: 'rust'
+layer: 'application'
+
+fileGroups:
+  sources:
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'crates/**/*.rs'
+    - 'crates/**/Cargo.toml'
+    - 'proto/**/*.proto'
+    - 'rules/**/*.datalog'
+
+tasks:
+  check:
+    command: 'cargo check --workspace'
+    inputs:
+      - '@group(sources)'
+
+  test:
+    command: 'cargo test --workspace'
+    inputs:
+      - '@group(sources)'
+
+  lint:
+    command: 'cargo clippy --workspace --all-targets -- -D warnings'
+    deps:
+      - 'format-check'
+    inputs:
+      - '@group(sources)'
+
+  format-check:
+    command: 'cargo fmt --all -- --check'
+    inputs:
+      - '@group(sources)'
+
+  format:
+    command: 'cargo fmt --all'
+    inputs:
+      - '@group(sources)'
+    options:
+      cache: false
+
+  release:
+    command: 'cargo build --release -p beholder-cli -p beholder-daemon'
+    inputs:
+      - '@group(sources)'
+    options:
+      cache: false
+      runInCI: false
+
+  install:
+    command: 'bash scripts/install.sh'
+    deps:
+      - 'release'
+    inputs:
+      - 'scripts/install.sh'
+    options:
+      cache: false
+      runInCI: false
+
+  uninstall:
+    command: 'bash scripts/uninstall.sh'
+    inputs:
+      - 'scripts/uninstall.sh'
+    options:
+      cache: false
+      runInCI: false
+
+  smoke:
+    command: 'bash scripts/dogfood.sh'
+    inputs:
+      - '@group(sources)'
+      - 'scripts/dogfood.sh'
+    options:
+      cache: false

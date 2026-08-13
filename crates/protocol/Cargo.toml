@@ -1,0 +1,14 @@
+[package]
+name = "beholder-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+beholder-domain.workspace = true
+beholder-dto.workspace = true
+prost = "0.14.4"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
