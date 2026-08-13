@@ -1,0 +1,8 @@
+[package]
+name = "beholder-daemon-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+beholder-protocol.workspace = true
+tonic = "0.14.6"

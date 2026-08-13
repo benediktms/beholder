@@ -949,6 +949,11 @@ integration tests
 
 Daemonisation should remain separate from the implementation of the server itself.
 
+`beholderd` must enforce a single user-level instance with an operating-system file lock. The
+locked PID file registers the owning process for diagnostics, but PID contents alone must never
+be used as the single-instance gate: a crashed process may leave stale contents while its OS lock
+is released.
+
 ---
 
 # 24. Index Scheduling
@@ -2189,6 +2194,9 @@ rust-toolchain.toml
 
 crates/
     cli/
+    daemon/
+    daemon-client/
+    protocol/
     domain/
     dto/
     adapters-git/

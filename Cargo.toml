@@ -3,6 +3,9 @@ resolver = "3"
 default-members = ["crates/cli"]
 members = [
     "crates/cli",
+    "crates/daemon",
+    "crates/daemon-client",
+    "crates/protocol",
     "crates/adapters-mnestic",
     "crates/adapters-git",
     "crates/adapters-treesitter-rust",
@@ -20,3 +23,5 @@ beholder-adapters-git = { path = "crates/adapters-git" }
 beholder-adapters-treesitter-rust = { path = "crates/adapters-treesitter-rust" }
 beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }
+beholder-daemon-client = { path = "crates/daemon-client" }
+beholder-protocol = { path = "crates/protocol" }

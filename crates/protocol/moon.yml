@@ -1,0 +1,18 @@
+language: 'rust'
+layer: 'library'
+
+fileGroups:
+  sources:
+    - 'Cargo.toml'
+    - 'build.rs'
+    - 'src/**/*.rs'
+    - '/proto/**/*.proto'
+
+workspace:
+  inheritedTasks:
+    include:
+      - 'check'
+      - 'test'
+      - 'smoke'
+      - 'lint'
+      - 'format'

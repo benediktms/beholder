@@ -1,6 +1,7 @@
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, source_files};
+use beholder_daemon_client::get_status;
 use beholder_domain::{RepositoryState, WorkspaceView};
 use std::{env, error::Error, fs, path::Path, path::PathBuf};
 
@@ -80,8 +81,20 @@ fn index_rust_workspace(
     Ok((all_observations.len(), true))
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if let [daemon, status] = args.as_slice()
+        && daemon == "daemon"
+        && status == "status"
+    {
+        let status = get_status().await?;
+        println!(
+            "{} (pid {}, protocol v{})",
+            status.status, status.pid, status.protocol_version
+        );
+        return Ok(());
+    }
     if let [command, source, path] = args.as_slice()
         && command == "index-rust"
     {
@@ -207,7 +220,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         [command, entity] if command == "dependencies" => store.dependencies(entity)?,
         [] => store.trace("web/CheckoutPage", "cache/update_price")?,
         _ => return Err(
-            "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | index-rust-workspace <database-path> <repository>... | inspect <relations|revisions|observations> [relation] <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
+            "usage: beholder daemon status | <index-rust|index-rust-repo> <source> <database-path> | index-rust-workspace <database-path> <repository>... | inspect <relations|revisions|observations> [relation] <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
                 .into(),
         ),
     };

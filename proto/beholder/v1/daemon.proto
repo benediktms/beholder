@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package beholder.v1;
+
+service Daemon {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  string status = 1;
+  uint32 protocol_version = 2;
+  uint32 pid = 3;
+}

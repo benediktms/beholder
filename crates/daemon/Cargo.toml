@@ -1,0 +1,15 @@
+[package]
+name = "beholder-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "beholderd"
+path = "src/main.rs"
+
+[dependencies]
+beholder-adapters-mnestic = { workspace = true, features = ["sqlite"] }
+beholder-daemon-client.workspace = true
+beholder-protocol.workspace = true
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = "0.14.6"

@@ -2,12 +2,9 @@ language: 'rust'
 layer: 'application'
 
 dependsOn:
-  - 'beholder-adapters-git'
   - 'beholder-adapters-mnestic'
-  - 'beholder-adapters-treesitter-rust'
   - 'beholder-daemon-client'
-  - 'beholder-domain'
-  - 'beholder-dto'
+  - 'beholder-protocol'
 
 workspace:
   inheritedTasks:
@@ -17,9 +14,3 @@ workspace:
       - 'smoke'
       - 'lint'
       - 'format'
-
-tasks:
-  dogfood:
-    extends: 'smoke'
-    deps:
-      - 'beholder-daemon:smoke'
