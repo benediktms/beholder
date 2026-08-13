@@ -5,18 +5,53 @@ use tree_sitter::{Node, Parser};
 fn collect_functions<'tree>(
     node: Node<'tree>,
     source: &[u8],
-    functions: &mut Vec<(String, Node<'tree>)>,
+    scope: &mut Vec<String>,
+    functions: &mut Vec<(String, String, Node<'tree>)>,
 ) {
     if node.kind() == "function_item"
         && let Some(name) = node.child_by_field_name("name")
         && let Ok(name) = name.utf8_text(source)
     {
-        functions.push((name.to_owned(), node));
+        let qualified_name = scope
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(name))
+            .collect::<Vec<_>>()
+            .join("/");
+        functions.push((name.to_owned(), qualified_name, node));
         return;
+    }
+
+    let nested_scope = match node.kind() {
+        "mod_item" => node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            .map(str::to_owned),
+        "impl_item" => node
+            .child_by_field_name("type")
+            .and_then(|target| target.utf8_text(source).ok())
+            .map(|target| {
+                let owner = node
+                    .child_by_field_name("trait")
+                    .and_then(|trait_| trait_.utf8_text(source).ok())
+                    .map_or_else(
+                        || target.to_owned(),
+                        |trait_| format!("{trait_}-for-{target}"),
+                    );
+                format!("impl/{owner}")
+            }),
+        _ => None,
+    };
+    let pushed_scope = nested_scope.is_some();
+    if let Some(nested_scope) = nested_scope {
+        scope.push(nested_scope);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_functions(child, source, functions);
+        collect_functions(child, source, scope, functions);
+    }
+    if pushed_scope {
+        scope.pop();
     }
 }
 
@@ -50,7 +85,12 @@ pub fn observations(
 
     let source_bytes = source.as_bytes();
     let mut functions = Vec::new();
-    collect_functions(tree.root_node(), source_bytes, &mut functions);
+    collect_functions(
+        tree.root_node(),
+        source_bytes,
+        &mut Vec::new(),
+        &mut functions,
+    );
     let module = path
         .strip_prefix("src")
         .unwrap_or(path)
@@ -58,15 +98,18 @@ pub fn observations(
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
     let source_id = format!("repo://{repository}/rust/{module}");
-    // ponytail: simple names cover this fixture; qualify impl methods when Rust support expands.
-    let definitions = functions
-        .iter()
-        .map(|(name, _)| (name.clone(), format!("{source_id}/{name}")))
-        .collect::<BTreeMap<_, _>>();
+    let mut definitions = BTreeMap::<String, Option<String>>::new();
+    for (name, qualified_name, _) in &functions {
+        let id = format!("{source_id}/{qualified_name}");
+        definitions
+            .entry(name.clone())
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(id));
+    }
     let mut observations = Vec::new();
 
-    for (name, function) in functions {
-        let function_id = definitions[&name].clone();
+    for (_, qualified_name, function) in functions {
+        let function_id = format!("{source_id}/{qualified_name}");
         observations.push(Observation {
             from: source_id.clone(),
             relation: "defines".into(),
@@ -81,7 +124,7 @@ pub fn observations(
                 relation: "calls".into(),
                 to: definitions
                     .get(&callee)
-                    .cloned()
+                    .and_then(Clone::clone)
                     .unwrap_or_else(|| format!("rust-call://{callee}")),
                 evidence: format!("{}:{line}", path.display()),
             });
@@ -178,5 +221,25 @@ mod tests {
         ];
         resolve_repository_calls(&mut ambiguous);
         assert_eq!(ambiguous[0].to, "rust-call://helper");
+    }
+
+    #[test]
+    fn qualifies_scoped_function_ids() {
+        let observations = observations(
+            "beholder",
+            "mod nested { fn run() {} } struct One; struct Two; \
+             impl One { fn run() {} } impl Two { fn run() {} }",
+            Path::new("crates/example/src/lib.rs"),
+        )
+        .unwrap();
+        let definitions = observations
+            .iter()
+            .filter(|observation| observation.relation == "defines")
+            .map(|observation| observation.to.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(definitions.contains(&"repo://beholder/rust/crates/example/src/lib/nested/run"));
+        assert!(definitions.contains(&"repo://beholder/rust/crates/example/src/lib/impl/One/run"));
+        assert!(definitions.contains(&"repo://beholder/rust/crates/example/src/lib/impl/Two/run"));
     }
 }
