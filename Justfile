@@ -16,3 +16,13 @@ test:
 [group('manual')]
 smoke:
     moon run beholder:smoke
+
+# Check Rust formatting without changing files.
+[group('formatting')]
+format-check:
+    moon run beholder:format-check
+
+# Format every Rust crate.
+[group('formatting')]
+format:
+    moon run beholder:format
