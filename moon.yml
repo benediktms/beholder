@@ -1,0 +1,28 @@
+language: 'rust'
+layer: 'application'
+
+tasks:
+  check:
+    command: 'cargo check --workspace'
+    inputs: &rustInputs
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**/*.rs'
+      - 'crates/**/Cargo.toml'
+      - 'src/**/*.rs'
+
+  test:
+    command: 'cargo test --workspace'
+    inputs: *rustInputs
+
+  lint:
+    command: 'cargo clippy --workspace --all-targets -- -D warnings'
+    inputs: *rustInputs
+
+  format:
+    command: 'cargo fmt --all --check'
+    inputs: *rustInputs
+
+  dogfood:
+    command: 'cargo test --workspace workspace_smoke'
+    inputs: *rustInputs
