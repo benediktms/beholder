@@ -179,11 +179,9 @@ fn rust_observations(source: &str, path: &Path) -> Result<Vec<[String; 5]>, Box<
     Ok(observations)
 }
 
-fn index_rust(path: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>> {
-    let observations = rust_observations(&fs::read_to_string(path)?, path)?;
-    let db = persistent_database(database_path, true)?;
-    // ponytail: one-file dogfooding writes directly; revision batching will replace stale facts.
-    for [view, from, relation, to, evidence] in &observations {
+fn store_observations(db: &DbInstance, observations: &[[String; 5]]) -> Result<(), Box<dyn Error>> {
+    // ponytail: dogfooding writes directly; revision batching will replace stale facts.
+    for [view, from, relation, to, evidence] in observations {
         db.run_script(
             "?[view, from, relation, to, evidence] <- [[$view, $from, $relation, $to, $evidence]]\n\
              :put observation {view, from, relation, to => evidence}",
@@ -197,7 +195,54 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>
             ScriptMutability::Mutable,
         )?;
     }
+    Ok(())
+}
+
+fn index_rust(path: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>> {
+    let observations = rust_observations(&fs::read_to_string(path)?, path)?;
+    let db = persistent_database(database_path, true)?;
+    store_observations(&db, &observations)?;
     Ok(observations.len())
+}
+
+fn rust_source_files(
+    directory: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            rust_source_files(&path, files)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn index_rust_repository(root: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>> {
+    let source_root = root.join("src");
+    if !source_root.is_dir() {
+        return Err(format!(
+            "Rust source directory does not exist: {}",
+            source_root.display()
+        )
+        .into());
+    }
+    let mut files = Vec::new();
+    rust_source_files(&source_root, &mut files)?;
+    files.sort();
+
+    let db = persistent_database(database_path, true)?;
+    let mut count = 0;
+    for path in files {
+        let relative_path = path.strip_prefix(root)?;
+        let observations = rust_observations(&fs::read_to_string(&path)?, relative_path)?;
+        store_observations(&db, &observations)?;
+        count += observations.len();
+    }
+    Ok(count)
 }
 
 fn query(
@@ -396,6 +441,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("indexed {count} Rust observations");
         return Ok(());
     }
+    if let [command, root, path] = args.as_slice()
+        && command == "index-rust-repo"
+    {
+        let count = index_rust_repository(Path::new(root), Path::new(path))?;
+        println!("indexed {count} Rust observations");
+        return Ok(());
+    }
     if let [
         command,
         storage,
@@ -459,7 +511,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             [command, entity] if command == "dependencies" => dependencies(&db, entity)?,
             [] => trace(&db, "web/CheckoutPage", "cache/update_price")?,
             _ => return Err(
-                "usage: beholder index-rust <source> <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
+                "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
                     .into(),
             ),
         };
@@ -518,7 +570,7 @@ mod tests {
 
         let path = env::temp_dir().join(format!("beholder-dogfood-{}.db", std::process::id()));
         let _ = fs::remove_file(&path);
-        assert!(index_rust(Path::new("src/main.rs"), &path).unwrap() > 0);
+        assert!(index_rust_repository(Path::new("."), &path).unwrap() > 0);
         let indexed = persistent_database(&path, false).unwrap();
         let context = context(&indexed, "repo://beholder/rust/main/trace").unwrap();
         assert!(format!("{context:?}").contains("repo://beholder/rust/main/query"));
