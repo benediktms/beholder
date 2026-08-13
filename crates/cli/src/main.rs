@@ -37,7 +37,8 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dy
 #[command(
     name = "beholder",
     version,
-    about = "Multi-repository architecture intelligence"
+    about = "Multi-repository architecture intelligence",
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -458,10 +459,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "{:#?}",
             daemon_why(query.workspace, query.from, query.to).await?
         ),
-        None => println!(
-            "{:#?}",
-            SemanticStore::memory()?.trace("main", "web/CheckoutPage", "cache/update_price")?
-        ),
+        None => unreachable!("Clap requires a subcommand"),
     }
     Ok(())
 }
@@ -473,6 +471,7 @@ mod tests {
 
     #[test]
     fn workspace_smoke() {
+        assert!(Cli::try_parse_from(["beholder"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["beholder", "daemon", "install"])
                 .unwrap()
