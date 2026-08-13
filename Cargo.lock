@@ -293,6 +293,7 @@ dependencies = [
  "beholder-adapters-treesitter-rust",
  "beholder-daemon-client",
  "beholder-domain",
+ "beholder-dto",
  "beholder-protocol",
  "tokio",
  "tonic",
@@ -302,6 +303,7 @@ dependencies = [
 name = "beholder-daemon-client"
 version = "0.1.0"
 dependencies = [
+ "beholder-dto",
  "beholder-protocol",
  "tonic",
 ]
@@ -318,6 +320,7 @@ version = "0.1.0"
 name = "beholder-protocol"
 version = "0.1.0"
 dependencies = [
+ "beholder-dto",
  "prost",
  "tonic",
  "tonic-prost",

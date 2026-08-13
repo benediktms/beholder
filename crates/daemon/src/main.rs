@@ -4,8 +4,8 @@ use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, 
 use beholder_daemon_client::{ADDRESS, state_dir};
 use beholder_domain::{RepositoryState, WorkspaceView};
 use beholder_protocol::v1::{
-    GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest, IndexRustWorkspaceResponse,
-    StopRequest, StopResponse,
+    EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest,
+    IndexRustWorkspaceResponse, PathRequest, QueryResult, StopRequest, StopResponse,
     daemon_server::{Daemon, DaemonServer},
 };
 use std::{error::Error, fs, net::SocketAddr, path::Path, path::PathBuf, sync::Mutex};
@@ -84,6 +84,20 @@ fn index_rust_workspace(
 
 #[tonic::async_trait]
 impl Daemon for BeholderDaemon {
+    async fn context(
+        &self,
+        request: Request<EntityRequest>,
+    ) -> Result<Response<QueryResult>, Status> {
+        query_response(self.store.context(&request.into_inner().entity))
+    }
+
+    async fn dependencies(
+        &self,
+        request: Request<EntityRequest>,
+    ) -> Result<Response<QueryResult>, Status> {
+        query_response(self.store.dependencies(&request.into_inner().entity))
+    }
+
     async fn get_status(
         &self,
         _request: Request<GetStatusRequest>,
@@ -93,6 +107,13 @@ impl Daemon for BeholderDaemon {
             protocol_version: 1,
             pid: std::process::id(),
         }))
+    }
+
+    async fn impact(
+        &self,
+        request: Request<EntityRequest>,
+    ) -> Result<Response<QueryResult>, Status> {
+        query_response(self.store.impact(&request.into_inner().entity))
     }
 
     async fn index_rust_workspace(
@@ -125,6 +146,24 @@ impl Daemon for BeholderDaemon {
             .is_some_and(|shutdown| shutdown.send(()).is_ok());
         Ok(Response::new(StopResponse { accepted }))
     }
+
+    async fn trace(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
+        let request = request.into_inner();
+        query_response(self.store.trace(&request.from, &request.to))
+    }
+
+    async fn why(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
+        let request = request.into_inner();
+        query_response(self.store.trace(&request.from, &request.to))
+    }
+}
+
+fn query_response(
+    result: Result<beholder_dto::QueryResult, Box<dyn Error>>,
+) -> Result<Response<QueryResult>, Status> {
+    result
+        .map(|result| Response::new(result.into()))
+        .map_err(|error| Status::internal(error.to_string()))
 }
 
 #[tokio::main]
@@ -157,7 +196,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        GetStatusRequest, IndexRustWorkspaceRequest, StopRequest, daemon_client::DaemonClient,
+        EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest, PathRequest, StopRequest,
+        daemon_client::DaemonClient,
     };
     use std::{env, fs, net::TcpListener, time::Duration};
 
@@ -235,6 +275,66 @@ mod tests {
             .into_inner();
         assert!(!unchanged.published);
         assert_eq!(unchanged.observation_count, 0);
+
+        let caller = "repo://repo-a/rust/lib/caller";
+        let helper = "repo://repo-b/rust/lib/helper";
+        assert!(
+            format!(
+                "{:?}",
+                client
+                    .context(EntityRequest {
+                        entity: caller.into()
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+            )
+            .contains(helper)
+        );
+        assert!(
+            !client
+                .dependencies(EntityRequest {
+                    entity: caller.into()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .rows
+                .is_empty()
+        );
+        assert!(
+            !client
+                .impact(EntityRequest {
+                    entity: caller.into()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .rows
+                .is_empty()
+        );
+        let path = || PathRequest {
+            from: caller.into(),
+            to: helper.into(),
+        };
+        assert!(
+            !client
+                .trace(path())
+                .await
+                .unwrap()
+                .into_inner()
+                .rows
+                .is_empty()
+        );
+        assert!(
+            !client
+                .why(path())
+                .await
+                .unwrap()
+                .into_inner()
+                .rows
+                .is_empty()
+        );
 
         assert!(
             client

@@ -1,6 +1,7 @@
+use beholder_dto::QueryResult;
 use beholder_protocol::v1::{
-    GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest, StopRequest,
-    daemon_client::DaemonClient,
+    EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest, PathRequest,
+    StopRequest, daemon_client::DaemonClient,
 };
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,51 @@ pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error
         .get_status(GetStatusRequest {})
         .await?
         .into_inner())
+}
+
+pub async fn context(entity: String) -> Result<QueryResult, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(ENDPOINT)
+        .await?
+        .context(EntityRequest { entity })
+        .await?
+        .into_inner()
+        .try_into()?)
+}
+
+pub async fn dependencies(entity: String) -> Result<QueryResult, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(ENDPOINT)
+        .await?
+        .dependencies(EntityRequest { entity })
+        .await?
+        .into_inner()
+        .try_into()?)
+}
+
+pub async fn impact(entity: String) -> Result<QueryResult, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(ENDPOINT)
+        .await?
+        .impact(EntityRequest { entity })
+        .await?
+        .into_inner()
+        .try_into()?)
+}
+
+pub async fn trace(from: String, to: String) -> Result<QueryResult, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(ENDPOINT)
+        .await?
+        .trace(PathRequest { from, to })
+        .await?
+        .into_inner()
+        .try_into()?)
+}
+
+pub async fn why(from: String, to: String) -> Result<QueryResult, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(ENDPOINT)
+        .await?
+        .why(PathRequest { from, to })
+        .await?
+        .into_inner()
+        .try_into()?)
 }
 
 pub async fn index_rust_workspace(

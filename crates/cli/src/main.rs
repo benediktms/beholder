@@ -1,7 +1,11 @@
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::observations;
-use beholder_daemon_client::{get_status, index_rust_workspace as daemon_index_workspace, stop};
+use beholder_daemon_client::{
+    context as daemon_context, dependencies as daemon_dependencies, get_status,
+    impact as daemon_impact, index_rust_workspace as daemon_index_workspace, stop,
+    trace as daemon_trace, why as daemon_why,
+};
 use beholder_domain::WorkspaceView;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{error::Error, fs, path::Path, path::PathBuf};
@@ -140,9 +144,6 @@ enum InspectSubject {
 struct QueryEntity {
     /// Canonical semantic entity ID.
     entity: String,
-    /// Persisted database; omit to query the in-memory example.
-    #[arg(short, long)]
-    database: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -151,16 +152,6 @@ struct QueryPath {
     from: String,
     /// Destination semantic entity ID.
     to: String,
-    /// Persisted database; omit to query the in-memory example.
-    #[arg(short, long)]
-    database: Option<PathBuf>,
-}
-
-fn query_store(database: Option<&Path>) -> Result<SemanticStore, Box<dyn Error>> {
-    match database {
-        Some(path) => SemanticStore::persistent(path, false),
-        None => SemanticStore::memory(),
-    }
 }
 
 fn print_index_result((count, published): (usize, bool)) {
@@ -254,25 +245,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", store.benchmark_queries(&topology, entities, depth));
         }
         Some(Command::Context(query)) => {
-            println!(
-                "{:#?}",
-                query_store(query.database.as_deref())?.context(&query.entity)?
-            );
+            println!("{:#?}", daemon_context(query.entity).await?);
         }
         Some(Command::Impact(query)) => {
-            println!(
-                "{:#?}",
-                query_store(query.database.as_deref())?.impact(&query.entity)?
-            );
+            println!("{:#?}", daemon_impact(query.entity).await?);
         }
-        Some(Command::Dependencies(query)) => println!(
-            "{:#?}",
-            query_store(query.database.as_deref())?.dependencies(&query.entity)?
-        ),
-        Some(Command::Trace(query) | Command::Why(query)) => println!(
-            "{:#?}",
-            query_store(query.database.as_deref())?.trace(&query.from, &query.to)?
-        ),
+        Some(Command::Dependencies(query)) => {
+            println!("{:#?}", daemon_dependencies(query.entity).await?)
+        }
+        Some(Command::Trace(query)) => {
+            println!("{:#?}", daemon_trace(query.from, query.to).await?)
+        }
+        Some(Command::Why(query)) => println!("{:#?}", daemon_why(query.from, query.to).await?),
         None => println!(
             "{:#?}",
             SemanticStore::memory()?.trace("web/CheckoutPage", "cache/update_price")?

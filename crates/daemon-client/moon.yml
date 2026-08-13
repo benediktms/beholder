@@ -2,6 +2,7 @@ language: 'rust'
 layer: 'library'
 
 dependsOn:
+  - 'beholder-dto'
   - 'beholder-protocol'
 
 workspace:

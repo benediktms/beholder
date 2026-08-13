@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+beholder-dto.workspace = true
 beholder-protocol.workspace = true
 tonic = "0.14.6"

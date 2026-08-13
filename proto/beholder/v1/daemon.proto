@@ -3,9 +3,50 @@ syntax = "proto3";
 package beholder.v1;
 
 service Daemon {
+  rpc Context(EntityRequest) returns (QueryResult);
+  rpc Dependencies(EntityRequest) returns (QueryResult);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc Impact(EntityRequest) returns (QueryResult);
   rpc IndexRustWorkspace(IndexRustWorkspaceRequest) returns (IndexRustWorkspaceResponse);
   rpc Stop(StopRequest) returns (StopResponse);
+  rpc Trace(PathRequest) returns (QueryResult);
+  rpc Why(PathRequest) returns (QueryResult);
+}
+
+message EntityRequest {
+  string entity = 1;
+}
+
+message PathRequest {
+  string from = 1;
+  string to = 2;
+}
+
+message QueryResult {
+  repeated string headers = 1;
+  repeated QueryRow rows = 2;
+  optional QueryResult next = 3;
+}
+
+message QueryRow {
+  repeated QueryValue values = 1;
+}
+
+message QueryValue {
+  oneof value {
+    bool null = 1;
+    bool boolean = 2;
+    sint64 integer = 3;
+    double float = 4;
+    string text = 5;
+    bytes bytes = 6;
+    QueryList list = 7;
+    string other = 8;
+  }
+}
+
+message QueryList {
+  repeated QueryValue values = 1;
 }
 
 message IndexRustWorkspaceRequest {

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+beholder-dto.workspace = true
 prost = "0.14.4"
 tonic = "0.14.6"
 tonic-prost = "0.14.6"

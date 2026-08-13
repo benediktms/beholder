@@ -1,6 +1,9 @@
 language: 'rust'
 layer: 'library'
 
+dependsOn:
+  - 'beholder-dto'
+
 fileGroups:
   sources:
     - 'Cargo.toml'
