@@ -2,8 +2,11 @@ language: 'rust'
 layer: 'application'
 
 dependsOn:
+  - 'beholder-adapters-git'
   - 'beholder-adapters-mnestic'
+  - 'beholder-adapters-treesitter-rust'
   - 'beholder-daemon-client'
+  - 'beholder-domain'
   - 'beholder-protocol'
 
 workspace:

@@ -4,7 +4,17 @@ package beholder.v1;
 
 service Daemon {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc IndexRustWorkspace(IndexRustWorkspaceRequest) returns (IndexRustWorkspaceResponse);
   rpc Stop(StopRequest) returns (StopResponse);
+}
+
+message IndexRustWorkspaceRequest {
+  repeated string repositories = 1;
+}
+
+message IndexRustWorkspaceResponse {
+  uint64 observation_count = 1;
+  bool published = 2;
 }
 
 message StopRequest {}

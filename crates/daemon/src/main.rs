@@ -1,17 +1,21 @@
+use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
+use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, source_files};
 use beholder_daemon_client::{ADDRESS, state_dir};
+use beholder_domain::{RepositoryState, WorkspaceView};
 use beholder_protocol::v1::{
-    GetStatusRequest, GetStatusResponse, StopRequest, StopResponse,
+    GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest, IndexRustWorkspaceResponse,
+    StopRequest, StopResponse,
     daemon_server::{Daemon, DaemonServer},
 };
-use std::{error::Error, net::SocketAddr, sync::Mutex};
+use std::{error::Error, fs, net::SocketAddr, path::Path, path::PathBuf, sync::Mutex};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status, transport::Server};
 
 mod single_instance;
 
 struct BeholderDaemon {
-    _store: SemanticStore,
+    store: SemanticStore,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -19,11 +23,63 @@ fn daemon(store: SemanticStore) -> (BeholderDaemon, oneshot::Receiver<()>) {
     let (shutdown, stopped) = oneshot::channel();
     (
         BeholderDaemon {
-            _store: store,
+            store,
             shutdown: Mutex::new(Some(shutdown)),
         },
         stopped,
     )
+}
+
+type RustSources = Vec<(PathBuf, String)>;
+
+fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources), Box<dyn Error>> {
+    if !root.is_dir() {
+        return Err(format!("repository does not exist: {}", root.display()).into());
+    }
+    let mut files = Vec::new();
+    source_files(root, &mut files)?;
+    files.sort();
+    let sources = files
+        .into_iter()
+        .map(|path| {
+            let relative_path = path.strip_prefix(root)?.to_path_buf();
+            Ok((relative_path, fs::read_to_string(path)?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok((repository_state(root, &sources)?, sources))
+}
+
+fn index_rust_workspace(
+    store: &SemanticStore,
+    roots: &[PathBuf],
+) -> Result<(usize, bool), Box<dyn Error>> {
+    if roots.is_empty() {
+        return Err("workspace must contain a repository".into());
+    }
+    let repositories = roots
+        .iter()
+        .map(|root| rust_repository_sources(root))
+        .collect::<Result<Vec<_>, _>>()?;
+    let view = WorkspaceView::new(
+        "main",
+        repositories
+            .iter()
+            .map(|(state, _)| state.clone())
+            .collect(),
+    )?;
+    if store.view_matches(&view)? {
+        return Ok((0, false));
+    }
+
+    let mut all_observations = Vec::new();
+    for (state, sources) in repositories {
+        for (path, source) in sources {
+            all_observations.extend(observations(&state.repository.identity, &source, &path)?);
+        }
+    }
+    resolve_repository_calls(&mut all_observations);
+    store.publish(&view, &all_observations)?;
+    Ok((all_observations.len(), true))
 }
 
 #[tonic::async_trait]
@@ -36,6 +92,27 @@ impl Daemon for BeholderDaemon {
             status: "ready".into(),
             protocol_version: 1,
             pid: std::process::id(),
+        }))
+    }
+
+    async fn index_rust_workspace(
+        &self,
+        request: Request<IndexRustWorkspaceRequest>,
+    ) -> Result<Response<IndexRustWorkspaceResponse>, Status> {
+        // ponytail: this blocks one Tokio worker; add a bounded job queue when indexing competes with RPC latency.
+        let roots = request
+            .into_inner()
+            .repositories
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let (observation_count, published) = index_rust_workspace(&self.store, &roots)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(IndexRustWorkspaceResponse {
+            observation_count: observation_count
+                .try_into()
+                .map_err(|_| Status::internal("observation count exceeds protocol capacity"))?,
+            published,
         }))
     }
 
@@ -79,7 +156,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_protocol::v1::{GetStatusRequest, StopRequest, daemon_client::DaemonClient};
+    use beholder_protocol::v1::{
+        GetStatusRequest, IndexRustWorkspaceRequest, StopRequest, daemon_client::DaemonClient,
+    };
     use std::{env, fs, net::TcpListener, time::Duration};
 
     #[tokio::test]
@@ -132,6 +211,31 @@ mod tests {
         assert_eq!(status.protocol_version, 1);
         assert_eq!(status.pid, std::process::id());
 
+        let first = state.join("repo-a");
+        let second = state.join("repo-b");
+        fs::create_dir_all(first.join("src")).unwrap();
+        fs::create_dir_all(second.join("src")).unwrap();
+        fs::write(first.join("src/lib.rs"), "fn caller() { helper(); }").unwrap();
+        fs::write(second.join("src/lib.rs"), "fn helper() {}").unwrap();
+        let repository = |path: &Path| path.to_str().unwrap().to_owned();
+        let indexed = client
+            .index_rust_workspace(IndexRustWorkspaceRequest {
+                repositories: vec![repository(&first), repository(&second)],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(indexed.published && indexed.observation_count > 0);
+        let unchanged = client
+            .index_rust_workspace(IndexRustWorkspaceRequest {
+                repositories: vec![repository(&second), repository(&first)],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!unchanged.published);
+        assert_eq!(unchanged.observation_count, 0);
+
         assert!(
             client
                 .stop(StopRequest {})
@@ -141,6 +245,16 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
+        let indexed = SemanticStore::persistent(&database, false).unwrap();
+        assert_eq!(indexed.inspect_revisions().unwrap().rows.len(), 2);
+        assert!(
+            format!(
+                "{:?}",
+                indexed.context("repo://repo-a/rust/lib/caller").unwrap()
+            )
+            .contains("repo://repo-b/rust/lib/helper")
+        );
+        drop(indexed);
         drop(lock);
         assert!(
             fs::read_to_string(state.join("beholderd.pid"))

@@ -288,8 +288,11 @@ dependencies = [
 name = "beholder-daemon"
 version = "0.1.0"
 dependencies = [
+ "beholder-adapters-git",
  "beholder-adapters-mnestic",
+ "beholder-adapters-treesitter-rust",
  "beholder-daemon-client",
+ "beholder-domain",
  "beholder-protocol",
  "tokio",
  "tonic",
