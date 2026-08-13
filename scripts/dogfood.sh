@@ -41,8 +41,15 @@ done
 target/debug/beholder daemon status >/dev/null
 target/debug/beholder workspace register main "$root" >/dev/null
 
-caller='repo://beholder/rust/crates/daemon/src/main/main'
-callee='repo://beholder/rust/crates/daemon-client/src/lib/state_dir'
+repository="$(basename "$root")"
+if remote="$(git -C "$root" remote get-url origin 2>/dev/null)"; then
+    repository="${remote#*://}"
+    repository="${repository#*@}"
+    repository="${repository/:/\/}"
+    repository="${repository%.git}"
+fi
+caller="repo://$repository/rust/crates/daemon/src/main/main"
+callee="repo://$repository/rust/crates/daemon-client/src/lib/state_dir"
 echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
 for _ in {1..100}; do
