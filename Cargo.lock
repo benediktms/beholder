@@ -317,6 +317,9 @@ dependencies = [
 [[package]]
 name = "beholder-domain"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "beholder-dto"

@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, error::Error, fs, path::Path};
 use tree_sitter::{Node, Parser};
 
 pub const FRONTEND_VERSION: &str = "1";
+pub const RESOLVER_VERSION: &str = "1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
