@@ -1,6 +1,8 @@
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability, ScriptRunOptions};
 use std::{collections::BTreeMap, env, error::Error, time::Instant};
 
+const MAX_HOPS: i64 = 32;
+
 const CREATE_SCHEMA: &str = r#"
 :create observation {
     view: String,
@@ -41,20 +43,13 @@ direct[from, to, relation, evidence] :=
     $view != 'main'
 "#;
 
-const PATH_RULES: &str = r#"
-path[to, nodes, relations, evidence] :=
-    direct[$from, to, relation, proof],
-    nodes = [$from, to],
-    relations = [relation],
-    evidence = [proof]
-
-path[to, nodes, relations, evidence] :=
-    path[via, previous_nodes, previous_relations, previous_evidence],
-    direct[via, to, relation, proof],
-    not is_in(to, previous_nodes),
-    nodes = append(previous_nodes, to),
-    relations = append(previous_relations, relation),
-    evidence = append(previous_evidence, proof)
+const DISTANCE_RULES: &str = r#"
+distance[node, min(hops)] := start[node], hops = 0
+distance[to, min(hops)] :=
+    distance[from, previous_hops],
+    previous_hops < $max_hops,
+    direct[from, to, _, _],
+    hops = previous_hops + 1
 "#;
 
 fn database() -> Result<DbInstance, Box<dyn Error>> {
@@ -114,19 +109,36 @@ fn trace(db: &DbInstance, from: &str, to: &str) -> Result<NamedRows, Box<dyn Err
     query(
         db,
         &format!(
-            "{RULES}\n{PATH_RULES}\n?[nodes, relations, evidence, hops] := \
-             path[$to, nodes, relations, evidence], hops = length(relations)\n\
-             :order hops\n:limit 1"
+            "{RULES}\n{DISTANCE_RULES}\n\
+             start[] <- [[$from]]\n\
+             predecessor[to, min(from)] := distance[to, hops], hops > 0, \
+                 distance[from, previous_hops], previous_hops + 1 == hops, \
+                 direct[from, to, _, _]\n\
+             path[to, nodes] := predecessor[to, $from], nodes = [$from, to]\n\
+             path[to, nodes] := path[from, previous_nodes], predecessor[to, from], \
+                 nodes = append(previous_nodes, to)\n\
+             steps[nodes, step] := path[$to, nodes], \
+                 index in int_range(length(nodes) - 1), \
+                 from = get(nodes, index), to = get(nodes, index + 1), \
+                 direct[from, to, relation, evidence], step = [index, relation, evidence]\n\
+             ?[nodes, collect(step), hops] := steps[nodes, step], hops = length(nodes) - 1"
         ),
-        [("from", from.into()), ("to", to.into())],
+        [
+            ("from", from.into()),
+            ("to", to.into()),
+            ("max_hops", MAX_HOPS.into()),
+        ],
     )
 }
 
 fn impact(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
-        &format!("{RULES}\n{PATH_RULES}\n?[affected] := path[affected, _, _, _]\n:order affected"),
-        [("from", entity.into())],
+        &format!(
+            "{RULES}\n{DISTANCE_RULES}\nstart[] <- [[$from]]\n\
+             ?[affected] := distance[affected, hops], hops > 0\n:order affected"
+        ),
+        [("from", entity.into()), ("max_hops", MAX_HOPS.into())],
     )
 }
 
@@ -134,11 +146,12 @@ fn dependencies(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Erro
     query(
         db,
         &format!(
-            "{RULES}\n{PATH_RULES}\n?[dependency, min(hops)] := \
-             path[dependency, _, relations, _], hops = length(relations)\n\
+            "{RULES}\n{DISTANCE_RULES}\n\
+             start[] <- [[$from]]\n\
+             ?[dependency, hops] := distance[dependency, hops], hops > 0\n\
              :order dependency"
         ),
-        [("from", entity.into())],
+        [("from", entity.into()), ("max_hops", MAX_HOPS.into())],
     )
 }
 
@@ -192,12 +205,8 @@ fn benchmark(
     let loaded_in = started.elapsed();
 
     Ok(format!(
-        "mode={}, topology={topology}, entities={entities}, fanout={fanout}, depth={depth}, load={loaded_in:?}, {}",
-        if cfg!(feature = "parallel") {
-            "parallel"
-        } else {
-            "single"
-        },
+        "algorithm={}, topology={topology}, entities={entities}, fanout={fanout}, depth={depth}, load={loaded_in:?}, {}",
+        "bounded-distance",
         benchmark_queries(db, topology, entities, depth)
     ))
 }
@@ -207,23 +216,11 @@ fn benchmark_queries(db: &DbInstance, _topology: &str, entities: i64, depth: i64
         ("depth".into(), depth.into()),
         ("target".into(), depth.min(entities - 1).into()),
     ]);
-    let rules = "path[to, nodes, evidence, hops] := \
-                     *benchmark_edge{from: 0, to, evidence: proof}, \
-                     nodes = [0, to], evidence = [proof], hops = 1\n\
-                 path[to, nodes, evidence, hops] := \
-                     path[via, previous_nodes, previous_evidence, previous_hops], \
-                     previous_hops < $depth, *benchmark_edge{from: via, to, evidence: proof}, \
-                     not is_in(to, previous_nodes), nodes = append(previous_nodes, to), \
-                     evidence = append(previous_evidence, proof), hops = previous_hops + 1";
-
-    let closure = timed_query(
-        db,
-        "reachable[to, hops] := *benchmark_edge{from: 0, to}, hops = 1\n\
+    let reachability = "reachable[to, hops] := *benchmark_edge{from: 0, to}, hops = 1\n\
          reachable[to, hops] := reachable[from, previous_hops], previous_hops < $depth, \
              *benchmark_edge{from, to}, hops = previous_hops + 1\n\
-         ?[count_unique(to)] := reachable[to, _]",
-        params.clone(),
-    );
+         ?[count_unique(to)] := reachable[to, _]";
+    let closure = timed_query(db, reachability, params.clone());
     let context = timed_query(
         db,
         "?[count(to)] := *benchmark_edge{from: 0, to}",
@@ -231,17 +228,24 @@ fn benchmark_queries(db: &DbInstance, _topology: &str, entities: i64, depth: i64
     );
     let trace = timed_query(
         db,
-        &format!(
-            "{rules}\n?[nodes, evidence, hops] := path[$target, nodes, evidence, hops]\n\
-             :order hops\n:limit 1"
-        ),
+        "start[] <- [[0]]\n\
+         distance[node, min(hops)] := start[node], hops = 0\n\
+         distance[to, min(hops)] := distance[from, previous_hops], previous_hops < $depth, \
+             *benchmark_edge{from, to}, hops = previous_hops + 1\n\
+         predecessor[to, min(from)] := distance[to, hops], hops > 0, \
+             distance[from, previous_hops], previous_hops + 1 == hops, \
+             *benchmark_edge{from, to}\n\
+         path[to, nodes] := predecessor[to, 0], nodes = [0, to]\n\
+         path[to, nodes] := path[from, previous_nodes], predecessor[to, from], \
+             nodes = append(previous_nodes, to)\n\
+         steps[nodes, step] := path[$target, nodes], \
+             index in int_range(length(nodes) - 1), \
+             from = get(nodes, index), to = get(nodes, index + 1), \
+             *benchmark_edge{from, to, evidence}, step = [index, evidence]\n\
+         ?[nodes, collect(step), hops] := steps[nodes, step], hops = length(nodes) - 1",
         params.clone(),
     );
-    let impact = timed_query(
-        db,
-        &format!("{rules}\n?[count_unique(to)] := path[to, _, _, _]"),
-        params,
-    );
+    let impact = timed_query(db, reachability, params);
 
     format!("context={context}, closure={closure}, trace={trace}, impact={impact}")
 }
@@ -344,8 +348,13 @@ mod tests {
         assert!(feature.contains("pricing/get_price_v2"));
         assert!(!feature.contains("pricing/get_price\""));
 
-        let benchmark = benchmark(&db, "linear", 100, 1, 10).unwrap();
-        assert!(benchmark.contains("topology=linear"));
-        assert!(!benchmark.contains("query_timeout"));
+        let linear_benchmark = benchmark(&db, "linear", 100, 1, 10).unwrap();
+        assert!(linear_benchmark.contains("topology=linear"));
+        assert!(!linear_benchmark.contains("query_timeout"));
+
+        let dag = DbInstance::new("mem", "", Default::default()).unwrap();
+        let dag_benchmark = benchmark(&dag, "dag", 1_000, 10, 6).unwrap();
+        assert!(dag_benchmark.contains("algorithm=bounded-distance"));
+        assert!(!dag_benchmark.contains("query_timeout"));
     }
 }
