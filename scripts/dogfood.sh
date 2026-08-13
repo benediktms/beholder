@@ -41,17 +41,20 @@ done
 target/debug/beholder daemon status >/dev/null
 target/debug/beholder workspace register main "$root" >/dev/null
 
-echo 'Indexing Beholder...' >&2
-target/debug/beholder index-rust-workspace main >/dev/null
-
 caller='repo://beholder/rust/crates/daemon/src/main/main'
 callee='repo://beholder/rust/crates/daemon-client/src/lib/state_dir'
-echo 'Checking main -> state_dir...' >&2
-result="$(target/debug/beholder context --workspace main "$caller")"
+echo 'Waiting for automatic Beholder indexing...' >&2
+result=''
+for _ in {1..100}; do
+    result="$(target/debug/beholder context --workspace main "$caller" 2>/dev/null || true)"
+    grep -Fq "$callee" <<<"$result" && break
+    sleep 0.1
+done
 if ! grep -Fq "$callee" <<<"$result"; then
-    printf 'expected %s in context:\n%s\n' "$callee" "$result" >&2
+    printf 'automatic indexing did not produce %s in context:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
+echo 'Checking main -> state_dir...' >&2
 echo 'Checking state_dir impact reaches main...' >&2
 result="$(target/debug/beholder impact --workspace main "$callee")"
 if ! grep -Fq "$caller" <<<"$result"; then
