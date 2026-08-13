@@ -41,3 +41,9 @@ pub struct QueryMetadata {
     pub indexing: bool,
     pub dirty_repositories: Vec<String>,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevisionedQuery {
+    pub result: QueryResult,
+    pub analysis_revision: u64,
+}

@@ -1,5 +1,5 @@
 use beholder_domain::{FactChanges, Observation, RepositoryState, WorkspaceView};
-use beholder_dto::{QueryResult, QueryValue};
+use beholder_dto::{QueryResult, QueryValue, RevisionedQuery};
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, Num, ScriptMutability, ScriptRunOptions,
 };
@@ -50,10 +50,6 @@ impl SemanticStore {
         inspect_revisions(&self.db).map(query_result)
     }
 
-    pub fn analysis_revision(&self, view: &str) -> Result<u64, Box<dyn Error>> {
-        analysis_revision(&self.db, view)
-    }
-
     pub fn inspect_observations(
         &self,
         relation: Option<&str>,
@@ -65,16 +61,64 @@ impl SemanticStore {
         context(&self.db, view, entity).map(query_result)
     }
 
+    pub fn context_snapshot(
+        &self,
+        view: &str,
+        entity: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| context(transaction, view, entity))
+    }
+
     pub fn trace(&self, view: &str, from: &str, to: &str) -> Result<QueryResult, Box<dyn Error>> {
         trace(&self.db, view, from, to).map(query_result)
+    }
+
+    pub fn trace_snapshot(
+        &self,
+        view: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| trace(transaction, view, from, to))
     }
 
     pub fn impact(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
         impact(&self.db, view, entity).map(query_result)
     }
 
+    pub fn impact_snapshot(
+        &self,
+        view: &str,
+        entity: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| impact(transaction, view, entity))
+    }
+
     pub fn dependencies(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
         dependencies(&self.db, view, entity).map(query_result)
+    }
+
+    pub fn dependencies_snapshot(
+        &self,
+        view: &str,
+        entity: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| dependencies(transaction, view, entity))
+    }
+
+    fn snapshot(
+        &self,
+        view: &str,
+        read: impl FnOnce(&MultiTransaction) -> Result<NamedRows, Box<dyn Error>>,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        let transaction = self.db.multi_transaction(false);
+        let result = query_result(read(&transaction)?);
+        let analysis_revision = analysis_revision(&transaction, view)?;
+        transaction.abort()?;
+        Ok(RevisionedQuery {
+            result,
+            analysis_revision,
+        })
     }
 
     pub fn benchmark(
@@ -449,8 +493,36 @@ fn store_repository_states(
     Ok(())
 }
 
+trait QueryRunner {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>>;
+}
+
+impl QueryRunner for DbInstance {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        Ok(self.run_script(script, params, ScriptMutability::Immutable)?)
+    }
+}
+
+impl QueryRunner for MultiTransaction {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        Ok(self.run_script(script, params)?)
+    }
+}
+
 fn query(
-    db: &DbInstance,
+    db: &impl QueryRunner,
     view: &str,
     script: &str,
     additions: impl IntoIterator<Item = (&'static str, DataValue)>,
@@ -461,7 +533,7 @@ fn query(
             .into_iter()
             .map(|(name, value)| (name.into(), value)),
     );
-    Ok(db.run_script(script, params, ScriptMutability::Immutable)?)
+    db.run_query(script, params)
 }
 
 fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
@@ -481,7 +553,7 @@ fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
     )?)
 }
 
-fn analysis_revision(db: &DbInstance, view: &str) -> Result<u64, Box<dyn Error>> {
+fn analysis_revision(db: &impl QueryRunner, view: &str) -> Result<u64, Box<dyn Error>> {
     let rows = query(
         db,
         view,
@@ -518,7 +590,7 @@ fn inspect_observations(
     )?)
 }
 
-fn context(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn context(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -534,7 +606,12 @@ fn context(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<d
     )
 }
 
-fn trace(db: &DbInstance, view: &str, from: &str, to: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn trace(
+    db: &impl QueryRunner,
+    view: &str,
+    from: &str,
+    to: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -561,7 +638,7 @@ fn trace(db: &DbInstance, view: &str, from: &str, to: &str) -> Result<NamedRows,
     )
 }
 
-fn impact(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn impact(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -574,7 +651,11 @@ fn impact(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dy
     )
 }
 
-fn dependencies(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn dependencies(
+    db: &impl QueryRunner,
+    view: &str,
+    entity: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -842,6 +923,53 @@ mod tests {
                 .rows
                 .iter()
                 .any(|row| row[1].as_i64() == Some(2))
+        );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn query_snapshot_keeps_rows_and_revision_consistent() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-query-snapshot-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let store = SemanticStore::persistent(&state_dir.join("beholder.db"), true).unwrap();
+        let view = WorkspaceView::new(
+            "snapshot",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .publish(
+                &view,
+                &[Observation {
+                    from: "repo/source".into(),
+                    relation: "calls".into(),
+                    to: "repo/target".into(),
+                    evidence: "source.rs:1".into(),
+                }],
+            )
+            .unwrap();
+        let snapshot = store.context_snapshot("snapshot", "repo/source").unwrap();
+
+        assert_eq!(snapshot.analysis_revision, 1);
+        assert!(
+            snapshot
+                .result
+                .rows
+                .iter()
+                .flatten()
+                .any(|value| value.as_str() == Some("repo/target"))
         );
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();

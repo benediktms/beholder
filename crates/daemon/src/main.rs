@@ -128,7 +128,8 @@ impl Daemon for BeholderDaemon {
         let request = request.into_inner();
         self.query_response(
             &request.workspace,
-            self.store.context(&request.workspace, &request.entity),
+            self.store
+                .context_snapshot(&request.workspace, &request.entity),
         )
     }
 
@@ -145,7 +146,8 @@ impl Daemon for BeholderDaemon {
         let request = request.into_inner();
         self.query_response(
             &request.workspace,
-            self.store.dependencies(&request.workspace, &request.entity),
+            self.store
+                .dependencies_snapshot(&request.workspace, &request.entity),
         )
     }
 
@@ -174,7 +176,8 @@ impl Daemon for BeholderDaemon {
         let request = request.into_inner();
         self.query_response(
             &request.workspace,
-            self.store.impact(&request.workspace, &request.entity),
+            self.store
+                .impact_snapshot(&request.workspace, &request.entity),
         )
     }
 
@@ -291,7 +294,7 @@ impl Daemon for BeholderDaemon {
         self.query_response(
             &request.workspace,
             self.store
-                .trace(&request.workspace, &request.from, &request.to),
+                .trace_snapshot(&request.workspace, &request.from, &request.to),
         )
     }
 
@@ -306,7 +309,7 @@ impl Daemon for BeholderDaemon {
         self.query_response(
             &request.workspace,
             self.store
-                .trace(&request.workspace, &request.from, &request.to),
+                .trace_snapshot(&request.workspace, &request.from, &request.to),
         )
     }
 }
@@ -315,14 +318,14 @@ impl BeholderDaemon {
     fn query_response(
         &self,
         workspace: &str,
-        result: Result<beholder_dto::QueryResult, Box<dyn Error>>,
+        result: Result<beholder_dto::RevisionedQuery, Box<dyn Error>>,
     ) -> Result<Response<QueryResult>, Status> {
-        let mut result = result.map_err(|error| Status::internal(error.to_string()))?;
-        let revision = self
-            .store
-            .analysis_revision(workspace)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        result.metadata = Some(self.scheduler.query_metadata(workspace, revision));
+        let revisioned = result.map_err(|error| Status::internal(error.to_string()))?;
+        let mut result = revisioned.result;
+        result.metadata = Some(
+            self.scheduler
+                .query_metadata(workspace, revisioned.analysis_revision),
+        );
         Ok(Response::new(result.into()))
     }
 }

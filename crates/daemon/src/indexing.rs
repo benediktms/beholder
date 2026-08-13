@@ -62,6 +62,7 @@ type Cached<T> = Result<(Arc<T>, CacheStatus), Box<dyn Error>>;
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     dirty_repositories: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    active_workspace: Mutex<Option<String>>,
     changed: Notify,
     indexing: Mutex<()>,
     cache_dir: PathBuf,
@@ -75,6 +76,7 @@ impl IndexScheduler {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
+            active_workspace: Mutex::new(None),
             changed: Notify::new(),
             indexing: Mutex::new(()),
             cache_dir,
@@ -111,7 +113,10 @@ impl IndexScheduler {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let indexing = stale && self.indexing.try_lock().is_err();
+        let indexing = self
+            .active_workspace
+            .lock()
+            .is_ok_and(|active| active.as_deref() == Some(workspace));
         QueryMetadata {
             analysis_revision,
             stale,
@@ -149,7 +154,49 @@ impl IndexScheduler {
             .indexing
             .lock()
             .map_err(|_| "index coordinator lock poisoned")?;
-        index_rust_workspace(self, store, workspace)
+        let generation = self
+            .generations
+            .lock()
+            .map_err(|_| "index generations lock poisoned")?
+            .get(&workspace.name)
+            .copied();
+        let result = self.index_active(store, workspace);
+        if result.is_ok() {
+            self.complete_generation(&workspace.name, generation);
+        }
+        result
+    }
+
+    fn index_active(
+        &self,
+        store: &SemanticStore,
+        workspace: &Workspace,
+    ) -> Result<(usize, bool), Box<dyn Error>> {
+        *self
+            .active_workspace
+            .lock()
+            .map_err(|_| "active workspace lock poisoned")? = Some(workspace.name.clone());
+        let result = index_rust_workspace(self, store, workspace);
+        *self
+            .active_workspace
+            .lock()
+            .map_err(|_| "active workspace lock poisoned")? = None;
+        result
+    }
+
+    fn complete_generation(&self, workspace: &str, indexed: Option<u64>) {
+        let Ok(mut generations) = self.generations.lock() else {
+            return;
+        };
+        if indexed.is_some() && generations.get(workspace).copied() == indexed {
+            generations.remove(workspace);
+            if let Ok(mut dirty) = self.dirty_repositories.lock() {
+                dirty.remove(workspace);
+            }
+        }
+        if generations.contains_key(workspace) {
+            self.changed.notify_one();
+        }
     }
 
     pub fn add_event(&self, event: notify::Result<Event>, workspaces: &Mutex<WorkspaceRegistry>) {
@@ -284,33 +331,13 @@ impl IndexScheduler {
         let Ok(_indexing) = self.indexing.lock() else {
             return;
         };
-        let mut completed = BTreeSet::new();
         for workspace in registered {
-            match index_rust_workspace(self, store, &workspace) {
-                Ok(_) => {
-                    completed.insert(workspace.name);
-                }
+            match self.index_active(store, &workspace) {
+                Ok(_) => self
+                    .complete_generation(&workspace.name, snapshot.get(&workspace.name).copied()),
                 Err(error) => {
                     tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed")
                 }
-            }
-        }
-        if let Ok(mut generations) = self.generations.lock() {
-            generations.retain(|name, generation| {
-                !completed.contains(name)
-                    || snapshot
-                        .get(name)
-                        .is_none_or(|indexed| *generation > *indexed)
-            });
-            if generations.iter().any(|(name, generation)| {
-                snapshot
-                    .get(name)
-                    .is_none_or(|indexed| generation > indexed)
-            }) {
-                self.changed.notify_one();
-            }
-            if let Ok(mut dirty) = self.dirty_repositories.lock() {
-                dirty.retain(|name, _| generations.contains_key(name));
             }
         }
     }
@@ -730,19 +757,38 @@ mod tests {
             .as_nanos();
         let state = std::env::temp_dir().join(format!("beholder-freshness-{unique}"));
         let repository = state.join("repo");
-        fs::create_dir_all(&repository).unwrap();
-        let workspace = Workspace::new("main", vec![repository]).unwrap();
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        let workspace = Workspace::new("main", vec![repository.clone()]).unwrap();
+        let other = Workspace::new("other", vec![repository]).unwrap();
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
 
         scheduler.mark(&workspace);
+        scheduler.mark(&other);
         let pending = scheduler.query_metadata("main", 4);
         assert_eq!(pending.analysis_revision, 4);
         assert!(pending.stale);
         assert!(!pending.indexing);
         assert_eq!(pending.dirty_repositories, ["repo"]);
 
-        let _indexing = scheduler.indexing.lock().unwrap();
+        *scheduler.active_workspace.lock().unwrap() = Some("main".into());
         assert!(scheduler.query_metadata("main", 4).indexing);
+        assert!(!scheduler.query_metadata("other", 4).indexing);
+        *scheduler.active_workspace.lock().unwrap() = None;
+
+        let indexed_generation = scheduler.generations.lock().unwrap()["main"];
+        scheduler.mark(&workspace);
+        scheduler.complete_generation("main", Some(indexed_generation));
+        assert!(scheduler.query_metadata("main", 4).stale);
+
+        scheduler.index(&store, &workspace).unwrap();
+        let current = scheduler.query_metadata("main", 5);
+        assert!(!current.stale);
+        assert!(!current.indexing);
+        assert!(current.dirty_repositories.is_empty());
+        assert!(scheduler.query_metadata("other", 4).stale);
+        drop(store);
         fs::remove_dir_all(state).unwrap();
     }
 
