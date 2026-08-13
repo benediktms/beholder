@@ -1,5 +1,6 @@
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability, ScriptRunOptions};
-use std::{collections::BTreeMap, env, error::Error, time::Instant};
+use std::{collections::BTreeMap, env, error::Error, fs, path::Path, time::Instant};
+use tree_sitter::{Node, Parser};
 
 const MAX_HOPS: i64 = 32;
 
@@ -74,6 +75,129 @@ fn benchmark_database(storage: &str, path: Option<&str>) -> Result<DbInstance, B
         "sqlite" => Err("build with --features sqlite to benchmark SQLite".into()),
         _ => Err("storage must be mem or sqlite".into()),
     }
+}
+
+fn persistent_database(path: &Path, initialize: bool) -> Result<DbInstance, Box<dyn Error>> {
+    if path.as_os_str().is_empty() {
+        return Err("database path must not be empty".into());
+    }
+    let is_new = !path.exists();
+    if is_new && !initialize {
+        return Err(format!("database does not exist: {}", path.display()).into());
+    }
+    let db = benchmark_database("sqlite", path.to_str())?;
+    if is_new {
+        db.run_script(CREATE_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)?;
+    }
+    Ok(db)
+}
+
+fn collect_functions<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+    functions: &mut Vec<(String, Node<'tree>)>,
+) {
+    if node.kind() == "function_item"
+        && let Some(name) = node.child_by_field_name("name")
+        && let Ok(name) = name.utf8_text(source)
+    {
+        functions.push((name.to_owned(), node));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_functions(child, source, functions);
+    }
+}
+
+fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<(String, usize)>) {
+    if node.kind() == "call_expression"
+        && let Some(function) = node.child_by_field_name("function")
+        && let Ok(function) = function.utf8_text(source)
+        && let Some(name) = function.rsplit([':', '.']).find(|part| !part.is_empty())
+    {
+        calls.push((name.to_owned(), node.start_position().row + 1));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls(child, source, calls);
+    }
+}
+
+fn rust_observations(source: &str, path: &Path) -> Result<Vec<[String; 5]>, Box<dyn Error>> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("Rust parser returned no tree")?;
+    if tree.root_node().has_error() {
+        return Err(format!("failed to parse Rust source: {}", path.display()).into());
+    }
+
+    let source_bytes = source.as_bytes();
+    let mut functions = Vec::new();
+    collect_functions(tree.root_node(), source_bytes, &mut functions);
+    let module = path
+        .strip_prefix("src")
+        .unwrap_or(path)
+        .with_extension("")
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    // ponytail: fixed identity is enough for self-indexing; workspace registration will supply it.
+    let source_id = format!("repo://beholder/rust/{module}");
+    // ponytail: simple names cover this fixture; qualify impl methods when Rust support expands.
+    let definitions = functions
+        .iter()
+        .map(|(name, _)| (name.clone(), format!("{source_id}/{name}")))
+        .collect::<BTreeMap<_, _>>();
+    let mut observations = Vec::new();
+
+    for (name, function) in functions {
+        let function_id = definitions[&name].clone();
+        observations.push([
+            "main".into(),
+            source_id.clone(),
+            "defines".into(),
+            function_id.clone(),
+            format!("{}:{}", path.display(), function.start_position().row + 1),
+        ]);
+        let mut calls = Vec::new();
+        collect_calls(function, source_bytes, &mut calls);
+        for (callee, line) in calls {
+            observations.push([
+                "main".into(),
+                function_id.clone(),
+                "calls".into(),
+                definitions
+                    .get(&callee)
+                    .cloned()
+                    .unwrap_or_else(|| format!("rust-call://{callee}")),
+                format!("{}:{line}", path.display()),
+            ]);
+        }
+    }
+    Ok(observations)
+}
+
+fn index_rust(path: &Path, database_path: &Path) -> Result<usize, Box<dyn Error>> {
+    let observations = rust_observations(&fs::read_to_string(path)?, path)?;
+    let db = persistent_database(database_path, true)?;
+    // ponytail: one-file dogfooding writes directly; revision batching will replace stale facts.
+    for [view, from, relation, to, evidence] in &observations {
+        db.run_script(
+            "?[view, from, relation, to, evidence] <- [[$view, $from, $relation, $to, $evidence]]\n\
+             :put observation {view, from, relation, to => evidence}",
+            BTreeMap::from([
+                ("view".into(), view.clone().into()),
+                ("from".into(), from.clone().into()),
+                ("relation".into(), relation.clone().into()),
+                ("to".into(), to.clone().into()),
+                ("evidence".into(), evidence.clone().into()),
+            ]),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    Ok(observations.len())
 }
 
 fn query(
@@ -265,6 +389,13 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if let [command, source, path] = args.as_slice()
+        && command == "index-rust"
+    {
+        let count = index_rust(Path::new(source), Path::new(path))?;
+        println!("indexed {count} Rust observations");
+        return Ok(());
+    }
     if let [
         command,
         storage,
@@ -299,6 +430,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
+    if let [command, entity, path] = args.as_slice()
+        && (command == "context" || command == "impact" || command == "dependencies")
+    {
+        let db = persistent_database(Path::new(path), false)?;
+        let result = match command.as_str() {
+            "context" => context(&db, entity)?,
+            "impact" => impact(&db, entity)?,
+            "dependencies" => dependencies(&db, entity)?,
+            _ => unreachable!(),
+        };
+        println!("{result:#?}");
+        return Ok(());
+    }
+    if let [command, from, to, path] = args.as_slice()
+        && (command == "trace" || command == "why")
+    {
+        let db = persistent_database(Path::new(path), false)?;
+        println!("{:#?}", trace(&db, from, to)?);
+        return Ok(());
+    }
     let db = database()?;
     let result =
         match args.as_slice() {
@@ -308,7 +459,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             [command, entity] if command == "dependencies" => dependencies(&db, entity)?,
             [] => trace(&db, "web/CheckoutPage", "cache/update_price")?,
             _ => return Err(
-                "usage: beholder benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> | <trace|why> <from> <to>"
+                "usage: beholder index-rust <source> <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
                     .into(),
             ),
         };
@@ -332,8 +483,8 @@ mod tests {
         assert_eq!(impact.rows.len(), 3);
         assert!(format!("{impact:?}").contains("cache/update_price"));
 
-        let context = context(&db, "rpc/Pricing.GetPrice").unwrap();
-        assert_eq!(context.rows.len(), 2);
+        let seed_context = context(&db, "rpc/Pricing.GetPrice").unwrap();
+        assert_eq!(seed_context.rows.len(), 2);
 
         let dependencies = dependencies(&db, "rpc/Pricing.GetPrice").unwrap();
         assert_eq!(dependencies.rows.len(), 3);
@@ -356,5 +507,22 @@ mod tests {
         let dag_benchmark = benchmark(&dag, "dag", 1_000, 10, 6).unwrap();
         assert!(dag_benchmark.contains("algorithm=bounded-distance"));
         assert!(!dag_benchmark.contains("query_timeout"));
+
+        let observations = rust_observations(include_str!("main.rs"), Path::new("src/main.rs"))
+            .expect("Beholder should parse its own Rust source");
+        assert!(observations.iter().any(|row| {
+            row[1] == "repo://beholder/rust/main/trace"
+                && row[2] == "calls"
+                && row[3] == "repo://beholder/rust/main/query"
+        }));
+
+        let path = env::temp_dir().join(format!("beholder-dogfood-{}.db", std::process::id()));
+        let _ = fs::remove_file(&path);
+        assert!(index_rust(Path::new("src/main.rs"), &path).unwrap() > 0);
+        let indexed = persistent_database(&path, false).unwrap();
+        let context = context(&indexed, "repo://beholder/rust/main/trace").unwrap();
+        assert!(format!("{context:?}").contains("repo://beholder/rust/main/query"));
+        drop(indexed);
+        fs::remove_file(path).unwrap();
     }
 }
