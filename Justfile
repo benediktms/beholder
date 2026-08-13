@@ -42,6 +42,20 @@ format:
 
 alias f := format
 
+# ── Install ──────────────────────────────────────────────────────────────────
+
+# Build, link both binaries into ~/.local/bin, and load the user daemon.
+[group('install')]
+[unix]
+install:
+    moon run beholder:install
+
+# Unload the user daemon and remove both ~/.local/bin links.
+[group('install')]
+[unix]
+uninstall:
+    moon run beholder:uninstall
+
 # ── Manual ────────────────────────────────────────────────────────────────────
 
 # Run the end-to-end dogfood smoke test.

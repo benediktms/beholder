@@ -40,6 +40,32 @@ tasks:
     options:
       cache: false
 
+  release:
+    command: 'cargo build --release -p beholder-cli -p beholder-daemon'
+    inputs:
+      - '@group(sources)'
+    options:
+      cache: false
+      runInCI: false
+
+  install:
+    command: 'bash scripts/install.sh'
+    deps:
+      - 'release'
+    inputs:
+      - 'scripts/install.sh'
+    options:
+      cache: false
+      runInCI: false
+
+  uninstall:
+    command: 'bash scripts/uninstall.sh'
+    inputs:
+      - 'scripts/uninstall.sh'
+    options:
+      cache: false
+      runInCI: false
+
   smoke:
     command: 'bash scripts/dogfood.sh'
     inputs:
