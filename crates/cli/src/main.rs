@@ -16,6 +16,8 @@ use std::{
     time::Duration,
 };
 
+mod service;
+
 const MAIN_VIEW: &str = "main";
 
 fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dyn Error>> {
@@ -132,6 +134,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DaemonCommand {
+    /// Install and start the user-level daemon service.
+    Install,
+    /// Stop and remove the user-level daemon service.
+    Uninstall,
     /// Start the daemon in the background.
     Start,
     /// Run the daemon in the foreground.
@@ -266,9 +272,72 @@ fn run_daemon() -> Result<(), Box<dyn Error>> {
     }
 }
 
+async fn wait_for_daemon_lock() -> Result<(), Box<dyn Error>> {
+    let path = state_dir()?.join("beholderd.pid");
+    for _ in 0..100 {
+        if !path.exists() {
+            return Ok(());
+        }
+        let file = fs::File::options().read(true).write(true).open(&path)?;
+        if file.try_lock().is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err("beholderd did not release its single-instance lock".into())
+}
+
+async fn stop_for_service_change() -> Result<(), Box<dyn Error>> {
+    if matches!(
+        tokio::time::timeout(Duration::from_millis(500), get_status()).await,
+        Ok(Ok(_))
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), stop())
+            .await
+            .map_err(|_| "timed out stopping beholderd")??;
+    }
+    wait_for_daemon_lock().await
+}
+
+async fn install_daemon_service() -> Result<(), Box<dyn Error>> {
+    stop_for_service_change().await?;
+    let outcome = service::install(&service::installed_daemon_path()?, &state_dir()?)?;
+    println!(
+        "installed {} ({})",
+        outcome.manifest_path.display(),
+        if outcome.manifest_changed {
+            "updated"
+        } else {
+            "unchanged"
+        }
+    );
+    Ok(())
+}
+
+async fn uninstall_daemon_service() -> Result<(), Box<dyn Error>> {
+    stop_for_service_change().await?;
+    let outcome = service::uninstall()?;
+    println!(
+        "{} {}",
+        if outcome.manifest_existed {
+            "removed"
+        } else {
+            "already absent"
+        },
+        outcome.manifest_path.display()
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Some(Command::Daemon {
+            command: DaemonCommand::Install,
+        }) => install_daemon_service().await?,
+        Some(Command::Daemon {
+            command: DaemonCommand::Uninstall,
+        }) => uninstall_daemon_service().await?,
         Some(Command::Daemon {
             command: DaemonCommand::Start,
         }) => start_daemon().await?,
@@ -389,6 +458,14 @@ mod tests {
 
     #[test]
     fn workspace_smoke() {
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "daemon", "install"])
+                .unwrap()
+                .command,
+            Some(Command::Daemon {
+                command: DaemonCommand::Install
+            })
+        ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "daemon", "start"])
                 .unwrap()

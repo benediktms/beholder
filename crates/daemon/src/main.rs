@@ -247,6 +247,33 @@ fn query_response(
         .map_err(|error| Status::internal(error.to_string()))
 }
 
+#[cfg(unix)]
+async fn shutdown_signal(stopped: oneshot::Receiver<()>) {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = stopped => {}
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        Err(_) => {
+            tokio::select! {
+                _ = stopped => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal(stopped: oneshot::Receiver<()>) {
+    tokio::select! {
+        _ = stopped => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let state_dir = state_dir()?;
@@ -265,12 +292,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
     Server::builder()
         .add_service(DaemonServer::new(service))
-        .serve_with_shutdown(address().parse::<SocketAddr>()?, async {
-            tokio::select! {
-                _ = stopped => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        })
+        .serve_with_shutdown(address().parse::<SocketAddr>()?, shutdown_signal(stopped))
         .await?;
     watcher_task.abort();
     Ok(())
