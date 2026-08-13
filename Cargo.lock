@@ -132,6 +132,7 @@ dependencies = [
 name = "beholder-adapters-git"
 version = "0.1.0"
 dependencies = [
+ "beholder-domain",
  "gix-url",
  "sha2",
 ]
