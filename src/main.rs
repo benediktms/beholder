@@ -247,6 +247,30 @@ fn rust_observations(
     Ok(observations)
 }
 
+fn resolve_repository_calls(observations: &mut [[String; 5]]) {
+    let mut definitions = BTreeMap::<String, Option<String>>::new();
+    for row in observations.iter().filter(|row| row[2] == "defines") {
+        let Some(name) = row[3].rsplit('/').next() else {
+            continue;
+        };
+        definitions
+            .entry(name.to_owned())
+            .and_modify(|candidate| {
+                if candidate.as_deref() != Some(row[3].as_str()) {
+                    *candidate = None;
+                }
+            })
+            .or_insert_with(|| Some(row[3].clone()));
+    }
+    for row in observations.iter_mut().filter(|row| row[2] == "calls") {
+        if let Some(name) = row[3].strip_prefix("rust-call://")
+            && let Some(Some(target)) = definitions.get(name)
+        {
+            row[3] = target.clone();
+        }
+    }
+}
+
 fn store_observations(
     transaction: &MultiTransaction,
     observations: &[[String; 5]],
@@ -383,6 +407,7 @@ fn index_rust_repository(
     for (path, source) in &sources {
         all_observations.extend(rust_observations(&repository, source, path)?);
     }
+    resolve_repository_calls(&mut all_observations);
     publish_observations(&db, &all_observations, &fingerprint)?;
     Ok((all_observations.len(), true))
 }
@@ -787,6 +812,34 @@ mod tests {
                 && row[2] == "calls"
                 && row[3] == "repo://beholder/rust/main/query"
         }));
+        let mut cross_file = vec![
+            [
+                "main".into(),
+                "repo://beholder/rust/lib".into(),
+                "calls".into(),
+                "rust-call://helper".into(),
+                "src/lib.rs:1".into(),
+            ],
+            [
+                "main".into(),
+                "repo://beholder/rust/helper".into(),
+                "defines".into(),
+                "repo://beholder/rust/helper/helper".into(),
+                "src/helper.rs:1".into(),
+            ],
+        ];
+        resolve_repository_calls(&mut cross_file);
+        assert_eq!(cross_file[0][3], "repo://beholder/rust/helper/helper");
+        cross_file.push([
+            "main".into(),
+            "repo://beholder/rust/other".into(),
+            "defines".into(),
+            "repo://beholder/rust/other/helper".into(),
+            "src/other.rs:1".into(),
+        ]);
+        cross_file[0][3] = "rust-call://helper".into();
+        resolve_repository_calls(&mut cross_file);
+        assert_eq!(cross_file[0][3], "rust-call://helper");
 
         let path = env::temp_dir().join(format!("beholder-dogfood-{}.db", std::process::id()));
         let _ = fs::remove_file(&path);
