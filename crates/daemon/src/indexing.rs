@@ -24,6 +24,7 @@ use tokio::{
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
+const CORE_RULE_PACK_VERSION: &str = "1";
 type RustSources = Vec<(PathBuf, String)>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -313,14 +314,6 @@ impl IndexScheduler {
             .join(format!("{hash}.json"))
     }
 
-    fn repository_observations(
-        &self,
-        state: &RepositoryState,
-        sources: &RustSources,
-    ) -> Cached<Vec<Observation>> {
-        self.repository_observations_versioned(state, sources, FRONTEND_VERSION, RESOLVER_VERSION)
-    }
-
     fn repository_observations_versioned(
         &self,
         state: &RepositoryState,
@@ -408,6 +401,24 @@ fn index_rust_workspace(
     store: &SemanticStore,
     workspace: &Workspace,
 ) -> Result<(usize, bool), Box<dyn Error>> {
+    index_rust_workspace_versioned(
+        scheduler,
+        store,
+        workspace,
+        FRONTEND_VERSION,
+        RESOLVER_VERSION,
+        CORE_RULE_PACK_VERSION,
+    )
+}
+
+fn index_rust_workspace_versioned(
+    scheduler: &IndexScheduler,
+    store: &SemanticStore,
+    workspace: &Workspace,
+    frontend_version: &'static str,
+    resolver_version: &'static str,
+    rule_pack_version: &'static str,
+) -> Result<(usize, bool), Box<dyn Error>> {
     let repositories = workspace
         .repositories
         .iter()
@@ -415,6 +426,7 @@ fn index_rust_workspace(
         .collect::<Result<Vec<_>, _>>()?;
     let view = WorkspaceView::new(
         &workspace.name,
+        format!("rust:{frontend_version}:{resolver_version}:core-rules:{rule_pack_version}"),
         repositories
             .iter()
             .map(|(state, _)| state.clone())
@@ -426,7 +438,12 @@ fn index_rust_workspace(
 
     let mut all_observations = Vec::new();
     for (state, sources) in repositories {
-        let (observations, _) = scheduler.repository_observations(&state, &sources)?;
+        let (observations, _) = scheduler.repository_observations_versioned(
+            &state,
+            &sources,
+            frontend_version,
+            resolver_version,
+        )?;
         all_observations.extend(observations.iter().cloned());
     }
     resolve_repository_calls(&mut all_observations);
@@ -517,8 +534,12 @@ mod tests {
             "fn caller() { helper(); } fn helper() {}".into(),
         )];
         let scheduler = IndexScheduler::new(cache.clone());
-        let (first, first_status) = scheduler.repository_observations(&state, &sources).unwrap();
-        let (second, second_status) = scheduler.repository_observations(&state, &sources).unwrap();
+        let (first, first_status) = scheduler
+            .repository_observations_versioned(&state, &sources, FRONTEND_VERSION, RESOLVER_VERSION)
+            .unwrap();
+        let (second, second_status) = scheduler
+            .repository_observations_versioned(&state, &sources, FRONTEND_VERSION, RESOLVER_VERSION)
+            .unwrap();
 
         assert_eq!(first_status, CacheStatus::Miss);
         assert_eq!(second_status, CacheStatus::Memory);
@@ -532,7 +553,12 @@ mod tests {
         let scheduler = IndexScheduler::new(cache.clone());
         assert_eq!(
             scheduler
-                .repository_observations(&state, &sources)
+                .repository_observations_versioned(
+                    &state,
+                    &sources,
+                    FRONTEND_VERSION,
+                    RESOLVER_VERSION,
+                )
                 .unwrap()
                 .1,
             CacheStatus::Disk
@@ -557,7 +583,12 @@ mod tests {
         let scheduler = IndexScheduler::new(cache.clone());
         assert_eq!(
             scheduler
-                .repository_observations(&versioned_state, &sources)
+                .repository_observations_versioned(
+                    &versioned_state,
+                    &sources,
+                    FRONTEND_VERSION,
+                    RESOLVER_VERSION,
+                )
                 .unwrap()
                 .1,
             CacheStatus::Miss
@@ -566,6 +597,43 @@ mod tests {
         assert!(scheduler.rust_cache.lock().unwrap().is_empty());
         assert!(scheduler.repository_cache.lock().unwrap().is_empty());
         assert!(!cache.exists());
+    }
+
+    #[test]
+    fn workspace_view_invalidates_when_analysis_version_changes() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-view-version-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let workspace = Workspace::new("main", vec![repository]).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+
+        assert!(
+            index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "1")
+                .unwrap()
+                .1
+        );
+        assert!(
+            !index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "1")
+                .unwrap()
+                .1
+        );
+        assert!(
+            index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "2")
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            store.inspect_revisions().unwrap().rows[0][1].as_i64(),
+            Some(2)
+        );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[tokio::test]

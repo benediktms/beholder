@@ -1,6 +1,6 @@
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_adapters_treesitter_rust::observations;
+use beholder_adapters_treesitter_rust::{FRONTEND_VERSION, observations};
 use beholder_daemon_client::{
     clear_cache, context as daemon_context, dependencies as daemon_dependencies, get_status,
     impact as daemon_impact, index_rust_workspace as daemon_index_workspace, list_workspaces,
@@ -23,7 +23,11 @@ const MAIN_VIEW: &str = "main";
 fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dyn Error>> {
     let sources = vec![(path.to_path_buf(), fs::read_to_string(path)?)];
     let state = repository_state(path.parent().unwrap_or_else(|| Path::new(".")), &sources)?;
-    let view = WorkspaceView::new(MAIN_VIEW, vec![state.clone()])?;
+    let view = WorkspaceView::new(
+        MAIN_VIEW,
+        format!("rust:{FRONTEND_VERSION}:single-file:1"),
+        vec![state.clone()],
+    )?;
     let store = SemanticStore::persistent(database_path, true)?;
     if store.view_matches(&view)? {
         return Ok((0, false));
