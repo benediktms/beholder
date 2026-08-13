@@ -67,24 +67,24 @@ pub fn observations(
 
     for (name, function) in functions {
         let function_id = definitions[&name].clone();
-        observations.push([
-            source_id.clone(),
-            "defines".into(),
-            function_id.clone(),
-            format!("{}:{}", path.display(), function.start_position().row + 1),
-        ]);
+        observations.push(Observation {
+            from: source_id.clone(),
+            relation: "defines".into(),
+            to: function_id.clone(),
+            evidence: format!("{}:{}", path.display(), function.start_position().row + 1),
+        });
         let mut calls = Vec::new();
         collect_calls(function, source_bytes, &mut calls);
         for (callee, line) in calls {
-            observations.push([
-                function_id.clone(),
-                "calls".into(),
-                definitions
+            observations.push(Observation {
+                from: function_id.clone(),
+                relation: "calls".into(),
+                to: definitions
                     .get(&callee)
                     .cloned()
                     .unwrap_or_else(|| format!("rust-call://{callee}")),
-                format!("{}:{line}", path.display()),
-            ]);
+                evidence: format!("{}:{line}", path.display()),
+            });
         }
     }
     Ok(observations)
@@ -92,24 +92,30 @@ pub fn observations(
 
 pub fn resolve_repository_calls(observations: &mut [Observation]) {
     let mut definitions = BTreeMap::<String, Option<String>>::new();
-    for row in observations.iter().filter(|row| row[1] == "defines") {
-        let Some(name) = row[2].rsplit('/').next() else {
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.relation == "defines")
+    {
+        let Some(name) = observation.to.rsplit('/').next() else {
             continue;
         };
         definitions
             .entry(name.to_owned())
             .and_modify(|candidate| {
-                if candidate.as_deref() != Some(row[2].as_str()) {
+                if candidate.as_deref() != Some(observation.to.as_str()) {
                     *candidate = None;
                 }
             })
-            .or_insert_with(|| Some(row[2].clone()));
+            .or_insert_with(|| Some(observation.to.clone()));
     }
-    for row in observations.iter_mut().filter(|row| row[1] == "calls") {
-        if let Some(name) = row[2].strip_prefix("rust-call://")
+    for observation in observations
+        .iter_mut()
+        .filter(|observation| observation.relation == "calls")
+    {
+        if let Some(name) = observation.to.strip_prefix("rust-call://")
             && let Some(Some(target)) = definitions.get(name)
         {
-            row[2] = target.clone();
+            observation.to = target.clone();
         }
     }
 }
@@ -144,33 +150,33 @@ mod tests {
             Path::new("src/lib.rs"),
         )
         .unwrap();
-        assert!(observations.iter().any(|row| {
-            row[0] == "repo://beholder/rust/lib/first"
-                && row[1] == "calls"
-                && row[2] == "repo://beholder/rust/lib/second"
+        assert!(observations.iter().any(|observation| {
+            observation.from == "repo://beholder/rust/lib/first"
+                && observation.relation == "calls"
+                && observation.to == "repo://beholder/rust/lib/second"
         }));
 
         let mut ambiguous = vec![
-            [
-                "repo://beholder/rust/caller".into(),
-                "calls".into(),
-                "rust-call://helper".into(),
-                "src/lib.rs:1".into(),
-            ],
-            [
-                "repo://beholder/rust/one".into(),
-                "defines".into(),
-                "repo://beholder/rust/one/helper".into(),
-                "src/one.rs:1".into(),
-            ],
-            [
-                "repo://beholder/rust/two".into(),
-                "defines".into(),
-                "repo://beholder/rust/two/helper".into(),
-                "src/two.rs:1".into(),
-            ],
+            Observation {
+                from: "repo://beholder/rust/caller".into(),
+                relation: "calls".into(),
+                to: "rust-call://helper".into(),
+                evidence: "src/lib.rs:1".into(),
+            },
+            Observation {
+                from: "repo://beholder/rust/one".into(),
+                relation: "defines".into(),
+                to: "repo://beholder/rust/one/helper".into(),
+                evidence: "src/one.rs:1".into(),
+            },
+            Observation {
+                from: "repo://beholder/rust/two".into(),
+                relation: "defines".into(),
+                to: "repo://beholder/rust/two/helper".into(),
+                evidence: "src/two.rs:1".into(),
+            },
         ];
         resolve_repository_calls(&mut ambiguous);
-        assert_eq!(ambiguous[0][2], "rust-call://helper");
+        assert_eq!(ambiguous[0].to, "rust-call://helper");
     }
 }

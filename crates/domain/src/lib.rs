@@ -1,6 +1,12 @@
 use std::path::PathBuf;
 
-pub type Observation = [String; 4];
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Observation {
+    pub from: String,
+    pub relation: String,
+    pub to: String,
+    pub evidence: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {

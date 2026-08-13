@@ -293,16 +293,16 @@ fn store_observations(
     observations: &[Observation],
 ) -> Result<(), Box<dyn Error>> {
     // ponytail: one transaction, per-row writes; batch when ingestion throughput matters.
-    for [from, relation, to, evidence] in observations {
+    for observation in observations {
         transaction.run_script(
             "?[view, from, relation, to, evidence] <- [[$view, $from, $relation, $to, $evidence]]\n\
              :put observation {view, from, relation, to => evidence}",
             BTreeMap::from([
                 ("view".into(), view.into()),
-                ("from".into(), from.clone().into()),
-                ("relation".into(), relation.clone().into()),
-                ("to".into(), to.clone().into()),
-                ("evidence".into(), evidence.clone().into()),
+                ("from".into(), observation.from.clone().into()),
+                ("relation".into(), observation.relation.clone().into()),
+                ("to".into(), observation.to.clone().into()),
+                ("evidence".into(), observation.evidence.clone().into()),
             ]),
         )?;
     }
