@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(pwd)"
+state="$(mktemp -d "${TMPDIR:-/tmp}/beholder-dogfood.XXXXXX")"
+# ponytail: PID-derived port can collide; accept BEHOLDER_ADDRESS when parallel dogfood makes that real.
+export BEHOLDER_ADDRESS="${BEHOLDER_ADDRESS:-127.0.0.1:$((49152 + $$ % 10000))}"
+export BEHOLDER_STATE_DIR="$state"
+daemon_pid=""
+
+cleanup() {
+    if [[ -n "$daemon_pid" ]]; then
+        target/debug/beholder daemon stop >/dev/null 2>&1 || true
+        kill "$daemon_pid" >/dev/null 2>&1 || true
+        wait "$daemon_pid" 2>/dev/null || true
+    fi
+    rm -rf "$state"
+}
+trap cleanup EXIT
+
+cargo build -p beholder-cli -p beholder-daemon
+target/debug/beholderd >"$state/daemon.log" 2>&1 &
+daemon_pid=$!
+
+for _ in {1..200}; do
+    if target/debug/beholder daemon status >/dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then
+        cat "$state/daemon.log" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+target/debug/beholder daemon status >/dev/null
+target/debug/beholder workspace register main "$root" >/dev/null
+
+caller='repo://beholder/rust/crates/daemon/src/main/main'
+callee='repo://beholder/rust/crates/daemon-client/src/lib/state_dir'
+for _ in {1..600}; do
+    if result="$(target/debug/beholder why --workspace main "$caller" "$callee" 2>/dev/null)" \
+        && grep -Fq "$callee" <<<"$result"; then
+        break
+    fi
+    sleep 0.05
+done
+
+grep -Fq "$callee" <<<"${result:-}"
+revision="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
+grep -Fq 'String("main")' <<<"$revision"
+echo "dogfood smoke passed: indexed Beholder and resolved main -> state_dir"

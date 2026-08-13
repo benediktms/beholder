@@ -1,5 +1,5 @@
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_daemon_client::{ADDRESS, state_dir};
+use beholder_daemon_client::{address, state_dir};
 use beholder_protocol::v1::{
     EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest,
     IndexRustWorkspaceResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
@@ -265,7 +265,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
     Server::builder()
         .add_service(DaemonServer::new(service))
-        .serve_with_shutdown(ADDRESS.parse::<SocketAddr>()?, async {
+        .serve_with_shutdown(address().parse::<SocketAddr>()?, async {
             tokio::select! {
                 _ = stopped => {}
                 _ = tokio::signal::ctrl_c() => {}

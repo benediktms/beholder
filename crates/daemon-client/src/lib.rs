@@ -7,8 +7,15 @@ use beholder_protocol::v1::{
 };
 use std::path::{Path, PathBuf};
 
-pub const ADDRESS: &str = "127.0.0.1:50051";
-pub const ENDPOINT: &str = "http://127.0.0.1:50051";
+const DEFAULT_ADDRESS: &str = "127.0.0.1:50051";
+
+pub fn address() -> String {
+    std::env::var("BEHOLDER_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into())
+}
+
+fn endpoint() -> String {
+    format!("http://{}", address())
+}
 
 pub fn state_dir() -> Result<PathBuf, String> {
     let base = if let Some(path) = env_path("BEHOLDER_STATE_DIR") {
@@ -30,7 +37,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(ENDPOINT)
+    Ok(DaemonClient::connect(endpoint())
         .await?
         .get_status(GetStatusRequest {})
         .await?
@@ -41,7 +48,7 @@ pub async fn context(
     workspace: String,
     entity: String,
 ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(ENDPOINT)
+    Ok(DaemonClient::connect(endpoint())
         .await?
         .context(EntityRequest { workspace, entity })
         .await?
@@ -53,7 +60,7 @@ pub async fn dependencies(
     workspace: String,
     entity: String,
 ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(ENDPOINT)
+    Ok(DaemonClient::connect(endpoint())
         .await?
         .dependencies(EntityRequest { workspace, entity })
         .await?
@@ -65,7 +72,7 @@ pub async fn impact(
     workspace: String,
     entity: String,
 ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(ENDPOINT)
+    Ok(DaemonClient::connect(endpoint())
         .await?
         .impact(EntityRequest { workspace, entity })
         .await?
@@ -78,7 +85,7 @@ pub async fn trace(
     from: String,
     to: String,
 ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(ENDPOINT)
+    Ok(DaemonClient::connect(endpoint())
         .await?
         .trace(PathRequest {
             workspace,
@@ -95,7 +102,7 @@ pub async fn why(
     from: String,
     to: String,
 ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(ENDPOINT)
+    Ok(DaemonClient::connect(endpoint())
         .await?
         .why(PathRequest {
             workspace,
@@ -110,7 +117,7 @@ pub async fn why(
 pub async fn index_rust_workspace(
     workspace: String,
 ) -> Result<(usize, bool), Box<dyn std::error::Error>> {
-    let response = DaemonClient::connect(ENDPOINT)
+    let response = DaemonClient::connect(endpoint())
         .await?
         .index_rust_workspace(IndexRustWorkspaceRequest { workspace })
         .await?
@@ -126,7 +133,7 @@ pub async fn register_workspace(
         .iter()
         .map(|path| path_string(path))
         .collect::<Result<_, _>>()?;
-    let workspace = DaemonClient::connect(ENDPOINT)
+    let workspace = DaemonClient::connect(endpoint())
         .await?
         .register_workspace(RegisterWorkspaceRequest { name, repositories })
         .await?
@@ -137,7 +144,7 @@ pub async fn register_workspace(
 }
 
 pub async fn list_workspaces() -> Result<Vec<Workspace>, Box<dyn std::error::Error>> {
-    DaemonClient::connect(ENDPOINT)
+    DaemonClient::connect(endpoint())
         .await?
         .list_workspaces(ListWorkspacesRequest {})
         .await?
@@ -155,7 +162,7 @@ fn path_string(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 pub async fn stop() -> Result<bool, Box<dyn std::error::Error>> {
-    let Ok(mut client) = DaemonClient::connect(ENDPOINT).await else {
+    let Ok(mut client) = DaemonClient::connect(endpoint()).await else {
         return Ok(false);
     };
     Ok(client.stop(StopRequest {}).await?.into_inner().accepted)

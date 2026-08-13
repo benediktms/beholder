@@ -20,6 +20,12 @@ workspace:
 
 tasks:
   dogfood:
-    extends: 'smoke'
-    deps:
-      - 'beholder-daemon:smoke'
+    command: 'bash scripts/dogfood.sh'
+    inputs:
+      - '/Cargo.lock'
+      - '/Cargo.toml'
+      - '/crates/**/*'
+      - '/scripts/dogfood.sh'
+    options:
+      cache: false
+      runFromWorkspaceRoot: true
