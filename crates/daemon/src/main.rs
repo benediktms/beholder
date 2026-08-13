@@ -56,7 +56,7 @@ fn daemon(
         watch_workspace(&mut watcher, workspace)?;
     }
     for workspace in registered {
-        scheduler.mark(workspace.name);
+        scheduler.mark(&workspace);
     }
     Ok((
         BeholderDaemon {
@@ -117,7 +117,10 @@ impl Daemon for BeholderDaemon {
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.context(&request.workspace, &request.entity))
+        self.query_response(
+            &request.workspace,
+            self.store.context(&request.workspace, &request.entity),
+        )
     }
 
     async fn dependencies(
@@ -125,7 +128,10 @@ impl Daemon for BeholderDaemon {
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.dependencies(&request.workspace, &request.entity))
+        self.query_response(
+            &request.workspace,
+            self.store.dependencies(&request.workspace, &request.entity),
+        )
     }
 
     async fn get_status(
@@ -144,7 +150,10 @@ impl Daemon for BeholderDaemon {
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.impact(&request.workspace, &request.entity))
+        self.query_response(
+            &request.workspace,
+            self.store.impact(&request.workspace, &request.entity),
+        )
     }
 
     async fn index_rust_workspace(
@@ -218,7 +227,7 @@ impl Daemon for BeholderDaemon {
             .map_err(|_| Status::internal("filesystem watcher lock poisoned"))?;
         update_workspace_watch(&mut watcher, previous.as_ref(), &workspace)
             .map_err(|error| Status::internal(error.to_string()))?;
-        self.scheduler.mark(workspace.name.clone());
+        self.scheduler.mark(&workspace);
         Ok(Response::new(RegisterWorkspaceResponse {
             workspace: Some(workspace.into()),
         }))
@@ -236,7 +245,8 @@ impl Daemon for BeholderDaemon {
 
     async fn trace(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(
+        self.query_response(
+            &request.workspace,
             self.store
                 .trace(&request.workspace, &request.from, &request.to),
         )
@@ -244,19 +254,28 @@ impl Daemon for BeholderDaemon {
 
     async fn why(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(
+        self.query_response(
+            &request.workspace,
             self.store
                 .trace(&request.workspace, &request.from, &request.to),
         )
     }
 }
 
-fn query_response(
-    result: Result<beholder_dto::QueryResult, Box<dyn Error>>,
-) -> Result<Response<QueryResult>, Status> {
-    result
-        .map(|result| Response::new(result.into()))
-        .map_err(|error| Status::internal(error.to_string()))
+impl BeholderDaemon {
+    fn query_response(
+        &self,
+        workspace: &str,
+        result: Result<beholder_dto::QueryResult, Box<dyn Error>>,
+    ) -> Result<Response<QueryResult>, Status> {
+        let mut result = result.map_err(|error| Status::internal(error.to_string()))?;
+        let revision = self
+            .store
+            .analysis_revision(workspace)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        result.metadata = Some(self.scheduler.query_metadata(workspace, revision));
+        Ok(Response::new(result.into()))
+    }
 }
 
 #[cfg(unix)]
@@ -436,6 +455,20 @@ mod tests {
             .into_inner();
         assert!(!unchanged.published);
         assert_eq!(unchanged.observation_count, 0);
+        let metadata = client
+            .context(EntityRequest {
+                workspace: "main".into(),
+                entity: caller.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .metadata
+            .unwrap();
+        assert_eq!(metadata.analysis_revision, 1);
+        assert!(!metadata.stale);
+        assert!(!metadata.indexing);
+        assert!(metadata.dirty_repositories.is_empty());
         client.clear_cache(ClearCacheRequest {}).await.unwrap();
         assert!(!state.join("frontend-cache").exists());
 

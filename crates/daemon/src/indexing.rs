@@ -1,11 +1,12 @@
 use crate::workspace_registry::WorkspaceRegistry;
-use beholder_adapters_git::repository_state;
+use beholder_adapters_git::{repository_identity, repository_state};
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
     resolve_repository_calls, source_files,
 };
 use beholder_domain::{Observation, RepositoryState, Workspace, WorkspaceView};
+use beholder_dto::QueryMetadata;
 use notify::{Event, EventKind};
 use sha2::{Digest, Sha256};
 use std::{
@@ -60,6 +61,7 @@ type Cached<T> = Result<(Arc<T>, CacheStatus), Box<dyn Error>>;
 
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
+    dirty_repositories: Mutex<BTreeMap<String, BTreeSet<String>>>,
     changed: Notify,
     indexing: Mutex<()>,
     cache_dir: PathBuf,
@@ -72,6 +74,7 @@ impl IndexScheduler {
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             generations: Mutex::new(BTreeMap::new()),
+            dirty_repositories: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
             indexing: Mutex::new(()),
             cache_dir,
@@ -80,10 +83,40 @@ impl IndexScheduler {
         }
     }
 
-    pub fn mark(&self, workspace: String) {
+    pub fn mark(&self, workspace: &Workspace) {
         if let Ok(mut generations) = self.generations.lock() {
-            *generations.entry(workspace).or_default() += 1;
+            *generations.entry(workspace.name.clone()).or_default() += 1;
+            if let Ok(mut dirty) = self.dirty_repositories.lock() {
+                dirty.entry(workspace.name.clone()).or_default().extend(
+                    workspace.repositories.iter().map(|root| {
+                        repository_identity(root)
+                            .unwrap_or_else(|_| root.to_string_lossy().into_owned())
+                    }),
+                );
+            }
             self.changed.notify_one();
+        }
+    }
+
+    pub fn query_metadata(&self, workspace: &str, analysis_revision: u64) -> QueryMetadata {
+        let stale = self
+            .generations
+            .lock()
+            .is_ok_and(|generations| generations.contains_key(workspace));
+        let dirty_repositories = self
+            .dirty_repositories
+            .lock()
+            .ok()
+            .and_then(|dirty| dirty.get(workspace).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let indexing = stale && self.indexing.try_lock().is_err();
+        QueryMetadata {
+            analysis_revision,
+            stale,
+            indexing,
+            dirty_repositories,
         }
     }
 
@@ -135,22 +168,41 @@ impl IndexScheduler {
         let Ok(mut generations) = self.generations.lock() else {
             return;
         };
+        let Ok(mut dirty_repositories) = self.dirty_repositories.lock() else {
+            return;
+        };
         let mut changed = false;
         // ponytail: linear root matching and full-workspace reindex; add per-source invalidation when dogfood shows it matters.
         for workspace in registry.list() {
-            if event.paths.iter().any(|path| {
-                workspace.repositories.iter().any(|root| {
-                    path.strip_prefix(root).is_ok_and(|relative| {
-                        relative
-                            .extension()
-                            .is_some_and(|extension| extension == "rs")
-                            && !relative.components().any(|component| {
-                                matches!(component.as_os_str().to_str(), Some(".git" | "target"))
-                            })
+            let dirty = workspace
+                .repositories
+                .iter()
+                .filter(|root| {
+                    event.paths.iter().any(|path| {
+                        path.strip_prefix(root).is_ok_and(|relative| {
+                            relative
+                                .extension()
+                                .is_some_and(|extension| extension == "rs")
+                                && !relative.components().any(|component| {
+                                    matches!(
+                                        component.as_os_str().to_str(),
+                                        Some(".git" | "target")
+                                    )
+                                })
+                        })
                     })
                 })
-            }) {
-                *generations.entry(workspace.name).or_default() += 1;
+                .map(|root| {
+                    repository_identity(root)
+                        .unwrap_or_else(|_| root.to_string_lossy().into_owned())
+                })
+                .collect::<Vec<_>>();
+            if !dirty.is_empty() {
+                *generations.entry(workspace.name.clone()).or_default() += 1;
+                dirty_repositories
+                    .entry(workspace.name)
+                    .or_default()
+                    .extend(dirty);
                 changed = true;
             }
         }
@@ -204,18 +256,15 @@ impl IndexScheduler {
     }
 
     fn mark_registered(&self, workspaces: &Mutex<WorkspaceRegistry>) -> bool {
-        let Ok(workspaces) = workspaces.lock() else {
+        let Ok(registry) = workspaces.lock() else {
             return false;
         };
-        let Ok(mut generations) = self.generations.lock() else {
-            return false;
-        };
-        let mut dirty = false;
-        for workspace in workspaces.list() {
-            *generations.entry(workspace.name).or_default() += 1;
-            dirty = true;
+        let workspaces = registry.list();
+        drop(registry);
+        for workspace in &workspaces {
+            self.mark(workspace);
         }
-        dirty
+        !workspaces.is_empty()
     }
 
     fn reindex_dirty(&self, store: &SemanticStore, workspaces: &Mutex<WorkspaceRegistry>) {
@@ -255,6 +304,9 @@ impl IndexScheduler {
                     .is_none_or(|indexed| generation > indexed)
             }) {
                 self.changed.notify_one();
+            }
+            if let Ok(mut dirty) = self.dirty_repositories.lock() {
+                dirty.retain(|name, _| generations.contains_key(name));
             }
         }
     }
@@ -633,6 +685,30 @@ mod tests {
             Some(2)
         );
         drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn query_metadata_reports_pending_repository_state() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-freshness-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        let workspace = Workspace::new("main", vec![repository]).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+
+        scheduler.mark(&workspace);
+        let pending = scheduler.query_metadata("main", 4);
+        assert_eq!(pending.analysis_revision, 4);
+        assert!(pending.stale);
+        assert!(!pending.indexing);
+        assert_eq!(pending.dirty_repositories, ["repo"]);
+
+        let _indexing = scheduler.indexing.lock().unwrap();
+        assert!(scheduler.query_metadata("main", 4).indexing);
         fs::remove_dir_all(state).unwrap();
     }
 

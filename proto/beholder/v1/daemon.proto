@@ -35,6 +35,14 @@ message QueryResult {
   repeated string headers = 1;
   repeated QueryRow rows = 2;
   optional QueryResult next = 3;
+  optional QueryMetadata metadata = 4;
+}
+
+message QueryMetadata {
+  uint64 analysis_revision = 1;
+  bool stale = 2;
+  bool indexing = 3;
+  repeated string dirty_repositories = 4;
 }
 
 message QueryRow {

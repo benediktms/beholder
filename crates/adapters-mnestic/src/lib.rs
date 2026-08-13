@@ -50,6 +50,10 @@ impl SemanticStore {
         inspect_revisions(&self.db).map(query_result)
     }
 
+    pub fn analysis_revision(&self, view: &str) -> Result<u64, Box<dyn Error>> {
+        analysis_revision(&self.db, view)
+    }
+
     pub fn inspect_observations(
         &self,
         relation: Option<&str>,
@@ -97,6 +101,7 @@ fn query_result(rows: NamedRows) -> QueryResult {
             .map(|row| row.into_iter().map(query_value).collect())
             .collect(),
         next: rows.next.map(|next| Box::new(query_result(*next))),
+        metadata: None,
     }
 }
 
@@ -409,6 +414,21 @@ fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Immutable,
     )?)
+}
+
+fn analysis_revision(db: &DbInstance, view: &str) -> Result<u64, Box<dyn Error>> {
+    let rows = query(
+        db,
+        view,
+        "?[revision] := *analysis_revision{view: $view, revision}",
+        [],
+    )?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row[0].get_int())
+        .unwrap_or_default()
+        .try_into()?)
 }
 
 fn inspect_observations(

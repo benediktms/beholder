@@ -3,7 +3,9 @@ pub mod v1 {
 }
 
 use beholder_domain::Workspace as DomainWorkspace;
-use beholder_dto::{QueryResult as DtoResult, QueryValue as DtoValue};
+use beholder_dto::{
+    QueryMetadata as DtoMetadata, QueryResult as DtoResult, QueryValue as DtoValue,
+};
 use std::path::PathBuf;
 use v1::{QueryList, QueryResult, QueryRow, QueryValue, query_value};
 
@@ -47,6 +49,7 @@ impl From<DtoResult> for QueryResult {
                 })
                 .collect(),
             next: result.next.map(|next| Box::new((*next).into())),
+            metadata: result.metadata.map(Into::into),
         }
     }
 }
@@ -66,7 +69,30 @@ impl TryFrom<QueryResult> for DtoResult {
                 Some(next) => Some(Box::new((*next).try_into()?)),
                 None => None,
             },
+            metadata: result.metadata.map(Into::into),
         })
+    }
+}
+
+impl From<DtoMetadata> for v1::QueryMetadata {
+    fn from(metadata: DtoMetadata) -> Self {
+        Self {
+            analysis_revision: metadata.analysis_revision,
+            stale: metadata.stale,
+            indexing: metadata.indexing,
+            dirty_repositories: metadata.dirty_repositories,
+        }
+    }
+}
+
+impl From<v1::QueryMetadata> for DtoMetadata {
+    fn from(metadata: v1::QueryMetadata) -> Self {
+        Self {
+            analysis_revision: metadata.analysis_revision,
+            stale: metadata.stale,
+            indexing: metadata.indexing,
+            dirty_repositories: metadata.dirty_repositories,
+        }
     }
 }
 
@@ -136,6 +162,12 @@ mod tests {
                 DtoValue::Other("other".into()),
             ])]],
             next: None,
+            metadata: Some(DtoMetadata {
+                analysis_revision: 3,
+                stale: true,
+                indexing: true,
+                dirty_repositories: vec!["repo".into()],
+            }),
         };
         assert_eq!(
             DtoResult::try_from(QueryResult::from(result.clone())).unwrap(),
