@@ -18,8 +18,10 @@ fn canonical_url(remote: &gix::Url) -> Option<String> {
 }
 
 pub fn repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
-    let repository = gix::discover(root)?;
-    repository_identity_from(&repository, root)
+    match gix::discover(root) {
+        Ok(repository) => repository_identity_from(&repository, root),
+        Err(_) => local_repository_identity(root),
+    }
 }
 
 fn repository_identity_from(
@@ -34,6 +36,10 @@ fn repository_identity_from(
     if let Some(identity) = identity {
         return Ok(identity);
     }
+    local_repository_identity(root)
+}
+
+fn local_repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
     // ponytail: directory name is the local-only fallback; canonical Git remotes come with registration.
     root.canonicalize()?
         .file_name()
