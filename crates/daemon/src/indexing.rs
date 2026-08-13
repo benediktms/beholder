@@ -139,6 +139,7 @@ impl IndexScheduler {
         Ok(())
     }
 
+    #[tracing::instrument(name = "index.workspace", skip(self, store), err, fields(workspace = %workspace.name))]
     pub fn index(
         &self,
         store: &SemanticStore,
@@ -155,7 +156,7 @@ impl IndexScheduler {
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                eprintln!("filesystem watcher error: {error}");
+                tracing::warn!(%error, "filesystem watcher error");
                 return;
             }
         };
@@ -198,6 +199,7 @@ impl IndexScheduler {
                 })
                 .collect::<Vec<_>>();
             if !dirty.is_empty() {
+                tracing::debug!(workspace = %workspace.name, repositories = ?dirty, "workspace marked stale");
                 *generations.entry(workspace.name.clone()).or_default() += 1;
                 dirty_repositories
                     .entry(workspace.name)
@@ -288,7 +290,9 @@ impl IndexScheduler {
                 Ok(_) => {
                     completed.insert(workspace.name);
                 }
-                Err(error) => eprintln!("failed to reindex workspace {}: {error}", workspace.name),
+                Err(error) => {
+                    tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed")
+                }
             }
         }
         if let Ok(mut generations) = self.generations.lock() {
@@ -385,6 +389,7 @@ impl IndexScheduler {
             .get(&key)
             .cloned()
         {
+            tracing::debug!(repository = %state.repository.identity, cache_status = "memory", "repository cache lookup");
             return Ok((observations, CacheStatus::Memory));
         }
         let path = self
@@ -402,13 +407,20 @@ impl IndexScheduler {
                 .lock()
                 .map_err(|_| "repository cache lock poisoned")?
                 .insert(key, observations.clone());
+            tracing::debug!(repository = %state.repository.identity, cache_status = "disk", "repository cache lookup");
             return Ok((observations, CacheStatus::Disk));
         }
         let mut observations = Vec::new();
         for (path, source) in sources {
-            let (analysis, _) = self
-                .rust_analysis_versioned(source, frontend_version)
-                .map_err(|error| format!("failed to analyze {}: {error}", path.display()))?;
+            let (analysis, cache_status) =
+                self.rust_analysis_versioned(source, frontend_version)
+                    .map_err(|error| format!("failed to analyze {}: {error}", path.display()))?;
+            tracing::debug!(
+                repository = %state.repository.identity,
+                path = %path.display(),
+                ?cache_status,
+                "frontend cache lookup"
+            );
             observations.extend(observations_from_analysis(
                 &state.repository.identity,
                 &analysis,
@@ -427,6 +439,7 @@ impl IndexScheduler {
             .lock()
             .map_err(|_| "repository cache lock poisoned")?
             .insert(key, observations.clone());
+        tracing::debug!(repository = %state.repository.identity, cache_status = "miss", "repository cache lookup");
         Ok((observations, CacheStatus::Miss))
     }
 }
@@ -485,21 +498,38 @@ fn index_rust_workspace_versioned(
             .collect(),
     )?;
     if store.view_matches(&view)? {
+        tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
 
     let mut all_observations = Vec::new();
+    let mut memory_hits = 0;
+    let mut disk_hits = 0;
+    let mut misses = 0;
     for (state, sources) in repositories {
-        let (observations, _) = scheduler.repository_observations_versioned(
+        let (observations, cache_status) = scheduler.repository_observations_versioned(
             &state,
             &sources,
             frontend_version,
             resolver_version,
         )?;
+        match cache_status {
+            CacheStatus::Memory => memory_hits += 1,
+            CacheStatus::Disk => disk_hits += 1,
+            CacheStatus::Miss => misses += 1,
+        }
         all_observations.extend(observations.iter().cloned());
     }
     resolve_repository_calls(&mut all_observations);
     store.publish(&view, &all_observations)?;
+    tracing::info!(
+        workspace = %workspace.name,
+        observation_count = all_observations.len(),
+        repository_cache_memory_hits = memory_hits,
+        repository_cache_disk_hits = disk_hits,
+        repository_cache_misses = misses,
+        "workspace indexed"
+    );
     Ok((all_observations.len(), true))
 }
 

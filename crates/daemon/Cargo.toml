@@ -21,3 +21,6 @@ serde_json = "1.0.149"
 sha2 = "0.10.9"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tonic = "0.14.6"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
