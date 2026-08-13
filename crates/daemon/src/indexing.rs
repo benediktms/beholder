@@ -1,9 +1,13 @@
 use crate::workspace_registry::WorkspaceRegistry;
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, source_files};
+use beholder_adapters_treesitter_rust::{
+    FRONTEND_VERSION, RustAnalysis, analyze, observations_from_analysis, resolve_repository_calls,
+    source_files,
+};
 use beholder_domain::{RepositoryState, Workspace, WorkspaceView};
 use notify::{Event, EventKind};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -22,10 +26,18 @@ const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
 type RustSources = Vec<(PathBuf, String)>;
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SourceAnalysisKey {
+    content_hash: [u8; 32],
+    frontend_version: &'static str,
+}
+
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     changed: Notify,
     indexing: Mutex<()>,
+    // ponytail: process-local cache is unbounded; persist and evict after measured daemon memory pressure.
+    rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
 }
 
 impl IndexScheduler {
@@ -34,6 +46,7 @@ impl IndexScheduler {
             generations: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
             indexing: Mutex::new(()),
+            rust_cache: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -53,7 +66,7 @@ impl IndexScheduler {
             .indexing
             .lock()
             .map_err(|_| "index coordinator lock poisoned")?;
-        index_rust_workspace(store, workspace)
+        index_rust_workspace(self, store, workspace)
     }
 
     pub fn add_event(&self, event: notify::Result<Event>, workspaces: &Mutex<WorkspaceRegistry>) {
@@ -173,7 +186,7 @@ impl IndexScheduler {
         };
         let mut completed = BTreeSet::new();
         for workspace in registered {
-            match index_rust_workspace(store, &workspace) {
+            match index_rust_workspace(self, store, &workspace) {
                 Ok(_) => {
                     completed.insert(workspace.name);
                 }
@@ -196,6 +209,30 @@ impl IndexScheduler {
             }
         }
     }
+
+    fn rust_analysis(&self, source: &str) -> Result<Arc<RustAnalysis>, Box<dyn Error>> {
+        let key = SourceAnalysisKey {
+            content_hash: Sha256::digest(source.as_bytes()).into(),
+            frontend_version: FRONTEND_VERSION,
+        };
+        if let Some(analysis) = self
+            .rust_cache
+            .lock()
+            .map_err(|_| "Rust frontend cache lock poisoned")?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(analysis);
+        }
+        let analysis = Arc::new(analyze(source)?);
+        Ok(self
+            .rust_cache
+            .lock()
+            .map_err(|_| "Rust frontend cache lock poisoned")?
+            .entry(key)
+            .or_insert_with(|| analysis.clone())
+            .clone())
+    }
 }
 
 fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources), Box<dyn Error>> {
@@ -216,6 +253,7 @@ fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources)
 }
 
 fn index_rust_workspace(
+    scheduler: &IndexScheduler,
     store: &SemanticStore,
     workspace: &Workspace,
 ) -> Result<(usize, bool), Box<dyn Error>> {
@@ -238,7 +276,14 @@ fn index_rust_workspace(
     let mut all_observations = Vec::new();
     for (state, sources) in repositories {
         for (path, source) in sources {
-            all_observations.extend(observations(&state.repository.identity, &source, &path)?);
+            let analysis = scheduler
+                .rust_analysis(&source)
+                .map_err(|error| format!("failed to analyze {}: {error}", path.display()))?;
+            all_observations.extend(observations_from_analysis(
+                &state.repository.identity,
+                &analysis,
+                &path,
+            ));
         }
     }
     resolve_repository_calls(&mut all_observations);
@@ -250,6 +295,24 @@ fn index_rust_workspace(
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn identical_content_reuses_frontend_analysis() {
+        let scheduler = IndexScheduler::new();
+        let first = scheduler.rust_analysis("fn shared() {}").unwrap();
+        let second = scheduler.rust_analysis("fn shared() {}").unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 1);
+        assert_eq!(
+            observations_from_analysis("one", &first, Path::new("src/one.rs"))[0].to,
+            "repo://one/rust/one/shared"
+        );
+        assert_eq!(
+            observations_from_analysis("two", &second, Path::new("src/two.rs"))[0].to,
+            "repo://two/rust/two/shared"
+        );
+    }
 
     #[tokio::test]
     async fn reconciliation_recovers_a_missed_event() {
