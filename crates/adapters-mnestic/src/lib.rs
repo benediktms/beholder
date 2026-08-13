@@ -466,9 +466,9 @@ fn trace(db: &DbInstance, view: &str, from: &str, to: &str) -> Result<NamedRows,
         &format!(
             "{RULES}\n{DISTANCE_RULES}\n\
              start[] <- [[$from]]\n\
-             predecessor[to, min(from)] := distance[to, hops], hops > 0, \
+             predecessor[to, smallest_by(candidate)] := distance[to, hops], hops > 0, \
                  distance[from, previous_hops], previous_hops + 1 == hops, \
-                 direct[from, to, _, _]\n\
+                 direct[from, to, _, _], candidate = [from, from]\n\
              path[to, nodes] := predecessor[to, $from], nodes = [$from, to]\n\
              path[to, nodes] := path[from, previous_nodes], predecessor[to, from], \
                  nodes = append(previous_nodes, to)\n\
@@ -623,6 +623,27 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_chooses_a_string_predecessor() {
+        let db = memory_database().unwrap();
+        db.run_script(
+            "?[view, from, relation, to, evidence] <- [
+                ['diamond', 'start', 'calls', 'left', 'left:1'],
+                ['diamond', 'start', 'calls', 'right', 'right:1'],
+                ['diamond', 'left', 'calls', 'end', 'left:2'],
+                ['diamond', 'right', 'calls', 'end', 'right:2'],
+             ]
+             :put observation {view, from, relation, to => evidence}",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .unwrap();
+
+        let result = trace(&db, "diamond", "start", "end").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][2], 2.into());
+    }
 
     #[test]
     fn workspace_smoke() {

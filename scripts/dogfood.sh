@@ -48,6 +48,12 @@ if ! grep -Fq "$callee" <<<"$result"; then
     printf 'expected %s in context:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
+echo 'Checking why main reaches state_dir...' >&2
+result="$(target/debug/beholder why --workspace main "$caller" "$callee")"
+if ! grep -Fq "$callee" <<<"$result"; then
+    printf 'expected %s in why result:\n%s\n' "$callee" "$result" >&2
+    exit 1
+fi
 echo 'Checking completed revision...' >&2
 revision="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
 if ! grep -Fq '"main"' <<<"$revision"; then
