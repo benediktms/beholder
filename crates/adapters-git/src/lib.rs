@@ -53,10 +53,19 @@ pub fn repository_state(
     sources: &[(std::path::PathBuf, String)],
 ) -> Result<RepositoryState, Box<dyn Error>> {
     let (repository, head) = match gix::discover(root) {
-        Ok(git) => (
-            repository_identity_from(&git, root)?,
-            git.head_id().ok().map(|id| id.to_string()),
-        ),
+        Ok(git) => {
+            let topology = topology_from(git, root)?;
+            let root = root.canonicalize()?;
+            let selected = topology
+                .working_trees
+                .iter()
+                .filter(|worktree| root.starts_with(&worktree.path))
+                .max_by_key(|worktree| worktree.path.components().count())
+                .ok_or_else(|| {
+                    format!("{} is not inside a discovered working tree", root.display())
+                })?;
+            (topology.repository.identity, Some(selected.head.clone()))
+        }
         Err(_) => (local_repository_identity(root)?, None),
     };
 
@@ -94,6 +103,10 @@ fn state_fingerprint(
 
 pub fn discover_topology(root: &Path) -> Result<GitTopology, Box<dyn Error>> {
     let repository = gix::discover(root)?;
+    topology_from(repository, root)
+}
+
+fn topology_from(repository: gix::Repository, root: &Path) -> Result<GitTopology, Box<dyn Error>> {
     let main_repository = repository.main_repo()?;
     let common_directory = main_repository.common_dir().canonicalize()?;
     let mut working_trees = Vec::new();
@@ -248,11 +261,47 @@ mod tests {
         let linked_state = repository_state(&linked, &source(&linked)?)?;
         assert_eq!(main_state, linked_state);
 
+        fs::write(linked.join("README.md"), "feature fixture")?;
+        required_output(&linked, &["add", "README.md"])?;
+        let tree = String::from_utf8(required_output(&linked, &["write-tree"])?)?;
+        let commit = String::from_utf8(required_output(
+            &linked,
+            &[
+                "-c",
+                "user.name=Beholder Test",
+                "-c",
+                "user.email=beholder@example.com",
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                linked_state.head.as_deref().unwrap(),
+                "-m",
+                "feature",
+            ],
+        )?)?;
+        required_output(
+            &linked,
+            &["update-ref", "refs/heads/feature", commit.trim()],
+        )?;
+        let linked_topology = discover_topology(&linked)?;
+        let nested = linked.join("src");
+        fs::create_dir(&nested)?;
+        let feature_state = repository_state(&nested, &source(&linked)?)?;
+        assert_ne!(feature_state.head, main_state.head);
+        assert_eq!(
+            feature_state.head.as_deref(),
+            linked_topology
+                .working_trees
+                .iter()
+                .find(|worktree| worktree.path == linked.canonicalize().unwrap())
+                .map(|worktree| worktree.head.as_str())
+        );
+
         fs::write(linked.join("README.md"), "dirty fixture")?;
         let dirty_state = repository_state(&linked, &source(&linked)?)?;
-        assert_eq!(dirty_state.repository, linked_state.repository);
-        assert_eq!(dirty_state.head, linked_state.head);
-        assert_ne!(dirty_state.fingerprint, linked_state.fingerprint);
+        assert_eq!(dirty_state.repository, feature_state.repository);
+        assert_eq!(dirty_state.head, feature_state.head);
+        assert_ne!(dirty_state.fingerprint, feature_state.fingerprint);
         Ok(())
     }
 }
