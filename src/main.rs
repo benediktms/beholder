@@ -259,6 +259,32 @@ fn query(
     Ok(db.run_script(script, params, ScriptMutability::Immutable)?)
 }
 
+fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
+    Ok(db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?)
+}
+
+fn inspect_observations(
+    db: &DbInstance,
+    relation: Option<&str>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let (filter, params) = match relation {
+        Some(relation) => (
+            ", relation == $relation",
+            BTreeMap::from([("relation".into(), relation.into())]),
+        ),
+        None => ("", BTreeMap::new()),
+    };
+    Ok(db.run_script(
+        &format!(
+            "?[view, from, relation, to, evidence] := \
+                 *observation{{view, from, relation, to, evidence}}{filter}\n\
+             :order relation, from, to"
+        ),
+        params,
+        ScriptMutability::Immutable,
+    )?)
+}
+
 fn context(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
@@ -448,6 +474,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("indexed {count} Rust observations");
         return Ok(());
     }
+    if let [command, subject, path] = args.as_slice()
+        && command == "inspect"
+    {
+        let db = persistent_database(Path::new(path), false)?;
+        let result = match subject.as_str() {
+            "relations" => inspect_relations(&db)?,
+            "observations" => inspect_observations(&db, None)?,
+            _ => return Err("inspect subject must be relations or observations".into()),
+        };
+        println!("{result:#?}");
+        return Ok(());
+    }
+    if let [command, subject, relation, path] = args.as_slice()
+        && command == "inspect"
+        && subject == "observations"
+    {
+        let db = persistent_database(Path::new(path), false)?;
+        println!("{:#?}", inspect_observations(&db, Some(relation))?);
+        return Ok(());
+    }
     if let [
         command,
         storage,
@@ -511,7 +557,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             [command, entity] if command == "dependencies" => dependencies(&db, entity)?,
             [] => trace(&db, "web/CheckoutPage", "cache/update_price")?,
             _ => return Err(
-                "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
+                "usage: beholder <index-rust|index-rust-repo> <source> <database-path> | inspect <relations|observations> [relation] <database-path> | benchmark <mem|sqlite> <linear|tree|dag|corpus> <entities> <fanout> <depth> [database-path] | benchmark-query sqlite <topology> <entities> <depth> <database-path> | <context|impact|dependencies> <entity> [database-path] | <trace|why> <from> <to> [database-path]"
                     .into(),
             ),
         };
@@ -574,6 +620,10 @@ mod tests {
         let indexed = persistent_database(&path, false).unwrap();
         let context = context(&indexed, "repo://beholder/rust/main/trace").unwrap();
         assert!(format!("{context:?}").contains("repo://beholder/rust/main/query"));
+        assert!(format!("{:?}", inspect_relations(&indexed).unwrap()).contains("observation"));
+        let calls = inspect_observations(&indexed, Some("calls")).unwrap();
+        assert!(!calls.rows.is_empty());
+        assert!(calls.rows.iter().all(|row| row[2] == "calls".into()));
         drop(indexed);
         fs::remove_file(path).unwrap();
     }
