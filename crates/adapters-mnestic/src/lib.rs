@@ -173,19 +173,9 @@ const SEED: &str = r#"
 :put observation {view, from, relation, to => evidence}
 "#;
 
-const RULES: &str = r#"
-direct[from, to, relation, evidence] :=
-    *observation{view: $view, from, relation, to, evidence}
-"#;
-
-const DISTANCE_RULES: &str = r#"
-distance[node, min(hops)] := start[node], hops = 0
-distance[to, min(hops)] :=
-    distance[from, previous_hops],
-    previous_hops < $max_hops,
-    direct[from, to, _, _],
-    hops = previous_hops + 1
-"#;
+const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
+const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
+const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
 
 fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
     let db = DbInstance::new("mem", "", Default::default())?;
@@ -448,7 +438,7 @@ fn context(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<d
         db,
         view,
         &format!(
-            "{RULES}\n\
+            "{DIRECT_RULES}\n\
              ?[direction, relation, related, evidence] := \
                  direct[$entity, related, relation, evidence], direction = 'outgoing'\n\
              ?[direction, relation, related, evidence] := \
@@ -464,7 +454,7 @@ fn trace(db: &DbInstance, view: &str, from: &str, to: &str) -> Result<NamedRows,
         db,
         view,
         &format!(
-            "{RULES}\n{DISTANCE_RULES}\n\
+            "{DIRECT_RULES}\n{DEPENDENCY_RULES}\n\
              start[] <- [[$from]]\n\
              predecessor[to, smallest_by(candidate)] := distance[to, hops], hops > 0, \
                  distance[from, previous_hops], previous_hops + 1 == hops, \
@@ -491,11 +481,7 @@ fn impact(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dy
         db,
         view,
         &format!(
-            "{RULES}\n\
-             distance[node, min(hops)] := start[node], hops = 0\n\
-             distance[from, min(hops)] := distance[to, previous_hops], \
-                 previous_hops < $max_hops, direct[from, to, _, _], \
-                 hops = previous_hops + 1\n\
+            "{DIRECT_RULES}\n{IMPACT_RULES}\n\
              start[] <- [[$from]]\n\
              ?[affected] := distance[affected, hops], hops > 0\n:order affected"
         ),
@@ -508,7 +494,7 @@ fn dependencies(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, 
         db,
         view,
         &format!(
-            "{RULES}\n{DISTANCE_RULES}\n\
+            "{DIRECT_RULES}\n{DEPENDENCY_RULES}\n\
              start[] <- [[$from]]\n\
              ?[dependency, hops] := distance[dependency, hops], hops > 0\n\
              :order dependency"
@@ -677,7 +663,7 @@ mod tests {
             &db,
             "feature",
             &format!(
-                "{RULES}\n?[provider] := direct['rpc/Pricing.GetPrice', provider, 'implemented_by', _]"
+                "{DIRECT_RULES}\n?[provider] := direct['rpc/Pricing.GetPrice', provider, 'implemented_by', _]"
             ),
             [],
         )

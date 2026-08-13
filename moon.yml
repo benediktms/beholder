@@ -8,6 +8,7 @@ fileGroups:
     - 'crates/**/*.rs'
     - 'crates/**/Cargo.toml'
     - 'proto/**/*.proto'
+    - 'rules/**/*.datalog'
 
 tasks:
   check:

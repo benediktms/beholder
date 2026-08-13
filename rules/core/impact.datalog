@@ -1,0 +1,6 @@
+distance[node, min(hops)] := start[node], hops = 0
+distance[from, min(hops)] :=
+    distance[to, previous_hops],
+    previous_hops < $max_hops,
+    direct[from, to, _, _],
+    hops = previous_hops + 1
