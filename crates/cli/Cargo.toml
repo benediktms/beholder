@@ -19,4 +19,5 @@ beholder-adapters-treesitter-rust.workspace = true
 beholder-daemon-client.workspace = true
 beholder-domain.workspace = true
 beholder-dto.workspace = true
+clap = { version = "4.6.6", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

@@ -4,6 +4,13 @@ package beholder.v1;
 
 service Daemon {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+}
+
+message StopRequest {}
+
+message StopResponse {
+  bool accepted = 1;
 }
 
 message GetStatusRequest {}

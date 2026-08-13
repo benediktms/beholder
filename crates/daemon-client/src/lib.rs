@@ -1,4 +1,6 @@
-use beholder_protocol::v1::{GetStatusRequest, GetStatusResponse, daemon_client::DaemonClient};
+use beholder_protocol::v1::{
+    GetStatusRequest, GetStatusResponse, StopRequest, daemon_client::DaemonClient,
+};
 use std::path::PathBuf;
 
 pub const ADDRESS: &str = "127.0.0.1:50051";
@@ -29,4 +31,11 @@ pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error
         .get_status(GetStatusRequest {})
         .await?
         .into_inner())
+}
+
+pub async fn stop() -> Result<bool, Box<dyn std::error::Error>> {
+    let Ok(mut client) = DaemonClient::connect(ENDPOINT).await else {
+        return Ok(false);
+    };
+    Ok(client.stop(StopRequest {}).await?.into_inner().accepted)
 }

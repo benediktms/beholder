@@ -1,16 +1,29 @@
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{ADDRESS, state_dir};
 use beholder_protocol::v1::{
-    GetStatusRequest, GetStatusResponse,
+    GetStatusRequest, GetStatusResponse, StopRequest, StopResponse,
     daemon_server::{Daemon, DaemonServer},
 };
-use std::{error::Error, net::SocketAddr};
+use std::{error::Error, net::SocketAddr, sync::Mutex};
+use tokio::sync::oneshot;
 use tonic::{Request, Response, Status, transport::Server};
 
 mod single_instance;
 
 struct BeholderDaemon {
     _store: SemanticStore,
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+fn daemon(store: SemanticStore) -> (BeholderDaemon, oneshot::Receiver<()>) {
+    let (shutdown, stopped) = oneshot::channel();
+    (
+        BeholderDaemon {
+            _store: store,
+            shutdown: Mutex::new(Some(shutdown)),
+        },
+        stopped,
+    )
 }
 
 #[tonic::async_trait]
@@ -25,6 +38,16 @@ impl Daemon for BeholderDaemon {
             pid: std::process::id(),
         }))
     }
+
+    async fn stop(&self, _request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
+        let accepted = self
+            .shutdown
+            .lock()
+            .map_err(|_| Status::internal("shutdown lock poisoned"))?
+            .take()
+            .is_some_and(|shutdown| shutdown.send(()).is_ok());
+        Ok(Response::new(StopResponse { accepted }))
+    }
 }
 
 #[tokio::main]
@@ -37,12 +60,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let _lock = single_instance::acquire(&state_dir)?;
-    let service = BeholderDaemon {
-        _store: SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
-    };
+    let (service, stopped) = daemon(SemanticStore::persistent(
+        &state_dir.join("beholder.db"),
+        true,
+    )?);
     Server::builder()
         .add_service(DaemonServer::new(service))
-        .serve(ADDRESS.parse::<SocketAddr>()?)
+        .serve_with_shutdown(ADDRESS.parse::<SocketAddr>()?, async {
+            tokio::select! {
+                _ = stopped => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        })
         .await?;
     Ok(())
 }
@@ -50,9 +79,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_protocol::v1::{GetStatusRequest, daemon_client::DaemonClient};
+    use beholder_protocol::v1::{GetStatusRequest, StopRequest, daemon_client::DaemonClient};
     use std::{env, fs, net::TcpListener, time::Duration};
-    use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn workspace_smoke() {
@@ -77,10 +105,7 @@ mod tests {
                 .contains(&std::process::id().to_string())
         );
         let _ = fs::remove_file(&database);
-        let service = BeholderDaemon {
-            _store: SemanticStore::persistent(&database, true).unwrap(),
-        };
-        let (shutdown, stopped) = oneshot::channel();
+        let (service, stopped) = daemon(SemanticStore::persistent(&database, true).unwrap());
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(DaemonServer::new(service))
@@ -107,7 +132,14 @@ mod tests {
         assert_eq!(status.protocol_version, 1);
         assert_eq!(status.pid, std::process::id());
 
-        shutdown.send(()).unwrap();
+        assert!(
+            client
+                .stop(StopRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .accepted
+        );
         server.await.unwrap();
         drop(lock);
         assert!(
