@@ -32,20 +32,38 @@ struct SourceAnalysisKey {
     frontend_version: &'static str,
 }
 
+impl SourceAnalysisKey {
+    fn rust(source: &str, frontend_version: &'static str) -> Self {
+        Self {
+            content_hash: Sha256::digest(source.as_bytes()).into(),
+            frontend_version,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheStatus {
+    Memory,
+    Disk,
+    Miss,
+}
+
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     changed: Notify,
     indexing: Mutex<()>,
-    // ponytail: process-local cache is unbounded; persist and evict after measured daemon memory pressure.
+    cache_dir: PathBuf,
+    // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
 }
 
 impl IndexScheduler {
-    pub fn new() -> Self {
+    pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
             indexing: Mutex::new(()),
+            cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
         }
     }
@@ -210,11 +228,19 @@ impl IndexScheduler {
         }
     }
 
-    fn rust_analysis(&self, source: &str) -> Result<Arc<RustAnalysis>, Box<dyn Error>> {
-        let key = SourceAnalysisKey {
-            content_hash: Sha256::digest(source.as_bytes()).into(),
-            frontend_version: FRONTEND_VERSION,
-        };
+    fn rust_analysis(
+        &self,
+        source: &str,
+    ) -> Result<(Arc<RustAnalysis>, CacheStatus), Box<dyn Error>> {
+        self.rust_analysis_versioned(source, FRONTEND_VERSION)
+    }
+
+    fn rust_analysis_versioned(
+        &self,
+        source: &str,
+        frontend_version: &'static str,
+    ) -> Result<(Arc<RustAnalysis>, CacheStatus), Box<dyn Error>> {
+        let key = SourceAnalysisKey::rust(source, frontend_version);
         if let Some(analysis) = self
             .rust_cache
             .lock()
@@ -222,16 +248,46 @@ impl IndexScheduler {
             .get(&key)
             .cloned()
         {
-            return Ok(analysis);
+            return Ok((analysis, CacheStatus::Memory));
+        }
+        let path = self.cache_path(&key);
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(analysis) = serde_json::from_slice::<RustAnalysis>(&bytes)
+        {
+            let analysis = Arc::new(analysis);
+            self.rust_cache
+                .lock()
+                .map_err(|_| "Rust frontend cache lock poisoned")?
+                .insert(key, analysis.clone());
+            return Ok((analysis, CacheStatus::Disk));
         }
         let analysis = Arc::new(analyze(source)?);
-        Ok(self
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_ok()
+            && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
+        {
+            let _ = fs::write(path, bytes);
+        }
+        let analysis = self
             .rust_cache
             .lock()
             .map_err(|_| "Rust frontend cache lock poisoned")?
             .entry(key)
             .or_insert_with(|| analysis.clone())
-            .clone())
+            .clone();
+        Ok((analysis, CacheStatus::Miss))
+    }
+
+    fn cache_path(&self, key: &SourceAnalysisKey) -> PathBuf {
+        let hash = key
+            .content_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.cache_dir
+            .join("rust")
+            .join(key.frontend_version)
+            .join(format!("{hash}.json"))
     }
 }
 
@@ -276,7 +332,7 @@ fn index_rust_workspace(
     let mut all_observations = Vec::new();
     for (state, sources) in repositories {
         for (path, source) in sources {
-            let analysis = scheduler
+            let (analysis, _) = scheduler
                 .rust_analysis(&source)
                 .map_err(|error| format!("failed to analyze {}: {error}", path.display()))?;
             all_observations.extend(observations_from_analysis(
@@ -297,11 +353,18 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
-    fn identical_content_reuses_frontend_analysis() {
-        let scheduler = IndexScheduler::new();
-        let first = scheduler.rust_analysis("fn shared() {}").unwrap();
-        let second = scheduler.rust_analysis("fn shared() {}").unwrap();
+    fn frontend_cache_reuses_content_and_invalidates_versions() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-cache-{unique}"));
+        let scheduler = IndexScheduler::new(cache.clone());
+        let (first, first_status) = scheduler.rust_analysis("fn shared() {}").unwrap();
+        let (second, second_status) = scheduler.rust_analysis("fn shared() {}").unwrap();
 
+        assert_eq!(first_status, CacheStatus::Miss);
+        assert_eq!(second_status, CacheStatus::Memory);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 1);
         assert_eq!(
@@ -312,6 +375,29 @@ mod tests {
             observations_from_analysis("two", &second, Path::new("src/two.rs"))[0].to,
             "repo://two/rust/two/shared"
         );
+
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        assert_eq!(
+            scheduler.rust_analysis("fn shared() {}").unwrap().1,
+            CacheStatus::Disk
+        );
+        let versioned = "fn versioned() {}";
+        assert_eq!(
+            scheduler
+                .rust_analysis_versioned(versioned, "old")
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        assert_eq!(
+            scheduler.rust_analysis(versioned).unwrap().1,
+            CacheStatus::Miss
+        );
+        drop(scheduler);
+        fs::remove_dir_all(cache).unwrap();
     }
 
     #[tokio::test]
@@ -330,7 +416,7 @@ mod tests {
         let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
         let workspace = registry.register("main".into(), vec![repository]).unwrap();
         let registry = Arc::new(Mutex::new(registry));
-        let scheduler = Arc::new(IndexScheduler::new());
+        let scheduler = Arc::new(IndexScheduler::new(state.join("frontend-cache")));
         scheduler.index(&store, &workspace).unwrap();
         fs::write(&source, "fn caller() { after(); } fn after() {}").unwrap();
 

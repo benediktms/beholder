@@ -266,6 +266,7 @@ name = "beholder-adapters-treesitter-rust"
 version = "0.1.0"
 dependencies = [
  "beholder-domain",
+ "serde",
  "tree-sitter",
  "tree-sitter-rust",
 ]

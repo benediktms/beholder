@@ -37,10 +37,11 @@ type DaemonParts = (BeholderDaemon, oneshot::Receiver<()>, Arc<IndexScheduler>);
 fn daemon(
     store: SemanticStore,
     workspaces: WorkspaceRegistry,
+    cache_dir: PathBuf,
 ) -> Result<DaemonParts, Box<dyn Error>> {
     let (shutdown, stopped) = oneshot::channel();
     let workspaces = Arc::new(Mutex::new(workspaces));
-    let scheduler = Arc::new(IndexScheduler::new());
+    let scheduler = Arc::new(IndexScheduler::new(cache_dir));
     let callback_workspaces = workspaces.clone();
     let callback_scheduler = scheduler.clone();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -287,6 +288,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (service, stopped, index_scheduler) = daemon(
         SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
         WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
+        state_dir.join("frontend-cache"),
     )?;
     let watcher_task =
         tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
@@ -334,6 +336,7 @@ mod tests {
         let (service, stopped, index_scheduler) = daemon(
             SemanticStore::persistent(&database, true).unwrap(),
             WorkspaceRegistry::open(registry_path.clone()).unwrap(),
+            state.join("frontend-cache"),
         )
         .unwrap();
         let watcher_task =

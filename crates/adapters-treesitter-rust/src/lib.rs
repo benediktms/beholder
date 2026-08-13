@@ -1,15 +1,16 @@
 use beholder_domain::Observation;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 use tree_sitter::{Node, Parser};
 
 pub const FRONTEND_VERSION: &str = "1";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
     functions: Vec<RustFunction>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct RustFunction {
     name: String,
     qualified_name: String,
