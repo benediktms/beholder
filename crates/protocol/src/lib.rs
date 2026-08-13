@@ -2,8 +2,38 @@ pub mod v1 {
     tonic::include_proto!("beholder.v1");
 }
 
+use beholder_domain::Workspace as DomainWorkspace;
 use beholder_dto::{QueryResult as DtoResult, QueryValue as DtoValue};
+use std::path::PathBuf;
 use v1::{QueryList, QueryResult, QueryRow, QueryValue, query_value};
+
+impl From<DomainWorkspace> for v1::Workspace {
+    fn from(workspace: DomainWorkspace) -> Self {
+        Self {
+            name: workspace.name,
+            repositories: workspace
+                .repositories
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<v1::Workspace> for DomainWorkspace {
+    type Error = String;
+
+    fn try_from(workspace: v1::Workspace) -> Result<Self, Self::Error> {
+        Self::new(
+            workspace.name,
+            workspace
+                .repositories
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+        )
+    }
+}
 
 impl From<DtoResult> for QueryResult {
     fn from(result: DtoResult) -> Self {
@@ -89,6 +119,11 @@ mod tests {
 
     #[test]
     fn workspace_smoke() {
+        let workspace = DomainWorkspace::new("main", vec![PathBuf::from("/tmp/repo")]).unwrap();
+        assert_eq!(
+            DomainWorkspace::try_from(v1::Workspace::from(workspace.clone())).unwrap(),
+            workspace
+        );
         let result = DtoResult {
             headers: vec!["value".into()],
             rows: vec![vec![DtoValue::List(vec![

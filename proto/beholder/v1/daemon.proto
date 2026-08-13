@@ -8,6 +8,8 @@ service Daemon {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc Impact(EntityRequest) returns (QueryResult);
   rpc IndexRustWorkspace(IndexRustWorkspaceRequest) returns (IndexRustWorkspaceResponse);
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc Trace(PathRequest) returns (QueryResult);
   rpc Why(PathRequest) returns (QueryResult);
@@ -15,11 +17,13 @@ service Daemon {
 
 message EntityRequest {
   string entity = 1;
+  string workspace = 2;
 }
 
 message PathRequest {
   string from = 1;
   string to = 2;
+  string workspace = 3;
 }
 
 message QueryResult {
@@ -50,12 +54,33 @@ message QueryList {
 }
 
 message IndexRustWorkspaceRequest {
-  repeated string repositories = 1;
+  reserved 1;
+  string workspace = 2;
 }
 
 message IndexRustWorkspaceResponse {
   uint64 observation_count = 1;
   bool published = 2;
+}
+
+message Workspace {
+  string name = 1;
+  repeated string repositories = 2;
+}
+
+message RegisterWorkspaceRequest {
+  string name = 1;
+  repeated string repositories = 2;
+}
+
+message RegisterWorkspaceResponse {
+  Workspace workspace = 1;
+}
+
+message ListWorkspacesRequest {}
+
+message ListWorkspacesResponse {
+  repeated Workspace workspaces = 1;
 }
 
 message StopRequest {}

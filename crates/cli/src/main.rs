@@ -3,8 +3,8 @@ use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::observations;
 use beholder_daemon_client::{
     context as daemon_context, dependencies as daemon_dependencies, get_status,
-    impact as daemon_impact, index_rust_workspace as daemon_index_workspace, stop,
-    trace as daemon_trace, why as daemon_why,
+    impact as daemon_impact, index_rust_workspace as daemon_index_workspace, list_workspaces,
+    register_workspace, stop, trace as daemon_trace, why as daemon_why,
 };
 use beholder_domain::WorkspaceView;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -51,16 +51,15 @@ enum Command {
         #[arg(short, long)]
         database: PathBuf,
     },
-    /// Index every Rust source file in one repository.
-    IndexRustRepo {
-        /// Repository root to analyze.
-        repository: PathBuf,
-    },
-    /// Index multiple repositories as one coherent workspace view.
+    /// Index a registered workspace as one coherent view.
     IndexRustWorkspace {
-        /// Repository roots to analyze together.
-        #[arg(required = true, num_args = 1..)]
-        repositories: Vec<PathBuf>,
+        /// Registered workspace name.
+        workspace: String,
+    },
+    /// Manage registered workspaces.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
     },
     /// Inspect persisted Mnestic state through Beholder DTOs.
     Inspect {
@@ -133,6 +132,20 @@ enum DaemonCommand {
     Stop,
 }
 
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// Register or replace a workspace configuration.
+    Register {
+        /// Stable workspace name.
+        name: String,
+        /// Repository roots in the workspace.
+        #[arg(required = true, num_args = 1..)]
+        repositories: Vec<PathBuf>,
+    },
+    /// List registered workspaces.
+    List,
+}
+
 #[derive(Clone, Eq, PartialEq, ValueEnum)]
 enum InspectSubject {
     Relations,
@@ -142,12 +155,18 @@ enum InspectSubject {
 
 #[derive(clap::Args)]
 struct QueryEntity {
+    /// Workspace to query.
+    #[arg(short, long, default_value = "main")]
+    workspace: String,
     /// Canonical semantic entity ID.
     entity: String,
 }
 
 #[derive(clap::Args)]
 struct QueryPath {
+    /// Workspace to query.
+    #[arg(short, long, default_value = "main")]
+    workspace: String,
     /// Starting semantic entity ID.
     from: String,
     /// Destination semantic entity ID.
@@ -199,11 +218,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(Command::IndexRust { source, database }) => {
             print_index_result(index_rust(&source, &database)?);
         }
-        Some(Command::IndexRustRepo { repository }) => {
-            print_index_result(daemon_index_workspace(&[repository]).await?)
+        Some(Command::IndexRustWorkspace { workspace }) => {
+            print_index_result(daemon_index_workspace(workspace).await?)
         }
-        Some(Command::IndexRustWorkspace { repositories }) => {
-            print_index_result(daemon_index_workspace(&repositories).await?)
+        Some(Command::Workspace {
+            command: WorkspaceCommand::Register { name, repositories },
+        }) => println!("{:#?}", register_workspace(name, &repositories).await?),
+        Some(Command::Workspace {
+            command: WorkspaceCommand::List,
+        }) => {
+            for workspace in list_workspaces().await? {
+                println!("{}\t{}", workspace.name, workspace.repositories.len());
+            }
         }
         Some(Command::Inspect {
             subject,
@@ -245,21 +271,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", store.benchmark_queries(&topology, entities, depth));
         }
         Some(Command::Context(query)) => {
-            println!("{:#?}", daemon_context(query.entity).await?);
+            println!(
+                "{:#?}",
+                daemon_context(query.workspace, query.entity).await?
+            );
         }
         Some(Command::Impact(query)) => {
-            println!("{:#?}", daemon_impact(query.entity).await?);
+            println!("{:#?}", daemon_impact(query.workspace, query.entity).await?);
         }
         Some(Command::Dependencies(query)) => {
-            println!("{:#?}", daemon_dependencies(query.entity).await?)
+            println!(
+                "{:#?}",
+                daemon_dependencies(query.workspace, query.entity).await?
+            )
         }
         Some(Command::Trace(query)) => {
-            println!("{:#?}", daemon_trace(query.from, query.to).await?)
+            println!(
+                "{:#?}",
+                daemon_trace(query.workspace, query.from, query.to).await?
+            )
         }
-        Some(Command::Why(query)) => println!("{:#?}", daemon_why(query.from, query.to).await?),
+        Some(Command::Why(query)) => println!(
+            "{:#?}",
+            daemon_why(query.workspace, query.from, query.to).await?
+        ),
         None => println!(
             "{:#?}",
-            SemanticStore::memory()?.trace("web/CheckoutPage", "cache/update_price")?
+            SemanticStore::memory()?.trace("main", "web/CheckoutPage", "cache/update_price")?
         ),
     }
     Ok(())
@@ -275,29 +313,53 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from([
                 "beholder",
-                "index-rust-workspace",
+                "workspace",
+                "register",
+                "main",
                 "repo-a",
                 "repo-b",
             ])
             .unwrap()
             .command,
-            Some(Command::IndexRustWorkspace { repositories, .. }) if repositories.len() == 2
+            Some(Command::Workspace {
+                command: WorkspaceCommand::Register { repositories, .. }
+            }) if repositories.len() == 2
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "index-rust-workspace", "main"])
+                .unwrap()
+                .command,
+            Some(Command::IndexRustWorkspace { workspace }) if workspace == "main"
         ));
         assert!(Cli::try_parse_from(["beholder", "index-rust", "src/main.rs"]).is_err());
 
         let store = SemanticStore::memory().unwrap();
 
         let result = store
-            .trace("web/CheckoutPage", "cache/update_price")
+            .trace("main", "web/CheckoutPage", "cache/update_price")
             .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert!(format!("{result:?}").contains("CheckoutPage.tsx:12"));
 
-        assert_eq!(store.impact("rpc/Pricing.GetPrice").unwrap().rows.len(), 3);
-        assert_eq!(store.context("rpc/Pricing.GetPrice").unwrap().rows.len(), 2);
         assert_eq!(
             store
-                .dependencies("rpc/Pricing.GetPrice")
+                .impact("main", "rpc/Pricing.GetPrice")
+                .unwrap()
+                .rows
+                .len(),
+            3
+        );
+        assert_eq!(
+            store
+                .context("main", "rpc/Pricing.GetPrice")
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .dependencies("main", "rpc/Pricing.GetPrice")
                 .unwrap()
                 .rows
                 .len(),

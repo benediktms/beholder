@@ -2,6 +2,7 @@ language: 'rust'
 layer: 'library'
 
 dependsOn:
+  - 'beholder-domain'
   - 'beholder-dto'
 
 fileGroups:

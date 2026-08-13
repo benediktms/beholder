@@ -5,7 +5,8 @@ use beholder_daemon_client::{ADDRESS, state_dir};
 use beholder_domain::{RepositoryState, WorkspaceView};
 use beholder_protocol::v1::{
     EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest,
-    IndexRustWorkspaceResponse, PathRequest, QueryResult, StopRequest, StopResponse,
+    IndexRustWorkspaceResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
+    QueryResult, RegisterWorkspaceRequest, RegisterWorkspaceResponse, StopRequest, StopResponse,
     daemon_server::{Daemon, DaemonServer},
 };
 use std::{error::Error, fs, net::SocketAddr, path::Path, path::PathBuf, sync::Mutex};
@@ -13,17 +14,25 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status, transport::Server};
 
 mod single_instance;
+mod workspace_registry;
+
+use workspace_registry::WorkspaceRegistry;
 
 struct BeholderDaemon {
     store: SemanticStore,
+    workspaces: Mutex<WorkspaceRegistry>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
-fn daemon(store: SemanticStore) -> (BeholderDaemon, oneshot::Receiver<()>) {
+fn daemon(
+    store: SemanticStore,
+    workspaces: WorkspaceRegistry,
+) -> (BeholderDaemon, oneshot::Receiver<()>) {
     let (shutdown, stopped) = oneshot::channel();
     (
         BeholderDaemon {
             store,
+            workspaces: Mutex::new(workspaces),
             shutdown: Mutex::new(Some(shutdown)),
         },
         stopped,
@@ -51,6 +60,7 @@ fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources)
 
 fn index_rust_workspace(
     store: &SemanticStore,
+    workspace: &str,
     roots: &[PathBuf],
 ) -> Result<(usize, bool), Box<dyn Error>> {
     if roots.is_empty() {
@@ -61,7 +71,7 @@ fn index_rust_workspace(
         .map(|root| rust_repository_sources(root))
         .collect::<Result<Vec<_>, _>>()?;
     let view = WorkspaceView::new(
-        "main",
+        workspace,
         repositories
             .iter()
             .map(|(state, _)| state.clone())
@@ -88,14 +98,16 @@ impl Daemon for BeholderDaemon {
         &self,
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
-        query_response(self.store.context(&request.into_inner().entity))
+        let request = request.into_inner();
+        query_response(self.store.context(&request.workspace, &request.entity))
     }
 
     async fn dependencies(
         &self,
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
-        query_response(self.store.dependencies(&request.into_inner().entity))
+        let request = request.into_inner();
+        query_response(self.store.dependencies(&request.workspace, &request.entity))
     }
 
     async fn get_status(
@@ -113,7 +125,8 @@ impl Daemon for BeholderDaemon {
         &self,
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
-        query_response(self.store.impact(&request.into_inner().entity))
+        let request = request.into_inner();
+        query_response(self.store.impact(&request.workspace, &request.entity))
     }
 
     async fn index_rust_workspace(
@@ -121,19 +134,62 @@ impl Daemon for BeholderDaemon {
         request: Request<IndexRustWorkspaceRequest>,
     ) -> Result<Response<IndexRustWorkspaceResponse>, Status> {
         // ponytail: this blocks one Tokio worker; add a bounded job queue when indexing competes with RPC latency.
-        let roots = request
-            .into_inner()
-            .repositories
-            .into_iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        let (observation_count, published) = index_rust_workspace(&self.store, &roots)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let workspace_name = request.into_inner().workspace;
+        let workspace = self
+            .workspaces
+            .lock()
+            .map_err(|_| Status::internal("workspace registry lock poisoned"))?
+            .get(&workspace_name)
+            .cloned()
+            .ok_or_else(|| {
+                Status::not_found(format!("workspace not registered: {workspace_name}"))
+            })?;
+        let (observation_count, published) =
+            index_rust_workspace(&self.store, &workspace.name, &workspace.repositories)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(IndexRustWorkspaceResponse {
             observation_count: observation_count
                 .try_into()
                 .map_err(|_| Status::internal("observation count exceeds protocol capacity"))?,
             published,
+        }))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: Request<ListWorkspacesRequest>,
+    ) -> Result<Response<ListWorkspacesResponse>, Status> {
+        let workspaces = self
+            .workspaces
+            .lock()
+            .map_err(|_| Status::internal("workspace registry lock poisoned"))?
+            .list()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        Ok(Response::new(ListWorkspacesResponse { workspaces }))
+    }
+
+    async fn register_workspace(
+        &self,
+        request: Request<RegisterWorkspaceRequest>,
+    ) -> Result<Response<RegisterWorkspaceResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = self
+            .workspaces
+            .lock()
+            .map_err(|_| Status::internal("workspace registry lock poisoned"))?
+            .register(
+                request.name,
+                request
+                    .repositories
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        Ok(Response::new(RegisterWorkspaceResponse {
+            workspace: Some(workspace.into()),
         }))
     }
 
@@ -149,12 +205,18 @@ impl Daemon for BeholderDaemon {
 
     async fn trace(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.trace(&request.from, &request.to))
+        query_response(
+            self.store
+                .trace(&request.workspace, &request.from, &request.to),
+        )
     }
 
     async fn why(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.trace(&request.from, &request.to))
+        query_response(
+            self.store
+                .trace(&request.workspace, &request.from, &request.to),
+        )
     }
 }
 
@@ -176,10 +238,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let _lock = single_instance::acquire(&state_dir)?;
-    let (service, stopped) = daemon(SemanticStore::persistent(
-        &state_dir.join("beholder.db"),
-        true,
-    )?);
+    let (service, stopped) = daemon(
+        SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
+        WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
+    );
     Server::builder()
         .add_service(DaemonServer::new(service))
         .serve_with_shutdown(ADDRESS.parse::<SocketAddr>()?, async {
@@ -196,8 +258,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest, PathRequest, StopRequest,
-        daemon_client::DaemonClient,
+        EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest, ListWorkspacesRequest,
+        PathRequest, RegisterWorkspaceRequest, StopRequest, daemon_client::DaemonClient,
     };
     use std::{env, fs, net::TcpListener, time::Duration};
 
@@ -224,7 +286,11 @@ mod tests {
                 .contains(&std::process::id().to_string())
         );
         let _ = fs::remove_file(&database);
-        let (service, stopped) = daemon(SemanticStore::persistent(&database, true).unwrap());
+        let registry_path = workspace_registry::registry_path(&state);
+        let (service, stopped) = daemon(
+            SemanticStore::persistent(&database, true).unwrap(),
+            WorkspaceRegistry::open(registry_path.clone()).unwrap(),
+        );
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(DaemonServer::new(service))
@@ -258,9 +324,30 @@ mod tests {
         fs::write(first.join("src/lib.rs"), "fn caller() { helper(); }").unwrap();
         fs::write(second.join("src/lib.rs"), "fn helper() {}").unwrap();
         let repository = |path: &Path| path.to_str().unwrap().to_owned();
+        let registered = client
+            .register_workspace(RegisterWorkspaceRequest {
+                name: "main".into(),
+                repositories: vec![repository(&first), repository(&second)],
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .workspace
+            .unwrap();
+        assert_eq!(registered.name, "main");
+        assert_eq!(
+            client
+                .list_workspaces(ListWorkspacesRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .workspaces
+                .len(),
+            1
+        );
         let indexed = client
             .index_rust_workspace(IndexRustWorkspaceRequest {
-                repositories: vec![repository(&first), repository(&second)],
+                workspace: "main".into(),
             })
             .await
             .unwrap()
@@ -268,13 +355,59 @@ mod tests {
         assert!(indexed.published && indexed.observation_count > 0);
         let unchanged = client
             .index_rust_workspace(IndexRustWorkspaceRequest {
-                repositories: vec![repository(&second), repository(&first)],
+                workspace: "main".into(),
             })
             .await
             .unwrap()
             .into_inner();
         assert!(!unchanged.published);
         assert_eq!(unchanged.observation_count, 0);
+
+        let third = state.join("repo-c");
+        fs::create_dir_all(third.join("src")).unwrap();
+        fs::write(third.join("src/lib.rs"), "fn isolated() {}").unwrap();
+        client
+            .register_workspace(RegisterWorkspaceRequest {
+                name: "secondary".into(),
+                repositories: vec![repository(&third)],
+            })
+            .await
+            .unwrap();
+        assert!(
+            client
+                .index_rust_workspace(IndexRustWorkspaceRequest {
+                    workspace: "secondary".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .published
+        );
+        let isolated = "repo://repo-c/rust/lib/isolated";
+        assert!(
+            client
+                .context(EntityRequest {
+                    workspace: "main".into(),
+                    entity: isolated.into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .rows
+                .is_empty()
+        );
+        assert!(
+            !client
+                .context(EntityRequest {
+                    workspace: "secondary".into(),
+                    entity: isolated.into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .rows
+                .is_empty()
+        );
 
         let caller = "repo://repo-a/rust/lib/caller";
         let helper = "repo://repo-b/rust/lib/helper";
@@ -283,6 +416,7 @@ mod tests {
                 "{:?}",
                 client
                     .context(EntityRequest {
+                        workspace: "main".into(),
                         entity: caller.into()
                     })
                     .await
@@ -294,6 +428,7 @@ mod tests {
         assert!(
             !client
                 .dependencies(EntityRequest {
+                    workspace: "main".into(),
                     entity: caller.into()
                 })
                 .await
@@ -305,6 +440,7 @@ mod tests {
         assert!(
             !client
                 .impact(EntityRequest {
+                    workspace: "main".into(),
                     entity: caller.into()
                 })
                 .await
@@ -314,6 +450,7 @@ mod tests {
                 .is_empty()
         );
         let path = || PathRequest {
+            workspace: "main".into(),
             from: caller.into(),
             to: helper.into(),
         };
@@ -345,12 +482,17 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
+        let reloaded = WorkspaceRegistry::open(registry_path).unwrap();
+        assert!(reloaded.get("main").is_some());
+        assert!(reloaded.get("secondary").is_some());
         let indexed = SemanticStore::persistent(&database, false).unwrap();
-        assert_eq!(indexed.inspect_revisions().unwrap().rows.len(), 2);
+        assert_eq!(indexed.inspect_revisions().unwrap().rows.len(), 3);
         assert!(
             format!(
                 "{:?}",
-                indexed.context("repo://repo-a/rust/lib/caller").unwrap()
+                indexed
+                    .context("main", "repo://repo-a/rust/lib/caller")
+                    .unwrap()
             )
             .contains("repo://repo-b/rust/lib/helper")
         );

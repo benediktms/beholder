@@ -295,6 +295,8 @@ dependencies = [
  "beholder-domain",
  "beholder-dto",
  "beholder-protocol",
+ "serde",
+ "serde_json",
  "tokio",
  "tonic",
 ]
@@ -303,6 +305,7 @@ dependencies = [
 name = "beholder-daemon-client"
 version = "0.1.0"
 dependencies = [
+ "beholder-domain",
  "beholder-dto",
  "beholder-protocol",
  "tonic",
@@ -320,6 +323,7 @@ version = "0.1.0"
 name = "beholder-protocol"
 version = "0.1.0"
 dependencies = [
+ "beholder-domain",
  "beholder-dto",
  "prost",
  "tonic",
@@ -2744,6 +2748,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

@@ -57,20 +57,20 @@ impl SemanticStore {
         inspect_observations(&self.db, relation).map(query_result)
     }
 
-    pub fn context(&self, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
-        context(&self.db, entity).map(query_result)
+    pub fn context(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
+        context(&self.db, view, entity).map(query_result)
     }
 
-    pub fn trace(&self, from: &str, to: &str) -> Result<QueryResult, Box<dyn Error>> {
-        trace(&self.db, from, to).map(query_result)
+    pub fn trace(&self, view: &str, from: &str, to: &str) -> Result<QueryResult, Box<dyn Error>> {
+        trace(&self.db, view, from, to).map(query_result)
     }
 
-    pub fn impact(&self, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
-        impact(&self.db, entity).map(query_result)
+    pub fn impact(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
+        impact(&self.db, view, entity).map(query_result)
     }
 
-    pub fn dependencies(&self, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
-        dependencies(&self.db, entity).map(query_result)
+    pub fn dependencies(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
+        dependencies(&self.db, view, entity).map(query_result)
     }
 
     pub fn benchmark(
@@ -175,17 +175,7 @@ const SEED: &str = r#"
 
 const RULES: &str = r#"
 direct[from, to, relation, evidence] :=
-    *observation{view: 'main', from, relation, to, evidence},
-    $view == 'main'
-
-direct[from, to, relation, evidence] :=
-    *observation{view: 'main', from, relation, to, evidence},
-    $view != 'main',
-    not *observation{view: $view, from, relation}
-
-direct[from, to, relation, evidence] :=
-    *observation{view: $view, from, relation, to, evidence},
-    $view != 'main'
+    *observation{view: $view, from, relation, to, evidence}
 "#;
 
 const DISTANCE_RULES: &str = r#"
@@ -352,6 +342,8 @@ fn publish_observations(
         "?[view, revision] := \
              *analysis_revision{view: $view, revision: previous}, \
              view = $view, revision = previous + 1\n\
+         ?[view, revision] := \
+             not *analysis_revision{view: $view}, view = $view, revision = 1\n\
          :put analysis_revision {view => revision}",
         params.clone(),
     )?;
@@ -399,10 +391,11 @@ fn store_repository_states(
 
 fn query(
     db: &DbInstance,
+    view: &str,
     script: &str,
     additions: impl IntoIterator<Item = (&'static str, DataValue)>,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let mut params = BTreeMap::from([("view".into(), "main".into())]);
+    let mut params = BTreeMap::from([("view".into(), view.into())]);
     params.extend(
         additions
             .into_iter()
@@ -450,9 +443,10 @@ fn inspect_observations(
     )?)
 }
 
-fn context(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn context(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
+        view,
         &format!(
             "{RULES}\n\
              ?[direction, relation, related, evidence] := \
@@ -465,9 +459,10 @@ fn context(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     )
 }
 
-fn trace(db: &DbInstance, from: &str, to: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn trace(db: &DbInstance, view: &str, from: &str, to: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
+        view,
         &format!(
             "{RULES}\n{DISTANCE_RULES}\n\
              start[] <- [[$from]]\n\
@@ -491,9 +486,10 @@ fn trace(db: &DbInstance, from: &str, to: &str) -> Result<NamedRows, Box<dyn Err
     )
 }
 
-fn impact(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn impact(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
+        view,
         &format!(
             "{RULES}\n{DISTANCE_RULES}\nstart[] <- [[$from]]\n\
              ?[affected] := distance[affected, hops], hops > 0\n:order affected"
@@ -502,9 +498,10 @@ fn impact(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     )
 }
 
-fn dependencies(db: &DbInstance, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn dependencies(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
+        view,
         &format!(
             "{RULES}\n{DISTANCE_RULES}\n\
              start[] <- [[$from]]\n\
@@ -632,10 +629,11 @@ mod tests {
         let db = memory_database().unwrap();
         let feature = query(
             &db,
+            "feature",
             &format!(
                 "{RULES}\n?[provider] := direct['rpc/Pricing.GetPrice', provider, 'implemented_by', _]"
             ),
-            [("view", "feature".into())],
+            [],
         )
         .unwrap();
         let feature = format!("{feature:?}");
@@ -643,7 +641,7 @@ mod tests {
         assert!(!feature.contains("pricing/get_price\""));
 
         let store = SemanticStore { db };
-        let result = store.context("rpc/Pricing.GetPrice").unwrap();
+        let result = store.context("main", "rpc/Pricing.GetPrice").unwrap();
         assert_eq!(result.rows.len(), 2);
         assert!(
             result
