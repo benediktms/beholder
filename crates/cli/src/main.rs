@@ -33,7 +33,7 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dy
         return Ok((0, false));
     }
     let observations = observations(&state.repository.identity, &sources[0].1, path)?;
-    store.publish(&view, &observations)?;
+    let _changes = store.publish(&view, &observations)?;
     Ok((observations.len(), true))
 }
 

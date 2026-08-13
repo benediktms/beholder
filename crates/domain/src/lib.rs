@@ -9,6 +9,14 @@ pub struct Observation {
     pub evidence: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FactChanges {
+    pub inserted: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
     pub name: String,

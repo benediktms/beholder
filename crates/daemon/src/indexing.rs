@@ -521,10 +521,14 @@ fn index_rust_workspace_versioned(
         all_observations.extend(observations.iter().cloned());
     }
     resolve_repository_calls(&mut all_observations);
-    store.publish(&view, &all_observations)?;
+    let changes = store.publish(&view, &all_observations)?;
     tracing::info!(
         workspace = %workspace.name,
         observation_count = all_observations.len(),
+        facts_inserted = changes.inserted,
+        facts_updated = changes.updated,
+        facts_removed = changes.removed,
+        facts_unchanged = changes.unchanged,
         repository_cache_memory_hits = memory_hits,
         repository_cache_disk_hits = disk_hits,
         repository_cache_misses = misses,

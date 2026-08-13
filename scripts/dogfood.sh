@@ -103,7 +103,7 @@ if grep -Eq '"level":"(WARN|ERROR)"' "$trace_file"; then
     cat "$trace_file" >&2
     exit 1
 fi
-for expected in 'daemon started' 'workspace indexed' 'rpc.context' 'daemon stopped'; do
+for expected in 'daemon started' 'workspace indexed' 'facts_inserted' 'rpc.context' 'daemon stopped'; do
     if ! grep -Fq "$expected" "$trace_file"; then
         printf 'daemon trace is missing %s:\n' "$expected" >&2
         cat "$trace_file" >&2
