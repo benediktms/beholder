@@ -1,9 +1,14 @@
 use beholder_domain::{GitClone, GitTopology, LogicalRepository, WorkingTree};
+use gix::bstr::ByteSlice;
 use sha2::{Digest, Sha256};
-use std::{error::Error, path::Path, process::Command};
+use std::{error::Error, path::Path};
 
 pub fn canonical_remote(remote: &str) -> Option<String> {
-    let remote = gix_url::parse(remote.trim().into()).ok()?;
+    let remote = gix::url::parse(remote.trim()).ok()?;
+    canonical_url(&remote)
+}
+
+fn canonical_url(remote: &gix::Url) -> Option<String> {
     let host = remote.host()?;
     let path = std::str::from_utf8(remote.path.as_ref())
         .ok()?
@@ -12,49 +17,21 @@ pub fn canonical_remote(remote: &str) -> Option<String> {
     (!host.is_empty() && !path.is_empty()).then(|| format!("{host}/{path}"))
 }
 
-fn output(root: &Path, arguments: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
-fn required_output(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, Box<dyn Error>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(output.stdout)
-}
-
 pub fn repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
-    let remote = output(root, &["remote", "get-url", "origin"]).or_else(|| {
-        let remotes = output(root, &["remote"])?;
-        let mut remotes = remotes.lines();
-        let only = remotes.next()?;
-        remotes
-            .next()
-            .is_none()
-            .then(|| output(root, &["remote", "get-url", only]))
-            .flatten()
-    });
-    if let Some(identity) = remote.as_deref().and_then(canonical_remote) {
+    let repository = gix::discover(root)?;
+    repository_identity_from(&repository, root)
+}
+
+fn repository_identity_from(
+    repository: &gix::Repository,
+    root: &Path,
+) -> Result<String, Box<dyn Error>> {
+    let remote_name = repository.remote_default_name(gix::remote::Direction::Fetch);
+    let identity = remote_name
+        .and_then(|name| repository.find_remote(name).ok())
+        .and_then(|remote| remote.url(gix::remote::Direction::Fetch).cloned())
+        .and_then(|remote| canonical_url(&remote));
+    if let Some(identity) = identity {
         return Ok(identity);
     }
     // ponytail: directory name is the local-only fallback; canonical Git remotes come with registration.
@@ -80,61 +57,63 @@ pub fn source_fingerprint(repository: &str, sources: &[(std::path::PathBuf, Stri
 }
 
 pub fn discover_topology(root: &Path) -> Result<GitTopology, Box<dyn Error>> {
-    let common_directory = String::from_utf8(required_output(
-        root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?)?;
-    let common_directory = Path::new(common_directory.trim()).canonicalize()?;
-    let worktrees = required_output(root, &["worktree", "list", "--porcelain", "-z"])?;
+    let repository = gix::discover(root)?;
+    let main_repository = repository.main_repo()?;
+    let common_directory = main_repository.common_dir().canonicalize()?;
+    let mut working_trees = Vec::new();
+    if main_repository.worktree().is_some() {
+        working_trees.push(working_tree(&main_repository)?);
+    }
+    for worktree in main_repository.worktrees()? {
+        working_trees.push(working_tree(&worktree.into_repo()?)?);
+    }
+    working_trees.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(GitTopology {
         repository: LogicalRepository {
-            identity: repository_identity(root)?,
+            identity: repository_identity_from(&repository, root)?,
         },
         clone: GitClone { common_directory },
-        working_trees: parse_worktrees(&worktrees)?,
+        working_trees,
     })
 }
 
-fn parse_worktrees(output: &[u8]) -> Result<Vec<WorkingTree>, Box<dyn Error>> {
-    let mut worktrees = Vec::new();
-    let mut path = None;
-    let mut head = None;
-    let mut branch = None;
-
-    for field in output.split(|byte| *byte == 0) {
-        if field.is_empty() {
-            if let (Some(path), Some(head)) = (path.take(), head.take()) {
-                worktrees.push(WorkingTree {
-                    path,
-                    head,
-                    branch: branch.take(),
-                });
-            }
-            continue;
-        }
-        let field = std::str::from_utf8(field)?;
-        if let Some(value) = field.strip_prefix("worktree ") {
-            path = Some(Path::new(value).canonicalize()?);
-        } else if let Some(value) = field.strip_prefix("HEAD ") {
-            head = Some(value.to_owned());
-        } else if let Some(value) = field.strip_prefix("branch ") {
-            branch = Some(
-                value
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(value)
-                    .to_owned(),
-            );
-        }
-    }
-
-    Ok(worktrees)
+fn working_tree(repository: &gix::Repository) -> Result<WorkingTree, Box<dyn Error>> {
+    Ok(WorkingTree {
+        path: repository
+            .worktree()
+            .ok_or("repository has no working tree")?
+            .base()
+            .canonicalize()?,
+        head: repository.head_id()?.to_string(),
+        branch: repository
+            .head_name()?
+            .map(|name| name.shorten().to_str().map(str::to_owned))
+            .transpose()?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, time::SystemTime};
+    use std::{fs, process::Command, time::SystemTime};
+
+    fn required_output(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        Ok(output.stdout)
+    }
 
     struct TestDirectory(std::path::PathBuf);
 
@@ -216,14 +195,12 @@ mod tests {
             main_topology.working_trees[0].path,
             main_topology.working_trees[1].path
         );
-        assert_eq!(
-            main_topology
-                .working_trees
-                .iter()
-                .map(|worktree| worktree.branch.as_deref())
-                .collect::<Vec<_>>(),
-            [Some("main"), Some("feature")]
-        );
+        let branches = main_topology
+            .working_trees
+            .iter()
+            .filter_map(|worktree| worktree.branch.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(branches, ["feature", "main"].into());
         Ok(())
     }
 }
