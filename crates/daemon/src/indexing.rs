@@ -1,9 +1,14 @@
 use crate::workspace_registry::WorkspaceRegistry;
-use beholder_adapters_git::repository_state;
+use beholder_adapters_git::{repository_identity, repository_state};
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_adapters_treesitter_rust::{observations, resolve_repository_calls, source_files};
-use beholder_domain::{RepositoryState, Workspace, WorkspaceView};
+use beholder_adapters_treesitter_rust::{
+    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
+    resolve_repository_calls, source_files,
+};
+use beholder_domain::{Observation, RepositoryState, Workspace, WorkspaceView};
+use beholder_dto::QueryMetadata;
 use notify::{Event, EventKind};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -20,30 +25,126 @@ use tokio::{
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
+const CORE_RULE_PACK_VERSION: &str = "1";
 type RustSources = Vec<(PathBuf, String)>;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SourceAnalysisKey {
+    content_hash: [u8; 32],
+    frontend_version: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RepositoryAnalysisKey {
+    fingerprint: String,
+    frontend_version: &'static str,
+    resolver_version: &'static str,
+}
+
+impl SourceAnalysisKey {
+    fn rust(source: &str, frontend_version: &'static str) -> Self {
+        Self {
+            content_hash: Sha256::digest(source.as_bytes()).into(),
+            frontend_version,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheStatus {
+    Memory,
+    Disk,
+    Miss,
+}
+
+type Cached<T> = Result<(Arc<T>, CacheStatus), Box<dyn Error>>;
 
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
+    dirty_repositories: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    active_workspace: Mutex<Option<String>>,
     changed: Notify,
     indexing: Mutex<()>,
+    cache_dir: PathBuf,
+    // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
+    rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
+    repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<Vec<Observation>>>>,
 }
 
 impl IndexScheduler {
-    pub fn new() -> Self {
+    pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             generations: Mutex::new(BTreeMap::new()),
+            dirty_repositories: Mutex::new(BTreeMap::new()),
+            active_workspace: Mutex::new(None),
             changed: Notify::new(),
             indexing: Mutex::new(()),
+            cache_dir,
+            rust_cache: Mutex::new(BTreeMap::new()),
+            repository_cache: Mutex::new(BTreeMap::new()),
         }
     }
 
-    pub fn mark(&self, workspace: String) {
+    pub fn mark(&self, workspace: &Workspace) {
         if let Ok(mut generations) = self.generations.lock() {
-            *generations.entry(workspace).or_default() += 1;
+            *generations.entry(workspace.name.clone()).or_default() += 1;
+            if let Ok(mut dirty) = self.dirty_repositories.lock() {
+                dirty.entry(workspace.name.clone()).or_default().extend(
+                    workspace.repositories.iter().map(|root| {
+                        repository_identity(root)
+                            .unwrap_or_else(|_| root.to_string_lossy().into_owned())
+                    }),
+                );
+            }
             self.changed.notify_one();
         }
     }
 
+    pub fn query_metadata(&self, workspace: &str, analysis_revision: u64) -> QueryMetadata {
+        let stale = self
+            .generations
+            .lock()
+            .is_ok_and(|generations| generations.contains_key(workspace));
+        let dirty_repositories = self
+            .dirty_repositories
+            .lock()
+            .ok()
+            .and_then(|dirty| dirty.get(workspace).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let indexing = self
+            .active_workspace
+            .lock()
+            .is_ok_and(|active| active.as_deref() == Some(workspace));
+        QueryMetadata {
+            analysis_revision,
+            stale,
+            indexing,
+            dirty_repositories,
+        }
+    }
+
+    pub fn clear_cache(&self) -> Result<(), Box<dyn Error>> {
+        let _indexing = self
+            .indexing
+            .lock()
+            .map_err(|_| "index coordinator lock poisoned")?;
+        self.rust_cache
+            .lock()
+            .map_err(|_| "Rust frontend cache lock poisoned")?
+            .clear();
+        self.repository_cache
+            .lock()
+            .map_err(|_| "repository cache lock poisoned")?
+            .clear();
+        if self.cache_dir.exists() {
+            fs::remove_dir_all(&self.cache_dir)?;
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "index.workspace", skip(self, store), err, fields(workspace = %workspace.name))]
     pub fn index(
         &self,
         store: &SemanticStore,
@@ -53,14 +154,56 @@ impl IndexScheduler {
             .indexing
             .lock()
             .map_err(|_| "index coordinator lock poisoned")?;
-        index_rust_workspace(store, workspace)
+        let generation = self
+            .generations
+            .lock()
+            .map_err(|_| "index generations lock poisoned")?
+            .get(&workspace.name)
+            .copied();
+        let result = self.index_active(store, workspace);
+        if result.is_ok() {
+            self.complete_generation(&workspace.name, generation);
+        }
+        result
+    }
+
+    fn index_active(
+        &self,
+        store: &SemanticStore,
+        workspace: &Workspace,
+    ) -> Result<(usize, bool), Box<dyn Error>> {
+        *self
+            .active_workspace
+            .lock()
+            .map_err(|_| "active workspace lock poisoned")? = Some(workspace.name.clone());
+        let result = index_rust_workspace(self, store, workspace);
+        *self
+            .active_workspace
+            .lock()
+            .map_err(|_| "active workspace lock poisoned")? = None;
+        result
+    }
+
+    fn complete_generation(&self, workspace: &str, indexed: Option<u64>) {
+        let Ok(mut generations) = self.generations.lock() else {
+            return;
+        };
+        if indexed.is_some() && generations.get(workspace).copied() == indexed {
+            generations.remove(workspace);
+            if let Ok(mut dirty) = self.dirty_repositories.lock() {
+                dirty.remove(workspace);
+            }
+        }
+        if generations.contains_key(workspace) {
+            self.changed.notify_one();
+        }
     }
 
     pub fn add_event(&self, event: notify::Result<Event>, workspaces: &Mutex<WorkspaceRegistry>) {
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                eprintln!("filesystem watcher error: {error}");
+                tracing::warn!(%error, "filesystem watcher error");
                 return;
             }
         };
@@ -73,22 +216,42 @@ impl IndexScheduler {
         let Ok(mut generations) = self.generations.lock() else {
             return;
         };
+        let Ok(mut dirty_repositories) = self.dirty_repositories.lock() else {
+            return;
+        };
         let mut changed = false;
         // ponytail: linear root matching and full-workspace reindex; add per-source invalidation when dogfood shows it matters.
         for workspace in registry.list() {
-            if event.paths.iter().any(|path| {
-                workspace.repositories.iter().any(|root| {
-                    path.strip_prefix(root).is_ok_and(|relative| {
-                        relative
-                            .extension()
-                            .is_some_and(|extension| extension == "rs")
-                            && !relative.components().any(|component| {
-                                matches!(component.as_os_str().to_str(), Some(".git" | "target"))
-                            })
+            let dirty = workspace
+                .repositories
+                .iter()
+                .filter(|root| {
+                    event.paths.iter().any(|path| {
+                        path.strip_prefix(root).is_ok_and(|relative| {
+                            relative
+                                .extension()
+                                .is_some_and(|extension| extension == "rs")
+                                && !relative.components().any(|component| {
+                                    matches!(
+                                        component.as_os_str().to_str(),
+                                        Some(".git" | "target")
+                                    )
+                                })
+                        })
                     })
                 })
-            }) {
-                *generations.entry(workspace.name).or_default() += 1;
+                .map(|root| {
+                    repository_identity(root)
+                        .unwrap_or_else(|_| root.to_string_lossy().into_owned())
+                })
+                .collect::<Vec<_>>();
+            if !dirty.is_empty() {
+                tracing::debug!(workspace = %workspace.name, repositories = ?dirty, "workspace marked stale");
+                *generations.entry(workspace.name.clone()).or_default() += 1;
+                dirty_repositories
+                    .entry(workspace.name)
+                    .or_default()
+                    .extend(dirty);
                 changed = true;
             }
         }
@@ -142,18 +305,15 @@ impl IndexScheduler {
     }
 
     fn mark_registered(&self, workspaces: &Mutex<WorkspaceRegistry>) -> bool {
-        let Ok(workspaces) = workspaces.lock() else {
+        let Ok(registry) = workspaces.lock() else {
             return false;
         };
-        let Ok(mut generations) = self.generations.lock() else {
-            return false;
-        };
-        let mut dirty = false;
-        for workspace in workspaces.list() {
-            *generations.entry(workspace.name).or_default() += 1;
-            dirty = true;
+        let workspaces = registry.list();
+        drop(registry);
+        for workspace in &workspaces {
+            self.mark(workspace);
         }
-        dirty
+        !workspaces.is_empty()
     }
 
     fn reindex_dirty(&self, store: &SemanticStore, workspaces: &Mutex<WorkspaceRegistry>) {
@@ -171,30 +331,143 @@ impl IndexScheduler {
         let Ok(_indexing) = self.indexing.lock() else {
             return;
         };
-        let mut completed = BTreeSet::new();
         for workspace in registered {
-            match index_rust_workspace(store, &workspace) {
-                Ok(_) => {
-                    completed.insert(workspace.name);
+            match self.index_active(store, &workspace) {
+                Ok(_) => self
+                    .complete_generation(&workspace.name, snapshot.get(&workspace.name).copied()),
+                Err(error) => {
+                    tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed")
                 }
-                Err(error) => eprintln!("failed to reindex workspace {}: {error}", workspace.name),
             }
         }
-        if let Ok(mut generations) = self.generations.lock() {
-            generations.retain(|name, generation| {
-                !completed.contains(name)
-                    || snapshot
-                        .get(name)
-                        .is_none_or(|indexed| *generation > *indexed)
-            });
-            if generations.iter().any(|(name, generation)| {
-                snapshot
-                    .get(name)
-                    .is_none_or(|indexed| generation > indexed)
-            }) {
-                self.changed.notify_one();
-            }
+    }
+
+    fn rust_analysis_versioned(
+        &self,
+        source: &str,
+        frontend_version: &'static str,
+    ) -> Cached<RustAnalysis> {
+        let key = SourceAnalysisKey::rust(source, frontend_version);
+        if let Some(analysis) = self
+            .rust_cache
+            .lock()
+            .map_err(|_| "Rust frontend cache lock poisoned")?
+            .get(&key)
+            .cloned()
+        {
+            return Ok((analysis, CacheStatus::Memory));
         }
+        let path = self.cache_path(&key);
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(analysis) = serde_json::from_slice::<RustAnalysis>(&bytes)
+        {
+            let analysis = Arc::new(analysis);
+            self.rust_cache
+                .lock()
+                .map_err(|_| "Rust frontend cache lock poisoned")?
+                .insert(key, analysis.clone());
+            return Ok((analysis, CacheStatus::Disk));
+        }
+        let analysis = Arc::new(analyze(source)?);
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_ok()
+            && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
+        {
+            let _ = fs::write(path, bytes);
+        }
+        let analysis = self
+            .rust_cache
+            .lock()
+            .map_err(|_| "Rust frontend cache lock poisoned")?
+            .entry(key)
+            .or_insert_with(|| analysis.clone())
+            .clone();
+        Ok((analysis, CacheStatus::Miss))
+    }
+
+    fn cache_path(&self, key: &SourceAnalysisKey) -> PathBuf {
+        let hash = key
+            .content_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.cache_dir
+            .join("rust")
+            .join(key.frontend_version)
+            .join(format!("{hash}.json"))
+    }
+
+    fn repository_observations_versioned(
+        &self,
+        state: &RepositoryState,
+        sources: &RustSources,
+        frontend_version: &'static str,
+        resolver_version: &'static str,
+    ) -> Cached<Vec<Observation>> {
+        let key = RepositoryAnalysisKey {
+            fingerprint: state.fingerprint.clone(),
+            frontend_version,
+            resolver_version,
+        };
+        if let Some(observations) = self
+            .repository_cache
+            .lock()
+            .map_err(|_| "repository cache lock poisoned")?
+            .get(&key)
+            .cloned()
+        {
+            tracing::debug!(repository = %state.repository.identity, cache_status = "memory", "repository cache lookup");
+            return Ok((observations, CacheStatus::Memory));
+        }
+        let path = self
+            .cache_dir
+            .join("repository")
+            .join("rust")
+            .join(frontend_version)
+            .join(resolver_version)
+            .join(format!("{}.json", state.fingerprint));
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(observations) = serde_json::from_slice::<Vec<Observation>>(&bytes)
+        {
+            let observations = Arc::new(observations);
+            self.repository_cache
+                .lock()
+                .map_err(|_| "repository cache lock poisoned")?
+                .insert(key, observations.clone());
+            tracing::debug!(repository = %state.repository.identity, cache_status = "disk", "repository cache lookup");
+            return Ok((observations, CacheStatus::Disk));
+        }
+        let mut observations = Vec::new();
+        for (path, source) in sources {
+            let (analysis, cache_status) =
+                self.rust_analysis_versioned(source, frontend_version)
+                    .map_err(|error| format!("failed to analyze {}: {error}", path.display()))?;
+            tracing::debug!(
+                repository = %state.repository.identity,
+                path = %path.display(),
+                ?cache_status,
+                "frontend cache lookup"
+            );
+            observations.extend(observations_from_analysis(
+                &state.repository.identity,
+                &analysis,
+                path,
+            ));
+        }
+        resolve_repository_calls(&mut observations);
+        let observations = Arc::new(observations);
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_ok()
+            && let Ok(bytes) = serde_json::to_vec(observations.as_ref())
+        {
+            let _ = fs::write(path, bytes);
+        }
+        self.repository_cache
+            .lock()
+            .map_err(|_| "repository cache lock poisoned")?
+            .insert(key, observations.clone());
+        tracing::debug!(repository = %state.repository.identity, cache_status = "miss", "repository cache lookup");
+        Ok((observations, CacheStatus::Miss))
     }
 }
 
@@ -216,8 +489,27 @@ fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources)
 }
 
 fn index_rust_workspace(
+    scheduler: &IndexScheduler,
     store: &SemanticStore,
     workspace: &Workspace,
+) -> Result<(usize, bool), Box<dyn Error>> {
+    index_rust_workspace_versioned(
+        scheduler,
+        store,
+        workspace,
+        FRONTEND_VERSION,
+        RESOLVER_VERSION,
+        CORE_RULE_PACK_VERSION,
+    )
+}
+
+fn index_rust_workspace_versioned(
+    scheduler: &IndexScheduler,
+    store: &SemanticStore,
+    workspace: &Workspace,
+    frontend_version: &'static str,
+    resolver_version: &'static str,
+    rule_pack_version: &'static str,
 ) -> Result<(usize, bool), Box<dyn Error>> {
     let repositories = workspace
         .repositories
@@ -226,30 +518,279 @@ fn index_rust_workspace(
         .collect::<Result<Vec<_>, _>>()?;
     let view = WorkspaceView::new(
         &workspace.name,
+        format!("rust:{frontend_version}:{resolver_version}:core-rules:{rule_pack_version}"),
         repositories
             .iter()
             .map(|(state, _)| state.clone())
             .collect(),
     )?;
     if store.view_matches(&view)? {
+        tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
 
     let mut all_observations = Vec::new();
+    let mut memory_hits = 0;
+    let mut disk_hits = 0;
+    let mut misses = 0;
     for (state, sources) in repositories {
-        for (path, source) in sources {
-            all_observations.extend(observations(&state.repository.identity, &source, &path)?);
+        let (observations, cache_status) = scheduler.repository_observations_versioned(
+            &state,
+            &sources,
+            frontend_version,
+            resolver_version,
+        )?;
+        match cache_status {
+            CacheStatus::Memory => memory_hits += 1,
+            CacheStatus::Disk => disk_hits += 1,
+            CacheStatus::Miss => misses += 1,
         }
+        all_observations.extend(observations.iter().cloned());
     }
     resolve_repository_calls(&mut all_observations);
-    store.publish(&view, &all_observations)?;
+    let changes = store.publish(&view, &all_observations)?;
+    tracing::info!(
+        workspace = %workspace.name,
+        observation_count = all_observations.len(),
+        facts_inserted = changes.inserted,
+        facts_updated = changes.updated,
+        facts_removed = changes.removed,
+        facts_unchanged = changes.unchanged,
+        repository_cache_memory_hits = memory_hits,
+        repository_cache_disk_hits = disk_hits,
+        repository_cache_misses = misses,
+        "workspace indexed"
+    );
     Ok((all_observations.len(), true))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beholder_domain::LogicalRepository;
     use std::time::SystemTime;
+
+    #[test]
+    fn frontend_cache_reuses_content_and_invalidates_versions() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-cache-{unique}"));
+        let scheduler = IndexScheduler::new(cache.clone());
+        let (first, first_status) = scheduler
+            .rust_analysis_versioned("fn shared() {}", FRONTEND_VERSION)
+            .unwrap();
+        let (second, second_status) = scheduler
+            .rust_analysis_versioned("fn shared() {}", FRONTEND_VERSION)
+            .unwrap();
+
+        assert_eq!(first_status, CacheStatus::Miss);
+        assert_eq!(second_status, CacheStatus::Memory);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 1);
+        assert_eq!(
+            observations_from_analysis("one", &first, Path::new("src/one.rs"))[0].to,
+            "repo://one/rust/one/shared"
+        );
+        assert_eq!(
+            observations_from_analysis("two", &second, Path::new("src/two.rs"))[0].to,
+            "repo://two/rust/two/shared"
+        );
+
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        assert_eq!(
+            scheduler
+                .rust_analysis_versioned("fn shared() {}", FRONTEND_VERSION)
+                .unwrap()
+                .1,
+            CacheStatus::Disk
+        );
+        let versioned = "fn versioned() {}";
+        assert_eq!(
+            scheduler
+                .rust_analysis_versioned(versioned, "old")
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        assert_eq!(
+            scheduler
+                .rust_analysis_versioned(versioned, FRONTEND_VERSION)
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+        drop(scheduler);
+        fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn repository_cache_reuses_resolved_observations_and_invalidates_versions() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-repository-cache-{unique}"));
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "state".into(),
+        };
+        let sources = vec![(
+            PathBuf::from("src/lib.rs"),
+            "fn caller() { helper(); } fn helper() {}".into(),
+        )];
+        let scheduler = IndexScheduler::new(cache.clone());
+        let (first, first_status) = scheduler
+            .repository_observations_versioned(&state, &sources, FRONTEND_VERSION, RESOLVER_VERSION)
+            .unwrap();
+        let (second, second_status) = scheduler
+            .repository_observations_versioned(&state, &sources, FRONTEND_VERSION, RESOLVER_VERSION)
+            .unwrap();
+
+        assert_eq!(first_status, CacheStatus::Miss);
+        assert_eq!(second_status, CacheStatus::Memory);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.iter().any(|observation| {
+            observation.from == "repo://repo/rust/lib/caller"
+                && observation.to == "repo://repo/rust/lib/helper"
+        }));
+
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        assert_eq!(
+            scheduler
+                .repository_observations_versioned(
+                    &state,
+                    &sources,
+                    FRONTEND_VERSION,
+                    RESOLVER_VERSION,
+                )
+                .unwrap()
+                .1,
+            CacheStatus::Disk
+        );
+        let versioned_state = RepositoryState {
+            fingerprint: "versioned-state".into(),
+            ..state
+        };
+        assert_eq!(
+            scheduler
+                .repository_observations_versioned(
+                    &versioned_state,
+                    &sources,
+                    FRONTEND_VERSION,
+                    "old",
+                )
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        assert_eq!(
+            scheduler
+                .repository_observations_versioned(
+                    &versioned_state,
+                    &sources,
+                    FRONTEND_VERSION,
+                    RESOLVER_VERSION,
+                )
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+        scheduler.clear_cache().unwrap();
+        assert!(scheduler.rust_cache.lock().unwrap().is_empty());
+        assert!(scheduler.repository_cache.lock().unwrap().is_empty());
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn workspace_view_invalidates_when_analysis_version_changes() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-view-version-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let workspace = Workspace::new("main", vec![repository]).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+
+        assert!(
+            index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "1")
+                .unwrap()
+                .1
+        );
+        assert!(
+            !index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "1")
+                .unwrap()
+                .1
+        );
+        assert!(
+            index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "2")
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            store.inspect_revisions().unwrap().rows[0][1].as_i64(),
+            Some(2)
+        );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn query_metadata_reports_pending_repository_state() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-freshness-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        let workspace = Workspace::new("main", vec![repository.clone()]).unwrap();
+        let other = Workspace::new("other", vec![repository]).unwrap();
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+
+        scheduler.mark(&workspace);
+        scheduler.mark(&other);
+        let pending = scheduler.query_metadata("main", 4);
+        assert_eq!(pending.analysis_revision, 4);
+        assert!(pending.stale);
+        assert!(!pending.indexing);
+        assert_eq!(pending.dirty_repositories, ["repo"]);
+
+        *scheduler.active_workspace.lock().unwrap() = Some("main".into());
+        assert!(scheduler.query_metadata("main", 4).indexing);
+        assert!(!scheduler.query_metadata("other", 4).indexing);
+        *scheduler.active_workspace.lock().unwrap() = None;
+
+        let indexed_generation = scheduler.generations.lock().unwrap()["main"];
+        scheduler.mark(&workspace);
+        scheduler.complete_generation("main", Some(indexed_generation));
+        assert!(scheduler.query_metadata("main", 4).stale);
+
+        scheduler.index(&store, &workspace).unwrap();
+        let current = scheduler.query_metadata("main", 5);
+        assert!(!current.stale);
+        assert!(!current.indexing);
+        assert!(current.dirty_repositories.is_empty());
+        assert!(scheduler.query_metadata("other", 4).stale);
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
 
     #[tokio::test]
     async fn reconciliation_recovers_a_missed_event() {
@@ -267,7 +808,7 @@ mod tests {
         let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
         let workspace = registry.register("main".into(), vec![repository]).unwrap();
         let registry = Arc::new(Mutex::new(registry));
-        let scheduler = Arc::new(IndexScheduler::new());
+        let scheduler = Arc::new(IndexScheduler::new(state.join("frontend-cache")));
         scheduler.index(&store, &workspace).unwrap();
         fs::write(&source, "fn caller() { after(); } fn after() {}").unwrap();
 

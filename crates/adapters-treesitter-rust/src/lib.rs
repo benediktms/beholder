@@ -1,6 +1,23 @@
 use beholder_domain::Observation;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 use tree_sitter::{Node, Parser};
+
+pub const FRONTEND_VERSION: &str = "1";
+pub const RESOLVER_VERSION: &str = "1";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RustAnalysis {
+    functions: Vec<RustFunction>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RustFunction {
+    name: String,
+    qualified_name: String,
+    line: usize,
+    calls: Vec<(String, usize)>,
+}
 
 fn collect_functions<'tree>(
     node: Node<'tree>,
@@ -69,18 +86,14 @@ fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<(String, usize)>
     }
 }
 
-pub fn observations(
-    repository: &str,
-    source: &str,
-    path: &Path,
-) -> Result<Vec<Observation>, Box<dyn Error>> {
+pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let tree = parser
         .parse(source, None)
         .ok_or("Rust parser returned no tree")?;
     if tree.root_node().has_error() {
-        return Err(format!("failed to parse Rust source: {}", path.display()).into());
+        return Err("failed to parse Rust source".into());
     }
 
     let source_bytes = source.as_bytes();
@@ -91,6 +104,28 @@ pub fn observations(
         &mut Vec::new(),
         &mut functions,
     );
+    Ok(RustAnalysis {
+        functions: functions
+            .into_iter()
+            .map(|(name, qualified_name, function)| {
+                let mut calls = Vec::new();
+                collect_calls(function, source_bytes, &mut calls);
+                RustFunction {
+                    name,
+                    qualified_name,
+                    line: function.start_position().row + 1,
+                    calls,
+                }
+            })
+            .collect(),
+    })
+}
+
+pub fn observations_from_analysis(
+    repository: &str,
+    analysis: &RustAnalysis,
+    path: &Path,
+) -> Vec<Observation> {
     let module = path
         .strip_prefix("src")
         .unwrap_or(path)
@@ -99,38 +134,48 @@ pub fn observations(
         .replace(std::path::MAIN_SEPARATOR, "/");
     let source_id = format!("repo://{repository}/rust/{module}");
     let mut definitions = BTreeMap::<String, Option<String>>::new();
-    for (name, qualified_name, _) in &functions {
-        let id = format!("{source_id}/{qualified_name}");
+    for function in &analysis.functions {
+        let id = format!("{source_id}/{}", function.qualified_name);
         definitions
-            .entry(name.clone())
+            .entry(function.name.clone())
             .and_modify(|candidate| *candidate = None)
             .or_insert(Some(id));
     }
     let mut observations = Vec::new();
 
-    for (_, qualified_name, function) in functions {
-        let function_id = format!("{source_id}/{qualified_name}");
+    for function in &analysis.functions {
+        let function_id = format!("{source_id}/{}", function.qualified_name);
         observations.push(Observation {
             from: source_id.clone(),
             relation: "defines".into(),
             to: function_id.clone(),
-            evidence: format!("{}:{}", path.display(), function.start_position().row + 1),
+            evidence: format!("{}:{}", path.display(), function.line),
         });
-        let mut calls = Vec::new();
-        collect_calls(function, source_bytes, &mut calls);
-        for (callee, line) in calls {
+        for (callee, line) in &function.calls {
             observations.push(Observation {
                 from: function_id.clone(),
                 relation: "calls".into(),
                 to: definitions
-                    .get(&callee)
+                    .get(callee)
                     .and_then(Clone::clone)
                     .unwrap_or_else(|| format!("rust-call://{callee}")),
                 evidence: format!("{}:{line}", path.display()),
             });
         }
     }
-    Ok(observations)
+    observations
+}
+
+pub fn observations(
+    repository: &str,
+    source: &str,
+    path: &Path,
+) -> Result<Vec<Observation>, Box<dyn Error>> {
+    Ok(observations_from_analysis(
+        repository,
+        &analyze(source)?,
+        path,
+    ))
 }
 
 pub fn resolve_repository_calls(observations: &mut [Observation]) {

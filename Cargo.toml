@@ -25,3 +25,4 @@ beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }
 beholder-daemon-client = { path = "crates/daemon-client" }
 beholder-protocol = { path = "crates/protocol" }
+serde = { version = "1.0.228", features = ["derive"] }

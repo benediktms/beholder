@@ -1,9 +1,10 @@
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{address, state_dir};
 use beholder_protocol::v1::{
-    EntityRequest, GetStatusRequest, GetStatusResponse, IndexRustWorkspaceRequest,
-    IndexRustWorkspaceResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
-    QueryResult, RegisterWorkspaceRequest, RegisterWorkspaceResponse, StopRequest, StopResponse,
+    ClearCacheRequest, ClearCacheResponse, EntityRequest, GetStatusRequest, GetStatusResponse,
+    IndexRustWorkspaceRequest, IndexRustWorkspaceResponse, ListWorkspacesRequest,
+    ListWorkspacesResponse, PathRequest, QueryResult, RegisterWorkspaceRequest,
+    RegisterWorkspaceResponse, StopRequest, StopResponse,
     daemon_server::{Daemon, DaemonServer},
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -18,6 +19,7 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status, transport::Server};
 
 mod indexing;
+mod logging;
 mod single_instance;
 mod workspace_registry;
 
@@ -37,10 +39,11 @@ type DaemonParts = (BeholderDaemon, oneshot::Receiver<()>, Arc<IndexScheduler>);
 fn daemon(
     store: SemanticStore,
     workspaces: WorkspaceRegistry,
+    cache_dir: PathBuf,
 ) -> Result<DaemonParts, Box<dyn Error>> {
     let (shutdown, stopped) = oneshot::channel();
     let workspaces = Arc::new(Mutex::new(workspaces));
-    let scheduler = Arc::new(IndexScheduler::new());
+    let scheduler = Arc::new(IndexScheduler::new(cache_dir));
     let callback_workspaces = workspaces.clone();
     let callback_scheduler = scheduler.clone();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -54,7 +57,7 @@ fn daemon(
         watch_workspace(&mut watcher, workspace)?;
     }
     for workspace in registered {
-        scheduler.mark(workspace.name);
+        scheduler.mark(&workspace);
     }
     Ok((
         BeholderDaemon {
@@ -100,22 +103,55 @@ fn update_workspace_watch(
 
 #[tonic::async_trait]
 impl Daemon for BeholderDaemon {
+    #[tracing::instrument(name = "rpc.clear_cache", skip_all, err)]
+    async fn clear_cache(
+        &self,
+        _request: Request<ClearCacheRequest>,
+    ) -> Result<Response<ClearCacheResponse>, Status> {
+        self.scheduler
+            .clear_cache()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        tracing::info!("analysis cache cleared");
+        Ok(Response::new(ClearCacheResponse {}))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.context",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
+    )]
     async fn context(
         &self,
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.context(&request.workspace, &request.entity))
+        self.query_response(
+            &request.workspace,
+            self.store
+                .context_snapshot(&request.workspace, &request.entity),
+        )
     }
 
+    #[tracing::instrument(
+        name = "rpc.dependencies",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
+    )]
     async fn dependencies(
         &self,
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.dependencies(&request.workspace, &request.entity))
+        self.query_response(
+            &request.workspace,
+            self.store
+                .dependencies_snapshot(&request.workspace, &request.entity),
+        )
     }
 
+    #[tracing::instrument(name = "rpc.get_status", skip_all, err)]
     async fn get_status(
         &self,
         _request: Request<GetStatusRequest>,
@@ -127,14 +163,30 @@ impl Daemon for BeholderDaemon {
         }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.impact",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
+    )]
     async fn impact(
         &self,
         request: Request<EntityRequest>,
     ) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(self.store.impact(&request.workspace, &request.entity))
+        self.query_response(
+            &request.workspace,
+            self.store
+                .impact_snapshot(&request.workspace, &request.entity),
+        )
     }
 
+    #[tracing::instrument(
+        name = "rpc.index_rust_workspace",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().workspace)
+    )]
     async fn index_rust_workspace(
         &self,
         request: Request<IndexRustWorkspaceRequest>,
@@ -162,6 +214,7 @@ impl Daemon for BeholderDaemon {
         }))
     }
 
+    #[tracing::instrument(name = "rpc.list_workspaces", skip_all, err)]
     async fn list_workspaces(
         &self,
         _request: Request<ListWorkspacesRequest>,
@@ -177,6 +230,12 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(ListWorkspacesResponse { workspaces }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.register_workspace",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().name, repositories = request.get_ref().repositories.len())
+    )]
     async fn register_workspace(
         &self,
         request: Request<RegisterWorkspaceRequest>,
@@ -206,12 +265,14 @@ impl Daemon for BeholderDaemon {
             .map_err(|_| Status::internal("filesystem watcher lock poisoned"))?;
         update_workspace_watch(&mut watcher, previous.as_ref(), &workspace)
             .map_err(|error| Status::internal(error.to_string()))?;
-        self.scheduler.mark(workspace.name.clone());
+        self.scheduler.mark(&workspace);
+        tracing::info!(workspace = %workspace.name, "workspace registered");
         Ok(Response::new(RegisterWorkspaceResponse {
             workspace: Some(workspace.into()),
         }))
     }
 
+    #[tracing::instrument(name = "rpc.stop", skip_all, err)]
     async fn stop(&self, _request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
         let accepted = self
             .shutdown
@@ -222,29 +283,51 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(StopResponse { accepted }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.trace",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().workspace, from = %request.get_ref().from, to = %request.get_ref().to)
+    )]
     async fn trace(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(
+        self.query_response(
+            &request.workspace,
             self.store
-                .trace(&request.workspace, &request.from, &request.to),
+                .trace_snapshot(&request.workspace, &request.from, &request.to),
         )
     }
 
+    #[tracing::instrument(
+        name = "rpc.why",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().workspace, from = %request.get_ref().from, to = %request.get_ref().to)
+    )]
     async fn why(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
         let request = request.into_inner();
-        query_response(
+        self.query_response(
+            &request.workspace,
             self.store
-                .trace(&request.workspace, &request.from, &request.to),
+                .trace_snapshot(&request.workspace, &request.from, &request.to),
         )
     }
 }
 
-fn query_response(
-    result: Result<beholder_dto::QueryResult, Box<dyn Error>>,
-) -> Result<Response<QueryResult>, Status> {
-    result
-        .map(|result| Response::new(result.into()))
-        .map_err(|error| Status::internal(error.to_string()))
+impl BeholderDaemon {
+    fn query_response(
+        &self,
+        workspace: &str,
+        result: Result<beholder_dto::RevisionedQuery, Box<dyn Error>>,
+    ) -> Result<Response<QueryResult>, Status> {
+        let revisioned = result.map_err(|error| Status::internal(error.to_string()))?;
+        let mut result = revisioned.result;
+        result.metadata = Some(
+            self.scheduler
+                .query_metadata(workspace, revisioned.analysis_revision),
+        );
+        Ok(Response::new(result.into()))
+    }
 }
 
 #[cfg(unix)]
@@ -284,9 +367,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let _lock = single_instance::acquire(&state_dir)?;
+    let _log_guard = logging::init(&state_dir);
+    tracing::info!(pid = std::process::id(), address = %address(), "daemon started");
     let (service, stopped, index_scheduler) = daemon(
         SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
         WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
+        state_dir.join("frontend-cache"),
     )?;
     let watcher_task =
         tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
@@ -295,6 +381,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .serve_with_shutdown(address().parse::<SocketAddr>()?, shutdown_signal(stopped))
         .await?;
     watcher_task.abort();
+    tracing::info!("daemon stopped");
     Ok(())
 }
 
@@ -302,8 +389,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest, ListWorkspacesRequest,
-        PathRequest, RegisterWorkspaceRequest, StopRequest, daemon_client::DaemonClient,
+        ClearCacheRequest, EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest,
+        ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, StopRequest,
+        daemon_client::DaemonClient,
     };
     use std::{env, fs, net::TcpListener, path::Path, time::Duration};
 
@@ -334,6 +422,7 @@ mod tests {
         let (service, stopped, index_scheduler) = daemon(
             SemanticStore::persistent(&database, true).unwrap(),
             WorkspaceRegistry::open(registry_path.clone()).unwrap(),
+            state.join("frontend-cache"),
         )
         .unwrap();
         let watcher_task =
@@ -421,6 +510,22 @@ mod tests {
             .into_inner();
         assert!(!unchanged.published);
         assert_eq!(unchanged.observation_count, 0);
+        let metadata = client
+            .context(EntityRequest {
+                workspace: "main".into(),
+                entity: caller.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .metadata
+            .unwrap();
+        assert_eq!(metadata.analysis_revision, 1);
+        assert!(!metadata.stale);
+        assert!(!metadata.indexing);
+        assert!(metadata.dirty_repositories.is_empty());
+        client.clear_cache(ClearCacheRequest {}).await.unwrap();
+        assert!(!state.join("frontend-cache").exists());
 
         let third = state.join("repo-c");
         fs::create_dir_all(third.join("src")).unwrap();

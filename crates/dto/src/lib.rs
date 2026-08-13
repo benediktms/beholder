@@ -31,4 +31,19 @@ pub struct QueryResult {
     pub headers: Vec<String>,
     pub rows: Vec<Vec<QueryValue>>,
     pub next: Option<Box<QueryResult>>,
+    pub metadata: Option<QueryMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryMetadata {
+    pub analysis_revision: u64,
+    pub stale: bool,
+    pub indexing: bool,
+    pub dirty_repositories: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevisionedQuery {
+    pub result: QueryResult,
+    pub analysis_revision: u64,
 }

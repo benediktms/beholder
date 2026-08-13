@@ -62,3 +62,16 @@ uninstall:
 [group('manual')]
 smoke:
     moon run beholder:smoke
+
+# Print the newest daemon trace segment (default: 100 lines).
+[group('manual')]
+logs lines="100":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "{{lines}}" =~ ^[1-9][0-9]*$ ]] || { echo 'line count must be a positive integer' >&2; exit 2; }
+    state_base="${BEHOLDER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/beholder}"
+    log_dir="$state_base/daemon"
+    log="$(find "$log_dir" -maxdepth 1 -name 'beholderd.*.log' -print 2>/dev/null | sort | tail -n 1)"
+    [[ -n "$log" ]] || log="$log_dir/beholderd.log"
+    [[ -f "$log" ]] || { echo "daemon log not found in $log_dir" >&2; exit 1; }
+    tail -n "{{lines}}" "$log"

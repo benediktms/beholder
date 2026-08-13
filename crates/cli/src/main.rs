@@ -1,8 +1,8 @@
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_adapters_treesitter_rust::observations;
+use beholder_adapters_treesitter_rust::{FRONTEND_VERSION, observations};
 use beholder_daemon_client::{
-    context as daemon_context, dependencies as daemon_dependencies, get_status,
+    clear_cache, context as daemon_context, dependencies as daemon_dependencies, get_status,
     impact as daemon_impact, index_rust_workspace as daemon_index_workspace, list_workspaces,
     register_workspace, state_dir, stop, trace as daemon_trace, why as daemon_why,
 };
@@ -23,13 +23,17 @@ const MAIN_VIEW: &str = "main";
 fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dyn Error>> {
     let sources = vec![(path.to_path_buf(), fs::read_to_string(path)?)];
     let state = repository_state(path.parent().unwrap_or_else(|| Path::new(".")), &sources)?;
-    let view = WorkspaceView::new(MAIN_VIEW, vec![state.clone()])?;
+    let view = WorkspaceView::new(
+        MAIN_VIEW,
+        format!("rust:{FRONTEND_VERSION}:single-file:1"),
+        vec![state.clone()],
+    )?;
     let store = SemanticStore::persistent(database_path, true)?;
     if store.view_matches(&view)? {
         return Ok((0, false));
     }
     let observations = observations(&state.repository.identity, &sources[0].1, path)?;
-    store.publish(&view, &observations)?;
+    let _changes = store.publish(&view, &observations)?;
     Ok((observations.len(), true))
 }
 
@@ -37,7 +41,8 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dy
 #[command(
     name = "beholder",
     version,
-    about = "Multi-repository architecture intelligence"
+    about = "Multi-repository architecture intelligence",
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -68,6 +73,11 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
+    },
+    /// Manage disposable analysis caches.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
     },
     /// Inspect persisted Mnestic state through Beholder DTOs.
     Inspect {
@@ -130,6 +140,12 @@ enum Command {
     Trace(QueryPath),
     /// Explain why one entity depends on another.
     Why(QueryPath),
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Clear in-memory and persistent analysis caches.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -301,7 +317,22 @@ async fn stop_for_service_change() -> Result<(), Box<dyn Error>> {
 
 async fn install_daemon_service() -> Result<(), Box<dyn Error>> {
     stop_for_service_change().await?;
-    let outcome = service::install(&service::installed_daemon_path()?, &state_dir()?)?;
+    let state = state_dir()?;
+    let outcome = service::install(&service::installed_daemon_path()?, &state)?;
+    if std::env::var("BEHOLDER_LAUNCHER").as_deref() != Ok("fake") {
+        for _ in 0..50 {
+            if get_status().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        get_status().await.map_err(|_| {
+            format!(
+                "installed beholderd did not become ready; see {}",
+                state.join("beholderd.log").display()
+            )
+        })?;
+    }
     println!(
         "installed {} ({})",
         outcome.manifest_path.display(),
@@ -379,6 +410,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("{}\t{}", workspace.name, workspace.repositories.len());
             }
         }
+        Some(Command::Cache {
+            command: CacheCommand::Clear,
+        }) => {
+            clear_cache().await?;
+            println!("cleared analysis cache");
+        }
         Some(Command::Inspect {
             subject,
             database,
@@ -443,10 +480,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "{:#?}",
             daemon_why(query.workspace, query.from, query.to).await?
         ),
-        None => println!(
-            "{:#?}",
-            SemanticStore::memory()?.trace("main", "web/CheckoutPage", "cache/update_price")?
-        ),
+        None => unreachable!("Clap requires a subcommand"),
     }
     Ok(())
 }
@@ -458,6 +492,15 @@ mod tests {
 
     #[test]
     fn workspace_smoke() {
+        assert!(Cli::try_parse_from(["beholder"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "cache", "clear"])
+                .unwrap()
+                .command,
+            Some(Command::Cache {
+                command: CacheCommand::Clear
+            })
+        ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "daemon", "install"])
                 .unwrap()

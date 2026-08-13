@@ -1,5 +1,5 @@
-use beholder_domain::{Observation, RepositoryState, WorkspaceView};
-use beholder_dto::{QueryResult, QueryValue};
+use beholder_domain::{FactChanges, Observation, RepositoryState, WorkspaceView};
+use beholder_dto::{QueryResult, QueryValue, RevisionedQuery};
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, Num, ScriptMutability, ScriptRunOptions,
 };
@@ -38,7 +38,7 @@ impl SemanticStore {
         &self,
         view: &WorkspaceView,
         observations: &[Observation],
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<FactChanges, Box<dyn Error>> {
         publish_observations(&self.db, view, observations)
     }
 
@@ -61,16 +61,64 @@ impl SemanticStore {
         context(&self.db, view, entity).map(query_result)
     }
 
+    pub fn context_snapshot(
+        &self,
+        view: &str,
+        entity: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| context(transaction, view, entity))
+    }
+
     pub fn trace(&self, view: &str, from: &str, to: &str) -> Result<QueryResult, Box<dyn Error>> {
         trace(&self.db, view, from, to).map(query_result)
+    }
+
+    pub fn trace_snapshot(
+        &self,
+        view: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| trace(transaction, view, from, to))
     }
 
     pub fn impact(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
         impact(&self.db, view, entity).map(query_result)
     }
 
+    pub fn impact_snapshot(
+        &self,
+        view: &str,
+        entity: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| impact(transaction, view, entity))
+    }
+
     pub fn dependencies(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
         dependencies(&self.db, view, entity).map(query_result)
+    }
+
+    pub fn dependencies_snapshot(
+        &self,
+        view: &str,
+        entity: &str,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        self.snapshot(view, |transaction| dependencies(transaction, view, entity))
+    }
+
+    fn snapshot(
+        &self,
+        view: &str,
+        read: impl FnOnce(&MultiTransaction) -> Result<NamedRows, Box<dyn Error>>,
+    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        let transaction = self.db.multi_transaction(false);
+        let result = query_result(read(&transaction)?);
+        let analysis_revision = analysis_revision(&transaction, view)?;
+        transaction.abort()?;
+        Ok(RevisionedQuery {
+            result,
+            analysis_revision,
+        })
     }
 
     pub fn benchmark(
@@ -97,6 +145,7 @@ fn query_result(rows: NamedRows) -> QueryResult {
             .map(|row| row.into_iter().map(query_value).collect())
             .collect(),
         next: rows.next.map(|next| Box::new(query_result(*next))),
+        metadata: None,
     }
 }
 
@@ -316,18 +365,83 @@ fn publish_observations(
     db: &DbInstance,
     view: &WorkspaceView,
     observations: &[Observation],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<FactChanges, Box<dyn Error>> {
     let params = BTreeMap::from([
         ("view".into(), view.name.clone().into()),
         ("fingerprint".into(), view.fingerprint().into()),
     ]);
     let transaction = db.multi_transaction(true);
-    transaction.run_script(
-        "?[view, from, relation, to] := *observation{view, from, relation, to}, view == $view\n\
-         :rm observation {view, from, relation, to}",
-        params.clone(),
+    let current = transaction.run_script(
+        "?[from, relation, to, evidence] := \
+             *observation{view: $view, from, relation, to, evidence}",
+        BTreeMap::from([("view".into(), view.name.clone().into())]),
     )?;
-    store_observations(&transaction, &view.name, observations)?;
+    let current = current
+        .rows
+        .into_iter()
+        .map(|row| {
+            let value = |index: usize| {
+                row[index]
+                    .get_str()
+                    .map(str::to_owned)
+                    .ok_or("observation contains a non-string value")
+            };
+            Ok(((value(0)?, value(1)?, value(2)?), value(3)?))
+        })
+        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+    let next = observations
+        .iter()
+        .map(|observation| {
+            (
+                (
+                    observation.from.clone(),
+                    observation.relation.clone(),
+                    observation.to.clone(),
+                ),
+                observation.evidence.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let removed = current
+        .keys()
+        .filter(|key| !next.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    // ponytail: compare the completed view in memory and write per changed fact; stage server-side when graph size makes this scan material.
+    for (from, relation, to) in &removed {
+        transaction.run_script(
+            "?[view, from, relation, to] <- [[$view, $from, $relation, $to]]\n\
+             :rm observation {view, from, relation, to}",
+            BTreeMap::from([
+                ("view".into(), view.name.clone().into()),
+                ("from".into(), from.clone().into()),
+                ("relation".into(), relation.clone().into()),
+                ("to".into(), to.clone().into()),
+            ]),
+        )?;
+    }
+    let mut changes = FactChanges {
+        removed: removed.len(),
+        ..FactChanges::default()
+    };
+    let mut changed = Vec::new();
+    for ((from, relation, to), evidence) in &next {
+        match current.get(&(from.clone(), relation.clone(), to.clone())) {
+            None => changes.inserted += 1,
+            Some(current) if current == evidence => {
+                changes.unchanged += 1;
+                continue;
+            }
+            Some(_) => changes.updated += 1,
+        }
+        changed.push(Observation {
+            from: from.clone(),
+            relation: relation.clone(),
+            to: to.clone(),
+            evidence: evidence.clone(),
+        });
+    }
+    store_observations(&transaction, &view.name, &changed)?;
     transaction.run_script(
         "?[view, revision] := \
              *analysis_revision{view: $view, revision: previous}, \
@@ -344,7 +458,7 @@ fn publish_observations(
     )?;
     store_repository_states(&transaction, view)?;
     transaction.commit()?;
-    Ok(())
+    Ok(changes)
 }
 
 fn store_repository_states(
@@ -379,8 +493,36 @@ fn store_repository_states(
     Ok(())
 }
 
+trait QueryRunner {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>>;
+}
+
+impl QueryRunner for DbInstance {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        Ok(self.run_script(script, params, ScriptMutability::Immutable)?)
+    }
+}
+
+impl QueryRunner for MultiTransaction {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        Ok(self.run_script(script, params)?)
+    }
+}
+
 fn query(
-    db: &DbInstance,
+    db: &impl QueryRunner,
     view: &str,
     script: &str,
     additions: impl IntoIterator<Item = (&'static str, DataValue)>,
@@ -391,7 +533,7 @@ fn query(
             .into_iter()
             .map(|(name, value)| (name.into(), value)),
     );
-    Ok(db.run_script(script, params, ScriptMutability::Immutable)?)
+    db.run_query(script, params)
 }
 
 fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
@@ -409,6 +551,21 @@ fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Immutable,
     )?)
+}
+
+fn analysis_revision(db: &impl QueryRunner, view: &str) -> Result<u64, Box<dyn Error>> {
+    let rows = query(
+        db,
+        view,
+        "?[revision] := *analysis_revision{view: $view, revision}",
+        [],
+    )?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row[0].get_int())
+        .unwrap_or_default()
+        .try_into()?)
 }
 
 fn inspect_observations(
@@ -433,7 +590,7 @@ fn inspect_observations(
     )?)
 }
 
-fn context(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn context(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -449,7 +606,12 @@ fn context(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<d
     )
 }
 
-fn trace(db: &DbInstance, view: &str, from: &str, to: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn trace(
+    db: &impl QueryRunner,
+    view: &str,
+    from: &str,
+    to: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -476,7 +638,7 @@ fn trace(db: &DbInstance, view: &str, from: &str, to: &str) -> Result<NamedRows,
     )
 }
 
-fn impact(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn impact(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -489,7 +651,11 @@ fn impact(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dy
     )
 }
 
-fn dependencies(db: &DbInstance, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
+fn dependencies(
+    db: &impl QueryRunner,
+    view: &str,
+    entity: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
@@ -614,6 +780,8 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beholder_domain::LogicalRepository;
+    use std::{fs, time::SystemTime};
 
     #[test]
     fn impact_traverses_dependants() {
@@ -682,5 +850,128 @@ mod tests {
                 .flatten()
                 .any(|value| { value.as_str() == Some("pricing/get_price") })
         );
+    }
+
+    #[test]
+    fn publish_replaces_only_changed_facts() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-fact-replacement-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let store = SemanticStore::persistent(&state_dir.join("beholder.db"), true).unwrap();
+        let repository_state = |fingerprint: &str| RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: fingerprint.into(),
+        };
+        let observation = |from: &str, to: &str, evidence: &str| Observation {
+            from: from.into(),
+            relation: "calls".into(),
+            to: to.into(),
+            evidence: evidence.into(),
+        };
+
+        let first = WorkspaceView::new("main", "analysis", vec![repository_state("one")]).unwrap();
+        assert_eq!(
+            store
+                .publish(
+                    &first,
+                    &[
+                        observation("repo/a", "repo/b", "a.rs:1"),
+                        observation("repo/removed", "repo/b", "removed.rs:1"),
+                    ],
+                )
+                .unwrap(),
+            FactChanges {
+                inserted: 2,
+                updated: 0,
+                removed: 0,
+                unchanged: 0,
+            }
+        );
+
+        let second = WorkspaceView::new("main", "analysis", vec![repository_state("two")]).unwrap();
+        assert_eq!(
+            store
+                .publish(
+                    &second,
+                    &[
+                        observation("repo/a", "repo/b", "a.rs:2"),
+                        observation("repo/new", "repo/b", "new.rs:1"),
+                    ],
+                )
+                .unwrap(),
+            FactChanges {
+                inserted: 1,
+                updated: 1,
+                removed: 1,
+                unchanged: 0,
+            }
+        );
+        let observations = store.inspect_observations(None).unwrap();
+        assert_eq!(observations.rows.len(), 2);
+        assert!(!format!("{observations:?}").contains("repo/removed"));
+        assert!(format!("{observations:?}").contains("a.rs:2"));
+        assert!(
+            store
+                .inspect_revisions()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| row[1].as_i64() == Some(2))
+        );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn query_snapshot_keeps_rows_and_revision_consistent() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-query-snapshot-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let store = SemanticStore::persistent(&state_dir.join("beholder.db"), true).unwrap();
+        let view = WorkspaceView::new(
+            "snapshot",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .publish(
+                &view,
+                &[Observation {
+                    from: "repo/source".into(),
+                    relation: "calls".into(),
+                    to: "repo/target".into(),
+                    evidence: "source.rs:1".into(),
+                }],
+            )
+            .unwrap();
+        let snapshot = store.context_snapshot("snapshot", "repo/source").unwrap();
+
+        assert_eq!(snapshot.analysis_revision, 1);
+        assert!(
+            snapshot
+                .result
+                .rows
+                .iter()
+                .flatten()
+                .any(|value| value.as_str() == Some("repo/target"))
+        );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 }

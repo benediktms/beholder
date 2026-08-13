@@ -1,11 +1,20 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Observation {
     pub from: String,
     pub relation: String,
     pub to: String,
     pub evidence: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FactChanges {
+    pub inserted: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub unchanged: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,17 +53,23 @@ pub struct RepositoryState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceView {
     pub name: String,
+    pub analysis_identity: String,
     pub repository_states: Vec<RepositoryState>,
 }
 
 impl WorkspaceView {
     pub fn new(
         name: impl Into<String>,
+        analysis_identity: impl Into<String>,
         mut repository_states: Vec<RepositoryState>,
     ) -> Result<Self, String> {
         let name = name.into();
+        let analysis_identity = analysis_identity.into();
         if name.is_empty() {
             return Err("workspace view name must not be empty".into());
+        }
+        if analysis_identity.is_empty() {
+            return Err("workspace view analysis identity must not be empty".into());
         }
         if repository_states.is_empty() {
             return Err("workspace view must contain a repository state".into());
@@ -72,15 +87,23 @@ impl WorkspaceView {
         }
         Ok(Self {
             name,
+            analysis_identity,
             repository_states,
         })
     }
 
     pub fn fingerprint(&self) -> String {
-        self.repository_states
-            .iter()
-            .map(|state| format!("{}:{}", state.fingerprint.len(), state.fingerprint))
-            .collect()
+        std::iter::once(format!(
+            "{}:{}",
+            self.analysis_identity.len(),
+            self.analysis_identity
+        ))
+        .chain(
+            self.repository_states
+                .iter()
+                .map(|state| format!("{}:{}", state.fingerprint.len(), state.fingerprint)),
+        )
+        .collect()
     }
 }
 
@@ -116,6 +139,23 @@ mod tests {
                 .unwrap()
                 .repositories,
             vec![PathBuf::from("repo")]
+        );
+
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "state".into(),
+        };
+        assert!(WorkspaceView::new("main", "", vec![state.clone()]).is_err());
+        assert_ne!(
+            WorkspaceView::new("main", "analysis-1", vec![state.clone()])
+                .unwrap()
+                .fingerprint(),
+            WorkspaceView::new("main", "analysis-2", vec![state])
+                .unwrap()
+                .fingerprint()
         );
     }
 }

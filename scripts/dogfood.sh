@@ -6,9 +6,11 @@ state="$(mktemp -d "${TMPDIR:-/tmp}/beholder-dogfood.XXXXXX")"
 # ponytail: PID-derived port can collide; accept BEHOLDER_ADDRESS when parallel dogfood makes that real.
 export BEHOLDER_ADDRESS="${BEHOLDER_ADDRESS:-127.0.0.1:$((49152 + $$ % 10000))}"
 export BEHOLDER_STATE_DIR="$state"
+export RUST_LOG="${RUST_LOG:-info,beholderd=debug}"
 daemon_pid=''
 
 cleanup() {
+    exit_status=$?
     target/debug/beholder daemon stop >/dev/null 2>&1 || true
     if [[ -n "$daemon_pid" ]]; then
         wait "$daemon_pid" 2>/dev/null || true
@@ -19,9 +21,16 @@ cleanup() {
     done
     if [[ -s "$state/daemon/beholderd.pid" ]]; then
         echo 'isolated beholderd did not stop' >&2
-        return 1
+        exit_status=1
+    fi
+    if (( exit_status != 0 )); then
+        echo '--- isolated daemon logs ---' >&2
+        for log in "$state/beholderd.log" "$state/daemon"/beholderd.*.log; do
+            [[ -f "$log" ]] && cat "$log" >&2
+        done
     fi
     rm -rf "$state"
+    return "$exit_status"
 }
 trap cleanup EXIT
 
@@ -41,8 +50,15 @@ done
 target/debug/beholder daemon status >/dev/null
 target/debug/beholder workspace register main "$root" >/dev/null
 
-caller='repo://beholder/rust/crates/daemon/src/main/main'
-callee='repo://beholder/rust/crates/daemon-client/src/lib/state_dir'
+repository="$(basename "$root")"
+if remote="$(git -C "$root" remote get-url origin 2>/dev/null)"; then
+    repository="${remote#*://}"
+    repository="${repository#*@}"
+    repository="${repository/:/\/}"
+    repository="${repository%.git}"
+fi
+caller="repo://$repository/rust/crates/daemon/src/main/main"
+callee="repo://$repository/rust/crates/daemon-client/src/lib/state_dir"
 echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
 for _ in {1..100}; do
@@ -73,4 +89,27 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     printf 'expected main revision:\n%s\n' "$revision" >&2
     exit 1
 fi
+echo 'Stopping daemon and inspecting traces...' >&2
+target/debug/beholder daemon stop >/dev/null
+wait "$daemon_pid"
+daemon_pid=''
+trace_file="$(find "$state/daemon" -maxdepth 1 -name 'beholderd.*.log' -print | sort | tail -n 1)"
+if [[ -z "$trace_file" ]]; then
+    echo 'daemon produced no structured trace file' >&2
+    exit 1
+fi
+if grep -Eq '"level":"(WARN|ERROR)"' "$trace_file"; then
+    echo 'daemon trace contains warnings or errors:' >&2
+    cat "$trace_file" >&2
+    exit 1
+fi
+for expected in 'daemon started' 'workspace indexed' 'facts_inserted' 'rpc.context' 'daemon stopped'; do
+    if ! grep -Fq "$expected" "$trace_file"; then
+        printf 'daemon trace is missing %s:\n' "$expected" >&2
+        cat "$trace_file" >&2
+        exit 1
+    fi
+done
+trace_events="$(wc -l <"$trace_file" | tr -d ' ')"
+echo "Trace inspection passed: $trace_events events, no warnings or errors" >&2
 echo "dogfood smoke passed: indexed Beholder and resolved main -> state_dir" >&2
