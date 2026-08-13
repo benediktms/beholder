@@ -183,22 +183,12 @@ fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<(String, usize)>
 }
 
 fn canonical_git_remote(remote: &str) -> Option<String> {
-    let remote = remote.trim().trim_end_matches('/');
-    let (host, path) = if let Some((_, address)) = remote.split_once("://") {
-        let (authority, path) = address.split_once('/')?;
-        (authority.rsplit('@').next()?, path)
-    } else if let Some((authority, path)) = remote.split_once(':') {
-        if !authority.contains('@') {
-            return None;
-        }
-        (authority.rsplit('@').next()?, path)
-    } else {
-        return None;
-    };
-    let path = path
-        .trim_start_matches('/')
-        .strip_suffix(".git")
-        .unwrap_or(path);
+    let remote = gix_url::parse(remote.trim().into()).ok()?;
+    let host = remote.host()?;
+    let path = std::str::from_utf8(remote.path.as_ref())
+        .ok()?
+        .trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
     (!host.is_empty() && !path.is_empty()).then(|| format!("{host}/{path}"))
 }
 
