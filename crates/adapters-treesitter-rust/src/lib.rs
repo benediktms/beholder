@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 use tree_sitter::{Node, Parser};
 
-pub const FRONTEND_VERSION: &str = "1";
-pub const RESOLVER_VERSION: &str = "1";
+pub const FRONTEND_VERSION: &str = "2";
+pub const RESOLVER_VERSION: &str = "2";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
@@ -16,7 +16,14 @@ struct RustFunction {
     name: String,
     qualified_name: String,
     line: usize,
-    calls: Vec<(String, usize)>,
+    calls: Vec<RustCall>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RustCall {
+    name: String,
+    line: usize,
+    receiver_method: bool,
 }
 
 fn collect_functions<'tree>(
@@ -72,13 +79,17 @@ fn collect_functions<'tree>(
     }
 }
 
-fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<(String, usize)>) {
+fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<RustCall>) {
     if node.kind() == "call_expression"
         && let Some(function) = node.child_by_field_name("function")
-        && let Ok(function) = function.utf8_text(source)
-        && let Some(name) = function.rsplit([':', '.']).find(|part| !part.is_empty())
+        && let Ok(text) = function.utf8_text(source)
+        && let Some(name) = text.rsplit([':', '.']).find(|part| !part.is_empty())
     {
-        calls.push((name.to_owned(), node.start_position().row + 1));
+        calls.push(RustCall {
+            name: name.to_owned(),
+            line: node.start_position().row + 1,
+            receiver_method: function.kind() == "field_expression",
+        });
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -151,15 +162,19 @@ pub fn observations_from_analysis(
             to: function_id.clone(),
             evidence: format!("{}:{}", path.display(), function.line),
         });
-        for (callee, line) in &function.calls {
+        for call in &function.calls {
             observations.push(Observation {
                 from: function_id.clone(),
                 relation: "calls".into(),
-                to: definitions
-                    .get(callee)
-                    .and_then(Clone::clone)
-                    .unwrap_or_else(|| format!("rust-call://{callee}")),
-                evidence: format!("{}:{line}", path.display()),
+                to: if call.receiver_method {
+                    format!("rust-method://{}", call.name)
+                } else {
+                    definitions
+                        .get(&call.name)
+                        .and_then(Clone::clone)
+                        .unwrap_or_else(|| format!("rust-call://{}", call.name))
+                },
+                evidence: format!("{}:{}", path.display(), call.line),
             });
         }
     }
@@ -286,5 +301,37 @@ mod tests {
         assert!(definitions.contains(&"repo://beholder/rust/crates/example/src/lib/nested/run"));
         assert!(definitions.contains(&"repo://beholder/rust/crates/example/src/lib/impl/One/run"));
         assert!(definitions.contains(&"repo://beholder/rust/crates/example/src/lib/impl/Two/run"));
+    }
+
+    #[test]
+    fn leaves_receiver_methods_unresolved() {
+        let mut observations = observations(
+            "repo-link",
+            "fn is_valid_hash(s: &str) -> bool { \
+                 s.chars().all(|c| c.is_ascii()) \
+             } \
+             struct InMemoryOutboxRepository; \
+             impl InMemoryOutboxRepository { fn all(&self) {} }",
+            Path::new("crates/domain-task/src/hash.rs"),
+        )
+        .unwrap();
+
+        resolve_repository_calls(&mut observations);
+        let calls = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == "calls" && observation.from.ends_with("/is_valid_hash")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(calls.contains(&"rust-method://all"));
+        assert!(calls.contains(&"rust-method://chars"));
+        assert!(calls.contains(&"rust-method://is_ascii"));
+        assert!(
+            !calls
+                .iter()
+                .any(|target| { target.ends_with("/impl/InMemoryOutboxRepository/all") })
+        );
     }
 }
