@@ -22,6 +22,8 @@ tasks:
 
   lint:
     command: 'cargo clippy --workspace --all-targets -- -D warnings'
+    deps:
+      - 'format-check'
     inputs:
       - '@group(sources)'
 
