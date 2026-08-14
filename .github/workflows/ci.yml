@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - uses: moonrepo/setup-rust@v1
+        with:
+          inherit-toolchain: true
+          cache-base: main
+      - uses: moonrepo/setup-toolchain@v0
+        with:
+          moon-version: 2.4.6
+      - name: Run affected checks
+        run: >-
+          moon ci
+          beholder:format-check
+          beholder:lint
+          beholder:test
+          beholder:smoke
+          --concurrency 1
