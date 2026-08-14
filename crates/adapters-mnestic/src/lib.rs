@@ -271,6 +271,23 @@ const CREATE_DEPENDENCY_SCHEMA: &str = r#"
 }
 "#;
 
+const CREATE_METADATA_SCHEMA: &str = r#"
+:create state_observation_metadata {
+    state: String,
+    from: String,
+    relation: String,
+    to: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+const CREATE_OBSERVATION_TO_INDEX: &str =
+    "::index create state_observation:by_to {to, state, from, relation, evidence}";
+const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \
+     {to, state, from, relation, confidence, provenance}";
+
 const CREATE_OVERRIDE_SCHEMA: &str = r#"
 :create analysis_revision_dependency_override {
     view: String,
@@ -281,6 +298,19 @@ const CREATE_OVERRIDE_SCHEMA: &str = r#"
     =>
     resolved_to: String,
     evidence: String,
+}
+"#;
+
+const CREATE_OVERRIDE_METADATA_SCHEMA: &str = r#"
+:create analysis_revision_dependency_override_metadata {
+    view: String,
+    revision: Int,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    =>
+    confidence: Float,
+    provenance: String,
 }
 "#;
 
@@ -339,6 +369,14 @@ const SEED_DEPENDENCIES: &str = r#"
 :put state_dependency_observation {state, from, relation, to => evidence}
 "#;
 
+const SEED_METADATA: &str = r#"
+?[state, from, relation, to, confidence, provenance] :=
+    *state_observation{state, from, relation, to},
+    confidence = 1.0,
+    provenance = 'ast'
+:put state_observation_metadata {state, from, relation, to => confidence, provenance}
+"#;
+
 const SEED_REVISIONS: &str = r#"
 ?[view, revision] <- [['main', 0], ['feature', 0]]
 :put analysis_revision {view => revision}
@@ -355,6 +393,50 @@ const SEED_STATES: &str = r#"
 const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
 const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
 const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
+const CONTEXT_QUERY: &str = "selected_state[state] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_state{view: $view, revision, state}\n\
+     context_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_dependency_override{\
+             view: $view, revision, from, relation, unresolved_to, resolved_to, evidence\
+         }, \
+         *analysis_revision_dependency_override_metadata{\
+             view: $view, revision, from, relation, unresolved_to, confidence, provenance\
+         }\n\
+     overridden[from, relation, unresolved_to, evidence] := \
+         context_override[from, relation, unresolved_to, _, evidence, _, _]\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         selected_state[state], \
+         *state_observation{\
+             state, from: $entity, relation, to: related, evidence\
+         }, \
+         *state_observation_metadata{\
+             state, from: $entity, relation, to: related, confidence, provenance\
+         }, \
+         not overridden[$entity, relation, related, evidence], \
+         direction = 'outgoing'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         context_override[\
+             $entity, relation, _, related, evidence, confidence, provenance\
+         ], \
+         direction = 'outgoing'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         selected_state[state], \
+         *state_observation:by_to{\
+             state, from: related, relation, to: $entity, evidence\
+         }, \
+         *state_observation_metadata:by_to{\
+             state, from: related, relation, to: $entity, confidence, provenance\
+         }, \
+         not overridden[related, relation, $entity, evidence], \
+         direction = 'incoming'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         context_override[\
+             related, relation, _, $entity, evidence, confidence, provenance\
+         ], \
+         direction = 'incoming'\n\
+     :order direction, relation, related";
 
 fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
     let db = DbInstance::new("mem", "", Default::default())?;
@@ -365,7 +447,27 @@ fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_METADATA_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_OBSERVATION_TO_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_METADATA_TO_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_OVERRIDE_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_OVERRIDE_METADATA_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
@@ -385,6 +487,7 @@ fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
+    db.run_script(SEED_METADATA, BTreeMap::new(), ScriptMutability::Mutable)?;
     db.run_script(SEED_REVISIONS, BTreeMap::new(), ScriptMutability::Mutable)?;
     db.run_script(SEED_STATES, BTreeMap::new(), ScriptMutability::Mutable)?;
     Ok(db)
@@ -432,10 +535,34 @@ fn persistent_database(path: &Path, initialize: bool) -> Result<DbInstance, Box<
         && !relations
             .rows
             .iter()
+            .any(|row| row[0].get_str() == Some("state_observation_metadata"))
+    {
+        db.run_script(
+            CREATE_METADATA_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    if initialize
+        && !relations
+            .rows
+            .iter()
             .any(|row| row[0].get_str() == Some("state_dependency_observation"))
     {
         db.run_script(
             CREATE_DEPENDENCY_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("analysis_revision_dependency_override_metadata"))
+    {
+        db.run_script(
+            CREATE_OVERRIDE_METADATA_SCHEMA,
             BTreeMap::new(),
             ScriptMutability::Mutable,
         )?;
@@ -512,6 +639,22 @@ fn persistent_database(path: &Path, initialize: bool) -> Result<DbInstance, Box<
             ScriptMutability::Mutable,
         )?;
     }
+    if initialize {
+        let relations =
+            db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
+        for (name, script) in [
+            ("state_observation:by_to", CREATE_OBSERVATION_TO_INDEX),
+            ("state_observation_metadata:by_to", CREATE_METADATA_TO_INDEX),
+        ] {
+            if !relations
+                .rows
+                .iter()
+                .any(|row| row[0].get_str() == Some(name))
+            {
+                db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)?;
+            }
+        }
+    }
     Ok(db)
 }
 
@@ -528,6 +671,8 @@ fn store_observations(
             ("relation".into(), observation.relation.as_str().into()),
             ("to".into(), observation.to.as_str().into()),
             ("evidence".into(), observation.evidence.as_str().into()),
+            ("confidence".into(), observation.confidence.score().into()),
+            ("provenance".into(), observation.provenance.as_str().into()),
         ]);
         transaction.run_script(
             "?[state, from, relation, to, evidence] <- [[$state, $from, $relation, $to, $evidence]]\n\
@@ -538,9 +683,18 @@ fn store_observations(
             transaction.run_script(
                 "?[state, from, relation, to, evidence] <- [[$state, $from, $relation, $to, $evidence]]\n\
                  :put state_dependency_observation {state, from, relation, to => evidence}",
-                params,
+                params.clone(),
             )?;
         }
+        transaction.run_script(
+            "?[state, from, relation, to, confidence, provenance] <- [\
+                 [$state, $from, $relation, $to, $confidence, $provenance]\
+             ]\n\
+             :put state_observation_metadata {\
+                 state, from, relation, to => confidence, provenance\
+             }",
+            params,
+        )?;
     }
     Ok(())
 }
@@ -595,7 +749,8 @@ fn publish_observations(
     let current = transaction.run_script(
         &format!(
             "{DIRECT_RULES}\n\
-             ?[from, relation, to, evidence] := effective_observation[from, to, relation, evidence]"
+             ?[from, relation, to, evidence] := \
+                 effective_observation[from, to, relation, evidence, _, _]"
         ),
         BTreeMap::from([("view".into(), view.name.clone().into())]),
     )?;
@@ -685,6 +840,19 @@ fn publish_observations(
     )?;
     store_repository_states(&transaction, view, repositories)?;
     for override_ in overrides {
+        let params = BTreeMap::from([
+            ("view".into(), view.name.clone().into()),
+            ("from".into(), override_.from.as_str().into()),
+            ("relation".into(), override_.relation.as_str().into()),
+            (
+                "unresolved_to".into(),
+                override_.unresolved_to.as_str().into(),
+            ),
+            ("resolved_to".into(), override_.resolved_to.as_str().into()),
+            ("evidence".into(), override_.evidence.as_str().into()),
+            ("confidence".into(), override_.confidence.score().into()),
+            ("provenance".into(), override_.provenance.as_str().into()),
+        ]);
         transaction.run_script(
             "?[view, revision, from, relation, unresolved_to, resolved_to, evidence] := \
                  *analysis_revision{view: $view, revision}, \
@@ -693,17 +861,18 @@ fn publish_observations(
              :put analysis_revision_dependency_override {\
                  view, revision, from, relation, unresolved_to => resolved_to, evidence\
              }",
-            BTreeMap::from([
-                ("view".into(), view.name.clone().into()),
-                ("from".into(), override_.from.as_str().into()),
-                ("relation".into(), override_.relation.as_str().into()),
-                (
-                    "unresolved_to".into(),
-                    override_.unresolved_to.as_str().into(),
-                ),
-                ("resolved_to".into(), override_.resolved_to.as_str().into()),
-                ("evidence".into(), override_.evidence.as_str().into()),
-            ]),
+            params.clone(),
+        )?;
+        transaction.run_script(
+            "?[view, revision, from, relation, unresolved_to, confidence, provenance] := \
+                 *analysis_revision{view: $view, revision}, \
+                 view = $view, from = $from, relation = $relation, \
+                 unresolved_to = $unresolved_to, confidence = $confidence, \
+                 provenance = $provenance\n\
+             :put analysis_revision_dependency_override_metadata {\
+                 view, revision, from, relation, unresolved_to => confidence, provenance\
+             }",
+            params,
         )?;
     }
     transaction.commit()?;
@@ -843,21 +1012,7 @@ fn inspect_observations(
 }
 
 fn context(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        &format!(
-            "{DIRECT_RULES}\n\
-             ?[direction, relation, related, evidence] := \
-                 effective_observation[$entity, related, relation, evidence], \
-                 direction = 'outgoing'\n\
-             ?[direction, relation, related, evidence] := \
-                 effective_observation[related, $entity, relation, evidence], \
-                 direction = 'incoming'\n\
-             :order direction, relation, related"
-        ),
-        [("entity", entity.into())],
-    )
+    query(db, view, CONTEXT_QUERY, [("entity", entity.into())])
 }
 
 fn trace(
@@ -874,14 +1029,15 @@ fn trace(
              start[] <- [[$from]]\n\
              predecessor[to, smallest_by(candidate)] := distance[to, hops], hops > 0, \
                  distance[from, previous_hops], previous_hops + 1 == hops, \
-                 direct[from, to, _, _], candidate = [from, from]\n\
+                 direct[from, to, _, _, _, _], candidate = [from, from]\n\
              path[to, nodes] := predecessor[to, $from], nodes = [$from, to]\n\
              path[to, nodes] := path[from, previous_nodes], predecessor[to, from], \
                  nodes = append(previous_nodes, to)\n\
              steps[nodes, step] := path[$to, nodes], \
                  index in int_range(length(nodes) - 1), \
                  from = get(nodes, index), to = get(nodes, index + 1), \
-                 direct[from, to, relation, evidence], step = [index, relation, evidence]\n\
+                 direct[from, to, relation, evidence, confidence, provenance], \
+                 step = [index, relation, evidence, confidence, provenance]\n\
              ?[nodes, collect(step), hops] := steps[nodes, step], hops = length(nodes) - 1"
         ),
         [
@@ -900,12 +1056,15 @@ fn impact(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows, 
             "{DIRECT_RULES}\n{IMPACT_RULES}\n\
              start[] <- [[$from]]\n\
              selected[node, hops] := distance[node, hops]\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
                  selected[entity, hops], hops > 0, row_kind = 'entity', \
-                 edge_from = '', edge_to = '', relation = '', evidence = ''\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+                 edge_from = '', edge_to = '', relation = '', evidence = '', \
+                 confidence = 1.0, provenance = 'ast'\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
                  selected[edge_from, _], selected[edge_to, _], \
-                 direct[edge_from, edge_to, relation, evidence], row_kind = 'edge', \
+                 direct[\
+                     edge_from, edge_to, relation, evidence, confidence, provenance\
+                 ], row_kind = 'edge', \
                  entity = '', hops = 0\n\
              :order row_kind, hops, entity, edge_from, edge_to, relation"
         ),
@@ -925,12 +1084,15 @@ fn dependencies(
             "{DIRECT_RULES}\n{DEPENDENCY_RULES}\n\
              start[] <- [[$from]]\n\
              selected[node, hops] := distance[node, hops]\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
                  selected[entity, hops], hops > 0, row_kind = 'entity', \
-                 edge_from = '', edge_to = '', relation = '', evidence = ''\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+                 edge_from = '', edge_to = '', relation = '', evidence = '', \
+                 confidence = 1.0, provenance = 'ast'\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
                  selected[edge_from, _], selected[edge_to, _], \
-                 direct[edge_from, edge_to, relation, evidence], row_kind = 'edge', \
+                 direct[\
+                     edge_from, edge_to, relation, evidence, confidence, provenance\
+                 ], row_kind = 'edge', \
                  entity = '', hops = 0\n\
              :order row_kind, hops, entity, edge_from, edge_to, relation"
         ),
@@ -1049,7 +1211,9 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::{DependencyRelation, LogicalRepository, StructuralRelation};
+    use beholder_domain::{
+        Confidence, DependencyRelation, LogicalRepository, Provenance, StructuralRelation,
+    };
     use std::{collections::BTreeSet, fs, time::SystemTime};
 
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
@@ -1134,6 +1298,13 @@ mod tests {
         assert_eq!(node_ids.len(), result.nodes.len());
         assert_eq!(edge_ids.len(), result.edges.len());
         assert_eq!(result.nodes[0].kind, beholder_dto::EntityKind::Callable);
+        assert!(result.edges.iter().all(|edge| {
+            edge.confidence == 1.0
+                && edge
+                    .evidence
+                    .iter()
+                    .all(|evidence| evidence.source_kind == beholder_dto::EvidenceKind::Ast)
+        }));
         for path in &result.paths {
             assert!(path.nodes.iter().all(|id| node_ids.contains(id.as_str())));
             assert!(path.edges.iter().all(|id| edge_ids.contains(id.as_str())));
@@ -1147,7 +1318,9 @@ mod tests {
             &db,
             "feature",
             &format!(
-                "{DIRECT_RULES}\n?[provider] := direct['rpc/Pricing.GetPrice', provider, 'implemented_by', _]"
+                "{DIRECT_RULES}\n?[provider] := direct[\
+                    'rpc/Pricing.GetPrice', provider, 'implemented_by', _, _, _\
+                 ]"
             ),
             [],
         )
@@ -1358,16 +1531,30 @@ mod tests {
                     unresolved_to: unresolved.to,
                     resolved_to: resolved.into(),
                     evidence: unresolved.evidence,
+                    confidence: Confidence::Inferred,
+                    provenance: Provenance::UniqueNameHeuristic,
                 }],
             )
             .unwrap();
 
-        let context = format!(
-            "{:?}",
-            store
-                .context("joined", "repo://source/rust/lib/caller")
-                .unwrap()
+        let context = store
+            .context("joined", "repo://source/rust/lib/caller")
+            .unwrap();
+        let edge = context
+            .edges
+            .iter()
+            .find(|edge| edge.to == resolved)
+            .unwrap();
+        assert_eq!(edge.confidence, 0.6);
+        assert_eq!(
+            edge.evidence[0].source_kind,
+            beholder_dto::EvidenceKind::Inference
         );
+        assert_eq!(
+            edge.evidence[0].detail.as_deref(),
+            Some("unique_name_heuristic")
+        );
+        let context = format!("{context:?}");
         assert!(context.contains(resolved));
         assert!(!context.contains("rust-call://helper"));
         assert_eq!(

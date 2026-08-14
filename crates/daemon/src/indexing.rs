@@ -25,7 +25,7 @@ use tokio::{
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
-const CORE_RULE_PACK_VERSION: &str = "4";
+const CORE_RULE_PACK_VERSION: &str = "5";
 type RustSources = Vec<(PathBuf, String)>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

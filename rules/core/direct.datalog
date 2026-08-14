@@ -2,7 +2,7 @@ selected_state[state] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_state{view: $view, revision, state}
 
-dependency_override[from, relation, unresolved_to, resolved_to, evidence] :=
+dependency_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_dependency_override{
         view: $view,
@@ -12,23 +12,34 @@ dependency_override[from, relation, unresolved_to, resolved_to, evidence] :=
         unresolved_to,
         resolved_to,
         evidence,
+    },
+    *analysis_revision_dependency_override_metadata{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        confidence,
+        provenance,
     }
 
 overridden[from, relation, unresolved_to, evidence] :=
-    dependency_override[from, relation, unresolved_to, _, evidence]
+    dependency_override[from, relation, unresolved_to, _, evidence, _, _]
 
-effective_observation[from, to, relation, evidence] :=
+effective_observation[from, to, relation, evidence, confidence, provenance] :=
     selected_state[state],
     *state_observation{state, from, relation, to, evidence},
+    *state_observation_metadata{state, from, relation, to, confidence, provenance},
     not overridden[from, relation, to, evidence]
 
-effective_observation[from, resolved_to, relation, evidence] :=
-    dependency_override[from, relation, _, resolved_to, evidence]
+effective_observation[from, resolved_to, relation, evidence, confidence, provenance] :=
+    dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
 
-direct[from, to, relation, evidence] :=
+direct[from, to, relation, evidence, confidence, provenance] :=
     selected_state[state],
     *state_dependency_observation{state, from, relation, to, evidence},
+    *state_observation_metadata{state, from, relation, to, confidence, provenance},
     not overridden[from, relation, to, evidence]
 
-direct[from, resolved_to, relation, evidence] :=
-    dependency_override[from, relation, _, resolved_to, evidence]
+direct[from, resolved_to, relation, evidence, confidence, provenance] :=
+    dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]

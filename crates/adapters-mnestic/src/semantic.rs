@@ -23,9 +23,15 @@ pub(super) fn context(
         let relation = text(&row, 1, "context relation")?;
         let related = text(&row, 2, "context related entity")?;
         let evidence = text(&row, 3, "context evidence")?;
+        let confidence = float(&row, 4, "context confidence")? as f32;
+        let provenance = text(&row, 5, "context provenance")?;
         let _ = match direction {
-            "outgoing" => graph.add_edge(entity, related, relation, evidence)?,
-            "incoming" => graph.add_edge(related, entity, relation, evidence)?,
+            "outgoing" => {
+                graph.add_edge(entity, related, relation, evidence, confidence, provenance)?
+            }
+            "incoming" => {
+                graph.add_edge(related, entity, relation, evidence, confidence, provenance)?
+            }
             _ => return Err(format!("unknown context direction: {direction}").into()),
         };
     }
@@ -102,6 +108,8 @@ fn closure(result: InspectionResult, root: &str) -> Result<Closure, Box<dyn Erro
                     text(&row, 4, "closure edge target")?,
                     text(&row, 5, "closure relation")?,
                     text(&row, 6, "closure evidence")?,
+                    float(&row, 7, "closure confidence")? as f32,
+                    text(&row, 8, "closure provenance")?,
                 )?;
             }
             kind => return Err(format!("unknown closure row kind: {kind}").into()),
@@ -153,13 +161,25 @@ pub(super) fn trace(
                 .get(2)
                 .and_then(InspectionValue::as_str)
                 .ok_or("trace step evidence must be text")?;
+            let confidence = values
+                .get(3)
+                .and_then(|value| match value {
+                    InspectionValue::Float(value) => Some(*value as f32),
+                    InspectionValue::Integer(value) => Some(*value as f32),
+                    _ => None,
+                })
+                .ok_or("trace step confidence must be numeric")?;
+            let provenance = values
+                .get(4)
+                .and_then(InspectionValue::as_str)
+                .ok_or("trace step provenance must be text")?;
             let source = nodes
                 .get(index)
                 .ok_or("trace step source is out of bounds")?;
             let target = nodes
                 .get(index + 1)
                 .ok_or("trace step target is out of bounds")?;
-            keys.push(graph.add_edge(source, target, relation, evidence)?);
+            keys.push(graph.add_edge(source, target, relation, evidence, confidence, provenance)?);
         }
         paths.push((nodes, keys));
     }
@@ -189,8 +209,13 @@ pub(super) fn trace(
 
 #[derive(Default)]
 struct GraphBuilder {
-    edges: BTreeMap<EdgeKey, BTreeSet<EvidenceRef>>,
+    edges: BTreeMap<EdgeKey, EdgeData>,
     kinds: BTreeMap<String, EntityKind>,
+}
+
+struct EdgeData {
+    confidence: f32,
+    evidence: BTreeSet<EvidenceRef>,
 }
 
 impl GraphBuilder {
@@ -207,15 +232,24 @@ impl GraphBuilder {
         to: &str,
         relation: &str,
         evidence: &str,
+        confidence: f32,
+        provenance: &str,
     ) -> Result<EdgeKey, Box<dyn Error>> {
         let relation = RelationKind::try_from(relation)?;
         let key = (from.into(), to.into(), relation);
         self.hint(from, relation_kind_hint(relation.as_str(), true, from));
         self.hint(to, relation_kind_hint(relation.as_str(), false, to));
+        let evidence = evidence_ref(from, evidence, provenance);
         self.edges
             .entry(key.clone())
-            .or_default()
-            .insert(evidence_ref(from, evidence));
+            .and_modify(|edge| {
+                edge.confidence = edge.confidence.min(confidence);
+                edge.evidence.insert(evidence.clone());
+            })
+            .or_insert_with(|| EdgeData {
+                confidence,
+                evidence: BTreeSet::from([evidence]),
+            });
         Ok(key)
     }
 
@@ -242,7 +276,7 @@ impl GraphBuilder {
             .edges
             .into_iter()
             .enumerate()
-            .map(|(index, (key, evidence))| {
+            .map(|(index, (key, edge))| {
                 let id = format!("e{}", index + 1);
                 edge_ids.insert(key.clone(), id.clone());
                 SemanticEdge {
@@ -250,8 +284,8 @@ impl GraphBuilder {
                     from: key.0,
                     to: key.1,
                     kind: key.2,
-                    confidence: 1.0,
-                    evidence: evidence.into_iter().collect(),
+                    confidence: edge.confidence,
+                    evidence: edge.evidence.into_iter().collect(),
                 }
             })
             .collect();
@@ -372,7 +406,7 @@ fn repository(id: &str) -> Option<String> {
     })
 }
 
-fn evidence_ref(from: &str, evidence: &str) -> EvidenceRef {
+fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
     let (path, line) = evidence
         .rsplit_once(':')
         .and_then(|(path, line)| {
@@ -383,15 +417,18 @@ fn evidence_ref(from: &str, evidence: &str) -> EvidenceRef {
         .unwrap_or((None, None));
     let has_path = path.is_some();
     EvidenceRef {
-        source_kind: if path.is_some() {
-            EvidenceKind::Ast
-        } else {
-            EvidenceKind::Unknown
+        source_kind: match provenance {
+            "ast" => EvidenceKind::Ast,
+            "unique_name_heuristic" => EvidenceKind::Inference,
+            _ => EvidenceKind::Unknown,
         },
         repository: repository(from),
         path,
         line,
-        detail: (!has_path).then(|| evidence.into()),
+        detail: match provenance {
+            "unique_name_heuristic" => Some(provenance.into()),
+            _ => (!has_path).then(|| evidence.into()),
+        },
     }
 }
 
@@ -409,6 +446,14 @@ fn integer(row: &[InspectionValue], index: usize, name: &str) -> Result<i64, Box
     row.get(index)
         .and_then(InspectionValue::as_i64)
         .ok_or_else(|| format!("{name} must be an integer").into())
+}
+
+fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<dyn Error>> {
+    match row.get(index) {
+        Some(InspectionValue::Float(value)) => Ok(*value),
+        Some(InspectionValue::Integer(value)) => Ok(*value as f64),
+        _ => Err(format!("{name} must be numeric").into()),
+    }
 }
 
 fn list<'a>(

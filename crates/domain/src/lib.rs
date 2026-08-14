@@ -39,6 +39,38 @@ impl Evidence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    Exact,
+    Inferred,
+}
+
+impl Confidence {
+    pub fn score(self) -> f64 {
+        match self {
+            Self::Exact => 1.0,
+            Self::Inferred => 0.6,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    Ast,
+    UniqueNameHeuristic,
+}
+
+impl Provenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ast => "ast",
+            Self::UniqueNameHeuristic => "unique_name_heuristic",
+        }
+    }
+}
+
 impl From<String> for Evidence {
     fn from(value: String) -> Self {
         Self(value)
@@ -113,6 +145,8 @@ pub struct Observation {
     pub relation: SemanticRelation,
     pub to: EntityId,
     pub evidence: Evidence,
+    pub confidence: Confidence,
+    pub provenance: Provenance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +163,8 @@ pub struct DependencyOverride {
     pub unresolved_to: EntityId,
     pub resolved_to: EntityId,
     pub evidence: Evidence,
+    pub confidence: Confidence,
+    pub provenance: Provenance,
 }
 
 impl Observation {
@@ -143,6 +179,8 @@ impl Observation {
             relation: SemanticRelation::Structural(relation),
             to: to.into(),
             evidence: evidence.into(),
+            confidence: Confidence::Exact,
+            provenance: Provenance::Ast,
         }
     }
 
@@ -157,6 +195,8 @@ impl Observation {
             relation: SemanticRelation::Dependency(relation),
             to: to.into(),
             evidence: evidence.into(),
+            confidence: Confidence::Exact,
+            provenance: Provenance::Ast,
         }
     }
 }

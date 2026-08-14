@@ -157,6 +157,7 @@ impl From<dto::EvidenceKind> for v1::EvidenceKind {
             dto::EvidenceKind::Configuration => Self::Configuration,
             dto::EvidenceKind::Descriptor => Self::Descriptor,
             dto::EvidenceKind::Generated => Self::Generated,
+            dto::EvidenceKind::Inference => Self::Inference,
             dto::EvidenceKind::Unknown => Self::Unknown,
         }
     }
@@ -169,6 +170,7 @@ fn evidence_kind(value: i32) -> Result<dto::EvidenceKind, &'static str> {
             v1::EvidenceKind::Configuration => dto::EvidenceKind::Configuration,
             v1::EvidenceKind::Descriptor => dto::EvidenceKind::Descriptor,
             v1::EvidenceKind::Generated => dto::EvidenceKind::Generated,
+            v1::EvidenceKind::Inference => dto::EvidenceKind::Inference,
             v1::EvidenceKind::Unknown => dto::EvidenceKind::Unknown,
         },
     )
@@ -534,13 +536,23 @@ mod tests {
                 from: "a".into(),
                 to: "b".into(),
                 kind: dto::RelationKind::Calls,
-                confidence: 1.0,
-                evidence: Vec::new(),
+                confidence: 0.6,
+                evidence: vec![dto::EvidenceRef {
+                    source_kind: dto::EvidenceKind::Inference,
+                    repository: None,
+                    path: Some("src/lib.rs".into()),
+                    line: Some(1),
+                    detail: Some("unique_name_heuristic".into()),
+                }],
             }],
             paths: Vec::new(),
         };
         let response = v1::TraceResponse::from(trace.clone());
         assert_eq!(response.edges[0].kind, v1::RelationKind::Calls as i32);
+        assert_eq!(
+            response.edges[0].evidence[0].source,
+            v1::EvidenceKind::Inference as i32
+        );
         assert_eq!(dto::TraceResult::try_from(response).unwrap(), trace);
         assert!(relation_kind(v1::RelationKind::Unknown as i32).is_err());
         let protocol = include_str!("../../../proto/beholder/v1/daemon.proto");

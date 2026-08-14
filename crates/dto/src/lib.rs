@@ -120,6 +120,7 @@ pub enum EvidenceKind {
     Configuration,
     Descriptor,
     Generated,
+    Inference,
     Unknown,
 }
 

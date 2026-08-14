@@ -1,13 +1,13 @@
 use beholder_domain::{
-    DependencyOverride, DependencyRelation, EntityId, Observation, SemanticRelation,
-    StructuralRelation,
+    Confidence, DependencyOverride, DependencyRelation, EntityId, Observation, Provenance,
+    SemanticRelation, StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 use tree_sitter::{Node, Parser};
 
 pub const FRONTEND_VERSION: &str = "2";
-pub const RESOLVER_VERSION: &str = "3";
+pub const RESOLVER_VERSION: &str = "5";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
@@ -147,18 +147,28 @@ pub fn observations_from_analysis(
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
     let source_id = format!("repo://{repository}/rust/{module}");
-    let mut definitions = BTreeMap::<String, Option<String>>::new();
+    let mut definitions = BTreeMap::<(String, String), Option<String>>::new();
     for function in &analysis.functions {
         let id = format!("{source_id}/{}", function.qualified_name);
-        definitions
-            .entry(function.name.clone())
-            .and_modify(|candidate| *candidate = None)
-            .or_insert(Some(id));
+        let scope = function
+            .qualified_name
+            .rsplit_once('/')
+            .map_or("", |(scope, _)| scope);
+        if !scope.starts_with("impl/") {
+            definitions
+                .entry((scope.into(), function.name.clone()))
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(id));
+        }
     }
     let mut observations = Vec::new();
 
     for function in &analysis.functions {
         let function_id = format!("{source_id}/{}", function.qualified_name);
+        let scope = function
+            .qualified_name
+            .rsplit_once('/')
+            .map_or("", |(scope, _)| scope);
         observations.push(Observation::structural(
             source_id.clone(),
             StructuralRelation::Defines,
@@ -173,7 +183,7 @@ pub fn observations_from_analysis(
                     format!("rust-method://{}", call.name)
                 } else {
                     definitions
-                        .get(&call.name)
+                        .get(&(scope.into(), call.name.clone()))
                         .and_then(Clone::clone)
                         .unwrap_or_else(|| format!("rust-call://{}", call.name))
                 },
@@ -226,8 +236,12 @@ pub fn resolve_repository_calls(observations: &mut [Observation]) -> Vec<Depende
                 unresolved_to: observation.to.clone(),
                 resolved_to: EntityId::from(target.clone()),
                 evidence: observation.evidence.clone(),
+                confidence: Confidence::Inferred,
+                provenance: Provenance::UniqueNameHeuristic,
             });
             observation.to = EntityId::from(target.clone());
+            observation.confidence = Confidence::Inferred;
+            observation.provenance = Provenance::UniqueNameHeuristic;
         }
     }
     overrides
@@ -267,6 +281,8 @@ mod tests {
             observation.from.as_str() == "repo://beholder/rust/lib/first"
                 && observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
                 && observation.to.as_str() == "repo://beholder/rust/lib/second"
+                && observation.confidence == Confidence::Exact
+                && observation.provenance == Provenance::Ast
         }));
 
         let mut ambiguous = vec![
@@ -291,6 +307,63 @@ mod tests {
         ];
         resolve_repository_calls(&mut ambiguous);
         assert_eq!(ambiguous[0].to.as_str(), "rust-call://helper");
+        assert_eq!(ambiguous[0].confidence, Confidence::Exact);
+        assert_eq!(ambiguous[0].provenance, Provenance::Ast);
+    }
+
+    #[test]
+    fn marks_unique_name_resolution_as_inferred() {
+        let mut observations = vec![
+            Observation::dependency(
+                "repo://beholder/rust/caller",
+                DependencyRelation::Calls,
+                "rust-call://helper",
+                "src/caller.rs:1",
+            ),
+            Observation::structural(
+                "repo://beholder/rust/helper",
+                StructuralRelation::Defines,
+                "repo://beholder/rust/helper/helper",
+                "src/helper.rs:1",
+            ),
+        ];
+
+        let overrides = resolve_repository_calls(&mut observations);
+
+        assert_eq!(
+            observations[0].to.as_str(),
+            "repo://beholder/rust/helper/helper"
+        );
+        assert_eq!(observations[0].confidence, Confidence::Inferred);
+        assert_eq!(observations[0].provenance, Provenance::UniqueNameHeuristic);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].confidence, Confidence::Inferred);
+        assert_eq!(overrides[0].provenance, Provenance::UniqueNameHeuristic);
+    }
+
+    #[test]
+    fn does_not_treat_sibling_module_names_as_exact() {
+        let mut observations = observations(
+            "beholder",
+            "mod one { fn caller() { helper(); } } mod two { fn helper() {} }",
+            Path::new("src/lib.rs"),
+        )
+        .unwrap();
+        let call = observations
+            .iter()
+            .find(|observation| observation.from.as_str().ends_with("/one/caller"))
+            .unwrap();
+        assert_eq!(call.to.as_str(), "rust-call://helper");
+        assert_eq!(call.confidence, Confidence::Exact);
+
+        resolve_repository_calls(&mut observations);
+        let call = observations
+            .iter()
+            .find(|observation| observation.from.as_str().ends_with("/one/caller"))
+            .unwrap();
+        assert!(call.to.as_str().ends_with("/two/helper"));
+        assert_eq!(call.confidence, Confidence::Inferred);
+        assert_eq!(call.provenance, Provenance::UniqueNameHeuristic);
     }
 
     #[test]
@@ -341,6 +414,15 @@ mod tests {
         assert!(calls.contains(&"rust-method://all"));
         assert!(calls.contains(&"rust-method://chars"));
         assert!(calls.contains(&"rust-method://is_ascii"));
+        assert!(
+            observations
+                .iter()
+                .filter(|observation| { observation.to.as_str().starts_with("rust-method://") })
+                .all(|observation| {
+                    observation.confidence == Confidence::Exact
+                        && observation.provenance == Provenance::Ast
+                })
+        );
         assert!(
             !calls
                 .iter()
