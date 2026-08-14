@@ -73,3 +73,11 @@ tasks:
       - 'scripts/dogfood.sh'
     options:
       cache: false
+
+  db-plan:
+    command: 'cargo run --quiet -p shell-mnestic --features devtools --bin mnestic-plan --'
+    inputs:
+      - '@group(sources)'
+    options:
+      cache: false
+      runInCI: false

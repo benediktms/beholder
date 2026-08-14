@@ -1,0 +1,16 @@
+[package]
+name = "shell-mnestic"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+devtools = ["dep:beholder-adapters-mnestic"]
+
+[[bin]]
+name = "mnestic-plan"
+path = "src/main.rs"
+required-features = ["devtools"]
+
+[dependencies]
+beholder-adapters-mnestic = { workspace = true, features = ["devtools"], optional = true }

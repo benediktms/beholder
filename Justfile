@@ -63,6 +63,22 @@ uninstall:
 smoke:
     moon run beholder:smoke
 
+# Explain a Datalog query against the installed daemon database.
+[group('manual')]
+db-plan query:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for attempt in 1 2 3; do
+        if output="$(moon run beholder:db-plan -- "{{query}}" 2>&1)"; then
+            printf '%s\n' "$output"
+            exit 0
+        fi
+        [[ "$output" == *"database is locked"* ]] || break
+        sleep 1
+    done
+    printf '%s\n' "$output" >&2
+    exit 1
+
 # Print the newest daemon trace segment (default: 100 lines).
 [group('manual')]
 logs lines="100":

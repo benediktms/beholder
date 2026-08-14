@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
+devtools = ["sqlite"]
 parallel = ["mnestic-engine/rayon"]
 sqlite = ["mnestic-engine/storage-sqlite", "mnestic-engine/storage-sqlite-src"]
 

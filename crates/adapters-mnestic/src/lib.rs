@@ -222,6 +222,18 @@ impl SemanticStore {
     }
 }
 
+#[cfg(feature = "devtools")]
+pub fn explain(path: &Path, query: &str) -> Result<InspectionResult, Box<dyn Error>> {
+    let db = persistent_database(path, false)?;
+    db.run_script(
+        &format!("::explain {{\n{query}\n}}"),
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )
+    .map(inspection_result)
+    .map_err(Into::into)
+}
+
 fn inspection_result(rows: NamedRows) -> InspectionResult {
     InspectionResult {
         headers: rows.headers,
