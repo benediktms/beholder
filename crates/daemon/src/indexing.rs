@@ -1208,7 +1208,7 @@ mod tests {
         let changed = repository.join("lib/sample.ex");
         fs::write(
             &changed,
-            "defmodule MyApp.Sample do\n  use MyApp.Macro\n  import External.Helpers\n  def before, do: :ok\nend",
+            "defmodule MyApp do\n  defmodule Sample do\n    use MyApp.Macro, mode: :strict\n    import External.Helpers, only: [help: 1]\n    require External.Macros, as: Macros\n    def before, do: :ok\n  end\nend",
         )
         .unwrap();
 
@@ -1242,6 +1242,11 @@ mod tests {
                 && edge.to == "elixir-module://External.Helpers"
                 && edge.kind == beholder_dto::RelationKind::Imports
         }));
+        assert!(context.edges.iter().any(|edge| {
+            edge.from == module
+                && edge.to == "elixir-module://External.Macros"
+                && edge.kind == beholder_dto::RelationKind::Requires
+        }));
         assert!(context.nodes.iter().any(|node| {
             node.id == "elixir-module://External.Helpers"
                 && node.kind == beholder_dto::EntityKind::Namespace
@@ -1259,7 +1264,7 @@ mod tests {
 
         fs::write(
             &changed,
-            "defmodule MyApp.Sample do\n  use MyApp.Macro\n  import External.Helpers\n  def updated(value), do: value\nend",
+            "defmodule MyApp do\n  defmodule Sample do\n    use MyApp.Macro, mode: :strict\n    import External.Helpers, only: [help: 1]\n    require External.Macros, as: Macros\n    def updated(value), do: value\n  end\nend",
         )
         .unwrap();
         scheduler.add_event(

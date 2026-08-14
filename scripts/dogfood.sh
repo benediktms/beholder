@@ -52,17 +52,20 @@ mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
 mkdir -p "$state/elixir/lib"
 printf '%s\n' \
-    'defmodule Beholder.Smoke.Macro do' \
+    'defmodule Beholder.Macro do' \
     '  defmacro __using__(_) do' \
     '    quote do' \
     '      def generated, do: :ok' \
     '    end' \
     '  end' \
     'end' \
-    'defmodule Beholder.Smoke do' \
-    '  use Beholder.Smoke.Macro' \
-    '  import External.Helpers' \
-    '  def indexed(value), do: value' \
+    'defmodule Beholder do' \
+    '  defmodule Smoke do' \
+    '    use Beholder.Macro, mode: :strict' \
+    '    import External.Helpers, only: [help: 1]' \
+    '    require External.Macros, as: Macros' \
+    '    def indexed(value), do: value' \
+    '  end' \
     'end' >"$state/elixir/lib/smoke.ex"
 git -C "$state/elixir" init -q
 git -C "$state/elixir" config user.name 'Beholder Smoke'
@@ -100,17 +103,19 @@ for expected in \
     '"kind":"namespace"' \
     'Beholder.Smoke/indexed/1' \
     '"name":"indexed/1"' \
-    'Beholder.Smoke.Macro' \
+    'Beholder.Macro' \
     '"kind":"uses"' \
     'elixir-module://External.Helpers' \
-    '"kind":"imports"'; do
+    '"kind":"imports"' \
+    'elixir-module://External.Macros' \
+    '"kind":"requires"'; do
     if ! grep -Fq "$expected" <<<"$result"; then
         printf 'expected %s in Elixir context:\n%s\n' "$expected" "$result" >&2
         exit 1
     fi
 done
 macro_result="$(target/debug/beholder context --json --workspace main \
-    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke.Macro')"
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Macro')"
 if grep -Fq '/generated/0' <<<"$macro_result"; then
     printf 'quoted macro expansion leaked into direct definitions:\n%s\n' "$macro_result" >&2
     exit 1

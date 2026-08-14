@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-pub const FRONTEND_VERSION: &str = "3";
+pub const FRONTEND_VERSION: &str = "4";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ElixirAnalysis {
@@ -32,6 +32,7 @@ struct ElixirFunction {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ElixirModuleReferenceKind {
     Import,
+    Require,
     Use,
 }
 
@@ -92,9 +93,16 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                     .filter(|name| name.kind() == "alias")
                     .and_then(|name| text(name, source))
                 {
+                    let name = if let Some(name) = name.strip_prefix("Elixir.") {
+                        name.into()
+                    } else if let Some(parent) = module {
+                        format!("{}.{}", modules[parent].name, name)
+                    } else {
+                        name.into()
+                    };
                     let module = modules.len();
                     modules.push(ElixirModule {
-                        name: name.into(),
+                        name,
                         line: node.start_position().row + 1,
                         functions: Vec::new(),
                         references: Vec::new(),
@@ -130,17 +138,17 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                 }
                 return;
             }
-            Some(target @ ("import" | "use")) => {
+            Some(target @ ("import" | "require" | "use")) => {
                 if let Some(module) = module
                     && let Some(name) = arguments(node)
                         .and_then(|arguments| arguments.named_child(0))
                         .filter(|name| name.kind() == "alias")
                         .and_then(|name| text(name, source))
                 {
-                    let kind = if target == "import" {
-                        ElixirModuleReferenceKind::Import
-                    } else {
-                        ElixirModuleReferenceKind::Use
+                    let kind = match target {
+                        "import" => ElixirModuleReferenceKind::Import,
+                        "require" => ElixirModuleReferenceKind::Require,
+                        _ => ElixirModuleReferenceKind::Use,
                     };
                     let references = &mut modules[module].references;
                     // ponytail: retain first reference evidence until storage supports multiple
@@ -216,6 +224,7 @@ pub fn observations_from_analysis(
                 module_id.clone(),
                 match reference.kind {
                     ElixirModuleReferenceKind::Import => DependencyRelation::Imports,
+                    ElixirModuleReferenceKind::Require => DependencyRelation::Requires,
                     ElixirModuleReferenceKind::Use => DependencyRelation::Uses,
                 },
                 format!("elixir-module://{}", reference.name),
@@ -255,6 +264,7 @@ pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<Dependency
         .filter_map(|observation| {
             let relation = match observation.relation {
                 SemanticRelation::Dependency(relation @ DependencyRelation::Imports)
+                | SemanticRelation::Dependency(relation @ DependencyRelation::Requires)
                 | SemanticRelation::Dependency(relation @ DependencyRelation::Uses) => relation,
                 _ => return None,
             };
@@ -343,10 +353,13 @@ mod tests {
                 end
               end
             end
-            defmodule MyApp.Consumer do
-              use MyApp.Macro
-              import External.Helpers
-              def own, do: :ok
+            defmodule MyApp do
+              defmodule Consumer do
+                use MyApp.Macro, mode: :strict
+                import External.Helpers, only: [help: 1]
+                require External.Macros, as: Macros
+                def own, do: :ok
+              end
             end
             "#,
             Path::new("lib/my_app/consumer.ex"),
@@ -361,13 +374,20 @@ mod tests {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
                 && observation.relation == SemanticRelation::Dependency(DependencyRelation::Uses)
                 && observation.to.as_str() == "elixir-module://MyApp.Macro"
-                && observation.evidence.as_str() == "lib/my_app/consumer.ex:10"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:11"
         }));
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
                 && observation.relation == SemanticRelation::Dependency(DependencyRelation::Imports)
                 && observation.to.as_str() == "elixir-module://External.Helpers"
-                && observation.evidence.as_str() == "lib/my_app/consumer.ex:11"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:12"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
+                && observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::Requires)
+                && observation.to.as_str() == "elixir-module://External.Macros"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:13"
         }));
 
         let overrides = resolve_workspace_modules(&observations);
