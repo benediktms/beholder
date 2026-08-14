@@ -6,7 +6,7 @@ use beholder_daemon_client::{
     impact as daemon_impact, index_rust_workspace as daemon_index_workspace, list_workspaces,
     register_workspace, state_dir, stop, trace as daemon_trace, why as daemon_why,
 };
-use beholder_domain::WorkspaceView;
+use beholder_domain::{RepositoryFacts, WorkspaceView};
 use beholder_presentation::{
     OutputMode, RenderOptions, context as render_context, dependencies as render_dependencies,
     impact as render_impact, trace as render_trace, why as render_why,
@@ -37,7 +37,15 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dy
         return Ok((0, false));
     }
     let observations = observations(&state.repository.identity, &sources[0].1, path)?;
-    let _changes = store.publish(&view, &observations)?;
+    let _changes = store.publish(
+        &view,
+        &[RepositoryFacts {
+            state,
+            analysis_identity: format!("rust:{FRONTEND_VERSION}:single-file:1"),
+            observations: observations.clone(),
+        }],
+        &[],
+    )?;
     Ok((observations.len(), true))
 }
 
@@ -682,11 +690,14 @@ mod tests {
         assert!(index_rust(&source, &path).unwrap().1);
         assert_eq!(index_rust(&source, &path).unwrap(), (0, false));
         let indexed = SemanticStore::persistent(&path, false).unwrap();
+        let stored_calls = indexed.inspect_observations(Some("calls")).unwrap();
+        assert_eq!(stored_calls.rows.len(), 1);
+        let caller = stored_calls.rows[0][1].as_str().unwrap();
         assert!(
             indexed
-                .inspect_observations(Some("calls"))
+                .dependencies(MAIN_VIEW, caller)
                 .unwrap()
-                .rows
+                .dependencies
                 .is_empty()
         );
         assert_eq!(

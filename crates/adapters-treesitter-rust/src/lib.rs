@@ -1,5 +1,6 @@
 use beholder_domain::{
-    DependencyRelation, EntityId, Observation, SemanticRelation, StructuralRelation,
+    DependencyOverride, DependencyRelation, EntityId, Observation, SemanticRelation,
+    StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
@@ -195,7 +196,7 @@ pub fn observations(
     ))
 }
 
-pub fn resolve_repository_calls(observations: &mut [Observation]) {
+pub fn resolve_repository_calls(observations: &mut [Observation]) -> Vec<DependencyOverride> {
     let mut definitions = BTreeMap::<String, Option<String>>::new();
     for observation in observations.iter().filter(|observation| {
         observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
@@ -212,15 +213,24 @@ pub fn resolve_repository_calls(observations: &mut [Observation]) {
             })
             .or_insert_with(|| Some(observation.to.as_str().to_owned()));
     }
+    let mut overrides = Vec::new();
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
     }) {
         if let Some(name) = observation.to.as_str().strip_prefix("rust-call://")
             && let Some(Some(target)) = definitions.get(name)
         {
+            overrides.push(DependencyOverride {
+                from: observation.from.clone(),
+                relation: DependencyRelation::Calls,
+                unresolved_to: observation.to.clone(),
+                resolved_to: EntityId::from(target.clone()),
+                evidence: observation.evidence.clone(),
+            });
             observation.to = EntityId::from(target.clone());
         }
     }
+    overrides
 }
 
 pub fn source_files(

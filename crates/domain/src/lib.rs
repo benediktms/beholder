@@ -70,6 +70,21 @@ pub enum DependencyRelation {
     Uses,
 }
 
+impl DependencyRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "calls",
+            Self::CallsRpc => "calls_rpc",
+            Self::ConsumedBy => "consumed_by",
+            Self::ImplementedBy => "implemented_by",
+            Self::Publishes => "publishes",
+            Self::ResolvedBy => "resolved_by",
+            Self::Selects => "selects",
+            Self::Uses => "uses",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SemanticRelation {
     Structural(StructuralRelation),
@@ -80,14 +95,7 @@ impl SemanticRelation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Structural(StructuralRelation::Defines) => "defines",
-            Self::Dependency(DependencyRelation::Calls) => "calls",
-            Self::Dependency(DependencyRelation::CallsRpc) => "calls_rpc",
-            Self::Dependency(DependencyRelation::ConsumedBy) => "consumed_by",
-            Self::Dependency(DependencyRelation::ImplementedBy) => "implemented_by",
-            Self::Dependency(DependencyRelation::Publishes) => "publishes",
-            Self::Dependency(DependencyRelation::ResolvedBy) => "resolved_by",
-            Self::Dependency(DependencyRelation::Selects) => "selects",
-            Self::Dependency(DependencyRelation::Uses) => "uses",
+            Self::Dependency(relation) => relation.as_str(),
         }
     }
 
@@ -104,6 +112,22 @@ pub struct Observation {
     pub from: EntityId,
     pub relation: SemanticRelation,
     pub to: EntityId,
+    pub evidence: Evidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryFacts {
+    pub state: RepositoryState,
+    pub analysis_identity: String,
+    pub observations: Vec<Observation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyOverride {
+    pub from: EntityId,
+    pub relation: DependencyRelation,
+    pub unresolved_to: EntityId,
+    pub resolved_to: EntityId,
     pub evidence: Evidence,
 }
 

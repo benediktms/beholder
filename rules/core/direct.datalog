@@ -1,2 +1,34 @@
+selected_state[state] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_state{view: $view, revision, state}
+
+dependency_override[from, relation, unresolved_to, resolved_to, evidence] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence,
+    }
+
+overridden[from, relation, unresolved_to, evidence] :=
+    dependency_override[from, relation, unresolved_to, _, evidence]
+
+effective_observation[from, to, relation, evidence] :=
+    selected_state[state],
+    *state_observation{state, from, relation, to, evidence},
+    not overridden[from, relation, to, evidence]
+
+effective_observation[from, resolved_to, relation, evidence] :=
+    dependency_override[from, relation, _, resolved_to, evidence]
+
 direct[from, to, relation, evidence] :=
-    *dependency_observation{view: $view, from, relation, to, evidence}
+    selected_state[state],
+    *state_dependency_observation{state, from, relation, to, evidence},
+    not overridden[from, relation, to, evidence]
+
+direct[from, resolved_to, relation, evidence] :=
+    dependency_override[from, relation, _, resolved_to, evidence]

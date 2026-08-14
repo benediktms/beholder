@@ -5,7 +5,7 @@ use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
     resolve_repository_calls, source_files,
 };
-use beholder_domain::{Observation, RepositoryState, Workspace, WorkspaceView};
+use beholder_domain::{Observation, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, QueryMetadata};
 use notify::{Event, EventKind};
 use sha2::{Digest, Sha256};
@@ -25,7 +25,7 @@ use tokio::{
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
-const CORE_RULE_PACK_VERSION: &str = "2";
+const CORE_RULE_PACK_VERSION: &str = "4";
 type RustSources = Vec<(PathBuf, String)>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -532,7 +532,7 @@ fn index_rust_workspace_versioned(
         return Ok((0, false));
     }
 
-    let mut all_observations = Vec::new();
+    let mut repository_facts = Vec::new();
     let mut memory_hits = 0;
     let mut disk_hits = 0;
     let mut misses = 0;
@@ -548,10 +548,18 @@ fn index_rust_workspace_versioned(
             CacheStatus::Disk => disk_hits += 1,
             CacheStatus::Miss => misses += 1,
         }
-        all_observations.extend(observations.iter().cloned());
+        repository_facts.push(RepositoryFacts {
+            state,
+            analysis_identity: format!("rust:{frontend_version}:{resolver_version}"),
+            observations: observations.as_ref().clone(),
+        });
     }
-    resolve_repository_calls(&mut all_observations);
-    let changes = store.publish(&view, &all_observations)?;
+    let mut all_observations = repository_facts
+        .iter()
+        .flat_map(|facts| facts.observations.iter().cloned())
+        .collect::<Vec<_>>();
+    let overrides = resolve_repository_calls(&mut all_observations);
+    let changes = store.publish(&view, &repository_facts, &overrides)?;
     tracing::info!(
         workspace = %workspace.name,
         observation_count = all_observations.len(),
