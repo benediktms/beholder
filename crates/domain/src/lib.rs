@@ -64,6 +64,31 @@ pub enum Provenance {
     UniqueNameHeuristic,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisDiagnosticSeverity {
+    KnownLimitation,
+    Warning,
+}
+
+impl AnalysisDiagnosticSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KnownLimitation => "known_limitation",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnalysisDiagnostic {
+    pub code: String,
+    pub severity: AnalysisDiagnosticSeverity,
+    pub path: PathBuf,
+    pub line: Option<u32>,
+    pub detail: Option<String>,
+}
+
 impl Provenance {
     pub fn as_str(self) -> &'static str {
         match self {

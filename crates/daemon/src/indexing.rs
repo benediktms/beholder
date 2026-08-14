@@ -7,17 +7,23 @@ use beholder_adapters_protobuf::{
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
     RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, analyze as analyze_elixir,
+    diagnostics_from_analysis as elixir_diagnostics,
     generated_observations as elixir_generated_observations,
     observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
-    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
+    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze,
+    diagnostics_from_analysis as rust_diagnostics, observations_from_analysis,
     resolve_repository_calls as resolve_rust_repository_calls,
 };
-use beholder_domain::{Observation, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
+use beholder_domain::{
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Observation, RepositoryFacts, RepositoryState,
+    Workspace, WorkspaceView,
+};
 use beholder_dto::{Freshness, QueryMetadata};
 use notify::{Event, EventKind};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -83,6 +89,12 @@ struct RepositoryAnalysisKey {
     protobuf_frontend_version: &'static str,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RepositoryAnalysis {
+    observations: Vec<Observation>,
+    diagnostics: Vec<AnalysisDiagnostic>,
+}
+
 impl SourceAnalysisKey {
     fn new(source: &str, frontend_version: &'static str) -> Self {
         Self {
@@ -111,7 +123,7 @@ pub struct IndexScheduler {
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
-    repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<Vec<Observation>>>>,
+    repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<RepositoryAnalysis>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -555,7 +567,7 @@ impl IndexScheduler {
         elixir_sources: &[(PathBuf, String)],
         descriptors: &[(PathBuf, Vec<u8>)],
         versions: AnalysisVersions,
-    ) -> Cached<Vec<Observation>> {
+    ) -> Cached<RepositoryAnalysis> {
         let key = RepositoryAnalysisKey {
             fingerprint: state.fingerprint.clone(),
             frontend_version: versions.rust_frontend,
@@ -564,7 +576,7 @@ impl IndexScheduler {
             elixir_resolver_version: versions.elixir_resolver,
             protobuf_frontend_version: versions.protobuf_frontend,
         };
-        if let Some(observations) = self
+        if let Some(analysis) = self
             .repository_cache
             .lock()
             .map_err(|_| "repository cache lock poisoned")?
@@ -572,7 +584,7 @@ impl IndexScheduler {
             .cloned()
         {
             tracing::debug!(repository = %state.repository.identity, cache_status = "memory", "repository cache lookup");
-            return Ok((observations, CacheStatus::Memory));
+            return Ok((analysis, CacheStatus::Memory));
         }
         let path = self
             .cache_dir
@@ -585,17 +597,18 @@ impl IndexScheduler {
             .join(versions.protobuf_frontend)
             .join(format!("{}.json", state.fingerprint));
         if let Ok(bytes) = fs::read(&path)
-            && let Ok(observations) = serde_json::from_slice::<Vec<Observation>>(&bytes)
+            && let Ok(analysis) = serde_json::from_slice::<RepositoryAnalysis>(&bytes)
         {
-            let observations = Arc::new(observations);
+            let analysis = Arc::new(analysis);
             self.repository_cache
                 .lock()
                 .map_err(|_| "repository cache lock poisoned")?
-                .insert(key, observations.clone());
+                .insert(key, analysis.clone());
             tracing::debug!(repository = %state.repository.identity, cache_status = "disk", "repository cache lookup");
-            return Ok((observations, CacheStatus::Disk));
+            return Ok((analysis, CacheStatus::Disk));
         }
         let mut observations = Vec::new();
+        let mut diagnostics = Vec::new();
         for (path, source) in rust_sources {
             let (analysis, cache_status) = self
                 .rust_analysis_versioned(source, versions.rust_frontend)
@@ -611,6 +624,7 @@ impl IndexScheduler {
                 &analysis,
                 path,
             ));
+            diagnostics.extend(rust_diagnostics(&analysis, path));
         }
         resolve_rust_repository_calls(&mut observations);
         let mut elixir_analyses = Vec::new();
@@ -629,6 +643,7 @@ impl IndexScheduler {
                 &analysis,
                 path,
             ));
+            diagnostics.extend(elixir_diagnostics(&analysis, path));
             elixir_analyses.push((path.as_path(), analysis));
         }
         let elixir_sources = elixir_analyses
@@ -644,19 +659,61 @@ impl IndexScheduler {
         for (_, descriptor) in descriptors {
             observations.extend(protobuf_observations(descriptor)?);
         }
-        let observations = Arc::new(observations);
+        let analysis = Arc::new(RepositoryAnalysis {
+            observations,
+            diagnostics,
+        });
         if let Some(parent) = path.parent()
             && fs::create_dir_all(parent).is_ok()
-            && let Ok(bytes) = serde_json::to_vec(observations.as_ref())
+            && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
         {
             let _ = fs::write(path, bytes);
         }
         self.repository_cache
             .lock()
             .map_err(|_| "repository cache lock poisoned")?
-            .insert(key, observations.clone());
+            .insert(key, analysis.clone());
         tracing::debug!(repository = %state.repository.identity, cache_status = "miss", "repository cache lookup");
-        Ok((observations, CacheStatus::Miss))
+        Ok((analysis, CacheStatus::Miss))
+    }
+}
+
+fn report_analysis_diagnostics(workspace: &str, diagnostics: &[(String, AnalysisDiagnostic)]) {
+    let mut limitations = BTreeMap::<&str, usize>::new();
+    for (repository, diagnostic) in diagnostics {
+        match diagnostic.severity {
+            AnalysisDiagnosticSeverity::KnownLimitation => {
+                *limitations.entry(diagnostic.code.as_str()).or_default() += 1;
+                tracing::debug!(
+                    workspace,
+                    repository,
+                    code = %diagnostic.code,
+                    severity = diagnostic.severity.as_str(),
+                    path = %diagnostic.path.display(),
+                    line = ?diagnostic.line,
+                    detail = ?diagnostic.detail,
+                    "frontend analysis diagnostic"
+                );
+            }
+            AnalysisDiagnosticSeverity::Warning => tracing::warn!(
+                workspace,
+                repository,
+                code = %diagnostic.code,
+                severity = diagnostic.severity.as_str(),
+                path = %diagnostic.path.display(),
+                line = ?diagnostic.line,
+                detail = ?diagnostic.detail,
+                "frontend analysis diagnostic"
+            ),
+        }
+    }
+    if !limitations.is_empty() {
+        tracing::info!(
+            workspace,
+            known_limitations = limitations.values().sum::<usize>(),
+            codes = ?limitations,
+            "frontend analysis limitations"
+        );
     }
 }
 
@@ -792,6 +849,7 @@ fn index_workspace_versioned(
     let mut disk_hits = 0;
     let mut misses = 0;
     let mut dirty_source_units = 0;
+    let mut diagnostics = Vec::new();
     for sources in repositories {
         let RepositorySources {
             state,
@@ -804,13 +862,20 @@ fn index_workspace_versioned(
                 Some(DirtyRepository::Sources(sources)) => sources.len(),
                 Some(DirtyRepository::All) | None => rust.len() + elixir.len() + protobuf.len(),
             };
-        let (observations, cache_status) = scheduler
+        let (analysis, cache_status) = scheduler
             .repository_observations_versioned(&state, &rust, &elixir, &protobuf, versions)?;
         match cache_status {
             CacheStatus::Memory => memory_hits += 1,
             CacheStatus::Disk => disk_hits += 1,
             CacheStatus::Miss => misses += 1,
         }
+        diagnostics.extend(
+            analysis
+                .diagnostics
+                .iter()
+                .cloned()
+                .map(|diagnostic| (state.repository.identity.clone(), diagnostic)),
+        );
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity: format!(
@@ -821,7 +886,7 @@ fn index_workspace_versioned(
                 versions.elixir_resolver,
                 versions.protobuf_frontend,
             ),
-            observations: observations.as_ref().clone(),
+            observations: analysis.observations.clone(),
         });
     }
     let mut all_observations = repository_facts
@@ -831,6 +896,7 @@ fn index_workspace_versioned(
     let mut overrides = resolve_rust_repository_calls(&mut all_observations);
     overrides.extend(resolve_workspace_modules(&all_observations));
     let changes = store.publish(&view, &repository_facts, &overrides)?;
+    report_analysis_diagnostics(&workspace.name, &diagnostics);
     tracing::info!(
         workspace = %workspace.name,
         observation_count = all_observations.len(),
@@ -971,7 +1037,7 @@ mod tests {
         assert_eq!(first_status, CacheStatus::Miss);
         assert_eq!(second_status, CacheStatus::Memory);
         assert!(Arc::ptr_eq(&first, &second));
-        assert!(first.iter().any(|observation| {
+        assert!(first.observations.iter().any(|observation| {
             observation.from.as_str() == "repo://repo/rust/lib/caller"
                 && observation.to.as_str() == "repo://repo/rust/lib/helper"
         }));

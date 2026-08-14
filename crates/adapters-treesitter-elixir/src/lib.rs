@@ -1,13 +1,13 @@
 use beholder_domain::{
-    Confidence, DependencyOverride, DependencyRelation, EntityId, Observation, Provenance,
-    SemanticRelation, StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
+    DependencyRelation, EntityId, Observation, Provenance, SemanticRelation, StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-pub const FRONTEND_VERSION: &str = "7";
+pub const FRONTEND_VERSION: &str = "8";
 pub const RESOLVER_VERSION: &str = "1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -569,6 +569,32 @@ pub fn observations_from_analysis(
     observations
 }
 
+pub fn diagnostics_from_analysis(
+    analysis: &ElixirAnalysis,
+    path: &Path,
+) -> Vec<AnalysisDiagnostic> {
+    analysis
+        .modules
+        .iter()
+        .flat_map(|module| {
+            module
+                .references
+                .iter()
+                .filter(|reference| reference.kind == ElixirModuleReferenceKind::Use)
+                .map(|reference| AnalysisDiagnostic {
+                    code: "elixir.macro_expansion_incomplete".into(),
+                    severity: AnalysisDiagnosticSeverity::KnownLimitation,
+                    path: path.into(),
+                    line: u32::try_from(reference.line).ok(),
+                    detail: Some(format!(
+                        "use {} is indexed without compiler macro expansion",
+                        expand_alias(&reference.name, &module.aliases, &module.name)
+                    )),
+                })
+        })
+        .collect()
+}
+
 pub fn generated_observations(
     repository: &str,
     sources: &[(&Path, &ElixirAnalysis)],
@@ -1018,6 +1044,32 @@ mod tests {
         assert_eq!(
             overrides[0].resolved_to.as_str(),
             "repo://payments/elixir/MyApp.Macro"
+        );
+    }
+
+    #[test]
+    fn reports_macro_expansion_as_a_known_limitation() {
+        let analysis = analyze(
+            r#"
+            defmodule MyApp.Consumer do
+              alias MyApp.ServerMacro, as: Server
+              use Server, mode: :strict
+            end
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics_from_analysis(&analysis, Path::new("lib/my_app/consumer.ex")),
+            vec![AnalysisDiagnostic {
+                code: "elixir.macro_expansion_incomplete".into(),
+                severity: AnalysisDiagnosticSeverity::KnownLimitation,
+                path: std::path::PathBuf::from("lib/my_app/consumer.ex"),
+                line: Some(4),
+                detail: Some(
+                    "use MyApp.ServerMacro is indexed without compiler macro expansion".into(),
+                ),
+            }]
         );
     }
 }
