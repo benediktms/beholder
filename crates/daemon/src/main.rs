@@ -1,5 +1,5 @@
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_daemon_client::{address, state_dir};
+use beholder_daemon_client::{socket_path, state_dir};
 use beholder_dto::{Revisioned, SemanticQueryResult, WhyResult};
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
@@ -13,11 +13,14 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
     collections::BTreeSet,
     error::Error,
-    net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::oneshot;
+#[cfg(unix)]
+use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 
 mod indexing;
@@ -27,6 +30,30 @@ mod workspace_registry;
 
 use indexing::IndexScheduler;
 use workspace_registry::WorkspaceRegistry;
+
+#[cfg(unix)]
+struct SocketFile(PathBuf);
+
+#[cfg(unix)]
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn bind_socket(path: &Path) -> Result<(UnixListener, SocketFile), Box<dyn Error>> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = UnixListener::bind(path)?;
+    let socket = SocketFile(path.to_path_buf());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok((listener, socket))
+}
 
 struct BeholderDaemon {
     store: Arc<SemanticStore>,
@@ -380,30 +407,38 @@ async fn shutdown_signal(stopped: oneshot::Receiver<()>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let state_dir = state_dir()?;
-    std::fs::create_dir_all(&state_dir)?;
+    #[cfg(not(unix))]
+    return Err("beholderd local IPC is supported on Unix platforms".into());
+
     #[cfg(unix)]
     {
+        let state_dir = state_dir()?;
+        std::fs::create_dir_all(&state_dir)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
+        let _lock = single_instance::acquire(&state_dir)?;
+        let socket_path = socket_path()?;
+        let (listener, _socket_file) = bind_socket(&socket_path)?;
+        let _log_guard = logging::init(&state_dir);
+        tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "daemon started");
+        let (service, stopped, index_scheduler) = daemon(
+            SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
+            WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
+            state_dir.join("frontend-cache"),
+        )?;
+        let watcher_task =
+            tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
+        Server::builder()
+            .add_service(DaemonServer::new(service))
+            .serve_with_incoming_shutdown(
+                UnixListenerStream::new(listener),
+                shutdown_signal(stopped),
+            )
+            .await?;
+        watcher_task.abort();
+        tracing::info!("daemon stopped");
+        Ok(())
     }
-    let _lock = single_instance::acquire(&state_dir)?;
-    let _log_guard = logging::init(&state_dir);
-    tracing::info!(pid = std::process::id(), address = %address(), "daemon started");
-    let (service, stopped, index_scheduler) = daemon(
-        SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
-        WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
-        state_dir.join("frontend-cache"),
-    )?;
-    let watcher_task =
-        tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
-    Server::builder()
-        .add_service(DaemonServer::new(service))
-        .serve_with_shutdown(address().parse::<SocketAddr>()?, shutdown_signal(stopped))
-        .await?;
-    watcher_task.abort();
-    tracing::info!("daemon stopped");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -414,13 +449,10 @@ mod tests {
         RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
         daemon_client::DaemonClient,
     };
-    use std::{env, fs, net::TcpListener, path::Path, time::Duration};
+    use std::{env, fs, path::Path, time::Duration};
 
     #[tokio::test]
     async fn workspace_smoke() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
         let database = env::temp_dir().join(format!("beholderd-{}.db", std::process::id()));
         let state = env::temp_dir().join(format!("beholderd-state-{}", std::process::id()));
         let _ = fs::remove_dir_all(&state);
@@ -438,6 +470,14 @@ mod tests {
                 .to_string()
                 .contains(&std::process::id().to_string())
         );
+        let socket_path = state.join("beholder.sock");
+        fs::write(&socket_path, "stale").unwrap();
+        let (listener, socket_file) = bind_socket(&socket_path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_file(&database);
         let registry_path = workspace_registry::registry_path(&state);
         let (service, stopped, index_scheduler) = daemon(
@@ -449,16 +489,17 @@ mod tests {
         let watcher_task =
             tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
         let server = tokio::spawn(async move {
+            let _socket_file = socket_file;
             Server::builder()
                 .add_service(DaemonServer::new(service))
-                .serve_with_shutdown(address, async {
+                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
                     let _ = stopped.await;
                 })
                 .await
                 .unwrap();
         });
 
-        let endpoint = format!("http://{address}");
+        let endpoint = format!("unix:{}", socket_path.display());
         let mut client = loop {
             match DaemonClient::connect(endpoint.clone()).await {
                 Ok(client) => break client,
@@ -694,6 +735,7 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
+        assert!(!socket_path.exists());
         watcher_task.abort();
         let reloaded = WorkspaceRegistry::open(registry_path).unwrap();
         assert!(reloaded.get("main").is_some());

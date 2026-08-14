@@ -6,15 +6,21 @@ use beholder_protocol::v1::{
     daemon_client::DaemonClient,
 };
 use std::path::{Path, PathBuf};
+use tonic::transport::Channel;
 
-const DEFAULT_ADDRESS: &str = "127.0.0.1:50051";
-
-pub fn address() -> String {
-    std::env::var("BEHOLDER_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into())
+pub fn socket_path() -> Result<PathBuf, String> {
+    Ok(state_dir()?.join("beholder.sock"))
 }
 
-fn endpoint() -> String {
-    format!("http://{}", address())
+fn endpoint() -> Result<String, String> {
+    socket_path()?
+        .to_str()
+        .map(|path| format!("unix:{path}"))
+        .ok_or_else(|| "daemon socket path is not UTF-8".into())
+}
+
+async fn connect() -> Result<DaemonClient<Channel>, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(endpoint()?).await?)
 }
 
 pub fn state_dir() -> Result<PathBuf, String> {
@@ -37,7 +43,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(endpoint())
+    Ok(connect()
         .await?
         .get_status(GetStatusRequest {})
         .await?
@@ -45,10 +51,7 @@ pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error
 }
 
 pub async fn clear_cache() -> Result<(), Box<dyn std::error::Error>> {
-    DaemonClient::connect(endpoint())
-        .await?
-        .clear_cache(ClearCacheRequest {})
-        .await?;
+    connect().await?.clear_cache(ClearCacheRequest {}).await?;
     Ok(())
 }
 
@@ -56,7 +59,7 @@ pub async fn context(
     workspace: String,
     entity: String,
 ) -> Result<ContextResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(endpoint())
+    Ok(connect()
         .await?
         .context(EntityRequest { workspace, entity })
         .await?
@@ -68,7 +71,7 @@ pub async fn dependencies(
     workspace: String,
     entity: String,
 ) -> Result<DependenciesResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(endpoint())
+    Ok(connect()
         .await?
         .dependencies(EntityRequest { workspace, entity })
         .await?
@@ -80,7 +83,7 @@ pub async fn impact(
     workspace: String,
     entity: String,
 ) -> Result<ImpactResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(endpoint())
+    Ok(connect()
         .await?
         .impact(EntityRequest { workspace, entity })
         .await?
@@ -93,7 +96,7 @@ pub async fn trace(
     from: String,
     to: String,
 ) -> Result<TraceResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(endpoint())
+    Ok(connect()
         .await?
         .trace(PathRequest {
             workspace,
@@ -110,7 +113,7 @@ pub async fn why(
     from: String,
     to: String,
 ) -> Result<WhyResult, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(endpoint())
+    Ok(connect()
         .await?
         .why(PathRequest {
             workspace,
@@ -125,7 +128,7 @@ pub async fn why(
 pub async fn reindex_workspace(
     workspace: String,
 ) -> Result<(usize, bool), Box<dyn std::error::Error>> {
-    let response = DaemonClient::connect(endpoint())
+    let response = connect()
         .await?
         .reindex_workspace(ReindexWorkspaceRequest { workspace })
         .await?
@@ -141,7 +144,7 @@ pub async fn register_workspace(
         .iter()
         .map(|path| path_string(path))
         .collect::<Result<_, _>>()?;
-    let workspace = DaemonClient::connect(endpoint())
+    let workspace = connect()
         .await?
         .register_workspace(RegisterWorkspaceRequest {
             name,
@@ -155,7 +158,7 @@ pub async fn register_workspace(
 }
 
 pub async fn list_workspaces() -> Result<Vec<Workspace>, Box<dyn std::error::Error>> {
-    DaemonClient::connect(endpoint())
+    connect()
         .await?
         .list_workspaces(ListWorkspacesRequest {})
         .await?
@@ -173,7 +176,7 @@ fn path_string(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 pub async fn stop() -> Result<bool, Box<dyn std::error::Error>> {
-    let Ok(mut client) = DaemonClient::connect(endpoint()).await else {
+    let Ok(mut client) = connect().await else {
         return Ok(false);
     };
     Ok(client.stop(StopRequest {}).await?.into_inner().accepted)

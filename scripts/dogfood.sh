@@ -3,10 +3,9 @@ set -euo pipefail
 
 root="$(pwd)"
 state="$(mktemp -d "${TMPDIR:-/tmp}/beholder-dogfood.XXXXXX")"
-# ponytail: PID-derived port can collide; accept BEHOLDER_ADDRESS when parallel dogfood makes that real.
-export BEHOLDER_ADDRESS="${BEHOLDER_ADDRESS:-127.0.0.1:$((49152 + $$ % 10000))}"
 export BEHOLDER_STATE_DIR="$state"
 export RUST_LOG="${RUST_LOG:-info,beholderd=debug}"
+socket="$state/daemon/beholder.sock"
 daemon_pid=''
 
 cleanup() {
@@ -48,6 +47,7 @@ for _ in {1..50}; do
     sleep 0.1
 done
 target/debug/beholder daemon status >/dev/null
+[[ -S "$socket" ]] || { echo "daemon socket not found at $socket" >&2; exit 1; }
 target/debug/beholder workspace register main "$root" >/dev/null
 
 repository="$(basename "$root")"
@@ -97,6 +97,7 @@ echo 'Stopping daemon and inspecting traces...' >&2
 target/debug/beholder daemon stop >/dev/null
 wait "$daemon_pid"
 daemon_pid=''
+[[ ! -e "$socket" ]] || { echo "daemon socket was not removed: $socket" >&2; exit 1; }
 trace_file="$(find "$state/daemon" -maxdepth 1 -name 'beholderd.*.log' -print | sort | tail -n 1)"
 if [[ -z "$trace_file" ]]; then
     echo 'daemon produced no structured trace file' >&2

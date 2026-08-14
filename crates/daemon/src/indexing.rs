@@ -14,7 +14,7 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -63,6 +63,7 @@ pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
     active_workspace: Mutex<Option<String>>,
+    idle: Condvar,
     changed: Notify,
     cache_dir: PathBuf,
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
@@ -76,12 +77,16 @@ enum DirtyRepository {
     Sources(BTreeSet<PathBuf>),
 }
 
-struct ActiveIndex<'a>(&'a Mutex<Option<String>>);
+struct ActiveIndex<'a> {
+    active_workspace: &'a Mutex<Option<String>>,
+    idle: &'a Condvar,
+}
 
 impl Drop for ActiveIndex<'_> {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.0.lock() {
+        if let Ok(mut active) = self.active_workspace.lock() {
             *active = None;
+            self.idle.notify_all();
         }
     }
 }
@@ -92,6 +97,7 @@ impl IndexScheduler {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
             active_workspace: Mutex::new(None),
+            idle: Condvar::new(),
             changed: Notify::new(),
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
@@ -198,11 +204,17 @@ impl IndexScheduler {
             .active_workspace
             .lock()
             .map_err(|_| "active workspace lock poisoned")?;
-        if let Some(active) = active.as_deref() {
-            return Err(format!("indexer is busy with {active}").into());
+        while active.is_some() {
+            active = self
+                .idle
+                .wait(active)
+                .map_err(|_| "active workspace lock poisoned")?;
         }
         *active = Some(workspace.into());
-        Ok(ActiveIndex(&self.active_workspace))
+        Ok(ActiveIndex {
+            active_workspace: &self.active_workspace,
+            idle: &self.idle,
+        })
     }
 
     fn complete_generation(&self, workspace: &str, indexed: Option<u64>) {
@@ -375,9 +387,6 @@ impl IndexScheduler {
                     .complete_generation(&workspace.name, snapshot.get(&workspace.name).copied()),
                 Err(error) => {
                     tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed");
-                    if error.to_string().starts_with("indexer is busy with ") {
-                        self.changed.notify_one();
-                    }
                 }
             }
         }
@@ -868,6 +877,26 @@ mod tests {
         assert!(scheduler.query_metadata("other", 4).freshness.stale);
         drop(store);
         fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn concurrent_index_claims_wait_for_the_active_job() {
+        let scheduler = Arc::new(IndexScheduler::new(PathBuf::new()));
+        let active = scheduler.begin("first").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let waiting = scheduler.clone();
+        let thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let _active = waiting.begin("second").unwrap();
+            claimed_tx.send(()).unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+        assert!(claimed_rx.recv_timeout(Duration::from_millis(25)).is_err());
+        drop(active);
+        claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread.join().unwrap();
     }
 
     #[test]
