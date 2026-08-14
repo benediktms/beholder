@@ -211,6 +211,7 @@ pub(super) fn trace(
 struct GraphBuilder {
     edges: BTreeMap<EdgeKey, EdgeData>,
     kinds: BTreeMap<String, EntityKind>,
+    origins: BTreeMap<String, EntityOrigin>,
 }
 
 struct EdgeData {
@@ -239,6 +240,9 @@ impl GraphBuilder {
         let key = (from.into(), to.into(), relation);
         self.hint(from, relation_kind_hint(relation.as_str(), true, from));
         self.hint(to, relation_kind_hint(relation.as_str(), false, to));
+        if relation == RelationKind::Defines && provenance == "generated" {
+            self.origins.insert(to.into(), EntityOrigin::Generated);
+        }
         let evidence = evidence_ref(from, evidence, provenance);
         self.edges
             .entry(key.clone())
@@ -262,12 +266,13 @@ impl GraphBuilder {
         let nodes = ids
             .into_iter()
             .map(|id| {
-                entity_ref(
+                entity_ref_with_origin(
                     &id,
                     self.kinds
                         .get(&id)
                         .copied()
                         .unwrap_or_else(|| infer_kind(&id)),
+                    self.origins.get(&id).copied(),
                 )
             })
             .collect::<Vec<_>>();
@@ -331,16 +336,26 @@ impl GraphOutput {
 }
 
 fn entity_ref(id: &str, kind: EntityKind) -> EntityRef {
+    entity_ref_with_origin(id, kind, None)
+}
+
+fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigin>) -> EntityRef {
     EntityRef {
         id: id.into(),
         kind,
         name: entity_name(id),
         repository: repository(id),
-        origin: if id.starts_with("rust-call://") || id.starts_with("rust-method://") {
-            EntityOrigin::ExternalDependency
-        } else {
-            EntityOrigin::Source
-        },
+        origin: origin.unwrap_or_else(|| {
+            if id.starts_with("rust-call://")
+                || id.starts_with("rust-method://")
+                || id.starts_with("elixir-call://")
+                || id.starts_with("elixir-module://")
+            {
+                EntityOrigin::ExternalDependency
+            } else {
+                EntityOrigin::Source
+            }
+        }),
         test: is_test_entity(id),
     }
 }
@@ -376,8 +391,13 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::GraphqlField
     } else if id.starts_with("kafka-topic://") {
         EntityKind::KafkaTopic
-    } else if id.starts_with("rust-call://") || id.starts_with("rust-method://") {
+    } else if id.starts_with("rust-call://")
+        || id.starts_with("rust-method://")
+        || id.starts_with("elixir-call://")
+    {
         EntityKind::Callable
+    } else if id.starts_with("elixir-module://") {
+        EntityKind::Namespace
     } else if id.starts_with("proto-file://") {
         EntityKind::ProtoFile
     } else if id.starts_with("proto-message://") {
@@ -388,6 +408,17 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::ProtoEnum
     } else if id.starts_with("proto-service://") {
         EntityKind::ProtoService
+    } else if id.contains("/elixir-source/") {
+        EntityKind::Namespace
+    } else if let Some(symbol) = id.split_once("/elixir/").map(|(_, symbol)| symbol) {
+        if symbol
+            .rsplit_once('/')
+            .is_some_and(|(_, arity)| arity.parse::<usize>().is_ok())
+        {
+            EntityKind::Callable
+        } else {
+            EntityKind::Namespace
+        }
     } else {
         EntityKind::Unknown
     }
@@ -408,11 +439,34 @@ fn relation_kind_hint(relation: &str, source: bool, id: &str) -> EntityKind {
 }
 
 fn entity_name(id: &str) -> String {
+    if let Some(module) = id.strip_prefix("elixir-module://") {
+        return module.into();
+    }
+    if let Some(symbol) = id.strip_prefix("elixir-call://")
+        && let Some((function, arity)) = symbol.rsplit_once('/')
+        && arity.parse::<usize>().is_ok()
+    {
+        return if let Some((module, function)) = function.rsplit_once('/') {
+            format!("{module}.{function}/{arity}")
+        } else {
+            format!("{function}/{arity}")
+        };
+    }
     if let Some((service, method)) = id.strip_prefix("grpc://").and_then(|id| id.split_once('/')) {
         return format!(
             "{}.{}",
             service.rsplit('.').next().unwrap_or(service),
             method
+        );
+    }
+    if let Some(symbol) = id.split_once("/elixir/").map(|(_, symbol)| symbol)
+        && let Some((function, arity)) = symbol.rsplit_once('/')
+        && arity.parse::<usize>().is_ok()
+    {
+        return format!(
+            "{}/{}",
+            function.rsplit('/').next().unwrap_or(function),
+            arity
         );
     }
     id.rsplit(['/', ':'])
@@ -424,6 +478,8 @@ fn entity_name(id: &str) -> String {
 fn repository(id: &str) -> Option<String> {
     id.strip_prefix("repo://").and_then(|rest| {
         rest.split_once("/rust/")
+            .or_else(|| rest.split_once("/elixir/"))
+            .or_else(|| rest.split_once("/elixir-source/"))
             .map(|(repository, _)| repository.into())
     })
 }
@@ -446,6 +502,7 @@ fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
             "ast" => EvidenceKind::Ast,
             "unique_name_heuristic" => EvidenceKind::Inference,
             "descriptor" => EvidenceKind::Descriptor,
+            "generated" => EvidenceKind::Generated,
             _ => EvidenceKind::Unknown,
         },
         repository: repository(from),
@@ -495,7 +552,29 @@ fn list<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::is_test_entity;
+    use super::{entity_ref, infer_kind, is_test_entity};
+    use beholder_dto::EntityKind;
+
+    #[test]
+    fn maps_elixir_modules_and_functions() {
+        let module_id = "repo://github.com/fresha/app-packages/elixir/Packages.Domain.Instances";
+        let module = entity_ref(module_id, infer_kind(module_id));
+        assert_eq!(module.kind, EntityKind::Namespace);
+        assert_eq!(module.name, "Packages.Domain.Instances");
+        assert_eq!(
+            module.repository.as_deref(),
+            Some("github.com/fresha/app-packages")
+        );
+
+        let function_id = format!("{module_id}/activate/1");
+        let function = entity_ref(&function_id, infer_kind(&function_id));
+        assert_eq!(function.kind, EntityKind::Callable);
+        assert_eq!(function.name, "activate/1");
+        assert_eq!(
+            function.repository.as_deref(),
+            Some("github.com/fresha/app-packages")
+        );
+    }
 
     #[test]
     fn recognises_rust_and_javascript_test_segments() {

@@ -60,7 +60,33 @@ impl Confidence {
 pub enum Provenance {
     Ast,
     Descriptor,
+    Generated,
     UniqueNameHeuristic,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisDiagnosticSeverity {
+    KnownLimitation,
+    Warning,
+}
+
+impl AnalysisDiagnosticSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KnownLimitation => "known_limitation",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnalysisDiagnostic {
+    pub code: String,
+    pub severity: AnalysisDiagnosticSeverity,
+    pub path: PathBuf,
+    pub line: Option<u32>,
+    pub detail: Option<String>,
 }
 
 impl Provenance {
@@ -68,6 +94,7 @@ impl Provenance {
         match self {
             Self::Ast => "ast",
             Self::Descriptor => "descriptor",
+            Self::Generated => "generated",
             Self::UniqueNameHeuristic => "unique_name_heuristic",
         }
     }
@@ -101,7 +128,9 @@ pub enum DependencyRelation {
     CallsRpc,
     ConsumedBy,
     ImplementedBy,
+    Imports,
     Publishes,
+    Requires,
     ResolvedBy,
     Selects,
     Uses,
@@ -114,7 +143,9 @@ impl DependencyRelation {
             Self::CallsRpc => "calls_rpc",
             Self::ConsumedBy => "consumed_by",
             Self::ImplementedBy => "implemented_by",
+            Self::Imports => "imports",
             Self::Publishes => "publishes",
+            Self::Requires => "requires",
             Self::ResolvedBy => "resolved_by",
             Self::Selects => "selects",
             Self::Uses => "uses",
@@ -221,6 +252,22 @@ impl Observation {
             evidence: descriptor.into(),
             confidence: Confidence::Exact,
             provenance: Provenance::Descriptor,
+        }
+    }
+
+    pub fn generated(
+        from: impl Into<EntityId>,
+        relation: StructuralRelation,
+        to: impl Into<EntityId>,
+        evidence: impl Into<Evidence>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            relation: SemanticRelation::Structural(relation),
+            to: to.into(),
+            evidence: evidence.into(),
+            confidence: Confidence::Exact,
+            provenance: Provenance::Generated,
         }
     }
 }

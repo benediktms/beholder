@@ -50,7 +50,34 @@ target/debug/beholder daemon status >/dev/null
 [[ -S "$socket" ]] || { echo "daemon socket not found at $socket" >&2; exit 1; }
 mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
-target/debug/beholder workspace register main "$root" "$state/contracts" \
+mkdir -p "$state/elixir/lib"
+printf '%s\n' \
+    'defmodule Beholder.Macro do' \
+    '  defmacro __using__(_) do' \
+    '    quote do' \
+    '      def generated(value), do: Beholder.Helper.work(value)' \
+    '    end' \
+    '  end' \
+    'end' \
+    'defmodule Beholder do' \
+    '  defmodule Smoke do' \
+    '    use Beholder.Macro, mode: :strict' \
+    '    import External.Helpers, only: [help: 1]' \
+    '    require External.Macros, as: Macros' \
+    '    def indexed(value), do: helper(value)' \
+    '    defp helper(value), do: value' \
+    '  end' \
+    'end' \
+    'defmodule Beholder.Helper do' \
+    '  def work(value), do: value' \
+    'end' >"$state/elixir/lib/smoke.ex"
+git -C "$state/elixir" init -q
+git -C "$state/elixir" config user.name 'Beholder Smoke'
+git -C "$state/elixir" config user.email 'smoke@beholder.local'
+git -C "$state/elixir" add lib/smoke.ex
+git -C "$state/elixir" commit -qm 'Add Elixir smoke fixture'
+git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
+target/debug/beholder workspace register main "$root" "$state/contracts" "$state/elixir" \
     --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" >/dev/null
 
 repository="$(basename "$root")"
@@ -64,13 +91,56 @@ caller="repo://$repository/rust/crates/daemon/src/main/main"
 callee="repo://$repository/rust/crates/daemon-client/src/lib/state_dir"
 echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
-for _ in {1..100}; do
+for _ in {1..600}; do
     result="$(target/debug/beholder context --json --workspace main "$caller" 2>/dev/null || true)"
     grep -Fq "$callee" <<<"$result" && break
     sleep 0.1
 done
 if ! grep -Fq "$callee" <<<"$result"; then
     printf 'automatic indexing did not produce %s in context:\n%s\n' "$callee" "$result" >&2
+    exit 1
+fi
+echo 'Checking Elixir module and function indexing...' >&2
+elixir_module='repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke'
+result="$(target/debug/beholder context --json --workspace main "$elixir_module")"
+for expected in \
+    '"kind":"namespace"' \
+    'Beholder.Smoke/indexed/1' \
+    '"name":"indexed/1"' \
+    'Beholder.Smoke/generated/1' \
+    '"origin":"generated"' \
+    '"source":"generated"' \
+    'Beholder.Macro' \
+    '"kind":"uses"' \
+    'elixir-module://External.Helpers' \
+    '"kind":"imports"' \
+    'elixir-module://External.Macros' \
+    '"kind":"requires"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in Elixir context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke/indexed/1')"
+for expected in 'Beholder.Smoke/helper/1' '"kind":"calls"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in local Elixir call context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke/generated/1')"
+for expected in 'Beholder.Helper/work/1' '"kind":"calls"' '"source":"generated"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in generated Elixir call context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+macro_result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Macro')"
+if grep -Fq '/generated/1' <<<"$macro_result"; then
+    printf 'quoted macro expansion leaked into direct definitions:\n%s\n' "$macro_result" >&2
     exit 1
 fi
 echo 'Checking Protobuf descriptor indexing...' >&2
@@ -120,7 +190,15 @@ if grep -Eq '"level":"(WARN|ERROR)"' "$trace_file"; then
     cat "$trace_file" >&2
     exit 1
 fi
-for expected in 'daemon started' 'workspace indexed' 'facts_inserted' 'rpc.context' 'daemon stopped'; do
+for expected in \
+    'daemon started' \
+    'workspace indexed' \
+    'facts_inserted' \
+    'rpc.context' \
+    'elixir.macro_expansion_incomplete' \
+    'rust.receiver_method_resolution_unavailable' \
+    'frontend analysis limitations' \
+    'daemon stopped'; do
     if ! grep -Fq "$expected" "$trace_file"; then
         printf 'daemon trace is missing %s:\n' "$expected" >&2
         cat "$trace_file" >&2
@@ -129,4 +207,4 @@ for expected in 'daemon started' 'workspace indexed' 'facts_inserted' 'rpc.conte
 done
 trace_events="$(wc -l <"$trace_file" | tr -d ' ')"
 echo "Trace inspection passed: $trace_events events, no warnings or errors" >&2
-echo "dogfood smoke passed: indexed Rust and Protobuf semantics" >&2
+echo "dogfood smoke passed: indexed Rust, Elixir, and Protobuf semantics" >&2

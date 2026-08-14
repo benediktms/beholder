@@ -11,6 +11,7 @@ members = [
     "crates/adapters-mnestic",
     "crates/adapters-protobuf",
     "crates/adapters-git",
+    "crates/adapters-treesitter-elixir",
     "crates/adapters-treesitter-rust",
     "crates/domain",
     "crates/dto",
@@ -24,6 +25,7 @@ edition = "2024"
 beholder-adapters-mnestic = { path = "crates/adapters-mnestic", default-features = false }
 beholder-adapters-git = { path = "crates/adapters-git" }
 beholder-adapters-protobuf = { path = "crates/adapters-protobuf" }
+beholder-adapters-treesitter-elixir = { path = "crates/adapters-treesitter-elixir" }
 beholder-adapters-treesitter-rust = { path = "crates/adapters-treesitter-rust" }
 beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }

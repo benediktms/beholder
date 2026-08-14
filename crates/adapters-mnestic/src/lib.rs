@@ -1360,6 +1360,17 @@ mod tests {
         )
         .unwrap();
         db.run_script(
+            "?[state, from, relation, to, confidence, provenance] :=
+                 *state_dependency_observation{state, from, relation, to},
+                 confidence = 1.0, provenance = 'ast'
+             :put state_observation_metadata {
+                 state, from, relation, to => confidence, provenance
+             }",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .unwrap();
+        db.run_script(
             "?[view, revision] <- [['diamond', 0]]
              :put analysis_revision {view => revision}",
             BTreeMap::new(),

@@ -1,12 +1,12 @@
 use beholder_domain::{
-    Confidence, DependencyOverride, DependencyRelation, EntityId, Observation, Provenance,
-    SemanticRelation, StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
+    DependencyRelation, EntityId, Observation, Provenance, SemanticRelation, StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 use tree_sitter::{Node, Parser};
 
-pub const FRONTEND_VERSION: &str = "2";
+pub const FRONTEND_VERSION: &str = "3";
 pub const RESOLVER_VERSION: &str = "5";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -194,6 +194,27 @@ pub fn observations_from_analysis(
     observations
 }
 
+pub fn diagnostics_from_analysis(analysis: &RustAnalysis, path: &Path) -> Vec<AnalysisDiagnostic> {
+    let mut calls = analysis
+        .functions
+        .iter()
+        .flat_map(|function| &function.calls)
+        .filter(|call| call.receiver_method);
+    let Some(first) = calls.next() else {
+        return Vec::new();
+    };
+    vec![AnalysisDiagnostic {
+        code: "rust.receiver_method_resolution_unavailable".into(),
+        severity: AnalysisDiagnosticSeverity::KnownLimitation,
+        path: path.into(),
+        line: u32::try_from(first.line).ok(),
+        detail: Some(format!(
+            "{} receiver method calls are indexed without type resolution",
+            1 + calls.count()
+        )),
+    }]
+}
+
 pub fn observations(
     repository: &str,
     source: &str,
@@ -210,6 +231,7 @@ pub fn resolve_repository_calls(observations: &mut [Observation]) -> Vec<Depende
     let mut definitions = BTreeMap::<String, Option<String>>::new();
     for observation in observations.iter().filter(|observation| {
         observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+            && observation.to.as_str().contains("/rust/")
     }) {
         let Some(name) = observation.to.as_str().rsplit('/').next() else {
             continue;
@@ -390,13 +412,14 @@ mod tests {
 
     #[test]
     fn leaves_receiver_methods_unresolved() {
-        let mut observations = observations(
-            "repo-link",
-            "fn is_valid_hash(s: &str) -> bool { \
+        let source = "fn is_valid_hash(s: &str) -> bool { \
                  s.chars().all(|c| c.is_ascii()) \
              } \
              struct InMemoryOutboxRepository; \
-             impl InMemoryOutboxRepository { fn all(&self) {} }",
+             impl InMemoryOutboxRepository { fn all(&self) {} }";
+        let mut observations = observations(
+            "repo-link",
+            source,
             Path::new("crates/domain-task/src/hash.rs"),
         )
         .unwrap();
@@ -427,6 +450,20 @@ mod tests {
             !calls
                 .iter()
                 .any(|target| { target.ends_with("/impl/InMemoryOutboxRepository/all") })
+        );
+        let diagnostics = diagnostics_from_analysis(
+            &analyze(source).unwrap(),
+            Path::new("crates/domain-task/src/hash.rs"),
+        );
+        assert_eq!(
+            diagnostics,
+            vec![AnalysisDiagnostic {
+                code: "rust.receiver_method_resolution_unavailable".into(),
+                severity: AnalysisDiagnosticSeverity::KnownLimitation,
+                path: Path::new("crates/domain-task/src/hash.rs").into(),
+                line: Some(1),
+                detail: Some("3 receiver method calls are indexed without type resolution".into(),),
+            }]
         );
     }
 }

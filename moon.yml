@@ -3,12 +3,19 @@ layer: 'application'
 
 fileGroups:
   sources:
+    - '.github/workflows/*.yml'
+    - '.moon/*.yml'
     - 'Cargo.toml'
     - 'Cargo.lock'
+    - 'Justfile'
     - 'crates/**/*.rs'
     - 'crates/**/Cargo.toml'
+    - 'mise.toml'
+    - 'moon.yml'
     - 'proto/**/*.proto'
     - 'rules/**/*.datalog'
+    - 'rust-toolchain.toml'
+    - 'scripts/**/*.sh'
 
 tasks:
   check:
@@ -22,7 +29,7 @@ tasks:
       - '@group(sources)'
 
   lint:
-    command: 'cargo clippy --workspace --all-targets -- -D warnings'
+    command: 'cargo clippy --workspace --all-targets --no-deps -- -D warnings'
     deps:
       - 'format-check'
     inputs:
@@ -39,6 +46,7 @@ tasks:
       - '@group(sources)'
     options:
       cache: false
+      runInCI: false
 
   release:
     command: 'cargo build --release -p beholder-cli -p beholder-daemon'
