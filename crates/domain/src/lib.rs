@@ -1,12 +1,140 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct EntityId(String);
+
+impl EntityId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EntityId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for EntityId {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+impl fmt::Display for EntityId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Evidence(String);
+
+impl Evidence {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Evidence {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Evidence {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuralRelation {
+    Defines,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyRelation {
+    Calls,
+    CallsRpc,
+    ConsumedBy,
+    ImplementedBy,
+    Publishes,
+    ResolvedBy,
+    Selects,
+    Uses,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SemanticRelation {
+    Structural(StructuralRelation),
+    Dependency(DependencyRelation),
+}
+
+impl SemanticRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Structural(StructuralRelation::Defines) => "defines",
+            Self::Dependency(DependencyRelation::Calls) => "calls",
+            Self::Dependency(DependencyRelation::CallsRpc) => "calls_rpc",
+            Self::Dependency(DependencyRelation::ConsumedBy) => "consumed_by",
+            Self::Dependency(DependencyRelation::ImplementedBy) => "implemented_by",
+            Self::Dependency(DependencyRelation::Publishes) => "publishes",
+            Self::Dependency(DependencyRelation::ResolvedBy) => "resolved_by",
+            Self::Dependency(DependencyRelation::Selects) => "selects",
+            Self::Dependency(DependencyRelation::Uses) => "uses",
+        }
+    }
+
+    pub fn dependency(self) -> Option<DependencyRelation> {
+        match self {
+            Self::Dependency(relation) => Some(relation),
+            Self::Structural(_) => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Observation {
-    pub from: String,
-    pub relation: String,
-    pub to: String,
-    pub evidence: String,
+    pub from: EntityId,
+    pub relation: SemanticRelation,
+    pub to: EntityId,
+    pub evidence: Evidence,
+}
+
+impl Observation {
+    pub fn structural(
+        from: impl Into<EntityId>,
+        relation: StructuralRelation,
+        to: impl Into<EntityId>,
+        evidence: impl Into<Evidence>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            relation: SemanticRelation::Structural(relation),
+            to: to.into(),
+            evidence: evidence.into(),
+        }
+    }
+
+    pub fn dependency(
+        from: impl Into<EntityId>,
+        relation: DependencyRelation,
+        to: impl Into<EntityId>,
+        evidence: impl Into<Evidence>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            relation: SemanticRelation::Dependency(relation),
+            to: to.into(),
+            evidence: evidence.into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -129,6 +257,18 @@ pub struct GitTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_dependency_relations_are_traversable() {
+        assert_eq!(
+            SemanticRelation::Structural(StructuralRelation::Defines).dependency(),
+            None
+        );
+        assert_eq!(
+            SemanticRelation::Dependency(DependencyRelation::Calls).dependency(),
+            Some(DependencyRelation::Calls)
+        );
+    }
 
     #[test]
     fn workspace_smoke() {

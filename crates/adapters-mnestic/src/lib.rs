@@ -257,6 +257,34 @@ const CREATE_SCHEMA: &str = r#"
 }
 "#;
 
+const CREATE_DEPENDENCY_SCHEMA: &str = r#"
+:create dependency_observation {
+    view: String,
+    from: String,
+    relation: String,
+    to: String,
+    =>
+    evidence: String,
+}
+"#;
+
+const BACKFILL_DEPENDENCIES: &str = r#"
+dependency_relation[relation] <- [
+    ['calls'],
+    ['calls_rpc'],
+    ['consumed_by'],
+    ['implemented_by'],
+    ['publishes'],
+    ['resolved_by'],
+    ['selects'],
+    ['uses'],
+]
+?[view, from, relation, to, evidence] :=
+    *observation{view, from, relation, to, evidence},
+    dependency_relation[relation]
+:put dependency_observation {view, from, relation, to => evidence}
+"#;
+
 const CREATE_REVISION_SCHEMA: &str = r#"
 :create analysis_revision {
     view: String,
@@ -313,7 +341,17 @@ const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
 fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
     let db = DbInstance::new("mem", "", Default::default())?;
     db.run_script(CREATE_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)?;
+    db.run_script(
+        CREATE_DEPENDENCY_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
     db.run_script(SEED, BTreeMap::new(), ScriptMutability::Mutable)?;
+    db.run_script(
+        BACKFILL_DEPENDENCIES,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
     Ok(db)
 }
 
@@ -347,6 +385,23 @@ fn persistent_database(path: &Path, initialize: bool) -> Result<DbInstance, Box<
         db.run_script(CREATE_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)?;
     }
     let relations = db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("dependency_observation"))
+    {
+        db.run_script(
+            CREATE_DEPENDENCY_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+        db.run_script(
+            BACKFILL_DEPENDENCIES,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
     if initialize
         && !relations
             .rows
@@ -417,17 +472,25 @@ fn store_observations(
 ) -> Result<(), Box<dyn Error>> {
     // ponytail: one transaction, per-row writes; batch when ingestion throughput matters.
     for observation in observations {
+        let params = BTreeMap::from([
+            ("view".into(), view.into()),
+            ("from".into(), observation.from.as_str().into()),
+            ("relation".into(), observation.relation.as_str().into()),
+            ("to".into(), observation.to.as_str().into()),
+            ("evidence".into(), observation.evidence.as_str().into()),
+        ]);
         transaction.run_script(
             "?[view, from, relation, to, evidence] <- [[$view, $from, $relation, $to, $evidence]]\n\
              :put observation {view, from, relation, to => evidence}",
-            BTreeMap::from([
-                ("view".into(), view.into()),
-                ("from".into(), observation.from.clone().into()),
-                ("relation".into(), observation.relation.clone().into()),
-                ("to".into(), observation.to.clone().into()),
-                ("evidence".into(), observation.evidence.clone().into()),
-            ]),
+            params.clone(),
         )?;
+        if observation.relation.dependency().is_some() {
+            transaction.run_script(
+                "?[view, from, relation, to, evidence] <- [[$view, $from, $relation, $to, $evidence]]\n\
+                 :put dependency_observation {view, from, relation, to => evidence}",
+                params,
+            )?;
+        }
     }
     Ok(())
 }
@@ -478,11 +541,11 @@ fn publish_observations(
         .map(|observation| {
             (
                 (
-                    observation.from.clone(),
-                    observation.relation.clone(),
-                    observation.to.clone(),
+                    observation.from.as_str().to_owned(),
+                    observation.relation.as_str().to_owned(),
+                    observation.to.as_str().to_owned(),
                 ),
-                observation.evidence.clone(),
+                observation,
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -503,27 +566,32 @@ fn publish_observations(
                 ("to".into(), to.clone().into()),
             ]),
         )?;
+        transaction.run_script(
+            "?[view, from, relation, to] <- [[$view, $from, $relation, $to]]\n\
+             :rm dependency_observation {view, from, relation, to}",
+            BTreeMap::from([
+                ("view".into(), view.name.clone().into()),
+                ("from".into(), from.clone().into()),
+                ("relation".into(), relation.clone().into()),
+                ("to".into(), to.clone().into()),
+            ]),
+        )?;
     }
     let mut changes = FactChanges {
         removed: removed.len(),
         ..FactChanges::default()
     };
     let mut changed = Vec::new();
-    for ((from, relation, to), evidence) in &next {
+    for ((from, relation, to), observation) in &next {
         match current.get(&(from.clone(), relation.clone(), to.clone())) {
             None => changes.inserted += 1,
-            Some(current) if current == evidence => {
+            Some(current) if current == observation.evidence.as_str() => {
                 changes.unchanged += 1;
                 continue;
             }
             Some(_) => changes.updated += 1,
         }
-        changed.push(Observation {
-            from: from.clone(),
-            relation: relation.clone(),
-            to: to.clone(),
-            evidence: evidence.clone(),
-        });
+        changed.push((*observation).clone());
     }
     store_observations(&transaction, &view.name, &changed)?;
     transaction.run_script(
@@ -678,14 +746,13 @@ fn context(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows,
     query(
         db,
         view,
-        &format!(
-            "{DIRECT_RULES}\n\
-             ?[direction, relation, related, evidence] := \
-                 direct[$entity, related, relation, evidence], direction = 'outgoing'\n\
-             ?[direction, relation, related, evidence] := \
-                 direct[related, $entity, relation, evidence], direction = 'incoming'\n\
-             :order direction, relation, related"
-        ),
+        "?[direction, relation, related, evidence] := \
+             *observation{view: $view, from: $entity, to: related, relation, evidence}, \
+             direction = 'outgoing'\n\
+         ?[direction, relation, related, evidence] := \
+             *observation{view: $view, from: related, to: $entity, relation, evidence}, \
+             direction = 'incoming'\n\
+         :order direction, relation, related",
         [("entity", entity.into())],
     )
 }
@@ -879,7 +946,7 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::LogicalRepository;
+    use beholder_domain::{DependencyRelation, LogicalRepository, StructuralRelation};
     use std::{collections::BTreeSet, fs, time::SystemTime};
 
     #[test]
@@ -910,7 +977,7 @@ mod tests {
                 ['diamond', 'left', 'calls', 'end', 'left:2'],
                 ['diamond', 'right', 'calls', 'end', 'right:2'],
              ]
-             :put observation {view, from, relation, to => evidence}",
+             :put dependency_observation {view, from, relation, to => evidence}",
             BTreeMap::new(),
             ScriptMutability::Mutable,
         )
@@ -989,11 +1056,8 @@ mod tests {
             head: Some("head".into()),
             fingerprint: fingerprint.into(),
         };
-        let observation = |from: &str, to: &str, evidence: &str| Observation {
-            from: from.into(),
-            relation: "calls".into(),
-            to: to.into(),
-            evidence: evidence.into(),
+        let observation = |from: &str, to: &str, evidence: &str| {
+            Observation::dependency(from, DependencyRelation::Calls, to, evidence)
         };
 
         let first = WorkspaceView::new("main", "analysis", vec![repository_state("one")]).unwrap();
@@ -1073,12 +1137,12 @@ mod tests {
         store
             .publish(
                 &view,
-                &[Observation {
-                    from: "repo/source".into(),
-                    relation: "calls".into(),
-                    to: "repo/target".into(),
-                    evidence: "source.rs:1".into(),
-                }],
+                &[Observation::dependency(
+                    "repo/source",
+                    DependencyRelation::Calls,
+                    "repo/target",
+                    "source.rs:1",
+                )],
             )
             .unwrap();
         let snapshot = store.context_snapshot("snapshot", "repo/source").unwrap();
@@ -1090,6 +1154,118 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|value| value.id == "repo/target")
+        );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn structural_facts_are_context_only() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-structural-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let store = SemanticStore::persistent(&state_dir.join("beholder.db"), true).unwrap();
+        let view = WorkspaceView::new(
+            "structural",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .publish(
+                &view,
+                &[
+                    Observation::structural(
+                        "repo/file",
+                        StructuralRelation::Defines,
+                        "repo/caller",
+                        "src/lib.rs:1",
+                    ),
+                    Observation::dependency(
+                        "repo/caller",
+                        DependencyRelation::Calls,
+                        "repo/target",
+                        "src/lib.rs:2",
+                    ),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .context("structural", "repo/file")
+                .unwrap()
+                .edges
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .trace("structural", "repo/file", "repo/target")
+                .unwrap()
+                .paths
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .trace("structural", "repo/caller", "repo/target")
+                .unwrap()
+                .paths
+                .len(),
+            1
+        );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn existing_observations_are_backfilled_for_traversal() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-backfill-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let path = state_dir.join("beholder.db");
+        let db = benchmark_database("sqlite", path.to_str()).unwrap();
+        db.run_script(CREATE_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)
+            .unwrap();
+        db.run_script(
+            "?[view, from, relation, to, evidence] <- [\
+                 ['legacy', 'repo/file', 'defines', 'repo/caller', 'src/lib.rs:1'], \
+                 ['legacy', 'repo/caller', 'calls', 'repo/target', 'src/lib.rs:2']\
+             ] \
+             :put observation {view, from, relation, to => evidence}",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .unwrap();
+        drop(db);
+
+        let store = SemanticStore::persistent(&path, true).unwrap();
+        assert_eq!(
+            store
+                .trace("legacy", "repo/caller", "repo/target")
+                .unwrap()
+                .paths
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .trace("legacy", "repo/file", "repo/target")
+                .unwrap()
+                .paths
+                .is_empty()
         );
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();

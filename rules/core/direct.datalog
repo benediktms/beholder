@@ -1,2 +1,2 @@
 direct[from, to, relation, evidence] :=
-    *observation{view: $view, from, relation, to, evidence}
+    *dependency_observation{view: $view, from, relation, to, evidence}

@@ -1,10 +1,12 @@
-use beholder_domain::Observation;
+use beholder_domain::{
+    DependencyRelation, EntityId, Observation, SemanticRelation, StructuralRelation,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 use tree_sitter::{Node, Parser};
 
 pub const FRONTEND_VERSION: &str = "2";
-pub const RESOLVER_VERSION: &str = "2";
+pub const RESOLVER_VERSION: &str = "3";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
@@ -156,17 +158,17 @@ pub fn observations_from_analysis(
 
     for function in &analysis.functions {
         let function_id = format!("{source_id}/{}", function.qualified_name);
-        observations.push(Observation {
-            from: source_id.clone(),
-            relation: "defines".into(),
-            to: function_id.clone(),
-            evidence: format!("{}:{}", path.display(), function.line),
-        });
+        observations.push(Observation::structural(
+            source_id.clone(),
+            StructuralRelation::Defines,
+            function_id.clone(),
+            format!("{}:{}", path.display(), function.line),
+        ));
         for call in &function.calls {
-            observations.push(Observation {
-                from: function_id.clone(),
-                relation: "calls".into(),
-                to: if call.receiver_method {
+            observations.push(Observation::dependency(
+                function_id.clone(),
+                DependencyRelation::Calls,
+                if call.receiver_method {
                     format!("rust-method://{}", call.name)
                 } else {
                     definitions
@@ -174,8 +176,8 @@ pub fn observations_from_analysis(
                         .and_then(Clone::clone)
                         .unwrap_or_else(|| format!("rust-call://{}", call.name))
                 },
-                evidence: format!("{}:{}", path.display(), call.line),
-            });
+                format!("{}:{}", path.display(), call.line),
+            ));
         }
     }
     observations
@@ -195,11 +197,10 @@ pub fn observations(
 
 pub fn resolve_repository_calls(observations: &mut [Observation]) {
     let mut definitions = BTreeMap::<String, Option<String>>::new();
-    for observation in observations
-        .iter()
-        .filter(|observation| observation.relation == "defines")
-    {
-        let Some(name) = observation.to.rsplit('/').next() else {
+    for observation in observations.iter().filter(|observation| {
+        observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+    }) {
+        let Some(name) = observation.to.as_str().rsplit('/').next() else {
             continue;
         };
         definitions
@@ -209,16 +210,15 @@ pub fn resolve_repository_calls(observations: &mut [Observation]) {
                     *candidate = None;
                 }
             })
-            .or_insert_with(|| Some(observation.to.clone()));
+            .or_insert_with(|| Some(observation.to.as_str().to_owned()));
     }
-    for observation in observations
-        .iter_mut()
-        .filter(|observation| observation.relation == "calls")
-    {
-        if let Some(name) = observation.to.strip_prefix("rust-call://")
+    for observation in observations.iter_mut().filter(|observation| {
+        observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+    }) {
+        if let Some(name) = observation.to.as_str().strip_prefix("rust-call://")
             && let Some(Some(target)) = definitions.get(name)
         {
-            observation.to = target.clone();
+            observation.to = EntityId::from(target.clone());
         }
     }
 }
@@ -254,33 +254,33 @@ mod tests {
         )
         .unwrap();
         assert!(observations.iter().any(|observation| {
-            observation.from == "repo://beholder/rust/lib/first"
-                && observation.relation == "calls"
-                && observation.to == "repo://beholder/rust/lib/second"
+            observation.from.as_str() == "repo://beholder/rust/lib/first"
+                && observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                && observation.to.as_str() == "repo://beholder/rust/lib/second"
         }));
 
         let mut ambiguous = vec![
-            Observation {
-                from: "repo://beholder/rust/caller".into(),
-                relation: "calls".into(),
-                to: "rust-call://helper".into(),
-                evidence: "src/lib.rs:1".into(),
-            },
-            Observation {
-                from: "repo://beholder/rust/one".into(),
-                relation: "defines".into(),
-                to: "repo://beholder/rust/one/helper".into(),
-                evidence: "src/one.rs:1".into(),
-            },
-            Observation {
-                from: "repo://beholder/rust/two".into(),
-                relation: "defines".into(),
-                to: "repo://beholder/rust/two/helper".into(),
-                evidence: "src/two.rs:1".into(),
-            },
+            Observation::dependency(
+                "repo://beholder/rust/caller",
+                DependencyRelation::Calls,
+                "rust-call://helper",
+                "src/lib.rs:1",
+            ),
+            Observation::structural(
+                "repo://beholder/rust/one",
+                StructuralRelation::Defines,
+                "repo://beholder/rust/one/helper",
+                "src/one.rs:1",
+            ),
+            Observation::structural(
+                "repo://beholder/rust/two",
+                StructuralRelation::Defines,
+                "repo://beholder/rust/two/helper",
+                "src/two.rs:1",
+            ),
         ];
         resolve_repository_calls(&mut ambiguous);
-        assert_eq!(ambiguous[0].to, "rust-call://helper");
+        assert_eq!(ambiguous[0].to.as_str(), "rust-call://helper");
     }
 
     #[test]
@@ -294,7 +294,9 @@ mod tests {
         .unwrap();
         let definitions = observations
             .iter()
-            .filter(|observation| observation.relation == "defines")
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+            })
             .map(|observation| observation.to.as_str())
             .collect::<Vec<_>>();
 
@@ -320,7 +322,8 @@ mod tests {
         let calls = observations
             .iter()
             .filter(|observation| {
-                observation.relation == "calls" && observation.from.ends_with("/is_valid_hash")
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation.from.as_str().ends_with("/is_valid_hash")
             })
             .map(|observation| observation.to.as_str())
             .collect::<Vec<_>>();

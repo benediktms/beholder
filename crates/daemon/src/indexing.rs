@@ -25,7 +25,7 @@ use tokio::{
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
-const CORE_RULE_PACK_VERSION: &str = "1";
+const CORE_RULE_PACK_VERSION: &str = "2";
 type RustSources = Vec<(PathBuf, String)>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -593,11 +593,15 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 1);
         assert_eq!(
-            observations_from_analysis("one", &first, Path::new("src/one.rs"))[0].to,
+            observations_from_analysis("one", &first, Path::new("src/one.rs"))[0]
+                .to
+                .as_str(),
             "repo://one/rust/one/shared"
         );
         assert_eq!(
-            observations_from_analysis("two", &second, Path::new("src/two.rs"))[0].to,
+            observations_from_analysis("two", &second, Path::new("src/two.rs"))[0]
+                .to
+                .as_str(),
             "repo://two/rust/two/shared"
         );
 
@@ -661,8 +665,8 @@ mod tests {
         assert_eq!(second_status, CacheStatus::Memory);
         assert!(Arc::ptr_eq(&first, &second));
         assert!(first.iter().any(|observation| {
-            observation.from == "repo://repo/rust/lib/caller"
-                && observation.to == "repo://repo/rust/lib/helper"
+            observation.from.as_str() == "repo://repo/rust/lib/caller"
+                && observation.to.as_str() == "repo://repo/rust/lib/helper"
         }));
 
         drop(scheduler);
