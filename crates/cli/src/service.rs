@@ -61,6 +61,33 @@ pub fn uninstall() -> Result<UninstallOutcome, Box<dyn Error>> {
     }
 }
 
+pub fn stop() -> Result<(), Box<dyn Error>> {
+    if cfg!(target_os = "macos") {
+        let manifest = launch_agent_path()?;
+        launch(
+            vec![
+                "launchctl".into(),
+                "bootout".into(),
+                format!("gui/{}", current_uid()?),
+                path_text(&manifest)?.into(),
+            ],
+            true,
+        )
+    } else if cfg!(target_os = "linux") {
+        launch(
+            vec![
+                "systemctl".into(),
+                "--user".into(),
+                "stop".into(),
+                UNIT.into(),
+            ],
+            true,
+        )
+    } else {
+        Err("daemon installation is supported on macOS and Linux".into())
+    }
+}
+
 fn home_dir() -> Result<PathBuf, Box<dyn Error>> {
     std::env::var_os("BEHOLDER_HOME")
         .or_else(|| std::env::var_os("HOME"))
