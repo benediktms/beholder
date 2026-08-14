@@ -557,13 +557,13 @@ mod tests {
 
     #[test]
     fn maps_elixir_modules_and_functions() {
-        let module_id = "repo://github.com/fresha/app-packages/elixir/Packages.Domain.Instances";
+        let module_id = "repo://github.com/example/commerce-service/elixir/Commerce.Domain.Items";
         let module = entity_ref(module_id, infer_kind(module_id));
         assert_eq!(module.kind, EntityKind::Namespace);
-        assert_eq!(module.name, "Packages.Domain.Instances");
+        assert_eq!(module.name, "Commerce.Domain.Items");
         assert_eq!(
             module.repository.as_deref(),
-            Some("github.com/fresha/app-packages")
+            Some("github.com/example/commerce-service")
         );
 
         let function_id = format!("{module_id}/activate/1");
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(function.name, "activate/1");
         assert_eq!(
             function.repository.as_deref(),
-            Some("github.com/fresha/app-packages")
+            Some("github.com/example/commerce-service")
         );
     }
 

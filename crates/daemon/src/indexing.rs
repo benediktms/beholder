@@ -909,6 +909,9 @@ fn index_workspace_versioned(
     let mut overrides = resolve_rust_repository_calls(&mut all_observations);
     overrides.extend(resolve_workspace_modules(&all_observations));
     let changes = store.publish(&view, &repository_facts, &overrides)?;
+    if let Err(error) = store.checkpoint() {
+        tracing::warn!(workspace = %workspace.name, %error, "Mnestic checkpoint failed");
+    }
     report_analysis_diagnostics(&workspace.name, &diagnostics);
     tracing::info!(
         workspace = %workspace.name,

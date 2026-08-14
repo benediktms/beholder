@@ -13,4 +13,5 @@ sqlite = ["dep:sqlite", "mnestic-engine/storage-sqlite", "mnestic-engine/storage
 beholder-domain.workspace = true
 beholder-dto.workspace = true
 mnestic-engine = { package = "mnestic", version = "0.14.0", default-features = false }
+sha2 = "0.10.9"
 sqlite = { version = "0.36.0", optional = true }

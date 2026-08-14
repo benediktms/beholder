@@ -1,11 +1,17 @@
 use beholder_domain::{
-    DependencyOverride, FactChanges, Observation, RepositoryFacts, RepositoryState, WorkspaceView,
+    DependencyOverride, FactChanges, Observation, RepositoryFacts, WorkspaceView,
 };
 use beholder_dto::{ContextResult, DependenciesResult, ImpactResult, Revisioned, TraceResult};
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, Num, ScriptMutability, ScriptRunOptions,
 };
-use std::{collections::BTreeMap, error::Error, path::Path, time::Instant};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 mod semantic;
 
@@ -49,6 +55,7 @@ pub struct InspectionResult {
 pub struct SemanticStore {
     db: DbInstance,
     read_db: DbInstance,
+    database_path: Option<PathBuf>,
 }
 
 impl SemanticStore {
@@ -57,6 +64,7 @@ impl SemanticStore {
         Ok(Self {
             read_db: db.clone(),
             db,
+            database_path: None,
         })
     }
 
@@ -65,7 +73,11 @@ impl SemanticStore {
         #[cfg(feature = "sqlite")]
         sqlite::open(path)?.execute("PRAGMA journal_mode=WAL")?;
         let read_db = persistent_database(path, false)?;
-        Ok(Self { db, read_db })
+        Ok(Self {
+            db,
+            read_db,
+            database_path: Some(path.into()),
+        })
     }
 
     pub fn benchmark_store(storage: &str, path: Option<&str>) -> Result<Self, Box<dyn Error>> {
@@ -73,6 +85,10 @@ impl SemanticStore {
         Ok(Self {
             read_db: db.clone(),
             db,
+            database_path: (storage == "sqlite")
+                .then_some(path)
+                .flatten()
+                .map(PathBuf::from),
         })
     }
 
@@ -87,6 +103,14 @@ impl SemanticStore {
         overrides: &[DependencyOverride],
     ) -> Result<FactChanges, Box<dyn Error>> {
         publish_observations(&self.db, view, repositories, overrides)
+    }
+
+    pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "sqlite")]
+        if let Some(path) = &self.database_path {
+            sqlite::open(path)?.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        }
+        Ok(())
     }
 
     pub fn inspect_relations(&self) -> Result<InspectionResult, Box<dyn Error>> {
@@ -728,13 +752,121 @@ fn store_observations(
     Ok(())
 }
 
-fn analyzed_state(analysis_identity: &str, state: &RepositoryState) -> String {
-    format!(
-        "{}:{}{}",
-        analysis_identity.len(),
-        analysis_identity,
-        state.fingerprint
-    )
+fn hash_string(hash: &mut Sha256, value: &str) {
+    hash.update(value.len().to_le_bytes());
+    hash.update(value.as_bytes());
+}
+
+type NormalizedObservations = BTreeMap<(String, String, String), (String, u64, String)>;
+
+fn normalized_observations(facts: &RepositoryFacts) -> NormalizedObservations {
+    facts
+        .observations
+        .iter()
+        .map(|observation| {
+            (
+                (
+                    observation.from.as_str().to_owned(),
+                    observation.relation.as_str().to_owned(),
+                    observation.to.as_str().to_owned(),
+                ),
+                (
+                    observation.evidence.as_str().to_owned(),
+                    observation.confidence.score().to_bits(),
+                    observation.provenance.as_str().to_owned(),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn analyzed_state(facts: &RepositoryFacts) -> String {
+    let mut hash = Sha256::new();
+    hash_string(&mut hash, &facts.state.repository.identity);
+    hash_string(&mut hash, &facts.state.fingerprint);
+    for ((from, relation, to), (evidence, confidence, provenance)) in normalized_observations(facts)
+    {
+        for value in [&from, &relation, &to, &evidence, &provenance] {
+            hash_string(&mut hash, value);
+        }
+        hash.update(confidence.to_le_bytes());
+    }
+    format!("{}:{:x}", facts.state.fingerprint, hash.finalize())
+}
+
+fn state_exists(transaction: &MultiTransaction, state: &str) -> Result<bool, Box<dyn Error>> {
+    Ok(!transaction
+        .run_script(
+            "?[stored] := *repository_state{fingerprint: $state}, stored = true",
+            BTreeMap::from([("state".into(), state.into())]),
+        )?
+        .rows
+        .is_empty())
+}
+
+fn reusable_current_state(
+    transaction: &MultiTransaction,
+    view: &WorkspaceView,
+    facts: &RepositoryFacts,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let params = BTreeMap::from([
+        ("view".into(), view.name.clone().into()),
+        (
+            "repository".into(),
+            facts.state.repository.identity.clone().into(),
+        ),
+    ]);
+    let current = transaction.run_script(
+        "?[state] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, repository: $repository, state}",
+        params,
+    )?;
+    let Some(state) = current
+        .rows
+        .first()
+        .and_then(|row| row[0].get_str())
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    let fingerprint = &facts.state.fingerprint;
+    if !state.ends_with(fingerprint)
+        && !state
+            .strip_prefix(fingerprint)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+    {
+        return Ok(None);
+    }
+    let stored = transaction.run_script(
+        "?[from, relation, to, evidence, confidence, provenance] := \
+             *state_observation{state: $state, from, relation, to, evidence}, \
+             *state_observation_metadata{state: $state, from, relation, to, confidence, provenance}",
+        BTreeMap::from([("state".into(), state.clone().into())]),
+    )?;
+    let string = |row: &[DataValue], index: usize| {
+        row[index]
+            .get_str()
+            .map(str::to_owned)
+            .ok_or("stored observation contains a non-string value")
+    };
+    let stored = stored
+        .rows
+        .iter()
+        .map(|row| {
+            Ok((
+                (string(row, 0)?, string(row, 1)?, string(row, 2)?),
+                (
+                    string(row, 3)?,
+                    row[4]
+                        .get_float()
+                        .ok_or("stored observation contains a non-float confidence")?
+                        .to_bits(),
+                    string(row, 5)?,
+                ),
+            ))
+        })
+        .collect::<Result<NormalizedObservations, Box<dyn Error>>>()?;
+    Ok((stored == normalized_observations(facts)).then_some(state))
 }
 
 fn view_matches(db: &DbInstance, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
@@ -843,15 +975,18 @@ fn publish_observations(
         .filter(|key| !next.contains_key(*key))
         .count();
 
+    let mut analyzed_states = Vec::with_capacity(repositories.len());
     for facts in repositories {
-        let state = analyzed_state(&facts.analysis_identity, &facts.state);
-        let stored = transaction.run_script(
-            "?[stored] := *repository_state{fingerprint: $state}, stored = true",
-            BTreeMap::from([("state".into(), state.clone().into())]),
-        )?;
-        if stored.rows.is_empty() {
-            store_observations(&transaction, &state, &facts.observations)?;
-        }
+        let desired = analyzed_state(facts);
+        let state = if state_exists(&transaction, &desired)? {
+            desired
+        } else if let Some(current) = reusable_current_state(&transaction, view, facts)? {
+            current
+        } else {
+            store_observations(&transaction, &desired, &facts.observations)?;
+            desired
+        };
+        analyzed_states.push(state);
     }
     transaction.run_script(
         "?[view, revision] := \
@@ -867,7 +1002,7 @@ fn publish_observations(
          :put analysis_fingerprint {view => fingerprint}",
         params,
     )?;
-    store_repository_states(&transaction, view, repositories)?;
+    store_repository_states(&transaction, view, repositories, &analyzed_states)?;
     for override_ in overrides {
         let params = BTreeMap::from([
             ("view".into(), view.name.clone().into()),
@@ -912,8 +1047,9 @@ fn store_repository_states(
     transaction: &MultiTransaction,
     view: &WorkspaceView,
     repositories: &[RepositoryFacts],
+    analyzed_states: &[String],
 ) -> Result<(), Box<dyn Error>> {
-    for facts in repositories {
+    for (facts, analyzed_state) in repositories.iter().zip(analyzed_states) {
         let state = &facts.state;
         let params = BTreeMap::from([
             ("view".into(), view.name.clone().into()),
@@ -922,10 +1058,7 @@ fn store_repository_states(
                 state.repository.identity.clone().into(),
             ),
             ("head".into(), state.head.clone().unwrap_or_default().into()),
-            (
-                "state".into(),
-                analyzed_state(&facts.analysis_identity, state).into(),
-            ),
+            ("state".into(), analyzed_state.as_str().into()),
         ]);
         transaction.run_script(
             "?[fingerprint, repository, head] <- [[$state, $repository, $head]]\n\
@@ -1241,7 +1374,8 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 mod tests {
     use super::*;
     use beholder_domain::{
-        Confidence, DependencyRelation, LogicalRepository, Provenance, StructuralRelation,
+        Confidence, DependencyRelation, LogicalRepository, Provenance, RepositoryState,
+        StructuralRelation,
     };
     use std::{
         collections::BTreeSet,
@@ -1445,6 +1579,7 @@ mod tests {
         let store = SemanticStore {
             read_db: db.clone(),
             db,
+            database_path: None,
         };
         let result = store.context("main", "rpc/Pricing.GetPrice").unwrap();
         assert_eq!(result.edges.len(), 2);
@@ -1545,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_state_facts_are_reused_across_views() {
+    fn repository_state_facts_are_reused_across_views_and_analysis_versions() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -1566,7 +1701,7 @@ mod tests {
             "repo/target",
             "src/lib.rs:1",
         );
-        for name in ["first", "second"] {
+        for (name, analysis_identity) in [("first", "analysis-v1"), ("second", "analysis-v2")] {
             let view =
                 WorkspaceView::new(name, format!("workspace-rules:{name}"), vec![state.clone()])
                     .unwrap();
@@ -1575,7 +1710,7 @@ mod tests {
                     &view,
                     &[RepositoryFacts {
                         state: state.clone(),
-                        analysis_identity: "analysis".into(),
+                        analysis_identity: analysis_identity.into(),
                         observations: vec![observation.clone()],
                     }],
                     &[],
@@ -1585,6 +1720,171 @@ mod tests {
         }
 
         assert_eq!(store.inspect_observations(None).unwrap().rows.len(), 1);
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_analysis_state_is_reused_after_analyzer_invalidation() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-legacy-reuse-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let store = SemanticStore::persistent(&state_dir.join("beholder.db"), true).unwrap();
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "shared".into(),
+        };
+        let observation = Observation::dependency(
+            "repo/source",
+            DependencyRelation::Calls,
+            "repo/target",
+            "src/lib.rs:1",
+        );
+        let legacy_state = "8:analysisshared";
+        let transaction = store.db.multi_transaction(true);
+        store_observations(
+            &transaction,
+            legacy_state,
+            std::slice::from_ref(&observation),
+        )
+        .unwrap();
+        transaction
+            .run_script(
+                "?[fingerprint, repository, head] <- [[$state, 'repo', 'head']] \
+                 :put repository_state {fingerprint => repository, head}",
+                BTreeMap::from([("state".into(), legacy_state.into())]),
+            )
+            .unwrap();
+        transaction
+            .run_script(
+                "?[view, revision] <- [['main', 1]] \
+                 :put analysis_revision {view => revision}",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        transaction
+            .run_script(
+                "?[view, revision, repository, state] <- [['main', 1, 'repo', $state]] \
+                 :put analysis_revision_state {view, revision, repository => state}",
+                BTreeMap::from([("state".into(), legacy_state.into())]),
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let view = WorkspaceView::new("main", "analysis-v2", vec![state.clone()]).unwrap();
+        store
+            .publish(
+                &view,
+                &[RepositoryFacts {
+                    state,
+                    analysis_identity: "analysis-v2".into(),
+                    observations: vec![observation],
+                }],
+                &[],
+            )
+            .unwrap();
+        store.checkpoint().unwrap();
+
+        assert_eq!(store.inspect_observations(None).unwrap().rows.len(), 1);
+        assert_eq!(
+            fs::metadata(state_dir.join("beholder.db-wal")).map_or(0, |m| m.len()),
+            0
+        );
+        let selected = store
+            .db
+            .run_script(
+                "?[state] := *analysis_revision{view: 'main', revision}, \
+                     *analysis_revision_state{view: 'main', revision, repository: 'repo', state}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(selected.rows[0][0].get_str(), Some(legacy_state));
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual production-scale publish regression benchmark"]
+    fn production_scale_analyzer_invalidation_benchmark() {
+        const FACTS: usize = 21_000;
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-publish-bench-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let database = state_dir.join("beholder.db");
+        let wal = state_dir.join("beholder.db-wal");
+        let store = SemanticStore::persistent(&database, true).unwrap();
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/repository".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "unchanged-source-state".into(),
+        };
+        let observations = (0..FACTS)
+            .map(|index| {
+                Observation::dependency(
+                    format!("repo://example/source/{index}"),
+                    DependencyRelation::Calls,
+                    format!("repo://example/target/{index}"),
+                    format!("lib/source.ex:{}", index + 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        let publish = |analysis_identity: &str| {
+            let view = WorkspaceView::new("main", analysis_identity, vec![state.clone()]).unwrap();
+            let started = Instant::now();
+            store
+                .publish(
+                    &view,
+                    &[RepositoryFacts {
+                        state: state.clone(),
+                        analysis_identity: analysis_identity.into(),
+                        observations: observations.clone(),
+                    }],
+                    &[],
+                )
+                .unwrap();
+            store.checkpoint().unwrap();
+            started.elapsed()
+        };
+        let size = |path: &Path| fs::metadata(path).map_or(0, |metadata| metadata.len());
+
+        let first = publish("analysis-v1");
+        let database_after_first = size(&database);
+        let wal_after_first = size(&wal);
+        let second = publish("analysis-v2");
+        let database_after_second = size(&database);
+        let wal_after_second = size(&wal);
+        let stored = store
+            .db
+            .run_script(
+                "?[count(from)] := *state_observation{from}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+
+        eprintln!(
+            "facts={FACTS} first_ms={} second_ms={} database_first_bytes={database_after_first} \
+             database_growth_bytes={} wal_first_bytes={wal_after_first} wal_growth_bytes={}",
+            first.as_millis(),
+            second.as_millis(),
+            database_after_second.saturating_sub(database_after_first),
+            wal_after_second.saturating_sub(wal_after_first),
+        );
+        assert_eq!(stored.rows[0][0].get_int(), Some(FACTS as i64));
+        assert!(database_after_second.saturating_sub(database_after_first) < 1024 * 1024);
+        assert!(wal_after_second.saturating_sub(wal_after_first) < 1024 * 1024);
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }
