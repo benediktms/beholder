@@ -179,7 +179,7 @@ impl IndexScheduler {
             .active_workspace
             .lock()
             .map_err(|_| "active workspace lock poisoned")? = Some(workspace.name.clone());
-        let result = index_rust_workspace(self, store, workspace);
+        let result = index_workspace(self, store, workspace);
         *self
             .active_workspace
             .lock()
@@ -488,7 +488,7 @@ fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources)
     Ok((repository_state(root, &sources)?, sources))
 }
 
-fn index_rust_workspace(
+fn index_workspace(
     scheduler: &IndexScheduler,
     store: &SemanticStore,
     workspace: &Workspace,

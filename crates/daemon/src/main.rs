@@ -3,9 +3,9 @@ use beholder_daemon_client::{address, state_dir};
 use beholder_dto::{Revisioned, SemanticQueryResult, WhyResult};
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
-    GetStatusRequest, GetStatusResponse, ImpactResponse, IndexRustWorkspaceRequest,
-    IndexRustWorkspaceResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
-    RegisterWorkspaceRequest, RegisterWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
+    GetStatusRequest, GetStatusResponse, ImpactResponse, ListWorkspacesRequest,
+    ListWorkspacesResponse, PathRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
+    ReindexWorkspaceRequest, ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
     WhyResponse,
     daemon_server::{Daemon, DaemonServer},
 };
@@ -165,7 +165,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 3,
+            protocol_version: 4,
             pid: std::process::id(),
         }))
     }
@@ -189,15 +189,15 @@ impl Daemon for BeholderDaemon {
     }
 
     #[tracing::instrument(
-        name = "rpc.index_rust_workspace",
+        name = "rpc.reindex_workspace",
         skip_all,
         err,
         fields(workspace = %request.get_ref().workspace)
     )]
-    async fn index_rust_workspace(
+    async fn reindex_workspace(
         &self,
-        request: Request<IndexRustWorkspaceRequest>,
-    ) -> Result<Response<IndexRustWorkspaceResponse>, Status> {
+        request: Request<ReindexWorkspaceRequest>,
+    ) -> Result<Response<ReindexWorkspaceResponse>, Status> {
         // ponytail: this blocks one Tokio worker; add a bounded job queue when indexing competes with RPC latency.
         let workspace_name = request.into_inner().workspace;
         let workspace = self
@@ -213,7 +213,7 @@ impl Daemon for BeholderDaemon {
             .scheduler
             .index(&self.store, &workspace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        Ok(Response::new(IndexRustWorkspaceResponse {
+        Ok(Response::new(ReindexWorkspaceResponse {
             observation_count: observation_count
                 .try_into()
                 .map_err(|_| Status::internal("observation count exceeds protocol capacity"))?,
@@ -405,8 +405,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        ClearCacheRequest, EntityRequest, GetStatusRequest, IndexRustWorkspaceRequest,
-        ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, StopRequest,
+        ClearCacheRequest, EntityRequest, GetStatusRequest, ListWorkspacesRequest, PathRequest,
+        RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
         daemon_client::DaemonClient,
     };
     use std::{env, fs, net::TcpListener, path::Path, time::Duration};
@@ -466,7 +466,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 3);
+        assert_eq!(status.protocol_version, 4);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");
@@ -520,7 +520,7 @@ mod tests {
         .await
         .expect("registered workspace was not indexed");
         let unchanged = client
-            .index_rust_workspace(IndexRustWorkspaceRequest {
+            .reindex_workspace(ReindexWorkspaceRequest {
                 workspace: "main".into(),
             })
             .await

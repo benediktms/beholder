@@ -1,9 +1,9 @@
 use beholder_domain::Workspace;
 use beholder_dto::{ContextResult, DependenciesResult, ImpactResult, TraceResult, WhyResult};
 use beholder_protocol::v1::{
-    ClearCacheRequest, EntityRequest, GetStatusRequest, GetStatusResponse,
-    IndexRustWorkspaceRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
-    StopRequest, daemon_client::DaemonClient,
+    ClearCacheRequest, EntityRequest, GetStatusRequest, GetStatusResponse, ListWorkspacesRequest,
+    PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
+    daemon_client::DaemonClient,
 };
 use std::path::{Path, PathBuf};
 
@@ -122,12 +122,12 @@ pub async fn why(
         .try_into()?)
 }
 
-pub async fn index_rust_workspace(
+pub async fn reindex_workspace(
     workspace: String,
 ) -> Result<(usize, bool), Box<dyn std::error::Error>> {
     let response = DaemonClient::connect(endpoint())
         .await?
-        .index_rust_workspace(IndexRustWorkspaceRequest { workspace })
+        .reindex_workspace(ReindexWorkspaceRequest { workspace })
         .await?
         .into_inner();
     Ok((response.observation_count.try_into()?, response.published))

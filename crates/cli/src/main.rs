@@ -3,8 +3,9 @@ use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{FRONTEND_VERSION, observations};
 use beholder_daemon_client::{
     clear_cache, context as daemon_context, dependencies as daemon_dependencies, get_status,
-    impact as daemon_impact, index_rust_workspace as daemon_index_workspace, list_workspaces,
-    register_workspace, state_dir, stop, trace as daemon_trace, why as daemon_why,
+    impact as daemon_impact, list_workspaces, register_workspace,
+    reindex_workspace as daemon_reindex_workspace, state_dir, stop, trace as daemon_trace,
+    why as daemon_why,
 };
 use beholder_domain::{RepositoryFacts, WorkspaceView};
 use beholder_presentation::{
@@ -77,7 +78,7 @@ enum Command {
         database: PathBuf,
     },
     /// Index a registered workspace as one coherent view.
-    IndexRustWorkspace {
+    ReindexWorkspace {
         /// Registered workspace name.
         workspace: String,
     },
@@ -451,8 +452,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(Command::IndexRust { source, database }) => {
             print_index_result(index_rust(&source, &database)?);
         }
-        Some(Command::IndexRustWorkspace { workspace }) => {
-            print_index_result(daemon_index_workspace(workspace).await?)
+        Some(Command::ReindexWorkspace { workspace }) => {
+            print_index_result(daemon_reindex_workspace(workspace).await?)
         }
         Some(Command::Workspace {
             command: WorkspaceCommand::Register { name, repositories },
@@ -620,11 +621,12 @@ mod tests {
             }) if repositories.len() == 2
         ));
         assert!(matches!(
-            Cli::try_parse_from(["beholder", "index-rust-workspace", "main"])
+            Cli::try_parse_from(["beholder", "reindex-workspace", "main"])
                 .unwrap()
                 .command,
-            Some(Command::IndexRustWorkspace { workspace }) if workspace == "main"
+            Some(Command::ReindexWorkspace { workspace }) if workspace == "main"
         ));
+        assert!(Cli::try_parse_from(["beholder", "index-rust-workspace", "main"]).is_err());
         assert!(Cli::try_parse_from(["beholder", "index-rust", "src/main.rs"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["beholder", "trace", "--json", "a", "b"])

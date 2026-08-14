@@ -8,7 +8,7 @@ service Daemon {
   rpc Dependencies(EntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc Impact(EntityRequest) returns (ImpactResponse);
-  rpc IndexRustWorkspace(IndexRustWorkspaceRequest) returns (IndexRustWorkspaceResponse);
+  rpc ReindexWorkspace(ReindexWorkspaceRequest) returns (ReindexWorkspaceResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
   rpc Stop(StopRequest) returns (StopResponse);
@@ -178,12 +178,12 @@ message WhyResponse {
   repeated SemanticPath paths = 6;
 }
 
-message IndexRustWorkspaceRequest {
+message ReindexWorkspaceRequest {
   reserved 1;
   string workspace = 2;
 }
 
-message IndexRustWorkspaceResponse {
+message ReindexWorkspaceResponse {
   uint64 observation_count = 1;
   bool published = 2;
 }
