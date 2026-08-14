@@ -1,5 +1,5 @@
 use crate::workspace_registry::WorkspaceRegistry;
-use beholder_adapters_git::{repository_identity, repository_state};
+use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
@@ -90,10 +90,10 @@ impl IndexScheduler {
             *generations.entry(workspace.name.clone()).or_default() += 1;
             if let Ok(mut dirty) = self.dirty_repositories.lock() {
                 dirty.entry(workspace.name.clone()).or_default().extend(
-                    workspace.repositories.iter().map(|root| {
-                        repository_identity(root)
-                            .unwrap_or_else(|_| root.to_string_lossy().into_owned())
-                    }),
+                    workspace
+                        .repositories
+                        .iter()
+                        .map(|repository| repository.repository.identity.clone()),
                 );
             }
             self.changed.notify_one();
@@ -228,9 +228,9 @@ impl IndexScheduler {
             let dirty = workspace
                 .repositories
                 .iter()
-                .filter(|root| {
+                .filter(|repository| {
                     event.paths.iter().any(|path| {
-                        path.strip_prefix(root).is_ok_and(|relative| {
+                        path.strip_prefix(&repository.base).is_ok_and(|relative| {
                             relative
                                 .extension()
                                 .is_some_and(|extension| extension == "rs")
@@ -243,10 +243,7 @@ impl IndexScheduler {
                         })
                     })
                 })
-                .map(|root| {
-                    repository_identity(root)
-                        .unwrap_or_else(|_| root.to_string_lossy().into_owned())
-                })
+                .map(|repository| repository.repository.identity.clone())
                 .collect::<Vec<_>>();
             if !dirty.is_empty() {
                 tracing::debug!(workspace = %workspace.name, repositories = ?dirty, "workspace marked stale");
@@ -517,7 +514,7 @@ fn index_rust_workspace_versioned(
     let repositories = workspace
         .repositories
         .iter()
-        .map(|root| rust_repository_sources(root))
+        .map(|repository| rust_repository_sources(&repository.base))
         .collect::<Result<Vec<_>, _>>()?;
     let view = WorkspaceView::new(
         &workspace.name,
@@ -578,8 +575,23 @@ fn index_rust_workspace_versioned(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::LogicalRepository;
+    use beholder_domain::{LogicalRepository, WorkspaceRepository};
     use std::time::SystemTime;
+
+    fn test_workspace(name: &str, base: PathBuf) -> Workspace {
+        Workspace::new(
+            name,
+            vec![WorkspaceRepository {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                display_name: "repo".into(),
+                base,
+                alternatives: Vec::new(),
+            }],
+        )
+        .unwrap()
+    }
 
     #[test]
     fn frontend_cache_reuses_content_and_invalidates_versions() {
@@ -738,7 +750,7 @@ mod tests {
         fs::create_dir_all(repository.join("src")).unwrap();
         fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
         let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
-        let workspace = Workspace::new("main", vec![repository]).unwrap();
+        let workspace = test_workspace("main", repository);
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
 
         assert!(
@@ -774,8 +786,8 @@ mod tests {
         let repository = state.join("repo");
         fs::create_dir_all(repository.join("src")).unwrap();
         fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
-        let workspace = Workspace::new("main", vec![repository.clone()]).unwrap();
-        let other = Workspace::new("other", vec![repository]).unwrap();
+        let workspace = test_workspace("main", repository.clone());
+        let other = test_workspace("other", repository);
         let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
 
@@ -822,6 +834,9 @@ mod tests {
         let store = Arc::new(SemanticStore::persistent(&state.join("beholder.db"), true).unwrap());
         let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
         let workspace = registry.register("main".into(), vec![repository]).unwrap();
+        let identity = &workspace.repositories[0].repository.identity;
+        let caller = format!("repo://{identity}/rust/lib/caller");
+        let after = format!("repo://{identity}/rust/lib/after");
         let registry = Arc::new(Mutex::new(registry));
         let scheduler = Arc::new(IndexScheduler::new(state.join("frontend-cache")));
         scheduler.index(&store, &workspace).unwrap();
@@ -834,14 +849,7 @@ mod tests {
         ));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if format!(
-                    "{:?}",
-                    store
-                        .context("main", "repo://repo/rust/lib/caller")
-                        .unwrap()
-                )
-                .contains("repo://repo/rust/lib/after")
-                {
+                if format!("{:?}", store.context("main", &caller).unwrap()).contains(&after) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

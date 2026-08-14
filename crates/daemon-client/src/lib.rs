@@ -137,13 +137,16 @@ pub async fn register_workspace(
     name: String,
     repositories: &[PathBuf],
 ) -> Result<Workspace, Box<dyn std::error::Error>> {
-    let repositories = repositories
+    let repository_paths = repositories
         .iter()
         .map(|path| path_string(path))
         .collect::<Result<_, _>>()?;
     let workspace = DaemonClient::connect(endpoint())
         .await?
-        .register_workspace(RegisterWorkspaceRequest { name, repositories })
+        .register_workspace(RegisterWorkspaceRequest {
+            name,
+            repository_paths,
+        })
         .await?
         .into_inner()
         .workspace

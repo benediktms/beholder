@@ -212,11 +212,14 @@ pub struct FactChanges {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
     pub name: String,
-    pub repositories: Vec<PathBuf>,
+    pub repositories: Vec<WorkspaceRepository>,
 }
 
 impl Workspace {
-    pub fn new(name: impl Into<String>, mut repositories: Vec<PathBuf>) -> Result<Self, String> {
+    pub fn new(
+        name: impl Into<String>,
+        repositories: Vec<WorkspaceRepository>,
+    ) -> Result<Self, String> {
         let name = name.into();
         if name.trim().is_empty() {
             return Err("workspace name must not be empty".into());
@@ -224,10 +227,45 @@ impl Workspace {
         if repositories.is_empty() {
             return Err("workspace must contain a repository".into());
         }
-        repositories.sort();
-        repositories.dedup();
+        let mut merged = std::collections::BTreeMap::<String, WorkspaceRepository>::new();
+        for repository in repositories {
+            if repository.repository.identity.trim().is_empty() {
+                return Err("repository identity must not be empty".into());
+            }
+            if repository.display_name.trim().is_empty() {
+                return Err("repository display name must not be empty".into());
+            }
+            match merged.get_mut(&repository.repository.identity) {
+                Some(existing) => {
+                    existing.alternatives.push(repository.base);
+                    existing.alternatives.extend(repository.alternatives);
+                }
+                None => {
+                    merged.insert(repository.repository.identity.clone(), repository);
+                }
+            }
+        }
+        let repositories = merged
+            .into_values()
+            .map(|mut repository| {
+                repository.alternatives.sort();
+                repository.alternatives.dedup();
+                repository
+                    .alternatives
+                    .retain(|path| path != &repository.base);
+                repository
+            })
+            .collect();
         Ok(Self { name, repositories })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRepository {
+    pub repository: LogicalRepository,
+    pub display_name: String,
+    pub base: PathBuf,
+    pub alternatives: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,13 +374,23 @@ mod tests {
 
     #[test]
     fn workspace_smoke() {
-        assert!(Workspace::new("", vec!["repo".into()]).is_err());
+        let repository = |base: &str| WorkspaceRepository {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            display_name: "repo".into(),
+            base: base.into(),
+            alternatives: Vec::new(),
+        };
+        assert!(Workspace::new("", vec![repository("repo")]).is_err());
         assert!(Workspace::new("main", Vec::new()).is_err());
+        let workspace =
+            Workspace::new("main", vec![repository("base"), repository("alternative")]).unwrap();
+        assert_eq!(workspace.repositories.len(), 1);
+        assert_eq!(workspace.repositories[0].base, PathBuf::from("base"));
         assert_eq!(
-            Workspace::new("main", vec!["repo".into(), "repo".into()])
-                .unwrap()
-                .repositories,
-            vec![PathBuf::from("repo")]
+            workspace.repositories[0].alternatives,
+            vec![PathBuf::from("alternative")]
         );
 
         let state = RepositoryState {

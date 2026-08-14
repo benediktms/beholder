@@ -190,12 +190,19 @@ message IndexRustWorkspaceResponse {
 
 message Workspace {
   string name = 1;
-  repeated string repositories = 2;
+  repeated WorkspaceRepository repositories = 2;
+}
+
+message WorkspaceRepository {
+  string identity = 1;
+  string display_name = 2;
+  string base = 3;
+  repeated string alternatives = 4;
 }
 
 message RegisterWorkspaceRequest {
   string name = 1;
-  repeated string repositories = 2;
+  repeated string repository_paths = 2;
 }
 
 message RegisterWorkspaceResponse {

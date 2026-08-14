@@ -79,7 +79,7 @@ fn watch_workspace(
     workspace: &beholder_domain::Workspace,
 ) -> notify::Result<()> {
     for repository in &workspace.repositories {
-        watcher.watch(repository, RecursiveMode::Recursive)?;
+        watcher.watch(&repository.base, RecursiveMode::Recursive)?;
     }
     Ok(())
 }
@@ -92,8 +92,13 @@ fn update_workspace_watch(
     let previous = previous
         .into_iter()
         .flat_map(|workspace| &workspace.repositories)
+        .map(|repository| &repository.base)
         .collect::<BTreeSet<_>>();
-    let current = workspace.repositories.iter().collect::<BTreeSet<_>>();
+    let current = workspace
+        .repositories
+        .iter()
+        .map(|repository| &repository.base)
+        .collect::<BTreeSet<_>>();
     for repository in previous.difference(&current) {
         watcher.unwatch(repository)?;
     }
@@ -160,7 +165,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 2,
+            protocol_version: 3,
             pid: std::process::id(),
         }))
     }
@@ -236,7 +241,7 @@ impl Daemon for BeholderDaemon {
         name = "rpc.register_workspace",
         skip_all,
         err,
-        fields(workspace = %request.get_ref().name, repositories = request.get_ref().repositories.len())
+        fields(workspace = %request.get_ref().name, repositories = request.get_ref().repository_paths.len())
     )]
     async fn register_workspace(
         &self,
@@ -253,7 +258,7 @@ impl Daemon for BeholderDaemon {
                 .register(
                     request.name,
                     request
-                        .repositories
+                        .repository_paths
                         .into_iter()
                         .map(PathBuf::from)
                         .collect(),
@@ -461,7 +466,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 2);
+        assert_eq!(status.protocol_version, 3);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");
@@ -470,13 +475,15 @@ mod tests {
         fs::create_dir_all(second.join("src")).unwrap();
         fs::write(first.join("src/lib.rs"), "fn caller() { helper(); }").unwrap();
         fs::write(second.join("src/lib.rs"), "fn helper() {}").unwrap();
-        let caller = "repo://repo-a/rust/lib/caller";
-        let helper = "repo://repo-b/rust/lib/helper";
+        let first_identity = beholder_adapters_git::repository_identity(&first).unwrap();
+        let second_identity = beholder_adapters_git::repository_identity(&second).unwrap();
+        let caller = format!("repo://{first_identity}/rust/lib/caller");
+        let helper = format!("repo://{second_identity}/rust/lib/helper");
         let repository = |path: &Path| path.to_str().unwrap().to_owned();
         let registered = client
             .register_workspace(RegisterWorkspaceRequest {
                 name: "main".into(),
-                repositories: vec![repository(&first), repository(&second)],
+                repository_paths: vec![repository(&first), repository(&second)],
             })
             .await
             .unwrap()
@@ -499,12 +506,12 @@ mod tests {
                 let context = client
                     .context(EntityRequest {
                         workspace: "main".into(),
-                        entity: caller.into(),
+                        entity: caller.clone(),
                     })
                     .await
                     .unwrap()
                     .into_inner();
-                if format!("{context:?}").contains(helper) {
+                if format!("{context:?}").contains(&helper) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -524,7 +531,7 @@ mod tests {
         let metadata = client
             .context(EntityRequest {
                 workspace: "main".into(),
-                entity: caller.into(),
+                entity: caller.clone(),
             })
             .await
             .unwrap()
@@ -546,16 +553,19 @@ mod tests {
         client
             .register_workspace(RegisterWorkspaceRequest {
                 name: "secondary".into(),
-                repositories: vec![repository(&third)],
+                repository_paths: vec![repository(&third)],
             })
             .await
             .unwrap();
-        let isolated = "repo://repo-c/rust/lib/isolated";
+        let isolated = format!(
+            "repo://{}/rust/lib/isolated",
+            beholder_adapters_git::repository_identity(&third).unwrap()
+        );
         assert!(
             client
                 .context(EntityRequest {
                     workspace: "main".into(),
-                    entity: isolated.into(),
+                    entity: isolated.clone(),
                 })
                 .await
                 .unwrap()
@@ -568,7 +578,7 @@ mod tests {
                 if !client
                     .context(EntityRequest {
                         workspace: "secondary".into(),
-                        entity: isolated.into(),
+                        entity: isolated.clone(),
                     })
                     .await
                     .unwrap()
@@ -589,19 +599,19 @@ mod tests {
                 client
                     .context(EntityRequest {
                         workspace: "main".into(),
-                        entity: caller.into()
+                        entity: caller.clone()
                     })
                     .await
                     .unwrap()
                     .into_inner()
             )
-            .contains(helper)
+            .contains(&helper)
         );
         assert!(
             !client
                 .dependencies(EntityRequest {
                     workspace: "main".into(),
-                    entity: caller.into()
+                    entity: caller.clone()
                 })
                 .await
                 .unwrap()
@@ -615,18 +625,18 @@ mod tests {
                 client
                     .impact(EntityRequest {
                         workspace: "main".into(),
-                        entity: helper.into()
+                        entity: helper.clone()
                     })
                     .await
                     .unwrap()
                     .into_inner()
             )
-            .contains(caller)
+            .contains(&caller)
         );
         let path = || PathRequest {
             workspace: "main".into(),
-            from: caller.into(),
-            to: helper.into(),
+            from: caller.clone(),
+            to: helper.clone(),
         };
         assert!(
             !client
@@ -654,12 +664,14 @@ mod tests {
                 let context = client
                     .context(EntityRequest {
                         workspace: "main".into(),
-                        entity: caller.into(),
+                        entity: caller.clone(),
                     })
                     .await
                     .unwrap()
                     .into_inner();
-                if format!("{context:?}").contains("repo://repo-b/rust/lib/replacement") {
+                if format!("{context:?}")
+                    .contains(&format!("repo://{}/rust/lib/replacement", second_identity))
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -686,13 +698,8 @@ mod tests {
             row[0].as_str() == Some("main") && row[1].as_i64().is_some_and(|revision| revision >= 2)
         }));
         assert!(
-            format!(
-                "{:?}",
-                indexed
-                    .context("main", "repo://repo-a/rust/lib/caller")
-                    .unwrap()
-            )
-            .contains("repo://repo-b/rust/lib/replacement")
+            format!("{:?}", indexed.context("main", &caller).unwrap())
+                .contains(&format!("repo://{}/rust/lib/replacement", second_identity))
         );
         drop(indexed);
         drop(lock);

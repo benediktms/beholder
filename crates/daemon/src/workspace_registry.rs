@@ -1,4 +1,5 @@
-use beholder_domain::Workspace;
+use beholder_adapters_git::workspace_repository;
+use beholder_domain::{LogicalRepository, Workspace, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -10,7 +11,19 @@ use std::{
 #[derive(Deserialize, Serialize)]
 struct StoredWorkspace {
     name: String,
-    repositories: Vec<PathBuf>,
+    repositories: Vec<StoredRepository>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum StoredRepository {
+    Path(PathBuf),
+    Registered {
+        identity: String,
+        display_name: String,
+        base: PathBuf,
+        alternatives: Vec<PathBuf>,
+    },
 }
 
 pub struct WorkspaceRegistry {
@@ -24,7 +37,27 @@ impl WorkspaceRegistry {
             serde_json::from_reader::<_, Vec<StoredWorkspace>>(File::open(&path)?)?
                 .into_iter()
                 .map(|stored| {
-                    Workspace::new(stored.name, stored.repositories)
+                    let repositories = stored
+                        .repositories
+                        .into_iter()
+                        .map(|repository| match repository {
+                            StoredRepository::Path(path) => {
+                                workspace_repository(&path).map_err(|error| error.to_string())
+                            }
+                            StoredRepository::Registered {
+                                identity,
+                                display_name,
+                                base,
+                                alternatives,
+                            } => Ok(WorkspaceRepository {
+                                repository: LogicalRepository { identity },
+                                display_name,
+                                base,
+                                alternatives,
+                            }),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Workspace::new(stored.name, repositories)
                         .map(|workspace| (workspace.name.clone(), workspace))
                 })
                 .collect::<Result<_, _>>()?
@@ -50,7 +83,7 @@ impl WorkspaceRegistry {
                 if path.to_str().is_none() {
                     return Err(format!("repository path is not UTF-8: {}", path.display()));
                 }
-                Ok(path)
+                workspace_repository(&path).map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, String>>()?;
         let workspace = Workspace::new(name, repositories)?;
@@ -78,7 +111,16 @@ impl WorkspaceRegistry {
                 .values()
                 .map(|workspace| StoredWorkspace {
                     name: workspace.name.clone(),
-                    repositories: workspace.repositories.clone(),
+                    repositories: workspace
+                        .repositories
+                        .iter()
+                        .map(|repository| StoredRepository::Registered {
+                            identity: repository.repository.identity.clone(),
+                            display_name: repository.display_name.clone(),
+                            base: repository.base.clone(),
+                            alternatives: repository.alternatives.clone(),
+                        })
+                        .collect(),
                 })
                 .collect::<Vec<_>>(),
         )?;

@@ -1,4 +1,6 @@
-use beholder_domain::{GitClone, GitTopology, LogicalRepository, RepositoryState, WorkingTree};
+use beholder_domain::{
+    GitClone, GitTopology, LogicalRepository, RepositoryState, WorkingTree, WorkspaceRepository,
+};
 use gix::bstr::ByteSlice;
 use sha2::{Digest, Sha256};
 use std::{error::Error, path::Path, process::Command};
@@ -19,15 +21,12 @@ fn canonical_url(remote: &gix::Url) -> Option<String> {
 
 pub fn repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
     match gix::discover(root) {
-        Ok(repository) => repository_identity_from(&repository, root),
+        Ok(repository) => repository_identity_from(&repository),
         Err(_) => local_repository_identity(root),
     }
 }
 
-fn repository_identity_from(
-    repository: &gix::Repository,
-    root: &Path,
-) -> Result<String, Box<dyn Error>> {
+fn repository_identity_from(repository: &gix::Repository) -> Result<String, Box<dyn Error>> {
     let remote_name = repository.remote_default_name(gix::remote::Direction::Fetch);
     let identity = remote_name
         .and_then(|name| repository.find_remote(name).ok())
@@ -36,16 +35,63 @@ fn repository_identity_from(
     if let Some(identity) = identity {
         return Ok(identity);
     }
-    local_repository_identity(root)
+    local_identity(&repository.common_dir().canonicalize()?)
 }
 
 fn local_repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
-    // ponytail: directory name is the local-only fallback; canonical Git remotes come with registration.
-    root.canonicalize()?
-        .file_name()
+    local_identity(&root.canonicalize()?)
+}
+
+fn local_identity(anchor: &Path) -> Result<String, Box<dyn Error>> {
+    let anchor = anchor
+        .to_str()
+        .ok_or_else(|| format!("repository path is not UTF-8: {}", anchor.display()))?;
+    Ok(format!("local://{:x}", Sha256::digest(anchor.as_bytes())))
+}
+
+fn display_name(root: &Path) -> Result<String, Box<dyn Error>> {
+    root.file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .ok_or_else(|| format!("cannot derive repository identity from {}", root.display()).into())
+}
+
+pub fn workspace_repository(root: &Path) -> Result<WorkspaceRepository, Box<dyn Error>> {
+    let root = root.canonicalize()?;
+    match gix::discover(&root) {
+        Ok(repository) => {
+            let topology = topology_from(repository, &root)?;
+            let base = topology
+                .working_trees
+                .iter()
+                .filter(|worktree| root.starts_with(&worktree.path))
+                .max_by_key(|worktree| worktree.path.components().count())
+                .ok_or_else(|| {
+                    format!("{} is not inside a discovered working tree", root.display())
+                })?
+                .path
+                .clone();
+            Ok(WorkspaceRepository {
+                repository: topology.repository,
+                display_name: display_name(&base)?,
+                alternatives: topology
+                    .working_trees
+                    .into_iter()
+                    .map(|worktree| worktree.path)
+                    .filter(|path| path != &base)
+                    .collect(),
+                base,
+            })
+        }
+        Err(_) => Ok(WorkspaceRepository {
+            repository: LogicalRepository {
+                identity: local_repository_identity(&root)?,
+            },
+            display_name: display_name(&root)?,
+            base: root,
+            alternatives: Vec::new(),
+        }),
+    }
 }
 
 pub fn repository_state(
@@ -124,7 +170,7 @@ fn topology_from(repository: gix::Repository, root: &Path) -> Result<GitTopology
 
     Ok(GitTopology {
         repository: LogicalRepository {
-            identity: repository_identity_from(&repository, root)?,
+            identity: repository_identity_from(&repository)?,
         },
         clone: GitClone { common_directory },
         working_trees,
@@ -359,6 +405,60 @@ mod tests {
         let topology = discover_topology(&main)?;
         assert_eq!(topology.working_trees.len(), 1);
         assert_eq!(topology.working_trees[0].path, main.canonicalize()?);
+
+        let clone = fixture.0.join("clone");
+        required_output(
+            &main,
+            &[
+                "clone",
+                main.to_str().ok_or("non-UTF-8 fixture path")?,
+                clone.to_str().ok_or("non-UTF-8 fixture path")?,
+            ],
+        )?;
+        required_output(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:company/payments.git",
+            ],
+        )?;
+        let workspace = beholder_domain::Workspace::new(
+            "main",
+            vec![workspace_repository(&main)?, workspace_repository(&clone)?],
+        )?;
+        assert_eq!(workspace.repositories.len(), 1);
+        assert_eq!(workspace.repositories[0].base, main.canonicalize()?);
+        assert!(
+            workspace.repositories[0]
+                .alternatives
+                .contains(&clone.canonicalize()?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_named_local_repositories_have_distinct_identities() -> Result<(), Box<dyn Error>> {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let fixture = TestDirectory(std::env::temp_dir().join(format!(
+            "beholder-local-identity-{}-{unique}",
+            std::process::id()
+        )));
+        let first = fixture.0.join("one/backend");
+        let second = fixture.0.join("two/backend");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+
+        let first = workspace_repository(&first)?;
+        let second = workspace_repository(&second)?;
+        assert_ne!(first.repository, second.repository);
+        assert!(first.repository.identity.starts_with("local://"));
+        assert!(second.repository.identity.starts_with("local://"));
+        assert_eq!(first.display_name, "backend");
+        assert_eq!(second.display_name, "backend");
         Ok(())
     }
 }

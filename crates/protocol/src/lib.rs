@@ -2,7 +2,9 @@ pub mod v1 {
     tonic::include_proto!("beholder.v1");
 }
 
-use beholder_domain::Workspace as DomainWorkspace;
+use beholder_domain::{
+    LogicalRepository, Workspace as DomainWorkspace, WorkspaceRepository as DomainRepository,
+};
 use beholder_dto as dto;
 use std::path::PathBuf;
 
@@ -13,7 +15,16 @@ impl From<DomainWorkspace> for v1::Workspace {
             repositories: workspace
                 .repositories
                 .into_iter()
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(|repository| v1::WorkspaceRepository {
+                    identity: repository.repository.identity,
+                    display_name: repository.display_name,
+                    base: repository.base.to_string_lossy().into_owned(),
+                    alternatives: repository
+                        .alternatives
+                        .into_iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect(),
+                })
                 .collect(),
         }
     }
@@ -28,7 +39,18 @@ impl TryFrom<v1::Workspace> for DomainWorkspace {
             workspace
                 .repositories
                 .into_iter()
-                .map(PathBuf::from)
+                .map(|repository| DomainRepository {
+                    repository: LogicalRepository {
+                        identity: repository.identity,
+                    },
+                    display_name: repository.display_name,
+                    base: PathBuf::from(repository.base),
+                    alternatives: repository
+                        .alternatives
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .collect(),
+                })
                 .collect(),
         )
     }
@@ -513,6 +535,28 @@ impl TryFrom<v1::WhyResponse> for dto::WhyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_round_trips_logical_repository_selection() {
+        let workspace = DomainWorkspace::new(
+            "main",
+            vec![DomainRepository {
+                repository: LogicalRepository {
+                    identity: "github.com/company/repo".into(),
+                },
+                display_name: "repo".into(),
+                base: "/code/repo".into(),
+                alternatives: vec!["/code/repo-agent".into()],
+            }],
+        )
+        .unwrap();
+
+        let protocol = v1::Workspace::from(workspace.clone());
+        assert_eq!(protocol.repositories[0].identity, "github.com/company/repo");
+        assert_eq!(protocol.repositories[0].base, "/code/repo");
+        assert_eq!(protocol.repositories[0].alternatives, ["/code/repo-agent"]);
+        assert_eq!(DomainWorkspace::try_from(protocol).unwrap(), workspace);
+    }
 
     #[test]
     fn typed_trace_round_trips_without_generic_rows() {
