@@ -47,6 +47,7 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dy
         }],
         &[],
     )?;
+    store.checkpoint()?;
     Ok((observations.len(), true))
 }
 
