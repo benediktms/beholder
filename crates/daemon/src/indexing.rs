@@ -6,7 +6,7 @@ use beholder_adapters_treesitter_rust::{
     resolve_repository_calls, source_files,
 };
 use beholder_domain::{Observation, RepositoryState, Workspace, WorkspaceView};
-use beholder_dto::QueryMetadata;
+use beholder_dto::{Freshness, QueryMetadata};
 use notify::{Event, EventKind};
 use sha2::{Digest, Sha256};
 use std::{
@@ -118,10 +118,13 @@ impl IndexScheduler {
             .lock()
             .is_ok_and(|active| active.as_deref() == Some(workspace));
         QueryMetadata {
-            analysis_revision,
-            stale,
-            indexing,
-            dirty_repositories,
+            revision: analysis_revision,
+            view: workspace.into(),
+            freshness: Freshness {
+                stale,
+                indexing,
+                dirty_repositories,
+            },
         }
     }
 
@@ -767,27 +770,27 @@ mod tests {
         scheduler.mark(&workspace);
         scheduler.mark(&other);
         let pending = scheduler.query_metadata("main", 4);
-        assert_eq!(pending.analysis_revision, 4);
-        assert!(pending.stale);
-        assert!(!pending.indexing);
-        assert_eq!(pending.dirty_repositories, ["repo"]);
+        assert_eq!(pending.revision, 4);
+        assert!(pending.freshness.stale);
+        assert!(!pending.freshness.indexing);
+        assert_eq!(pending.freshness.dirty_repositories, ["repo"]);
 
         *scheduler.active_workspace.lock().unwrap() = Some("main".into());
-        assert!(scheduler.query_metadata("main", 4).indexing);
-        assert!(!scheduler.query_metadata("other", 4).indexing);
+        assert!(scheduler.query_metadata("main", 4).freshness.indexing);
+        assert!(!scheduler.query_metadata("other", 4).freshness.indexing);
         *scheduler.active_workspace.lock().unwrap() = None;
 
         let indexed_generation = scheduler.generations.lock().unwrap()["main"];
         scheduler.mark(&workspace);
         scheduler.complete_generation("main", Some(indexed_generation));
-        assert!(scheduler.query_metadata("main", 4).stale);
+        assert!(scheduler.query_metadata("main", 4).freshness.stale);
 
         scheduler.index(&store, &workspace).unwrap();
         let current = scheduler.query_metadata("main", 5);
-        assert!(!current.stale);
-        assert!(!current.indexing);
-        assert!(current.dirty_repositories.is_empty());
-        assert!(scheduler.query_metadata("other", 4).stale);
+        assert!(!current.freshness.stale);
+        assert!(!current.freshness.indexing);
+        assert!(current.freshness.dirty_repositories.is_empty());
+        assert!(scheduler.query_metadata("other", 4).freshness.stale);
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

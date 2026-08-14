@@ -6,6 +6,7 @@ members = [
     "crates/daemon",
     "crates/daemon-client",
     "crates/protocol",
+    "crates/presentation",
     "crates/adapters-mnestic",
     "crates/adapters-git",
     "crates/adapters-treesitter-rust",

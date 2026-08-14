@@ -4,16 +4,16 @@ package beholder.v1;
 
 service Daemon {
   rpc ClearCache(ClearCacheRequest) returns (ClearCacheResponse);
-  rpc Context(EntityRequest) returns (QueryResult);
-  rpc Dependencies(EntityRequest) returns (QueryResult);
+  rpc Context(EntityRequest) returns (ContextResponse);
+  rpc Dependencies(EntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
-  rpc Impact(EntityRequest) returns (QueryResult);
+  rpc Impact(EntityRequest) returns (ImpactResponse);
   rpc IndexRustWorkspace(IndexRustWorkspaceRequest) returns (IndexRustWorkspaceResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
   rpc Stop(StopRequest) returns (StopResponse);
-  rpc Trace(PathRequest) returns (QueryResult);
-  rpc Why(PathRequest) returns (QueryResult);
+  rpc Trace(PathRequest) returns (TraceResponse);
+  rpc Why(PathRequest) returns (WhyResponse);
 }
 
 message ClearCacheRequest {}
@@ -31,39 +31,150 @@ message PathRequest {
   string workspace = 3;
 }
 
-message QueryResult {
-  repeated string headers = 1;
-  repeated QueryRow rows = 2;
-  optional QueryResult next = 3;
-  optional QueryMetadata metadata = 4;
-}
-
 message QueryMetadata {
-  uint64 analysis_revision = 1;
-  bool stale = 2;
-  bool indexing = 3;
-  repeated string dirty_repositories = 4;
+  uint64 revision = 1;
+  string view = 2;
+  Freshness freshness = 3;
 }
 
-message QueryRow {
-  repeated QueryValue values = 1;
+message Freshness {
+  bool stale = 1;
+  bool indexing = 2;
+  repeated string dirty_repositories = 3;
 }
 
-message QueryValue {
-  oneof value {
-    bool null = 1;
-    bool boolean = 2;
-    sint64 integer = 3;
-    double float = 4;
-    string text = 5;
-    bytes bytes = 6;
-    QueryList list = 7;
-    string other = 8;
-  }
+enum EntityKind {
+  ENTITY_KIND_UNKNOWN = 0;
+  ENTITY_KIND_CALLABLE = 1;
+  ENTITY_KIND_GRAPHQL_FIELD = 2;
+  ENTITY_KIND_KAFKA_TOPIC = 3;
+  ENTITY_KIND_NAMESPACE = 4;
+  ENTITY_KIND_RPC = 5;
+  ENTITY_KIND_SERVICE = 6;
 }
 
-message QueryList {
-  repeated QueryValue values = 1;
+enum EntityOrigin {
+  ENTITY_ORIGIN_SOURCE = 0;
+  ENTITY_ORIGIN_GENERATED = 1;
+  ENTITY_ORIGIN_EXTERNAL_DEPENDENCY = 2;
+}
+
+enum EvidenceKind {
+  EVIDENCE_KIND_UNKNOWN = 0;
+  EVIDENCE_KIND_AST = 1;
+  EVIDENCE_KIND_CONFIGURATION = 2;
+  EVIDENCE_KIND_DESCRIPTOR = 3;
+  EVIDENCE_KIND_GENERATED = 4;
+}
+
+enum RelationKind {
+  RELATION_KIND_UNKNOWN = 0;
+  RELATION_KIND_CALLS = 1;
+  RELATION_KIND_CALLS_RPC = 2;
+  RELATION_KIND_CONSUMED_BY = 3;
+  RELATION_KIND_DEFINES = 4;
+  RELATION_KIND_IMPLEMENTED_BY = 5;
+  RELATION_KIND_PUBLISHES = 6;
+  RELATION_KIND_RESOLVED_BY = 7;
+  RELATION_KIND_SELECTS = 8;
+  RELATION_KIND_USES = 9;
+}
+
+message Entity {
+  string id = 1;
+  EntityKind kind = 2;
+  string name = 3;
+  optional string repository = 4;
+  EntityOrigin origin = 5;
+  bool test = 6;
+}
+
+message Evidence {
+  EvidenceKind source = 1;
+  optional string repository = 2;
+  optional string path = 3;
+  optional uint32 line = 4;
+  optional string detail = 5;
+}
+
+message Edge {
+  string id = 1;
+  string from = 2;
+  string to = 3;
+  RelationKind kind = 4;
+  float confidence = 5;
+  repeated Evidence evidence = 6;
+}
+
+message SemanticPath {
+  repeated string nodes = 1;
+  repeated string edges = 2;
+}
+
+message EntityQuery {
+  string entity = 1;
+}
+
+message SemanticPathQuery {
+  string from = 1;
+  string to = 2;
+}
+
+message ContextResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  EntityQuery query = 3;
+  Entity root = 4;
+  repeated Entity nodes = 5;
+  repeated Edge edges = 6;
+}
+
+message Dependency {
+  string entity = 1;
+  uint32 hops = 2;
+}
+
+message DependenciesResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  EntityQuery query = 3;
+  Entity root = 4;
+  repeated Dependency dependencies = 5;
+  repeated Entity nodes = 6;
+  repeated Edge edges = 7;
+}
+
+message Impact {
+  string entity = 1;
+  uint32 hops = 2;
+}
+
+message ImpactResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  EntityQuery query = 3;
+  Entity root = 4;
+  repeated Impact affected = 5;
+  repeated Entity nodes = 6;
+  repeated Edge edges = 7;
+}
+
+message TraceResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  SemanticPathQuery query = 3;
+  repeated Entity nodes = 4;
+  repeated Edge edges = 5;
+  repeated SemanticPath paths = 6;
+}
+
+message WhyResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  SemanticPathQuery query = 3;
+  repeated Entity nodes = 4;
+  repeated Edge edges = 5;
+  repeated SemanticPath paths = 6;
 }
 
 message IndexRustWorkspaceRequest {

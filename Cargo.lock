@@ -281,6 +281,7 @@ dependencies = [
  "beholder-daemon-client",
  "beholder-domain",
  "beholder-dto",
+ "beholder-presentation",
  "clap",
  "tokio",
 ]
@@ -327,6 +328,18 @@ dependencies = [
 [[package]]
 name = "beholder-dto"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "beholder-presentation"
+version = "0.1.0"
+dependencies = [
+ "beholder-dto",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "beholder-protocol"

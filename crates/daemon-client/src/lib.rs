@@ -1,5 +1,5 @@
 use beholder_domain::Workspace;
-use beholder_dto::QueryResult;
+use beholder_dto::{ContextResult, DependenciesResult, ImpactResult, TraceResult, WhyResult};
 use beholder_protocol::v1::{
     ClearCacheRequest, EntityRequest, GetStatusRequest, GetStatusResponse,
     IndexRustWorkspaceRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
@@ -55,7 +55,7 @@ pub async fn clear_cache() -> Result<(), Box<dyn std::error::Error>> {
 pub async fn context(
     workspace: String,
     entity: String,
-) -> Result<QueryResult, Box<dyn std::error::Error>> {
+) -> Result<ContextResult, Box<dyn std::error::Error>> {
     Ok(DaemonClient::connect(endpoint())
         .await?
         .context(EntityRequest { workspace, entity })
@@ -67,7 +67,7 @@ pub async fn context(
 pub async fn dependencies(
     workspace: String,
     entity: String,
-) -> Result<QueryResult, Box<dyn std::error::Error>> {
+) -> Result<DependenciesResult, Box<dyn std::error::Error>> {
     Ok(DaemonClient::connect(endpoint())
         .await?
         .dependencies(EntityRequest { workspace, entity })
@@ -79,7 +79,7 @@ pub async fn dependencies(
 pub async fn impact(
     workspace: String,
     entity: String,
-) -> Result<QueryResult, Box<dyn std::error::Error>> {
+) -> Result<ImpactResult, Box<dyn std::error::Error>> {
     Ok(DaemonClient::connect(endpoint())
         .await?
         .impact(EntityRequest { workspace, entity })
@@ -92,7 +92,7 @@ pub async fn trace(
     workspace: String,
     from: String,
     to: String,
-) -> Result<QueryResult, Box<dyn std::error::Error>> {
+) -> Result<TraceResult, Box<dyn std::error::Error>> {
     Ok(DaemonClient::connect(endpoint())
         .await?
         .trace(PathRequest {
@@ -109,7 +109,7 @@ pub async fn why(
     workspace: String,
     from: String,
     to: String,
-) -> Result<QueryResult, Box<dyn std::error::Error>> {
+) -> Result<WhyResult, Box<dyn std::error::Error>> {
     Ok(DaemonClient::connect(endpoint())
         .await?
         .why(PathRequest {

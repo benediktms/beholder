@@ -3,11 +3,8 @@ pub mod v1 {
 }
 
 use beholder_domain::Workspace as DomainWorkspace;
-use beholder_dto::{
-    QueryMetadata as DtoMetadata, QueryResult as DtoResult, QueryValue as DtoValue,
-};
+use beholder_dto as dto;
 use std::path::PathBuf;
-use v1::{QueryList, QueryResult, QueryRow, QueryValue, query_value};
 
 impl From<DomainWorkspace> for v1::Workspace {
     fn from(workspace: DomainWorkspace) -> Self {
@@ -37,105 +34,477 @@ impl TryFrom<v1::Workspace> for DomainWorkspace {
     }
 }
 
-impl From<DtoResult> for QueryResult {
-    fn from(result: DtoResult) -> Self {
+impl From<dto::Freshness> for v1::Freshness {
+    fn from(value: dto::Freshness) -> Self {
         Self {
-            headers: result.headers,
-            rows: result
-                .rows
-                .into_iter()
-                .map(|values| QueryRow {
-                    values: values.into_iter().map(Into::into).collect(),
-                })
-                .collect(),
-            next: result.next.map(|next| Box::new((*next).into())),
-            metadata: result.metadata.map(Into::into),
+            stale: value.stale,
+            indexing: value.indexing,
+            dirty_repositories: value.dirty_repositories,
         }
     }
 }
 
-impl TryFrom<QueryResult> for DtoResult {
+impl From<v1::Freshness> for dto::Freshness {
+    fn from(value: v1::Freshness) -> Self {
+        Self {
+            stale: value.stale,
+            indexing: value.indexing,
+            dirty_repositories: value.dirty_repositories,
+        }
+    }
+}
+
+impl From<dto::QueryMetadata> for v1::QueryMetadata {
+    fn from(value: dto::QueryMetadata) -> Self {
+        Self {
+            revision: value.revision,
+            view: value.view,
+            freshness: Some(value.freshness.into()),
+        }
+    }
+}
+
+impl TryFrom<v1::QueryMetadata> for dto::QueryMetadata {
     type Error = &'static str;
 
-    fn try_from(result: QueryResult) -> Result<Self, Self::Error> {
+    fn try_from(value: v1::QueryMetadata) -> Result<Self, Self::Error> {
         Ok(Self {
-            headers: result.headers,
-            rows: result
-                .rows
-                .into_iter()
-                .map(|row| row.values.into_iter().map(TryInto::try_into).collect())
-                .collect::<Result<_, _>>()?,
-            next: match result.next {
-                Some(next) => Some(Box::new((*next).try_into()?)),
-                None => None,
-            },
-            metadata: result.metadata.map(Into::into),
+            revision: value.revision,
+            view: value.view,
+            freshness: value.freshness.ok_or("query freshness is missing")?.into(),
         })
     }
 }
 
-impl From<DtoMetadata> for v1::QueryMetadata {
-    fn from(metadata: DtoMetadata) -> Self {
-        Self {
-            analysis_revision: metadata.analysis_revision,
-            stale: metadata.stale,
-            indexing: metadata.indexing,
-            dirty_repositories: metadata.dirty_repositories,
+impl From<dto::EntityKind> for v1::EntityKind {
+    fn from(value: dto::EntityKind) -> Self {
+        match value {
+            dto::EntityKind::Callable => Self::Callable,
+            dto::EntityKind::GraphqlField => Self::GraphqlField,
+            dto::EntityKind::KafkaTopic => Self::KafkaTopic,
+            dto::EntityKind::Namespace => Self::Namespace,
+            dto::EntityKind::Rpc => Self::Rpc,
+            dto::EntityKind::Service => Self::Service,
+            dto::EntityKind::Unknown => Self::Unknown,
         }
     }
 }
 
-impl From<v1::QueryMetadata> for DtoMetadata {
-    fn from(metadata: v1::QueryMetadata) -> Self {
-        Self {
-            analysis_revision: metadata.analysis_revision,
-            stale: metadata.stale,
-            indexing: metadata.indexing,
-            dirty_repositories: metadata.dirty_repositories,
+impl From<dto::EntityOrigin> for v1::EntityOrigin {
+    fn from(value: dto::EntityOrigin) -> Self {
+        match value {
+            dto::EntityOrigin::Source => Self::Source,
+            dto::EntityOrigin::Generated => Self::Generated,
+            dto::EntityOrigin::ExternalDependency => Self::ExternalDependency,
         }
     }
 }
 
-impl From<DtoValue> for QueryValue {
-    fn from(value: DtoValue) -> Self {
-        let value = match value {
-            DtoValue::Null => query_value::Value::Null(true),
-            DtoValue::Boolean(value) => query_value::Value::Boolean(value),
-            DtoValue::Integer(value) => query_value::Value::Integer(value),
-            DtoValue::Float(value) => query_value::Value::Float(value),
-            DtoValue::String(value) => query_value::Value::Text(value),
-            DtoValue::Bytes(value) => query_value::Value::Bytes(value),
-            DtoValue::List(values) => query_value::Value::List(QueryList {
-                values: values.into_iter().map(Into::into).collect(),
-            }),
-            DtoValue::Other(value) => query_value::Value::Other(value),
-        };
-        Self { value: Some(value) }
+fn entity_origin(value: i32) -> Result<dto::EntityOrigin, &'static str> {
+    match v1::EntityOrigin::try_from(value).map_err(|_| "unknown entity origin")? {
+        v1::EntityOrigin::Source => Ok(dto::EntityOrigin::Source),
+        v1::EntityOrigin::Generated => Ok(dto::EntityOrigin::Generated),
+        v1::EntityOrigin::ExternalDependency => Ok(dto::EntityOrigin::ExternalDependency),
     }
 }
 
-impl TryFrom<QueryValue> for DtoValue {
+fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
+    Ok(
+        match v1::EntityKind::try_from(value).map_err(|_| "unknown entity kind")? {
+            v1::EntityKind::Callable => dto::EntityKind::Callable,
+            v1::EntityKind::GraphqlField => dto::EntityKind::GraphqlField,
+            v1::EntityKind::KafkaTopic => dto::EntityKind::KafkaTopic,
+            v1::EntityKind::Namespace => dto::EntityKind::Namespace,
+            v1::EntityKind::Rpc => dto::EntityKind::Rpc,
+            v1::EntityKind::Service => dto::EntityKind::Service,
+            v1::EntityKind::Unknown => dto::EntityKind::Unknown,
+        },
+    )
+}
+
+impl From<dto::EntityRef> for v1::Entity {
+    fn from(value: dto::EntityRef) -> Self {
+        Self {
+            id: value.id,
+            kind: v1::EntityKind::from(value.kind) as i32,
+            name: value.name,
+            repository: value.repository,
+            origin: v1::EntityOrigin::from(value.origin) as i32,
+            test: value.test,
+        }
+    }
+}
+
+impl TryFrom<v1::Entity> for dto::EntityRef {
     type Error = &'static str;
 
-    fn try_from(value: QueryValue) -> Result<Self, Self::Error> {
-        Ok(
-            match value.value.ok_or("query value is missing its value")? {
-                query_value::Value::Null(_) => Self::Null,
-                query_value::Value::Boolean(value) => Self::Boolean(value),
-                query_value::Value::Integer(value) => Self::Integer(value),
-                query_value::Value::Float(value) => Self::Float(value),
-                query_value::Value::Text(value) => Self::String(value),
-                query_value::Value::Bytes(value) => Self::Bytes(value),
-                query_value::Value::List(values) => Self::List(
-                    values
-                        .values
-                        .into_iter()
-                        .map(TryInto::try_into)
-                        .collect::<Result<_, _>>()?,
-                ),
-                query_value::Value::Other(value) => Self::Other(value),
-            },
-        )
+    fn try_from(value: v1::Entity) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value.id,
+            kind: entity_kind(value.kind)?,
+            name: value.name,
+            repository: value.repository,
+            origin: entity_origin(value.origin)?,
+            test: value.test,
+        })
+    }
+}
+
+impl From<dto::EvidenceKind> for v1::EvidenceKind {
+    fn from(value: dto::EvidenceKind) -> Self {
+        match value {
+            dto::EvidenceKind::Ast => Self::Ast,
+            dto::EvidenceKind::Configuration => Self::Configuration,
+            dto::EvidenceKind::Descriptor => Self::Descriptor,
+            dto::EvidenceKind::Generated => Self::Generated,
+            dto::EvidenceKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
+fn evidence_kind(value: i32) -> Result<dto::EvidenceKind, &'static str> {
+    Ok(
+        match v1::EvidenceKind::try_from(value).map_err(|_| "unknown evidence kind")? {
+            v1::EvidenceKind::Ast => dto::EvidenceKind::Ast,
+            v1::EvidenceKind::Configuration => dto::EvidenceKind::Configuration,
+            v1::EvidenceKind::Descriptor => dto::EvidenceKind::Descriptor,
+            v1::EvidenceKind::Generated => dto::EvidenceKind::Generated,
+            v1::EvidenceKind::Unknown => dto::EvidenceKind::Unknown,
+        },
+    )
+}
+
+impl From<dto::EvidenceRef> for v1::Evidence {
+    fn from(value: dto::EvidenceRef) -> Self {
+        Self {
+            source: v1::EvidenceKind::from(value.source_kind) as i32,
+            repository: value.repository,
+            path: value.path,
+            line: value.line,
+            detail: value.detail,
+        }
+    }
+}
+
+impl TryFrom<v1::Evidence> for dto::EvidenceRef {
+    type Error = &'static str;
+
+    fn try_from(value: v1::Evidence) -> Result<Self, Self::Error> {
+        Ok(Self {
+            source_kind: evidence_kind(value.source)?,
+            repository: value.repository,
+            path: value.path,
+            line: value.line,
+            detail: value.detail,
+        })
+    }
+}
+
+impl From<dto::RelationKind> for v1::RelationKind {
+    fn from(value: dto::RelationKind) -> Self {
+        match value {
+            dto::RelationKind::Calls => Self::Calls,
+            dto::RelationKind::CallsRpc => Self::CallsRpc,
+            dto::RelationKind::ConsumedBy => Self::ConsumedBy,
+            dto::RelationKind::Defines => Self::Defines,
+            dto::RelationKind::ImplementedBy => Self::ImplementedBy,
+            dto::RelationKind::Publishes => Self::Publishes,
+            dto::RelationKind::ResolvedBy => Self::ResolvedBy,
+            dto::RelationKind::Selects => Self::Selects,
+            dto::RelationKind::Uses => Self::Uses,
+        }
+    }
+}
+
+fn relation_kind(value: i32) -> Result<dto::RelationKind, &'static str> {
+    match v1::RelationKind::try_from(value).map_err(|_| "unknown relation kind")? {
+        v1::RelationKind::Calls => Ok(dto::RelationKind::Calls),
+        v1::RelationKind::CallsRpc => Ok(dto::RelationKind::CallsRpc),
+        v1::RelationKind::ConsumedBy => Ok(dto::RelationKind::ConsumedBy),
+        v1::RelationKind::Defines => Ok(dto::RelationKind::Defines),
+        v1::RelationKind::ImplementedBy => Ok(dto::RelationKind::ImplementedBy),
+        v1::RelationKind::Publishes => Ok(dto::RelationKind::Publishes),
+        v1::RelationKind::ResolvedBy => Ok(dto::RelationKind::ResolvedBy),
+        v1::RelationKind::Selects => Ok(dto::RelationKind::Selects),
+        v1::RelationKind::Uses => Ok(dto::RelationKind::Uses),
+        v1::RelationKind::Unknown => Err("relation kind is missing"),
+    }
+}
+
+impl From<dto::SemanticEdge> for v1::Edge {
+    fn from(value: dto::SemanticEdge) -> Self {
+        Self {
+            id: value.id,
+            from: value.from,
+            to: value.to,
+            kind: v1::RelationKind::from(value.kind) as i32,
+            confidence: value.confidence,
+            evidence: value.evidence.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<v1::Edge> for dto::SemanticEdge {
+    type Error = &'static str;
+
+    fn try_from(value: v1::Edge) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value.id,
+            from: value.from,
+            to: value.to,
+            kind: relation_kind(value.kind)?,
+            confidence: value.confidence,
+            evidence: value
+                .evidence
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl From<dto::SemanticPath> for v1::SemanticPath {
+    fn from(value: dto::SemanticPath) -> Self {
+        Self {
+            nodes: value.nodes,
+            edges: value.edges,
+        }
+    }
+}
+
+impl From<v1::SemanticPath> for dto::SemanticPath {
+    fn from(value: v1::SemanticPath) -> Self {
+        Self {
+            nodes: value.nodes,
+            edges: value.edges,
+        }
+    }
+}
+
+impl From<dto::EntityQuery> for v1::EntityQuery {
+    fn from(value: dto::EntityQuery) -> Self {
+        Self {
+            entity: value.entity,
+        }
+    }
+}
+
+impl From<v1::EntityQuery> for dto::EntityQuery {
+    fn from(value: v1::EntityQuery) -> Self {
+        Self {
+            entity: value.entity,
+        }
+    }
+}
+
+impl From<dto::PathQuery> for v1::SemanticPathQuery {
+    fn from(value: dto::PathQuery) -> Self {
+        Self {
+            from: value.from,
+            to: value.to,
+        }
+    }
+}
+
+impl From<v1::SemanticPathQuery> for dto::PathQuery {
+    fn from(value: v1::SemanticPathQuery) -> Self {
+        Self {
+            from: value.from,
+            to: value.to,
+        }
+    }
+}
+
+macro_rules! common_into_proto {
+    ($value:ident, $response:ident) => {
+        v1::$response {
+            schema: $value.schema,
+            metadata: Some($value.metadata.into()),
+            query: Some($value.query.into()),
+            nodes: $value.nodes.into_iter().map(Into::into).collect(),
+            edges: $value.edges.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    };
+}
+
+fn entities(values: Vec<v1::Entity>) -> Result<Vec<dto::EntityRef>, &'static str> {
+    values.into_iter().map(TryInto::try_into).collect()
+}
+
+fn edges(values: Vec<v1::Edge>) -> Result<Vec<dto::SemanticEdge>, &'static str> {
+    values.into_iter().map(TryInto::try_into).collect()
+}
+
+impl From<dto::ContextResult> for v1::ContextResponse {
+    fn from(value: dto::ContextResult) -> Self {
+        let root = value.root.clone();
+        let mut response = common_into_proto!(value, ContextResponse);
+        response.root = Some(root.into());
+        response
+    }
+}
+
+impl TryFrom<v1::ContextResponse> for dto::ContextResult {
+    type Error = &'static str;
+
+    fn try_from(value: v1::ContextResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema: value.schema,
+            metadata: value
+                .metadata
+                .ok_or("context metadata is missing")?
+                .try_into()?,
+            query: value.query.ok_or("context query is missing")?.into(),
+            root: value.root.ok_or("context root is missing")?.try_into()?,
+            nodes: entities(value.nodes)?,
+            edges: edges(value.edges)?,
+        })
+    }
+}
+
+impl From<dto::DependenciesResult> for v1::DependenciesResponse {
+    fn from(value: dto::DependenciesResult) -> Self {
+        let root = value.root.clone();
+        let dependencies = value
+            .dependencies
+            .iter()
+            .map(|item| v1::Dependency {
+                entity: item.entity.clone(),
+                hops: item.hops,
+            })
+            .collect();
+        let mut response = common_into_proto!(value, DependenciesResponse);
+        response.root = Some(root.into());
+        response.dependencies = dependencies;
+        response
+    }
+}
+
+impl TryFrom<v1::DependenciesResponse> for dto::DependenciesResult {
+    type Error = &'static str;
+
+    fn try_from(value: v1::DependenciesResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema: value.schema,
+            metadata: value
+                .metadata
+                .ok_or("dependencies metadata is missing")?
+                .try_into()?,
+            query: value.query.ok_or("dependencies query is missing")?.into(),
+            root: value
+                .root
+                .ok_or("dependencies root is missing")?
+                .try_into()?,
+            dependencies: value
+                .dependencies
+                .into_iter()
+                .map(|item| dto::DependencyRef {
+                    entity: item.entity,
+                    hops: item.hops,
+                })
+                .collect(),
+            nodes: entities(value.nodes)?,
+            edges: edges(value.edges)?,
+        })
+    }
+}
+
+impl From<dto::ImpactResult> for v1::ImpactResponse {
+    fn from(value: dto::ImpactResult) -> Self {
+        let root = value.root.clone();
+        let affected = value
+            .affected
+            .iter()
+            .map(|item| v1::Impact {
+                entity: item.entity.clone(),
+                hops: item.hops,
+            })
+            .collect();
+        let mut response = common_into_proto!(value, ImpactResponse);
+        response.root = Some(root.into());
+        response.affected = affected;
+        response
+    }
+}
+
+impl TryFrom<v1::ImpactResponse> for dto::ImpactResult {
+    type Error = &'static str;
+
+    fn try_from(value: v1::ImpactResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema: value.schema,
+            metadata: value
+                .metadata
+                .ok_or("impact metadata is missing")?
+                .try_into()?,
+            query: value.query.ok_or("impact query is missing")?.into(),
+            root: value.root.ok_or("impact root is missing")?.try_into()?,
+            affected: value
+                .affected
+                .into_iter()
+                .map(|item| dto::ImpactRef {
+                    entity: item.entity,
+                    hops: item.hops,
+                })
+                .collect(),
+            nodes: entities(value.nodes)?,
+            edges: edges(value.edges)?,
+        })
+    }
+}
+
+impl From<dto::TraceResult> for v1::TraceResponse {
+    fn from(value: dto::TraceResult) -> Self {
+        let paths = value.paths.iter().cloned().map(Into::into).collect();
+        let mut response = common_into_proto!(value, TraceResponse);
+        response.paths = paths;
+        response
+    }
+}
+
+impl TryFrom<v1::TraceResponse> for dto::TraceResult {
+    type Error = &'static str;
+
+    fn try_from(value: v1::TraceResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema: value.schema,
+            metadata: value
+                .metadata
+                .ok_or("trace metadata is missing")?
+                .try_into()?,
+            query: value.query.ok_or("trace query is missing")?.into(),
+            nodes: entities(value.nodes)?,
+            edges: edges(value.edges)?,
+            paths: value.paths.into_iter().map(Into::into).collect(),
+        })
+    }
+}
+
+impl From<dto::WhyResult> for v1::WhyResponse {
+    fn from(value: dto::WhyResult) -> Self {
+        let paths = value.paths.iter().cloned().map(Into::into).collect();
+        let mut response = common_into_proto!(value, WhyResponse);
+        response.paths = paths;
+        response
+    }
+}
+
+impl TryFrom<v1::WhyResponse> for dto::WhyResult {
+    type Error = &'static str;
+
+    fn try_from(value: v1::WhyResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema: value.schema,
+            metadata: value
+                .metadata
+                .ok_or("why metadata is missing")?
+                .try_into()?,
+            query: value.query.ok_or("why query is missing")?.into(),
+            nodes: entities(value.nodes)?,
+            edges: edges(value.edges)?,
+            paths: value.paths.into_iter().map(Into::into).collect(),
+        })
     }
 }
 
@@ -144,35 +513,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_smoke() {
-        let workspace = DomainWorkspace::new("main", vec![PathBuf::from("/tmp/repo")]).unwrap();
-        assert_eq!(
-            DomainWorkspace::try_from(v1::Workspace::from(workspace.clone())).unwrap(),
-            workspace
-        );
-        let result = DtoResult {
-            headers: vec!["value".into()],
-            rows: vec![vec![DtoValue::List(vec![
-                DtoValue::Null,
-                DtoValue::Boolean(true),
-                DtoValue::Integer(42),
-                DtoValue::Float(1.5),
-                DtoValue::String("text".into()),
-                DtoValue::Bytes(vec![1, 2]),
-                DtoValue::Other("other".into()),
-            ])]],
-            next: None,
-            metadata: Some(DtoMetadata {
-                analysis_revision: 3,
-                stale: true,
-                indexing: true,
-                dirty_repositories: vec!["repo".into()],
-            }),
+    fn typed_trace_round_trips_without_generic_rows() {
+        let trace = dto::TraceResult {
+            schema: dto::TRACE_SCHEMA_V1.into(),
+            metadata: dto::QueryMetadata::completed("main", 3),
+            query: dto::PathQuery {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            nodes: vec![dto::EntityRef {
+                id: "a".into(),
+                kind: dto::EntityKind::Callable,
+                name: "a".into(),
+                repository: None,
+                origin: dto::EntityOrigin::Source,
+                test: false,
+            }],
+            edges: vec![dto::SemanticEdge {
+                id: "e1".into(),
+                from: "a".into(),
+                to: "b".into(),
+                kind: dto::RelationKind::Calls,
+                confidence: 1.0,
+                evidence: Vec::new(),
+            }],
+            paths: Vec::new(),
         };
-        assert_eq!(
-            DtoResult::try_from(QueryResult::from(result.clone())).unwrap(),
-            result
-        );
-        assert!(DtoValue::try_from(QueryValue { value: None }).is_err());
+        let response = v1::TraceResponse::from(trace.clone());
+        assert_eq!(response.edges[0].kind, v1::RelationKind::Calls as i32);
+        assert_eq!(dto::TraceResult::try_from(response).unwrap(), trace);
+        assert!(relation_kind(v1::RelationKind::Unknown as i32).is_err());
+        let protocol = include_str!("../../../proto/beholder/v1/daemon.proto");
+        assert!(!protocol.contains("message QueryResult"));
+        assert!(!protocol.contains("repeated string headers"));
     }
 }

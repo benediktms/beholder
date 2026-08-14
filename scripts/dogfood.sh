@@ -62,7 +62,7 @@ callee="repo://$repository/rust/crates/daemon-client/src/lib/state_dir"
 echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
 for _ in {1..100}; do
-    result="$(target/debug/beholder context --workspace main "$caller" 2>/dev/null || true)"
+    result="$(target/debug/beholder context --json --workspace main "$caller" 2>/dev/null || true)"
     grep -Fq "$callee" <<<"$result" && break
     sleep 0.1
 done
@@ -72,15 +72,19 @@ if ! grep -Fq "$callee" <<<"$result"; then
 fi
 echo 'Checking main -> state_dir...' >&2
 echo 'Checking state_dir impact reaches main...' >&2
-result="$(target/debug/beholder impact --workspace main "$callee")"
+result="$(target/debug/beholder impact --json --workspace main "$callee")"
 if ! grep -Fq "$caller" <<<"$result"; then
     printf 'expected %s in impact result:\n%s\n' "$caller" "$result" >&2
     exit 1
 fi
 echo 'Checking why main reaches state_dir...' >&2
-result="$(target/debug/beholder why --workspace main "$caller" "$callee")"
+result="$(target/debug/beholder why --json --workspace main "$caller" "$callee")"
 if ! grep -Fq "$callee" <<<"$result"; then
     printf 'expected %s in why result:\n%s\n' "$callee" "$result" >&2
+    exit 1
+fi
+if ! grep -Fq '"schema":"beholder.why.v1"' <<<"$result"; then
+    printf 'why result did not use the versioned JSON contract:\n%s\n' "$result" >&2
     exit 1
 fi
 echo 'Checking completed revision...' >&2

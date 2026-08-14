@@ -1,10 +1,12 @@
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{address, state_dir};
+use beholder_dto::{Revisioned, SemanticQueryResult, WhyResult};
 use beholder_protocol::v1::{
-    ClearCacheRequest, ClearCacheResponse, EntityRequest, GetStatusRequest, GetStatusResponse,
-    IndexRustWorkspaceRequest, IndexRustWorkspaceResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, PathRequest, QueryResult, RegisterWorkspaceRequest,
-    RegisterWorkspaceResponse, StopRequest, StopResponse,
+    ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
+    GetStatusRequest, GetStatusResponse, ImpactResponse, IndexRustWorkspaceRequest,
+    IndexRustWorkspaceResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
+    RegisterWorkspaceRequest, RegisterWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
+    WhyResponse,
     daemon_server::{Daemon, DaemonServer},
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -124,7 +126,7 @@ impl Daemon for BeholderDaemon {
     async fn context(
         &self,
         request: Request<EntityRequest>,
-    ) -> Result<Response<QueryResult>, Status> {
+    ) -> Result<Response<ContextResponse>, Status> {
         let request = request.into_inner();
         self.query_response(
             &request.workspace,
@@ -142,7 +144,7 @@ impl Daemon for BeholderDaemon {
     async fn dependencies(
         &self,
         request: Request<EntityRequest>,
-    ) -> Result<Response<QueryResult>, Status> {
+    ) -> Result<Response<DependenciesResponse>, Status> {
         let request = request.into_inner();
         self.query_response(
             &request.workspace,
@@ -158,7 +160,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 1,
+            protocol_version: 2,
             pid: std::process::id(),
         }))
     }
@@ -172,7 +174,7 @@ impl Daemon for BeholderDaemon {
     async fn impact(
         &self,
         request: Request<EntityRequest>,
-    ) -> Result<Response<QueryResult>, Status> {
+    ) -> Result<Response<ImpactResponse>, Status> {
         let request = request.into_inner();
         self.query_response(
             &request.workspace,
@@ -289,7 +291,10 @@ impl Daemon for BeholderDaemon {
         err,
         fields(workspace = %request.get_ref().workspace, from = %request.get_ref().from, to = %request.get_ref().to)
     )]
-    async fn trace(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
+    async fn trace(
+        &self,
+        request: Request<PathRequest>,
+    ) -> Result<Response<TraceResponse>, Status> {
         let request = request.into_inner();
         self.query_response(
             &request.workspace,
@@ -304,28 +309,34 @@ impl Daemon for BeholderDaemon {
         err,
         fields(workspace = %request.get_ref().workspace, from = %request.get_ref().from, to = %request.get_ref().to)
     )]
-    async fn why(&self, request: Request<PathRequest>) -> Result<Response<QueryResult>, Status> {
+    async fn why(&self, request: Request<PathRequest>) -> Result<Response<WhyResponse>, Status> {
         let request = request.into_inner();
-        self.query_response(
-            &request.workspace,
-            self.store
-                .trace_snapshot(&request.workspace, &request.from, &request.to),
-        )
+        let revisioned = self
+            .store
+            .trace_snapshot(&request.workspace, &request.from, &request.to)
+            .map(|revisioned| Revisioned {
+                result: WhyResult::from(revisioned.result),
+                analysis_revision: revisioned.analysis_revision,
+            });
+        self.query_response(&request.workspace, revisioned)
     }
 }
 
 impl BeholderDaemon {
-    fn query_response(
+    fn query_response<T, P>(
         &self,
         workspace: &str,
-        result: Result<beholder_dto::RevisionedQuery, Box<dyn Error>>,
-    ) -> Result<Response<QueryResult>, Status> {
+        result: Result<Revisioned<T>, Box<dyn Error>>,
+    ) -> Result<Response<P>, Status>
+    where
+        T: SemanticQueryResult,
+        P: From<T>,
+    {
         let revisioned = result.map_err(|error| Status::internal(error.to_string()))?;
         let mut result = revisioned.result;
-        result.metadata = Some(
-            self.scheduler
-                .query_metadata(workspace, revisioned.analysis_revision),
-        );
+        *result.metadata_mut() = self
+            .scheduler
+            .query_metadata(workspace, revisioned.analysis_revision);
         Ok(Response::new(result.into()))
     }
 }
@@ -450,7 +461,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 1);
+        assert_eq!(status.protocol_version, 2);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");
@@ -520,10 +531,12 @@ mod tests {
             .into_inner()
             .metadata
             .unwrap();
-        assert_eq!(metadata.analysis_revision, 1);
-        assert!(!metadata.stale);
-        assert!(!metadata.indexing);
-        assert!(metadata.dirty_repositories.is_empty());
+        assert_eq!(metadata.revision, 1);
+        assert_eq!(metadata.view, "main");
+        let freshness = metadata.freshness.unwrap();
+        assert!(!freshness.stale);
+        assert!(!freshness.indexing);
+        assert!(freshness.dirty_repositories.is_empty());
         client.clear_cache(ClearCacheRequest {}).await.unwrap();
         assert!(!state.join("frontend-cache").exists());
 
@@ -547,7 +560,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner()
-                .rows
+                .edges
                 .is_empty()
         );
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -560,7 +573,7 @@ mod tests {
                     .await
                     .unwrap()
                     .into_inner()
-                    .rows
+                    .edges
                     .is_empty()
                 {
                     break;
@@ -593,7 +606,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner()
-                .rows
+                .dependencies
                 .is_empty()
         );
         assert!(
@@ -621,7 +634,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner()
-                .rows
+                .paths
                 .is_empty()
         );
         assert!(
@@ -630,7 +643,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner()
-                .rows
+                .paths
                 .is_empty()
         );
 

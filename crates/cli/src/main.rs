@@ -7,6 +7,10 @@ use beholder_daemon_client::{
     register_workspace, state_dir, stop, trace as daemon_trace, why as daemon_why,
 };
 use beholder_domain::WorkspaceView;
+use beholder_presentation::{
+    OutputMode, RenderOptions, context as render_context, dependencies as render_dependencies,
+    impact as render_impact, trace as render_trace, why as render_why,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{
     error::Error,
@@ -190,6 +194,8 @@ struct QueryEntity {
     /// Workspace to query.
     #[arg(short, long, default_value = "main")]
     workspace: String,
+    #[command(flatten)]
+    output: OutputArgs,
     /// Canonical semantic entity ID.
     entity: String,
 }
@@ -199,10 +205,50 @@ struct QueryPath {
     /// Workspace to query.
     #[arg(short, long, default_value = "main")]
     workspace: String,
+    #[command(flatten)]
+    output: OutputArgs,
     /// Starting semantic entity ID.
     from: String,
     /// Destination semantic entity ID.
     to: String,
+}
+
+#[derive(clap::Args, Default)]
+#[group(id = "output-format", multiple = false)]
+struct OutputArgs {
+    /// Emit stable, versioned Beholder JSON.
+    #[arg(long, group = "output-format")]
+    json: bool,
+    /// Emit indented stable, versioned Beholder JSON.
+    #[arg(long, group = "output-format")]
+    json_pretty: bool,
+    /// Emit the full uncollapsed semantic graph and evidence.
+    #[arg(long, group = "output-format")]
+    raw: bool,
+    /// Include test and spec symbols in compact human output.
+    #[arg(long)]
+    include_tests: bool,
+}
+
+impl OutputArgs {
+    fn mode(&self) -> OutputMode {
+        if self.json {
+            OutputMode::Json
+        } else if self.json_pretty {
+            OutputMode::JsonPretty
+        } else if self.raw {
+            OutputMode::Raw
+        } else {
+            OutputMode::Human
+        }
+    }
+
+    fn options(&self) -> RenderOptions {
+        RenderOptions {
+            mode: self.mode(),
+            include_tests: self.include_tests,
+        }
+    }
 }
 
 fn print_index_result((count, published): (usize, bool)) {
@@ -456,30 +502,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", store.benchmark_queries(&topology, entities, depth));
         }
         Some(Command::Context(query)) => {
+            let options = query.output.options();
             println!(
-                "{:#?}",
-                daemon_context(query.workspace, query.entity).await?
+                "{}",
+                render_context(
+                    &daemon_context(query.workspace, query.entity).await?,
+                    options
+                )?
             );
         }
         Some(Command::Impact(query)) => {
-            println!("{:#?}", daemon_impact(query.workspace, query.entity).await?);
+            let options = query.output.options();
+            println!(
+                "{}",
+                render_impact(
+                    &daemon_impact(query.workspace, query.entity).await?,
+                    options
+                )?
+            );
         }
         Some(Command::Dependencies(query)) => {
+            let options = query.output.options();
             println!(
-                "{:#?}",
-                daemon_dependencies(query.workspace, query.entity).await?
-            )
+                "{}",
+                render_dependencies(
+                    &daemon_dependencies(query.workspace, query.entity).await?,
+                    options
+                )?
+            );
         }
         Some(Command::Trace(query)) => {
+            let options = query.output.options();
             println!(
-                "{:#?}",
-                daemon_trace(query.workspace, query.from, query.to).await?
-            )
+                "{}",
+                render_trace(
+                    &daemon_trace(query.workspace, query.from, query.to).await?,
+                    options
+                )?
+            );
         }
-        Some(Command::Why(query)) => println!(
-            "{:#?}",
-            daemon_why(query.workspace, query.from, query.to).await?
-        ),
+        Some(Command::Why(query)) => {
+            let options = query.output.options();
+            println!(
+                "{}",
+                render_why(
+                    &daemon_why(query.workspace, query.from, query.to).await?,
+                    options
+                )?
+            );
+        }
         None => unreachable!("Clap requires a subcommand"),
     }
     Ok(())
@@ -547,20 +618,41 @@ mod tests {
             Some(Command::IndexRustWorkspace { workspace }) if workspace == "main"
         ));
         assert!(Cli::try_parse_from(["beholder", "index-rust", "src/main.rs"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "trace", "--json", "a", "b"])
+                .unwrap()
+                .command,
+            Some(Command::Trace(QueryPath { output, .. })) if output.mode() == OutputMode::Json
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "impact", "--include-tests", "a"])
+                .unwrap()
+                .command,
+            Some(Command::Impact(QueryEntity { output, .. })) if output.include_tests
+        ));
+        assert!(Cli::try_parse_from(["beholder", "trace", "--json", "--raw", "a", "b"]).is_err());
 
         let store = SemanticStore::memory().unwrap();
 
         let result = store
             .trace("main", "web/CheckoutPage", "cache/update_price")
             .unwrap();
-        assert_eq!(result.rows.len(), 1);
-        assert!(format!("{result:?}").contains("CheckoutPage.tsx:12"));
+        assert_eq!(result.paths.len(), 1);
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| edge.evidence.iter().any(|evidence| {
+                    evidence.path.as_deref() == Some("CheckoutPage.tsx")
+                        && evidence.line == Some(12)
+                }))
+        );
 
         assert_eq!(
             store
                 .impact("main", "rpc/Pricing.GetPrice")
                 .unwrap()
-                .rows
+                .affected
                 .len(),
             4
         );
@@ -568,7 +660,7 @@ mod tests {
             store
                 .context("main", "rpc/Pricing.GetPrice")
                 .unwrap()
-                .rows
+                .edges
                 .len(),
             2
         );
@@ -576,7 +668,7 @@ mod tests {
             store
                 .dependencies("main", "rpc/Pricing.GetPrice")
                 .unwrap()
-                .rows
+                .dependencies
                 .len(),
             3
         );

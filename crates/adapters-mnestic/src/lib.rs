@@ -1,11 +1,48 @@
 use beholder_domain::{FactChanges, Observation, RepositoryState, WorkspaceView};
-use beholder_dto::{QueryResult, QueryValue, RevisionedQuery};
+use beholder_dto::{ContextResult, DependenciesResult, ImpactResult, Revisioned, TraceResult};
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, Num, ScriptMutability, ScriptRunOptions,
 };
 use std::{collections::BTreeMap, error::Error, path::Path, time::Instant};
 
+mod semantic;
+
 const MAX_HOPS: i64 = 32;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InspectionValue {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    List(Vec<InspectionValue>),
+    Other(String),
+}
+
+impl InspectionValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InspectionResult {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<InspectionValue>>,
+    pub next: Option<Box<InspectionResult>>,
+}
 
 pub struct SemanticStore {
     db: DbInstance,
@@ -42,35 +79,50 @@ impl SemanticStore {
         publish_observations(&self.db, view, observations)
     }
 
-    pub fn inspect_relations(&self) -> Result<QueryResult, Box<dyn Error>> {
-        inspect_relations(&self.db).map(query_result)
+    pub fn inspect_relations(&self) -> Result<InspectionResult, Box<dyn Error>> {
+        inspect_relations(&self.db).map(inspection_result)
     }
 
-    pub fn inspect_revisions(&self) -> Result<QueryResult, Box<dyn Error>> {
-        inspect_revisions(&self.db).map(query_result)
+    pub fn inspect_revisions(&self) -> Result<InspectionResult, Box<dyn Error>> {
+        inspect_revisions(&self.db).map(inspection_result)
     }
 
     pub fn inspect_observations(
         &self,
         relation: Option<&str>,
-    ) -> Result<QueryResult, Box<dyn Error>> {
-        inspect_observations(&self.db, relation).map(query_result)
+    ) -> Result<InspectionResult, Box<dyn Error>> {
+        inspect_observations(&self.db, relation).map(inspection_result)
     }
 
-    pub fn context(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
-        context(&self.db, view, entity).map(query_result)
+    pub fn context(&self, view: &str, entity: &str) -> Result<ContextResult, Box<dyn Error>> {
+        semantic::context(
+            view,
+            entity,
+            inspection_result(context(&self.db, view, entity)?),
+        )
     }
 
     pub fn context_snapshot(
         &self,
         view: &str,
         entity: &str,
-    ) -> Result<RevisionedQuery, Box<dyn Error>> {
-        self.snapshot(view, |transaction| context(transaction, view, entity))
+    ) -> Result<Revisioned<ContextResult>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            semantic::context(
+                view,
+                entity,
+                inspection_result(context(transaction, view, entity)?),
+            )
+        })
     }
 
-    pub fn trace(&self, view: &str, from: &str, to: &str) -> Result<QueryResult, Box<dyn Error>> {
-        trace(&self.db, view, from, to).map(query_result)
+    pub fn trace(&self, view: &str, from: &str, to: &str) -> Result<TraceResult, Box<dyn Error>> {
+        semantic::trace(
+            view,
+            from,
+            to,
+            inspection_result(trace(&self.db, view, from, to)?),
+        )
     }
 
     pub fn trace_snapshot(
@@ -78,44 +130,75 @@ impl SemanticStore {
         view: &str,
         from: &str,
         to: &str,
-    ) -> Result<RevisionedQuery, Box<dyn Error>> {
-        self.snapshot(view, |transaction| trace(transaction, view, from, to))
+    ) -> Result<Revisioned<TraceResult>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            semantic::trace(
+                view,
+                from,
+                to,
+                inspection_result(trace(transaction, view, from, to)?),
+            )
+        })
     }
 
-    pub fn impact(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
-        impact(&self.db, view, entity).map(query_result)
+    pub fn impact(&self, view: &str, entity: &str) -> Result<ImpactResult, Box<dyn Error>> {
+        semantic::impact(
+            view,
+            entity,
+            inspection_result(impact(&self.db, view, entity)?),
+        )
     }
 
     pub fn impact_snapshot(
         &self,
         view: &str,
         entity: &str,
-    ) -> Result<RevisionedQuery, Box<dyn Error>> {
-        self.snapshot(view, |transaction| impact(transaction, view, entity))
+    ) -> Result<Revisioned<ImpactResult>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            semantic::impact(
+                view,
+                entity,
+                inspection_result(impact(transaction, view, entity)?),
+            )
+        })
     }
 
-    pub fn dependencies(&self, view: &str, entity: &str) -> Result<QueryResult, Box<dyn Error>> {
-        dependencies(&self.db, view, entity).map(query_result)
+    pub fn dependencies(
+        &self,
+        view: &str,
+        entity: &str,
+    ) -> Result<DependenciesResult, Box<dyn Error>> {
+        semantic::dependencies(
+            view,
+            entity,
+            inspection_result(dependencies(&self.db, view, entity)?),
+        )
     }
 
     pub fn dependencies_snapshot(
         &self,
         view: &str,
         entity: &str,
-    ) -> Result<RevisionedQuery, Box<dyn Error>> {
-        self.snapshot(view, |transaction| dependencies(transaction, view, entity))
+    ) -> Result<Revisioned<DependenciesResult>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            semantic::dependencies(
+                view,
+                entity,
+                inspection_result(dependencies(transaction, view, entity)?),
+            )
+        })
     }
 
-    fn snapshot(
+    fn snapshot<T>(
         &self,
         view: &str,
-        read: impl FnOnce(&MultiTransaction) -> Result<NamedRows, Box<dyn Error>>,
-    ) -> Result<RevisionedQuery, Box<dyn Error>> {
+        read: impl FnOnce(&MultiTransaction) -> Result<T, Box<dyn Error>>,
+    ) -> Result<Revisioned<T>, Box<dyn Error>> {
         let transaction = self.db.multi_transaction(false);
-        let result = query_result(read(&transaction)?);
+        let result = read(&transaction)?;
         let analysis_revision = analysis_revision(&transaction, view)?;
         transaction.abort()?;
-        Ok(RevisionedQuery {
+        Ok(Revisioned {
             result,
             analysis_revision,
         })
@@ -136,29 +219,30 @@ impl SemanticStore {
     }
 }
 
-fn query_result(rows: NamedRows) -> QueryResult {
-    QueryResult {
+fn inspection_result(rows: NamedRows) -> InspectionResult {
+    InspectionResult {
         headers: rows.headers,
         rows: rows
             .rows
             .into_iter()
-            .map(|row| row.into_iter().map(query_value).collect())
+            .map(|row| row.into_iter().map(inspection_value).collect())
             .collect(),
-        next: rows.next.map(|next| Box::new(query_result(*next))),
-        metadata: None,
+        next: rows.next.map(|next| Box::new(inspection_result(*next))),
     }
 }
 
-fn query_value(value: DataValue) -> QueryValue {
+fn inspection_value(value: DataValue) -> InspectionValue {
     match value {
-        DataValue::Null => QueryValue::Null,
-        DataValue::Bool(value) => QueryValue::Boolean(value),
-        DataValue::Num(Num::Int(value)) => QueryValue::Integer(value),
-        DataValue::Num(Num::Float(value)) => QueryValue::Float(value),
-        DataValue::Str(value) => QueryValue::String(value.into()),
-        DataValue::Bytes(value) => QueryValue::Bytes(value),
-        DataValue::List(values) => QueryValue::List(values.into_iter().map(query_value).collect()),
-        value => QueryValue::Other(value.to_string()),
+        DataValue::Null => InspectionValue::Null,
+        DataValue::Bool(value) => InspectionValue::Boolean(value),
+        DataValue::Num(Num::Int(value)) => InspectionValue::Integer(value),
+        DataValue::Num(Num::Float(value)) => InspectionValue::Float(value),
+        DataValue::Str(value) => InspectionValue::String(value.into()),
+        DataValue::Bytes(value) => InspectionValue::Bytes(value),
+        DataValue::List(values) => {
+            InspectionValue::List(values.into_iter().map(inspection_value).collect())
+        }
+        value => InspectionValue::Other(value.to_string()),
     }
 }
 
@@ -645,7 +729,15 @@ fn impact(db: &impl QueryRunner, view: &str, entity: &str) -> Result<NamedRows, 
         &format!(
             "{DIRECT_RULES}\n{IMPACT_RULES}\n\
              start[] <- [[$from]]\n\
-             ?[affected] := distance[affected, hops], hops > 0\n:order affected"
+             selected[node, hops] := distance[node, hops]\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+                 selected[entity, hops], hops > 0, row_kind = 'entity', \
+                 edge_from = '', edge_to = '', relation = '', evidence = ''\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+                 selected[edge_from, _], selected[edge_to, _], \
+                 direct[edge_from, edge_to, relation, evidence], row_kind = 'edge', \
+                 entity = '', hops = 0\n\
+             :order row_kind, hops, entity, edge_from, edge_to, relation"
         ),
         [("from", entity.into()), ("max_hops", MAX_HOPS.into())],
     )
@@ -662,8 +754,15 @@ fn dependencies(
         &format!(
             "{DIRECT_RULES}\n{DEPENDENCY_RULES}\n\
              start[] <- [[$from]]\n\
-             ?[dependency, hops] := distance[dependency, hops], hops > 0\n\
-             :order dependency"
+             selected[node, hops] := distance[node, hops]\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+                 selected[entity, hops], hops > 0, row_kind = 'entity', \
+                 edge_from = '', edge_to = '', relation = '', evidence = ''\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence] := \
+                 selected[edge_from, _], selected[edge_to, _], \
+                 direct[edge_from, edge_to, relation, evidence], row_kind = 'edge', \
+                 entity = '', hops = 0\n\
+             :order row_kind, hops, entity, edge_from, edge_to, relation"
         ),
         [("from", entity.into()), ("max_hops", MAX_HOPS.into())],
     )
@@ -781,7 +880,7 @@ fn timed_query(db: &DbInstance, script: &str, params: BTreeMap<String, DataValue
 mod tests {
     use super::*;
     use beholder_domain::LogicalRepository;
-    use std::{fs, time::SystemTime};
+    use std::{collections::BTreeSet, fs, time::SystemTime};
 
     #[test]
     fn impact_traverses_dependants() {
@@ -789,17 +888,15 @@ mod tests {
         let result = store.impact("main", "rpc/Pricing.GetPrice").unwrap();
         assert!(
             result
-                .rows
+                .affected
                 .iter()
-                .flatten()
-                .any(|value| { value.as_str() == Some("web/CheckoutPage") })
+                .any(|value| value.entity == "web/CheckoutPage")
         );
         assert!(
             !result
-                .rows
+                .affected
                 .iter()
-                .flatten()
-                .any(|value| { value.as_str() == Some("pricing/get_price") })
+                .any(|value| value.entity == "pricing/get_price")
         );
     }
 
@@ -825,6 +922,31 @@ mod tests {
     }
 
     #[test]
+    fn typed_trace_deduplicates_graph_and_resolves_path_references() {
+        let result = SemanticStore::memory()
+            .unwrap()
+            .trace("main", "web/CheckoutPage", "cache/update_price")
+            .unwrap();
+        let node_ids = result
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let edge_ids = result
+            .edges
+            .iter()
+            .map(|edge| edge.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(node_ids.len(), result.nodes.len());
+        assert_eq!(edge_ids.len(), result.edges.len());
+        assert_eq!(result.nodes[0].kind, beholder_dto::EntityKind::Callable);
+        for path in &result.paths {
+            assert!(path.nodes.iter().all(|id| node_ids.contains(id.as_str())));
+            assert!(path.edges.iter().all(|id| edge_ids.contains(id.as_str())));
+        }
+    }
+
+    #[test]
     fn workspace_smoke() {
         let db = memory_database().unwrap();
         let feature = query(
@@ -842,13 +964,12 @@ mod tests {
 
         let store = SemanticStore { db };
         let result = store.context("main", "rpc/Pricing.GetPrice").unwrap();
-        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.edges.len(), 2);
         assert!(
             result
-                .rows
+                .nodes
                 .iter()
-                .flatten()
-                .any(|value| { value.as_str() == Some("pricing/get_price") })
+                .any(|value| value.id == "pricing/get_price")
         );
     }
 
@@ -966,10 +1087,9 @@ mod tests {
         assert!(
             snapshot
                 .result
-                .rows
+                .nodes
                 .iter()
-                .flatten()
-                .any(|value| value.as_str() == Some("repo/target"))
+                .any(|value| value.id == "repo/target")
         );
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
