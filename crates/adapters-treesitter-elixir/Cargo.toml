@@ -1,0 +1,10 @@
+[package]
+name = "beholder-adapters-treesitter-elixir"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+beholder-domain.workspace = true
+serde.workspace = true
+tree-sitter = "0.26.12"
+tree-sitter-elixir = "0.3.5"
