@@ -61,14 +61,29 @@ type Cached<T> = Result<(Arc<T>, CacheStatus), Box<dyn Error>>;
 
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
-    dirty_repositories: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
     active_workspace: Mutex<Option<String>>,
     changed: Notify,
-    indexing: Mutex<()>,
     cache_dir: PathBuf,
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<Vec<Observation>>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DirtyRepository {
+    All,
+    Sources(BTreeSet<PathBuf>),
+}
+
+struct ActiveIndex<'a>(&'a Mutex<Option<String>>);
+
+impl Drop for ActiveIndex<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0.lock() {
+            *active = None;
+        }
+    }
 }
 
 impl IndexScheduler {
@@ -78,7 +93,6 @@ impl IndexScheduler {
             dirty_repositories: Mutex::new(BTreeMap::new()),
             active_workspace: Mutex::new(None),
             changed: Notify::new(),
-            indexing: Mutex::new(()),
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
             repository_cache: Mutex::new(BTreeMap::new()),
@@ -90,10 +104,9 @@ impl IndexScheduler {
             *generations.entry(workspace.name.clone()).or_default() += 1;
             if let Ok(mut dirty) = self.dirty_repositories.lock() {
                 dirty.entry(workspace.name.clone()).or_default().extend(
-                    workspace
-                        .repositories
-                        .iter()
-                        .map(|repository| repository.repository.identity.clone()),
+                    workspace.repositories.iter().map(|repository| {
+                        (repository.repository.identity.clone(), DirtyRepository::All)
+                    }),
                 );
             }
             self.changed.notify_one();
@@ -109,10 +122,12 @@ impl IndexScheduler {
             .dirty_repositories
             .lock()
             .ok()
-            .and_then(|dirty| dirty.get(workspace).cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+            .and_then(|dirty| {
+                dirty
+                    .get(workspace)
+                    .map(|repositories| repositories.keys().cloned().collect())
+            })
+            .unwrap_or_default();
         let indexing = self
             .active_workspace
             .lock()
@@ -129,10 +144,7 @@ impl IndexScheduler {
     }
 
     pub fn clear_cache(&self) -> Result<(), Box<dyn Error>> {
-        let _indexing = self
-            .indexing
-            .lock()
-            .map_err(|_| "index coordinator lock poisoned")?;
+        let _active = self.begin("cache clear")?;
         self.rust_cache
             .lock()
             .map_err(|_| "Rust frontend cache lock poisoned")?
@@ -153,10 +165,6 @@ impl IndexScheduler {
         store: &SemanticStore,
         workspace: &Workspace,
     ) -> Result<(usize, bool), Box<dyn Error>> {
-        let _indexing = self
-            .indexing
-            .lock()
-            .map_err(|_| "index coordinator lock poisoned")?;
         let generation = self
             .generations
             .lock()
@@ -175,16 +183,26 @@ impl IndexScheduler {
         store: &SemanticStore,
         workspace: &Workspace,
     ) -> Result<(usize, bool), Box<dyn Error>> {
-        *self
+        let _active = self.begin(&workspace.name)?;
+        let dirty = self
+            .dirty_repositories
+            .lock()
+            .map_err(|_| "dirty repository lock poisoned")?
+            .get(&workspace.name)
+            .cloned();
+        index_workspace(self, store, workspace, dirty.as_ref())
+    }
+
+    fn begin(&self, workspace: &str) -> Result<ActiveIndex<'_>, Box<dyn Error>> {
+        let mut active = self
             .active_workspace
             .lock()
-            .map_err(|_| "active workspace lock poisoned")? = Some(workspace.name.clone());
-        let result = index_workspace(self, store, workspace);
-        *self
-            .active_workspace
-            .lock()
-            .map_err(|_| "active workspace lock poisoned")? = None;
-        result
+            .map_err(|_| "active workspace lock poisoned")?;
+        if let Some(active) = active.as_deref() {
+            return Err(format!("indexer is busy with {active}").into());
+        }
+        *active = Some(workspace.into());
+        Ok(ActiveIndex(&self.active_workspace))
     }
 
     fn complete_generation(&self, workspace: &str, indexed: Option<u64>) {
@@ -223,35 +241,50 @@ impl IndexScheduler {
             return;
         };
         let mut changed = false;
-        // ponytail: linear root matching and full-workspace reindex; add per-source invalidation when dogfood shows it matters.
         for workspace in registry.list() {
             let dirty = workspace
                 .repositories
                 .iter()
-                .filter(|repository| {
-                    event.paths.iter().any(|path| {
-                        path.strip_prefix(&repository.base).is_ok_and(|relative| {
-                            relative
-                                .extension()
-                                .is_some_and(|extension| extension == "rs")
-                                && !relative.components().any(|component| {
-                                    matches!(
-                                        component.as_os_str().to_str(),
-                                        Some(".git" | "target")
-                                    )
+                .filter_map(|repository| {
+                    let sources = event
+                        .paths
+                        .iter()
+                        .filter_map(|path| {
+                            path.strip_prefix(&repository.base)
+                                .ok()
+                                .filter(|relative| {
+                                    relative
+                                        .extension()
+                                        .is_some_and(|extension| extension == "rs")
+                                        && !relative.components().any(|component| {
+                                            matches!(
+                                                component.as_os_str().to_str(),
+                                                Some(".git" | "target")
+                                            )
+                                        })
                                 })
+                                .map(Path::to_path_buf)
                         })
-                    })
+                        .collect::<BTreeSet<_>>();
+                    (!sources.is_empty()).then(|| (repository.repository.identity.clone(), sources))
                 })
-                .map(|repository| repository.repository.identity.clone())
                 .collect::<Vec<_>>();
             if !dirty.is_empty() {
-                tracing::debug!(workspace = %workspace.name, repositories = ?dirty, "workspace marked stale");
+                tracing::debug!(workspace = %workspace.name, repositories = dirty.len(), source_units = dirty.iter().map(|(_, sources)| sources.len()).sum::<usize>(), "workspace marked stale");
                 *generations.entry(workspace.name.clone()).or_default() += 1;
-                dirty_repositories
-                    .entry(workspace.name)
-                    .or_default()
-                    .extend(dirty);
+                let repositories = dirty_repositories.entry(workspace.name).or_default();
+                for (repository, sources) in dirty {
+                    match repositories.entry(repository) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(DirtyRepository::Sources(sources));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if let DirtyRepository::Sources(pending) = entry.get_mut() {
+                                pending.extend(sources);
+                            }
+                        }
+                    }
+                }
                 changed = true;
             }
         }
@@ -300,7 +333,15 @@ impl IndexScheduler {
                     _ = &mut maximum => break,
                 }
             }
-            self.reindex_dirty(&store, &workspaces);
+            let scheduler = self.clone();
+            let store = store.clone();
+            let workspaces = workspaces.clone();
+            if let Err(error) =
+                tokio::task::spawn_blocking(move || scheduler.reindex_dirty(&store, &workspaces))
+                    .await
+            {
+                tracing::error!(%error, "index worker failed");
+            }
         }
     }
 
@@ -328,15 +369,15 @@ impl IndexScheduler {
                 .collect::<Vec<_>>(),
             Err(_) => return,
         };
-        let Ok(_indexing) = self.indexing.lock() else {
-            return;
-        };
         for workspace in registered {
             match self.index_active(store, &workspace) {
                 Ok(_) => self
                     .complete_generation(&workspace.name, snapshot.get(&workspace.name).copied()),
                 Err(error) => {
-                    tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed")
+                    tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed");
+                    if error.to_string().starts_with("indexer is busy with ") {
+                        self.changed.notify_one();
+                    }
                 }
             }
         }
@@ -492,11 +533,13 @@ fn index_workspace(
     scheduler: &IndexScheduler,
     store: &SemanticStore,
     workspace: &Workspace,
+    dirty: Option<&BTreeMap<String, DirtyRepository>>,
 ) -> Result<(usize, bool), Box<dyn Error>> {
     index_rust_workspace_versioned(
         scheduler,
         store,
         workspace,
+        dirty,
         FRONTEND_VERSION,
         RESOLVER_VERSION,
         CORE_RULE_PACK_VERSION,
@@ -507,6 +550,7 @@ fn index_rust_workspace_versioned(
     scheduler: &IndexScheduler,
     store: &SemanticStore,
     workspace: &Workspace,
+    dirty: Option<&BTreeMap<String, DirtyRepository>>,
     frontend_version: &'static str,
     resolver_version: &'static str,
     rule_pack_version: &'static str,
@@ -533,7 +577,13 @@ fn index_rust_workspace_versioned(
     let mut memory_hits = 0;
     let mut disk_hits = 0;
     let mut misses = 0;
+    let mut dirty_source_units = 0;
     for (state, sources) in repositories {
+        dirty_source_units +=
+            match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
+                Some(DirtyRepository::Sources(sources)) => sources.len(),
+                Some(DirtyRepository::All) | None => sources.len(),
+            };
         let (observations, cache_status) = scheduler.repository_observations_versioned(
             &state,
             &sources,
@@ -567,6 +617,7 @@ fn index_rust_workspace_versioned(
         repository_cache_memory_hits = memory_hits,
         repository_cache_disk_hits = disk_hits,
         repository_cache_misses = misses,
+        dirty_source_units,
         "workspace indexed"
     );
     Ok((all_observations.len(), true))
@@ -754,17 +805,17 @@ mod tests {
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
 
         assert!(
-            index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "1")
+            index_rust_workspace_versioned(&scheduler, &store, &workspace, None, "1", "1", "1")
                 .unwrap()
                 .1
         );
         assert!(
-            !index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "1")
+            !index_rust_workspace_versioned(&scheduler, &store, &workspace, None, "1", "1", "1")
                 .unwrap()
                 .1
         );
         assert!(
-            index_rust_workspace_versioned(&scheduler, &store, &workspace, "1", "1", "2")
+            index_rust_workspace_versioned(&scheduler, &store, &workspace, None, "1", "1", "2")
                 .unwrap()
                 .1
         );
@@ -815,6 +866,68 @@ mod tests {
         assert!(!current.freshness.indexing);
         assert!(current.freshness.dirty_repositories.is_empty());
         assert!(scheduler.query_metadata("other", 4).freshness.stale);
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn filesystem_events_reanalyze_only_changed_source_units() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-source-units-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        let changed = repository.join("src/changed.rs");
+        fs::write(&changed, "fn before() {}").unwrap();
+        fs::write(repository.join("src/stable.rs"), "fn stable() {}").unwrap();
+
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry.register("main".into(), vec![repository]).unwrap();
+        let identity = workspace.repositories[0].repository.identity.clone();
+        let registry = Mutex::new(registry);
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        scheduler.mark(&workspace);
+        scheduler.index(&store, &workspace).unwrap();
+        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 2);
+
+        fs::write(&changed, "fn after() {}").unwrap();
+        scheduler.add_event(
+            Ok(Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![changed.canonicalize().unwrap()],
+                attrs: Default::default(),
+            }),
+            &registry,
+        );
+        assert_eq!(
+            scheduler.dirty_repositories.lock().unwrap()["main"][&identity],
+            DirtyRepository::Sources(BTreeSet::from([PathBuf::from("src/changed.rs")]))
+        );
+
+        scheduler.index(&store, &workspace).unwrap();
+        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 3);
+        let context = format!(
+            "{:?}",
+            store
+                .context("main", &format!("repo://{identity}/rust/changed"))
+                .unwrap()
+        );
+        assert!(context.contains("after"));
+        assert!(!context.contains("before"));
+        assert_eq!(
+            store.inspect_revisions().unwrap().rows[0][1].as_i64(),
+            Some(2)
+        );
+        assert!(
+            scheduler
+                .query_metadata("main", 2)
+                .freshness
+                .dirty_repositories
+                .is_empty()
+        );
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

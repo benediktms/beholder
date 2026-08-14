@@ -198,7 +198,6 @@ impl Daemon for BeholderDaemon {
         &self,
         request: Request<ReindexWorkspaceRequest>,
     ) -> Result<Response<ReindexWorkspaceResponse>, Status> {
-        // ponytail: this blocks one Tokio worker; add a bounded job queue when indexing competes with RPC latency.
         let workspace_name = request.into_inner().workspace;
         let workspace = self
             .workspaces
@@ -209,10 +208,16 @@ impl Daemon for BeholderDaemon {
             .ok_or_else(|| {
                 Status::not_found(format!("workspace not registered: {workspace_name}"))
             })?;
-        let (observation_count, published) = self
-            .scheduler
-            .index(&self.store, &workspace)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let scheduler = self.scheduler.clone();
+        let store = self.store.clone();
+        let (observation_count, published) = tokio::task::spawn_blocking(move || {
+            scheduler
+                .index(&store, &workspace)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| Status::internal(format!("index worker failed: {error}")))?
+        .map_err(Status::failed_precondition)?;
         Ok(Response::new(ReindexWorkspaceResponse {
             observation_count: observation_count
                 .try_into()
