@@ -1,7 +1,7 @@
 use beholder_domain::{GitClone, GitTopology, LogicalRepository, RepositoryState, WorkingTree};
 use gix::bstr::ByteSlice;
 use sha2::{Digest, Sha256};
-use std::{error::Error, path::Path};
+use std::{error::Error, path::Path, process::Command};
 
 pub fn canonical_remote(remote: &str) -> Option<String> {
     let remote = gix::url::parse(remote.trim()).ok()?;
@@ -109,11 +109,15 @@ pub fn discover_topology(root: &Path) -> Result<GitTopology, Box<dyn Error>> {
 fn topology_from(repository: gix::Repository, root: &Path) -> Result<GitTopology, Box<dyn Error>> {
     let main_repository = repository.main_repo()?;
     let common_directory = main_repository.common_dir().canonicalize()?;
+    let prunable = prunable_worktrees(root)?;
     let mut working_trees = Vec::new();
     if main_repository.worktree().is_some() {
         working_trees.push(working_tree(&main_repository)?);
     }
     for worktree in main_repository.worktrees()? {
+        if prunable.contains(&worktree.base()?) {
+            continue;
+        }
         working_trees.push(working_tree(&worktree.into_repo()?)?);
     }
     working_trees.sort_by(|left, right| left.path.cmp(&right.path));
@@ -125,6 +129,40 @@ fn topology_from(repository: gix::Repository, root: &Path) -> Result<GitTopology
         clone: GitClone { common_directory },
         working_trees,
     })
+}
+
+fn prunable_worktrees(root: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn Error>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree list failed for {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+
+    let mut paths = Vec::new();
+    let mut worktree = None;
+    let mut prunable = false;
+    for field in output.stdout.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if prunable && let Some(path) = worktree.take() {
+                paths.push(path);
+            }
+            worktree = None;
+            prunable = false;
+        } else if let Some(path) = field.strip_prefix(b"worktree ") {
+            worktree = Some(gix::path::from_bstr(path.as_bstr()).into_owned());
+        } else if field == b"prunable" || field.starts_with(b"prunable ") {
+            prunable = true;
+        }
+    }
+    Ok(paths)
 }
 
 fn working_tree(repository: &gix::Repository) -> Result<WorkingTree, Box<dyn Error>> {
@@ -145,7 +183,7 @@ fn working_tree(repository: &gix::Repository) -> Result<WorkingTree, Box<dyn Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, process::Command, time::SystemTime};
+    use std::{fs, time::SystemTime};
 
     fn required_output(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, Box<dyn Error>> {
         let output = Command::new("git")
@@ -302,6 +340,25 @@ mod tests {
         assert_eq!(dirty_state.repository, feature_state.repository);
         assert_eq!(dirty_state.head, feature_state.head);
         assert_ne!(dirty_state.fingerprint, feature_state.fingerprint);
+
+        required_output(
+            &main,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "temporarily unavailable",
+                linked.to_str().ok_or("non-UTF-8 fixture path")?,
+            ],
+        )?;
+        fs::remove_dir_all(&linked)?;
+        let inaccessible = discover_topology(&main).unwrap_err().to_string();
+        assert!(inaccessible.contains("is inaccessible"), "{inaccessible}");
+
+        fs::remove_file(main.join(".git/worktrees/linked/locked"))?;
+        let topology = discover_topology(&main)?;
+        assert_eq!(topology.working_trees.len(), 1);
+        assert_eq!(topology.working_trees[0].path, main.canonicalize()?);
         Ok(())
     }
 }
