@@ -119,6 +119,7 @@ pub struct IndexScheduler {
     active_workspace: Mutex<Option<String>>,
     idle: Condvar,
     changed: Notify,
+    shutdown: Notify,
     cache_dir: PathBuf,
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
@@ -154,6 +155,7 @@ impl IndexScheduler {
             active_workspace: Mutex::new(None),
             idle: Condvar::new(),
             changed: Notify::new(),
+            shutdown: Notify::new(),
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
             elixir_cache: Mutex::new(BTreeMap::new()),
@@ -384,6 +386,15 @@ impl IndexScheduler {
             .await;
     }
 
+    pub fn stop(&self) {
+        self.shutdown.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_indexing(&self) -> impl Drop + '_ {
+        self.begin("test blocker").unwrap()
+    }
+
     async fn run_with_reconciliation_period(
         self: Arc<Self>,
         store: Arc<SemanticStore>,
@@ -399,6 +410,7 @@ impl IndexScheduler {
             let dirty = tokio::select! {
                 _ = self.changed.notified() => true,
                 _ = reconciliation.tick() => self.mark_registered(&workspaces),
+                _ = self.shutdown.notified() => return,
             };
             if !dirty {
                 continue;
@@ -413,6 +425,7 @@ impl IndexScheduler {
                     _ = self.changed.notified() => last_change = Instant::now(),
                     _ = &mut quiet => break,
                     _ = &mut maximum => break,
+                    _ = self.shutdown.notified() => return,
                 }
             }
             let scheduler = self.clone();
@@ -1452,7 +1465,7 @@ mod tests {
         scheduler.index(&store, &workspace).unwrap();
         fs::write(&source, "fn caller() { after(); } fn after() {}").unwrap();
 
-        let task = tokio::spawn(scheduler.run_with_reconciliation_period(
+        let task = tokio::spawn(scheduler.clone().run_with_reconciliation_period(
             store.clone(),
             registry,
             Duration::from_millis(10),
@@ -1467,8 +1480,8 @@ mod tests {
         })
         .await
         .expect("periodic reconciliation did not recover the missed event");
-        task.abort();
-        let _ = task.await;
+        scheduler.stop();
+        task.await.unwrap();
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

@@ -348,7 +348,7 @@ fn run_daemon() -> Result<(), Box<dyn Error>> {
 
 async fn wait_for_daemon_lock() -> Result<(), Box<dyn Error>> {
     let path = state_dir()?.join("beholderd.pid");
-    for _ in 0..100 {
+    loop {
         if !path.exists() {
             return Ok(());
         }
@@ -358,7 +358,6 @@ async fn wait_for_daemon_lock() -> Result<(), Box<dyn Error>> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Err("beholderd did not release its single-instance lock".into())
 }
 
 async fn stop_for_service_change() -> Result<(), Box<dyn Error>> {
@@ -371,6 +370,21 @@ async fn stop_for_service_change() -> Result<(), Box<dyn Error>> {
             .map_err(|_| "timed out stopping beholderd")??;
     }
     wait_for_daemon_lock().await
+}
+
+async fn stop_daemon() -> Result<bool, Box<dyn Error>> {
+    let running = matches!(
+        tokio::time::timeout(Duration::from_millis(500), get_status()).await,
+        Ok(Ok(_))
+    );
+    if std::env::var_os("BEHOLDER_STATE_DIR").is_none() {
+        service::stop()?;
+    }
+    if running {
+        let _ = stop().await;
+    }
+    wait_for_daemon_lock().await?;
+    Ok(running)
 }
 
 async fn install_daemon_service() -> Result<(), Box<dyn Error>> {
@@ -446,7 +460,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             command: DaemonCommand::Stop,
         }) => println!(
             "{}",
-            if stop().await? {
+            if stop_daemon().await? {
                 "stopped"
             } else {
                 "not running"

@@ -431,8 +431,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
             state_dir.join("frontend-cache"),
         )?;
-        let watcher_task =
-            tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
+        let watcher_task = tokio::spawn(
+            index_scheduler
+                .clone()
+                .run(service.store.clone(), service.workspaces.clone()),
+        );
         Server::builder()
             .add_service(DaemonServer::new(service))
             .serve_with_incoming_shutdown(
@@ -440,7 +443,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 shutdown_signal(stopped),
             )
             .await?;
-        watcher_task.abort();
+        index_scheduler.stop();
+        watcher_task.await?;
         tracing::info!("daemon stopped");
         Ok(())
     }
@@ -491,10 +495,13 @@ mod tests {
             state.join("frontend-cache"),
         )
         .unwrap();
-        let watcher_task =
-            tokio::spawn(index_scheduler.run(service.store.clone(), service.workspaces.clone()));
+        let test_workspaces = service.workspaces.clone();
+        let mut watcher_task = tokio::spawn(
+            index_scheduler
+                .clone()
+                .run(service.store.clone(), service.workspaces.clone()),
+        );
         let server = tokio::spawn(async move {
-            let _socket_file = socket_file;
             Server::builder()
                 .add_service(DaemonServer::new(service))
                 .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
@@ -790,6 +797,11 @@ mod tests {
         .await
         .expect("filesystem change was not indexed");
 
+        let blocker = index_scheduler.block_indexing();
+        let workspace = test_workspaces.lock().unwrap().get("main").unwrap().clone();
+        index_scheduler.mark(&workspace);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
         assert!(
             client
                 .stop(StopRequest {})
@@ -799,8 +811,19 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
+        index_scheduler.stop();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut watcher_task)
+                .await
+                .is_err(),
+            "daemon detached the blocking index worker"
+        );
+        assert!(socket_path.exists());
+        assert!(single_instance::acquire(&state).is_err());
+        drop(blocker);
+        watcher_task.await.unwrap();
+        drop(socket_file);
         assert!(!socket_path.exists());
-        watcher_task.abort();
         let reloaded = WorkspaceRegistry::open(registry_path).unwrap();
         assert_eq!(reloaded.get("main").unwrap().protobuf_descriptors.len(), 1);
         assert!(reloaded.get("secondary").is_some());
