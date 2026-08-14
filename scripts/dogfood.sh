@@ -50,7 +50,16 @@ target/debug/beholder daemon status >/dev/null
 [[ -S "$socket" ]] || { echo "daemon socket not found at $socket" >&2; exit 1; }
 mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
-target/debug/beholder workspace register main "$root" "$state/contracts" \
+mkdir -p "$state/elixir/lib"
+printf '%s\n' 'defmodule Beholder.Smoke do' '  def indexed(value), do: value' 'end' \
+    >"$state/elixir/lib/smoke.ex"
+git -C "$state/elixir" init -q
+git -C "$state/elixir" config user.name 'Beholder Smoke'
+git -C "$state/elixir" config user.email 'smoke@beholder.local'
+git -C "$state/elixir" add lib/smoke.ex
+git -C "$state/elixir" commit -qm 'Add Elixir smoke fixture'
+git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
+target/debug/beholder workspace register main "$root" "$state/contracts" "$state/elixir" \
     --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" >/dev/null
 
 repository="$(basename "$root")"
@@ -73,6 +82,15 @@ if ! grep -Fq "$callee" <<<"$result"; then
     printf 'automatic indexing did not produce %s in context:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
+echo 'Checking Elixir module and function indexing...' >&2
+elixir_module='repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke'
+result="$(target/debug/beholder context --json --workspace main "$elixir_module")"
+for expected in '"kind":"namespace"' 'Beholder.Smoke/indexed/1' '"name":"indexed/1"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in Elixir context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
 echo 'Checking Protobuf descriptor indexing...' >&2
 result="$(target/debug/beholder context --json --workspace main \
     'grpc://pricing.v1.Pricing/GetQuote')"
@@ -129,4 +147,4 @@ for expected in 'daemon started' 'workspace indexed' 'facts_inserted' 'rpc.conte
 done
 trace_events="$(wc -l <"$trace_file" | tr -d ' ')"
 echo "Trace inspection passed: $trace_events events, no warnings or errors" >&2
-echo "dogfood smoke passed: indexed Rust and Protobuf semantics" >&2
+echo "dogfood smoke passed: indexed Rust, Elixir, and Protobuf semantics" >&2

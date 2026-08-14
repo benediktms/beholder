@@ -315,6 +315,7 @@ dependencies = [
  "beholder-adapters-git",
  "beholder-adapters-mnestic",
  "beholder-adapters-protobuf",
+ "beholder-adapters-treesitter-elixir",
  "beholder-adapters-treesitter-rust",
  "beholder-daemon-client",
  "beholder-domain",

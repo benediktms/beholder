@@ -210,6 +210,7 @@ pub fn resolve_repository_calls(observations: &mut [Observation]) -> Vec<Depende
     let mut definitions = BTreeMap::<String, Option<String>>::new();
     for observation in observations.iter().filter(|observation| {
         observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+            && observation.to.as_str().contains("/rust/")
     }) {
         let Some(name) = observation.to.as_str().rsplit('/').next() else {
             continue;

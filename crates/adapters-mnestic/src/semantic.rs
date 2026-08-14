@@ -388,6 +388,17 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::ProtoEnum
     } else if id.starts_with("proto-service://") {
         EntityKind::ProtoService
+    } else if id.contains("/elixir-source/") {
+        EntityKind::Namespace
+    } else if let Some(symbol) = id.split_once("/elixir/").map(|(_, symbol)| symbol) {
+        if symbol
+            .rsplit_once('/')
+            .is_some_and(|(_, arity)| arity.parse::<usize>().is_ok())
+        {
+            EntityKind::Callable
+        } else {
+            EntityKind::Namespace
+        }
     } else {
         EntityKind::Unknown
     }
@@ -415,6 +426,16 @@ fn entity_name(id: &str) -> String {
             method
         );
     }
+    if let Some(symbol) = id.split_once("/elixir/").map(|(_, symbol)| symbol)
+        && let Some((function, arity)) = symbol.rsplit_once('/')
+        && arity.parse::<usize>().is_ok()
+    {
+        return format!(
+            "{}/{}",
+            function.rsplit('/').next().unwrap_or(function),
+            arity
+        );
+    }
     id.rsplit(['/', ':'])
         .find(|part| !part.is_empty())
         .unwrap_or(id)
@@ -424,6 +445,8 @@ fn entity_name(id: &str) -> String {
 fn repository(id: &str) -> Option<String> {
     id.strip_prefix("repo://").and_then(|rest| {
         rest.split_once("/rust/")
+            .or_else(|| rest.split_once("/elixir/"))
+            .or_else(|| rest.split_once("/elixir-source/"))
             .map(|(repository, _)| repository.into())
     })
 }
@@ -495,7 +518,29 @@ fn list<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::is_test_entity;
+    use super::{entity_ref, infer_kind, is_test_entity};
+    use beholder_dto::EntityKind;
+
+    #[test]
+    fn maps_elixir_modules_and_functions() {
+        let module_id = "repo://github.com/fresha/app-packages/elixir/Packages.Domain.Instances";
+        let module = entity_ref(module_id, infer_kind(module_id));
+        assert_eq!(module.kind, EntityKind::Namespace);
+        assert_eq!(module.name, "Packages.Domain.Instances");
+        assert_eq!(
+            module.repository.as_deref(),
+            Some("github.com/fresha/app-packages")
+        );
+
+        let function_id = format!("{module_id}/activate/1");
+        let function = entity_ref(&function_id, infer_kind(&function_id));
+        assert_eq!(function.kind, EntityKind::Callable);
+        assert_eq!(function.name, "activate/1");
+        assert_eq!(
+            function.repository.as_deref(),
+            Some("github.com/fresha/app-packages")
+        );
+    }
 
     #[test]
     fn recognises_rust_and_javascript_test_segments() {
