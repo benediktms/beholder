@@ -1,6 +1,9 @@
 use crate::workspace_registry::WorkspaceRegistry;
-use beholder_adapters_git::repository_state;
+use beholder_adapters_git::repository_state_bytes;
 use beholder_adapters_mnestic::SemanticStore;
+use beholder_adapters_protobuf::{
+    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, observations as protobuf_observations,
+};
 use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
     resolve_repository_calls, source_files,
@@ -27,6 +30,8 @@ const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
 const CORE_RULE_PACK_VERSION: &str = "5";
 type RustSources = Vec<(PathBuf, String)>;
+type ProtobufSources = Vec<(PathBuf, Vec<u8>)>;
+type RepositorySources = (RepositoryState, RustSources, ProtobufSources);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SourceAnalysisKey {
@@ -39,6 +44,7 @@ struct RepositoryAnalysisKey {
     fingerprint: String,
     frontend_version: &'static str,
     resolver_version: &'static str,
+    protobuf_frontend_version: &'static str,
 }
 
 impl SourceAnalysisKey {
@@ -265,7 +271,7 @@ impl IndexScheduler {
                             path.strip_prefix(&repository.base)
                                 .ok()
                                 .filter(|relative| {
-                                    relative
+                                    let rust = relative
                                         .extension()
                                         .is_some_and(|extension| extension == "rs")
                                         && !relative.components().any(|component| {
@@ -273,7 +279,13 @@ impl IndexScheduler {
                                                 component.as_os_str().to_str(),
                                                 Some(".git" | "target")
                                             )
-                                        })
+                                        });
+                                    rust || workspace.protobuf_descriptors.iter().any(
+                                        |descriptor| {
+                                            descriptor.repository == repository.repository
+                                                && descriptor.path == *path
+                                        },
+                                    )
                                 })
                                 .map(Path::to_path_buf)
                         })
@@ -451,13 +463,16 @@ impl IndexScheduler {
         &self,
         state: &RepositoryState,
         sources: &RustSources,
+        descriptors: &[(PathBuf, Vec<u8>)],
         frontend_version: &'static str,
         resolver_version: &'static str,
+        protobuf_frontend_version: &'static str,
     ) -> Cached<Vec<Observation>> {
         let key = RepositoryAnalysisKey {
             fingerprint: state.fingerprint.clone(),
             frontend_version,
             resolver_version,
+            protobuf_frontend_version,
         };
         if let Some(observations) = self
             .repository_cache
@@ -475,6 +490,7 @@ impl IndexScheduler {
             .join("rust")
             .join(frontend_version)
             .join(resolver_version)
+            .join(protobuf_frontend_version)
             .join(format!("{}.json", state.fingerprint));
         if let Ok(bytes) = fs::read(&path)
             && let Ok(observations) = serde_json::from_slice::<Vec<Observation>>(&bytes)
@@ -504,6 +520,9 @@ impl IndexScheduler {
                 path,
             ));
         }
+        for (_, descriptor) in descriptors {
+            observations.extend(protobuf_observations(descriptor)?);
+        }
         resolve_repository_calls(&mut observations);
         let observations = Arc::new(observations);
         if let Some(parent) = path.parent()
@@ -521,7 +540,10 @@ impl IndexScheduler {
     }
 }
 
-fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources), Box<dyn Error>> {
+fn repository_sources(
+    root: &Path,
+    descriptor_paths: &[PathBuf],
+) -> Result<RepositorySources, Box<dyn Error>> {
     if !root.is_dir() {
         return Err(format!("repository does not exist: {}", root.display()).into());
     }
@@ -535,7 +557,23 @@ fn rust_repository_sources(root: &Path) -> Result<(RepositoryState, RustSources)
             Ok((relative_path, fs::read_to_string(path)?))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    Ok((repository_state(root, &sources)?, sources))
+    let mut descriptors = descriptor_paths
+        .iter()
+        .map(|path| Ok((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?)))
+        .collect::<Result<ProtobufSources, Box<dyn Error>>>()?;
+    descriptors.sort_by(|left, right| left.0.cmp(&right.0));
+    let state = repository_state_bytes(
+        root,
+        sources
+            .iter()
+            .map(|(path, source)| (path.as_path(), source.as_bytes()))
+            .chain(
+                descriptors
+                    .iter()
+                    .map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
+            ),
+    )?;
+    Ok((state, sources, descriptors))
 }
 
 fn index_workspace(
@@ -567,14 +605,24 @@ fn index_rust_workspace_versioned(
     let repositories = workspace
         .repositories
         .iter()
-        .map(|repository| rust_repository_sources(&repository.base))
+        .map(|repository| {
+            let descriptors = workspace
+                .protobuf_descriptors
+                .iter()
+                .filter(|descriptor| descriptor.repository == repository.repository)
+                .map(|descriptor| descriptor.path.clone())
+                .collect::<Vec<_>>();
+            repository_sources(&repository.base, &descriptors)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let view = WorkspaceView::new(
         &workspace.name,
-        format!("rust:{frontend_version}:{resolver_version}:core-rules:{rule_pack_version}"),
+        format!(
+            "rust:{frontend_version}:{resolver_version}:protobuf:{PROTOBUF_FRONTEND_VERSION}:core-rules:{rule_pack_version}"
+        ),
         repositories
             .iter()
-            .map(|(state, _)| state.clone())
+            .map(|(state, _, _)| state.clone())
             .collect(),
     )?;
     if store.view_matches(&view)? {
@@ -587,17 +635,19 @@ fn index_rust_workspace_versioned(
     let mut disk_hits = 0;
     let mut misses = 0;
     let mut dirty_source_units = 0;
-    for (state, sources) in repositories {
+    for (state, sources, descriptors) in repositories {
         dirty_source_units +=
             match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
                 Some(DirtyRepository::Sources(sources)) => sources.len(),
-                Some(DirtyRepository::All) | None => sources.len(),
+                Some(DirtyRepository::All) | None => sources.len() + descriptors.len(),
             };
         let (observations, cache_status) = scheduler.repository_observations_versioned(
             &state,
             &sources,
+            &descriptors,
             frontend_version,
             resolver_version,
+            PROTOBUF_FRONTEND_VERSION,
         )?;
         match cache_status {
             CacheStatus::Memory => memory_hits += 1,
@@ -606,7 +656,9 @@ fn index_rust_workspace_versioned(
         }
         repository_facts.push(RepositoryFacts {
             state,
-            analysis_identity: format!("rust:{frontend_version}:{resolver_version}"),
+            analysis_identity: format!(
+                "rust:{frontend_version}:{resolver_version}:protobuf:{PROTOBUF_FRONTEND_VERSION}"
+            ),
             observations: observations.as_ref().clone(),
         });
     }
@@ -735,10 +787,24 @@ mod tests {
         )];
         let scheduler = IndexScheduler::new(cache.clone());
         let (first, first_status) = scheduler
-            .repository_observations_versioned(&state, &sources, FRONTEND_VERSION, RESOLVER_VERSION)
+            .repository_observations_versioned(
+                &state,
+                &sources,
+                &[],
+                FRONTEND_VERSION,
+                RESOLVER_VERSION,
+                PROTOBUF_FRONTEND_VERSION,
+            )
             .unwrap();
         let (second, second_status) = scheduler
-            .repository_observations_versioned(&state, &sources, FRONTEND_VERSION, RESOLVER_VERSION)
+            .repository_observations_versioned(
+                &state,
+                &sources,
+                &[],
+                FRONTEND_VERSION,
+                RESOLVER_VERSION,
+                PROTOBUF_FRONTEND_VERSION,
+            )
             .unwrap();
 
         assert_eq!(first_status, CacheStatus::Miss);
@@ -756,8 +822,10 @@ mod tests {
                 .repository_observations_versioned(
                     &state,
                     &sources,
+                    &[],
                     FRONTEND_VERSION,
                     RESOLVER_VERSION,
+                    PROTOBUF_FRONTEND_VERSION,
                 )
                 .unwrap()
                 .1,
@@ -772,8 +840,10 @@ mod tests {
                 .repository_observations_versioned(
                     &versioned_state,
                     &sources,
+                    &[],
                     FRONTEND_VERSION,
                     "old",
+                    PROTOBUF_FRONTEND_VERSION,
                 )
                 .unwrap()
                 .1,
@@ -786,8 +856,10 @@ mod tests {
                 .repository_observations_versioned(
                     &versioned_state,
                     &sources,
+                    &[],
                     FRONTEND_VERSION,
                     RESOLVER_VERSION,
+                    PROTOBUF_FRONTEND_VERSION,
                 )
                 .unwrap()
                 .1,
@@ -913,7 +985,9 @@ mod tests {
         fs::write(repository.join("src/stable.rs"), "fn stable() {}").unwrap();
 
         let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
-        let workspace = registry.register("main".into(), vec![repository]).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
         let identity = workspace.repositories[0].repository.identity.clone();
         let registry = Mutex::new(registry);
         let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
@@ -975,7 +1049,9 @@ mod tests {
 
         let store = Arc::new(SemanticStore::persistent(&state.join("beholder.db"), true).unwrap());
         let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
-        let workspace = registry.register("main".into(), vec![repository]).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
         let identity = &workspace.repositories[0].repository.identity;
         let caller = format!("repo://{identity}/rust/lib/caller");
         let after = format!("repo://{identity}/rust/lib/after");

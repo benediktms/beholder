@@ -186,6 +186,9 @@ enum WorkspaceCommand {
         /// Repository roots in the workspace.
         #[arg(required = true, num_args = 1..)]
         repositories: Vec<PathBuf>,
+        /// Compiled FileDescriptorSet paths inside the registered repositories.
+        #[arg(long = "protobuf-descriptor")]
+        protobuf_descriptors: Vec<PathBuf>,
     },
     /// List registered workspaces.
     List,
@@ -456,8 +459,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             print_index_result(daemon_reindex_workspace(workspace).await?)
         }
         Some(Command::Workspace {
-            command: WorkspaceCommand::Register { name, repositories },
-        }) => println!("{:#?}", register_workspace(name, &repositories).await?),
+            command:
+                WorkspaceCommand::Register {
+                    name,
+                    repositories,
+                    protobuf_descriptors,
+                },
+        }) => println!(
+            "{:#?}",
+            register_workspace(name, &repositories, &protobuf_descriptors).await?
+        ),
         Some(Command::Workspace {
             command: WorkspaceCommand::List,
         }) => {
@@ -613,12 +624,14 @@ mod tests {
                 "main",
                 "repo-a",
                 "repo-b",
+                "--protobuf-descriptor",
+                "repo-a/contracts.bin",
             ])
             .unwrap()
             .command,
             Some(Command::Workspace {
-                command: WorkspaceCommand::Register { repositories, .. }
-            }) if repositories.len() == 2
+                command: WorkspaceCommand::Register { repositories, protobuf_descriptors, .. }
+            }) if repositories.len() == 2 && protobuf_descriptors.len() == 1
         ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "reindex-workspace", "main"])

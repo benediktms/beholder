@@ -192,7 +192,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 5,
+            protocol_version: 6,
             pid: std::process::id(),
         }))
     }
@@ -291,6 +291,11 @@ impl Daemon for BeholderDaemon {
                     request.name,
                     request
                         .repository_paths
+                        .into_iter()
+                        .map(PathBuf::from)
+                        .collect(),
+                    request
+                        .protobuf_descriptor_paths
                         .into_iter()
                         .map(PathBuf::from)
                         .collect(),
@@ -445,9 +450,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        ClearCacheRequest, EntityRequest, GetStatusRequest, ListWorkspacesRequest, PathRequest,
-        RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
-        daemon_client::DaemonClient,
+        ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GetStatusRequest,
+        ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
+        RelationKind, StopRequest, daemon_client::DaemonClient,
     };
     use std::{env, fs, path::Path, time::Duration};
 
@@ -512,7 +517,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 5);
+        assert_eq!(status.protocol_version, 6);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");
@@ -521,6 +526,14 @@ mod tests {
         fs::create_dir_all(second.join("src")).unwrap();
         fs::write(first.join("src/lib.rs"), "fn caller() { helper(); }").unwrap();
         fs::write(second.join("src/lib.rs"), "fn helper() {}").unwrap();
+        let descriptor = first.join("pricing.descriptor.bin");
+        let descriptor_bytes = include_str!("../../../scripts/fixtures/pricing.descriptor.hex")
+            .trim()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        fs::write(&descriptor, &descriptor_bytes).unwrap();
         let first_identity = beholder_adapters_git::repository_identity(&first).unwrap();
         let second_identity = beholder_adapters_git::repository_identity(&second).unwrap();
         let caller = format!("repo://{first_identity}/rust/lib/caller");
@@ -530,6 +543,7 @@ mod tests {
             .register_workspace(RegisterWorkspaceRequest {
                 name: "main".into(),
                 repository_paths: vec![repository(&first), repository(&second)],
+                protobuf_descriptor_paths: vec![repository(&descriptor)],
             })
             .await
             .unwrap()
@@ -565,6 +579,26 @@ mod tests {
         })
         .await
         .expect("registered workspace was not indexed");
+        let protobuf = client
+            .context(EntityRequest {
+                workspace: "main".into(),
+                entity: "grpc://pricing.v1.Pricing/GetQuote".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(protobuf.root.unwrap().kind, EntityKind::Rpc as i32);
+        assert!(protobuf.nodes.iter().any(|node| {
+            node.id == "proto-message://pricing.v1.Request"
+                && node.kind == EntityKind::ProtoMessage as i32
+        }));
+        assert!(protobuf.edges.iter().any(|edge| {
+            edge.kind == RelationKind::RequestType as i32
+                && edge
+                    .evidence
+                    .iter()
+                    .all(|evidence| evidence.source == EvidenceKind::Descriptor as i32)
+        }));
         let unchanged = client
             .reindex_workspace(ReindexWorkspaceRequest {
                 workspace: "main".into(),
@@ -574,6 +608,35 @@ mod tests {
             .into_inner();
         assert!(!unchanged.published);
         assert_eq!(unchanged.observation_count, 0);
+        let mut changed_descriptor = descriptor_bytes;
+        let method = changed_descriptor
+            .windows(b"GetQuote".len())
+            .position(|window| window == b"GetQuote")
+            .unwrap();
+        changed_descriptor[method..method + b"GetPrice".len()].copy_from_slice(b"GetPrice");
+        fs::write(&descriptor, changed_descriptor).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let context = client
+                    .context(EntityRequest {
+                        workspace: "main".into(),
+                        entity: "grpc://pricing.v1.Pricing/GetPrice".into(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if context
+                    .edges
+                    .iter()
+                    .any(|edge| edge.kind == RelationKind::RequestType as i32)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("protobuf descriptor change was not indexed");
         let metadata = client
             .context(EntityRequest {
                 workspace: "main".into(),
@@ -584,7 +647,7 @@ mod tests {
             .into_inner()
             .metadata
             .unwrap();
-        assert_eq!(metadata.revision, 1);
+        assert_eq!(metadata.revision, 2);
         assert_eq!(metadata.view, "main");
         let freshness = metadata.freshness.unwrap();
         assert!(!freshness.stale);
@@ -600,6 +663,7 @@ mod tests {
             .register_workspace(RegisterWorkspaceRequest {
                 name: "secondary".into(),
                 repository_paths: vec![repository(&third)],
+                protobuf_descriptor_paths: Vec::new(),
             })
             .await
             .unwrap();
@@ -738,7 +802,7 @@ mod tests {
         assert!(!socket_path.exists());
         watcher_task.abort();
         let reloaded = WorkspaceRegistry::open(registry_path).unwrap();
-        assert!(reloaded.get("main").is_some());
+        assert_eq!(reloaded.get("main").unwrap().protobuf_descriptors.len(), 1);
         assert!(reloaded.get("secondary").is_some());
         let indexed = SemanticStore::persistent(&database, false).unwrap();
         assert!(indexed.inspect_revisions().unwrap().rows.iter().any(|row| {

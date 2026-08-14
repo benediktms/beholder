@@ -2,6 +2,8 @@ use beholder_domain::{Observation, StructuralRelation};
 use prost::Message;
 use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
 
+pub const FRONTEND_VERSION: &str = "1";
+
 pub fn observations(descriptor_set: &[u8]) -> Result<Vec<Observation>, String> {
     let descriptor_set = FileDescriptorSet::decode(descriptor_set)
         .map_err(|error| format!("invalid FileDescriptorSet: {error}"))?;

@@ -48,7 +48,10 @@ for _ in {1..50}; do
 done
 target/debug/beholder daemon status >/dev/null
 [[ -S "$socket" ]] || { echo "daemon socket not found at $socket" >&2; exit 1; }
-target/debug/beholder workspace register main "$root" >/dev/null
+mkdir -p "$state/contracts"
+xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
+target/debug/beholder workspace register main "$root" "$state/contracts" \
+    --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" >/dev/null
 
 repository="$(basename "$root")"
 if remote="$(git -C "$root" remote get-url origin 2>/dev/null)"; then
@@ -70,6 +73,15 @@ if ! grep -Fq "$callee" <<<"$result"; then
     printf 'automatic indexing did not produce %s in context:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
+echo 'Checking Protobuf descriptor indexing...' >&2
+result="$(target/debug/beholder context --json --workspace main \
+    'grpc://pricing.v1.Pricing/GetQuote')"
+for expected in '"kind":"rpc"' 'proto-message://pricing.v1.Request' '"kind":"request_type"' '"source":"descriptor"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in Protobuf context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
 echo 'Checking main -> state_dir...' >&2
 echo 'Checking state_dir impact reaches main...' >&2
 result="$(target/debug/beholder impact --json --workspace main "$callee")"
@@ -117,4 +129,4 @@ for expected in 'daemon started' 'workspace indexed' 'facts_inserted' 'rpc.conte
 done
 trace_events="$(wc -l <"$trace_file" | tr -d ' ')"
 echo "Trace inspection passed: $trace_events events, no warnings or errors" >&2
-echo "dogfood smoke passed: indexed Beholder and resolved main -> state_dir" >&2
+echo "dogfood smoke passed: indexed Rust and Protobuf semantics" >&2

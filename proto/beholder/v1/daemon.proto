@@ -199,6 +199,12 @@ message ReindexWorkspaceResponse {
 message Workspace {
   string name = 1;
   repeated WorkspaceRepository repositories = 2;
+  repeated ProtobufDescriptorSource protobuf_descriptors = 3;
+}
+
+message ProtobufDescriptorSource {
+  string repository = 1;
+  string path = 2;
 }
 
 message WorkspaceRepository {
@@ -211,6 +217,7 @@ message WorkspaceRepository {
 message RegisterWorkspaceRequest {
   string name = 1;
   repeated string repository_paths = 2;
+  repeated string protobuf_descriptor_paths = 3;
 }
 
 message RegisterWorkspaceResponse {

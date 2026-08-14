@@ -98,6 +98,18 @@ pub fn repository_state(
     root: &Path,
     sources: &[(std::path::PathBuf, String)],
 ) -> Result<RepositoryState, Box<dyn Error>> {
+    repository_state_bytes(
+        root,
+        sources
+            .iter()
+            .map(|(path, source)| (path.as_path(), source.as_bytes())),
+    )
+}
+
+pub fn repository_state_bytes<'a>(
+    root: &Path,
+    sources: impl IntoIterator<Item = (&'a Path, &'a [u8])>,
+) -> Result<RepositoryState, Box<dyn Error>> {
     let (repository, head) = match gix::discover(root) {
         Ok(git) => {
             let topology = topology_from(git, root)?;
@@ -124,11 +136,15 @@ pub fn repository_state(
     })
 }
 
-fn state_fingerprint(
+fn state_fingerprint<P, B>(
     repository: &str,
     head: Option<&str>,
-    sources: &[(std::path::PathBuf, String)],
-) -> String {
+    sources: impl IntoIterator<Item = (P, B)>,
+) -> String
+where
+    P: AsRef<Path>,
+    B: AsRef<[u8]>,
+{
     let mut digest = Sha256::new();
     digest.update((repository.len() as u64).to_le_bytes());
     digest.update(repository.as_bytes());
@@ -138,7 +154,8 @@ fn state_fingerprint(
         digest.update(head.as_bytes());
     }
     for (path, source) in sources {
-        let path = path.to_string_lossy();
+        let path = path.as_ref().to_string_lossy();
+        let source = source.as_ref();
         digest.update((path.len() as u64).to_le_bytes());
         digest.update(path.as_bytes());
         digest.update((source.len() as u64).to_le_bytes());

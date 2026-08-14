@@ -139,6 +139,7 @@ pub async fn reindex_workspace(
 pub async fn register_workspace(
     name: String,
     repositories: &[PathBuf],
+    protobuf_descriptors: &[PathBuf],
 ) -> Result<Workspace, Box<dyn std::error::Error>> {
     let repository_paths = repositories
         .iter()
@@ -149,6 +150,10 @@ pub async fn register_workspace(
         .register_workspace(RegisterWorkspaceRequest {
             name,
             repository_paths,
+            protobuf_descriptor_paths: protobuf_descriptors
+                .iter()
+                .map(|path| path_string(path))
+                .collect::<Result<_, _>>()?,
         })
         .await?
         .into_inner()

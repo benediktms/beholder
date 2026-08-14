@@ -1,5 +1,7 @@
 use beholder_adapters_git::workspace_repository;
-use beholder_domain::{LogicalRepository, Workspace, WorkspaceRepository};
+use beholder_domain::{
+    LogicalRepository, ProtobufDescriptorSource, Workspace, WorkspaceRepository,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -12,6 +14,14 @@ use std::{
 struct StoredWorkspace {
     name: String,
     repositories: Vec<StoredRepository>,
+    #[serde(default)]
+    protobuf_descriptors: Vec<StoredProtobufDescriptor>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredProtobufDescriptor {
+    repository: String,
+    path: PathBuf,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -57,7 +67,19 @@ impl WorkspaceRegistry {
                             }),
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    Workspace::new(stored.name, repositories)
+                    Workspace::new(stored.name, repositories)?
+                        .with_protobuf_descriptors(
+                            stored
+                                .protobuf_descriptors
+                                .into_iter()
+                                .map(|descriptor| ProtobufDescriptorSource {
+                                    repository: LogicalRepository {
+                                        identity: descriptor.repository,
+                                    },
+                                    path: descriptor.path,
+                                })
+                                .collect(),
+                        )
                         .map(|workspace| (workspace.name.clone(), workspace))
                 })
                 .collect::<Result<_, _>>()?
@@ -71,6 +93,7 @@ impl WorkspaceRegistry {
         &mut self,
         name: String,
         repositories: Vec<PathBuf>,
+        protobuf_descriptors: Vec<PathBuf>,
     ) -> Result<Workspace, Box<dyn Error>> {
         let repositories = repositories
             .into_iter()
@@ -86,7 +109,36 @@ impl WorkspaceRegistry {
                 workspace_repository(&path).map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let workspace = Workspace::new(name, repositories)?;
+        let descriptors = protobuf_descriptors
+            .into_iter()
+            .map(|path| {
+                let path = fs::canonicalize(&path).map_err(|error| {
+                    format!("invalid protobuf descriptor {}: {error}", path.display())
+                })?;
+                if !path.is_file() {
+                    return Err(format!(
+                        "protobuf descriptor is not a file: {}",
+                        path.display()
+                    ));
+                }
+                let repository = repositories
+                    .iter()
+                    .filter(|repository| path.starts_with(&repository.base))
+                    .max_by_key(|repository| repository.base.components().count())
+                    .ok_or_else(|| {
+                        format!(
+                            "protobuf descriptor is outside registered repositories: {}",
+                            path.display()
+                        )
+                    })?;
+                Ok(ProtobufDescriptorSource {
+                    repository: repository.repository.clone(),
+                    path,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let workspace =
+            Workspace::new(name, repositories)?.with_protobuf_descriptors(descriptors)?;
         let mut workspaces = self.workspaces.clone();
         workspaces.insert(workspace.name.clone(), workspace.clone());
         self.persist(&workspaces)?;
@@ -119,6 +171,14 @@ impl WorkspaceRegistry {
                             display_name: repository.display_name.clone(),
                             base: repository.base.clone(),
                             alternatives: repository.alternatives.clone(),
+                        })
+                        .collect(),
+                    protobuf_descriptors: workspace
+                        .protobuf_descriptors
+                        .iter()
+                        .map(|descriptor| StoredProtobufDescriptor {
+                            repository: descriptor.repository.identity.clone(),
+                            path: descriptor.path.clone(),
                         })
                         .collect(),
                 })

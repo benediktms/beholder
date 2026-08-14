@@ -237,6 +237,7 @@ pub struct FactChanges {
 pub struct Workspace {
     pub name: String,
     pub repositories: Vec<WorkspaceRepository>,
+    pub protobuf_descriptors: Vec<ProtobufDescriptorSource>,
 }
 
 impl Workspace {
@@ -280,8 +281,42 @@ impl Workspace {
                 repository
             })
             .collect();
-        Ok(Self { name, repositories })
+        Ok(Self {
+            name,
+            repositories,
+            protobuf_descriptors: Vec::new(),
+        })
     }
+
+    pub fn with_protobuf_descriptors(
+        mut self,
+        mut descriptors: Vec<ProtobufDescriptorSource>,
+    ) -> Result<Self, String> {
+        for descriptor in &descriptors {
+            if !self
+                .repositories
+                .iter()
+                .any(|repository| repository.repository == descriptor.repository)
+            {
+                return Err(format!(
+                    "protobuf descriptor references unknown repository {}",
+                    descriptor.repository.identity
+                ));
+            }
+        }
+        descriptors.sort_by(|left, right| {
+            (&left.repository.identity, &left.path).cmp(&(&right.repository.identity, &right.path))
+        });
+        descriptors.dedup();
+        self.protobuf_descriptors = descriptors;
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtobufDescriptorSource {
+    pub repository: LogicalRepository,
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

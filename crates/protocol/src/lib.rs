@@ -3,7 +3,8 @@ pub mod v1 {
 }
 
 use beholder_domain::{
-    LogicalRepository, Workspace as DomainWorkspace, WorkspaceRepository as DomainRepository,
+    LogicalRepository, ProtobufDescriptorSource, Workspace as DomainWorkspace,
+    WorkspaceRepository as DomainRepository,
 };
 use beholder_dto as dto;
 use std::path::PathBuf;
@@ -24,6 +25,14 @@ impl From<DomainWorkspace> for v1::Workspace {
                         .into_iter()
                         .map(|path| path.to_string_lossy().into_owned())
                         .collect(),
+                })
+                .collect(),
+            protobuf_descriptors: workspace
+                .protobuf_descriptors
+                .into_iter()
+                .map(|descriptor| v1::ProtobufDescriptorSource {
+                    repository: descriptor.repository.identity,
+                    path: descriptor.path.to_string_lossy().into_owned(),
                 })
                 .collect(),
         }
@@ -50,6 +59,18 @@ impl TryFrom<v1::Workspace> for DomainWorkspace {
                         .into_iter()
                         .map(PathBuf::from)
                         .collect(),
+                })
+                .collect(),
+        )?
+        .with_protobuf_descriptors(
+            workspace
+                .protobuf_descriptors
+                .into_iter()
+                .map(|descriptor| ProtobufDescriptorSource {
+                    repository: LogicalRepository {
+                        identity: descriptor.repository,
+                    },
+                    path: PathBuf::from(descriptor.path),
                 })
                 .collect(),
         )
@@ -565,12 +586,23 @@ mod tests {
                 alternatives: vec!["/code/repo-agent".into()],
             }],
         )
+        .unwrap()
+        .with_protobuf_descriptors(vec![ProtobufDescriptorSource {
+            repository: LogicalRepository {
+                identity: "github.com/company/repo".into(),
+            },
+            path: "/code/repo/contracts.bin".into(),
+        }])
         .unwrap();
 
         let protocol = v1::Workspace::from(workspace.clone());
         assert_eq!(protocol.repositories[0].identity, "github.com/company/repo");
         assert_eq!(protocol.repositories[0].base, "/code/repo");
         assert_eq!(protocol.repositories[0].alternatives, ["/code/repo-agent"]);
+        assert_eq!(
+            protocol.protobuf_descriptors[0].path,
+            "/code/repo/contracts.bin"
+        );
         assert_eq!(DomainWorkspace::try_from(protocol).unwrap(), workspace);
     }
 

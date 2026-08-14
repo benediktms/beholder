@@ -32,6 +32,14 @@ The adapter emits `defines`, `field_of`, `request_type`, and `response_type` as
 structural facts with exact descriptor evidence. They are available to typed
 queries but do not become dependency-traversal edges.
 
-Workspace configuration will select descriptor sets in a separate integration
-slice. Resolving generated clients, servers, or application calls to canonical
-RPCs is explicitly outside Phase 3.
+Register compiled descriptor sets explicitly:
+
+```text
+beholder workspace register platform /code/contracts /code/service \
+  --protobuf-descriptor /code/contracts/platform.descriptor.bin
+```
+
+Each descriptor must be inside one of the registered repositories. Its bytes
+participate in that repository state's fingerprint, and filesystem changes
+trigger reindexing. Resolving generated clients, servers, or application calls
+to canonical RPCs is explicitly outside Phase 3.
