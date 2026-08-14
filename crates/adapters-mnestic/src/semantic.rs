@@ -336,7 +336,10 @@ fn entity_ref(id: &str, kind: EntityKind) -> EntityRef {
         kind,
         name: entity_name(id),
         repository: repository(id),
-        origin: if id.starts_with("rust-call://") || id.starts_with("rust-method://") {
+        origin: if id.starts_with("rust-call://")
+            || id.starts_with("rust-method://")
+            || id.starts_with("elixir-module://")
+        {
             EntityOrigin::ExternalDependency
         } else {
             EntityOrigin::Source
@@ -378,6 +381,8 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::KafkaTopic
     } else if id.starts_with("rust-call://") || id.starts_with("rust-method://") {
         EntityKind::Callable
+    } else if id.starts_with("elixir-module://") {
+        EntityKind::Namespace
     } else if id.starts_with("proto-file://") {
         EntityKind::ProtoFile
     } else if id.starts_with("proto-message://") {
@@ -419,6 +424,9 @@ fn relation_kind_hint(relation: &str, source: bool, id: &str) -> EntityKind {
 }
 
 fn entity_name(id: &str) -> String {
+    if let Some(module) = id.strip_prefix("elixir-module://") {
+        return module.into();
+    }
     if let Some((service, method)) = id.strip_prefix("grpc://").and_then(|id| id.split_once('/')) {
         return format!(
             "{}.{}",

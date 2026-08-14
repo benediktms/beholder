@@ -51,8 +51,19 @@ target/debug/beholder daemon status >/dev/null
 mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
 mkdir -p "$state/elixir/lib"
-printf '%s\n' 'defmodule Beholder.Smoke do' '  def indexed(value), do: value' 'end' \
-    >"$state/elixir/lib/smoke.ex"
+printf '%s\n' \
+    'defmodule Beholder.Smoke.Macro do' \
+    '  defmacro __using__(_) do' \
+    '    quote do' \
+    '      def generated, do: :ok' \
+    '    end' \
+    '  end' \
+    'end' \
+    'defmodule Beholder.Smoke do' \
+    '  use Beholder.Smoke.Macro' \
+    '  import External.Helpers' \
+    '  def indexed(value), do: value' \
+    'end' >"$state/elixir/lib/smoke.ex"
 git -C "$state/elixir" init -q
 git -C "$state/elixir" config user.name 'Beholder Smoke'
 git -C "$state/elixir" config user.email 'smoke@beholder.local'
@@ -85,12 +96,25 @@ fi
 echo 'Checking Elixir module and function indexing...' >&2
 elixir_module='repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke'
 result="$(target/debug/beholder context --json --workspace main "$elixir_module")"
-for expected in '"kind":"namespace"' 'Beholder.Smoke/indexed/1' '"name":"indexed/1"'; do
+for expected in \
+    '"kind":"namespace"' \
+    'Beholder.Smoke/indexed/1' \
+    '"name":"indexed/1"' \
+    'Beholder.Smoke.Macro' \
+    '"kind":"uses"' \
+    'elixir-module://External.Helpers' \
+    '"kind":"imports"'; do
     if ! grep -Fq "$expected" <<<"$result"; then
         printf 'expected %s in Elixir context:\n%s\n' "$expected" "$result" >&2
         exit 1
     fi
 done
+macro_result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke.Macro')"
+if grep -Fq '/generated/0' <<<"$macro_result"; then
+    printf 'quoted macro expansion leaked into direct definitions:\n%s\n' "$macro_result" >&2
+    exit 1
+fi
 echo 'Checking Protobuf descriptor indexing...' >&2
 result="$(target/debug/beholder context --json --workspace main \
     'grpc://pricing.v1.Pricing/GetQuote')"

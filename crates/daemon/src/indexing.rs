@@ -6,7 +6,7 @@ use beholder_adapters_protobuf::{
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION, analyze as analyze_elixir,
-    observations_from_analysis as elixir_observations,
+    observations_from_analysis as elixir_observations, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
@@ -806,7 +806,8 @@ fn index_workspace_versioned(
         .iter()
         .flat_map(|facts| facts.observations.iter().cloned())
         .collect::<Vec<_>>();
-    let overrides = resolve_repository_calls(&mut all_observations);
+    let mut overrides = resolve_repository_calls(&mut all_observations);
+    overrides.extend(resolve_workspace_modules(&all_observations));
     let changes = store.publish(&view, &repository_facts, &overrides)?;
     tracing::info!(
         workspace = %workspace.name,
@@ -1199,10 +1200,15 @@ mod tests {
         let state = std::env::temp_dir().join(format!("beholder-elixir-source-units-{unique}"));
         let repository = state.join("repo");
         fs::create_dir_all(repository.join("lib")).unwrap();
+        fs::write(
+            repository.join("lib/macro.ex"),
+            "defmodule MyApp.Macro do\n  defmacro __using__(_) do\n    quote do\n      def generated, do: :ok\n    end\n  end\nend",
+        )
+        .unwrap();
         let changed = repository.join("lib/sample.ex");
         fs::write(
             &changed,
-            "defmodule MyApp.Sample do\n  def before, do: :ok\nend",
+            "defmodule MyApp.Sample do\n  use MyApp.Macro\n  import External.Helpers\n  def before, do: :ok\nend",
         )
         .unwrap();
 
@@ -1216,7 +1222,7 @@ mod tests {
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
         scheduler.mark(&workspace);
         scheduler.index(&store, &workspace).unwrap();
-        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 1);
+        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 2);
 
         let module = format!("repo://{identity}/elixir/MyApp.Sample");
         let context = store.context("main", &module).unwrap();
@@ -1226,10 +1232,34 @@ mod tests {
                 && node.kind == beholder_dto::EntityKind::Callable
                 && node.name == "before/0"
         }));
+        assert!(context.edges.iter().any(|edge| {
+            edge.from == module
+                && edge.to == format!("repo://{identity}/elixir/MyApp.Macro")
+                && edge.kind == beholder_dto::RelationKind::Uses
+        }));
+        assert!(context.edges.iter().any(|edge| {
+            edge.from == module
+                && edge.to == "elixir-module://External.Helpers"
+                && edge.kind == beholder_dto::RelationKind::Imports
+        }));
+        assert!(context.nodes.iter().any(|node| {
+            node.id == "elixir-module://External.Helpers"
+                && node.kind == beholder_dto::EntityKind::Namespace
+                && node.origin == beholder_dto::EntityOrigin::ExternalDependency
+                && node.repository.is_none()
+        }));
+        assert!(
+            !store
+                .context("main", &format!("repo://{identity}/elixir/MyApp.Macro"))
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|node| node.id.ends_with("/generated/0"))
+        );
 
         fs::write(
             &changed,
-            "defmodule MyApp.Sample do\n  def updated(value), do: value\nend",
+            "defmodule MyApp.Sample do\n  use MyApp.Macro\n  import External.Helpers\n  def updated(value), do: value\nend",
         )
         .unwrap();
         scheduler.add_event(
@@ -1246,7 +1276,7 @@ mod tests {
         );
 
         scheduler.index(&store, &workspace).unwrap();
-        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 2);
+        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 3);
         let context = store.context("main", &module).unwrap();
         assert!(
             context
