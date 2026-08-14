@@ -28,6 +28,10 @@ jobs:
       - uses: moonrepo/setup-toolchain@v0
         with:
           moon-version: 2.4.6
+      - name: Install Protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
       - name: Run affected checks
         run: >-
           moon ci
