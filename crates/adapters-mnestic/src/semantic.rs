@@ -348,6 +348,7 @@ fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigi
         origin: origin.unwrap_or_else(|| {
             if id.starts_with("rust-call://")
                 || id.starts_with("rust-method://")
+                || id.starts_with("elixir-call://")
                 || id.starts_with("elixir-module://")
             {
                 EntityOrigin::ExternalDependency
@@ -390,7 +391,10 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::GraphqlField
     } else if id.starts_with("kafka-topic://") {
         EntityKind::KafkaTopic
-    } else if id.starts_with("rust-call://") || id.starts_with("rust-method://") {
+    } else if id.starts_with("rust-call://")
+        || id.starts_with("rust-method://")
+        || id.starts_with("elixir-call://")
+    {
         EntityKind::Callable
     } else if id.starts_with("elixir-module://") {
         EntityKind::Namespace
@@ -437,6 +441,16 @@ fn relation_kind_hint(relation: &str, source: bool, id: &str) -> EntityKind {
 fn entity_name(id: &str) -> String {
     if let Some(module) = id.strip_prefix("elixir-module://") {
         return module.into();
+    }
+    if let Some(symbol) = id.strip_prefix("elixir-call://")
+        && let Some((function, arity)) = symbol.rsplit_once('/')
+        && arity.parse::<usize>().is_ok()
+    {
+        return if let Some((module, function)) = function.rsplit_once('/') {
+            format!("{module}.{function}/{arity}")
+        } else {
+            format!("{function}/{arity}")
+        };
     }
     if let Some((service, method)) = id.strip_prefix("grpc://").and_then(|id| id.split_once('/')) {
         return format!(

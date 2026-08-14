@@ -5,13 +5,15 @@ use beholder_adapters_protobuf::{
     FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, observations as protobuf_observations,
 };
 use beholder_adapters_treesitter_elixir::{
-    ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION, analyze as analyze_elixir,
+    ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
+    RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, analyze as analyze_elixir,
     generated_observations as elixir_generated_observations,
-    observations_from_analysis as elixir_observations, resolve_workspace_modules,
+    observations_from_analysis as elixir_observations,
+    resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, observations_from_analysis,
-    resolve_repository_calls,
+    resolve_repository_calls as resolve_rust_repository_calls,
 };
 use beholder_domain::{Observation, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, QueryMetadata};
@@ -40,6 +42,7 @@ struct AnalysisVersions {
     rust_frontend: &'static str,
     rust_resolver: &'static str,
     elixir_frontend: &'static str,
+    elixir_resolver: &'static str,
     protobuf_frontend: &'static str,
     rule_pack: &'static str,
 }
@@ -48,6 +51,7 @@ const CURRENT_ANALYSIS_VERSIONS: AnalysisVersions = AnalysisVersions {
     rust_frontend: FRONTEND_VERSION,
     rust_resolver: RESOLVER_VERSION,
     elixir_frontend: ELIXIR_FRONTEND_VERSION,
+    elixir_resolver: ELIXIR_RESOLVER_VERSION,
     protobuf_frontend: PROTOBUF_FRONTEND_VERSION,
     rule_pack: CORE_RULE_PACK_VERSION,
 };
@@ -75,6 +79,7 @@ struct RepositoryAnalysisKey {
     frontend_version: &'static str,
     resolver_version: &'static str,
     elixir_frontend_version: &'static str,
+    elixir_resolver_version: &'static str,
     protobuf_frontend_version: &'static str,
 }
 
@@ -556,6 +561,7 @@ impl IndexScheduler {
             frontend_version: versions.rust_frontend,
             resolver_version: versions.rust_resolver,
             elixir_frontend_version: versions.elixir_frontend,
+            elixir_resolver_version: versions.elixir_resolver,
             protobuf_frontend_version: versions.protobuf_frontend,
         };
         if let Some(observations) = self
@@ -575,6 +581,7 @@ impl IndexScheduler {
             .join(versions.rust_frontend)
             .join(versions.rust_resolver)
             .join(versions.elixir_frontend)
+            .join(versions.elixir_resolver)
             .join(versions.protobuf_frontend)
             .join(format!("{}.json", state.fingerprint));
         if let Ok(bytes) = fs::read(&path)
@@ -605,7 +612,7 @@ impl IndexScheduler {
                 path,
             ));
         }
-        resolve_repository_calls(&mut observations);
+        resolve_rust_repository_calls(&mut observations);
         let mut elixir_analyses = Vec::new();
         for (path, source) in elixir_sources {
             let (analysis, cache_status) = self
@@ -633,6 +640,7 @@ impl IndexScheduler {
             &elixir_sources,
             &observations,
         ));
+        resolve_elixir_repository_calls(&mut observations);
         for (_, descriptor) in descriptors {
             observations.extend(protobuf_observations(descriptor)?);
         }
@@ -761,10 +769,11 @@ fn index_workspace_versioned(
     let view = WorkspaceView::new(
         &workspace.name,
         format!(
-            "rust:{}:{}:elixir:{}:protobuf:{}:core-rules:{}",
+            "rust:{}:{}:elixir:{}:{}:protobuf:{}:core-rules:{}",
             versions.rust_frontend,
             versions.rust_resolver,
             versions.elixir_frontend,
+            versions.elixir_resolver,
             versions.protobuf_frontend,
             versions.rule_pack,
         ),
@@ -805,10 +814,11 @@ fn index_workspace_versioned(
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity: format!(
-                "rust:{}:{}:elixir:{}:protobuf:{}",
+                "rust:{}:{}:elixir:{}:{}:protobuf:{}",
                 versions.rust_frontend,
                 versions.rust_resolver,
                 versions.elixir_frontend,
+                versions.elixir_resolver,
                 versions.protobuf_frontend,
             ),
             observations: observations.as_ref().clone(),
@@ -818,7 +828,7 @@ fn index_workspace_versioned(
         .iter()
         .flat_map(|facts| facts.observations.iter().cloned())
         .collect::<Vec<_>>();
-    let mut overrides = resolve_repository_calls(&mut all_observations);
+    let mut overrides = resolve_rust_repository_calls(&mut all_observations);
     overrides.extend(resolve_workspace_modules(&all_observations));
     let changes = store.publish(&view, &repository_facts, &overrides)?;
     tracing::info!(
@@ -1040,6 +1050,7 @@ mod tests {
             rust_frontend: "1",
             rust_resolver: "1",
             elixir_frontend: "1",
+            elixir_resolver: "1",
             protobuf_frontend: "1",
             rule_pack: "1",
         };
@@ -1214,13 +1225,13 @@ mod tests {
         fs::create_dir_all(repository.join("lib")).unwrap();
         fs::write(
             repository.join("lib/macro.ex"),
-            "defmodule MyApp.Macro do\n  defmacro __using__(_) do\n    quote do\n      def generated, do: :ok\n    end\n  end\nend",
+            "defmodule MyApp.Macro do\n  defmacro __using__(_) do\n    quote do\n      def generated(value), do: MyApp.Helper.work(value)\n    end\n  end\nend\ndefmodule MyApp.Helper do\n  def work(value), do: value\nend",
         )
         .unwrap();
         let changed = repository.join("lib/sample.ex");
         fs::write(
             &changed,
-            "defmodule MyApp do\n  defmodule Sample do\n    use MyApp.Macro, mode: :strict\n    import External.Helpers, only: [help: 1]\n    require External.Macros, as: Macros\n    def before, do: :ok\n  end\nend",
+            "defmodule MyApp do\n  defmodule Sample do\n    use MyApp.Macro, mode: :strict\n    import External.Helpers, only: [help: 1]\n    require External.Macros, as: Macros\n    def before, do: helper()\n    defp helper, do: :ok\n  end\nend",
         )
         .unwrap();
 
@@ -1245,13 +1256,13 @@ mod tests {
                 && node.name == "before/0"
         }));
         assert!(context.nodes.iter().any(|node| {
-            node.id == format!("{module}/generated/0")
+            node.id == format!("{module}/generated/1")
                 && node.kind == beholder_dto::EntityKind::Callable
                 && node.origin == beholder_dto::EntityOrigin::Generated
         }));
         assert!(context.edges.iter().any(|edge| {
             edge.from == module
-                && edge.to == format!("{module}/generated/0")
+                && edge.to == format!("{module}/generated/1")
                 && edge.kind == beholder_dto::RelationKind::Defines
                 && edge.evidence.iter().any(|evidence| {
                     evidence.source_kind == beholder_dto::EvidenceKind::Generated
@@ -1280,13 +1291,37 @@ mod tests {
                 && node.origin == beholder_dto::EntityOrigin::ExternalDependency
                 && node.repository.is_none()
         }));
+        let local_call = store
+            .context("main", &format!("{module}/before/0"))
+            .unwrap();
+        assert!(local_call.edges.iter().any(|edge| {
+            edge.from == format!("{module}/before/0")
+                && edge.to == format!("{module}/helper/0")
+                && edge.kind == beholder_dto::RelationKind::Calls
+        }));
+        let generated_call = store
+            .context("main", &format!("{module}/generated/1"))
+            .unwrap();
+        assert_eq!(
+            generated_call.root.origin,
+            beholder_dto::EntityOrigin::Generated
+        );
+        assert!(generated_call.edges.iter().any(|edge| {
+            edge.from == format!("{module}/generated/1")
+                && edge.to == format!("repo://{identity}/elixir/MyApp.Helper/work/1")
+                && edge.kind == beholder_dto::RelationKind::Calls
+                && edge
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.source_kind == beholder_dto::EvidenceKind::Generated)
+        }));
         assert!(
             !store
                 .context("main", &format!("repo://{identity}/elixir/MyApp.Macro"))
                 .unwrap()
                 .nodes
                 .iter()
-                .any(|node| node.id.ends_with("/generated/0"))
+                .any(|node| node.id.ends_with("/generated/1"))
         );
 
         fs::write(

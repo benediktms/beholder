@@ -55,7 +55,7 @@ printf '%s\n' \
     'defmodule Beholder.Macro do' \
     '  defmacro __using__(_) do' \
     '    quote do' \
-    '      def generated, do: :ok' \
+    '      def generated(value), do: Beholder.Helper.work(value)' \
     '    end' \
     '  end' \
     'end' \
@@ -64,8 +64,12 @@ printf '%s\n' \
     '    use Beholder.Macro, mode: :strict' \
     '    import External.Helpers, only: [help: 1]' \
     '    require External.Macros, as: Macros' \
-    '    def indexed(value), do: value' \
+    '    def indexed(value), do: helper(value)' \
+    '    defp helper(value), do: value' \
     '  end' \
+    'end' \
+    'defmodule Beholder.Helper do' \
+    '  def work(value), do: value' \
     'end' >"$state/elixir/lib/smoke.ex"
 git -C "$state/elixir" init -q
 git -C "$state/elixir" config user.name 'Beholder Smoke'
@@ -103,7 +107,7 @@ for expected in \
     '"kind":"namespace"' \
     'Beholder.Smoke/indexed/1' \
     '"name":"indexed/1"' \
-    'Beholder.Smoke/generated/0' \
+    'Beholder.Smoke/generated/1' \
     '"origin":"generated"' \
     '"source":"generated"' \
     'Beholder.Macro' \
@@ -117,9 +121,25 @@ for expected in \
         exit 1
     fi
 done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke/indexed/1')"
+for expected in 'Beholder.Smoke/helper/1' '"kind":"calls"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in local Elixir call context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke/generated/1')"
+for expected in 'Beholder.Helper/work/1' '"kind":"calls"' '"source":"generated"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in generated Elixir call context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
 macro_result="$(target/debug/beholder context --json --workspace main \
     'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Macro')"
-if grep -Fq '/generated/0' <<<"$macro_result"; then
+if grep -Fq '/generated/1' <<<"$macro_result"; then
     printf 'quoted macro expansion leaked into direct definitions:\n%s\n' "$macro_result" >&2
     exit 1
 fi
