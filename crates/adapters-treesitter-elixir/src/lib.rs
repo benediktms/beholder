@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-pub const FRONTEND_VERSION: &str = "1";
+pub const FRONTEND_VERSION: &str = "2";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ElixirAnalysis {
@@ -38,13 +38,27 @@ fn arguments(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| child.kind() == "arguments")
 }
 
-fn function_head<'a>(node: Node<'a>, source: &'a [u8]) -> Option<(&'a str, usize)> {
+fn function_head<'a>(node: Node<'a>, source: &'a [u8]) -> Option<(&'a str, usize, usize)> {
     match node.kind() {
-        "identifier" => Some((text(node, source)?, 0)),
+        "identifier" => Some((text(node, source)?, 0, 0)),
         "call" => {
             let name = call_target(node, source)?;
-            let arity = arguments(node).map_or(0, |arguments| arguments.named_child_count());
-            Some((name, arity))
+            let arguments = arguments(node);
+            let max_arity = arguments.map_or(0, |arguments| arguments.named_child_count());
+            let defaults = arguments.map_or(0, |arguments| {
+                let mut cursor = arguments.walk();
+                arguments
+                    .named_children(&mut cursor)
+                    .filter(|argument| {
+                        argument.kind() == "binary_operator"
+                            && argument
+                                .child_by_field_name("operator")
+                                .and_then(|operator| text(operator, source))
+                                == Some("\\\\")
+                    })
+                    .count()
+            });
+            Some((name, max_arity - defaults, max_arity))
         }
         "binary_operator" => function_head(node.child_by_field_name("left")?, source),
         _ => None,
@@ -73,24 +87,26 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                     return;
                 }
             }
-            Some("def" | "defp") => {
+            Some("def" | "defp" | "defdelegate") => {
                 if let Some(module) = module
-                    && let Some((name, arity)) = arguments(node)
+                    && let Some((name, min_arity, max_arity)) = arguments(node)
                         .and_then(|arguments| arguments.named_child(0))
                         .and_then(|head| function_head(head, source))
                 {
                     let functions = &mut modules[module].functions;
-                    // ponytail: retain first-clause evidence until storage supports multiple
-                    // evidence records for one semantic edge.
-                    if !functions
-                        .iter()
-                        .any(|function| function.name == name && function.arity == arity)
-                    {
-                        functions.push(ElixirFunction {
-                            name: name.into(),
-                            arity,
-                            line: node.start_position().row + 1,
-                        });
+                    for arity in min_arity..=max_arity {
+                        // ponytail: retain first-clause evidence until storage supports multiple
+                        // evidence records for one semantic edge.
+                        if !functions
+                            .iter()
+                            .any(|function| function.name == name && function.arity == arity)
+                        {
+                            functions.push(ElixirFunction {
+                                name: name.into(),
+                                arity,
+                                line: node.start_position().row + 1,
+                            });
+                        }
                     }
                 }
                 return;
@@ -176,6 +192,7 @@ mod tests {
             defmodule MyApp.Payments do
               def create_payment(account, amount), do: {:ok, account, amount}
               defp normalize(value \\ nil), do: value
+              defdelegate lookup(id, opts \\ []), to: Backend
               def create_payment(account, amount) when amount > 0, do: {:ok, account, amount}
             end
             "#,
@@ -200,7 +217,10 @@ mod tests {
             functions,
             vec![
                 "repo://payments/elixir/MyApp.Payments/create_payment/2",
+                "repo://payments/elixir/MyApp.Payments/normalize/0",
                 "repo://payments/elixir/MyApp.Payments/normalize/1",
+                "repo://payments/elixir/MyApp.Payments/lookup/1",
+                "repo://payments/elixir/MyApp.Payments/lookup/2",
             ]
         );
     }
