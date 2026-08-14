@@ -493,6 +493,16 @@ fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
+    db.run_script(
+        CREATE_FINGERPRINT_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_REPOSITORY_STATE_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
     db.run_script(SEED, BTreeMap::new(), ScriptMutability::Mutable)?;
     db.run_script(
         SEED_DEPENDENCIES,

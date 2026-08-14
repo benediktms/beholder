@@ -192,7 +192,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             pid: std::process::id(),
         }))
     }
@@ -512,7 +512,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 4);
+        assert_eq!(status.protocol_version, 5);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");

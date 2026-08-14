@@ -423,7 +423,7 @@ pub fn visibility(entity: &EntityRef, include_tests: bool) -> Visibility {
         Visibility::HiddenByDefault
     } else if entity.origin != EntityOrigin::Source {
         Visibility::Supporting
-    } else if entity.kind == EntityKind::Namespace {
+    } else if matches!(entity.kind, EntityKind::Namespace | EntityKind::ProtoFile) {
         Visibility::HiddenByDefault
     } else {
         Visibility::Primary
@@ -531,6 +531,11 @@ fn kind_label(kind: EntityKind) -> &'static str {
         EntityKind::GraphqlField => "GraphQL",
         EntityKind::KafkaTopic => "Kafka",
         EntityKind::Namespace => "namespaces",
+        EntityKind::ProtoEnum => "Protobuf enums",
+        EntityKind::ProtoField => "Protobuf fields",
+        EntityKind::ProtoFile => "Protobuf files",
+        EntityKind::ProtoMessage => "Protobuf messages",
+        EntityKind::ProtoService => "Protobuf services",
         EntityKind::Rpc => "RPCs",
         EntityKind::Service => "services",
         EntityKind::Unknown => "other",

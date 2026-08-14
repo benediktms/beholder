@@ -59,6 +59,7 @@ impl Confidence {
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     Ast,
+    Descriptor,
     UniqueNameHeuristic,
 }
 
@@ -66,6 +67,7 @@ impl Provenance {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ast => "ast",
+            Self::Descriptor => "descriptor",
             Self::UniqueNameHeuristic => "unique_name_heuristic",
         }
     }
@@ -87,6 +89,9 @@ impl From<&str> for Evidence {
 #[serde(rename_all = "snake_case")]
 pub enum StructuralRelation {
     Defines,
+    FieldOf,
+    RequestType,
+    ResponseType,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -127,6 +132,9 @@ impl SemanticRelation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Structural(StructuralRelation::Defines) => "defines",
+            Self::Structural(StructuralRelation::FieldOf) => "field_of",
+            Self::Structural(StructuralRelation::RequestType) => "request_type",
+            Self::Structural(StructuralRelation::ResponseType) => "response_type",
             Self::Dependency(relation) => relation.as_str(),
         }
     }
@@ -197,6 +205,22 @@ impl Observation {
             evidence: evidence.into(),
             confidence: Confidence::Exact,
             provenance: Provenance::Ast,
+        }
+    }
+
+    pub fn descriptor(
+        from: impl Into<EntityId>,
+        relation: StructuralRelation,
+        to: impl Into<EntityId>,
+        descriptor: impl Into<Evidence>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            relation: SemanticRelation::Structural(relation),
+            to: to.into(),
+            evidence: descriptor.into(),
+            confidence: Confidence::Exact,
+            provenance: Provenance::Descriptor,
         }
     }
 }

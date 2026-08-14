@@ -1,0 +1,13 @@
+[package]
+name = "beholder-adapters-protobuf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+beholder-domain.workspace = true
+prost = "0.14.4"
+prost-types = "0.14.4"
+
+[dev-dependencies]
+beholder-adapters-mnestic.workspace = true
+beholder-dto.workspace = true

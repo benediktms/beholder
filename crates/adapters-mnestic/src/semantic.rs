@@ -305,7 +305,12 @@ fn kind_priority(kind: EntityKind) -> u8 {
         EntityKind::GraphqlField
         | EntityKind::KafkaTopic
         | EntityKind::Rpc
-        | EntityKind::Service => 3,
+        | EntityKind::Service
+        | EntityKind::ProtoEnum
+        | EntityKind::ProtoField
+        | EntityKind::ProtoFile
+        | EntityKind::ProtoMessage
+        | EntityKind::ProtoService => 3,
     }
 }
 
@@ -373,6 +378,16 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::KafkaTopic
     } else if id.starts_with("rust-call://") || id.starts_with("rust-method://") {
         EntityKind::Callable
+    } else if id.starts_with("proto-file://") {
+        EntityKind::ProtoFile
+    } else if id.starts_with("proto-message://") {
+        EntityKind::ProtoMessage
+    } else if id.starts_with("proto-field://") {
+        EntityKind::ProtoField
+    } else if id.starts_with("proto-enum://") {
+        EntityKind::ProtoEnum
+    } else if id.starts_with("proto-service://") {
+        EntityKind::ProtoService
     } else {
         EntityKind::Unknown
     }
@@ -393,6 +408,13 @@ fn relation_kind_hint(relation: &str, source: bool, id: &str) -> EntityKind {
 }
 
 fn entity_name(id: &str) -> String {
+    if let Some((service, method)) = id.strip_prefix("grpc://").and_then(|id| id.split_once('/')) {
+        return format!(
+            "{}.{}",
+            service.rsplit('.').next().unwrap_or(service),
+            method
+        );
+    }
     id.rsplit(['/', ':'])
         .find(|part| !part.is_empty())
         .unwrap_or(id)
@@ -407,7 +429,7 @@ fn repository(id: &str) -> Option<String> {
 }
 
 fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
-    let (path, line) = evidence
+    let (mut path, line) = evidence
         .rsplit_once(':')
         .and_then(|(path, line)| {
             line.parse()
@@ -415,11 +437,15 @@ fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
                 .map(|line| (Some(path.into()), Some(line)))
         })
         .unwrap_or((None, None));
+    if provenance == "descriptor" && path.is_none() {
+        path = Some(evidence.into());
+    }
     let has_path = path.is_some();
     EvidenceRef {
         source_kind: match provenance {
             "ast" => EvidenceKind::Ast,
             "unique_name_heuristic" => EvidenceKind::Inference,
+            "descriptor" => EvidenceKind::Descriptor,
             _ => EvidenceKind::Unknown,
         },
         repository: repository(from),

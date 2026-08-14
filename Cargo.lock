@@ -262,6 +262,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "beholder-adapters-protobuf"
+version = "0.1.0"
+dependencies = [
+ "beholder-adapters-mnestic",
+ "beholder-domain",
+ "beholder-dto",
+ "prost",
+ "prost-types",
+]
+
+[[package]]
 name = "beholder-adapters-treesitter-rust"
 version = "0.1.0"
 dependencies = [
