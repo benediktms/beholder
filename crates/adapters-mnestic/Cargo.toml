@@ -7,9 +7,10 @@ edition.workspace = true
 default = []
 devtools = ["sqlite"]
 parallel = ["mnestic-engine/rayon"]
-sqlite = ["mnestic-engine/storage-sqlite", "mnestic-engine/storage-sqlite-src"]
+sqlite = ["dep:sqlite", "mnestic-engine/storage-sqlite", "mnestic-engine/storage-sqlite-src"]
 
 [dependencies]
 beholder-domain.workspace = true
 beholder-dto.workspace = true
 mnestic-engine = { package = "mnestic", version = "0.14.0", default-features = false }
+sqlite = { version = "0.36.0", optional = true }

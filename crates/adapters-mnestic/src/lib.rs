@@ -48,29 +48,36 @@ pub struct InspectionResult {
 
 pub struct SemanticStore {
     db: DbInstance,
+    read_db: DbInstance,
 }
 
 impl SemanticStore {
     pub fn memory() -> Result<Self, Box<dyn Error>> {
+        let db = memory_database()?;
         Ok(Self {
-            db: memory_database()?,
+            read_db: db.clone(),
+            db,
         })
     }
 
     pub fn persistent(path: &Path, initialize: bool) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            db: persistent_database(path, initialize)?,
-        })
+        let db = persistent_database(path, initialize)?;
+        #[cfg(feature = "sqlite")]
+        sqlite::open(path)?.execute("PRAGMA journal_mode=WAL")?;
+        let read_db = persistent_database(path, false)?;
+        Ok(Self { db, read_db })
     }
 
     pub fn benchmark_store(storage: &str, path: Option<&str>) -> Result<Self, Box<dyn Error>> {
+        let db = benchmark_database(storage, path)?;
         Ok(Self {
-            db: benchmark_database(storage, path)?,
+            read_db: db.clone(),
+            db,
         })
     }
 
     pub fn view_matches(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
-        view_matches(&self.db, view)
+        view_matches(&self.read_db, view)
     }
 
     pub fn publish(
@@ -83,25 +90,25 @@ impl SemanticStore {
     }
 
     pub fn inspect_relations(&self) -> Result<InspectionResult, Box<dyn Error>> {
-        inspect_relations(&self.db).map(inspection_result)
+        inspect_relations(&self.read_db).map(inspection_result)
     }
 
     pub fn inspect_revisions(&self) -> Result<InspectionResult, Box<dyn Error>> {
-        inspect_revisions(&self.db).map(inspection_result)
+        inspect_revisions(&self.read_db).map(inspection_result)
     }
 
     pub fn inspect_observations(
         &self,
         relation: Option<&str>,
     ) -> Result<InspectionResult, Box<dyn Error>> {
-        inspect_observations(&self.db, relation).map(inspection_result)
+        inspect_observations(&self.read_db, relation).map(inspection_result)
     }
 
     pub fn context(&self, view: &str, entity: &str) -> Result<ContextResult, Box<dyn Error>> {
         semantic::context(
             view,
             entity,
-            inspection_result(context(&self.db, view, entity)?),
+            inspection_result(context(&self.read_db, view, entity)?),
         )
     }
 
@@ -124,7 +131,7 @@ impl SemanticStore {
             view,
             from,
             to,
-            inspection_result(trace(&self.db, view, from, to)?),
+            inspection_result(trace(&self.read_db, view, from, to)?),
         )
     }
 
@@ -148,7 +155,7 @@ impl SemanticStore {
         semantic::impact(
             view,
             entity,
-            inspection_result(impact(&self.db, view, entity)?),
+            inspection_result(impact(&self.read_db, view, entity)?),
         )
     }
 
@@ -174,7 +181,7 @@ impl SemanticStore {
         semantic::dependencies(
             view,
             entity,
-            inspection_result(dependencies(&self.db, view, entity)?),
+            inspection_result(dependencies(&self.read_db, view, entity)?),
         )
     }
 
@@ -197,7 +204,7 @@ impl SemanticStore {
         view: &str,
         read: impl FnOnce(&MultiTransaction) -> Result<T, Box<dyn Error>>,
     ) -> Result<Revisioned<T>, Box<dyn Error>> {
-        let transaction = self.db.multi_transaction(false);
+        let transaction = self.read_db.multi_transaction(false);
         let result = read(&transaction)?;
         let analysis_revision = analysis_revision(&transaction, view)?;
         transaction.abort()?;
@@ -1236,7 +1243,13 @@ mod tests {
     use beholder_domain::{
         Confidence, DependencyRelation, LogicalRepository, Provenance, StructuralRelation,
     };
-    use std::{collections::BTreeSet, fs, time::SystemTime};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        sync::{Arc, mpsc},
+        thread,
+        time::{Duration, SystemTime},
+    };
 
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
         RepositoryFacts {
@@ -1244,6 +1257,73 @@ mod tests {
             analysis_identity: "analysis".into(),
             observations,
         }
+    }
+
+    #[test]
+    fn persistent_reads_serve_the_completed_revision_during_a_write() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-concurrent-read-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let store =
+            Arc::new(SemanticStore::persistent(&state_dir.join("beholder.db"), true).unwrap());
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .publish(
+                &view,
+                &[facts(
+                    &view,
+                    vec![Observation::dependency(
+                        "repo/caller",
+                        DependencyRelation::Calls,
+                        "repo/target",
+                        "src/lib.rs:1",
+                    )],
+                )],
+                &[],
+            )
+            .unwrap();
+
+        let writer = store.db.multi_transaction(true);
+        writer
+            .run_script(
+                "?[state, from, relation, to, evidence] := \
+                     i in int_range(10000), state = 'pending', from = to_string(i), \
+                     relation = 'calls', to = 'target', evidence = 'probe' \
+                 :put state_observation {state, from, relation, to => evidence}",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let (sent, received) = mpsc::channel();
+        let reader = store.clone();
+        let reader_thread = thread::spawn(move || {
+            let snapshot = reader.context_snapshot("main", "repo/caller").unwrap();
+            sent.send((snapshot.analysis_revision, snapshot.result.edges.len()))
+                .unwrap();
+        });
+
+        let (revision, edge_count) = received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("read blocked behind the uncommitted writer");
+        assert_eq!(revision, 1);
+        assert_eq!(edge_count, 1);
+        writer.abort().unwrap();
+        reader_thread.join().unwrap();
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]
@@ -1351,7 +1431,10 @@ mod tests {
         assert!(feature.contains("pricing/get_price_v2"));
         assert!(!feature.contains("pricing/get_price\""));
 
-        let store = SemanticStore { db };
+        let store = SemanticStore {
+            read_db: db.clone(),
+            db,
+        };
         let result = store.context("main", "rpc/Pricing.GetPrice").unwrap();
         assert_eq!(result.edges.len(), 2);
         assert!(

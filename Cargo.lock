@@ -259,6 +259,7 @@ dependencies = [
  "beholder-domain",
  "beholder-dto",
  "mnestic",
+ "sqlite",
 ]
 
 [[package]]
