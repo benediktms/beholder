@@ -60,6 +60,7 @@ impl Confidence {
 pub enum Provenance {
     Ast,
     Descriptor,
+    Generated,
     UniqueNameHeuristic,
 }
 
@@ -68,6 +69,7 @@ impl Provenance {
         match self {
             Self::Ast => "ast",
             Self::Descriptor => "descriptor",
+            Self::Generated => "generated",
             Self::UniqueNameHeuristic => "unique_name_heuristic",
         }
     }
@@ -225,6 +227,22 @@ impl Observation {
             evidence: descriptor.into(),
             confidence: Confidence::Exact,
             provenance: Provenance::Descriptor,
+        }
+    }
+
+    pub fn generated(
+        from: impl Into<EntityId>,
+        relation: StructuralRelation,
+        to: impl Into<EntityId>,
+        evidence: impl Into<Evidence>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            relation: SemanticRelation::Structural(relation),
+            to: to.into(),
+            evidence: evidence.into(),
+            confidence: Confidence::Exact,
+            provenance: Provenance::Generated,
         }
     }
 }

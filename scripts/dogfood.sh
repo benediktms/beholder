@@ -103,6 +103,9 @@ for expected in \
     '"kind":"namespace"' \
     'Beholder.Smoke/indexed/1' \
     '"name":"indexed/1"' \
+    'Beholder.Smoke/generated/0' \
+    '"origin":"generated"' \
+    '"source":"generated"' \
     'Beholder.Macro' \
     '"kind":"uses"' \
     'elixir-module://External.Helpers' \

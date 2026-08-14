@@ -211,6 +211,7 @@ pub(super) fn trace(
 struct GraphBuilder {
     edges: BTreeMap<EdgeKey, EdgeData>,
     kinds: BTreeMap<String, EntityKind>,
+    origins: BTreeMap<String, EntityOrigin>,
 }
 
 struct EdgeData {
@@ -239,6 +240,9 @@ impl GraphBuilder {
         let key = (from.into(), to.into(), relation);
         self.hint(from, relation_kind_hint(relation.as_str(), true, from));
         self.hint(to, relation_kind_hint(relation.as_str(), false, to));
+        if relation == RelationKind::Defines && provenance == "generated" {
+            self.origins.insert(to.into(), EntityOrigin::Generated);
+        }
         let evidence = evidence_ref(from, evidence, provenance);
         self.edges
             .entry(key.clone())
@@ -262,12 +266,13 @@ impl GraphBuilder {
         let nodes = ids
             .into_iter()
             .map(|id| {
-                entity_ref(
+                entity_ref_with_origin(
                     &id,
                     self.kinds
                         .get(&id)
                         .copied()
                         .unwrap_or_else(|| infer_kind(&id)),
+                    self.origins.get(&id).copied(),
                 )
             })
             .collect::<Vec<_>>();
@@ -331,19 +336,25 @@ impl GraphOutput {
 }
 
 fn entity_ref(id: &str, kind: EntityKind) -> EntityRef {
+    entity_ref_with_origin(id, kind, None)
+}
+
+fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigin>) -> EntityRef {
     EntityRef {
         id: id.into(),
         kind,
         name: entity_name(id),
         repository: repository(id),
-        origin: if id.starts_with("rust-call://")
-            || id.starts_with("rust-method://")
-            || id.starts_with("elixir-module://")
-        {
-            EntityOrigin::ExternalDependency
-        } else {
-            EntityOrigin::Source
-        },
+        origin: origin.unwrap_or_else(|| {
+            if id.starts_with("rust-call://")
+                || id.starts_with("rust-method://")
+                || id.starts_with("elixir-module://")
+            {
+                EntityOrigin::ExternalDependency
+            } else {
+                EntityOrigin::Source
+            }
+        }),
         test: is_test_entity(id),
     }
 }
@@ -477,6 +488,7 @@ fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
             "ast" => EvidenceKind::Ast,
             "unique_name_heuristic" => EvidenceKind::Inference,
             "descriptor" => EvidenceKind::Descriptor,
+            "generated" => EvidenceKind::Generated,
             _ => EvidenceKind::Unknown,
         },
         repository: repository(from),

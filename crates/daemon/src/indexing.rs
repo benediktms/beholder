@@ -6,6 +6,7 @@ use beholder_adapters_protobuf::{
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION, analyze as analyze_elixir,
+    generated_observations as elixir_generated_observations,
     observations_from_analysis as elixir_observations, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
@@ -605,6 +606,7 @@ impl IndexScheduler {
             ));
         }
         resolve_repository_calls(&mut observations);
+        let mut elixir_analyses = Vec::new();
         for (path, source) in elixir_sources {
             let (analysis, cache_status) = self
                 .elixir_analysis_versioned(source, versions.elixir_frontend)
@@ -620,7 +622,17 @@ impl IndexScheduler {
                 &analysis,
                 path,
             ));
+            elixir_analyses.push((path.as_path(), analysis));
         }
+        let elixir_sources = elixir_analyses
+            .iter()
+            .map(|(path, analysis)| (*path, analysis.as_ref()))
+            .collect::<Vec<_>>();
+        observations.extend(elixir_generated_observations(
+            &state.repository.identity,
+            &elixir_sources,
+            &observations,
+        ));
         for (_, descriptor) in descriptors {
             observations.extend(protobuf_observations(descriptor)?);
         }
@@ -1231,6 +1243,21 @@ mod tests {
             node.id == format!("{module}/before/0")
                 && node.kind == beholder_dto::EntityKind::Callable
                 && node.name == "before/0"
+        }));
+        assert!(context.nodes.iter().any(|node| {
+            node.id == format!("{module}/generated/0")
+                && node.kind == beholder_dto::EntityKind::Callable
+                && node.origin == beholder_dto::EntityOrigin::Generated
+        }));
+        assert!(context.edges.iter().any(|edge| {
+            edge.from == module
+                && edge.to == format!("{module}/generated/0")
+                && edge.kind == beholder_dto::RelationKind::Defines
+                && edge.evidence.iter().any(|evidence| {
+                    evidence.source_kind == beholder_dto::EvidenceKind::Generated
+                        && evidence.path.as_deref() == Some("lib/macro.ex")
+                        && evidence.line == Some(4)
+                })
         }));
         assert!(context.edges.iter().any(|edge| {
             edge.from == module

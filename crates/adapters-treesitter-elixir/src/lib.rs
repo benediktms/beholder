@@ -3,11 +3,11 @@ use beholder_domain::{
     SemanticRelation, StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-pub const FRONTEND_VERSION: &str = "4";
+pub const FRONTEND_VERSION: &str = "5";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ElixirAnalysis {
@@ -19,6 +19,7 @@ struct ElixirModule {
     name: String,
     line: usize,
     functions: Vec<ElixirFunction>,
+    using_functions: Vec<ElixirFunction>,
     references: Vec<ElixirModuleReference>,
 }
 
@@ -84,6 +85,61 @@ fn function_head<'a>(node: Node<'a>, source: &'a [u8]) -> Option<(&'a str, usize
     }
 }
 
+fn push_function(functions: &mut Vec<ElixirFunction>, node: Node<'_>, source: &[u8]) {
+    let Some((name, min_arity, max_arity)) = arguments(node)
+        .and_then(|arguments| arguments.named_child(0))
+        .and_then(|head| function_head(head, source))
+        .filter(|(name, _, _)| *name != "unquote")
+    else {
+        return;
+    };
+    for arity in min_arity..=max_arity {
+        // ponytail: retain first-clause evidence until storage supports multiple
+        // evidence records for one semantic edge.
+        if !functions
+            .iter()
+            .any(|function| function.name == name && function.arity == arity)
+        {
+            functions.push(ElixirFunction {
+                name: name.into(),
+                arity,
+                line: node.start_position().row + 1,
+            });
+        }
+    }
+}
+
+fn collect_quoted_functions(node: Node<'_>, source: &[u8], functions: &mut Vec<ElixirFunction>) {
+    // ponytail: literal top-level definitions only; use compiler expansion when dynamic macros
+    // must be modelled.
+    if node.kind() == "call" {
+        if matches!(call_target(node, source), Some("def" | "defp")) {
+            push_function(functions, node, source);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_quoted_functions(child, source, functions);
+    }
+}
+
+fn collect_using_functions(node: Node<'_>, source: &[u8], functions: &mut Vec<ElixirFunction>) {
+    if node.kind() == "call" {
+        if call_target(node, source) == Some("quote") {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_quoted_functions(child, source, functions);
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_using_functions(child, source, functions);
+    }
+}
+
 fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut Vec<ElixirModule>) {
     if node.kind() == "call" {
         match call_target(node, source) {
@@ -105,6 +161,7 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                         name,
                         line: node.start_position().row + 1,
                         functions: Vec::new(),
+                        using_functions: Vec::new(),
                         references: Vec::new(),
                     });
                     let mut cursor = node.walk();
@@ -115,26 +172,8 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                 }
             }
             Some("def" | "defp" | "defdelegate") => {
-                if let Some(module) = module
-                    && let Some((name, min_arity, max_arity)) = arguments(node)
-                        .and_then(|arguments| arguments.named_child(0))
-                        .and_then(|head| function_head(head, source))
-                {
-                    let functions = &mut modules[module].functions;
-                    for arity in min_arity..=max_arity {
-                        // ponytail: retain first-clause evidence until storage supports multiple
-                        // evidence records for one semantic edge.
-                        if !functions
-                            .iter()
-                            .any(|function| function.name == name && function.arity == arity)
-                        {
-                            functions.push(ElixirFunction {
-                                name: name.into(),
-                                arity,
-                                line: node.start_position().row + 1,
-                            });
-                        }
-                    }
+                if let Some(module) = module {
+                    push_function(&mut modules[module].functions, node, source);
                 }
                 return;
             }
@@ -166,7 +205,23 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                 }
                 return;
             }
-            Some("defmacro" | "defmacrop" | "quote") => return,
+            Some("defmacro") => {
+                if let Some(module) = module
+                    && arguments(node)
+                        .and_then(|arguments| arguments.named_child(0))
+                        .and_then(|head| function_head(head, source))
+                        .is_some_and(|(name, _, _)| name == "__using__")
+                {
+                    let mut functions = Vec::new();
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        collect_using_functions(child, source, &mut functions);
+                    }
+                    modules[module].using_functions = functions;
+                }
+                return;
+            }
+            Some("defmacrop" | "quote") => return,
             _ => {}
         }
     }
@@ -235,6 +290,65 @@ pub fn observations_from_analysis(
     observations
 }
 
+pub fn generated_observations(
+    repository: &str,
+    sources: &[(&Path, &ElixirAnalysis)],
+    observations: &[Observation],
+) -> Vec<Observation> {
+    let mut macros = BTreeMap::<&str, Option<(&Path, &[ElixirFunction])>>::new();
+    for (path, analysis) in sources {
+        for module in &analysis.modules {
+            if module.using_functions.is_empty() {
+                continue;
+            }
+            macros
+                .entry(&module.name)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some((path, &module.using_functions)));
+        }
+    }
+
+    let mut definitions = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+        })
+        .map(|observation| {
+            (
+                observation.from.as_str().to_owned(),
+                observation.to.as_str().to_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut generated = Vec::new();
+    for (_, analysis) in sources {
+        for module in &analysis.modules {
+            let module_id = format!("repo://{repository}/elixir/{}", module.name);
+            for reference in module
+                .references
+                .iter()
+                .filter(|reference| reference.kind == ElixirModuleReferenceKind::Use)
+            {
+                let Some(Some((path, functions))) = macros.get(reference.name.as_str()) else {
+                    continue;
+                };
+                for function in *functions {
+                    let function_id = format!("{module_id}/{}/{}", function.name, function.arity);
+                    if definitions.insert((module_id.clone(), function_id.clone())) {
+                        generated.push(Observation::generated(
+                            module_id.clone(),
+                            StructuralRelation::Defines,
+                            function_id,
+                            format!("{}:{}", path.display(), function.line),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    generated
+}
+
 pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<DependencyOverride> {
     let mut definitions = BTreeMap::<String, Option<String>>::new();
     for observation in observations.iter().filter(|observation| {
@@ -288,11 +402,14 @@ pub fn observations(
     source: &str,
     path: &Path,
 ) -> Result<Vec<Observation>, Box<dyn Error>> {
-    Ok(observations_from_analysis(
+    let analysis = analyze(source)?;
+    let mut observations = observations_from_analysis(repository, &analysis, path);
+    observations.extend(generated_observations(
         repository,
-        &analyze(source)?,
-        path,
-    ))
+        &[(path, &analysis)],
+        &observations,
+    ));
+    Ok(observations)
 }
 
 #[cfg(test)]
@@ -342,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn models_module_references_without_expanding_macros() {
+    fn models_literal_using_definitions_as_generated() {
         let observations = observations(
             "payments",
             r#"
@@ -366,9 +483,21 @@ mod tests {
         )
         .unwrap();
 
+        assert!(
+            !observations
+                .iter()
+                .any(|observation| observation.to.as_str().ends_with("/__using__/1"))
+        );
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
+                && observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+                && observation.to.as_str() == "repo://payments/elixir/MyApp.Consumer/generated/0"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:5"
+                && observation.provenance == Provenance::Generated
+        }));
         assert!(!observations.iter().any(|observation| {
-            observation.to.as_str().ends_with("/__using__/1")
-                || observation.to.as_str().ends_with("/generated/0")
+            observation.from.as_str() == "repo://payments/elixir/MyApp.Macro"
+                && observation.to.as_str().ends_with("/generated/0")
         }));
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
