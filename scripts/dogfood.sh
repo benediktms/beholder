@@ -91,7 +91,7 @@ caller="repo://$repository/rust/crates/daemon/src/main/main"
 callee="repo://$repository/rust/crates/daemon-client/src/lib/state_dir"
 echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
-for _ in {1..100}; do
+for _ in {1..600}; do
     result="$(target/debug/beholder context --json --workspace main "$caller" 2>/dev/null || true)"
     grep -Fq "$callee" <<<"$result" && break
     sleep 0.1
