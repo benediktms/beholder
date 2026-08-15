@@ -1,0 +1,101 @@
+use beholder_adapters_git::repository_state_bytes;
+use beholder_domain::RepositoryState;
+use std::{
+    error::Error,
+    fs,
+    path::{Path, PathBuf},
+};
+
+pub(super) type RustSources = Vec<(PathBuf, String)>;
+pub(super) type ElixirSources = Vec<(PathBuf, String)>;
+pub(super) type ProtobufSources = Vec<(PathBuf, Vec<u8>)>;
+
+#[derive(Debug)]
+pub(super) struct RepositorySources {
+    pub(super) state: RepositoryState,
+    pub(super) rust: RustSources,
+    pub(super) elixir: ElixirSources,
+    pub(super) protobuf: ProtobufSources,
+}
+
+fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | "target" | "_build" | "deps" | "node_modules")
+            ) {
+                source_files(&path, files)?;
+            }
+        } else if path
+            .extension()
+            .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "ex" | "exs")))
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn repository_sources(
+    root: &Path,
+    descriptor_paths: &[PathBuf],
+) -> Result<RepositorySources, Box<dyn Error>> {
+    if !root.is_dir() {
+        return Err(format!("repository does not exist: {}", root.display()).into());
+    }
+    let mut files = Vec::new();
+    source_files(root, &mut files)?;
+    files.sort();
+    let sources = files
+        .into_iter()
+        .map(|path| {
+            let relative_path = path.strip_prefix(root)?.to_path_buf();
+            Ok((relative_path, fs::read_to_string(path)?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let (elixir, rust): (ElixirSources, RustSources) =
+        sources.into_iter().partition(|(path, _)| {
+            path.extension()
+                .is_some_and(|extension| matches!(extension.to_str(), Some("ex" | "exs")))
+        });
+    let mut descriptors = descriptor_paths
+        .iter()
+        .map(|path| Ok((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?)))
+        .collect::<Result<ProtobufSources, Box<dyn Error>>>()?;
+    descriptors.sort_by(|left, right| left.0.cmp(&right.0));
+    let state = repository_state_bytes(
+        root,
+        rust.iter()
+            .map(|(path, source)| (path.as_path(), source.as_bytes()))
+            .chain(
+                elixir
+                    .iter()
+                    .map(|(path, source)| (path.as_path(), source.as_bytes())),
+            )
+            .chain(
+                descriptors
+                    .iter()
+                    .map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
+            ),
+    )?;
+    Ok(RepositorySources {
+        state,
+        rust,
+        elixir,
+        protobuf: descriptors,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_missing_repository() {
+        let error = repository_sources(Path::new("/definitely/missing"), &[]).unwrap_err();
+        assert!(error.to_string().contains("repository does not exist"));
+    }
+}
