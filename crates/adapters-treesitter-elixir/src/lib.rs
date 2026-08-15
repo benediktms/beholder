@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-pub const FRONTEND_VERSION: &str = "9";
-pub const RESOLVER_VERSION: &str = "4";
+pub const FRONTEND_VERSION: &str = "10";
+pub const RESOLVER_VERSION: &str = "5";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ElixirAnalysis {
@@ -22,6 +22,7 @@ struct ElixirModule {
     functions: Vec<ElixirFunction>,
     callbacks: Vec<ElixirFunction>,
     using_functions: Vec<ElixirFunction>,
+    using_implements: Vec<ElixirModuleReference>,
     struct_fields: Vec<ElixirStructField>,
     implements: Vec<ElixirModuleReference>,
     aliases: Vec<ElixirAlias>,
@@ -335,6 +336,58 @@ fn function_struct_uses(node: Node<'_>, source: &[u8]) -> Vec<ElixirStructUse> {
     uses
 }
 
+fn reference_definition(
+    node: Node<'_>,
+    source: &[u8],
+    kind: ElixirModuleReferenceKind,
+    aliases: &[ElixirAlias],
+    current_module: &str,
+) -> Option<ElixirModuleReference> {
+    let raw_name = arguments(node)
+        .and_then(|arguments| arguments.named_child(0))
+        .filter(|name| name.kind() == "alias")
+        .and_then(|name| text(name, source))?;
+    Some(ElixirModuleReference {
+        name: expand_alias(raw_name, aliases, current_module),
+        kind,
+        line: node.start_position().row + 1,
+        only: (kind == ElixirModuleReferenceKind::Import)
+            .then(|| function_filter(node, source, "only"))
+            .flatten(),
+        except: (kind == ElixirModuleReferenceKind::Import)
+            .then(|| function_filter(node, source, "except"))
+            .flatten()
+            .unwrap_or_default(),
+    })
+}
+
+fn function_imports(
+    node: Node<'_>,
+    source: &[u8],
+    aliases: &[ElixirAlias],
+    current_module: &str,
+) -> Vec<ElixirModuleReference> {
+    let Some(block) = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "do_block")
+    else {
+        return Vec::new();
+    };
+    block
+        .named_children(&mut block.walk())
+        .filter(|child| child.kind() == "call" && call_target(*child, source) == Some("import"))
+        .filter_map(|child| {
+            reference_definition(
+                child,
+                source,
+                ElixirModuleReferenceKind::Import,
+                aliases,
+                current_module,
+            )
+        })
+        .collect()
+}
+
 fn push_function(
     functions: &mut Vec<ElixirFunction>,
     node: Node<'_>,
@@ -360,6 +413,16 @@ fn push_function(
     } else {
         None
     };
+    let mut imports = references
+        .iter()
+        .filter(|reference| reference.kind == ElixirModuleReferenceKind::Import)
+        .cloned()
+        .collect::<Vec<_>>();
+    for import in function_imports(node, source, aliases, current_module) {
+        if !imports.contains(&import) {
+            imports.push(import);
+        }
+    }
     for arity in min_arity..=max_arity {
         let mut calls = delegate.as_ref().map_or_else(
             || function_calls(node, source),
@@ -397,10 +460,7 @@ fn push_function(
                     function.calls.push(call);
                 }
             }
-            for import in references
-                .iter()
-                .filter(|reference| reference.kind == ElixirModuleReferenceKind::Import)
-            {
+            for import in &imports {
                 if !function.imports.contains(import) {
                     function.imports.push(import.clone());
                 }
@@ -413,25 +473,29 @@ fn push_function(
             line: node.start_position().row + 1,
             calls,
             struct_uses,
-            imports: references
-                .iter()
-                .filter(|reference| reference.kind == ElixirModuleReferenceKind::Import)
-                .cloned()
-                .collect(),
+            imports: imports.clone(),
         });
     }
 }
 
-fn collect_quoted_functions(
+fn collect_quoted_semantics(
     node: Node<'_>,
     source: &[u8],
     functions: &mut Vec<ElixirFunction>,
+    implements: &mut Vec<ElixirModuleReference>,
     aliases: &[ElixirAlias],
     references: &[ElixirModuleReference],
     current_module: &str,
 ) {
     // ponytail: literal top-level definitions only; use compiler expansion when dynamic macros
     // must be modelled.
+    if node.kind() == "unary_operator"
+        && let Some(mut behaviour) = behaviour_reference(node, source)
+    {
+        behaviour.name = expand_alias(&behaviour.name, aliases, current_module);
+        implements.push(behaviour);
+        return;
+    }
     if node.kind() == "call" {
         if matches!(call_target(node, source), Some("def" | "defp")) {
             push_function(functions, node, source, aliases, references, current_module);
@@ -440,10 +504,11 @@ fn collect_quoted_functions(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_quoted_functions(
+        collect_quoted_semantics(
             child,
             source,
             functions,
+            implements,
             aliases,
             references,
             current_module,
@@ -451,10 +516,11 @@ fn collect_quoted_functions(
     }
 }
 
-fn collect_using_functions(
+fn collect_using_semantics(
     node: Node<'_>,
     source: &[u8],
     functions: &mut Vec<ElixirFunction>,
+    implements: &mut Vec<ElixirModuleReference>,
     aliases: &[ElixirAlias],
     references: &[ElixirModuleReference],
     current_module: &str,
@@ -463,10 +529,11 @@ fn collect_using_functions(
         if call_target(node, source) == Some("quote") {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect_quoted_functions(
+                collect_quoted_semantics(
                     child,
                     source,
                     functions,
+                    implements,
                     aliases,
                     references,
                     current_module,
@@ -477,10 +544,11 @@ fn collect_using_functions(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_using_functions(
+        collect_using_semantics(
             child,
             source,
             functions,
+            implements,
             aliases,
             references,
             current_module,
@@ -668,6 +736,7 @@ fn push_module(
         functions: Vec::new(),
         callbacks: Vec::new(),
         using_functions: Vec::new(),
+        using_implements: Vec::new(),
         struct_fields: Vec::new(),
         implements: Vec::new(),
         aliases: inherited_aliases,
@@ -812,30 +881,20 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                 return;
             }
             Some(target @ ("import" | "require" | "use")) => {
-                if let Some(module) = module
-                    && let Some(raw_name) = arguments(node)
-                        .and_then(|arguments| arguments.named_child(0))
-                        .filter(|name| name.kind() == "alias")
-                        .and_then(|name| text(name, source))
-                {
-                    let name =
-                        expand_alias(raw_name, &modules[module].aliases, &modules[module].name);
+                if let Some(module) = module {
                     let kind = match target {
                         "import" => ElixirModuleReferenceKind::Import,
                         "require" => ElixirModuleReferenceKind::Require,
                         _ => ElixirModuleReferenceKind::Use,
                     };
-                    let reference = ElixirModuleReference {
-                        name,
+                    let Some(reference) = reference_definition(
+                        node,
+                        source,
                         kind,
-                        line: node.start_position().row + 1,
-                        only: (kind == ElixirModuleReferenceKind::Import)
-                            .then(|| function_filter(node, source, "only"))
-                            .flatten(),
-                        except: (kind == ElixirModuleReferenceKind::Import)
-                            .then(|| function_filter(node, source, "except"))
-                            .flatten()
-                            .unwrap_or_default(),
+                        &modules[module].aliases,
+                        &modules[module].name,
+                    ) else {
+                        return;
                     };
                     let references = &mut modules[module].references;
                     // ponytail: retain first reference evidence until storage supports multiple
@@ -874,21 +933,24 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                         .is_some_and(|(name, _, _)| name == "__using__")
                 {
                     let mut functions = Vec::new();
+                    let mut implements = Vec::new();
                     let aliases = modules[module].aliases.clone();
                     let references = modules[module].references.clone();
                     let name = modules[module].name.clone();
                     let mut cursor = node.walk();
                     for child in node.named_children(&mut cursor) {
-                        collect_using_functions(
+                        collect_using_semantics(
                             child,
                             source,
                             &mut functions,
+                            &mut implements,
                             &aliases,
                             &references,
                             &name,
                         );
                     }
                     modules[module].using_functions = functions;
+                    modules[module].using_implements = implements;
                 }
                 return;
             }
@@ -1054,7 +1116,7 @@ pub fn generated_observations(
     let mut macros = BTreeMap::<&str, Option<(&Path, &ElixirModule)>>::new();
     for (path, analysis) in sources {
         for module in &analysis.modules {
-            if module.using_functions.is_empty() {
+            if module.using_functions.is_empty() && module.using_implements.is_empty() {
                 continue;
             }
             macros
@@ -1115,6 +1177,16 @@ pub fn generated_observations(
                     path,
                     true,
                 ));
+                generated.extend(macro_module.using_implements.iter().map(|implementation| {
+                    let mut observation = Observation::dependency(
+                        module_id.clone(),
+                        DependencyRelation::Implements,
+                        module_target(&implementation.name),
+                        format!("{}:{}", path.display(), implementation.line),
+                    );
+                    observation.provenance = Provenance::Generated;
+                    observation
+                }));
             }
         }
     }
@@ -1242,13 +1314,17 @@ pub fn resolve_repository_calls(
                         .is_none_or(|only| only.contains(&signature))
                         && !import.except.contains(&signature)
                 })
-                .filter_map(|import| definitions.get(&format!("{}/{signature}", import.name)))
-                .collect::<BTreeSet<_>>();
-            if candidates.len() == 1 {
-                candidates.into_iter().next()
+                .collect::<Vec<_>>();
+            let [import] = candidates.as_slice() else {
+                continue;
+            };
+            let imported = format!("{}/{signature}", import.name);
+            if let Some(target) = definitions.get(&imported) {
+                observation.to = target.clone();
             } else {
-                None
+                observation.to = EntityId::from(format!("elixir-call://{imported}"));
             }
+            continue;
         };
         if let Some(target) = target {
             observation.to = target.clone();
@@ -1406,6 +1482,43 @@ mod tests {
     }
 
     #[test]
+    fn resolves_function_scoped_imports() {
+        let observations = observations(
+            "payments",
+            r#"
+            defmodule MyApp.Consumer do
+              def query do
+                import Ecto.Query, only: [from: 2]
+                from(item in Item, where: item.active)
+              end
+
+              def audit do
+                import MyApp.Helpers, only: [record: 0]
+                record()
+              end
+            end
+
+            defmodule MyApp.Helpers do
+              def record, do: :ok
+            end
+            "#,
+            Path::new("lib/my_app/consumer.ex"),
+        )
+        .unwrap();
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer/query/0"
+                && observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                && observation.to.as_str() == "elixir-call://Ecto.Query/from/2"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer/audit/0"
+                && observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                && observation.to.as_str() == "repo://payments/elixir/MyApp.Helpers/record/0"
+        }));
+    }
+
+    #[test]
     fn resolves_repository_calls_and_generated_function_calls() {
         let macro_analysis = analyze(
             r#"
@@ -1473,6 +1586,7 @@ mod tests {
             defmodule MyApp.Macro do
               defmacro __using__(_) do
                 quote do
+                  @behaviour MyApp.Worker
                   def generated, do: :ok
                 end
               end
@@ -1484,6 +1598,10 @@ mod tests {
                 require External.Macros, as: Macros
                 def own, do: :ok
               end
+            end
+
+            defmodule MyApp.Worker do
+              @callback work() :: :ok
             end
             "#,
             Path::new("lib/my_app/consumer.ex"),
@@ -1499,7 +1617,7 @@ mod tests {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
                 && observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
                 && observation.to.as_str() == "repo://payments/elixir/MyApp.Consumer/generated/0"
-                && observation.evidence.as_str() == "lib/my_app/consumer.ex:5"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:6"
                 && observation.provenance == Provenance::Generated
         }));
         assert!(!observations.iter().any(|observation| {
@@ -1508,31 +1626,41 @@ mod tests {
         }));
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
+                && observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::Implements)
+                && observation.to.as_str() == "elixir-module://MyApp.Worker"
+                && observation.provenance == Provenance::Generated
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
                 && observation.relation == SemanticRelation::Dependency(DependencyRelation::Uses)
                 && observation.to.as_str() == "elixir-module://MyApp.Macro"
-                && observation.evidence.as_str() == "lib/my_app/consumer.ex:11"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:12"
         }));
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
                 && observation.relation == SemanticRelation::Dependency(DependencyRelation::Imports)
                 && observation.to.as_str() == "elixir-module://External.Helpers"
-                && observation.evidence.as_str() == "lib/my_app/consumer.ex:12"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:13"
         }));
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer"
                 && observation.relation
                     == SemanticRelation::Dependency(DependencyRelation::Requires)
                 && observation.to.as_str() == "elixir-module://External.Macros"
-                && observation.evidence.as_str() == "lib/my_app/consumer.ex:13"
+                && observation.evidence.as_str() == "lib/my_app/consumer.ex:14"
         }));
 
         let overrides = resolve_workspace_modules(&observations);
-        assert_eq!(overrides.len(), 1);
-        assert_eq!(overrides[0].relation, DependencyRelation::Uses);
-        assert_eq!(
-            overrides[0].resolved_to.as_str(),
-            "repo://payments/elixir/MyApp.Macro"
-        );
+        assert_eq!(overrides.len(), 2);
+        assert!(overrides.iter().any(|override_| {
+            override_.relation == DependencyRelation::Uses
+                && override_.resolved_to.as_str() == "repo://payments/elixir/MyApp.Macro"
+        }));
+        assert!(overrides.iter().any(|override_| {
+            override_.relation == DependencyRelation::Implements
+                && override_.resolved_to.as_str() == "repo://payments/elixir/MyApp.Worker"
+        }));
     }
 
     #[test]
