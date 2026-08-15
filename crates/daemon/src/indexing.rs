@@ -668,7 +668,7 @@ impl IndexScheduler {
             &elixir_sources,
             &observations,
         ));
-        resolve_elixir_repository_calls(&mut observations);
+        resolve_elixir_repository_calls(&mut observations, &elixir_sources);
         for (_, descriptor) in descriptors {
             observations.extend(protobuf_observations(descriptor)?);
         }

@@ -59,14 +59,29 @@ printf '%s\n' \
     '    end' \
     '  end' \
     'end' \
+    'defmodule Beholder.Worker do' \
+    '  @callback work(term()) :: term()' \
+    'end' \
+    'defmodule Beholder.Payload do' \
+    '  defstruct [:value]' \
+    'end' \
     'defmodule Beholder do' \
     '  defmodule Smoke do' \
     '    use Beholder.Macro, mode: :strict' \
+    '    @behaviour Beholder.Worker' \
+    '    alias Beholder.Payload' \
     '    import External.Helpers, only: [help: 1]' \
     '    require External.Macros, as: Macros' \
-    '    def indexed(value), do: helper(value)' \
+    '    def indexed(value), do: helper(%Payload{value: value})' \
     '    defp helper(value), do: value' \
+    '    def work(value), do: value' \
     '  end' \
+    'end' \
+    'defprotocol Beholder.Renderable do' \
+    '  def render(value)' \
+    'end' \
+    'defimpl Beholder.Renderable, for: Beholder.Payload do' \
+    '  def render(value), do: value.value' \
     'end' \
     'defmodule Beholder.Helper do' \
     '  def work(value), do: value' \
@@ -115,9 +130,27 @@ for expected in \
     'elixir-module://External.Helpers' \
     '"kind":"imports"' \
     'elixir-module://External.Macros' \
-    '"kind":"requires"'; do
+    '"kind":"requires"' \
+    'Beholder.Worker' \
+    '"kind":"implements"'; do
     if ! grep -Fq "$expected" <<<"$result"; then
         printf 'expected %s in Elixir context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Payload')"
+for expected in 'Beholder.Payload/field/value' '"kind":"field_of"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in Elixir struct context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Renderable')"
+for expected in 'Beholder.Renderable.Beholder.Payload' '"kind":"implements"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in Elixir protocol implementation context:\n%s\n' "$expected" "$result" >&2
         exit 1
     fi
 done
