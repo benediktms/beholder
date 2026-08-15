@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
     pub name: String,
@@ -236,4 +238,3 @@ mod tests {
         );
     }
 }
-use std::path::PathBuf;
