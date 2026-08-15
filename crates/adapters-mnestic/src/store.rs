@@ -73,7 +73,12 @@ impl SemanticStore {
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {
         #[cfg(feature = "sqlite")]
         if let Some(path) = &self.database_path {
-            sqlite::open(path)?.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let connection = sqlite::open(path)?;
+            connection.execute("PRAGMA busy_timeout = 5000")?;
+            let mut checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            if checkpoint.next()? != sqlite::State::Row || checkpoint.read::<i64, _>(0)? != 0 {
+                return Err("SQLite WAL checkpoint remained busy".into());
+            }
         }
         Ok(())
     }
