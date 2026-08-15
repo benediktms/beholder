@@ -263,6 +263,7 @@ impl From<dto::RelationKind> for v1::RelationKind {
             dto::RelationKind::ConsumedBy => Self::ConsumedBy,
             dto::RelationKind::Defines => Self::Defines,
             dto::RelationKind::FieldOf => Self::FieldOf,
+            dto::RelationKind::Implements => Self::Implements,
             dto::RelationKind::ImplementedBy => Self::ImplementedBy,
             dto::RelationKind::Imports => Self::Imports,
             dto::RelationKind::Publishes => Self::Publishes,
@@ -283,6 +284,7 @@ fn relation_kind(value: i32) -> Result<dto::RelationKind, &'static str> {
         v1::RelationKind::ConsumedBy => Ok(dto::RelationKind::ConsumedBy),
         v1::RelationKind::Defines => Ok(dto::RelationKind::Defines),
         v1::RelationKind::FieldOf => Ok(dto::RelationKind::FieldOf),
+        v1::RelationKind::Implements => Ok(dto::RelationKind::Implements),
         v1::RelationKind::ImplementedBy => Ok(dto::RelationKind::ImplementedBy),
         v1::RelationKind::Imports => Ok(dto::RelationKind::Imports),
         v1::RelationKind::Publishes => Ok(dto::RelationKind::Publishes),
@@ -631,7 +633,7 @@ mod tests {
                 id: "e1".into(),
                 from: "a".into(),
                 to: "b".into(),
-                kind: dto::RelationKind::Requires,
+                kind: dto::RelationKind::Implements,
                 confidence: 0.6,
                 evidence: vec![dto::EvidenceRef {
                     source_kind: dto::EvidenceKind::Inference,
@@ -644,7 +646,7 @@ mod tests {
             paths: Vec::new(),
         };
         let response = v1::TraceResponse::from(trace.clone());
-        assert_eq!(response.edges[0].kind, v1::RelationKind::Requires as i32);
+        assert_eq!(response.edges[0].kind, v1::RelationKind::Implements as i32);
         assert_eq!(
             response.edges[0].evidence[0].source,
             v1::EvidenceKind::Inference as i32

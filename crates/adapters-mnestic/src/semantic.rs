@@ -350,6 +350,7 @@ fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigi
                 || id.starts_with("rust-method://")
                 || id.starts_with("elixir-call://")
                 || id.starts_with("elixir-module://")
+                || id.starts_with("erlang-module://")
             {
                 EntityOrigin::ExternalDependency
             } else {
@@ -396,7 +397,7 @@ fn infer_kind(id: &str) -> EntityKind {
         || id.starts_with("elixir-call://")
     {
         EntityKind::Callable
-    } else if id.starts_with("elixir-module://") {
+    } else if id.starts_with("elixir-module://") || id.starts_with("erlang-module://") {
         EntityKind::Namespace
     } else if id.starts_with("proto-file://") {
         EntityKind::ProtoFile
@@ -410,7 +411,7 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::ProtoService
     } else if id.contains("/elixir-source/") {
         EntityKind::Namespace
-    } else if let Some(symbol) = id.split_once("/elixir/").map(|(_, symbol)| symbol) {
+    } else if let Some(symbol) = id.rsplit_once("/elixir/").map(|(_, symbol)| symbol) {
         if symbol
             .rsplit_once('/')
             .is_some_and(|(_, arity)| arity.parse::<usize>().is_ok())
@@ -459,7 +460,7 @@ fn entity_name(id: &str) -> String {
             method
         );
     }
-    if let Some(symbol) = id.split_once("/elixir/").map(|(_, symbol)| symbol)
+    if let Some(symbol) = id.rsplit_once("/elixir/").map(|(_, symbol)| symbol)
         && let Some((function, arity)) = symbol.rsplit_once('/')
         && arity.parse::<usize>().is_ok()
     {
@@ -477,9 +478,9 @@ fn entity_name(id: &str) -> String {
 
 fn repository(id: &str) -> Option<String> {
     id.strip_prefix("repo://").and_then(|rest| {
-        rest.split_once("/rust/")
-            .or_else(|| rest.split_once("/elixir/"))
-            .or_else(|| rest.split_once("/elixir-source/"))
+        rest.rsplit_once("/elixir-source/")
+            .or_else(|| rest.rsplit_once("/rust/"))
+            .or_else(|| rest.rsplit_once("/elixir/"))
             .map(|(repository, _)| repository.into())
     })
 }
@@ -557,13 +558,13 @@ mod tests {
 
     #[test]
     fn maps_elixir_modules_and_functions() {
-        let module_id = "repo://github.com/example/commerce-service/elixir/Commerce.Domain.Items";
+        let module_id = "repo://github.com/example/elixir/elixir/Example.Items";
         let module = entity_ref(module_id, infer_kind(module_id));
         assert_eq!(module.kind, EntityKind::Namespace);
-        assert_eq!(module.name, "Commerce.Domain.Items");
+        assert_eq!(module.name, "Example.Items");
         assert_eq!(
             module.repository.as_deref(),
-            Some("github.com/example/commerce-service")
+            Some("github.com/example/elixir")
         );
 
         let function_id = format!("{module_id}/activate/1");
@@ -572,7 +573,16 @@ mod tests {
         assert_eq!(function.name, "activate/1");
         assert_eq!(
             function.repository.as_deref(),
-            Some("github.com/example/commerce-service")
+            Some("github.com/example/elixir")
+        );
+
+        let source = entity_ref(
+            "repo://github.com/example/elixir/elixir-source/lib/elixir/lib/example.ex",
+            EntityKind::Namespace,
+        );
+        assert_eq!(
+            source.repository.as_deref(),
+            Some("github.com/example/elixir")
         );
     }
 

@@ -268,7 +268,7 @@ fn print_index_result((count, published): (usize, bool)) {
     println!(
         "{}",
         if published {
-            format!("indexed {count} Rust observations")
+            format!("indexed {count} observations")
         } else {
             "unchanged; kept current analysis revision".into()
         }

@@ -156,6 +156,7 @@ fn incoming_relation(relation: &str) -> &str {
     match relation {
         "calls" => "called by",
         "defines" => "defined by",
+        "implements" => "implemented by",
         relation => relation,
     }
 }
