@@ -648,6 +648,7 @@ fn index_workspace_versioned(
     dirty: Option<&BTreeMap<String, DirtyRepository>>,
     versions: AnalysisVersions,
 ) -> Result<(usize, bool), Box<dyn Error>> {
+    let source_loading_started = Instant::now();
     let repositories = workspace
         .repositories
         .iter()
@@ -661,6 +662,7 @@ fn index_workspace_versioned(
             repository_sources(&repository.base, &descriptors)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let source_loading = source_loading_started.elapsed();
     let view = WorkspaceView::new(
         &workspace.name,
         versions.workspace_identity(&repositories),
@@ -680,6 +682,7 @@ fn index_workspace_versioned(
     let mut misses = 0;
     let mut dirty_source_units = 0;
     let mut diagnostics = Vec::new();
+    let repository_analysis_started = Instant::now();
     for sources in repositories {
         let RepositorySources {
             state,
@@ -712,13 +715,18 @@ fn index_workspace_versioned(
             observations: analysis.observations.clone(),
         });
     }
+    let repository_analysis = repository_analysis_started.elapsed();
+    let workspace_resolution_started = Instant::now();
     let mut all_observations = repository_facts
         .iter()
         .flat_map(|facts| facts.observations.iter().cloned())
         .collect::<Vec<_>>();
     let mut overrides = resolve_rust_repository_calls(&mut all_observations);
     overrides.extend(resolve_workspace_modules(&all_observations));
+    let workspace_resolution = workspace_resolution_started.elapsed();
+    let publication_started = Instant::now();
     let changes = store.publish(&view, &repository_facts, &overrides)?;
+    let publication = publication_started.elapsed();
     if let Err(error) = store.checkpoint() {
         tracing::warn!(workspace = %workspace.name, %error, "Mnestic checkpoint failed");
     }
@@ -734,6 +742,10 @@ fn index_workspace_versioned(
         repository_cache_disk_hits = disk_hits,
         repository_cache_misses = misses,
         dirty_source_units,
+        source_loading_ms = source_loading.as_secs_f64() * 1000.0,
+        repository_analysis_ms = repository_analysis.as_secs_f64() * 1000.0,
+        workspace_resolution_ms = workspace_resolution.as_secs_f64() * 1000.0,
+        publication_ms = publication.as_secs_f64() * 1000.0,
         "workspace indexed"
     );
     Ok((all_observations.len(), true))
