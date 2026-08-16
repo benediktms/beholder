@@ -48,6 +48,8 @@ jobs:
       - uses: moonrepo/setup-rust@v1
         with:
           inherit-toolchain: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - uses: jdx/mise-action@v4
       - run: moon ci beholder:lint
 
@@ -67,6 +69,8 @@ jobs:
       - uses: moonrepo/setup-rust@v1
         with:
           inherit-toolchain: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - uses: jdx/mise-action@v4
       - run: moon ci beholder:test
 
@@ -86,5 +90,7 @@ jobs:
       - uses: moonrepo/setup-rust@v1
         with:
           inherit-toolchain: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - uses: jdx/mise-action@v4
       - run: moon ci beholder:smoke
