@@ -11,11 +11,9 @@ pub(super) struct SourceAnalysisKey {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct RepositoryAnalysisKey {
     pub(super) fingerprint: String,
-    pub(super) frontend_version: &'static str,
-    pub(super) resolver_version: &'static str,
-    pub(super) elixir_frontend_version: &'static str,
-    pub(super) elixir_resolver_version: &'static str,
-    pub(super) protobuf_frontend_version: &'static str,
+    pub(super) rust: Option<(&'static str, &'static str)>,
+    pub(super) elixir: Option<(&'static str, &'static str)>,
+    pub(super) protobuf: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -29,6 +27,26 @@ impl SourceAnalysisKey {
         Self {
             content_hash: Sha256::digest(source.as_bytes()).into(),
             frontend_version,
+        }
+    }
+}
+
+impl RepositoryAnalysisKey {
+    pub(super) fn analysis_identity(&self) -> String {
+        let mut languages = Vec::new();
+        if let Some((frontend, resolver)) = self.rust {
+            languages.push(format!("rust:{frontend}:{resolver}"));
+        }
+        if let Some((frontend, resolver)) = self.elixir {
+            languages.push(format!("elixir:{frontend}:{resolver}"));
+        }
+        if let Some(frontend) = self.protobuf {
+            languages.push(format!("protobuf:{frontend}"));
+        }
+        if languages.is_empty() {
+            "none".into()
+        } else {
+            languages.join(":")
         }
     }
 }

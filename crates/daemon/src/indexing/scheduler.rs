@@ -68,6 +68,37 @@ const CURRENT_ANALYSIS_VERSIONS: AnalysisVersions = AnalysisVersions {
     rule_pack: CORE_RULE_PACK_VERSION,
 };
 
+impl AnalysisVersions {
+    fn repository_key(
+        self,
+        fingerprint: String,
+        has_rust: bool,
+        has_elixir: bool,
+        has_protobuf: bool,
+    ) -> RepositoryAnalysisKey {
+        RepositoryAnalysisKey {
+            fingerprint,
+            rust: has_rust.then_some((self.rust_frontend, self.rust_resolver)),
+            elixir: has_elixir.then_some((self.elixir_frontend, self.elixir_resolver)),
+            protobuf: has_protobuf.then_some(self.protobuf_frontend),
+        }
+    }
+
+    fn workspace_identity(self, repositories: &[RepositorySources]) -> String {
+        let key = self.repository_key(
+            String::new(),
+            repositories.iter().any(|sources| !sources.rust.is_empty()),
+            repositories
+                .iter()
+                .any(|sources| !sources.elixir.is_empty()),
+            repositories
+                .iter()
+                .any(|sources| !sources.protobuf.is_empty()),
+        );
+        format!("{}:core-rules:{}", key.analysis_identity(), self.rule_pack)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CacheStatus {
     Memory,
@@ -482,15 +513,14 @@ impl IndexScheduler {
         elixir_sources: &[(PathBuf, String)],
         descriptors: &[(PathBuf, Vec<u8>)],
         versions: AnalysisVersions,
-    ) -> Cached<RepositoryAnalysis> {
-        let key = RepositoryAnalysisKey {
-            fingerprint: state.fingerprint.clone(),
-            frontend_version: versions.rust_frontend,
-            resolver_version: versions.rust_resolver,
-            elixir_frontend_version: versions.elixir_frontend,
-            elixir_resolver_version: versions.elixir_resolver,
-            protobuf_frontend_version: versions.protobuf_frontend,
-        };
+    ) -> Result<(Arc<RepositoryAnalysis>, CacheStatus, String), Box<dyn Error>> {
+        let key = versions.repository_key(
+            state.fingerprint.clone(),
+            !rust_sources.is_empty(),
+            !elixir_sources.is_empty(),
+            !descriptors.is_empty(),
+        );
+        let analysis_identity = key.analysis_identity();
         if let Some(analysis) = self
             .repository_cache
             .lock()
@@ -499,17 +529,19 @@ impl IndexScheduler {
             .cloned()
         {
             tracing::debug!(repository = %state.repository.identity, cache_status = "memory", "repository cache lookup");
-            return Ok((analysis, CacheStatus::Memory));
+            return Ok((analysis, CacheStatus::Memory, analysis_identity));
         }
+        let (rust_frontend, rust_resolver) = key.rust.unwrap_or(("_", "_"));
+        let (elixir_frontend, elixir_resolver) = key.elixir.unwrap_or(("_", "_"));
         let path = self
             .cache_dir
             .join("repository")
             .join("semantic")
-            .join(versions.rust_frontend)
-            .join(versions.rust_resolver)
-            .join(versions.elixir_frontend)
-            .join(versions.elixir_resolver)
-            .join(versions.protobuf_frontend)
+            .join(rust_frontend)
+            .join(rust_resolver)
+            .join(elixir_frontend)
+            .join(elixir_resolver)
+            .join(key.protobuf.unwrap_or("_"))
             .join(format!("{}.json", state.fingerprint));
         if let Ok(bytes) = fs::read(&path)
             && let Ok(analysis) = serde_json::from_slice::<RepositoryAnalysis>(&bytes)
@@ -520,7 +552,7 @@ impl IndexScheduler {
                 .map_err(|_| "repository cache lock poisoned")?
                 .insert(key, analysis.clone());
             tracing::debug!(repository = %state.repository.identity, cache_status = "disk", "repository cache lookup");
-            return Ok((analysis, CacheStatus::Disk));
+            return Ok((analysis, CacheStatus::Disk, analysis_identity));
         }
         let mut observations = Vec::new();
         let mut diagnostics = Vec::new();
@@ -589,7 +621,7 @@ impl IndexScheduler {
             .map_err(|_| "repository cache lock poisoned")?
             .insert(key, analysis.clone());
         tracing::debug!(repository = %state.repository.identity, cache_status = "miss", "repository cache lookup");
-        Ok((analysis, CacheStatus::Miss))
+        Ok((analysis, CacheStatus::Miss, analysis_identity))
     }
 }
 
@@ -630,15 +662,7 @@ fn index_workspace_versioned(
         .collect::<Result<Vec<_>, _>>()?;
     let view = WorkspaceView::new(
         &workspace.name,
-        format!(
-            "rust:{}:{}:elixir:{}:{}:protobuf:{}:core-rules:{}",
-            versions.rust_frontend,
-            versions.rust_resolver,
-            versions.elixir_frontend,
-            versions.elixir_resolver,
-            versions.protobuf_frontend,
-            versions.rule_pack,
-        ),
+        versions.workspace_identity(&repositories),
         repositories
             .iter()
             .map(|sources| sources.state.clone())
@@ -667,7 +691,7 @@ fn index_workspace_versioned(
                 Some(DirtyRepository::Sources(sources)) => sources.len(),
                 Some(DirtyRepository::All) | None => rust.len() + elixir.len() + protobuf.len(),
             };
-        let (analysis, cache_status) = scheduler
+        let (analysis, cache_status, analysis_identity) = scheduler
             .repository_observations_versioned(&state, &rust, &elixir, &protobuf, versions)?;
         match cache_status {
             CacheStatus::Memory => memory_hits += 1,
@@ -683,14 +707,7 @@ fn index_workspace_versioned(
         );
         repository_facts.push(RepositoryFacts {
             state,
-            analysis_identity: format!(
-                "rust:{}:{}:elixir:{}:{}:protobuf:{}",
-                versions.rust_frontend,
-                versions.rust_resolver,
-                versions.elixir_frontend,
-                versions.elixir_resolver,
-                versions.protobuf_frontend,
-            ),
+            analysis_identity,
             observations: analysis.observations.clone(),
         });
     }
@@ -805,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_cache_reuses_resolved_observations_and_invalidates_versions() {
+    fn repository_cache_ignores_versions_for_absent_languages() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -823,7 +840,7 @@ mod tests {
             "fn caller() { helper(); } fn helper() {}".into(),
         )];
         let scheduler = IndexScheduler::new(cache.clone());
-        let (first, first_status) = scheduler
+        let (first, first_status, first_identity) = scheduler
             .repository_observations_versioned(
                 &state,
                 &sources,
@@ -832,18 +849,23 @@ mod tests {
                 CURRENT_ANALYSIS_VERSIONS,
             )
             .unwrap();
-        let (second, second_status) = scheduler
-            .repository_observations_versioned(
-                &state,
-                &sources,
-                &[],
-                &[],
-                CURRENT_ANALYSIS_VERSIONS,
-            )
+        let irrelevant_versions = AnalysisVersions {
+            elixir_frontend: "changed",
+            elixir_resolver: "changed",
+            protobuf_frontend: "changed",
+            ..CURRENT_ANALYSIS_VERSIONS
+        };
+        let (second, second_status, second_identity) = scheduler
+            .repository_observations_versioned(&state, &sources, &[], &[], irrelevant_versions)
             .unwrap();
 
         assert_eq!(first_status, CacheStatus::Miss);
         assert_eq!(second_status, CacheStatus::Memory);
+        assert_eq!(first_identity, second_identity);
+        assert_eq!(
+            first_identity,
+            format!("rust:{FRONTEND_VERSION}:{RESOLVER_VERSION}")
+        );
         assert!(Arc::ptr_eq(&first, &second));
         assert!(first.observations.iter().any(|observation| {
             observation.from.as_str() == "repo://repo/rust/lib/caller"
@@ -854,25 +876,15 @@ mod tests {
         let scheduler = IndexScheduler::new(cache.clone());
         assert_eq!(
             scheduler
-                .repository_observations_versioned(
-                    &state,
-                    &sources,
-                    &[],
-                    &[],
-                    CURRENT_ANALYSIS_VERSIONS,
-                )
+                .repository_observations_versioned(&state, &sources, &[], &[], irrelevant_versions,)
                 .unwrap()
                 .1,
             CacheStatus::Disk
         );
-        let versioned_state = RepositoryState {
-            fingerprint: "versioned-state".into(),
-            ..state
-        };
         assert_eq!(
             scheduler
                 .repository_observations_versioned(
-                    &versioned_state,
+                    &state,
                     &sources,
                     &[],
                     &[],
@@ -880,21 +892,6 @@ mod tests {
                         rust_resolver: "old",
                         ..CURRENT_ANALYSIS_VERSIONS
                     },
-                )
-                .unwrap()
-                .1,
-            CacheStatus::Miss
-        );
-        drop(scheduler);
-        let scheduler = IndexScheduler::new(cache.clone());
-        assert_eq!(
-            scheduler
-                .repository_observations_versioned(
-                    &versioned_state,
-                    &sources,
-                    &[],
-                    &[],
-                    CURRENT_ANALYSIS_VERSIONS,
                 )
                 .unwrap()
                 .1,
@@ -908,7 +905,79 @@ mod tests {
     }
 
     #[test]
-    fn workspace_view_invalidates_when_analysis_version_changes() {
+    fn repository_keys_scope_each_analyzer_to_its_language() {
+        let versions = AnalysisVersions {
+            rust_frontend: "rust-1",
+            rust_resolver: "rust-resolver-1",
+            elixir_frontend: "elixir-1",
+            elixir_resolver: "elixir-resolver-1",
+            protobuf_frontend: "protobuf-1",
+            rule_pack: "rules-1",
+        };
+        let changed = AnalysisVersions {
+            rust_frontend: "rust-2",
+            rust_resolver: "rust-resolver-2",
+            elixir_frontend: "elixir-2",
+            elixir_resolver: "elixir-resolver-2",
+            protobuf_frontend: "protobuf-2",
+            ..versions
+        };
+
+        for (languages, expected) in [
+            ((true, false, false), "rust:rust-1:rust-resolver-1"),
+            ((false, true, false), "elixir:elixir-1:elixir-resolver-1"),
+            ((false, false, true), "protobuf:protobuf-1"),
+            ((false, false, false), "none"),
+        ] {
+            let (rust, elixir, protobuf) = languages;
+            let key = versions.repository_key("state".into(), rust, elixir, protobuf);
+            assert_eq!(key.analysis_identity(), expected);
+            if rust || elixir || protobuf {
+                assert_ne!(
+                    key,
+                    changed.repository_key("state".into(), rust, elixir, protobuf)
+                );
+            }
+        }
+
+        assert_eq!(
+            versions.repository_key("state".into(), true, false, false),
+            AnalysisVersions {
+                elixir_frontend: "irrelevant",
+                elixir_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), true, false, false)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), false, true, false),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), false, true, false)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), false, false, true),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
+                elixir_frontend: "irrelevant",
+                elixir_resolver: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), false, false, true)
+        );
+    }
+
+    #[test]
+    fn workspace_view_invalidates_only_relevant_versions_and_rules() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -940,6 +1009,31 @@ mod tests {
                 .1
         );
         assert!(
+            !index_workspace_versioned(
+                &scheduler,
+                &store,
+                &workspace,
+                None,
+                AnalysisVersions {
+                    elixir_frontend: "2",
+                    elixir_resolver: "2",
+                    protobuf_frontend: "2",
+                    ..versions
+                },
+            )
+            .unwrap()
+            .1
+        );
+        let rust_changed = AnalysisVersions {
+            rust_frontend: "2",
+            ..versions
+        };
+        assert!(
+            index_workspace_versioned(&scheduler, &store, &workspace, None, rust_changed)
+                .unwrap()
+                .1
+        );
+        assert!(
             index_workspace_versioned(
                 &scheduler,
                 &store,
@@ -947,12 +1041,76 @@ mod tests {
                 None,
                 AnalysisVersions {
                     rule_pack: "2",
+                    ..rust_changed
+                },
+            )
+            .unwrap()
+            .1
+        );
+        assert_eq!(
+            store.inspect_revisions().unwrap().rows[0][1].as_i64(),
+            Some(3)
+        );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn mixed_repository_reanalyzes_only_the_changed_language() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-mixed-version-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join("lib")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        fs::write(
+            repository.join("lib/sample.ex"),
+            "defmodule Sample do\n  def indexed, do: :ok\nend\n",
+        )
+        .unwrap();
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let workspace = test_workspace("main", repository);
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let versions = AnalysisVersions {
+            rust_frontend: "1",
+            rust_resolver: "1",
+            elixir_frontend: "1",
+            elixir_resolver: "1",
+            protobuf_frontend: "1",
+            rule_pack: "1",
+        };
+
+        assert!(
+            index_workspace_versioned(&scheduler, &store, &workspace, None, versions)
+                .unwrap()
+                .1
+        );
+        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 1);
+        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 1);
+
+        assert!(
+            index_workspace_versioned(
+                &scheduler,
+                &store,
+                &workspace,
+                None,
+                AnalysisVersions {
+                    elixir_frontend: "2",
                     ..versions
                 },
             )
             .unwrap()
             .1
         );
+        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 1);
+        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 2);
+        assert_eq!(scheduler.repository_cache.lock().unwrap().len(), 2);
+        let observations = format!("{:?}", store.inspect_observations(None).unwrap());
+        assert!(observations.contains("/rust/lib/indexed"));
+        assert!(observations.contains("/elixir/Sample/indexed/0"));
         assert_eq!(
             store.inspect_revisions().unwrap().rows[0][1].as_i64(),
             Some(2)
