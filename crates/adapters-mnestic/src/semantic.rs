@@ -321,8 +321,16 @@ impl GraphBuilder {
         let key = (from.into(), to.into(), relation);
         self.hint(from, relation_kind_hint(relation.as_str(), true, from));
         self.hint(to, relation_kind_hint(relation.as_str(), false, to));
-        if relation == RelationKind::Defines && provenance == "generated" {
-            self.origins.insert(to.into(), EntityOrigin::Generated);
+        if provenance == "generated" {
+            match relation {
+                RelationKind::Defines => {
+                    self.origins.insert(to.into(), EntityOrigin::Generated);
+                }
+                RelationKind::FieldOf => {
+                    self.origins.insert(from.into(), EntityOrigin::Generated);
+                }
+                _ => {}
+            }
         }
         let evidence = evidence_ref(from, evidence, provenance);
         self.edges
@@ -610,8 +618,8 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 
 #[cfg(test)]
 mod tests {
-    use super::{entity_ref, infer_kind, is_test_entity};
-    use beholder_dto::EntityKind;
+    use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity};
+    use beholder_dto::{EntityKind, EntityOrigin};
 
     #[test]
     fn maps_elixir_modules_and_functions() {
@@ -641,6 +649,47 @@ mod tests {
             source.repository.as_deref(),
             Some("github.com/example/elixir")
         );
+    }
+
+    #[test]
+    fn maps_generated_definitions_and_fields_to_generated_entities() {
+        let mut graph = GraphBuilder::default();
+        graph
+            .add_edge(
+                "repo://example/elixir-source/example.pb.ex",
+                "repo://example/elixir/Example.Message",
+                "defines",
+                "example.pb.ex:1",
+                1.0,
+                "generated",
+            )
+            .unwrap();
+        graph
+            .add_edge(
+                "repo://example/elixir/Example.Message/field/id",
+                "repo://example/elixir/Example.Message",
+                "field_of",
+                "example.pb.ex:2",
+                1.0,
+                "generated",
+            )
+            .unwrap();
+
+        let graph = graph.finish();
+        for id in [
+            "repo://example/elixir/Example.Message",
+            "repo://example/elixir/Example.Message/field/id",
+        ] {
+            assert_eq!(
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .unwrap()
+                    .origin,
+                EntityOrigin::Generated
+            );
+        }
     }
 
     #[test]
