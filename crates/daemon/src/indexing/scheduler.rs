@@ -1,30 +1,23 @@
 use crate::workspace_registry::WorkspaceRegistry;
-use beholder_adapters_git::repository_state_bytes;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_protobuf::{
     FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, observations as protobuf_observations,
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
-    RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, analyze as analyze_elixir,
-    diagnostics_from_analysis as elixir_diagnostics,
+    RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
     generated_observations as elixir_generated_observations,
     observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
-    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze,
+    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis,
     diagnostics_from_analysis as rust_diagnostics, observations_from_analysis,
     resolve_repository_calls as resolve_rust_repository_calls,
 };
-use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Observation, RepositoryFacts, RepositoryState,
-    Workspace, WorkspaceView,
-};
+use beholder_domain::{RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, QueryMetadata};
 use notify::{Event, EventKind};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -37,6 +30,19 @@ use tokio::{
     sync::Notify,
     time::{Instant, MissedTickBehavior},
 };
+
+#[path = "cache.rs"]
+mod cache;
+#[path = "elixir_analysis.rs"]
+mod elixir_analysis;
+#[path = "pipeline.rs"]
+mod pipeline;
+#[path = "rust_analysis.rs"]
+mod rust_analysis;
+#[path = "sources.rs"]
+mod sources;
+use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
+use sources::{RepositorySources, repository_sources};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
@@ -61,48 +67,6 @@ const CURRENT_ANALYSIS_VERSIONS: AnalysisVersions = AnalysisVersions {
     protobuf_frontend: PROTOBUF_FRONTEND_VERSION,
     rule_pack: CORE_RULE_PACK_VERSION,
 };
-
-type RustSources = Vec<(PathBuf, String)>;
-type ElixirSources = Vec<(PathBuf, String)>;
-type ProtobufSources = Vec<(PathBuf, Vec<u8>)>;
-
-struct RepositorySources {
-    state: RepositoryState,
-    rust: RustSources,
-    elixir: ElixirSources,
-    protobuf: ProtobufSources,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct SourceAnalysisKey {
-    content_hash: [u8; 32],
-    frontend_version: &'static str,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RepositoryAnalysisKey {
-    fingerprint: String,
-    frontend_version: &'static str,
-    resolver_version: &'static str,
-    elixir_frontend_version: &'static str,
-    elixir_resolver_version: &'static str,
-    protobuf_frontend_version: &'static str,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct RepositoryAnalysis {
-    observations: Vec<Observation>,
-    diagnostics: Vec<AnalysisDiagnostic>,
-}
-
-impl SourceAnalysisKey {
-    fn new(source: &str, frontend_version: &'static str) -> Self {
-        Self {
-            content_hash: Sha256::digest(source.as_bytes()).into(),
-            frontend_version,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CacheStatus {
@@ -480,42 +444,7 @@ impl IndexScheduler {
         source: &str,
         frontend_version: &'static str,
     ) -> Cached<RustAnalysis> {
-        let key = SourceAnalysisKey::new(source, frontend_version);
-        if let Some(analysis) = self
-            .rust_cache
-            .lock()
-            .map_err(|_| "Rust frontend cache lock poisoned")?
-            .get(&key)
-            .cloned()
-        {
-            return Ok((analysis, CacheStatus::Memory));
-        }
-        let path = self.cache_path("rust", &key);
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(analysis) = serde_json::from_slice::<RustAnalysis>(&bytes)
-        {
-            let analysis = Arc::new(analysis);
-            self.rust_cache
-                .lock()
-                .map_err(|_| "Rust frontend cache lock poisoned")?
-                .insert(key, analysis.clone());
-            return Ok((analysis, CacheStatus::Disk));
-        }
-        let analysis = Arc::new(analyze(source)?);
-        if let Some(parent) = path.parent()
-            && fs::create_dir_all(parent).is_ok()
-            && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
-        {
-            let _ = fs::write(path, bytes);
-        }
-        let analysis = self
-            .rust_cache
-            .lock()
-            .map_err(|_| "Rust frontend cache lock poisoned")?
-            .entry(key)
-            .or_insert_with(|| analysis.clone())
-            .clone();
-        Ok((analysis, CacheStatus::Miss))
+        rust_analysis::analysis_versioned(self, source, frontend_version)
     }
 
     fn elixir_analysis_versioned(
@@ -523,42 +452,7 @@ impl IndexScheduler {
         source: &str,
         frontend_version: &'static str,
     ) -> Cached<ElixirAnalysis> {
-        let key = SourceAnalysisKey::new(source, frontend_version);
-        if let Some(analysis) = self
-            .elixir_cache
-            .lock()
-            .map_err(|_| "Elixir frontend cache lock poisoned")?
-            .get(&key)
-            .cloned()
-        {
-            return Ok((analysis, CacheStatus::Memory));
-        }
-        let path = self.cache_path("elixir", &key);
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(analysis) = serde_json::from_slice::<ElixirAnalysis>(&bytes)
-        {
-            let analysis = Arc::new(analysis);
-            self.elixir_cache
-                .lock()
-                .map_err(|_| "Elixir frontend cache lock poisoned")?
-                .insert(key, analysis.clone());
-            return Ok((analysis, CacheStatus::Disk));
-        }
-        let analysis = Arc::new(analyze_elixir(source)?);
-        if let Some(parent) = path.parent()
-            && fs::create_dir_all(parent).is_ok()
-            && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
-        {
-            let _ = fs::write(path, bytes);
-        }
-        let analysis = self
-            .elixir_cache
-            .lock()
-            .map_err(|_| "Elixir frontend cache lock poisoned")?
-            .entry(key)
-            .or_insert_with(|| analysis.clone())
-            .clone();
-        Ok((analysis, CacheStatus::Miss))
+        elixir_analysis::analysis_versioned(self, source, frontend_version)
     }
 
     fn cache_path(&self, language: &str, key: &SourceAnalysisKey) -> PathBuf {
@@ -691,116 +585,6 @@ impl IndexScheduler {
     }
 }
 
-fn report_analysis_diagnostics(workspace: &str, diagnostics: &[(String, AnalysisDiagnostic)]) {
-    let mut limitations = BTreeMap::<&str, usize>::new();
-    for (repository, diagnostic) in diagnostics {
-        match diagnostic.severity {
-            AnalysisDiagnosticSeverity::KnownLimitation => {
-                *limitations.entry(diagnostic.code.as_str()).or_default() += 1;
-                tracing::debug!(
-                    workspace,
-                    repository,
-                    code = %diagnostic.code,
-                    severity = diagnostic.severity.as_str(),
-                    path = %diagnostic.path.display(),
-                    line = ?diagnostic.line,
-                    detail = ?diagnostic.detail,
-                    "frontend analysis diagnostic"
-                );
-            }
-            AnalysisDiagnosticSeverity::Warning => tracing::warn!(
-                workspace,
-                repository,
-                code = %diagnostic.code,
-                severity = diagnostic.severity.as_str(),
-                path = %diagnostic.path.display(),
-                line = ?diagnostic.line,
-                detail = ?diagnostic.detail,
-                "frontend analysis diagnostic"
-            ),
-        }
-    }
-    if !limitations.is_empty() {
-        tracing::info!(
-            workspace,
-            known_limitations = limitations.values().sum::<usize>(),
-            codes = ?limitations,
-            "frontend analysis limitations"
-        );
-    }
-}
-
-fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            if !matches!(
-                entry.file_name().to_str(),
-                Some(".git" | "target" | "_build" | "deps" | "node_modules")
-            ) {
-                source_files(&path, files)?;
-            }
-        } else if path
-            .extension()
-            .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "ex" | "exs")))
-        {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn repository_sources(
-    root: &Path,
-    descriptor_paths: &[PathBuf],
-) -> Result<RepositorySources, Box<dyn Error>> {
-    if !root.is_dir() {
-        return Err(format!("repository does not exist: {}", root.display()).into());
-    }
-    let mut files = Vec::new();
-    source_files(root, &mut files)?;
-    files.sort();
-    let sources = files
-        .into_iter()
-        .map(|path| {
-            let relative_path = path.strip_prefix(root)?.to_path_buf();
-            Ok((relative_path, fs::read_to_string(path)?))
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    let (elixir, rust): (ElixirSources, RustSources) =
-        sources.into_iter().partition(|(path, _)| {
-            path.extension()
-                .is_some_and(|extension| matches!(extension.to_str(), Some("ex" | "exs")))
-        });
-    let mut descriptors = descriptor_paths
-        .iter()
-        .map(|path| Ok((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?)))
-        .collect::<Result<ProtobufSources, Box<dyn Error>>>()?;
-    descriptors.sort_by(|left, right| left.0.cmp(&right.0));
-    let state = repository_state_bytes(
-        root,
-        rust.iter()
-            .map(|(path, source)| (path.as_path(), source.as_bytes()))
-            .chain(
-                elixir
-                    .iter()
-                    .map(|(path, source)| (path.as_path(), source.as_bytes())),
-            )
-            .chain(
-                descriptors
-                    .iter()
-                    .map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
-            ),
-    )?;
-    Ok(RepositorySources {
-        state,
-        rust,
-        elixir,
-        protobuf: descriptors,
-    })
-}
-
 fn index_workspace(
     scheduler: &IndexScheduler,
     store: &SemanticStore,
@@ -912,7 +696,7 @@ fn index_workspace_versioned(
     if let Err(error) = store.checkpoint() {
         tracing::warn!(workspace = %workspace.name, %error, "Mnestic checkpoint failed");
     }
-    report_analysis_diagnostics(&workspace.name, &diagnostics);
+    pipeline::report_analysis_diagnostics(&workspace.name, &diagnostics);
     tracing::info!(
         workspace = %workspace.name,
         observation_count = all_observations.len(),

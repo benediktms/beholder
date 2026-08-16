@@ -1,6 +1,6 @@
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{socket_path, state_dir};
-use beholder_dto::{Revisioned, SemanticQueryResult, WhyResult};
+use beholder_dto::{Revisioned, WhyResult};
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
     GetStatusRequest, GetStatusResponse, ImpactResponse, ListWorkspacesRequest,
@@ -9,131 +9,21 @@ use beholder_protocol::v1::{
     WhyResponse,
     daemon_server::{Daemon, DaemonServer},
 };
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::{
-    collections::BTreeSet,
-    error::Error,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
-#[cfg(unix)]
-use tokio::net::UnixListener;
-use tokio::sync::oneshot;
+use std::{error::Error, path::PathBuf};
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 
+mod daemon;
 mod indexing;
+mod ipc;
 mod logging;
+mod rpc;
 mod single_instance;
 mod workspace_registry;
 
-use indexing::IndexScheduler;
+use daemon::BeholderDaemon;
 use workspace_registry::WorkspaceRegistry;
-
-#[cfg(unix)]
-struct SocketFile(PathBuf);
-
-#[cfg(unix)]
-impl Drop for SocketFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-#[cfg(unix)]
-fn bind_socket(path: &Path) -> Result<(UnixListener, SocketFile), Box<dyn Error>> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let listener = UnixListener::bind(path)?;
-    let socket = SocketFile(path.to_path_buf());
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok((listener, socket))
-}
-
-struct BeholderDaemon {
-    store: Arc<SemanticStore>,
-    workspaces: Arc<Mutex<WorkspaceRegistry>>,
-    scheduler: Arc<IndexScheduler>,
-    watcher: Mutex<RecommendedWatcher>,
-    shutdown: Mutex<Option<oneshot::Sender<()>>>,
-}
-
-type DaemonParts = (BeholderDaemon, oneshot::Receiver<()>, Arc<IndexScheduler>);
-
-fn daemon(
-    store: SemanticStore,
-    workspaces: WorkspaceRegistry,
-    cache_dir: PathBuf,
-) -> Result<DaemonParts, Box<dyn Error>> {
-    let (shutdown, stopped) = oneshot::channel();
-    let workspaces = Arc::new(Mutex::new(workspaces));
-    let scheduler = Arc::new(IndexScheduler::new(cache_dir));
-    let callback_workspaces = workspaces.clone();
-    let callback_scheduler = scheduler.clone();
-    let mut watcher = notify::recommended_watcher(move |event| {
-        callback_scheduler.add_event(event, &callback_workspaces);
-    })?;
-    let registered = workspaces
-        .lock()
-        .map_err(|_| "workspace registry lock poisoned")?
-        .list();
-    for workspace in &registered {
-        watch_workspace(&mut watcher, workspace)?;
-    }
-    for workspace in registered {
-        scheduler.mark(&workspace);
-    }
-    Ok((
-        BeholderDaemon {
-            store: Arc::new(store),
-            workspaces,
-            scheduler: scheduler.clone(),
-            watcher: Mutex::new(watcher),
-            shutdown: Mutex::new(Some(shutdown)),
-        },
-        stopped,
-        scheduler,
-    ))
-}
-
-fn watch_workspace(
-    watcher: &mut RecommendedWatcher,
-    workspace: &beholder_domain::Workspace,
-) -> notify::Result<()> {
-    for repository in &workspace.repositories {
-        watcher.watch(&repository.base, RecursiveMode::Recursive)?;
-    }
-    Ok(())
-}
-
-fn update_workspace_watch(
-    watcher: &mut RecommendedWatcher,
-    previous: Option<&beholder_domain::Workspace>,
-    workspace: &beholder_domain::Workspace,
-) -> notify::Result<()> {
-    let previous = previous
-        .into_iter()
-        .flat_map(|workspace| &workspace.repositories)
-        .map(|repository| &repository.base)
-        .collect::<BTreeSet<_>>();
-    let current = workspace
-        .repositories
-        .iter()
-        .map(|repository| &repository.base)
-        .collect::<BTreeSet<_>>();
-    for repository in previous.difference(&current) {
-        watcher.unwatch(repository)?;
-    }
-    for repository in current.difference(&previous) {
-        watcher.watch(repository, RecursiveMode::Recursive)?;
-    }
-    Ok(())
-}
 
 #[tonic::async_trait]
 impl Daemon for BeholderDaemon {
@@ -307,7 +197,7 @@ impl Daemon for BeholderDaemon {
             .watcher
             .lock()
             .map_err(|_| Status::internal("filesystem watcher lock poisoned"))?;
-        update_workspace_watch(&mut watcher, previous.as_ref(), &workspace)
+        daemon::update_workspace_watch(&mut watcher, previous.as_ref(), &workspace)
             .map_err(|error| Status::internal(error.to_string()))?;
         self.scheduler.mark(&workspace);
         tracing::info!(workspace = %workspace.name, "workspace registered");
@@ -364,52 +254,6 @@ impl Daemon for BeholderDaemon {
     }
 }
 
-impl BeholderDaemon {
-    fn query_response<T, P>(
-        &self,
-        workspace: &str,
-        result: Result<Revisioned<T>, Box<dyn Error>>,
-    ) -> Result<Response<P>, Status>
-    where
-        T: SemanticQueryResult,
-        P: From<T>,
-    {
-        let revisioned = result.map_err(|error| Status::internal(error.to_string()))?;
-        let mut result = revisioned.result;
-        *result.metadata_mut() = self
-            .scheduler
-            .query_metadata(workspace, revisioned.analysis_revision);
-        Ok(Response::new(result.into()))
-    }
-}
-
-#[cfg(unix)]
-async fn shutdown_signal(stopped: oneshot::Receiver<()>) {
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(mut terminate) => {
-            tokio::select! {
-                _ = stopped => {}
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-            }
-        }
-        Err(_) => {
-            tokio::select! {
-                _ = stopped => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal(stopped: oneshot::Receiver<()>) {
-    tokio::select! {
-        _ = stopped => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(not(unix))]
@@ -423,10 +267,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
         let _lock = single_instance::acquire(&state_dir)?;
         let socket_path = socket_path()?;
-        let (listener, _socket_file) = bind_socket(&socket_path)?;
+        let (listener, _socket_file) = ipc::bind_socket(&socket_path)?;
         let _log_guard = logging::init(&state_dir);
         tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "daemon started");
-        let (service, stopped, index_scheduler) = daemon(
+        let (service, stopped, index_scheduler) = daemon::build(
             SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
             WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
             state_dir.join("frontend-cache"),
@@ -440,7 +284,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .add_service(DaemonServer::new(service))
             .serve_with_incoming_shutdown(
                 UnixListenerStream::new(listener),
-                shutdown_signal(stopped),
+                ipc::shutdown_signal(stopped),
             )
             .await?;
         index_scheduler.stop();
@@ -481,7 +325,7 @@ mod tests {
         );
         let socket_path = state.join("beholder.sock");
         fs::write(&socket_path, "stale").unwrap();
-        let (listener, socket_file) = bind_socket(&socket_path).unwrap();
+        let (listener, socket_file) = ipc::bind_socket(&socket_path).unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777,
@@ -489,7 +333,7 @@ mod tests {
         );
         let _ = fs::remove_file(&database);
         let registry_path = workspace_registry::registry_path(&state);
-        let (service, stopped, index_scheduler) = daemon(
+        let (service, stopped, index_scheduler) = daemon::build(
             SemanticStore::persistent(&database, true).unwrap(),
             WorkspaceRegistry::open(registry_path.clone()).unwrap(),
             state.join("frontend-cache"),

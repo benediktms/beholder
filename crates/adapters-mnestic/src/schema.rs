@@ -1,0 +1,188 @@
+pub(super) const CREATE_SCHEMA: &str = r#"
+:create state_observation {
+    state: String,
+    from: String,
+    relation: String,
+    to: String,
+    =>
+    evidence: String,
+}
+"#;
+
+pub(super) const CREATE_DEPENDENCY_SCHEMA: &str = r#"
+:create state_dependency_observation {
+    state: String,
+    from: String,
+    relation: String,
+    to: String,
+    =>
+    evidence: String,
+}
+"#;
+
+pub(super) const CREATE_METADATA_SCHEMA: &str = r#"
+:create state_observation_metadata {
+    state: String,
+    from: String,
+    relation: String,
+    to: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
+    "::index create state_observation:by_to {to, state, from, relation, evidence}";
+pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \
+     {to, state, from, relation, confidence, provenance}";
+
+pub(super) const CREATE_OVERRIDE_SCHEMA: &str = r#"
+:create analysis_revision_dependency_override {
+    view: String,
+    revision: Int,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    =>
+    resolved_to: String,
+    evidence: String,
+}
+"#;
+
+pub(super) const CREATE_OVERRIDE_METADATA_SCHEMA: &str = r#"
+:create analysis_revision_dependency_override_metadata {
+    view: String,
+    revision: Int,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_REVISION_SCHEMA: &str = r#"
+:create analysis_revision {
+    view: String,
+    =>
+    revision: Int,
+}
+"#;
+
+pub(super) const CREATE_FINGERPRINT_SCHEMA: &str = r#"
+:create analysis_fingerprint {
+    view: String,
+    =>
+    fingerprint: String,
+}
+"#;
+
+pub(super) const CREATE_REPOSITORY_STATE_SCHEMA: &str = r#"
+:create repository_state {
+    fingerprint: String,
+    =>
+    repository: String,
+    head: String,
+}
+"#;
+
+pub(super) const CREATE_REVISION_STATE_SCHEMA: &str = r#"
+:create analysis_revision_state {
+    view: String,
+    revision: Int,
+    repository: String,
+    =>
+    state: String,
+}
+"#;
+
+pub(super) const SEED: &str = r#"
+?[state, from, relation, to, evidence] <- [
+    ['seed-main', 'web/CheckoutPage', 'uses', 'web/CheckoutQuery', 'CheckoutPage.tsx:12'],
+    ['seed-main', 'web/CheckoutQuery', 'selects', 'graphql/Query.checkout', 'CheckoutQuery.graphql:2'],
+    ['seed-main', 'graphql/Query.checkout', 'resolved_by', 'bff/CheckoutResolver.checkout', 'schema.ex:41'],
+    ['seed-main', 'bff/CheckoutResolver.checkout', 'calls', 'rpc/Pricing.GetPrice', 'checkout_resolver.ex:28'],
+    ['seed-main', 'rpc/Pricing.GetPrice', 'implemented_by', 'pricing/get_price', 'pricing.proto:9'],
+    ['seed-main', 'pricing/get_price', 'publishes', 'topic/pricing.updated', 'get_price.rs:18'],
+    ['seed-main', 'topic/pricing.updated', 'consumed_by', 'cache/update_price', 'consumer.rs:7'],
+    ['seed-feature', 'rpc/Pricing.GetPrice', 'implemented_by', 'pricing/get_price_v2', 'pricing.proto:9'],
+]
+:put state_observation {state, from, relation, to => evidence}
+"#;
+
+pub(super) const SEED_DEPENDENCIES: &str = r#"
+?[state, from, relation, to, evidence] :=
+    *state_observation{state, from, relation, to, evidence}
+:put state_dependency_observation {state, from, relation, to => evidence}
+"#;
+
+pub(super) const SEED_METADATA: &str = r#"
+?[state, from, relation, to, confidence, provenance] :=
+    *state_observation{state, from, relation, to},
+    confidence = 1.0,
+    provenance = 'ast'
+:put state_observation_metadata {state, from, relation, to => confidence, provenance}
+"#;
+
+pub(super) const SEED_REVISIONS: &str = r#"
+?[view, revision] <- [['main', 0], ['feature', 0]]
+:put analysis_revision {view => revision}
+"#;
+
+pub(super) const SEED_STATES: &str = r#"
+?[view, revision, repository, state] <- [
+    ['main', 0, 'seed', 'seed-main'],
+    ['feature', 0, 'seed', 'seed-feature'],
+]
+:put analysis_revision_state {view, revision, repository => state}
+"#;
+
+pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
+pub(super) const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
+pub(super) const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
+pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_state{view: $view, revision, state}\n\
+     context_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_dependency_override{\
+             view: $view, revision, from, relation, unresolved_to, resolved_to, evidence\
+         }, \
+         *analysis_revision_dependency_override_metadata{\
+             view: $view, revision, from, relation, unresolved_to, confidence, provenance\
+         }\n\
+     overridden[from, relation, unresolved_to, evidence] := \
+         context_override[from, relation, unresolved_to, _, evidence, _, _]\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         selected_state[state], \
+         *state_observation{\
+             state, from: $entity, relation, to: related, evidence\
+         }, \
+         *state_observation_metadata{\
+             state, from: $entity, relation, to: related, confidence, provenance\
+         }, \
+         not overridden[$entity, relation, related, evidence], \
+         direction = 'outgoing'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         context_override[\
+             $entity, relation, _, related, evidence, confidence, provenance\
+         ], \
+         direction = 'outgoing'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         selected_state[state], \
+         *state_observation:by_to{\
+             state, from: related, relation, to: $entity, evidence\
+         }, \
+         *state_observation_metadata:by_to{\
+             state, from: related, relation, to: $entity, confidence, provenance\
+         }, \
+         not overridden[related, relation, $entity, evidence], \
+         direction = 'incoming'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         context_override[\
+             related, relation, _, $entity, evidence, confidence, provenance\
+         ], \
+         direction = 'incoming'\n\
+     :order direction, relation, related";
