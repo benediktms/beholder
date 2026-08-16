@@ -18,6 +18,7 @@ use beholder_adapters_treesitter_rust::{
 use beholder_domain::{RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
+use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -120,6 +121,7 @@ pub struct IndexScheduler {
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
     repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<RepositoryAnalysis>>>,
+    analysis_pool: rayon::ThreadPool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +146,25 @@ impl Drop for ActiveIndex<'_> {
 
 impl IndexScheduler {
     pub fn new(cache_dir: PathBuf) -> Self {
+        let workers = std::env::var("BEHOLDER_INDEX_WORKERS")
+            .ok()
+            .and_then(|workers| workers.parse().ok())
+            .filter(|workers| *workers > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(4)
+            });
+        Self::with_workers(cache_dir, workers)
+    }
+
+    fn with_workers(cache_dir: PathBuf, workers: usize) -> Self {
+        let analysis_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("beholder-index-{index}"))
+            .build()
+            .expect("bounded indexing pool should start");
+        tracing::info!(workers, "index analysis pool configured");
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
@@ -155,6 +176,7 @@ impl IndexScheduler {
             rust_cache: Mutex::new(BTreeMap::new()),
             elixir_cache: Mutex::new(BTreeMap::new()),
             repository_cache: Mutex::new(BTreeMap::new()),
+            analysis_pool,
         }
     }
 
@@ -556,43 +578,64 @@ impl IndexScheduler {
         }
         let mut observations = Vec::new();
         let mut diagnostics = Vec::new();
-        for (path, source) in rust_sources {
-            let (analysis, cache_status) = self
-                .rust_analysis_versioned(source, versions.rust_frontend)
-                .map_err(|error| format!("failed to analyze {}: {error}", path.display()))?;
-            tracing::debug!(
-                repository = %state.repository.identity,
-                path = %path.display(),
-                ?cache_status,
-                "frontend cache lookup"
-            );
-            observations.extend(observations_from_analysis(
-                &state.repository.identity,
-                &analysis,
-                path,
-            ));
-            diagnostics.extend(rust_diagnostics(&analysis, path));
+        let rust_analyses = self.analysis_pool.install(|| {
+            rust_sources
+                .par_iter()
+                .map(|(path, source)| {
+                    let (analysis, cache_status) = self
+                        .rust_analysis_versioned(source, versions.rust_frontend)
+                        .map_err(|error| {
+                            format!("failed to analyze {}: {error}", path.display())
+                        })?;
+                    tracing::debug!(
+                        repository = %state.repository.identity,
+                        path = %path.display(),
+                        ?cache_status,
+                        "frontend cache lookup"
+                    );
+                    Ok::<_, String>((
+                        observations_from_analysis(&state.repository.identity, &analysis, path),
+                        rust_diagnostics(&analysis, path),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+        for analysis in rust_analyses {
+            let (source_observations, source_diagnostics) = analysis?;
+            observations.extend(source_observations);
+            diagnostics.extend(source_diagnostics);
         }
         resolve_rust_repository_calls(&mut observations);
         let mut elixir_analyses = Vec::new();
-        for (path, source) in elixir_sources {
-            let (analysis, cache_status) = self
-                .elixir_analysis_versioned(source, versions.elixir_frontend)
-                .map_err(|error| format!("failed to analyze {}: {error}", path.display()))?;
-            tracing::debug!(
-                repository = %state.repository.identity,
-                path = %path.display(),
-                ?cache_status,
-                "frontend cache lookup"
-            );
-            observations.extend(elixir_observations(
-                &state.repository.identity,
-                &analysis,
-                source,
-                path,
-            ));
-            diagnostics.extend(elixir_diagnostics(&analysis, path));
-            elixir_analyses.push((path.as_path(), analysis));
+        let analyzed_elixir = self.analysis_pool.install(|| {
+            elixir_sources
+                .par_iter()
+                .map(|(path, source)| {
+                    let (analysis, cache_status) = self
+                        .elixir_analysis_versioned(source, versions.elixir_frontend)
+                        .map_err(|error| {
+                            format!("failed to analyze {}: {error}", path.display())
+                        })?;
+                    tracing::debug!(
+                        repository = %state.repository.identity,
+                        path = %path.display(),
+                        ?cache_status,
+                        "frontend cache lookup"
+                    );
+                    Ok::<_, String>((
+                        path.as_path(),
+                        analysis.clone(),
+                        elixir_observations(&state.repository.identity, &analysis, source, path),
+                        elixir_diagnostics(&analysis, path),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+        for analysis in analyzed_elixir {
+            let (path, analysis, source_observations, source_diagnostics) = analysis?;
+            observations.extend(source_observations);
+            diagnostics.extend(source_diagnostics);
+            elixir_analyses.push((path, analysis));
         }
         let elixir_sources = elixir_analyses
             .iter()
@@ -604,8 +647,16 @@ impl IndexScheduler {
             &observations,
         ));
         resolve_elixir_repository_calls(&mut observations, &elixir_sources);
-        for (_, descriptor) in descriptors {
-            observations.extend(protobuf_observations(descriptor)?);
+        let descriptor_observations = self.analysis_pool.install(|| {
+            descriptors
+                .par_iter()
+                .map(|(_, descriptor)| {
+                    protobuf_observations(descriptor).map_err(|error| error.to_string())
+                })
+                .collect::<Vec<_>>()
+        });
+        for descriptor in descriptor_observations {
+            observations.extend(descriptor?);
         }
         let analysis = Arc::new(RepositoryAnalysis {
             observations,
@@ -727,9 +778,11 @@ fn index_workspace_versioned(
     let publication_started = Instant::now();
     let changes = store.publish(&view, &repository_facts, &overrides)?;
     let publication = publication_started.elapsed();
+    let checkpoint_started = Instant::now();
     if let Err(error) = store.checkpoint() {
         tracing::warn!(workspace = %workspace.name, %error, "Mnestic checkpoint failed");
     }
+    let checkpoint = checkpoint_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &diagnostics);
     tracing::info!(
         workspace = %workspace.name,
@@ -746,6 +799,7 @@ fn index_workspace_versioned(
         repository_analysis_ms = repository_analysis.as_secs_f64() * 1000.0,
         workspace_resolution_ms = workspace_resolution.as_secs_f64() * 1000.0,
         publication_ms = publication.as_secs_f64() * 1000.0,
+        checkpoint_ms = checkpoint.as_secs_f64() * 1000.0,
         "workspace indexed"
     );
     Ok((all_observations.len(), true))
@@ -915,6 +969,122 @@ mod tests {
         assert!(scheduler.elixir_cache.lock().unwrap().is_empty());
         assert!(scheduler.repository_cache.lock().unwrap().is_empty());
         assert!(!cache.exists());
+    }
+
+    #[test]
+    fn parallel_source_analysis_is_deterministic() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-parallel-{unique}"));
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "parallel-determinism".into(),
+        };
+        let sources = (0..64)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("lib/module_{index}.ex")),
+                    format!(
+                        "defmodule Example.Module{index} do\n  def call(value), do: value\nend"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let analyze = |workers, directory: &str| {
+            let scheduler = IndexScheduler::with_workers(cache.join(directory), workers);
+            let (analysis, status, _) = scheduler
+                .repository_observations_versioned(
+                    &state,
+                    &[],
+                    &sources,
+                    &[],
+                    CURRENT_ANALYSIS_VERSIONS,
+                )
+                .unwrap();
+            assert_eq!(status, CacheStatus::Miss);
+            let store = SemanticStore::memory().unwrap();
+            let view = WorkspaceView::new("main", "analysis", vec![state.clone()]).unwrap();
+            store
+                .publish(
+                    &view,
+                    &[RepositoryFacts {
+                        state: state.clone(),
+                        analysis_identity: "analysis".into(),
+                        observations: analysis.observations.clone(),
+                    }],
+                    &[],
+                )
+                .unwrap();
+            let entity = analysis.observations[0].from.as_str();
+            let context = store.context("main", entity).unwrap();
+            serde_json::to_vec(&(analysis.as_ref(), context)).unwrap()
+        };
+
+        assert_eq!(analyze(1, "one"), analyze(8, "eight"));
+        fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    #[ignore = "run through `just index-bench` with an explicit local corpus"]
+    fn benchmark_indexing() {
+        let workers = std::env::var("BEHOLDER_INDEX_WORKERS")
+            .expect("BEHOLDER_INDEX_WORKERS is required")
+            .parse::<usize>()
+            .expect("BEHOLDER_INDEX_WORKERS must be a positive integer");
+        assert!(workers > 0);
+        let repositories = std::env::var_os("BEHOLDER_INDEX_BENCH_REPOSITORIES")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .filter(|paths| !paths.is_empty())
+            .expect("BEHOLDER_INDEX_BENCH_REPOSITORIES is required");
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-index-bench-{unique}"));
+        fs::create_dir_all(&state).unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("benchmark".into(), repositories, Vec::new())
+            .unwrap();
+        let scheduler = IndexScheduler::with_workers(state.join("frontend-cache"), workers);
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .try_init();
+
+        let cold_started = Instant::now();
+        let (cold_observations, _) = index_workspace(&scheduler, &store, &workspace, None).unwrap();
+        println!(
+            "workers={workers} mode=cold observations={cold_observations} elapsed_ms={:.3}",
+            cold_started.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let warm_started = Instant::now();
+        let (warm_observations, _) = index_workspace_versioned(
+            &scheduler,
+            &store,
+            &workspace,
+            None,
+            AnalysisVersions {
+                rust_resolver: "benchmark",
+                elixir_resolver: "benchmark",
+                ..CURRENT_ANALYSIS_VERSIONS
+            },
+        )
+        .unwrap();
+        println!(
+            "workers={workers} mode=warm-frontend observations={warm_observations} elapsed_ms={:.3}",
+            warm_started.elapsed().as_secs_f64() * 1000.0
+        );
+        assert_eq!(cold_observations, warm_observations);
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
