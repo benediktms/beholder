@@ -30,3 +30,11 @@ pub fn explain(path: &Path, query: &str) -> Result<InspectionResult, Box<dyn Err
     .map(inspection_result)
     .map_err(Into::into)
 }
+
+#[cfg(feature = "devtools")]
+pub fn execute(path: &Path, query: &str) -> Result<InspectionResult, Box<dyn Error>> {
+    let db = persistent_database(path, false)?;
+    db.run_script(query, BTreeMap::new(), ScriptMutability::Immutable)
+        .map(inspection_result)
+        .map_err(Into::into)
+}
