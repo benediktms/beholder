@@ -588,6 +588,7 @@ impl IndexScheduler {
             observations.extend(elixir_observations(
                 &state.repository.identity,
                 &analysis,
+                source,
                 path,
             ));
             diagnostics.extend(elixir_diagnostics(&analysis, path));
