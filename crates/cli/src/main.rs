@@ -2,8 +2,8 @@ use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{FRONTEND_VERSION, observations};
 use beholder_daemon_client::{
-    clear_cache, context as daemon_context, dependencies as daemon_dependencies, get_status,
-    impact as daemon_impact, list_workspaces, register_workspace,
+    clear_cache, context as daemon_context, dependencies as daemon_dependencies, garbage_collect,
+    get_status, impact as daemon_impact, list_workspaces, register_workspace,
     reindex_workspace as daemon_reindex_workspace, state_dir, stop, trace as daemon_trace,
     why as daemon_why,
 };
@@ -161,6 +161,8 @@ enum Command {
 enum CacheCommand {
     /// Clear in-memory and persistent analysis caches.
     Clear,
+    /// Remove obsolete indexed states and reclaim database space.
+    Gc,
 }
 
 #[derive(Subcommand)]
@@ -515,6 +517,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             clear_cache().await?;
             println!("cleared analysis cache");
         }
+        Some(Command::Cache {
+            command: CacheCommand::Gc,
+        }) => {
+            let collected = garbage_collect().await?;
+            println!(
+                "removed {} repository states · {} -> {} bytes",
+                collected.repository_states_removed, collected.bytes_before, collected.bytes_after
+            );
+        }
         Some(Command::Inspect {
             subject,
             database,
@@ -623,6 +634,14 @@ mod tests {
                 .command,
             Some(Command::Cache {
                 command: CacheCommand::Clear
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "cache", "gc"])
+                .unwrap()
+                .command,
+            Some(Command::Cache {
+                command: CacheCommand::Gc
             })
         ));
         assert!(matches!(

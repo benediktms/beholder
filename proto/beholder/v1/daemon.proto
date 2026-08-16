@@ -4,6 +4,7 @@ package beholder.v1;
 
 service Daemon {
   rpc ClearCache(ClearCacheRequest) returns (ClearCacheResponse);
+  rpc GarbageCollect(GarbageCollectRequest) returns (GarbageCollectResponse);
   rpc Context(EntityRequest) returns (ContextResponse);
   rpc Dependencies(TraversalEntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
@@ -19,6 +20,14 @@ service Daemon {
 message ClearCacheRequest {}
 
 message ClearCacheResponse {}
+
+message GarbageCollectRequest {}
+
+message GarbageCollectResponse {
+  uint64 repository_states_removed = 1;
+  uint64 bytes_before = 2;
+  uint64 bytes_after = 3;
+}
 
 message EntityRequest {
   string entity = 1;

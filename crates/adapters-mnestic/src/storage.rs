@@ -374,6 +374,100 @@ pub(super) fn store_repository_states(
     Ok(())
 }
 
+pub(super) fn garbage_collect(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
+    let stale = db.run_script(
+        "live_state[state] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_state{view, revision, state}\n\
+         ?[state] := *repository_state{fingerprint: state}, not live_state[state]",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?;
+
+    db.run_script(
+        "{ \
+             live_state[state] := \
+                 *analysis_revision{view, revision}, \
+                 *analysis_revision_state{view, revision, state} \
+             stale_state[state] := \
+                 *repository_state{fingerprint: state}, not live_state[state] \
+             ?[state, from, relation, to] := \
+                 *state_observation{state, from, relation, to}, stale_state[state] \
+                 :rm state_observation {state, from, relation, to} \
+             } \
+             { \
+                 live_state[state] := \
+                     *analysis_revision{view, revision}, \
+                     *analysis_revision_state{view, revision, state} \
+                 stale_state[state] := \
+                     *repository_state{fingerprint: state}, not live_state[state] \
+                 ?[state, from, relation, to] := \
+                     *state_dependency_observation{state, from, relation, to}, stale_state[state] \
+                 :rm state_dependency_observation {state, from, relation, to} \
+             } \
+             { \
+                 live_state[state] := \
+                     *analysis_revision{view, revision}, \
+                     *analysis_revision_state{view, revision, state} \
+                 stale_state[state] := \
+                     *repository_state{fingerprint: state}, not live_state[state] \
+                 ?[state, from, relation, to] := \
+                     *state_observation_metadata{state, from, relation, to}, stale_state[state] \
+                 :rm state_observation_metadata {state, from, relation, to} \
+             } \
+             { \
+                 live_state[state] := \
+                     *analysis_revision{view, revision}, \
+                     *analysis_revision_state{view, revision, state} \
+                 ?[fingerprint] := *repository_state{fingerprint}, not live_state[fingerprint] \
+                 :rm repository_state {fingerprint} \
+             }",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+
+    for (relation, keys) in [
+        ("analysis_revision_state", "view, revision, repository"),
+        (
+            "analysis_revision_dependency_override",
+            "view, revision, from, relation, unresolved_to",
+        ),
+        (
+            "analysis_revision_dependency_override_metadata",
+            "view, revision, from, relation, unresolved_to",
+        ),
+    ] {
+        db.run_script(
+            &format!(
+                "?[{keys}] := \
+                     *{relation}{{{keys}}}, \
+                     *analysis_revision{{view, revision: current}}, \
+                     revision != current \
+                 :rm {relation} {{{keys}}}"
+            ),
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+
+    let relations = db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
+    for legacy in ["observation", "dependency_observation"] {
+        if relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some(legacy))
+        {
+            db.run_script(
+                &format!("::remove {legacy}"),
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )?;
+        }
+    }
+
+    Ok(stale.rows.len().try_into()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -208,6 +208,12 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     printf 'expected main revision:\n%s\n' "$revision" >&2
     exit 1
 fi
+echo 'Garbage collecting obsolete semantic states...' >&2
+gc_result="$(target/debug/beholder cache gc)"
+if ! grep -Eq '^removed [0-9]+ repository states' <<<"$gc_result"; then
+    printf 'unexpected garbage collection result:\n%s\n' "$gc_result" >&2
+    exit 1
+fi
 echo 'Stopping daemon and inspecting traces...' >&2
 target/debug/beholder daemon stop >/dev/null
 wait "$daemon_pid"
@@ -228,6 +234,7 @@ for expected in \
     'workspace indexed' \
     'facts_inserted' \
     'rpc.context' \
+    'semantic store garbage collected' \
     'elixir.macro_expansion_incomplete' \
     'rust.receiver_method_resolution_unavailable' \
     'frontend analysis limitations' \

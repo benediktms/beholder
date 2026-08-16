@@ -8,6 +8,13 @@ pub const WHY_SCHEMA_V2: &str = "beholder.why.v2";
 pub const DEFAULT_MAX_HOPS: u32 = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GarbageCollection {
+    pub repository_states_removed: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Freshness {
     pub stale: bool,
     pub indexing: bool,

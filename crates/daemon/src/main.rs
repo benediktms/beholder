@@ -3,10 +3,11 @@ use beholder_daemon_client::{socket_path, state_dir};
 use beholder_dto::{DEFAULT_MAX_HOPS, Revisioned, WhyResult};
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
-    GetStatusRequest, GetStatusResponse, ImpactResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, PathRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
-    ReindexWorkspaceRequest, ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
-    TraversalEntityRequest, WhyResponse,
+    GarbageCollectRequest, GarbageCollectResponse, GetStatusRequest, GetStatusResponse,
+    ImpactResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
+    RegisterWorkspaceRequest, RegisterWorkspaceResponse, ReindexWorkspaceRequest,
+    ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse, TraversalEntityRequest,
+    WhyResponse,
     daemon_server::{Daemon, DaemonServer},
 };
 use std::{error::Error, path::PathBuf};
@@ -37,6 +38,34 @@ impl Daemon for BeholderDaemon {
             .map_err(|error| Status::internal(error.to_string()))?;
         tracing::info!("analysis cache cleared");
         Ok(Response::new(ClearCacheResponse {}))
+    }
+
+    #[tracing::instrument(name = "rpc.garbage_collect", skip_all, err)]
+    async fn garbage_collect(
+        &self,
+        _request: Request<GarbageCollectRequest>,
+    ) -> Result<Response<GarbageCollectResponse>, Status> {
+        let scheduler = self.scheduler.clone();
+        let store = self.store.clone();
+        let collected = tokio::task::spawn_blocking(move || {
+            scheduler
+                .garbage_collect(&store)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| Status::internal(format!("garbage collection worker failed: {error}")))?
+        .map_err(Status::internal)?;
+        tracing::info!(
+            repository_states_removed = collected.repository_states_removed,
+            bytes_before = collected.bytes_before,
+            bytes_after = collected.bytes_after,
+            "semantic store garbage collected"
+        );
+        Ok(Response::new(GarbageCollectResponse {
+            repository_states_removed: collected.repository_states_removed,
+            bytes_before: collected.bytes_before,
+            bytes_after: collected.bytes_after,
+        }))
     }
 
     #[tracing::instrument(
@@ -83,7 +112,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 9,
+            protocol_version: 10,
             pid: std::process::id(),
         }))
     }
@@ -311,9 +340,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GetStatusRequest,
-        ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-        RelationKind, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+        ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectRequest,
+        GetStatusRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
+        ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
+        daemon_client::DaemonClient,
     };
     use std::{env, fs, path::Path, time::Duration};
 
@@ -381,7 +411,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 9);
+        assert_eq!(status.protocol_version, 10);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");
@@ -519,6 +549,12 @@ mod tests {
         assert!(freshness.dirty_repositories.is_empty());
         client.clear_cache(ClearCacheRequest {}).await.unwrap();
         assert!(!state.join("frontend-cache").exists());
+        let collected = client
+            .garbage_collect(GarbageCollectRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(collected.bytes_after <= collected.bytes_before);
 
         let third = state.join("repo-c");
         fs::create_dir_all(third.join("src")).unwrap();

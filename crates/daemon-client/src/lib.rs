@@ -1,9 +1,11 @@
 use beholder_domain::Workspace;
-use beholder_dto::{ContextResult, DependenciesResult, ImpactResult, TraceResult, WhyResult};
+use beholder_dto::{
+    ContextResult, DependenciesResult, GarbageCollection, ImpactResult, TraceResult, WhyResult,
+};
 use beholder_protocol::v1::{
-    ClearCacheRequest, EntityRequest, GetStatusRequest, GetStatusResponse, ListWorkspacesRequest,
-    PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
-    TraversalEntityRequest, daemon_client::DaemonClient,
+    ClearCacheRequest, EntityRequest, GarbageCollectRequest, GetStatusRequest, GetStatusResponse,
+    ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
+    StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
 };
 use std::path::{Path, PathBuf};
 use tonic::transport::Channel;
@@ -53,6 +55,19 @@ pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error
 pub async fn clear_cache() -> Result<(), Box<dyn std::error::Error>> {
     connect().await?.clear_cache(ClearCacheRequest {}).await?;
     Ok(())
+}
+
+pub async fn garbage_collect() -> Result<GarbageCollection, Box<dyn std::error::Error>> {
+    let response = connect()
+        .await?
+        .garbage_collect(GarbageCollectRequest {})
+        .await?
+        .into_inner();
+    Ok(GarbageCollection {
+        repository_states_removed: response.repository_states_removed,
+        bytes_before: response.bytes_before,
+        bytes_after: response.bytes_after,
+    })
 }
 
 pub async fn context(

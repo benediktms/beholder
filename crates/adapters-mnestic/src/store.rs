@@ -7,10 +7,12 @@ use super::{
         analysis_revision, context, dependencies, impact, inspect_observations, inspect_relations,
         inspect_revisions, trace,
     },
-    storage::{publish_observations, view_matches},
+    storage::{garbage_collect, publish_observations, view_matches},
 };
 use beholder_domain::{DependencyOverride, FactChanges, RepositoryFacts, WorkspaceView};
-use beholder_dto::{ContextResult, DependenciesResult, ImpactResult, Revisioned, TraceResult};
+use beholder_dto::{
+    ContextResult, DependenciesResult, GarbageCollection, ImpactResult, Revisioned, TraceResult,
+};
 use mnestic_engine::{DbInstance, MultiTransaction};
 use std::{
     error::Error,
@@ -34,6 +36,10 @@ impl SemanticStore {
     }
 
     pub fn persistent(path: &Path, initialize: bool) -> Result<Self, Box<dyn Error>> {
+        #[cfg(feature = "sqlite")]
+        if initialize && !path.exists() {
+            sqlite::open(path)?.execute("PRAGMA auto_vacuum = INCREMENTAL")?;
+        }
         let db = persistent_database(path, initialize)?;
         #[cfg(feature = "sqlite")]
         sqlite::open(path)?.execute("PRAGMA journal_mode=WAL")?;
@@ -81,6 +87,48 @@ impl SemanticStore {
             }
         }
         Ok(())
+    }
+
+    pub fn garbage_collect(&self) -> Result<GarbageCollection, Box<dyn Error>> {
+        let bytes_before = self
+            .database_path
+            .as_deref()
+            .map(std::fs::metadata)
+            .transpose()?
+            .map_or(0, |metadata| metadata.len());
+        let repository_states_removed = garbage_collect(&self.db)?;
+        self.checkpoint()?;
+
+        #[cfg(feature = "sqlite")]
+        if let Some(path) = &self.database_path {
+            let connection = sqlite::open(path)?;
+            connection.execute("PRAGMA busy_timeout = 5000")?;
+            let mut mode = connection.prepare("PRAGMA auto_vacuum")?;
+            if mode.next()? != sqlite::State::Row {
+                return Err("SQLite did not report its auto-vacuum mode".into());
+            }
+            if mode.read::<i64, _>(0)? == 0 {
+                drop(mode);
+                connection.execute("PRAGMA auto_vacuum = INCREMENTAL")?;
+                connection.execute("VACUUM")?;
+            } else {
+                drop(mode);
+                connection.execute("PRAGMA incremental_vacuum")?;
+            }
+        }
+        self.checkpoint()?;
+
+        let bytes_after = self
+            .database_path
+            .as_deref()
+            .map(std::fs::metadata)
+            .transpose()?
+            .map_or(0, |metadata| metadata.len());
+        Ok(GarbageCollection {
+            repository_states_removed,
+            bytes_before,
+            bytes_after,
+        })
     }
 
     pub fn inspect_relations(&self) -> Result<InspectionResult, Box<dyn Error>> {
@@ -329,6 +377,74 @@ mod tests {
         writer.abort().unwrap();
         reader_thread.join().unwrap();
         drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn garbage_collection_keeps_only_current_states_and_enables_incremental_vacuum() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-gc-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let database = state_dir.join("beholder.db");
+        sqlite::open(&database).unwrap();
+        let store = SemanticStore::persistent(&database, true).unwrap();
+        let state = |fingerprint: &str| RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: Some(fingerprint.into()),
+            fingerprint: fingerprint.into(),
+        };
+
+        for fingerprint in ["old", "current"] {
+            let view = WorkspaceView::new("main", "analysis", vec![state(fingerprint)]).unwrap();
+            store
+                .publish(
+                    &view,
+                    &[facts(
+                        &view,
+                        vec![Observation::dependency(
+                            "repo/source",
+                            DependencyRelation::Calls,
+                            "repo/target",
+                            format!("src/lib.rs:{fingerprint}"),
+                        )],
+                    )],
+                    &[],
+                )
+                .unwrap();
+        }
+
+        let before = store.context("main", "repo/source").unwrap();
+        let collected = store.garbage_collect().unwrap();
+        assert_eq!(collected.repository_states_removed, 1);
+        assert_eq!(store.context("main", "repo/source").unwrap(), before);
+        let states = store
+            .db
+            .run_script(
+                "?[state] := *repository_state{fingerprint: state}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(states.rows.len(), 1);
+
+        let connection = sqlite::open(&database).unwrap();
+        let mut mode = connection.prepare("PRAGMA auto_vacuum").unwrap();
+        assert_eq!(mode.next().unwrap(), sqlite::State::Row);
+        assert_eq!(mode.read::<i64, _>(0).unwrap(), 2);
+        drop(store);
+
+        let new_database = state_dir.join("new.db");
+        let new_store = SemanticStore::persistent(&new_database, true).unwrap();
+        let connection = sqlite::open(new_database).unwrap();
+        let mut mode = connection.prepare("PRAGMA auto_vacuum").unwrap();
+        assert_eq!(mode.next().unwrap(), sqlite::State::Row);
+        assert_eq!(mode.read::<i64, _>(0).unwrap(), 2);
+        drop(new_store);
         fs::remove_dir_all(state_dir).unwrap();
     }
 
