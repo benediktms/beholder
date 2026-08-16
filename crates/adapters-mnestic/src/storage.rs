@@ -6,43 +6,62 @@ use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, error::Error};
 
+const OBSERVATION_BATCH_SIZE: usize = 10_000;
+
 pub(super) fn store_observations(
     transaction: &MultiTransaction,
     state: &str,
     observations: &[Observation],
 ) -> Result<(), Box<dyn Error>> {
-    // ponytail: one transaction, per-row writes; batch when ingestion throughput matters.
-    for observation in observations {
-        let params = BTreeMap::from([
-            ("state".into(), state.into()),
-            ("from".into(), observation.from.as_str().into()),
-            ("relation".into(), observation.relation.as_str().into()),
-            ("to".into(), observation.to.as_str().into()),
-            ("evidence".into(), observation.evidence.as_str().into()),
-            ("confidence".into(), observation.confidence.score().into()),
-            ("provenance".into(), observation.provenance.as_str().into()),
-        ]);
+    for observations in observations.chunks(OBSERVATION_BATCH_SIZE) {
+        let rows = observations
+            .iter()
+            .map(|observation| {
+                DataValue::List(vec![
+                    state.into(),
+                    observation.from.as_str().into(),
+                    observation.relation.as_str().into(),
+                    observation.to.as_str().into(),
+                    observation.evidence.as_str().into(),
+                    observation.confidence.score().into(),
+                    observation.provenance.as_str().into(),
+                ])
+            })
+            .collect();
+        let rows = DataValue::List(rows);
         transaction.run_script(
-            "?[state, from, relation, to, evidence] <- [[$state, $from, $relation, $to, $evidence]]\n\
+            "?[state, from, relation, to, evidence, confidence, provenance] <- $rows\n\
              :put state_observation {state, from, relation, to => evidence}",
-            params.clone(),
+            BTreeMap::from([("rows".into(), rows.clone())]),
         )?;
-        if observation.relation.dependency().is_some() {
-            transaction.run_script(
-                "?[state, from, relation, to, evidence] <- [[$state, $from, $relation, $to, $evidence]]\n\
-                 :put state_dependency_observation {state, from, relation, to => evidence}",
-                params.clone(),
-            )?;
-        }
         transaction.run_script(
-            "?[state, from, relation, to, confidence, provenance] <- [\
-                 [$state, $from, $relation, $to, $confidence, $provenance]\
-             ]\n\
+            "?[state, from, relation, to, evidence, confidence, provenance] <- $rows\n\
              :put state_observation_metadata {\
                  state, from, relation, to => confidence, provenance\
              }",
-            params,
+            BTreeMap::from([("rows".into(), rows)]),
         )?;
+
+        let dependency_rows = observations
+            .iter()
+            .filter(|observation| observation.relation.dependency().is_some())
+            .map(|observation| {
+                DataValue::List(vec![
+                    state.into(),
+                    observation.from.as_str().into(),
+                    observation.relation.as_str().into(),
+                    observation.to.as_str().into(),
+                    observation.evidence.as_str().into(),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if !dependency_rows.is_empty() {
+            transaction.run_script(
+                "?[state, from, relation, to, evidence] <- $rows\n\
+                 :put state_dependency_observation {state, from, relation, to => evidence}",
+                BTreeMap::from([("rows".into(), DataValue::List(dependency_rows))]),
+            )?;
+        }
     }
     Ok(())
 }

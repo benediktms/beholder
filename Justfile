@@ -63,6 +63,11 @@ uninstall:
 smoke:
     moon run beholder:smoke
 
+# Benchmark cold and warm-frontend indexing with a bounded worker count.
+[group('manual')]
+index-bench workers repositories:
+    moon run beholder:index-bench -- "{{workers}}" "{{repositories}}"
+
 # Explain a Datalog query against the installed daemon database.
 [group('manual')]
 db-plan query:

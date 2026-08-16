@@ -89,3 +89,12 @@ tasks:
     options:
       cache: false
       runInCI: false
+
+  index-bench:
+    command: 'bash scripts/benchmark-indexing.sh'
+    inputs:
+      - '@group(sources)'
+      - 'scripts/benchmark-indexing.sh'
+    options:
+      cache: false
+      runInCI: false
