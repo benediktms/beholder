@@ -89,6 +89,11 @@ printf '%s\n' \
 git -C "$state/elixir" init -q
 git -C "$state/elixir" config user.name 'Beholder Smoke'
 git -C "$state/elixir" config user.email 'smoke@beholder.local'
+ssh-keygen -q -t ed25519 -N '' -f "$state/signing-key"
+git -C "$state/elixir" config gpg.format ssh
+git -C "$state/elixir" config gpg.ssh.program "$(command -v ssh-keygen)"
+git -C "$state/elixir" config user.signingkey "$state/signing-key"
+git -C "$state/elixir" config commit.gpgsign true
 git -C "$state/elixir" add lib/smoke.ex
 git -C "$state/elixir" commit -qm 'Add Elixir smoke fixture'
 git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
