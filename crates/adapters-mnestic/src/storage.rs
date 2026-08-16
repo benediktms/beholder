@@ -787,6 +787,22 @@ mod tests {
                 .len(),
             1
         );
+        assert!(
+            store
+                .dependencies("joined", "repo://source/rust/lib/caller")
+                .unwrap()
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.entity == resolved)
+        );
+        assert!(
+            store
+                .impact("joined", resolved)
+                .unwrap()
+                .affected
+                .iter()
+                .any(|affected| affected.entity == "repo://source/rust/lib/caller")
+        );
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }

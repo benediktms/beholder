@@ -1,3 +1,4 @@
+use crate::query::MAX_HOPS;
 use crate::{InspectionResult, InspectionValue};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V1, DependenciesResult, DependencyRef,
@@ -5,11 +6,17 @@ use beholder_dto::{
     ImpactRef, ImpactResult, PathQuery, QueryMetadata, RelationKind, SemanticEdge, SemanticPath,
     TRACE_SCHEMA_V1, TraceResult,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 
 type EdgeKey = (String, String, RelationKind);
 type Closure = (Vec<(String, u32)>, GraphOutput);
+
+#[derive(Clone, Copy)]
+enum TraversalDirection {
+    Outgoing,
+    Incoming,
+}
 
 pub(super) fn context(
     view: &str,
@@ -53,7 +60,7 @@ pub(super) fn dependencies(
     entity: &str,
     result: InspectionResult,
 ) -> Result<DependenciesResult, Box<dyn Error>> {
-    let (entries, output) = closure(result, entity)?;
+    let (entries, output) = closure(result, entity, TraversalDirection::Outgoing)?;
     Ok(DependenciesResult {
         schema: DEPENDENCIES_SCHEMA_V1.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -75,7 +82,7 @@ pub(super) fn impact(
     entity: &str,
     result: InspectionResult,
 ) -> Result<ImpactResult, Box<dyn Error>> {
-    let (entries, output) = closure(result, entity)?;
+    let (entries, output) = closure(result, entity, TraversalDirection::Incoming)?;
     Ok(ImpactResult {
         schema: IMPACT_SCHEMA_V1.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -92,16 +99,32 @@ pub(super) fn impact(
     })
 }
 
-fn closure(result: InspectionResult, root: &str) -> Result<Closure, Box<dyn Error>> {
+fn closure(
+    result: InspectionResult,
+    root: &str,
+    direction: TraversalDirection,
+) -> Result<Closure, Box<dyn Error>> {
+    let mut output = graph(result, &[root])?;
+    let distances = distances(root, &output.edges, direction);
+    output.nodes.retain(|node| distances.contains_key(&node.id));
+    output
+        .edges
+        .retain(|edge| distances.contains_key(&edge.from) && distances.contains_key(&edge.to));
+    let mut entries = distances
+        .into_iter()
+        .filter(|(entity, _)| entity != root)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    Ok((entries, output))
+}
+
+fn graph(result: InspectionResult, roots: &[&str]) -> Result<GraphOutput, Box<dyn Error>> {
     let mut graph = GraphBuilder::default();
-    graph.hint(root, infer_kind(root));
-    let mut entries: Vec<(String, u32)> = Vec::new();
+    for root in roots {
+        graph.hint(root, infer_kind(root));
+    }
     for row in result.rows {
         match text(&row, 0, "closure row kind")? {
-            "entity" => entries.push((
-                text(&row, 1, "closure entity")?.into(),
-                integer(&row, 2, "closure hops")?.try_into()?,
-            )),
             "edge" => {
                 graph.add_edge(
                     text(&row, 3, "closure edge source")?,
@@ -115,8 +138,38 @@ fn closure(result: InspectionResult, root: &str) -> Result<Closure, Box<dyn Erro
             kind => return Err(format!("unknown closure row kind: {kind}").into()),
         }
     }
-    entries.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-    Ok((entries, graph.finish()))
+    Ok(graph.finish())
+}
+
+fn distances(
+    root: &str,
+    edges: &[SemanticEdge],
+    direction: TraversalDirection,
+) -> BTreeMap<String, u32> {
+    let mut adjacent = BTreeMap::<&str, Vec<&str>>::new();
+    for edge in edges {
+        let (from, to) = match direction {
+            TraversalDirection::Outgoing => (edge.from.as_str(), edge.to.as_str()),
+            TraversalDirection::Incoming => (edge.to.as_str(), edge.from.as_str()),
+        };
+        adjacent.entry(from).or_default().push(to);
+    }
+
+    let mut distances = BTreeMap::from([(root.to_owned(), 0)]);
+    let mut queue = VecDeque::from([root.to_owned()]);
+    while let Some(from) = queue.pop_front() {
+        let hops = distances[&from];
+        if hops == MAX_HOPS {
+            continue;
+        }
+        for &to in adjacent.get(from.as_str()).into_iter().flatten() {
+            if !distances.contains_key(to) {
+                distances.insert(to.to_owned(), hops + 1);
+                queue.push_back(to.to_owned());
+            }
+        }
+    }
+    distances
 }
 
 pub(super) fn trace(
@@ -125,75 +178,20 @@ pub(super) fn trace(
     to: &str,
     result: InspectionResult,
 ) -> Result<TraceResult, Box<dyn Error>> {
-    let mut graph = GraphBuilder::default();
-    graph.hint(from, infer_kind(from));
-    graph.hint(to, infer_kind(to));
-    let mut paths = Vec::new();
-    for row in result.rows {
-        let nodes = list(&row, 0, "trace nodes")?
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .ok_or("trace node must be text")
-                    .map(str::to_owned)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let steps = list(&row, 1, "trace steps")?;
-        if nodes.len() != steps.len() + 1 {
-            return Err("trace path node and edge counts do not align".into());
-        }
-        let mut keys = Vec::with_capacity(steps.len());
-        for step in steps {
-            let InspectionValue::List(values) = step else {
-                return Err("trace step must be a list".into());
-            };
-            let index: usize = values
-                .first()
-                .and_then(InspectionValue::as_i64)
-                .ok_or("trace step index must be an integer")?
-                .try_into()?;
-            let relation = values
-                .get(1)
-                .and_then(InspectionValue::as_str)
-                .ok_or("trace step relation must be text")?;
-            let evidence = values
-                .get(2)
-                .and_then(InspectionValue::as_str)
-                .ok_or("trace step evidence must be text")?;
-            let confidence = values
-                .get(3)
-                .and_then(|value| match value {
-                    InspectionValue::Float(value) => Some(*value as f32),
-                    InspectionValue::Integer(value) => Some(*value as f32),
-                    _ => None,
-                })
-                .ok_or("trace step confidence must be numeric")?;
-            let provenance = values
-                .get(4)
-                .and_then(InspectionValue::as_str)
-                .ok_or("trace step provenance must be text")?;
-            let source = nodes
-                .get(index)
-                .ok_or("trace step source is out of bounds")?;
-            let target = nodes
-                .get(index + 1)
-                .ok_or("trace step target is out of bounds")?;
-            keys.push(graph.add_edge(source, target, relation, evidence, confidence, provenance)?);
-        }
-        paths.push((nodes, keys));
-    }
-    let output = graph.finish();
-    let paths = paths
+    let mut output = graph(result, &[from, to])?;
+    let paths = shortest_path(from, to, &output.edges)
         .into_iter()
-        .map(|(nodes, keys)| SemanticPath {
-            nodes,
-            edges: keys
-                .into_iter()
-                .map(|key| output.edge_ids[&key].clone())
-                .collect(),
-        })
-        .collect();
+        .collect::<Vec<_>>();
+    let path_nodes = paths
+        .first()
+        .map(|path| path.nodes.iter().cloned().collect())
+        .unwrap_or_else(|| BTreeSet::from([from.into(), to.into()]));
+    let path_edges = paths
+        .first()
+        .map(|path| path.edges.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    output.nodes.retain(|node| path_nodes.contains(&node.id));
+    output.edges.retain(|edge| path_edges.contains(&edge.id));
     Ok(TraceResult {
         schema: TRACE_SCHEMA_V1.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -205,6 +203,54 @@ pub(super) fn trace(
         edges: output.edges,
         paths,
     })
+}
+
+fn shortest_path(from: &str, to: &str, edges: &[SemanticEdge]) -> Option<SemanticPath> {
+    if from == to {
+        return Some(SemanticPath {
+            nodes: vec![from.into()],
+            edges: Vec::new(),
+        });
+    }
+    let mut adjacent = BTreeMap::<&str, Vec<&SemanticEdge>>::new();
+    for edge in edges {
+        adjacent.entry(&edge.from).or_default().push(edge);
+    }
+    let mut parents = BTreeMap::<String, (String, String)>::new();
+    let mut distances = BTreeMap::from([(from.to_owned(), 0)]);
+    let mut queue = VecDeque::from([from.to_owned()]);
+    while let Some(node) = queue.pop_front() {
+        let hops = distances[&node];
+        if hops == MAX_HOPS {
+            continue;
+        }
+        for edge in adjacent.get(node.as_str()).into_iter().flatten() {
+            if distances.contains_key(&edge.to) {
+                continue;
+            }
+            distances.insert(edge.to.clone(), hops + 1);
+            parents.insert(edge.to.clone(), (node.clone(), edge.id.clone()));
+            if edge.to == to {
+                let mut nodes = vec![to.to_owned()];
+                let mut path_edges = Vec::new();
+                let mut cursor = to;
+                while cursor != from {
+                    let (parent, edge) = &parents[cursor];
+                    nodes.push(parent.clone());
+                    path_edges.push(edge.clone());
+                    cursor = parent;
+                }
+                nodes.reverse();
+                path_edges.reverse();
+                return Some(SemanticPath {
+                    nodes,
+                    edges: path_edges,
+                });
+            }
+            queue.push_back(edge.to.clone());
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -276,14 +322,12 @@ impl GraphBuilder {
                 )
             })
             .collect::<Vec<_>>();
-        let mut edge_ids = BTreeMap::new();
         let edges = self
             .edges
             .into_iter()
             .enumerate()
             .map(|(index, (key, edge))| {
                 let id = format!("e{}", index + 1);
-                edge_ids.insert(key.clone(), id.clone());
                 SemanticEdge {
                     id,
                     from: key.0,
@@ -294,11 +338,7 @@ impl GraphBuilder {
                 }
             })
             .collect();
-        GraphOutput {
-            nodes,
-            edges,
-            edge_ids,
-        }
+        GraphOutput { nodes, edges }
     }
 }
 
@@ -322,7 +362,6 @@ fn kind_priority(kind: EntityKind) -> u8 {
 struct GraphOutput {
     nodes: Vec<EntityRef>,
     edges: Vec<SemanticEdge>,
-    edge_ids: BTreeMap<EdgeKey, String>,
 }
 
 impl GraphOutput {
@@ -526,28 +565,11 @@ fn text<'a>(
         .ok_or_else(|| format!("{name} must be text").into())
 }
 
-fn integer(row: &[InspectionValue], index: usize, name: &str) -> Result<i64, Box<dyn Error>> {
-    row.get(index)
-        .and_then(InspectionValue::as_i64)
-        .ok_or_else(|| format!("{name} must be an integer").into())
-}
-
 fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<dyn Error>> {
     match row.get(index) {
         Some(InspectionValue::Float(value)) => Ok(*value),
         Some(InspectionValue::Integer(value)) => Ok(*value as f64),
         _ => Err(format!("{name} must be numeric").into()),
-    }
-}
-
-fn list<'a>(
-    row: &'a [InspectionValue],
-    index: usize,
-    name: &str,
-) -> Result<&'a [InspectionValue], Box<dyn Error>> {
-    match row.get(index) {
-        Some(InspectionValue::List(values)) => Ok(values),
-        _ => Err(format!("{name} must be a list").into()),
     }
 }
 

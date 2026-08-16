@@ -2,7 +2,7 @@ use super::schema::*;
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability};
 use std::{collections::BTreeMap, error::Error};
 
-const MAX_HOPS: i64 = 32;
+pub(super) const MAX_HOPS: u32 = 32;
 
 pub(super) trait QueryRunner {
     fn run_query(
@@ -113,33 +113,9 @@ pub(super) fn trace(
     db: &impl QueryRunner,
     view: &str,
     from: &str,
-    to: &str,
+    _to: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        &format!(
-            "{DIRECT_RULES}\n{DEPENDENCY_RULES}\n\
-             start[] <- [[$from]]\n\
-             predecessor[to, smallest_by(candidate)] := distance[to, hops], hops > 0, \
-                 distance[from, previous_hops], previous_hops + 1 == hops, \
-                 direct[from, to, _, _, _, _], candidate = [from, from]\n\
-             path[to, nodes] := predecessor[to, $from], nodes = [$from, to]\n\
-             path[to, nodes] := path[from, previous_nodes], predecessor[to, from], \
-                 nodes = append(previous_nodes, to)\n\
-             steps[nodes, step] := path[$to, nodes], \
-                 index in int_range(length(nodes) - 1), \
-                 from = get(nodes, index), to = get(nodes, index + 1), \
-                 direct[from, to, relation, evidence, confidence, provenance], \
-                 step = [index, relation, evidence, confidence, provenance]\n\
-             ?[nodes, collect(step), hops] := steps[nodes, step], hops = length(nodes) - 1"
-        ),
-        [
-            ("from", from.into()),
-            ("to", to.into()),
-            ("max_hops", MAX_HOPS.into()),
-        ],
-    )
+    closure(db, view, from, DEPENDENCY_RULES)
 }
 
 pub(super) fn impact(
@@ -147,27 +123,7 @@ pub(super) fn impact(
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        &format!(
-            "{DIRECT_RULES}\n{IMPACT_RULES}\n\
-             start[] <- [[$from]]\n\
-             selected[node, hops] := distance[node, hops]\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 selected[entity, hops], hops > 0, row_kind = 'entity', \
-                 edge_from = '', edge_to = '', relation = '', evidence = '', \
-                 confidence = 1.0, provenance = 'ast'\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 selected[edge_from, _], selected[edge_to, _], \
-                 direct[\
-                     edge_from, edge_to, relation, evidence, confidence, provenance\
-                 ], row_kind = 'edge', \
-                 entity = '', hops = 0\n\
-             :order row_kind, hops, entity, edge_from, edge_to, relation"
-        ),
-        [("from", entity.into()), ("max_hops", MAX_HOPS.into())],
-    )
+    closure(db, view, entity, IMPACT_RULES)
 }
 
 pub(super) fn dependencies(
@@ -175,26 +131,29 @@ pub(super) fn dependencies(
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
+    closure(db, view, entity, DEPENDENCY_RULES)
+}
+
+fn closure(
+    db: &impl QueryRunner,
+    view: &str,
+    entity: &str,
+    traversal_rules: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
     query(
         db,
         view,
         &format!(
-            "{DIRECT_RULES}\n{DEPENDENCY_RULES}\n\
+            "{DIRECT_RULES}\n{traversal_rules}\n\
              start[] <- [[$from]]\n\
-             selected[node, hops] := distance[node, hops]\n\
              ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 selected[entity, hops], hops > 0, row_kind = 'entity', \
-                 edge_from = '', edge_to = '', relation = '', evidence = '', \
-                 confidence = 1.0, provenance = 'ast'\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 selected[edge_from, _], selected[edge_to, _], \
-                 direct[\
+                 selected_edge[\
                      edge_from, edge_to, relation, evidence, confidence, provenance\
-                 ], row_kind = 'edge', \
-                 entity = '', hops = 0\n\
-             :order row_kind, hops, entity, edge_from, edge_to, relation"
+                 ], \
+                 row_kind = 'edge', entity = '', hops = 0\n\
+             :order edge_from, edge_to, relation"
         ),
-        [("from", entity.into()), ("max_hops", MAX_HOPS.into())],
+        [("from", entity.into())],
     )
 }
 
@@ -281,9 +240,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = trace(&db, "diamond", "start", "end").unwrap();
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][2], 2.into());
+        let result = crate::semantic::trace(
+            "diamond",
+            "start",
+            "end",
+            crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(result.paths[0].nodes, ["start", "left", "end"]);
     }
 
     #[test]
