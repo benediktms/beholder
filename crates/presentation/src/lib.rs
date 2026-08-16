@@ -1,6 +1,7 @@
 use beholder_dto::{
     ContextResult, DependenciesResult, EntityKind, EntityOrigin, EntityRef, EvidenceRef,
-    ImpactResult, QueryMetadata, SemanticEdge, SemanticPath, TraceResult, WhyResult,
+    ImpactResult, QueryMetadata, SemanticEdge, SemanticPath, TraceResult, TraversalMetadata,
+    WhyResult,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +43,7 @@ pub fn context(
             &result.nodes,
             &result.edges,
             &[],
+            None,
         )),
         OutputMode::Human => Ok(context_human(result, options.include_tests)),
     }
@@ -60,6 +62,7 @@ pub fn dependencies(
             &result.nodes,
             &result.edges,
             &[],
+            Some(&result.traversal),
         )),
         OutputMode::Human => Ok(dependencies_human(result, options.include_tests)),
     }
@@ -75,6 +78,7 @@ pub fn impact(result: &ImpactResult, options: RenderOptions) -> Result<String, s
             &result.nodes,
             &result.edges,
             &[],
+            Some(&result.traversal),
         )),
         OutputMode::Human => Ok(impact_human(result, options.include_tests)),
     }
@@ -90,6 +94,7 @@ pub fn trace(result: &TraceResult, options: RenderOptions) -> Result<String, ser
             &result.nodes,
             &result.edges,
             &result.paths,
+            Some(&result.traversal),
         )),
         OutputMode::Human => Ok(trace_human(result, options.include_tests)),
     }
@@ -105,6 +110,7 @@ pub fn why(result: &WhyResult, options: RenderOptions) -> Result<String, serde_j
             &result.nodes,
             &result.edges,
             &result.paths,
+            Some(&result.traversal),
         )),
         OutputMode::Human => Ok(why_human(result, options.include_tests)),
     }
@@ -179,6 +185,7 @@ fn dependencies_human(result: &DependenciesResult, include_tests: bool) -> Strin
         );
     }
     let _ = writeln!(output, "\n{} dependencies", dependencies.len());
+    write_traversal(&mut output, &result.traversal);
     write_metadata(&mut output, &result.metadata);
     output
 }
@@ -253,6 +260,7 @@ fn impact_human(result: &ImpactResult, include_tests: bool) -> String {
             "{hidden_tests} tests hidden · use --include-tests to show them"
         );
     }
+    write_traversal(&mut output, &result.traversal);
     write_metadata(&mut output, &result.metadata);
     output
 }
@@ -296,7 +304,10 @@ fn suffix(segments: &[&str], width: usize) -> String {
 fn trace_human(result: &TraceResult, include_tests: bool) -> String {
     let projected = projected_paths(&result.nodes, &result.edges, &result.paths, include_tests);
     if projected.is_empty() {
-        return format!("No path from {} to {}", result.query.from, result.query.to);
+        let mut output = format!("No path from {} to {}", result.query.from, result.query.to);
+        write_traversal(&mut output, &result.traversal);
+        write_metadata(&mut output, &result.metadata);
+        return output;
     }
     let mut output = String::new();
     if projected.len() == 1 {
@@ -335,6 +346,7 @@ fn trace_human(result: &TraceResult, include_tests: bool) -> String {
         "\n{hops} {} · {repositories} repositories · confidence {confidence:.2}",
         plural(hops as u32, "hop", "hops")
     );
+    write_traversal(&mut output, &result.traversal);
     write_metadata(&mut output, &result.metadata);
     output
 }
@@ -342,7 +354,10 @@ fn trace_human(result: &TraceResult, include_tests: bool) -> String {
 fn why_human(result: &WhyResult, include_tests: bool) -> String {
     let projected = projected_paths(&result.nodes, &result.edges, &result.paths, include_tests);
     if projected.is_empty() {
-        return format!("No path from {} to {}", result.query.from, result.query.to);
+        let mut output = format!("No path from {} to {}", result.query.from, result.query.to);
+        write_traversal(&mut output, &result.traversal);
+        write_metadata(&mut output, &result.metadata);
+        return output;
     }
     let mut output = String::new();
     for (path_index, path) in projected.iter().enumerate() {
@@ -360,6 +375,7 @@ fn why_human(result: &WhyResult, include_tests: bool) -> String {
             output.push('\n');
         }
     }
+    write_traversal(&mut output, &result.traversal);
     write_metadata(&mut output, &result.metadata);
     output
 }
@@ -370,11 +386,20 @@ fn raw(
     nodes: &[EntityRef],
     edges: &[SemanticEdge],
     paths: &[SemanticPath],
+    traversal: Option<&TraversalMetadata>,
 ) -> String {
     let mut output = format!(
-        "{schema} · view {} · revision {} · stale={} · indexing={}\n\nnodes\n",
+        "{schema} · view {} · revision {} · stale={} · indexing={}",
         metadata.view, metadata.revision, metadata.freshness.stale, metadata.freshness.indexing
     );
+    if let Some(traversal) = traversal {
+        let _ = write!(
+            output,
+            " · max_hops={} · truncated={}",
+            traversal.max_hops, traversal.truncated
+        );
+    }
+    output.push_str("\n\nnodes\n");
     for entity in nodes {
         let _ = writeln!(
             output,
@@ -555,18 +580,41 @@ fn write_metadata(output: &mut String, metadata: &QueryMetadata) {
     );
 }
 
+fn write_traversal(output: &mut String, traversal: &TraversalMetadata) {
+    if traversal.truncated {
+        let _ = write!(
+            output,
+            "\ntraversal incomplete · depth limit {} reached",
+            traversal.max_hops
+        );
+    } else {
+        let _ = write!(
+            output,
+            "\ntraversal complete · max depth {}",
+            traversal.max_hops
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use beholder_dto::{
-        CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V1, DependenciesResult, EntityQuery,
-        EvidenceKind, Freshness, IMPACT_SCHEMA_V1, ImpactRef, ImpactResult, PathQuery,
-        QueryMetadata, RelationKind, TRACE_SCHEMA_V1,
+        CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, EntityQuery,
+        EvidenceKind, Freshness, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery,
+        QueryMetadata, RelationKind, TRACE_SCHEMA_V2,
     };
+
+    fn traversal() -> TraversalMetadata {
+        TraversalMetadata {
+            max_hops: 32,
+            truncated: false,
+        }
+    }
 
     fn trace_result() -> TraceResult {
         TraceResult {
-            schema: TRACE_SCHEMA_V1.into(),
+            schema: TRACE_SCHEMA_V2.into(),
             metadata: QueryMetadata {
                 revision: 42,
                 view: "main".into(),
@@ -580,6 +628,7 @@ mod tests {
                 from: "a".into(),
                 to: "rpc".into(),
             },
+            traversal: traversal(),
             nodes: vec![
                 entity("a", "CheckoutPage", EntityKind::Callable, false),
                 entity("generated", "PricingClient", EntityKind::Callable, true),
@@ -632,11 +681,22 @@ mod tests {
     fn trace_json_is_versioned_and_compact_output_is_deterministic() {
         let result = trace_result();
         let json = trace(&result, OutputMode::Json.into()).unwrap();
-        assert!(json.starts_with(r#"{"schema":"beholder.trace.v1","revision":42,"view":"main""#));
+        assert!(json.starts_with(r#"{"schema":"beholder.trace.v2","revision":42,"view":"main""#));
+        assert!(json.contains(r#""traversal":{"max_hops":32,"truncated":false}"#));
         assert_eq!(
             trace(&result, OutputMode::Human.into()).unwrap(),
-            "CheckoutPage\n  → Pricing.GetPrice [calls_rpc]\n\n1 hop · 1 repositories · confidence 1.00\nview main · revision 42 · stale=false · indexing=false"
+            "CheckoutPage\n  → Pricing.GetPrice [calls_rpc]\n\n1 hop · 1 repositories · confidence 1.00\ntraversal complete · max depth 32\nview main · revision 42 · stale=false · indexing=false"
         );
+    }
+
+    #[test]
+    fn incomplete_traversal_is_explicit() {
+        let mut result = trace_result();
+        result.paths.clear();
+        result.traversal.max_hops = 1;
+        result.traversal.truncated = true;
+        let output = trace(&result, OutputMode::Human.into()).unwrap();
+        assert!(output.contains("traversal incomplete · depth limit 1 reached"));
     }
 
     #[test]
@@ -670,22 +730,24 @@ mod tests {
             edges: trace_result.edges.clone(),
         };
         let dependencies_result = DependenciesResult {
-            schema: DEPENDENCIES_SCHEMA_V1.into(),
+            schema: DEPENDENCIES_SCHEMA_V2.into(),
             metadata: trace_result.metadata.clone(),
             query: EntityQuery {
                 entity: root.id.clone(),
             },
+            traversal: traversal(),
             root: root.clone(),
             dependencies: Vec::new(),
             nodes: trace_result.nodes.clone(),
             edges: trace_result.edges.clone(),
         };
         let impact_result = ImpactResult {
-            schema: IMPACT_SCHEMA_V1.into(),
+            schema: IMPACT_SCHEMA_V2.into(),
             metadata: trace_result.metadata.clone(),
             query: EntityQuery {
                 entity: root.id.clone(),
             },
+            traversal: traversal(),
             root,
             affected: Vec::new(),
             nodes: trace_result.nodes.clone(),
@@ -743,11 +805,12 @@ mod tests {
         test.test = true;
         let root = entity("root", "checkout", EntityKind::Callable, false);
         let result = ImpactResult {
-            schema: IMPACT_SCHEMA_V1.into(),
+            schema: IMPACT_SCHEMA_V2.into(),
             metadata: QueryMetadata::completed("main", 42),
             query: EntityQuery {
                 entity: root.id.clone(),
             },
+            traversal: traversal(),
             root: root.clone(),
             affected: vec![ImpactRef {
                 entity: test.id.clone(),

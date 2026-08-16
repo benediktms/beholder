@@ -43,3 +43,11 @@ direct[from, to, relation, evidence, confidence, provenance] :=
 
 direct[from, resolved_to, relation, evidence, confidence, provenance] :=
     dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
+
+direct_pair[from, to] :=
+    selected_state[state],
+    *state_dependency_observation{state, from, relation, to, evidence},
+    not overridden[from, relation, to, evidence]
+
+direct_pair[from, resolved_to] :=
+    dependency_override[from, _, _, resolved_to, _, _, _]

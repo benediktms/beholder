@@ -16,7 +16,7 @@ use beholder_adapters_treesitter_rust::{
     resolve_repository_calls as resolve_rust_repository_calls,
 };
 use beholder_domain::{RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
-use beholder_dto::{Freshness, QueryMetadata};
+use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -189,6 +189,14 @@ impl IndexScheduler {
             fs::remove_dir_all(&self.cache_dir)?;
         }
         Ok(())
+    }
+
+    pub fn garbage_collect(
+        &self,
+        store: &SemanticStore,
+    ) -> Result<GarbageCollection, Box<dyn Error>> {
+        let _active = self.begin("garbage collection")?;
+        store.garbage_collect()
     }
 
     #[tracing::instrument(name = "index.workspace", skip(self, store), err, fields(workspace = %workspace.name))]

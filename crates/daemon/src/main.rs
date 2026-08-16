@@ -1,11 +1,12 @@
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{socket_path, state_dir};
-use beholder_dto::{Revisioned, WhyResult};
+use beholder_dto::{DEFAULT_MAX_HOPS, Revisioned, WhyResult};
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
-    GetStatusRequest, GetStatusResponse, ImpactResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, PathRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
-    ReindexWorkspaceRequest, ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
+    GarbageCollectRequest, GarbageCollectResponse, GetStatusRequest, GetStatusResponse,
+    ImpactResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
+    RegisterWorkspaceRequest, RegisterWorkspaceResponse, ReindexWorkspaceRequest,
+    ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse, TraversalEntityRequest,
     WhyResponse,
     daemon_server::{Daemon, DaemonServer},
 };
@@ -39,6 +40,34 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(ClearCacheResponse {}))
     }
 
+    #[tracing::instrument(name = "rpc.garbage_collect", skip_all, err)]
+    async fn garbage_collect(
+        &self,
+        _request: Request<GarbageCollectRequest>,
+    ) -> Result<Response<GarbageCollectResponse>, Status> {
+        let scheduler = self.scheduler.clone();
+        let store = self.store.clone();
+        let collected = tokio::task::spawn_blocking(move || {
+            scheduler
+                .garbage_collect(&store)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| Status::internal(format!("garbage collection worker failed: {error}")))?
+        .map_err(Status::internal)?;
+        tracing::info!(
+            repository_states_removed = collected.repository_states_removed,
+            bytes_before = collected.bytes_before,
+            bytes_after = collected.bytes_after,
+            "semantic store garbage collected"
+        );
+        Ok(Response::new(GarbageCollectResponse {
+            repository_states_removed: collected.repository_states_removed,
+            bytes_before: collected.bytes_before,
+            bytes_after: collected.bytes_after,
+        }))
+    }
+
     #[tracing::instrument(
         name = "rpc.context",
         skip_all,
@@ -65,13 +94,14 @@ impl Daemon for BeholderDaemon {
     )]
     async fn dependencies(
         &self,
-        request: Request<EntityRequest>,
+        request: Request<TraversalEntityRequest>,
     ) -> Result<Response<DependenciesResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         self.query_response(
             &request.workspace,
             self.store
-                .dependencies_snapshot(&request.workspace, &request.entity),
+                .dependencies_snapshot(&request.workspace, &request.entity, max_hops),
         )
     }
 
@@ -82,7 +112,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 8,
+            protocol_version: 10,
             pid: std::process::id(),
         }))
     }
@@ -95,13 +125,14 @@ impl Daemon for BeholderDaemon {
     )]
     async fn impact(
         &self,
-        request: Request<EntityRequest>,
+        request: Request<TraversalEntityRequest>,
     ) -> Result<Response<ImpactResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         self.query_response(
             &request.workspace,
             self.store
-                .impact_snapshot(&request.workspace, &request.entity),
+                .impact_snapshot(&request.workspace, &request.entity, max_hops),
         )
     }
 
@@ -228,10 +259,11 @@ impl Daemon for BeholderDaemon {
         request: Request<PathRequest>,
     ) -> Result<Response<TraceResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         self.query_response(
             &request.workspace,
             self.store
-                .trace_snapshot(&request.workspace, &request.from, &request.to),
+                .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops),
         )
     }
 
@@ -243,14 +275,24 @@ impl Daemon for BeholderDaemon {
     )]
     async fn why(&self, request: Request<PathRequest>) -> Result<Response<WhyResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         let revisioned = self
             .store
-            .trace_snapshot(&request.workspace, &request.from, &request.to)
+            .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops)
             .map(|revisioned| Revisioned {
                 result: WhyResult::from(revisioned.result),
                 analysis_revision: revisioned.analysis_revision,
             });
         self.query_response(&request.workspace, revisioned)
+    }
+}
+
+fn max_hops(value: Option<u32>) -> Result<u32, Status> {
+    match value.unwrap_or(DEFAULT_MAX_HOPS) {
+        0 => Err(Status::invalid_argument(
+            "max_hops must be greater than zero",
+        )),
+        value => Ok(value),
     }
 }
 
@@ -298,9 +340,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use beholder_protocol::v1::{
-        ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GetStatusRequest,
-        ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-        RelationKind, StopRequest, daemon_client::DaemonClient,
+        ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectRequest,
+        GetStatusRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
+        ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
+        daemon_client::DaemonClient,
     };
     use std::{env, fs, path::Path, time::Duration};
 
@@ -368,7 +411,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 8);
+        assert_eq!(status.protocol_version, 10);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");
@@ -506,6 +549,12 @@ mod tests {
         assert!(freshness.dirty_repositories.is_empty());
         client.clear_cache(ClearCacheRequest {}).await.unwrap();
         assert!(!state.join("frontend-cache").exists());
+        let collected = client
+            .garbage_collect(GarbageCollectRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(collected.bytes_after <= collected.bytes_before);
 
         let third = state.join("repo-c");
         fs::create_dir_all(third.join("src")).unwrap();
@@ -570,9 +619,10 @@ mod tests {
         );
         assert!(
             !client
-                .dependencies(EntityRequest {
+                .dependencies(TraversalEntityRequest {
                     workspace: "main".into(),
-                    entity: caller.clone()
+                    entity: caller.clone(),
+                    max_hops: None,
                 })
                 .await
                 .unwrap()
@@ -580,13 +630,26 @@ mod tests {
                 .dependencies
                 .is_empty()
         );
+        assert_eq!(
+            client
+                .dependencies(TraversalEntityRequest {
+                    workspace: "main".into(),
+                    entity: caller.clone(),
+                    max_hops: Some(0),
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
         assert!(
             format!(
                 "{:?}",
                 client
-                    .impact(EntityRequest {
+                    .impact(TraversalEntityRequest {
                         workspace: "main".into(),
-                        entity: helper.clone()
+                        entity: helper.clone(),
+                        max_hops: None,
                     })
                     .await
                     .unwrap()
@@ -598,6 +661,7 @@ mod tests {
             workspace: "main".into(),
             from: caller.clone(),
             to: helper.clone(),
+            max_hops: None,
         };
         assert!(
             !client

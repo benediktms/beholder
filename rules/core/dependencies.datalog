@@ -1,6 +1,8 @@
-distance[node, min(hops)] := start[node], hops = 0
-distance[to, min(hops)] :=
-    distance[from, previous_hops],
-    previous_hops < $max_hops,
-    direct[from, to, _, _, _, _],
-    hops = previous_hops + 1
+reachable[node] := start[node]
+reachable[to] :=
+    reachable[from],
+    direct_pair[from, to]
+
+selected_edge[from, to, relation, evidence, confidence, provenance] :=
+    reachable[from],
+    direct[from, to, relation, evidence, confidence, provenance]

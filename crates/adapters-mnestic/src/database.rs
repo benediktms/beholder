@@ -312,7 +312,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .trace("legacy", "repo/caller", "repo/target")
+                .trace(
+                    "legacy",
+                    "repo/caller",
+                    "repo/target",
+                    beholder_dto::DEFAULT_MAX_HOPS,
+                )
                 .unwrap()
                 .paths
                 .len(),
@@ -320,7 +325,12 @@ mod tests {
         );
         assert!(
             store
-                .trace("legacy", "repo/file", "repo/target")
+                .trace(
+                    "legacy",
+                    "repo/file",
+                    "repo/target",
+                    beholder_dto::DEFAULT_MAX_HOPS,
+                )
                 .unwrap()
                 .paths
                 .is_empty()

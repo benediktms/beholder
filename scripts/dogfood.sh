@@ -198,7 +198,7 @@ if ! grep -Fq "$callee" <<<"$result"; then
     printf 'expected %s in why result:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
-if ! grep -Fq '"schema":"beholder.why.v1"' <<<"$result"; then
+if ! grep -Fq '"schema":"beholder.why.v2"' <<<"$result"; then
     printf 'why result did not use the versioned JSON contract:\n%s\n' "$result" >&2
     exit 1
 fi
@@ -206,6 +206,12 @@ echo 'Checking completed revision...' >&2
 revision="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
 if ! grep -Fq '"main"' <<<"$revision"; then
     printf 'expected main revision:\n%s\n' "$revision" >&2
+    exit 1
+fi
+echo 'Garbage collecting obsolete semantic states...' >&2
+gc_result="$(target/debug/beholder cache gc)"
+if ! grep -Eq '^removed [0-9]+ repository states' <<<"$gc_result"; then
+    printf 'unexpected garbage collection result:\n%s\n' "$gc_result" >&2
     exit 1
 fi
 echo 'Stopping daemon and inspecting traces...' >&2
@@ -228,6 +234,7 @@ for expected in \
     'workspace indexed' \
     'facts_inserted' \
     'rpc.context' \
+    'semantic store garbage collected' \
     'elixir.macro_expansion_incomplete' \
     'rust.receiver_method_resolution_unavailable' \
     'frontend analysis limitations' \

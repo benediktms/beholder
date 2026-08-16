@@ -1,14 +1,35 @@
-use beholder_adapters_mnestic::{InspectionValue, explain};
-use std::{env, error::Error, fs, path::PathBuf};
+use beholder_adapters_mnestic::{InspectionValue, execute, explain};
+use std::{env, error::Error, fs, path::PathBuf, time::Instant};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
-    let query_path = args.next().ok_or("usage: mnestic-plan <query-file>")?;
+    let first = args
+        .next()
+        .ok_or("usage: mnestic-plan [--execute] <query-file>")?;
+    let (execute_query, query_path) = if first == "--execute" {
+        (
+            true,
+            args.next()
+                .ok_or("usage: mnestic-plan [--execute] <query-file>")?,
+        )
+    } else {
+        (false, first)
+    };
     if args.next().is_some() {
-        return Err("usage: mnestic-plan <query-file>".into());
+        return Err("usage: mnestic-plan [--execute] <query-file>".into());
     }
 
-    let plan = explain(&database_path(), &fs::read_to_string(query_path)?)?;
+    let started = Instant::now();
+    let query = fs::read_to_string(query_path)?;
+    let plan = if execute_query {
+        execute(&database_path(), &query)?
+    } else {
+        explain(&database_path(), &query)?
+    };
+    if execute_query {
+        println!("rows={} elapsed={:?}", plan.rows.len(), started.elapsed());
+        return Ok(());
+    }
     println!("{}", plan.headers.join("\t"));
     for row in plan.rows {
         println!("{}", row.iter().map(render).collect::<Vec<_>>().join("\t"));

@@ -119,6 +119,24 @@ impl TryFrom<v1::QueryMetadata> for dto::QueryMetadata {
     }
 }
 
+impl From<dto::TraversalMetadata> for v1::TraversalMetadata {
+    fn from(value: dto::TraversalMetadata) -> Self {
+        Self {
+            max_hops: value.max_hops,
+            truncated: value.truncated,
+        }
+    }
+}
+
+impl From<v1::TraversalMetadata> for dto::TraversalMetadata {
+    fn from(value: v1::TraversalMetadata) -> Self {
+        Self {
+            max_hops: value.max_hops,
+            truncated: value.truncated,
+        }
+    }
+}
+
 impl From<dto::EntityKind> for v1::EntityKind {
     fn from(value: dto::EntityKind) -> Self {
         match value {
@@ -433,6 +451,7 @@ impl TryFrom<v1::ContextResponse> for dto::ContextResult {
 impl From<dto::DependenciesResult> for v1::DependenciesResponse {
     fn from(value: dto::DependenciesResult) -> Self {
         let root = value.root.clone();
+        let traversal = value.traversal.clone();
         let dependencies = value
             .dependencies
             .iter()
@@ -444,6 +463,7 @@ impl From<dto::DependenciesResult> for v1::DependenciesResponse {
         let mut response = common_into_proto!(value, DependenciesResponse);
         response.root = Some(root.into());
         response.dependencies = dependencies;
+        response.traversal = Some(traversal.into());
         response
     }
 }
@@ -459,6 +479,10 @@ impl TryFrom<v1::DependenciesResponse> for dto::DependenciesResult {
                 .ok_or("dependencies metadata is missing")?
                 .try_into()?,
             query: value.query.ok_or("dependencies query is missing")?.into(),
+            traversal: value
+                .traversal
+                .ok_or("dependencies traversal metadata is missing")?
+                .into(),
             root: value
                 .root
                 .ok_or("dependencies root is missing")?
@@ -480,6 +504,7 @@ impl TryFrom<v1::DependenciesResponse> for dto::DependenciesResult {
 impl From<dto::ImpactResult> for v1::ImpactResponse {
     fn from(value: dto::ImpactResult) -> Self {
         let root = value.root.clone();
+        let traversal = value.traversal.clone();
         let affected = value
             .affected
             .iter()
@@ -491,6 +516,7 @@ impl From<dto::ImpactResult> for v1::ImpactResponse {
         let mut response = common_into_proto!(value, ImpactResponse);
         response.root = Some(root.into());
         response.affected = affected;
+        response.traversal = Some(traversal.into());
         response
     }
 }
@@ -506,6 +532,10 @@ impl TryFrom<v1::ImpactResponse> for dto::ImpactResult {
                 .ok_or("impact metadata is missing")?
                 .try_into()?,
             query: value.query.ok_or("impact query is missing")?.into(),
+            traversal: value
+                .traversal
+                .ok_or("impact traversal metadata is missing")?
+                .into(),
             root: value.root.ok_or("impact root is missing")?.try_into()?,
             affected: value
                 .affected
@@ -523,9 +553,11 @@ impl TryFrom<v1::ImpactResponse> for dto::ImpactResult {
 
 impl From<dto::TraceResult> for v1::TraceResponse {
     fn from(value: dto::TraceResult) -> Self {
+        let traversal = value.traversal.clone();
         let paths = value.paths.iter().cloned().map(Into::into).collect();
         let mut response = common_into_proto!(value, TraceResponse);
         response.paths = paths;
+        response.traversal = Some(traversal.into());
         response
     }
 }
@@ -541,6 +573,10 @@ impl TryFrom<v1::TraceResponse> for dto::TraceResult {
                 .ok_or("trace metadata is missing")?
                 .try_into()?,
             query: value.query.ok_or("trace query is missing")?.into(),
+            traversal: value
+                .traversal
+                .ok_or("trace traversal metadata is missing")?
+                .into(),
             nodes: entities(value.nodes)?,
             edges: edges(value.edges)?,
             paths: value.paths.into_iter().map(Into::into).collect(),
@@ -550,9 +586,11 @@ impl TryFrom<v1::TraceResponse> for dto::TraceResult {
 
 impl From<dto::WhyResult> for v1::WhyResponse {
     fn from(value: dto::WhyResult) -> Self {
+        let traversal = value.traversal.clone();
         let paths = value.paths.iter().cloned().map(Into::into).collect();
         let mut response = common_into_proto!(value, WhyResponse);
         response.paths = paths;
+        response.traversal = Some(traversal.into());
         response
     }
 }
@@ -568,6 +606,10 @@ impl TryFrom<v1::WhyResponse> for dto::WhyResult {
                 .ok_or("why metadata is missing")?
                 .try_into()?,
             query: value.query.ok_or("why query is missing")?.into(),
+            traversal: value
+                .traversal
+                .ok_or("why traversal metadata is missing")?
+                .into(),
             nodes: entities(value.nodes)?,
             edges: edges(value.edges)?,
             paths: value.paths.into_iter().map(Into::into).collect(),
@@ -615,11 +657,15 @@ mod tests {
     #[test]
     fn typed_trace_round_trips_without_generic_rows() {
         let trace = dto::TraceResult {
-            schema: dto::TRACE_SCHEMA_V1.into(),
+            schema: dto::TRACE_SCHEMA_V2.into(),
             metadata: dto::QueryMetadata::completed("main", 3),
             query: dto::PathQuery {
                 from: "a".into(),
                 to: "b".into(),
+            },
+            traversal: dto::TraversalMetadata {
+                max_hops: 7,
+                truncated: true,
             },
             nodes: vec![dto::EntityRef {
                 id: "a".into(),

@@ -4,10 +4,11 @@ package beholder.v1;
 
 service Daemon {
   rpc ClearCache(ClearCacheRequest) returns (ClearCacheResponse);
+  rpc GarbageCollect(GarbageCollectRequest) returns (GarbageCollectResponse);
   rpc Context(EntityRequest) returns (ContextResponse);
-  rpc Dependencies(EntityRequest) returns (DependenciesResponse);
+  rpc Dependencies(TraversalEntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
-  rpc Impact(EntityRequest) returns (ImpactResponse);
+  rpc Impact(TraversalEntityRequest) returns (ImpactResponse);
   rpc ReindexWorkspace(ReindexWorkspaceRequest) returns (ReindexWorkspaceResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
@@ -20,15 +21,35 @@ message ClearCacheRequest {}
 
 message ClearCacheResponse {}
 
+message GarbageCollectRequest {}
+
+message GarbageCollectResponse {
+  uint64 repository_states_removed = 1;
+  uint64 bytes_before = 2;
+  uint64 bytes_after = 3;
+}
+
 message EntityRequest {
   string entity = 1;
   string workspace = 2;
+}
+
+message TraversalEntityRequest {
+  string entity = 1;
+  string workspace = 2;
+  optional uint32 max_hops = 3;
 }
 
 message PathRequest {
   string from = 1;
   string to = 2;
   string workspace = 3;
+  optional uint32 max_hops = 4;
+}
+
+message TraversalMetadata {
+  uint32 max_hops = 1;
+  bool truncated = 2;
 }
 
 message QueryMetadata {
@@ -154,6 +175,7 @@ message DependenciesResponse {
   repeated Dependency dependencies = 5;
   repeated Entity nodes = 6;
   repeated Edge edges = 7;
+  TraversalMetadata traversal = 8;
 }
 
 message Impact {
@@ -169,6 +191,7 @@ message ImpactResponse {
   repeated Impact affected = 5;
   repeated Entity nodes = 6;
   repeated Edge edges = 7;
+  TraversalMetadata traversal = 8;
 }
 
 message TraceResponse {
@@ -178,6 +201,7 @@ message TraceResponse {
   repeated Entity nodes = 4;
   repeated Edge edges = 5;
   repeated SemanticPath paths = 6;
+  TraversalMetadata traversal = 7;
 }
 
 message WhyResponse {
@@ -187,6 +211,7 @@ message WhyResponse {
   repeated Entity nodes = 4;
   repeated Edge edges = 5;
   repeated SemanticPath paths = 6;
+  TraversalMetadata traversal = 7;
 }
 
 message ReindexWorkspaceRequest {

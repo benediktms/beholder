@@ -1,9 +1,11 @@
 use beholder_domain::Workspace;
-use beholder_dto::{ContextResult, DependenciesResult, ImpactResult, TraceResult, WhyResult};
+use beholder_dto::{
+    ContextResult, DependenciesResult, GarbageCollection, ImpactResult, TraceResult, WhyResult,
+};
 use beholder_protocol::v1::{
-    ClearCacheRequest, EntityRequest, GetStatusRequest, GetStatusResponse, ListWorkspacesRequest,
-    PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
-    daemon_client::DaemonClient,
+    ClearCacheRequest, EntityRequest, GarbageCollectRequest, GetStatusRequest, GetStatusResponse,
+    ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
+    StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
 };
 use std::path::{Path, PathBuf};
 use tonic::transport::Channel;
@@ -55,6 +57,19 @@ pub async fn clear_cache() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+pub async fn garbage_collect() -> Result<GarbageCollection, Box<dyn std::error::Error>> {
+    let response = connect()
+        .await?
+        .garbage_collect(GarbageCollectRequest {})
+        .await?
+        .into_inner();
+    Ok(GarbageCollection {
+        repository_states_removed: response.repository_states_removed,
+        bytes_before: response.bytes_before,
+        bytes_after: response.bytes_after,
+    })
+}
+
 pub async fn context(
     workspace: String,
     entity: String,
@@ -70,10 +85,15 @@ pub async fn context(
 pub async fn dependencies(
     workspace: String,
     entity: String,
+    max_hops: u32,
 ) -> Result<DependenciesResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .dependencies(EntityRequest { workspace, entity })
+        .dependencies(TraversalEntityRequest {
+            workspace,
+            entity,
+            max_hops: Some(max_hops),
+        })
         .await?
         .into_inner()
         .try_into()?)
@@ -82,10 +102,15 @@ pub async fn dependencies(
 pub async fn impact(
     workspace: String,
     entity: String,
+    max_hops: u32,
 ) -> Result<ImpactResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .impact(EntityRequest { workspace, entity })
+        .impact(TraversalEntityRequest {
+            workspace,
+            entity,
+            max_hops: Some(max_hops),
+        })
         .await?
         .into_inner()
         .try_into()?)
@@ -95,6 +120,7 @@ pub async fn trace(
     workspace: String,
     from: String,
     to: String,
+    max_hops: u32,
 ) -> Result<TraceResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
@@ -102,6 +128,7 @@ pub async fn trace(
             workspace,
             from,
             to,
+            max_hops: Some(max_hops),
         })
         .await?
         .into_inner()
@@ -112,6 +139,7 @@ pub async fn why(
     workspace: String,
     from: String,
     to: String,
+    max_hops: u32,
 ) -> Result<WhyResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
@@ -119,6 +147,7 @@ pub async fn why(
             workspace,
             from,
             to,
+            max_hops: Some(max_hops),
         })
         .await?
         .into_inner()
