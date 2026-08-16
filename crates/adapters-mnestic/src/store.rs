@@ -120,11 +120,18 @@ impl SemanticStore {
         })
     }
 
-    pub fn trace(&self, view: &str, from: &str, to: &str) -> Result<TraceResult, Box<dyn Error>> {
+    pub fn trace(
+        &self,
+        view: &str,
+        from: &str,
+        to: &str,
+        max_hops: u32,
+    ) -> Result<TraceResult, Box<dyn Error>> {
         semantic::trace(
             view,
             from,
             to,
+            max_hops,
             inspection_result(trace(&self.read_db, view, from, to)?),
         )
     }
@@ -134,21 +141,29 @@ impl SemanticStore {
         view: &str,
         from: &str,
         to: &str,
+        max_hops: u32,
     ) -> Result<Revisioned<TraceResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             semantic::trace(
                 view,
                 from,
                 to,
+                max_hops,
                 inspection_result(trace(transaction, view, from, to)?),
             )
         })
     }
 
-    pub fn impact(&self, view: &str, entity: &str) -> Result<ImpactResult, Box<dyn Error>> {
+    pub fn impact(
+        &self,
+        view: &str,
+        entity: &str,
+        max_hops: u32,
+    ) -> Result<ImpactResult, Box<dyn Error>> {
         semantic::impact(
             view,
             entity,
+            max_hops,
             inspection_result(impact(&self.read_db, view, entity)?),
         )
     }
@@ -157,11 +172,13 @@ impl SemanticStore {
         &self,
         view: &str,
         entity: &str,
+        max_hops: u32,
     ) -> Result<Revisioned<ImpactResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             semantic::impact(
                 view,
                 entity,
+                max_hops,
                 inspection_result(impact(transaction, view, entity)?),
             )
         })
@@ -171,10 +188,12 @@ impl SemanticStore {
         &self,
         view: &str,
         entity: &str,
+        max_hops: u32,
     ) -> Result<DependenciesResult, Box<dyn Error>> {
         semantic::dependencies(
             view,
             entity,
+            max_hops,
             inspection_result(dependencies(&self.read_db, view, entity)?),
         )
     }
@@ -183,11 +202,13 @@ impl SemanticStore {
         &self,
         view: &str,
         entity: &str,
+        max_hops: u32,
     ) -> Result<Revisioned<DependenciesResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             semantic::dependencies(
                 view,
                 entity,
+                max_hops,
                 inspection_result(dependencies(transaction, view, entity)?),
             )
         })

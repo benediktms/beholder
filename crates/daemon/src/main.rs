@@ -1,12 +1,12 @@
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{socket_path, state_dir};
-use beholder_dto::{Revisioned, WhyResult};
+use beholder_dto::{DEFAULT_MAX_HOPS, Revisioned, WhyResult};
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
     GetStatusRequest, GetStatusResponse, ImpactResponse, ListWorkspacesRequest,
     ListWorkspacesResponse, PathRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
     ReindexWorkspaceRequest, ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
-    WhyResponse,
+    TraversalEntityRequest, WhyResponse,
     daemon_server::{Daemon, DaemonServer},
 };
 use std::{error::Error, path::PathBuf};
@@ -65,13 +65,14 @@ impl Daemon for BeholderDaemon {
     )]
     async fn dependencies(
         &self,
-        request: Request<EntityRequest>,
+        request: Request<TraversalEntityRequest>,
     ) -> Result<Response<DependenciesResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         self.query_response(
             &request.workspace,
             self.store
-                .dependencies_snapshot(&request.workspace, &request.entity),
+                .dependencies_snapshot(&request.workspace, &request.entity, max_hops),
         )
     }
 
@@ -82,7 +83,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 8,
+            protocol_version: 9,
             pid: std::process::id(),
         }))
     }
@@ -95,13 +96,14 @@ impl Daemon for BeholderDaemon {
     )]
     async fn impact(
         &self,
-        request: Request<EntityRequest>,
+        request: Request<TraversalEntityRequest>,
     ) -> Result<Response<ImpactResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         self.query_response(
             &request.workspace,
             self.store
-                .impact_snapshot(&request.workspace, &request.entity),
+                .impact_snapshot(&request.workspace, &request.entity, max_hops),
         )
     }
 
@@ -228,10 +230,11 @@ impl Daemon for BeholderDaemon {
         request: Request<PathRequest>,
     ) -> Result<Response<TraceResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         self.query_response(
             &request.workspace,
             self.store
-                .trace_snapshot(&request.workspace, &request.from, &request.to),
+                .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops),
         )
     }
 
@@ -243,14 +246,24 @@ impl Daemon for BeholderDaemon {
     )]
     async fn why(&self, request: Request<PathRequest>) -> Result<Response<WhyResponse>, Status> {
         let request = request.into_inner();
+        let max_hops = max_hops(request.max_hops)?;
         let revisioned = self
             .store
-            .trace_snapshot(&request.workspace, &request.from, &request.to)
+            .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops)
             .map(|revisioned| Revisioned {
                 result: WhyResult::from(revisioned.result),
                 analysis_revision: revisioned.analysis_revision,
             });
         self.query_response(&request.workspace, revisioned)
+    }
+}
+
+fn max_hops(value: Option<u32>) -> Result<u32, Status> {
+    match value.unwrap_or(DEFAULT_MAX_HOPS) {
+        0 => Err(Status::invalid_argument(
+            "max_hops must be greater than zero",
+        )),
+        value => Ok(value),
     }
 }
 
@@ -300,7 +313,7 @@ mod tests {
     use beholder_protocol::v1::{
         ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GetStatusRequest,
         ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-        RelationKind, StopRequest, daemon_client::DaemonClient,
+        RelationKind, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
     };
     use std::{env, fs, path::Path, time::Duration};
 
@@ -368,7 +381,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 8);
+        assert_eq!(status.protocol_version, 9);
         assert_eq!(status.pid, std::process::id());
 
         let first = state.join("repo-a");
@@ -570,9 +583,10 @@ mod tests {
         );
         assert!(
             !client
-                .dependencies(EntityRequest {
+                .dependencies(TraversalEntityRequest {
                     workspace: "main".into(),
-                    entity: caller.clone()
+                    entity: caller.clone(),
+                    max_hops: None,
                 })
                 .await
                 .unwrap()
@@ -580,13 +594,26 @@ mod tests {
                 .dependencies
                 .is_empty()
         );
+        assert_eq!(
+            client
+                .dependencies(TraversalEntityRequest {
+                    workspace: "main".into(),
+                    entity: caller.clone(),
+                    max_hops: Some(0),
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
         assert!(
             format!(
                 "{:?}",
                 client
-                    .impact(EntityRequest {
+                    .impact(TraversalEntityRequest {
                         workspace: "main".into(),
-                        entity: helper.clone()
+                        entity: helper.clone(),
+                        max_hops: None,
                     })
                     .await
                     .unwrap()
@@ -598,6 +625,7 @@ mod tests {
             workspace: "main".into(),
             from: caller.clone(),
             to: helper.clone(),
+            max_hops: None,
         };
         assert!(
             !client

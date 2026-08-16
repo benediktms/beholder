@@ -198,7 +198,7 @@ if ! grep -Fq "$callee" <<<"$result"; then
     printf 'expected %s in why result:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
-if ! grep -Fq '"schema":"beholder.why.v1"' <<<"$result"; then
+if ! grep -Fq '"schema":"beholder.why.v2"' <<<"$result"; then
     printf 'why result did not use the versioned JSON contract:\n%s\n' "$result" >&2
     exit 1
 fi

@@ -781,7 +781,12 @@ mod tests {
         assert!(!context.contains("rust-call://helper"));
         assert_eq!(
             store
-                .trace("joined", "repo://source/rust/lib/caller", resolved)
+                .trace(
+                    "joined",
+                    "repo://source/rust/lib/caller",
+                    resolved,
+                    beholder_dto::DEFAULT_MAX_HOPS,
+                )
                 .unwrap()
                 .paths
                 .len(),
@@ -789,7 +794,11 @@ mod tests {
         );
         assert!(
             store
-                .dependencies("joined", "repo://source/rust/lib/caller")
+                .dependencies(
+                    "joined",
+                    "repo://source/rust/lib/caller",
+                    beholder_dto::DEFAULT_MAX_HOPS,
+                )
                 .unwrap()
                 .dependencies
                 .iter()
@@ -797,7 +806,7 @@ mod tests {
         );
         assert!(
             store
-                .impact("joined", resolved)
+                .impact("joined", resolved, beholder_dto::DEFAULT_MAX_HOPS)
                 .unwrap()
                 .affected
                 .iter()

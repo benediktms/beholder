@@ -8,6 +8,7 @@ use beholder_daemon_client::{
     why as daemon_why,
 };
 use beholder_domain::{RepositoryFacts, WorkspaceView};
+use beholder_dto::DEFAULT_MAX_HOPS;
 use beholder_presentation::{
     OutputMode, RenderOptions, context as render_context, dependencies as render_dependencies,
     impact as render_impact, trace as render_trace, why as render_why,
@@ -147,9 +148,9 @@ enum Command {
     /// Show direct incoming and outgoing relationships for an entity.
     Context(QueryEntity),
     /// Show everything transitively affected by an entity.
-    Impact(QueryEntity),
+    Impact(TraversalEntityQuery),
     /// Show transitive dependencies of an entity.
-    Dependencies(QueryEntity),
+    Dependencies(TraversalEntityQuery),
     /// Find an evidence-backed path between two entities.
     Trace(QueryPath),
     /// Explain why one entity depends on another.
@@ -214,10 +215,27 @@ struct QueryEntity {
 }
 
 #[derive(clap::Args)]
+struct TraversalEntityQuery {
+    /// Workspace to query.
+    #[arg(short, long, default_value = "main")]
+    workspace: String,
+    /// Limit traversal results to this many relationships.
+    #[arg(long, default_value_t = DEFAULT_MAX_HOPS)]
+    max_hops: u32,
+    #[command(flatten)]
+    output: OutputArgs,
+    /// Canonical semantic entity ID.
+    entity: String,
+}
+
+#[derive(clap::Args)]
 struct QueryPath {
     /// Workspace to query.
     #[arg(short, long, default_value = "main")]
     workspace: String,
+    /// Limit path search to this many relationships.
+    #[arg(long, default_value_t = DEFAULT_MAX_HOPS)]
+    max_hops: u32,
     #[command(flatten)]
     output: OutputArgs,
     /// Starting semantic entity ID.
@@ -551,7 +569,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!(
                 "{}",
                 render_impact(
-                    &daemon_impact(query.workspace, query.entity).await?,
+                    &daemon_impact(query.workspace, query.entity, query.max_hops).await?,
                     options
                 )?
             );
@@ -561,7 +579,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!(
                 "{}",
                 render_dependencies(
-                    &daemon_dependencies(query.workspace, query.entity).await?,
+                    &daemon_dependencies(query.workspace, query.entity, query.max_hops).await?,
                     options
                 )?
             );
@@ -571,7 +589,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!(
                 "{}",
                 render_trace(
-                    &daemon_trace(query.workspace, query.from, query.to).await?,
+                    &daemon_trace(query.workspace, query.from, query.to, query.max_hops).await?,
                     options
                 )?
             );
@@ -581,7 +599,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!(
                 "{}",
                 render_why(
-                    &daemon_why(query.workspace, query.from, query.to).await?,
+                    &daemon_why(query.workspace, query.from, query.to, query.max_hops).await?,
                     options
                 )?
             );
@@ -660,20 +678,32 @@ mod tests {
             Cli::try_parse_from(["beholder", "trace", "--json", "a", "b"])
                 .unwrap()
                 .command,
-            Some(Command::Trace(QueryPath { output, .. })) if output.mode() == OutputMode::Json
+            Some(Command::Trace(QueryPath { output, max_hops: DEFAULT_MAX_HOPS, .. }))
+                if output.mode() == OutputMode::Json
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "impact", "--max-hops", "3", "a"])
+                .unwrap()
+                .command,
+            Some(Command::Impact(TraversalEntityQuery { max_hops: 3, .. }))
         ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "impact", "--include-tests", "a"])
                 .unwrap()
                 .command,
-            Some(Command::Impact(QueryEntity { output, .. })) if output.include_tests
+            Some(Command::Impact(TraversalEntityQuery { output, .. })) if output.include_tests
         ));
         assert!(Cli::try_parse_from(["beholder", "trace", "--json", "--raw", "a", "b"]).is_err());
 
         let store = SemanticStore::memory().unwrap();
 
         let result = store
-            .trace("main", "web/CheckoutPage", "cache/update_price")
+            .trace(
+                "main",
+                "web/CheckoutPage",
+                "cache/update_price",
+                DEFAULT_MAX_HOPS,
+            )
             .unwrap();
         assert_eq!(result.paths.len(), 1);
         assert!(
@@ -688,7 +718,7 @@ mod tests {
 
         assert_eq!(
             store
-                .impact("main", "rpc/Pricing.GetPrice")
+                .impact("main", "rpc/Pricing.GetPrice", DEFAULT_MAX_HOPS)
                 .unwrap()
                 .affected
                 .len(),
@@ -704,7 +734,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .dependencies("main", "rpc/Pricing.GetPrice")
+                .dependencies("main", "rpc/Pricing.GetPrice", DEFAULT_MAX_HOPS)
                 .unwrap()
                 .dependencies
                 .len(),
@@ -725,7 +755,7 @@ mod tests {
         let caller = stored_calls.rows[0][1].as_str().unwrap();
         assert!(
             indexed
-                .dependencies(MAIN_VIEW, caller)
+                .dependencies(MAIN_VIEW, caller, DEFAULT_MAX_HOPS)
                 .unwrap()
                 .dependencies
                 .is_empty()

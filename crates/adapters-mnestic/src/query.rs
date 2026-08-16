@@ -2,8 +2,6 @@ use super::schema::*;
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability};
 use std::{collections::BTreeMap, error::Error};
 
-pub(super) const MAX_HOPS: u32 = 32;
-
 pub(super) trait QueryRunner {
     fn run_query(
         &self,
@@ -182,7 +180,13 @@ mod tests {
     #[test]
     fn impact_traverses_dependants() {
         let store = SemanticStore::memory().unwrap();
-        let result = store.impact("main", "rpc/Pricing.GetPrice").unwrap();
+        let result = store
+            .impact(
+                "main",
+                "rpc/Pricing.GetPrice",
+                beholder_dto::DEFAULT_MAX_HOPS,
+            )
+            .unwrap();
         assert!(
             result
                 .affected
@@ -195,6 +199,9 @@ mod tests {
                 .iter()
                 .any(|value| value.entity == "pricing/get_price")
         );
+        let limited = store.impact("main", "rpc/Pricing.GetPrice", 1).unwrap();
+        assert!(limited.traversal.truncated);
+        assert!(limited.affected.iter().all(|value| value.hops == 1));
     }
 
     #[test]
@@ -244,17 +251,34 @@ mod tests {
             "diamond",
             "start",
             "end",
+            beholder_dto::DEFAULT_MAX_HOPS,
             crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
         )
         .unwrap();
         assert_eq!(result.paths[0].nodes, ["start", "left", "end"]);
+
+        let limited = crate::semantic::trace(
+            "diamond",
+            "start",
+            "end",
+            1,
+            crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+        )
+        .unwrap();
+        assert!(limited.paths.is_empty());
+        assert!(limited.traversal.truncated);
     }
 
     #[test]
     fn typed_trace_deduplicates_graph_and_resolves_path_references() {
         let result = SemanticStore::memory()
             .unwrap()
-            .trace("main", "web/CheckoutPage", "cache/update_price")
+            .trace(
+                "main",
+                "web/CheckoutPage",
+                "cache/update_price",
+                beholder_dto::DEFAULT_MAX_HOPS,
+            )
             .unwrap();
         let node_ids = result
             .nodes
@@ -370,14 +394,24 @@ mod tests {
         );
         assert!(
             store
-                .trace("structural", "repo/file", "repo/target")
+                .trace(
+                    "structural",
+                    "repo/file",
+                    "repo/target",
+                    beholder_dto::DEFAULT_MAX_HOPS,
+                )
                 .unwrap()
                 .paths
                 .is_empty()
         );
         assert_eq!(
             store
-                .trace("structural", "repo/caller", "repo/target")
+                .trace(
+                    "structural",
+                    "repo/caller",
+                    "repo/target",
+                    beholder_dto::DEFAULT_MAX_HOPS,
+                )
                 .unwrap()
                 .paths
                 .len(),

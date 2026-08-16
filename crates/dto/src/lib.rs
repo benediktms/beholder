@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 pub const CONTEXT_SCHEMA_V1: &str = "beholder.context.v1";
-pub const DEPENDENCIES_SCHEMA_V1: &str = "beholder.dependencies.v1";
-pub const IMPACT_SCHEMA_V1: &str = "beholder.impact.v1";
-pub const TRACE_SCHEMA_V1: &str = "beholder.trace.v1";
-pub const WHY_SCHEMA_V1: &str = "beholder.why.v1";
+pub const DEPENDENCIES_SCHEMA_V2: &str = "beholder.dependencies.v2";
+pub const IMPACT_SCHEMA_V2: &str = "beholder.impact.v2";
+pub const TRACE_SCHEMA_V2: &str = "beholder.trace.v2";
+pub const WHY_SCHEMA_V2: &str = "beholder.why.v2";
+pub const DEFAULT_MAX_HOPS: u32 = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Freshness {
@@ -32,6 +33,12 @@ impl QueryMetadata {
             },
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TraversalMetadata {
+    pub max_hops: u32,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -207,6 +214,7 @@ pub struct DependenciesResult {
     #[serde(flatten)]
     pub metadata: QueryMetadata,
     pub query: EntityQuery,
+    pub traversal: TraversalMetadata,
     pub root: EntityRef,
     pub dependencies: Vec<DependencyRef>,
     pub nodes: Vec<EntityRef>,
@@ -225,6 +233,7 @@ pub struct ImpactResult {
     #[serde(flatten)]
     pub metadata: QueryMetadata,
     pub query: EntityQuery,
+    pub traversal: TraversalMetadata,
     pub root: EntityRef,
     pub affected: Vec<ImpactRef>,
     pub nodes: Vec<EntityRef>,
@@ -237,6 +246,7 @@ pub struct TraceResult {
     #[serde(flatten)]
     pub metadata: QueryMetadata,
     pub query: PathQuery,
+    pub traversal: TraversalMetadata,
     pub nodes: Vec<EntityRef>,
     pub edges: Vec<SemanticEdge>,
     pub paths: Vec<SemanticPath>,
@@ -248,6 +258,7 @@ pub struct WhyResult {
     #[serde(flatten)]
     pub metadata: QueryMetadata,
     pub query: PathQuery,
+    pub traversal: TraversalMetadata,
     pub nodes: Vec<EntityRef>,
     pub edges: Vec<SemanticEdge>,
     pub paths: Vec<SemanticPath>,
@@ -256,9 +267,10 @@ pub struct WhyResult {
 impl From<TraceResult> for WhyResult {
     fn from(value: TraceResult) -> Self {
         Self {
-            schema: WHY_SCHEMA_V1.into(),
+            schema: WHY_SCHEMA_V2.into(),
             metadata: value.metadata,
             query: value.query,
+            traversal: value.traversal,
             nodes: value.nodes,
             edges: value.edges,
             paths: value.paths,

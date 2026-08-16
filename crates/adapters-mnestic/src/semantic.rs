@@ -1,17 +1,15 @@
-use crate::query::MAX_HOPS;
 use crate::{InspectionResult, InspectionValue};
 use beholder_dto::{
-    CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V1, DependenciesResult, DependencyRef,
-    EntityKind, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef, IMPACT_SCHEMA_V1,
+    CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
+    EntityKind, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef, IMPACT_SCHEMA_V2,
     ImpactRef, ImpactResult, PathQuery, QueryMetadata, RelationKind, SemanticEdge, SemanticPath,
-    TRACE_SCHEMA_V1, TraceResult,
+    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 
 type EdgeKey = (String, String, RelationKind);
-type Closure = (Vec<(String, u32)>, GraphOutput);
-
+type Closure = (Vec<(String, u32)>, GraphOutput, bool);
 #[derive(Clone, Copy)]
 enum TraversalDirection {
     Outgoing,
@@ -58,14 +56,20 @@ pub(super) fn context(
 pub(super) fn dependencies(
     view: &str,
     entity: &str,
+    max_hops: u32,
     result: InspectionResult,
 ) -> Result<DependenciesResult, Box<dyn Error>> {
-    let (entries, output) = closure(result, entity, TraversalDirection::Outgoing)?;
+    let (entries, output, truncated) =
+        closure(result, entity, max_hops, TraversalDirection::Outgoing)?;
     Ok(DependenciesResult {
-        schema: DEPENDENCIES_SCHEMA_V1.into(),
+        schema: DEPENDENCIES_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
         query: EntityQuery {
             entity: entity.into(),
+        },
+        traversal: TraversalMetadata {
+            max_hops,
+            truncated,
         },
         root: output.entity(entity),
         dependencies: entries
@@ -80,14 +84,20 @@ pub(super) fn dependencies(
 pub(super) fn impact(
     view: &str,
     entity: &str,
+    max_hops: u32,
     result: InspectionResult,
 ) -> Result<ImpactResult, Box<dyn Error>> {
-    let (entries, output) = closure(result, entity, TraversalDirection::Incoming)?;
+    let (entries, output, truncated) =
+        closure(result, entity, max_hops, TraversalDirection::Incoming)?;
     Ok(ImpactResult {
-        schema: IMPACT_SCHEMA_V1.into(),
+        schema: IMPACT_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
         query: EntityQuery {
             entity: entity.into(),
+        },
+        traversal: TraversalMetadata {
+            max_hops,
+            truncated,
         },
         root: output.entity(entity),
         affected: entries
@@ -102,10 +112,11 @@ pub(super) fn impact(
 fn closure(
     result: InspectionResult,
     root: &str,
+    max_hops: u32,
     direction: TraversalDirection,
 ) -> Result<Closure, Box<dyn Error>> {
     let mut output = graph(result, &[root])?;
-    let distances = distances(root, &output.edges, direction);
+    let (distances, truncated) = distances(root, &output.edges, max_hops, direction);
     output.nodes.retain(|node| distances.contains_key(&node.id));
     output
         .edges
@@ -115,7 +126,7 @@ fn closure(
         .filter(|(entity, _)| entity != root)
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-    Ok((entries, output))
+    Ok((entries, output, truncated))
 }
 
 fn graph(result: InspectionResult, roots: &[&str]) -> Result<GraphOutput, Box<dyn Error>> {
@@ -144,8 +155,9 @@ fn graph(result: InspectionResult, roots: &[&str]) -> Result<GraphOutput, Box<dy
 fn distances(
     root: &str,
     edges: &[SemanticEdge],
+    max_hops: u32,
     direction: TraversalDirection,
-) -> BTreeMap<String, u32> {
+) -> (BTreeMap<String, u32>, bool) {
     let mut adjacent = BTreeMap::<&str, Vec<&str>>::new();
     for edge in edges {
         let (from, to) = match direction {
@@ -157,9 +169,13 @@ fn distances(
 
     let mut distances = BTreeMap::from([(root.to_owned(), 0)]);
     let mut queue = VecDeque::from([root.to_owned()]);
+    let mut truncated = false;
     while let Some(from) = queue.pop_front() {
         let hops = distances[&from];
-        if hops == MAX_HOPS {
+        if hops == max_hops {
+            truncated |= adjacent
+                .get(from.as_str())
+                .is_some_and(|nodes| nodes.iter().any(|node| !distances.contains_key(*node)));
             continue;
         }
         for &to in adjacent.get(from.as_str()).into_iter().flatten() {
@@ -169,19 +185,19 @@ fn distances(
             }
         }
     }
-    distances
+    (distances, truncated)
 }
 
 pub(super) fn trace(
     view: &str,
     from: &str,
     to: &str,
+    max_hops: u32,
     result: InspectionResult,
 ) -> Result<TraceResult, Box<dyn Error>> {
     let mut output = graph(result, &[from, to])?;
-    let paths = shortest_path(from, to, &output.edges)
-        .into_iter()
-        .collect::<Vec<_>>();
+    let (path, truncated) = shortest_path(from, to, max_hops, &output.edges);
+    let paths = path.into_iter().collect::<Vec<_>>();
     let path_nodes = paths
         .first()
         .map(|path| path.nodes.iter().cloned().collect())
@@ -193,11 +209,15 @@ pub(super) fn trace(
     output.nodes.retain(|node| path_nodes.contains(&node.id));
     output.edges.retain(|edge| path_edges.contains(&edge.id));
     Ok(TraceResult {
-        schema: TRACE_SCHEMA_V1.into(),
+        schema: TRACE_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
         query: PathQuery {
             from: from.into(),
             to: to.into(),
+        },
+        traversal: TraversalMetadata {
+            max_hops,
+            truncated,
         },
         nodes: output.nodes,
         edges: output.edges,
@@ -205,12 +225,20 @@ pub(super) fn trace(
     })
 }
 
-fn shortest_path(from: &str, to: &str, edges: &[SemanticEdge]) -> Option<SemanticPath> {
+fn shortest_path(
+    from: &str,
+    to: &str,
+    max_hops: u32,
+    edges: &[SemanticEdge],
+) -> (Option<SemanticPath>, bool) {
     if from == to {
-        return Some(SemanticPath {
-            nodes: vec![from.into()],
-            edges: Vec::new(),
-        });
+        return (
+            Some(SemanticPath {
+                nodes: vec![from.into()],
+                edges: Vec::new(),
+            }),
+            false,
+        );
     }
     let mut adjacent = BTreeMap::<&str, Vec<&SemanticEdge>>::new();
     for edge in edges {
@@ -219,9 +247,13 @@ fn shortest_path(from: &str, to: &str, edges: &[SemanticEdge]) -> Option<Semanti
     let mut parents = BTreeMap::<String, (String, String)>::new();
     let mut distances = BTreeMap::from([(from.to_owned(), 0)]);
     let mut queue = VecDeque::from([from.to_owned()]);
+    let mut truncated = false;
     while let Some(node) = queue.pop_front() {
         let hops = distances[&node];
-        if hops == MAX_HOPS {
+        if hops == max_hops {
+            truncated |= adjacent
+                .get(node.as_str())
+                .is_some_and(|edges| edges.iter().any(|edge| !distances.contains_key(&edge.to)));
             continue;
         }
         for edge in adjacent.get(node.as_str()).into_iter().flatten() {
@@ -242,15 +274,18 @@ fn shortest_path(from: &str, to: &str, edges: &[SemanticEdge]) -> Option<Semanti
                 }
                 nodes.reverse();
                 path_edges.reverse();
-                return Some(SemanticPath {
-                    nodes,
-                    edges: path_edges,
-                });
+                return (
+                    Some(SemanticPath {
+                        nodes,
+                        edges: path_edges,
+                    }),
+                    false,
+                );
             }
             queue.push_back(edge.to.clone());
         }
     }
-    None
+    (None, truncated)
 }
 
 #[derive(Default)]
