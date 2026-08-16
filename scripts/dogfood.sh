@@ -73,6 +73,8 @@ printf '%s\n' \
     '    import External.Helpers, only: [help: 1]' \
     '    require External.Macros, as: Macros' \
     '    def indexed(value), do: helper(%Payload{value: value})' \
+    '    def classify(:none), do: :none' \
+    '    def classify(%Beholder.PatternPayload{}), do: :pattern' \
     '    defp helper(value), do: value' \
     '    def work(value), do: value' \
     '  end' \
@@ -80,8 +82,10 @@ printf '%s\n' \
     'defprotocol Beholder.Renderable do' \
     '  def render(value)' \
     'end' \
-    'defimpl Beholder.Renderable, for: Beholder.Payload do' \
-    '  def render(value), do: value.value' \
+    'defmodule Beholder.Implementations do' \
+    '  defimpl Beholder.Renderable, for: Beholder.Payload do' \
+    '    def render(value), do: value.value' \
+    '  end' \
     'end' \
     'defmodule Beholder.Helper do' \
     '  def work(value), do: value' \
@@ -156,6 +160,22 @@ result="$(target/debug/beholder context --json --workspace main \
 for expected in 'Beholder.Renderable.Beholder.Payload' '"kind":"implements"'; do
     if ! grep -Fq "$expected" <<<"$result"; then
         printf 'expected %s in Elixir protocol implementation context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Smoke/classify/1')"
+for expected in 'elixir-module://Beholder.PatternPayload' '"kind":"uses"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in Elixir struct pattern context:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+result="$(target/debug/beholder context --json --workspace main \
+    'repo://github.com/example/beholder-elixir-smoke/elixir/Beholder.Implementations')"
+for expected in 'Beholder.Renderable.Beholder.Payload' '"kind":"defines"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'expected %s in nested protocol implementation context:\n%s\n' "$expected" "$result" >&2
         exit 1
     fi
 done
