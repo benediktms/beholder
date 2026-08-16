@@ -387,6 +387,15 @@ fn push_function(
                     function.imports.push(import.clone());
                 }
             }
+            for r#use in struct_uses {
+                if !function
+                    .struct_uses
+                    .iter()
+                    .any(|existing| existing.module == r#use.module)
+                {
+                    function.struct_uses.push(r#use);
+                }
+            }
             continue;
         }
         functions.push(ElixirFunction {
@@ -654,6 +663,7 @@ fn push_module(
     let module = modules.len();
     modules.push(ElixirModule {
         name,
+        enclosing_module: None,
         line,
         functions: Vec::new(),
         callbacks: Vec::new(),
@@ -741,12 +751,14 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                     .unwrap_or_default();
                 for r#type in types {
                     let r#type = expand_alias(&r#type, &aliases, &current_module);
+                    let enclosing_module = module.map(|parent| modules[parent].name.clone());
                     let implementation = push_module(
                         modules,
                         format!("{protocol}.{type}"),
                         node.start_position().row + 1,
                         aliases.clone(),
                     );
+                    modules[implementation].enclosing_module = enclosing_module;
                     modules[implementation]
                         .implements
                         .push(ElixirModuleReference {

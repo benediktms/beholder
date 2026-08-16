@@ -9,6 +9,7 @@ pub struct ElixirAnalysis {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct ElixirModule {
     pub(super) name: String,
+    pub(super) enclosing_module: Option<String>,
     pub(super) line: usize,
     pub(super) functions: Vec<ElixirFunction>,
     pub(super) callbacks: Vec<ElixirFunction>,

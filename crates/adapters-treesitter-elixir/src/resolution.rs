@@ -39,6 +39,14 @@ pub fn observations_from_analysis(
             module_id.clone(),
             format!("{}:{}", path.display(), module.line),
         ));
+        if let Some(enclosing_module) = &module.enclosing_module {
+            observations.push(Observation::structural(
+                format!("repo://{repository}/elixir/{enclosing_module}"),
+                StructuralRelation::Defines,
+                module_id.clone(),
+                format!("{}:{}", path.display(), module.line),
+            ));
+        }
         observations.extend(module.functions.iter().map(|function| {
             Observation::structural(
                 module_id.clone(),
@@ -825,6 +833,90 @@ mod tests {
                     == "repo://github.com/example/elixir/elixir/Example.Printable"
                 && override_.relation == DependencyRelation::Implements
         }));
+    }
+
+    #[test]
+    fn models_struct_patterns_and_nested_defimpl_context() {
+        let observations = observations(
+            "github.com/example/elixir",
+            r#"defprotocol Example.Printable do
+  def print(value)
+end
+
+defmodule Example.Context do
+  def inspect(%Example.First{}), do: :first
+  def inspect(%Example.Second{}), do: :second
+
+  def classify(value) do
+    case value do
+      %Example.Third{} -> :third
+    end
+
+    Enum.map([], fn %Example.Fourth{} -> :fourth end)
+  end
+
+  defimpl Example.Printable, for: Example.First do
+    def print(value), do: value
+  end
+end
+"#,
+            Path::new("lib/context.ex"),
+        )
+        .unwrap();
+        let context = "repo://github.com/example/elixir/elixir/Example.Context";
+        let inspect = format!("{context}/inspect/1");
+        let classify = format!("{context}/classify/1");
+        let implementation =
+            "repo://github.com/example/elixir/elixir/Example.Printable.Example.First";
+        let expected = [
+            (
+                inspect.as_str(),
+                "uses",
+                "elixir-module://Example.First",
+                "lib/context.ex:6",
+            ),
+            (
+                inspect.as_str(),
+                "uses",
+                "elixir-module://Example.Second",
+                "lib/context.ex:7",
+            ),
+            (
+                classify.as_str(),
+                "uses",
+                "elixir-module://Example.Third",
+                "lib/context.ex:11",
+            ),
+            (
+                classify.as_str(),
+                "uses",
+                "elixir-module://Example.Fourth",
+                "lib/context.ex:14",
+            ),
+            (context, "defines", implementation, "lib/context.ex:17"),
+            (
+                implementation,
+                "implements",
+                "elixir-module://Example.Printable",
+                "lib/context.ex:17",
+            ),
+        ];
+
+        for (from, relation, to, evidence) in expected {
+            assert_eq!(
+                observations
+                    .iter()
+                    .filter(|observation| {
+                        observation.from.as_str() == from
+                            && observation.relation.as_str() == relation
+                            && observation.to.as_str() == to
+                            && observation.evidence.as_str() == evidence
+                    })
+                    .count(),
+                1,
+                "missing or duplicated {from} {relation} {to} at {evidence}"
+            );
+        }
     }
 
     #[test]

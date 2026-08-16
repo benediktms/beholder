@@ -1,5 +1,5 @@
-pub const FRONTEND_VERSION: &str = "10";
-pub const RESOLVER_VERSION: &str = "6";
+pub const FRONTEND_VERSION: &str = "11";
+pub const RESOLVER_VERSION: &str = "7";
 
 mod analysis;
 mod model;
