@@ -195,7 +195,96 @@ pub struct Observation {
 pub struct RepositoryFacts {
     pub state: RepositoryState,
     pub analysis_identity: String,
+    pub entities: Vec<EntityFact>,
     pub observations: Vec<Observation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EntityFact {
+    pub id: EntityId,
+    pub kind: EntityKind,
+    pub metadata: Option<EntityMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EntityKind {
+    Callable,
+    GraphqlField,
+    KafkaTopic,
+    Namespace,
+    ProtoField,
+    ProtoMethod,
+    ProtoService,
+    ProtoType,
+    Service,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EntityMetadata {
+    ProtoMethod { cardinality: RpcCardinality },
+    ProtoType { kind: ProtoTypeKind },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ProtoTypeKind {
+    Enum,
+    Message,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RpcCardinality {
+    Unary,
+}
+
+impl EntityFact {
+    pub fn new(
+        id: impl Into<EntityId>,
+        kind: EntityKind,
+        metadata: Option<EntityMetadata>,
+    ) -> Result<Self, &'static str> {
+        match (kind, metadata) {
+            (EntityKind::ProtoMethod, Some(EntityMetadata::ProtoMethod { .. }))
+            | (EntityKind::ProtoType, Some(EntityMetadata::ProtoType { .. }))
+            | (EntityKind::Callable
+            | EntityKind::GraphqlField
+            | EntityKind::KafkaTopic
+            | EntityKind::Namespace
+            | EntityKind::ProtoField
+            | EntityKind::ProtoService
+            | EntityKind::Service,
+            None) => Ok(Self {
+                id: id.into(),
+                kind,
+                metadata,
+            }),
+            _ => Err("entity metadata does not match entity kind"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod entity_fact_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_incompatible_metadata() {
+        assert!(EntityFact::new(
+            "proto-type://example.v1.Quote",
+            EntityKind::ProtoType,
+            Some(EntityMetadata::ProtoMethod {
+                cardinality: RpcCardinality::Unary,
+            }),
+        )
+        .is_err());
+        assert!(EntityFact::new(
+            "proto-type://example.v1.Quote",
+            EntityKind::ProtoType,
+            Some(EntityMetadata::ProtoType {
+                kind: ProtoTypeKind::Message,
+            }),
+        )
+        .is_ok());
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

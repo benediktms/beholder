@@ -251,6 +251,7 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            entities: Vec::new(),
             observations,
         }
     }

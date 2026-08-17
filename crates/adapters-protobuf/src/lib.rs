@@ -277,6 +277,7 @@ mod tests {
                 &[RepositoryFacts {
                     state,
                     analysis_identity: "protobuf:1".into(),
+                    entities: Vec::new(),
                     observations: observations(&bytes).unwrap(),
                 }],
                 &[],

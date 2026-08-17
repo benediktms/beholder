@@ -507,6 +507,7 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            entities: Vec::new(),
             observations,
         }
     }
@@ -627,10 +628,11 @@ mod tests {
             store
                 .publish(
                     &view,
-                    &[RepositoryFacts {
-                        state: state.clone(),
-                        analysis_identity: analysis_identity.into(),
-                        observations: vec![observation.clone()],
+                &[RepositoryFacts {
+                    state: state.clone(),
+                    analysis_identity: analysis_identity.into(),
+                    entities: Vec::new(),
+                    observations: vec![observation.clone()],
                     }],
                     &[],
                 )
@@ -703,6 +705,7 @@ mod tests {
                 &[RepositoryFacts {
                     state,
                     analysis_identity: "analysis-v2".into(),
+                    entities: Vec::new(),
                     observations: vec![observation],
                 }],
                 &[],
@@ -765,10 +768,11 @@ mod tests {
             store
                 .publish(
                     &view,
-                    &[RepositoryFacts {
-                        state: state.clone(),
-                        analysis_identity: analysis_identity.into(),
-                        observations: observations.clone(),
+                &[RepositoryFacts {
+                    state: state.clone(),
+                    analysis_identity: analysis_identity.into(),
+                    entities: Vec::new(),
+                    observations: observations.clone(),
                     }],
                     &[],
                 )
@@ -847,11 +851,13 @@ mod tests {
                     RepositoryFacts {
                         state: source,
                         analysis_identity: "analysis".into(),
+                        entities: Vec::new(),
                         observations: vec![unresolved.clone()],
                     },
                     RepositoryFacts {
                         state: target,
                         analysis_identity: "analysis".into(),
+                        entities: Vec::new(),
                         observations: vec![Observation::structural(
                             "repo://target/rust/lib",
                             StructuralRelation::Defines,

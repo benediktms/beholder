@@ -763,6 +763,7 @@ fn index_workspace_versioned(
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity,
+            entities: Vec::new(),
             observations: analysis.observations.clone(),
         });
     }
@@ -1015,6 +1016,7 @@ mod tests {
                     &[RepositoryFacts {
                         state: state.clone(),
                         analysis_identity: "analysis".into(),
+                        entities: Vec::new(),
                         observations: analysis.observations.clone(),
                     }],
                     &[],

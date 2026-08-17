@@ -44,6 +44,7 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dy
         &[RepositoryFacts {
             state,
             analysis_identity: format!("rust:{FRONTEND_VERSION}:single-file:1"),
+            entities: Vec::new(),
             observations: observations.clone(),
         }],
         &[],
