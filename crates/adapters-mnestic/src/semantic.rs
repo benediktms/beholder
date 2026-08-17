@@ -351,7 +351,7 @@ impl GraphBuilder {
         self.edges
             .entry(key.clone())
             .and_modify(|edge| {
-                edge.confidence = edge.confidence.min(confidence);
+                edge.confidence = edge.confidence.max(confidence);
                 edge.evidence.insert(evidence.clone());
             })
             .or_insert_with(|| EdgeData {
@@ -661,6 +661,21 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 mod tests {
     use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity};
     use beholder_dto::{EntityKind, EntityOrigin};
+
+    #[test]
+    fn keeps_strongest_confidence_for_duplicate_edges() {
+        let mut graph = GraphBuilder::default();
+        graph
+            .add_edge("a", "b", "calls", "a.rs:1", 0.6, "unique_name_heuristic")
+            .unwrap();
+        graph
+            .add_edge("a", "b", "calls", "a.rs:2", 1.0, "ast")
+            .unwrap();
+
+        let graph = graph.finish();
+        assert_eq!(graph.edges[0].confidence, 1.0);
+        assert_eq!(graph.edges[0].evidence.len(), 2);
+    }
 
     #[test]
     fn maps_elixir_modules_and_functions() {
