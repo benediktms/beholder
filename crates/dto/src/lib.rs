@@ -86,6 +86,7 @@ pub struct EntityRef {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationKind {
+    BindsContract,
     Calls,
     CallsRpc,
     ConsumedBy,
@@ -106,6 +107,7 @@ pub enum RelationKind {
 impl RelationKind {
     pub fn as_str(&self) -> &str {
         match self {
+            Self::BindsContract => "binds_contract",
             Self::Calls => "calls",
             Self::CallsRpc => "calls_rpc",
             Self::ConsumedBy => "consumed_by",
@@ -130,6 +132,7 @@ impl TryFrom<&str> for RelationKind {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
+            "binds_contract" => Ok(Self::BindsContract),
             "calls" => Ok(Self::Calls),
             "calls_rpc" => Ok(Self::CallsRpc),
             "consumed_by" => Ok(Self::ConsumedBy),

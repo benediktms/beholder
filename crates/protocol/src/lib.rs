@@ -276,6 +276,7 @@ impl TryFrom<v1::Evidence> for dto::EvidenceRef {
 impl From<dto::RelationKind> for v1::RelationKind {
     fn from(value: dto::RelationKind) -> Self {
         match value {
+            dto::RelationKind::BindsContract => Self::BindsContract,
             dto::RelationKind::Calls => Self::Calls,
             dto::RelationKind::CallsRpc => Self::CallsRpc,
             dto::RelationKind::ConsumedBy => Self::ConsumedBy,
@@ -297,6 +298,7 @@ impl From<dto::RelationKind> for v1::RelationKind {
 
 fn relation_kind(value: i32) -> Result<dto::RelationKind, &'static str> {
     match v1::RelationKind::try_from(value).map_err(|_| "unknown relation kind")? {
+        v1::RelationKind::BindsContract => Ok(dto::RelationKind::BindsContract),
         v1::RelationKind::Calls => Ok(dto::RelationKind::Calls),
         v1::RelationKind::CallsRpc => Ok(dto::RelationKind::CallsRpc),
         v1::RelationKind::ConsumedBy => Ok(dto::RelationKind::ConsumedBy),
@@ -679,7 +681,7 @@ mod tests {
                 id: "e1".into(),
                 from: "a".into(),
                 to: "b".into(),
-                kind: dto::RelationKind::Implements,
+                kind: dto::RelationKind::BindsContract,
                 confidence: 0.6,
                 evidence: vec![dto::EvidenceRef {
                     source_kind: dto::EvidenceKind::Inference,
@@ -692,7 +694,10 @@ mod tests {
             paths: Vec::new(),
         };
         let response = v1::TraceResponse::from(trace.clone());
-        assert_eq!(response.edges[0].kind, v1::RelationKind::Implements as i32);
+        assert_eq!(
+            response.edges[0].kind,
+            v1::RelationKind::BindsContract as i32
+        );
         assert_eq!(
             response.edges[0].evidence[0].source,
             v1::EvidenceKind::Inference as i32

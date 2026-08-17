@@ -125,6 +125,7 @@ pub enum StructuralRelation {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyRelation {
+    BindsContract,
     Calls,
     CallsRpc,
     ConsumedBy,
@@ -141,6 +142,7 @@ pub enum DependencyRelation {
 impl DependencyRelation {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::BindsContract => "binds_contract",
             Self::Calls => "calls",
             Self::CallsRpc => "calls_rpc",
             Self::ConsumedBy => "consumed_by",
