@@ -5,7 +5,11 @@ use beholder_domain::{
 use prost::Message;
 use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
 
-pub const FRONTEND_VERSION: &str = "1";
+mod compiler;
+
+pub use compiler::SourceCompiler;
+
+pub const FRONTEND_VERSION: &str = "2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtobufFacts {

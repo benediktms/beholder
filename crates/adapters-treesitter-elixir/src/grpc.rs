@@ -369,8 +369,13 @@ mod tests {
 
     const SERVICE: &str = r#"
         defmodule Pricing.V1.PricingService.Service do
-          use GRPC.Service, name: "pricing.v1.PricingService"
-          rpc :GetQuote, Pricing.V1.Request, Pricing.V1.Response
+          use GRPC.Service,
+            name: "pricing.v1.PricingService",
+            protoc_gen_elixir_version: "0.16.0"
+          def descriptor, do: :descriptor
+          rpc :GetQuote,
+              Pricing.V1.Request,
+              Pricing.V1.Response
         end
 
         defmodule Pricing.V1.PricingService.Stub do

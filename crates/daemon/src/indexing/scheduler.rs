@@ -1,7 +1,7 @@
 use crate::workspace_registry::WorkspaceRegistry;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_protobuf::{
-    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, facts as protobuf_facts,
+    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, SourceCompiler, facts as protobuf_facts,
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
@@ -96,7 +96,7 @@ impl AnalysisVersions {
                 .any(|sources| !sources.elixir.is_empty()),
             repositories
                 .iter()
-                .any(|sources| !sources.protobuf.is_empty()),
+                .any(|sources| !sources.protobuf.is_empty() || !sources.protobuf_source.is_empty()),
         );
         format!("{}:core-rules:{}", key.analysis_identity(), self.rule_pack)
     }
@@ -122,6 +122,7 @@ pub struct IndexScheduler {
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
+    protobuf_compiler: SourceCompiler,
     repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<RepositoryAnalysis>>>,
     analysis_pool: rayon::ThreadPool,
 }
@@ -152,11 +153,7 @@ impl IndexScheduler {
             .ok()
             .and_then(|workers| workers.parse().ok())
             .filter(|workers| *workers > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(4)
-            });
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
         Self::with_workers(cache_dir, workers)
     }
 
@@ -167,6 +164,7 @@ impl IndexScheduler {
             .build()
             .expect("bounded indexing pool should start");
         tracing::info!(workers, "index analysis pool configured");
+        let protobuf_compiler = SourceCompiler::new(cache_dir.clone());
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
@@ -177,6 +175,7 @@ impl IndexScheduler {
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
             elixir_cache: Mutex::new(BTreeMap::new()),
+            protobuf_compiler,
             repository_cache: Mutex::new(BTreeMap::new()),
             analysis_pool,
         }
@@ -236,6 +235,7 @@ impl IndexScheduler {
             .lock()
             .map_err(|_| "Elixir frontend cache lock poisoned")?
             .clear();
+        self.protobuf_compiler.clear_memory()?;
         self.repository_cache
             .lock()
             .map_err(|_| "repository cache lock poisoned")?
@@ -354,9 +354,15 @@ impl IndexScheduler {
                             path.strip_prefix(&repository.base)
                                 .ok()
                                 .filter(|relative| {
-                                    let source = relative.extension().is_some_and(|extension| {
-                                        matches!(extension.to_str(), Some("rs" | "ex" | "exs"))
-                                    }) && !relative.components().any(|component| {
+                                    let source = (relative.extension().is_some_and(|extension| {
+                                        matches!(
+                                            extension.to_str(),
+                                            Some("rs" | "ex" | "exs" | "proto")
+                                        )
+                                    }) || matches!(
+                                        relative.file_name().and_then(|name| name.to_str()),
+                                        Some("buf.yaml" | "buf.lock")
+                                    )) && !relative.components().any(|component| {
                                         matches!(
                                             component.as_os_str().to_str(),
                                             Some(
@@ -736,7 +742,7 @@ fn index_workspace_versioned(
     versions: AnalysisVersions,
 ) -> Result<(usize, bool), Box<dyn Error>> {
     let source_loading_started = Instant::now();
-    let repositories = workspace
+    let mut repositories = workspace
         .repositories
         .iter()
         .map(|repository| {
@@ -762,6 +768,21 @@ fn index_workspace_versioned(
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
+    let protobuf_compilation_started = Instant::now();
+    for (repository, sources) in workspace.repositories.iter().zip(&mut repositories) {
+        let descriptors = scheduler.analysis_pool.install(|| {
+            scheduler
+                .protobuf_compiler
+                .compile_repository(&repository.base, &sources.protobuf_source)
+        })?;
+        for (index, descriptor) in descriptors.into_iter().enumerate() {
+            sources.protobuf.push((
+                PathBuf::from(format!("compiled-protobuf-{index}.binpb")),
+                descriptor.as_ref().clone(),
+            ));
+        }
+    }
+    let protobuf_compilation = protobuf_compilation_started.elapsed();
 
     let mut repository_facts = Vec::new();
     let mut memory_hits = 0;
@@ -776,12 +797,14 @@ fn index_workspace_versioned(
             rust,
             elixir,
             protobuf,
+            protobuf_source,
         } = sources;
-        dirty_source_units +=
-            match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
-                Some(DirtyRepository::Sources(sources)) => sources.len(),
-                Some(DirtyRepository::All) | None => rust.len() + elixir.len() + protobuf.len(),
-            };
+        dirty_source_units += match dirty
+            .and_then(|repositories| repositories.get(&state.repository.identity))
+        {
+            Some(DirtyRepository::Sources(sources)) => sources.len(),
+            Some(DirtyRepository::All) | None => rust.len() + elixir.len() + protobuf_source.len(),
+        };
         let (analysis, cache_status, analysis_identity) = scheduler
             .repository_observations_versioned(&state, &rust, &elixir, &protobuf, versions)?;
         match cache_status {
@@ -834,6 +857,7 @@ fn index_workspace_versioned(
         repository_cache_misses = misses,
         dirty_source_units,
         source_loading_ms = source_loading.as_secs_f64() * 1000.0,
+        protobuf_compilation_ms = protobuf_compilation.as_secs_f64() * 1000.0,
         repository_analysis_ms = repository_analysis.as_secs_f64() * 1000.0,
         workspace_resolution_ms = workspace_resolution.as_secs_f64() * 1000.0,
         publication_ms = publication.as_secs_f64() * 1000.0,
@@ -1471,6 +1495,40 @@ mod tests {
     }
 
     #[test]
+    fn protobuf_filesystem_events_mark_repository_dirty() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-protobuf-event-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        let changed = repository.join("contract.proto");
+        fs::write(&changed, "syntax = \"proto3\"; message Contract {}").unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
+        let identity = workspace.repositories[0].repository.identity.clone();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+
+        scheduler.add_event(
+            Ok(Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![changed.canonicalize().unwrap()],
+                attrs: Default::default(),
+            }),
+            &Mutex::new(registry),
+        );
+
+        assert_eq!(
+            scheduler.dirty_repositories.lock().unwrap()["main"][&identity],
+            DirtyRepository::Sources(BTreeSet::from([PathBuf::from("contract.proto")]))
+        );
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn elixir_source_units_are_indexed_incrementally() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1634,15 +1692,18 @@ mod tests {
         ] {
             fs::create_dir_all(directory).unwrap();
         }
-        let descriptor = contracts.join("matrix.descriptor.bin");
-        let descriptor_bytes =
-            include_str!("../../../../scripts/fixtures/grpc-matrix.descriptor.hex")
-                .trim()
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect::<Vec<_>>();
-        fs::write(&descriptor, descriptor_bytes).unwrap();
+        let contract_path = contracts.join("matrix.proto");
+        let contract_source = r#"
+            syntax = "proto3";
+            package phase5.v1;
+            message Request {}
+            message Response {}
+            service Bridge {
+              rpc RustToElixir(Request) returns (Response);
+              rpc ElixirToRust(Request) returns (Response);
+            }
+            "#;
+        fs::write(&contract_path, contract_source).unwrap();
         fs::write(
             rust.join("src/protocol.rs"),
             "tonic::include_proto!(\"phase5.v1\");",
@@ -1715,11 +1776,7 @@ mod tests {
         let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
         let repositories = vec![contracts.clone(), rust.clone(), elixir.clone()];
         let workspace = registry
-            .register(
-                "grpc-matrix".into(),
-                repositories.clone(),
-                vec![descriptor.clone()],
-            )
+            .register("grpc-matrix".into(), repositories.clone(), Vec::new())
             .unwrap();
         let rust_identity = beholder_adapters_git::repository_identity(&rust).unwrap();
         let elixir_identity = beholder_adapters_git::repository_identity(&elixir).unwrap();
@@ -1812,6 +1869,7 @@ mod tests {
 
         let rust_cache_entries = scheduler.rust_cache.lock().unwrap().len();
         let elixir_cache_entries = scheduler.elixir_cache.lock().unwrap().len();
+        fs::remove_file(&contract_path).unwrap();
         let without_contract = registry
             .register("grpc-matrix".into(), repositories.clone(), Vec::new())
             .unwrap();
@@ -1828,8 +1886,9 @@ mod tests {
         assert!(inspection.contains("grpc.contract_unmatched"));
         assert!(!format!("{:?}", store.inspect_relations().unwrap()).contains("calls_rpc"));
 
+        fs::write(&contract_path, contract_source).unwrap();
         let restored = registry
-            .register("grpc-matrix".into(), repositories, vec![descriptor])
+            .register("grpc-matrix".into(), repositories, Vec::new())
             .unwrap();
         scheduler.index(&store, &restored).unwrap();
         assert_eq!(
