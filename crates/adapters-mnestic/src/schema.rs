@@ -32,6 +32,16 @@ pub(super) const CREATE_METADATA_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ENTITY_SCHEMA: &str = r#"
+:create state_entity {
+    state: String,
+    id: String,
+    =>
+    kind: String,
+    metadata: String,
+}
+"#;
+
 pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \

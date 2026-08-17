@@ -1,6 +1,7 @@
 use super::schema::*;
 use beholder_domain::{
-    DependencyOverride, FactChanges, Observation, RepositoryFacts, WorkspaceView,
+    DependencyOverride, EntityFact, EntityKind, EntityMetadata, FactChanges, Observation,
+    ProtoTypeKind, RepositoryFacts, RpcCardinality, WorkspaceView,
 };
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
@@ -66,12 +67,84 @@ pub(super) fn store_observations(
     Ok(())
 }
 
+fn entity_kind(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Callable => "callable",
+        EntityKind::GraphqlField => "graphql_field",
+        EntityKind::KafkaTopic => "kafka_topic",
+        EntityKind::Namespace => "namespace",
+        EntityKind::ProtoField => "proto_field",
+        EntityKind::ProtoMethod => "proto_method",
+        EntityKind::ProtoService => "proto_service",
+        EntityKind::ProtoType => "proto_type",
+        EntityKind::Service => "service",
+    }
+}
+
+fn entity_metadata(metadata: Option<EntityMetadata>) -> &'static str {
+    match metadata {
+        None => "",
+        Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::Unary,
+        }) => "rpc_cardinality:unary",
+        Some(EntityMetadata::ProtoType {
+            kind: ProtoTypeKind::Enum,
+        }) => "proto_type:enum",
+        Some(EntityMetadata::ProtoType {
+            kind: ProtoTypeKind::Message,
+        }) => "proto_type:message",
+    }
+}
+
+pub(super) fn store_entities(
+    transaction: &MultiTransaction,
+    state: &str,
+    entities: &[EntityFact],
+) -> Result<(), Box<dyn Error>> {
+    let rows = entities
+        .iter()
+        .map(|entity| {
+            DataValue::List(vec![
+                state.into(),
+                entity.id.as_str().into(),
+                entity_kind(entity.kind).into(),
+                entity_metadata(entity.metadata).into(),
+            ])
+        })
+        .collect();
+    if !entities.is_empty() {
+        transaction.run_script(
+            "?[state, id, kind, metadata] <- $rows\n\
+             :put state_entity {state, id => kind, metadata}",
+            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn hash_string(hash: &mut Sha256, value: &str) {
     hash.update(value.len().to_le_bytes());
     hash.update(value.as_bytes());
 }
 
 type NormalizedObservations = BTreeMap<(String, String, String), (String, u64, String)>;
+type NormalizedEntities = BTreeMap<String, (String, String)>;
+
+fn normalized_entities(facts: &RepositoryFacts) -> NormalizedEntities {
+    facts
+        .entities
+        .iter()
+        .map(|entity| {
+            (
+                entity.id.as_str().into(),
+                (
+                    entity_kind(entity.kind).into(),
+                    entity_metadata(entity.metadata).into(),
+                ),
+            )
+        })
+        .collect()
+}
 
 pub(super) fn normalized_observations(facts: &RepositoryFacts) -> NormalizedObservations {
     facts
@@ -104,6 +177,11 @@ pub(super) fn analyzed_state(facts: &RepositoryFacts) -> String {
             hash_string(&mut hash, value);
         }
         hash.update(confidence.to_le_bytes());
+    }
+    for (id, (kind, metadata)) in normalized_entities(facts) {
+        for value in [&id, &kind, &metadata] {
+            hash_string(&mut hash, value);
+        }
     }
     format!("{}:{:x}", facts.state.fingerprint, hash.finalize())
 }
@@ -183,7 +261,18 @@ pub(super) fn reusable_current_state(
             ))
         })
         .collect::<Result<NormalizedObservations, Box<dyn Error>>>()?;
-    Ok((stored == normalized_observations(facts)).then_some(state))
+    let stored_entities = transaction.run_script(
+        "?[id, kind, metadata] := *state_entity{state: $state, id, kind, metadata}",
+        BTreeMap::from([("state".into(), state.clone().into())]),
+    )?;
+    let stored_entities = stored_entities
+        .rows
+        .iter()
+        .map(|row| Ok((string(row, 0)?, (string(row, 1)?, string(row, 2)?))))
+        .collect::<Result<NormalizedEntities, Box<dyn Error>>>()?;
+    Ok((stored == normalized_observations(facts)
+        && stored_entities == normalized_entities(facts))
+        .then_some(state))
 }
 
 pub(super) fn view_matches(db: &DbInstance, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
@@ -301,6 +390,7 @@ pub(super) fn publish_observations(
             current
         } else {
             store_observations(&transaction, &desired, &facts.observations)?;
+            store_entities(&transaction, &desired, &facts.entities)?;
             desired
         };
         analyzed_states.push(state);
@@ -420,6 +510,15 @@ pub(super) fn garbage_collect(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
                      *analysis_revision_state{view, revision, state} \
                  stale_state[state] := \
                      *repository_state{fingerprint: state}, not live_state[state] \
+                 ?[state, id] := *state_entity{state, id}, stale_state[state] \
+                 :rm state_entity {state, id} \
+             } \
+             { \
+                 live_state[state] := \
+                     *analysis_revision{view, revision}, \
+                     *analysis_revision_state{view, revision, state} \
+                 stale_state[state] := \
+                     *repository_state{fingerprint: state}, not live_state[state] \
                  ?[state, from, relation, to] := \
                      *state_dependency_observation{state, from, relation, to}, stale_state[state] \
                  :rm state_dependency_observation {state, from, relation, to} \
@@ -492,9 +591,9 @@ mod tests {
     use super::*;
     use crate::SemanticStore;
     use beholder_domain::{
-        Confidence, DependencyOverride, DependencyRelation, FactChanges, LogicalRepository,
-        Observation, Provenance, RepositoryFacts, RepositoryState, StructuralRelation,
-        WorkspaceView,
+        Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind,
+        EntityMetadata, FactChanges, LogicalRepository, Observation, ProtoTypeKind, Provenance,
+        RepositoryFacts, RepositoryState, StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
     use std::{
@@ -510,6 +609,46 @@ mod tests {
             entities: Vec::new(),
             observations,
         }
+    }
+
+    #[test]
+    fn persists_typed_entity_facts_with_repository_state() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "contracts".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "descriptor".into(),
+            }],
+        )
+        .unwrap();
+        let mut facts = facts(&view, Vec::new());
+        facts.entities.push(
+            EntityFact::new(
+                "proto-type://pricing.v1.Quote",
+                EntityKind::ProtoType,
+                Some(EntityMetadata::ProtoType {
+                    kind: ProtoTypeKind::Message,
+                }),
+            )
+            .unwrap(),
+        );
+        let state = analyzed_state(&facts);
+        store.publish(&view, &[facts], &[]).unwrap();
+
+        let rows = store
+            .db
+            .run_script(
+                "?[kind, metadata] := *state_entity{state: $state, id: 'proto-type://pricing.v1.Quote', kind, metadata}",
+                BTreeMap::from([("state".into(), state.into())]),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(rows.rows, vec![["proto_type".into(), "proto_type:message".into()]]);
     }
     #[test]
     fn publish_replaces_only_changed_facts() {
