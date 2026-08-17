@@ -3,7 +3,8 @@ use super::model::*;
 use crate::analyze;
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-    DependencyRelation, EntityId, Observation, Provenance, SemanticRelation, StructuralRelation,
+    DependencyRelation, EntityFact, EntityId, EntityKind, Observation, Provenance,
+    SemanticRelation, StructuralRelation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, path::Path};
@@ -122,6 +123,33 @@ pub fn observations_from_analysis(
         }
     }
     observations
+}
+
+pub fn entities_from_analysis(
+    repository: &str,
+    analysis: &ElixirAnalysis,
+    path: &Path,
+) -> Vec<EntityFact> {
+    let source_id = format!(
+        "repo://{repository}/elixir-source/{}",
+        path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+    );
+    let mut entities = vec![EntityFact::new(source_id, EntityKind::Namespace, None).unwrap()];
+    for module in &analysis.modules {
+        let module_id = format!("repo://{repository}/elixir/{}", module.name);
+        entities.push(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap());
+        for function in module.functions.iter().chain(&module.callbacks) {
+            entities.push(
+                EntityFact::new(
+                    format!("{module_id}/{}/{}", function.name, function.arity),
+                    EntityKind::Callable,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    entities
 }
 
 fn is_generated_source(path: &Path, source: &str) -> bool {
@@ -404,6 +432,16 @@ pub fn observations(
 mod tests {
     use super::*;
     use beholder_domain::SemanticRelation;
+
+    #[test]
+    fn emits_typed_source_entities() {
+        let analysis = analyze("defmodule Example.Worker do\n  def run, do: :ok\nend").unwrap();
+        let entities = entities_from_analysis("example", &analysis, Path::new("lib/worker.ex"));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "repo://example/elixir/Example.Worker/run/0"
+                && entity.kind == EntityKind::Callable
+        }));
+    }
 
     #[test]
     fn emits_stable_module_and_function_definitions() {
