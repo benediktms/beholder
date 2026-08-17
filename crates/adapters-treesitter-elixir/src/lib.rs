@@ -8,7 +8,7 @@ mod resolution;
 pub use analysis::analyze;
 pub use model::ElixirAnalysis;
 pub use resolution::{
-    diagnostics_from_analysis, entities_from_analysis, generated_observations, observations,
+    diagnostics_from_analysis, entities_from_analysis, generated_entities, generated_observations, observations,
     observations_from_analysis,
     resolve_repository_calls, resolve_workspace_modules,
 };

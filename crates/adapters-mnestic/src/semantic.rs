@@ -303,6 +303,7 @@ fn shortest_path(
 struct GraphBuilder {
     edges: BTreeMap<EdgeKey, EdgeData>,
     kinds: BTreeMap<String, EntityKind>,
+    explicit_kinds: BTreeSet<String>,
     origins: BTreeMap<String, EntityOrigin>,
 }
 
@@ -313,10 +314,14 @@ struct EdgeData {
 
 impl GraphBuilder {
     fn hint_facts(&mut self, facts: BTreeMap<String, EntityKind>) {
+        self.explicit_kinds.extend(facts.keys().cloned());
         self.kinds.extend(facts);
     }
 
     fn hint(&mut self, id: &str, kind: EntityKind) {
+        if self.explicit_kinds.contains(id) {
+            return;
+        }
         let current = self.kinds.entry(id.into()).or_insert(EntityKind::Unknown);
         if kind_priority(kind) > kind_priority(*current) {
             *current = kind;
@@ -661,6 +666,19 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 mod tests {
     use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity};
     use beholder_dto::{EntityKind, EntityOrigin};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn typed_entity_facts_override_relation_hints() {
+        let mut graph = GraphBuilder::default();
+        graph.hint_facts(BTreeMap::from([("repo://example/rust/lib".into(), EntityKind::Namespace)]));
+        graph.hint("repo://example/rust/lib", EntityKind::Callable);
+
+        assert_eq!(
+            graph.finish().entity("repo://example/rust/lib").kind,
+            EntityKind::Namespace
+        );
+    }
 
     #[test]
     fn keeps_strongest_confidence_for_duplicate_edges() {

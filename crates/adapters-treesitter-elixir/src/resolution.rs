@@ -273,6 +273,19 @@ pub fn generated_observations(
     generated
 }
 
+pub fn generated_entities(observations: &[Observation]) -> Vec<EntityFact> {
+    observations
+        .iter()
+        .filter(|observation| observation.provenance == Provenance::Generated)
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+        })
+        .map(|observation| {
+            EntityFact::new(observation.to.clone(), EntityKind::Callable, None).unwrap()
+        })
+        .collect()
+}
+
 pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<DependencyOverride> {
     let mut definitions = BTreeMap::<String, Option<String>>::new();
     for observation in observations.iter().filter(|observation| {
@@ -730,6 +743,7 @@ mod tests {
             Path::new("lib/my_app/consumer.ex"),
         )
         .unwrap();
+        let entities = generated_entities(&observations);
 
         assert!(
             !observations
@@ -742,6 +756,10 @@ mod tests {
                 && observation.to.as_str() == "repo://payments/elixir/MyApp.Consumer/generated/0"
                 && observation.evidence.as_str() == "lib/my_app/consumer.ex:6"
                 && observation.provenance == Provenance::Generated
+        }));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "repo://payments/elixir/MyApp.Consumer/generated/0"
+                && entity.kind == EntityKind::Callable
         }));
         assert!(!observations.iter().any(|observation| {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Macro"
