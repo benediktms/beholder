@@ -126,24 +126,25 @@ fn json(value: &impl Serialize, pretty: bool) -> Result<String, serde_json::Erro
 
 fn context_human(result: &ContextResult, include_tests: bool) -> String {
     let entities = entities(&result.nodes);
+    let names = entity_names(&result.nodes);
     let mut incoming = Vec::new();
     let mut outgoing = Vec::new();
     for edge in &result.edges {
         if edge.to == result.root.id && is_primary(&entities, &edge.from, include_tests) {
             incoming.push(format!(
                 "  ← {} [{}]",
-                name(&entities, &edge.from),
+                name(&names, &edge.from),
                 incoming_relation(edge.kind.as_str())
             ));
         } else if edge.from == result.root.id && is_primary(&entities, &edge.to, include_tests) {
             outgoing.push(format!(
                 "  → {} [{}]",
-                name(&entities, &edge.to),
+                name(&names, &edge.to),
                 edge.kind.as_str()
             ));
         }
     }
-    let mut output = format!("{}\n", name(&entities, &result.root.id));
+    let mut output = format!("{}\n", label(&names, &result.root));
     if !incoming.is_empty() {
         output.push_str("\nincoming\n");
         output.push_str(&incoming.join("\n"));
@@ -169,7 +170,8 @@ fn incoming_relation(relation: &str) -> &str {
 
 fn dependencies_human(result: &DependenciesResult, include_tests: bool) -> String {
     let entities = entities(&result.nodes);
-    let mut output = format!("{}\n", entity_label(&result.root));
+    let names = entity_names(&result.nodes);
+    let mut output = format!("{}\n", label(&names, &result.root));
     let dependencies = result
         .dependencies
         .iter()
@@ -179,7 +181,7 @@ fn dependencies_human(result: &DependenciesResult, include_tests: bool) -> Strin
         let _ = writeln!(
             output,
             "  → {} ({} {})",
-            name(&entities, &dependency.entity),
+            name(&names, &dependency.entity),
             dependency.hops,
             plural(dependency.hops, "hop", "hops")
         );
@@ -192,6 +194,7 @@ fn dependencies_human(result: &DependenciesResult, include_tests: bool) -> Strin
 
 fn impact_human(result: &ImpactResult, include_tests: bool) -> String {
     let entities = entities(&result.nodes);
+    let names = entity_names(&result.nodes);
     let mut groups: BTreeMap<String, Vec<&EntityRef>> = BTreeMap::new();
     let mut tests: BTreeMap<String, Vec<&EntityRef>> = BTreeMap::new();
     let mut hidden_tests = 0;
@@ -222,22 +225,22 @@ fn impact_human(result: &ImpactResult, include_tests: bool) -> String {
     }
     let affected_count = groups.values().map(Vec::len).sum::<usize>();
     let test_count = tests.values().map(Vec::len).sum::<usize>();
-    let mut output = format!("{}\n", entity_label(&result.root));
+    let mut output = format!("{}\n", label(&names, &result.root));
     for (group, entities) in groups {
-        let mut names = display_names(&entities);
-        names.sort_unstable();
+        let mut display_names = display_names(&entities, &names);
+        display_names.sort_unstable();
         let _ = writeln!(output, "\n{group}");
-        for name in names {
+        for name in display_names {
             let _ = writeln!(output, "  - {name}");
         }
     }
     if !tests.is_empty() {
         output.push_str("\ntests\n");
         for (path, entities) in tests {
-            let mut names = display_names(&entities);
-            names.sort_unstable();
+            let mut display_names = display_names(&entities, &names);
+            display_names.sort_unstable();
             let _ = writeln!(output, "  {path}");
-            for name in names {
+            for name in display_names {
                 let _ = writeln!(output, "    - {name}");
             }
         }
@@ -265,8 +268,8 @@ fn impact_human(result: &ImpactResult, include_tests: bool) -> String {
     output
 }
 
-fn display_names(entities: &[&EntityRef]) -> Vec<String> {
-    entities.iter().map(|entity| entity_label(entity)).collect()
+fn display_names(entities: &[&EntityRef], names: &BTreeMap<&str, String>) -> Vec<String> {
+    entities.iter().map(|entity| label(names, entity)).collect()
 }
 
 fn trace_human(result: &TraceResult, include_tests: bool) -> String {
@@ -449,6 +452,7 @@ fn projected_paths(
     include_tests: bool,
 ) -> Vec<ProjectedPath> {
     let entities = entities(nodes);
+    let names = entity_names(nodes);
     let edges = edges
         .iter()
         .map(|edge| (edge.id.as_str(), edge))
@@ -471,7 +475,7 @@ fn projected_paths(
                     evidence.sort();
                     evidence.dedup();
                     steps.push(ProjectedStep {
-                        to: entity_label(target),
+                        to: label(&names, target),
                         kind: edge.kind.as_str().into(),
                         confidence,
                         evidence: std::mem::take(&mut evidence),
@@ -480,7 +484,7 @@ fn projected_paths(
                 }
             }
             Some(ProjectedPath {
-                first: name(&entities, first_id),
+                first: name(&names, first_id),
                 steps,
             })
         })
@@ -503,11 +507,35 @@ fn entities(nodes: &[EntityRef]) -> BTreeMap<&str, &EntityRef> {
         .collect()
 }
 
-fn name(entities: &BTreeMap<&str, &EntityRef>, id: &str) -> String {
-    entities
-        .get(id)
-        .map(|entity| entity_label(entity))
-        .unwrap_or_else(|| id.into())
+fn entity_names(nodes: &[EntityRef]) -> BTreeMap<&str, String> {
+    let mut groups: BTreeMap<String, Vec<&EntityRef>> = BTreeMap::new();
+    for entity in nodes {
+        groups.entry(entity_label(entity)).or_default().push(entity);
+    }
+    nodes
+        .iter()
+        .map(|entity| {
+            let base = entity_label(entity);
+            let peers = &groups[&base];
+            let label = if peers.len() == 1 {
+                base
+            } else {
+                shortest_unique_label(entity, peers)
+            };
+            (entity.id.as_str(), label)
+        })
+        .collect()
+}
+
+fn name(names: &BTreeMap<&str, String>, id: &str) -> String {
+    names.get(id).cloned().unwrap_or_else(|| id.into())
+}
+
+fn label(names: &BTreeMap<&str, String>, entity: &EntityRef) -> String {
+    names
+        .get(entity.id.as_str())
+        .cloned()
+        .unwrap_or_else(|| entity_label(entity))
 }
 
 fn entity_label(entity: &EntityRef) -> String {
@@ -519,16 +547,45 @@ fn entity_label(entity: &EntityRef) -> String {
 }
 
 fn containing_scope(entity: &EntityRef) -> Option<&str> {
+    symbol_scope(entity)?
+        .rsplit('/')
+        .find(|segment| !matches!(*segment, "callback" | "field"))
+}
+
+fn shortest_unique_label(entity: &EntityRef, peers: &[&EntityRef]) -> String {
+    let repository = entity.repository.as_deref().unwrap_or("cross-repository");
+    let scope = scope_segments(entity);
+    for width in 1..=scope.len() {
+        let candidate = scope[scope.len() - width..].join("/");
+        if peers.iter().all(|peer| {
+            peer.id == entity.id || {
+                let peer_scope = scope_segments(peer);
+                peer_scope.len() < width
+                    || peer_scope[peer_scope.len() - width..].join("/") != candidate
+            }
+        }) {
+            return format!("{repository} · {candidate} · {}", entity.name);
+        }
+    }
+    format!("{repository} · {}", entity.id)
+}
+
+fn scope_segments(entity: &EntityRef) -> Vec<&str> {
+    symbol_scope(entity)
+        .into_iter()
+        .flat_map(|scope| scope.split('/'))
+        .filter(|segment| !matches!(*segment, "callback" | "field"))
+        .collect()
+}
+
+fn symbol_scope(entity: &EntityRef) -> Option<&str> {
     let repository = entity.repository.as_deref()?;
     let symbol = entity
         .id
         .strip_prefix(&format!("repo://{repository}/"))?
         .split_once('/')?
         .1;
-    let scope = symbol.strip_suffix(&format!("/{}", entity.name))?;
-    scope
-        .rsplit('/')
-        .find(|segment| !matches!(*segment, "callback" | "field"))
+    symbol.strip_suffix(&format!("/{}", entity.name))
 }
 
 fn evidence_label(evidence: &EvidenceRef) -> String {
@@ -799,14 +856,14 @@ mod tests {
             false,
         );
         let nodes = [elixir, rust];
-        let entities = entities(&nodes);
+        let names = entity_names(&nodes);
 
         assert_eq!(
-            name(&entities, "repo://repo/elixir/Example.Client/run/1"),
+            name(&names, "repo://repo/elixir/Example.Client/run/1"),
             "repo · Example.Client · run/1"
         );
         assert_eq!(
-            name(&entities, "repo://repo/rust/src/client/impl/Client/run"),
+            name(&names, "repo://repo/rust/src/client/impl/Client/run"),
             "repo · Client · run"
         );
     }
@@ -874,9 +931,34 @@ mod tests {
             false,
         );
 
+        let nodes = [first.clone(), second.clone()];
+        let names = entity_names(&nodes);
         assert_eq!(
-            display_names(&[&first, &second]),
+            display_names(&[&first, &second], &names),
             ["repo · AnalysisCtx · new", "repo · ArtifactCtx · new"]
+        );
+    }
+
+    #[test]
+    fn duplicate_labels_expand_to_the_shortest_unique_scope() {
+        let first = entity(
+            "repo://repo/rust/crates/one/src/client/run",
+            "run",
+            EntityKind::Callable,
+            false,
+        );
+        let second = entity(
+            "repo://repo/rust/crates/two/src/client/run",
+            "run",
+            EntityKind::Callable,
+            false,
+        );
+        let nodes = [first, second];
+        let names = entity_names(&nodes);
+
+        assert_eq!(
+            names.values().cloned().collect::<Vec<_>>(),
+            ["repo · one/src/client · run", "repo · two/src/client · run"]
         );
     }
 }
