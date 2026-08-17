@@ -7,7 +7,7 @@ use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
     RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
     entities_from_analysis as elixir_entities, generated_entities as elixir_generated_entities,
-    generated_observations as elixir_generated_observations,
+    generated_observations as elixir_generated_observations, grpc_bindings as elixir_grpc_bindings,
     observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
@@ -671,6 +671,10 @@ impl IndexScheduler {
         entities.extend(elixir_generated_entities(&generated_observations));
         observations.extend(generated_observations);
         resolve_elixir_repository_calls(&mut observations, &elixir_sources);
+        let (source_bindings, source_diagnostics) =
+            elixir_grpc_bindings(&state.repository.identity, &elixir_sources);
+        grpc_bindings.extend(source_bindings);
+        diagnostics.extend(source_diagnostics);
         let descriptor_facts = self.analysis_pool.install(|| {
             descriptors
                 .par_iter()

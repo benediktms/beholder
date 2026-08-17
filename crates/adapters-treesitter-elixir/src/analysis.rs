@@ -4,15 +4,15 @@ use std::collections::BTreeSet;
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-fn text<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+pub(super) fn text<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
     node.utf8_text(source).ok()
 }
 
-fn call_target<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+pub(super) fn call_target<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
     text(node.child_by_field_name("target")?, source)
 }
 
-fn arguments(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn arguments(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == "arguments")
@@ -154,7 +154,7 @@ fn keyword_token<'a>(node: Node<'a>, source: &'a [u8], key: &str) -> Option<&'a 
     (end > 0).then_some(&value[..end])
 }
 
-fn keyword_value<'a>(node: Node<'a>, source: &'a [u8], key: &str) -> Option<Node<'a>> {
+pub(super) fn keyword_value<'a>(node: Node<'a>, source: &'a [u8], key: &str) -> Option<Node<'a>> {
     let arguments = arguments(node)?;
     let mut cursor = arguments.walk();
     arguments
@@ -509,7 +509,7 @@ fn alias_definitions(node: Node<'_>, source: &[u8]) -> Vec<ElixirAlias> {
         .collect()
 }
 
-fn expand_alias(module: &str, aliases: &[ElixirAlias], current_module: &str) -> String {
+pub(super) fn expand_alias(module: &str, aliases: &[ElixirAlias], current_module: &str) -> String {
     if module == "__MODULE__" {
         return current_module.into();
     }
@@ -673,6 +673,7 @@ fn push_module(
         implements: Vec::new(),
         aliases: inherited_aliases,
         references: Vec::new(),
+        grpc: Default::default(),
     });
     module
 }
@@ -698,6 +699,11 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
     }
 
     if node.kind() == "call" {
+        if let Some(module) = module {
+            let aliases = modules[module].aliases.clone();
+            let name = modules[module].name.clone();
+            super::grpc::observe_call(&mut modules[module].grpc, node, source, &aliases, &name);
+        }
         match call_target(node, source) {
             Some("defmodule" | "defprotocol") => {
                 if let Some(name) = arguments(node)

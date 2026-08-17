@@ -1,11 +1,13 @@
-pub const FRONTEND_VERSION: &str = "11";
-pub const RESOLVER_VERSION: &str = "7";
+pub const FRONTEND_VERSION: &str = "12";
+pub const RESOLVER_VERSION: &str = "8";
 
 mod analysis;
+mod grpc;
 mod model;
 mod resolution;
 
 pub use analysis::analyze;
+pub use grpc::bindings as grpc_bindings;
 pub use model::ElixirAnalysis;
 pub use resolution::{
     diagnostics_from_analysis, entities_from_analysis, generated_entities, generated_observations,
