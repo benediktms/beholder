@@ -132,18 +132,18 @@ fn context_human(result: &ContextResult, include_tests: bool) -> String {
         if edge.to == result.root.id && is_primary(&entities, &edge.from, include_tests) {
             incoming.push(format!(
                 "  ← {} [{}]",
-                context_name(&entities, &edge.from),
+                name(&entities, &edge.from),
                 incoming_relation(edge.kind.as_str())
             ));
         } else if edge.from == result.root.id && is_primary(&entities, &edge.to, include_tests) {
             outgoing.push(format!(
                 "  → {} [{}]",
-                context_name(&entities, &edge.to),
+                name(&entities, &edge.to),
                 edge.kind.as_str()
             ));
         }
     }
-    let mut output = format!("{}\n", context_name(&entities, &result.root.id));
+    let mut output = format!("{}\n", name(&entities, &result.root.id));
     if !incoming.is_empty() {
         output.push_str("\nincoming\n");
         output.push_str(&incoming.join("\n"));
@@ -169,7 +169,7 @@ fn incoming_relation(relation: &str) -> &str {
 
 fn dependencies_human(result: &DependenciesResult, include_tests: bool) -> String {
     let entities = entities(&result.nodes);
-    let mut output = format!("{}\n", result.root.name);
+    let mut output = format!("{}\n", entity_label(&result.root));
     let dependencies = result
         .dependencies
         .iter()
@@ -222,7 +222,7 @@ fn impact_human(result: &ImpactResult, include_tests: bool) -> String {
     }
     let affected_count = groups.values().map(Vec::len).sum::<usize>();
     let test_count = tests.values().map(Vec::len).sum::<usize>();
-    let mut output = format!("{}\n", result.root.name);
+    let mut output = format!("{}\n", entity_label(&result.root));
     for (group, entities) in groups {
         let mut names = display_names(&entities);
         names.sort_unstable();
@@ -266,39 +266,7 @@ fn impact_human(result: &ImpactResult, include_tests: bool) -> String {
 }
 
 fn display_names(entities: &[&EntityRef]) -> Vec<String> {
-    let mut by_name: BTreeMap<&str, Vec<&EntityRef>> = BTreeMap::new();
-    for entity in entities {
-        by_name.entry(&entity.name).or_default().push(entity);
-    }
-    entities
-        .iter()
-        .map(|entity| {
-            let peers = &by_name[entity.name.as_str()];
-            if peers.len() == 1 {
-                entity.name.clone()
-            } else {
-                shortest_unique_suffix(entity, peers)
-            }
-        })
-        .collect()
-}
-
-fn shortest_unique_suffix(entity: &EntityRef, peers: &[&EntityRef]) -> String {
-    let segments = entity.id.split('/').collect::<Vec<_>>();
-    for width in 2..=segments.len() {
-        let candidate = suffix(&segments, width);
-        if peers.iter().all(|peer| {
-            peer.id == entity.id
-                || suffix(&peer.id.split('/').collect::<Vec<_>>(), width) != candidate
-        }) {
-            return candidate;
-        }
-    }
-    entity.id.clone()
-}
-
-fn suffix(segments: &[&str], width: usize) -> String {
-    segments[segments.len().saturating_sub(width)..].join("::")
+    entities.iter().map(|entity| entity_label(entity)).collect()
 }
 
 fn trace_human(result: &TraceResult, include_tests: bool) -> String {
@@ -503,7 +471,7 @@ fn projected_paths(
                     evidence.sort();
                     evidence.dedup();
                     steps.push(ProjectedStep {
-                        to: target.name.clone(),
+                        to: entity_label(target),
                         kind: edge.kind.as_str().into(),
                         confidence,
                         evidence: std::mem::take(&mut evidence),
@@ -538,21 +506,16 @@ fn entities(nodes: &[EntityRef]) -> BTreeMap<&str, &EntityRef> {
 fn name(entities: &BTreeMap<&str, &EntityRef>, id: &str) -> String {
     entities
         .get(id)
-        .map(|entity| entity.name.clone())
+        .map(|entity| entity_label(entity))
         .unwrap_or_else(|| id.into())
 }
 
-fn context_name(entities: &BTreeMap<&str, &EntityRef>, id: &str) -> String {
-    entities.get(id).map_or_else(
-        || id.into(),
-        |entity| {
-            let repository = entity.repository.as_deref().unwrap_or("cross-repository");
-            match containing_scope(entity) {
-                Some(scope) => format!("{repository} · {scope} · {}", entity.name),
-                None => format!("{repository} · {}", entity.name),
-            }
-        },
-    )
+fn entity_label(entity: &EntityRef) -> String {
+    let repository = entity.repository.as_deref().unwrap_or("cross-repository");
+    match containing_scope(entity) {
+        Some(scope) => format!("{repository} · {scope} · {}", entity.name),
+        None => format!("{repository} · {}", entity.name),
+    }
 }
 
 fn containing_scope(entity: &EntityRef) -> Option<&str> {
@@ -712,7 +675,7 @@ mod tests {
         assert!(json.contains(r#""traversal":{"max_hops":32,"truncated":false}"#));
         assert_eq!(
             trace(&result, OutputMode::Human.into()).unwrap(),
-            "CheckoutPage\n  → Pricing.GetPrice [calls_rpc]\n\n1 hop · 1 repositories · confidence 1.00\ntraversal complete · max depth 32\nview main · revision 42 · stale=false · indexing=false"
+            "repo · CheckoutPage\n  → repo · Pricing.GetPrice [calls_rpc]\n\n1 hop · 1 repositories · confidence 1.00\ntraversal complete · max depth 32\nview main · revision 42 · stale=false · indexing=false"
         );
     }
 
@@ -839,11 +802,11 @@ mod tests {
         let entities = entities(&nodes);
 
         assert_eq!(
-            context_name(&entities, "repo://repo/elixir/Example.Client/run/1"),
+            name(&entities, "repo://repo/elixir/Example.Client/run/1"),
             "repo · Example.Client · run/1"
         );
         assert_eq!(
-            context_name(&entities, "repo://repo/rust/src/client/impl/Client/run"),
+            name(&entities, "repo://repo/rust/src/client/impl/Client/run"),
             "repo · Client · run"
         );
     }
@@ -893,19 +856,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(included.contains("src/checkout/tests.rs\n    - test_checkout"));
+        assert!(included.contains("src/checkout/tests.rs\n    - repo · test_checkout"));
     }
 
     #[test]
-    fn duplicate_callable_names_use_the_shortest_unique_suffix() {
+    fn impact_names_always_include_repository_and_containing_scope() {
         let first = entity(
-            "repo://app/rust/crates/cli/src/commands/analyses/run/impl/AnalysisCtx/new",
+            "repo://repo/rust/crates/cli/src/commands/analyses/run/impl/AnalysisCtx/new",
             "new",
             EntityKind::Callable,
             false,
         );
         let second = entity(
-            "repo://app/rust/crates/cli/src/commands/artifacts/run/impl/ArtifactCtx/new",
+            "repo://repo/rust/crates/cli/src/commands/artifacts/run/impl/ArtifactCtx/new",
             "new",
             EntityKind::Callable,
             false,
@@ -913,7 +876,7 @@ mod tests {
 
         assert_eq!(
             display_names(&[&first, &second]),
-            ["AnalysisCtx::new", "ArtifactCtx::new"]
+            ["repo · AnalysisCtx · new", "repo · ArtifactCtx · new"]
         );
     }
 }
