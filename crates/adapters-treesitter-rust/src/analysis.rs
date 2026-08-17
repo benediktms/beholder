@@ -95,6 +95,7 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
         &mut Vec::new(),
         &mut functions,
     );
+    let tonic = super::tonic::analyze(tree.root_node(), source_bytes, &functions);
     Ok(RustAnalysis {
         functions: functions
             .into_iter()
@@ -109,6 +110,7 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
                 }
             })
             .collect(),
+        tonic,
     })
 }
 
@@ -200,7 +202,14 @@ pub fn diagnostics_from_analysis(analysis: &RustAnalysis, path: &Path) -> Vec<An
         .functions
         .iter()
         .flat_map(|function| &function.calls)
-        .filter(|call| call.receiver_method);
+        .filter(|call| {
+            call.receiver_method
+                && !analysis
+                    .tonic
+                    .recognized_receiver_calls
+                    .iter()
+                    .any(|(line, name)| *line == call.line && name == &call.name)
+        });
     let Some(first) = calls.next() else {
         return Vec::new();
     };

@@ -15,6 +15,7 @@ use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis,
     diagnostics_from_analysis as rust_diagnostics, entities_from_analysis as rust_entities,
     observations_from_analysis, resolve_repository_calls as resolve_rust_repository_calls,
+    tonic_bindings,
 };
 use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
@@ -579,8 +580,10 @@ impl IndexScheduler {
         }
         let mut observations = Vec::new();
         let mut entities = Vec::<EntityFact>::new();
+        let mut grpc_bindings = Vec::new();
         let mut diagnostics = Vec::new();
-        let rust_analyses = self.analysis_pool.install(|| {
+        let mut rust_analyses = Vec::new();
+        let analyzed_rust = self.analysis_pool.install(|| {
             rust_sources
                 .par_iter()
                 .map(|(path, source)| {
@@ -596,6 +599,8 @@ impl IndexScheduler {
                         "frontend cache lookup"
                     );
                     Ok::<_, String>((
+                        path.as_path(),
+                        analysis.clone(),
                         observations_from_analysis(&state.repository.identity, &analysis, path),
                         rust_entities(&state.repository.identity, &analysis, path),
                         rust_diagnostics(&analysis, path),
@@ -603,12 +608,22 @@ impl IndexScheduler {
                 })
                 .collect::<Vec<_>>()
         });
-        for analysis in rust_analyses {
-            let (source_observations, source_entities, source_diagnostics) = analysis?;
+        for analysis in analyzed_rust {
+            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+                analysis?;
             observations.extend(source_observations);
             entities.extend(source_entities);
             diagnostics.extend(source_diagnostics);
+            rust_analyses.push((path, analysis));
         }
+        let rust_sources = rust_analyses
+            .iter()
+            .map(|(path, analysis)| (*path, analysis.as_ref()))
+            .collect::<Vec<_>>();
+        let (source_bindings, source_diagnostics) =
+            tonic_bindings(&state.repository.identity, &rust_sources);
+        grpc_bindings.extend(source_bindings);
+        diagnostics.extend(source_diagnostics);
         resolve_rust_repository_calls(&mut observations);
         let mut elixir_analyses = Vec::new();
         let analyzed_elixir = self.analysis_pool.install(|| {
@@ -675,7 +690,7 @@ impl IndexScheduler {
         }
         let analysis = Arc::new(RepositoryAnalysis {
             entities,
-            grpc_bindings: Vec::new(),
+            grpc_bindings,
             observations,
             diagnostics,
         });
