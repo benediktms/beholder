@@ -9,6 +9,7 @@ use std::{
 pub(super) type RustSources = Vec<(PathBuf, String)>;
 pub(super) type ElixirSources = Vec<(PathBuf, String)>;
 pub(super) type ProtobufSources = Vec<(PathBuf, Vec<u8>)>;
+pub(super) type ProtobufSourceFiles = Vec<(PathBuf, Vec<u8>)>;
 
 #[derive(Debug)]
 pub(super) struct RepositorySources {
@@ -16,6 +17,7 @@ pub(super) struct RepositorySources {
     pub(super) rust: RustSources,
     pub(super) elixir: ElixirSources,
     pub(super) protobuf: ProtobufSources,
+    pub(super) protobuf_source: ProtobufSourceFiles,
 }
 
 fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
@@ -29,9 +31,9 @@ fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dy
             ) {
                 source_files(&path, files)?;
             }
-        } else if path
-            .extension()
-            .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "ex" | "exs")))
+        } else if path.extension().is_some_and(|extension| {
+            matches!(extension.to_str(), Some("rs" | "ex" | "exs" | "proto"))
+        }) || matches!(entry.file_name().to_str(), Some("buf.yaml" | "buf.lock"))
         {
             files.push(path);
         }
@@ -49,7 +51,15 @@ pub(super) fn repository_sources(
     let mut files = Vec::new();
     source_files(root, &mut files)?;
     files.sort();
-    let sources = files
+    let (protobuf_files, sources): (Vec<_>, Vec<_>) = files.into_iter().partition(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "proto")
+            || matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("buf.yaml" | "buf.lock")
+            )
+    });
+    let sources = sources
         .into_iter()
         .map(|path| {
             let relative_path = path.strip_prefix(root)?.to_path_buf();
@@ -66,6 +76,10 @@ pub(super) fn repository_sources(
         .map(|path| Ok((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?)))
         .collect::<Result<ProtobufSources, Box<dyn Error>>>()?;
     descriptors.sort_by(|left, right| left.0.cmp(&right.0));
+    let protobuf_source = protobuf_files
+        .into_iter()
+        .map(|path| Ok((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?)))
+        .collect::<Result<ProtobufSourceFiles, Box<dyn Error>>>()?;
     let state = repository_state_bytes(
         root,
         rust.iter()
@@ -79,6 +93,11 @@ pub(super) fn repository_sources(
                 descriptors
                     .iter()
                     .map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
+            )
+            .chain(
+                protobuf_source
+                    .iter()
+                    .map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
             ),
     )?;
     Ok(RepositorySources {
@@ -86,16 +105,47 @@ pub(super) fn repository_sources(
         rust,
         elixir,
         protobuf: descriptors,
+        protobuf_source,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn rejects_missing_repository() {
         let error = repository_sources(Path::new("/definitely/missing"), &[]).unwrap_err();
         assert!(error.to_string().contains("repository does not exist"));
+    }
+
+    #[test]
+    fn protobuf_inputs_participate_in_repository_state() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repository = std::env::temp_dir().join(format!("beholder-protobuf-sources-{unique}"));
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("buf.yaml"), "version: v2\n").unwrap();
+        fs::write(repository.join("buf.lock"), "version: v2\ndeps: []\n").unwrap();
+        fs::write(
+            repository.join("contract.proto"),
+            "syntax = \"proto3\"; message Before {}",
+        )
+        .unwrap();
+        fs::write(repository.join("README.md"), "ignored").unwrap();
+
+        let before = repository_sources(&repository, &[]).unwrap();
+        assert_eq!(before.protobuf_source.len(), 3);
+        fs::write(
+            repository.join("contract.proto"),
+            "syntax = \"proto3\"; message After {}",
+        )
+        .unwrap();
+        let after = repository_sources(&repository, &[]).unwrap();
+        assert_ne!(before.state.fingerprint, after.state.fingerprint);
+        fs::remove_dir_all(repository).unwrap();
     }
 }

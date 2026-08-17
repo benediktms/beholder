@@ -4,8 +4,8 @@ use super::{
     database::{benchmark_database, memory_database, persistent_database},
     inspection::{InspectionResult, inspection_result},
     query::{
-        analysis_revision, context, dependencies, impact, inspect_observations, inspect_relations,
-        inspect_revisions, trace,
+        analysis_revision, context, dependencies, entity_facts, impact, inspect_grpc_bindings,
+        inspect_observations, inspect_relations, inspect_revisions, trace,
     },
     storage::{garbage_collect, publish_observations, view_matches},
 };
@@ -13,11 +13,28 @@ use beholder_domain::{DependencyOverride, FactChanges, RepositoryFacts, Workspac
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, ImpactResult, Revisioned, TraceResult,
 };
-use mnestic_engine::{DbInstance, MultiTransaction};
+use mnestic_engine::{DbInstance, MultiTransaction, NamedRows};
 use std::{
+    collections::BTreeSet,
     error::Error,
     path::{Path, PathBuf},
 };
+
+fn relevant_entities(
+    result: &NamedRows,
+    roots: &[&str],
+    entity_columns: &[usize],
+) -> BTreeSet<String> {
+    roots
+        .iter()
+        .map(|entity| (*entity).to_owned())
+        .chain(result.rows.iter().flat_map(|row| {
+            entity_columns
+                .iter()
+                .filter_map(|&column| row.get(column)?.get_str().map(str::to_owned))
+        }))
+        .collect()
+}
 
 pub struct SemanticStore {
     pub(super) db: DbInstance,
@@ -146,11 +163,18 @@ impl SemanticStore {
         inspect_observations(&self.read_db, relation).map(inspection_result)
     }
 
+    pub fn inspect_grpc_bindings(&self) -> Result<InspectionResult, Box<dyn Error>> {
+        inspect_grpc_bindings(&self.read_db).map(inspection_result)
+    }
+
     pub fn context(&self, view: &str, entity: &str) -> Result<ContextResult, Box<dyn Error>> {
+        let result = context(&self.read_db, view, entity)?;
+        let entities = relevant_entities(&result, &[entity], &[2]);
         semantic::context(
             view,
             entity,
-            inspection_result(context(&self.read_db, view, entity)?),
+            inspection_result(result),
+            inspection_result(entity_facts(&self.read_db, view, &entities)?),
         )
     }
 
@@ -160,10 +184,13 @@ impl SemanticStore {
         entity: &str,
     ) -> Result<Revisioned<ContextResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
+            let result = context(transaction, view, entity)?;
+            let entities = relevant_entities(&result, &[entity], &[2]);
             semantic::context(
                 view,
                 entity,
-                inspection_result(context(transaction, view, entity)?),
+                inspection_result(result),
+                inspection_result(entity_facts(transaction, view, &entities)?),
             )
         })
     }
@@ -175,12 +202,15 @@ impl SemanticStore {
         to: &str,
         max_hops: u32,
     ) -> Result<TraceResult, Box<dyn Error>> {
+        let result = trace(&self.read_db, view, from, to)?;
+        let entities = relevant_entities(&result, &[from, to], &[3, 4]);
         semantic::trace(
             view,
             from,
             to,
             max_hops,
-            inspection_result(trace(&self.read_db, view, from, to)?),
+            inspection_result(result),
+            inspection_result(entity_facts(&self.read_db, view, &entities)?),
         )
     }
 
@@ -192,12 +222,15 @@ impl SemanticStore {
         max_hops: u32,
     ) -> Result<Revisioned<TraceResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
+            let result = trace(transaction, view, from, to)?;
+            let entities = relevant_entities(&result, &[from, to], &[3, 4]);
             semantic::trace(
                 view,
                 from,
                 to,
                 max_hops,
-                inspection_result(trace(transaction, view, from, to)?),
+                inspection_result(result),
+                inspection_result(entity_facts(transaction, view, &entities)?),
             )
         })
     }
@@ -208,11 +241,14 @@ impl SemanticStore {
         entity: &str,
         max_hops: u32,
     ) -> Result<ImpactResult, Box<dyn Error>> {
+        let result = impact(&self.read_db, view, entity)?;
+        let entities = relevant_entities(&result, &[entity], &[3, 4]);
         semantic::impact(
             view,
             entity,
             max_hops,
-            inspection_result(impact(&self.read_db, view, entity)?),
+            inspection_result(result),
+            inspection_result(entity_facts(&self.read_db, view, &entities)?),
         )
     }
 
@@ -223,11 +259,14 @@ impl SemanticStore {
         max_hops: u32,
     ) -> Result<Revisioned<ImpactResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
+            let result = impact(transaction, view, entity)?;
+            let entities = relevant_entities(&result, &[entity], &[3, 4]);
             semantic::impact(
                 view,
                 entity,
                 max_hops,
-                inspection_result(impact(transaction, view, entity)?),
+                inspection_result(result),
+                inspection_result(entity_facts(transaction, view, &entities)?),
             )
         })
     }
@@ -238,11 +277,14 @@ impl SemanticStore {
         entity: &str,
         max_hops: u32,
     ) -> Result<DependenciesResult, Box<dyn Error>> {
+        let result = dependencies(&self.read_db, view, entity)?;
+        let entities = relevant_entities(&result, &[entity], &[3, 4]);
         semantic::dependencies(
             view,
             entity,
             max_hops,
-            inspection_result(dependencies(&self.read_db, view, entity)?),
+            inspection_result(result),
+            inspection_result(entity_facts(&self.read_db, view, &entities)?),
         )
     }
 
@@ -253,11 +295,14 @@ impl SemanticStore {
         max_hops: u32,
     ) -> Result<Revisioned<DependenciesResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
+            let result = dependencies(transaction, view, entity)?;
+            let entities = relevant_entities(&result, &[entity], &[3, 4]);
             semantic::dependencies(
                 view,
                 entity,
                 max_hops,
-                inspection_result(dependencies(transaction, view, entity)?),
+                inspection_result(result),
+                inspection_result(entity_facts(transaction, view, &entities)?),
             )
         })
     }
@@ -310,6 +355,8 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            entities: Vec::new(),
+            grpc_bindings: Vec::new(),
             observations,
         }
     }

@@ -16,6 +16,31 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_ENTITY_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_GRPC_BINDING_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_REVISION_OBSERVATION_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_REVISION_ENTITY_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_GRPC_DIAGNOSTIC_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_OBSERVATION_TO_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -122,6 +147,39 @@ pub(super) fn persistent_database(
             BTreeMap::new(),
             ScriptMutability::Mutable,
         )?;
+    }
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("state_entity"))
+    {
+        db.run_script(
+            CREATE_ENTITY_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    for (name, script) in [
+        ("state_grpc_binding_candidate", CREATE_GRPC_BINDING_SCHEMA),
+        (
+            "analysis_revision_observation",
+            CREATE_REVISION_OBSERVATION_SCHEMA,
+        ),
+        ("analysis_revision_entity", CREATE_REVISION_ENTITY_SCHEMA),
+        (
+            "analysis_revision_grpc_diagnostic",
+            CREATE_GRPC_DIAGNOSTIC_SCHEMA,
+        ),
+    ] {
+        if initialize
+            && !relations
+                .rows
+                .iter()
+                .any(|row| row[0].get_str() == Some(name))
+        {
+            db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)?;
+        }
     }
     if initialize
         && !relations
@@ -251,6 +309,8 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            entities: Vec::new(),
+            grpc_bindings: Vec::new(),
             observations,
         }
     }

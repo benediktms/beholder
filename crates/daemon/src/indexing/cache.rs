@@ -1,4 +1,4 @@
-use beholder_domain::{AnalysisDiagnostic, Observation};
+use beholder_domain::{AnalysisDiagnostic, EntityFact, GrpcBindingCandidate, Observation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -18,6 +18,9 @@ pub(super) struct RepositoryAnalysisKey {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RepositoryAnalysis {
+    pub(super) entities: Vec<EntityFact>,
+    #[serde(default)]
+    pub(super) grpc_bindings: Vec<GrpcBindingCandidate>,
     pub(super) observations: Vec<Observation>,
     pub(super) diagnostics: Vec<AnalysisDiagnostic>,
 }

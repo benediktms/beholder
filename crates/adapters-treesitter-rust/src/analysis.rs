@@ -1,7 +1,7 @@
 use super::model::*;
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, Observation,
-    StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
+    Observation, StructuralRelation,
 };
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -95,6 +95,7 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
         &mut Vec::new(),
         &mut functions,
     );
+    let tonic = super::tonic::analyze(tree.root_node(), source_bytes, &functions);
     Ok(RustAnalysis {
         functions: functions
             .into_iter()
@@ -109,6 +110,7 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
                 }
             })
             .collect(),
+        tonic,
     })
 }
 
@@ -171,12 +173,43 @@ pub fn observations_from_analysis(
     observations
 }
 
+pub fn entities_from_analysis(
+    repository: &str,
+    analysis: &RustAnalysis,
+    path: &Path,
+) -> Vec<EntityFact> {
+    let module = path
+        .strip_prefix("src")
+        .unwrap_or(path)
+        .with_extension("")
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let source_id = format!("repo://{repository}/rust/{module}");
+    std::iter::once(EntityFact::new(source_id.clone(), EntityKind::Namespace, None).unwrap())
+        .chain(analysis.functions.iter().map(|function| {
+            EntityFact::new(
+                format!("{source_id}/{}", function.qualified_name),
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap()
+        }))
+        .collect()
+}
+
 pub fn diagnostics_from_analysis(analysis: &RustAnalysis, path: &Path) -> Vec<AnalysisDiagnostic> {
     let mut calls = analysis
         .functions
         .iter()
         .flat_map(|function| &function.calls)
-        .filter(|call| call.receiver_method);
+        .filter(|call| {
+            call.receiver_method
+                && !analysis
+                    .tonic
+                    .recognized_receiver_calls
+                    .iter()
+                    .any(|(line, name)| *line == call.line && name == &call.name)
+        });
     let Some(first) = calls.next() else {
         return Vec::new();
     };

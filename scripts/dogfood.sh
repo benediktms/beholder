@@ -50,6 +50,7 @@ target/debug/beholder daemon status >/dev/null
 [[ -S "$socket" ]] || { echo "daemon socket not found at $socket" >&2; exit 1; }
 mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
+xxd -r -p "$root/scripts/fixtures/grpc-matrix.descriptor.hex" "$state/contracts/grpc-matrix.descriptor.bin"
 mkdir -p "$state/elixir/lib"
 printf '%s\n' \
     'defmodule Beholder.Macro do' \
@@ -90,6 +91,24 @@ printf '%s\n' \
     'defmodule Beholder.Helper do' \
     '  def work(value), do: value' \
     'end' >"$state/elixir/lib/smoke.ex"
+printf '%s\n' \
+    'defmodule Phase5.V1.Bridge.Service do' \
+    '  use GRPC.Service, name: "phase5.v1.Bridge"' \
+    '  rpc :RustToElixir, Phase5.V1.Request, Phase5.V1.Response' \
+    '  rpc :ElixirToRust, Phase5.V1.Request, Phase5.V1.Response' \
+    'end' \
+    'defmodule Phase5.V1.Bridge.Stub do' \
+    '  use GRPC.Stub, service: Phase5.V1.Bridge.Service' \
+    'end' \
+    'defmodule Phase5.Client do' \
+    '  alias Phase5.V1.Bridge.Stub' \
+    '  def elixir_to_rust(channel, request), do: Stub.elixir_to_rust(channel, request)' \
+    'end' \
+    'defmodule Phase5.Server do' \
+    '  alias Phase5.V1.Bridge.Service' \
+    '  use GRPC.Server, service: Service' \
+    '  def rust_to_elixir(request, stream), do: {request, stream}' \
+    'end' >"$state/elixir/lib/grpc.pb.ex"
 git -C "$state/elixir" init -q
 git -C "$state/elixir" config user.name 'Beholder Smoke'
 git -C "$state/elixir" config user.email 'smoke@beholder.local'
@@ -98,11 +117,44 @@ git -C "$state/elixir" config gpg.format ssh
 git -C "$state/elixir" config gpg.ssh.program "$(command -v ssh-keygen)"
 git -C "$state/elixir" config user.signingkey "$state/signing-key"
 git -C "$state/elixir" config commit.gpgsign true
-git -C "$state/elixir" add lib/smoke.ex
+git -C "$state/elixir" add lib
 git -C "$state/elixir" commit -qm 'Add Elixir smoke fixture'
 git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
-target/debug/beholder workspace register main "$root" "$state/contracts" "$state/elixir" \
-    --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" >/dev/null
+mkdir -p "$state/rust/src"
+printf '%s\n' 'tonic::include_proto!("phase5.v1");' >"$state/rust/src/protocol.rs"
+printf '%s\n' \
+    'mod bridge_client {' \
+    '  pub struct BridgeClient<T>(T);' \
+    '  impl<T> BridgeClient<T> {' \
+    '    pub async fn rust_to_elixir(&mut self) {}' \
+    '    pub async fn elixir_to_rust(&mut self) {}' \
+    '  }' \
+    '}' >"$state/rust/src/generated.rs"
+printf '%s\n' \
+    'use contract::bridge_client::BridgeClient;' \
+    'async fn rust_to_elixir() {' \
+    '  let mut client = BridgeClient::new();' \
+    '  client.rust_to_elixir().await;' \
+    '}' >"$state/rust/src/client.rs"
+printf '%s\n' \
+    'use contract::bridge_server::{Bridge, BridgeServer};' \
+    'struct RustHandler;' \
+    'impl Bridge for RustHandler {' \
+    '  async fn elixir_to_rust(&self) {}' \
+    '}' >"$state/rust/src/server.rs"
+git -C "$state/rust" init -q
+git -C "$state/rust" config user.name 'Beholder Smoke'
+git -C "$state/rust" config user.email 'smoke@beholder.local'
+git -C "$state/rust" config gpg.format ssh
+git -C "$state/rust" config gpg.ssh.program "$(command -v ssh-keygen)"
+git -C "$state/rust" config user.signingkey "$state/signing-key"
+git -C "$state/rust" config commit.gpgsign true
+git -C "$state/rust" add src
+git -C "$state/rust" commit -qm 'Add Rust smoke fixture'
+git -C "$state/rust" remote add origin https://github.com/example/beholder-rust-smoke.git
+target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
+    --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" \
+    --protobuf-descriptor "$state/contracts/grpc-matrix.descriptor.bin" >/dev/null
 
 repository="$(basename "$root")"
 if remote="$(git -C "$root" remote get-url origin 2>/dev/null)"; then
@@ -203,13 +255,104 @@ if grep -Fq '/generated/1' <<<"$macro_result"; then
 fi
 echo 'Checking Protobuf descriptor indexing...' >&2
 result="$(target/debug/beholder context --json --workspace main \
-    'grpc://pricing.v1.Pricing/GetQuote')"
-for expected in '"kind":"rpc"' 'proto-message://pricing.v1.Request' '"kind":"request_type"' '"source":"descriptor"'; do
+    'proto-method://pricing.v1.Pricing/GetQuote')"
+for expected in '"kind":"rpc"' 'proto-type://pricing.v1.Request' '"kind":"request_type"' '"source":"descriptor"'; do
     if ! grep -Fq "$expected" <<<"$result"; then
         printf 'expected %s in Protobuf context:\n%s\n' "$expected" "$result" >&2
         exit 1
     fi
 done
+check_grpc_path() {
+    method="$1"
+    client="$2"
+    server="$3"
+    operation="grpc://phase5.v1.Bridge/$method"
+    contract="proto-method://phase5.v1.Bridge/$method"
+
+    context="$(target/debug/beholder context --json --workspace main "$operation")"
+    for expected in "$client" "$server" "$contract" '"kind":"calls_rpc"' \
+        '"kind":"implemented_by"' '"kind":"binds_contract"' '"confidence":1.0' \
+        '"stale":false'; do
+        if ! grep -Fq "$expected" <<<"$context"; then
+            printf 'expected %s in gRPC context:\n%s\n' "$expected" "$context" >&2
+            exit 1
+        fi
+    done
+
+    trace="$(target/debug/beholder trace --json --workspace main "$client" "$server")"
+    for expected in '"schema":"beholder.trace.v2"' "$client" "$operation" "$server" \
+        '"kind":"calls_rpc"' '"kind":"implemented_by"' '"stale":false'; do
+        if ! grep -Fq "$expected" <<<"$trace"; then
+            printf 'expected %s in cross-language trace:\n%s\n' "$expected" "$trace" >&2
+            exit 1
+        fi
+    done
+    if [[ "$trace" != "$(target/debug/beholder trace --json --workspace main "$client" "$server")" ]]; then
+        echo 'cross-language trace JSON ordering was not stable' >&2
+        exit 1
+    fi
+
+    why="$(target/debug/beholder why --json --workspace main "$client" "$server")"
+    if ! grep -Fq '"schema":"beholder.why.v2"' <<<"$why" || ! grep -Fq "$server" <<<"$why"; then
+        printf 'cross-language why did not resolve:\n%s\n' "$why" >&2
+        exit 1
+    fi
+    impact="$(target/debug/beholder impact --json --workspace main "$contract")"
+    for expected in "$client" "$server"; do
+        if ! grep -Fq "$expected" <<<"$impact"; then
+            printf 'contract impact did not reach %s:\n%s\n' "$expected" "$impact" >&2
+            exit 1
+        fi
+    done
+}
+
+echo 'Checking cross-language gRPC resolution...' >&2
+rust_client='repo://github.com/example/beholder-rust-smoke/rust/client/rust_to_elixir'
+rust_server='repo://github.com/example/beholder-rust-smoke/rust/server/impl/Bridge-for-RustHandler/elixir_to_rust'
+elixir_client='repo://github.com/example/beholder-elixir-smoke/elixir/Phase5.Client/elixir_to_rust/2'
+elixir_server='repo://github.com/example/beholder-elixir-smoke/elixir/Phase5.Server/rust_to_elixir/2'
+check_grpc_path 'RustToElixir' "$rust_client" "$elixir_server"
+check_grpc_path 'ElixirToRust' "$elixir_client" "$rust_server"
+
+compact="$(target/debug/beholder trace --workspace main "$rust_client" "$elixir_server")"
+if grep -Fq 'generated.rs' <<<"$compact"; then
+    printf 'compact trace leaked generated support:\n%s\n' "$compact" >&2
+    exit 1
+fi
+raw="$(target/debug/beholder trace --raw --workspace main "$rust_client" "$elixir_server")"
+for expected in 'src/generated.rs' 'lib/grpc.pb.ex' 'confidence 1.00' 'revision 1' 'stale=false'; do
+    if ! grep -Fq "$expected" <<<"$raw"; then
+        printf 'expected %s in raw cross-language trace:\n%s\n' "$expected" "$raw" >&2
+        exit 1
+    fi
+done
+
+echo 'Checking contract removal and restoration...' >&2
+target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
+    --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" >/dev/null
+bindings=''
+for _ in {1..100}; do
+    bindings="$(target/debug/beholder inspect grpc-bindings --database "$state/daemon/beholder.db")"
+    grep -Fq 'grpc.contract_unmatched' <<<"$bindings" && break
+    sleep 0.1
+done
+if ! grep -Fq 'grpc.contract_unmatched' <<<"$bindings"; then
+    printf 'removing the contract did not expose unresolved candidates:\n%s\n' "$bindings" >&2
+    exit 1
+fi
+target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
+    --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" \
+    --protobuf-descriptor "$state/contracts/grpc-matrix.descriptor.bin" >/dev/null
+for _ in {1..100}; do
+    result="$(target/debug/beholder context --json --workspace main \
+        'grpc://phase5.v1.Bridge/RustToElixir' 2>/dev/null || true)"
+    grep -Fq '"kind":"binds_contract"' <<<"$result" && break
+    sleep 0.1
+done
+if ! grep -Fq '"kind":"binds_contract"' <<<"$result"; then
+    printf 'restoring the contract did not resolve gRPC bindings:\n%s\n' "$result" >&2
+    exit 1
+fi
 echo 'Checking main -> state_dir...' >&2
 echo 'Checking state_dir impact reaches main...' >&2
 result="$(target/debug/beholder impact --json --workspace main "$callee")"

@@ -1,14 +1,16 @@
 use crate::{InspectionResult, InspectionValue};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
-    EntityKind, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef, IMPACT_SCHEMA_V2,
-    ImpactRef, ImpactResult, PathQuery, QueryMetadata, RelationKind, SemanticEdge, SemanticPath,
-    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata,
+    EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
+    IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, ProtoTypeKind, QueryMetadata,
+    RelationKind, RpcCardinality, SemanticEdge, SemanticPath, TRACE_SCHEMA_V2, TraceResult,
+    TraversalMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 
 type EdgeKey = (String, String, RelationKind);
+type EntityFactMap = BTreeMap<String, (EntityKind, Option<EntityMetadata>)>;
 type Closure = (Vec<(String, u32)>, GraphOutput, bool);
 #[derive(Clone, Copy)]
 enum TraversalDirection {
@@ -20,8 +22,10 @@ pub(super) fn context(
     view: &str,
     entity: &str,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<ContextResult, Box<dyn Error>> {
     let mut graph = GraphBuilder::default();
+    graph.hint_facts(entity_kinds(entities)?);
     graph.hint(entity, infer_kind(entity));
     for row in result.rows {
         let direction = text(&row, 0, "context direction")?;
@@ -58,9 +62,15 @@ pub(super) fn dependencies(
     entity: &str,
     max_hops: u32,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<DependenciesResult, Box<dyn Error>> {
-    let (entries, output, truncated) =
-        closure(result, entity, max_hops, TraversalDirection::Outgoing)?;
+    let (entries, output, truncated) = closure(
+        result,
+        entities,
+        entity,
+        max_hops,
+        TraversalDirection::Outgoing,
+    )?;
     Ok(DependenciesResult {
         schema: DEPENDENCIES_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -86,9 +96,15 @@ pub(super) fn impact(
     entity: &str,
     max_hops: u32,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<ImpactResult, Box<dyn Error>> {
-    let (entries, output, truncated) =
-        closure(result, entity, max_hops, TraversalDirection::Incoming)?;
+    let (entries, output, truncated) = closure(
+        result,
+        entities,
+        entity,
+        max_hops,
+        TraversalDirection::Incoming,
+    )?;
     Ok(ImpactResult {
         schema: IMPACT_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -111,11 +127,12 @@ pub(super) fn impact(
 
 fn closure(
     result: InspectionResult,
+    entities: InspectionResult,
     root: &str,
     max_hops: u32,
     direction: TraversalDirection,
 ) -> Result<Closure, Box<dyn Error>> {
-    let mut output = graph(result, &[root])?;
+    let mut output = graph(result, entities, &[root])?;
     let (distances, truncated) = distances(root, &output.edges, max_hops, direction);
     output.nodes.retain(|node| distances.contains_key(&node.id));
     output
@@ -129,8 +146,13 @@ fn closure(
     Ok((entries, output, truncated))
 }
 
-fn graph(result: InspectionResult, roots: &[&str]) -> Result<GraphOutput, Box<dyn Error>> {
+fn graph(
+    result: InspectionResult,
+    entities: InspectionResult,
+    roots: &[&str],
+) -> Result<GraphOutput, Box<dyn Error>> {
     let mut graph = GraphBuilder::default();
+    graph.hint_facts(entity_kinds(entities)?);
     for root in roots {
         graph.hint(root, infer_kind(root));
     }
@@ -162,6 +184,11 @@ fn distances(
     for edge in edges {
         let (from, to) = match direction {
             TraversalDirection::Outgoing => (edge.from.as_str(), edge.to.as_str()),
+            TraversalDirection::Incoming
+                if edge.kind == RelationKind::ImplementedBy && edge.from.starts_with("grpc://") =>
+            {
+                (edge.from.as_str(), edge.to.as_str())
+            }
             TraversalDirection::Incoming => (edge.to.as_str(), edge.from.as_str()),
         };
         adjacent.entry(from).or_default().push(to);
@@ -194,8 +221,9 @@ pub(super) fn trace(
     to: &str,
     max_hops: u32,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<TraceResult, Box<dyn Error>> {
-    let mut output = graph(result, &[from, to])?;
+    let mut output = graph(result, entities, &[from, to])?;
     let (path, truncated) = shortest_path(from, to, max_hops, &output.edges);
     let paths = path.into_iter().collect::<Vec<_>>();
     let path_nodes = paths
@@ -291,7 +319,9 @@ fn shortest_path(
 #[derive(Default)]
 struct GraphBuilder {
     edges: BTreeMap<EdgeKey, EdgeData>,
+    facts: EntityFactMap,
     kinds: BTreeMap<String, EntityKind>,
+    metadata: BTreeMap<String, EntityMetadata>,
     origins: BTreeMap<String, EntityOrigin>,
 }
 
@@ -301,7 +331,18 @@ struct EdgeData {
 }
 
 impl GraphBuilder {
+    fn hint_facts(&mut self, facts: EntityFactMap) {
+        self.facts = facts;
+    }
+
     fn hint(&mut self, id: &str, kind: EntityKind) {
+        if let Some((kind, metadata)) = self.facts.get(id).copied() {
+            self.kinds.insert(id.into(), kind);
+            if let Some(metadata) = metadata {
+                self.metadata.insert(id.into(), metadata);
+            }
+            return;
+        }
         let current = self.kinds.entry(id.into()).or_insert(EntityKind::Unknown);
         if kind_priority(kind) > kind_priority(*current) {
             *current = kind;
@@ -332,11 +373,11 @@ impl GraphBuilder {
                 _ => {}
             }
         }
-        let evidence = evidence_ref(from, evidence, provenance);
+        let evidence = evidence_ref(from, to, evidence, provenance);
         self.edges
             .entry(key.clone())
             .and_modify(|edge| {
-                edge.confidence = edge.confidence.min(confidence);
+                edge.confidence = edge.confidence.max(confidence);
                 edge.evidence.insert(evidence.clone());
             })
             .or_insert_with(|| EdgeData {
@@ -362,6 +403,7 @@ impl GraphBuilder {
                         .copied()
                         .unwrap_or_else(|| infer_kind(&id)),
                     self.origins.get(&id).copied(),
+                    self.metadata.get(&id).copied(),
                 )
             })
             .collect::<Vec<_>>();
@@ -383,6 +425,71 @@ impl GraphBuilder {
             .collect();
         GraphOutput { nodes, edges }
     }
+}
+
+fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error>> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let id = text(row, 0, "entity id")?.to_owned();
+            let entity = match (
+                text(row, 1, "entity kind")?,
+                text(row, 2, "entity metadata")?,
+            ) {
+                ("callable", "") => (EntityKind::Callable, None),
+                ("graphql_field", "") => (EntityKind::GraphqlField, None),
+                ("grpc_operation", "") => (EntityKind::Rpc, None),
+                ("kafka_topic", "") => (EntityKind::KafkaTopic, None),
+                ("namespace", "") => (EntityKind::Namespace, None),
+                ("proto_field", "") => (EntityKind::ProtoField, None),
+                ("proto_method", "rpc_cardinality:bidirectional_streaming") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::BidirectionalStreaming,
+                    }),
+                ),
+                ("proto_method", "rpc_cardinality:client_streaming") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::ClientStreaming,
+                    }),
+                ),
+                ("proto_method", "rpc_cardinality:server_streaming") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::ServerStreaming,
+                    }),
+                ),
+                ("proto_method", "rpc_cardinality:unary") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::Unary,
+                    }),
+                ),
+                ("proto_service", "") => (EntityKind::ProtoService, None),
+                ("proto_type", "proto_type:enum") => (
+                    EntityKind::ProtoEnum,
+                    Some(EntityMetadata::ProtoType {
+                        type_kind: ProtoTypeKind::Enum,
+                    }),
+                ),
+                ("proto_type", "proto_type:message") => (
+                    EntityKind::ProtoMessage,
+                    Some(EntityMetadata::ProtoType {
+                        type_kind: ProtoTypeKind::Message,
+                    }),
+                ),
+                ("service", "") => (EntityKind::Service, None),
+                (kind, metadata) => {
+                    return Err(
+                        format!("invalid persisted entity fact {kind} with {metadata}").into(),
+                    );
+                }
+            };
+            Ok((id, entity))
+        })
+        .collect()
 }
 
 fn kind_priority(kind: EntityKind) -> u8 {
@@ -418,10 +525,15 @@ impl GraphOutput {
 }
 
 fn entity_ref(id: &str, kind: EntityKind) -> EntityRef {
-    entity_ref_with_origin(id, kind, None)
+    entity_ref_with_origin(id, kind, None, None)
 }
 
-fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigin>) -> EntityRef {
+fn entity_ref_with_origin(
+    id: &str,
+    kind: EntityKind,
+    origin: Option<EntityOrigin>,
+    metadata: Option<EntityMetadata>,
+) -> EntityRef {
     EntityRef {
         id: id.into(),
         kind,
@@ -440,6 +552,7 @@ fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigi
             }
         }),
         test: is_test_entity(id),
+        metadata,
     }
 }
 
@@ -468,7 +581,11 @@ fn is_test_entity(id: &str) -> bool {
 }
 
 fn infer_kind(id: &str) -> EntityKind {
-    if id.starts_with("grpc://") || id.starts_with("rpc/") || id.starts_with("rpc://") {
+    if id.starts_with("grpc://")
+        || id.starts_with("proto-method://")
+        || id.starts_with("rpc/")
+        || id.starts_with("rpc://")
+    {
         EntityKind::Rpc
     } else if id.starts_with("graphql-field://") {
         EntityKind::GraphqlField
@@ -481,14 +598,8 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::Callable
     } else if id.starts_with("elixir-module://") || id.starts_with("erlang-module://") {
         EntityKind::Namespace
-    } else if id.starts_with("proto-file://") {
-        EntityKind::ProtoFile
-    } else if id.starts_with("proto-message://") {
-        EntityKind::ProtoMessage
     } else if id.starts_with("proto-field://") {
         EntityKind::ProtoField
-    } else if id.starts_with("proto-enum://") {
-        EntityKind::ProtoEnum
     } else if id.starts_with("proto-service://") {
         EntityKind::ProtoService
     } else if id.contains("/elixir-source/") {
@@ -535,7 +646,11 @@ fn entity_name(id: &str) -> String {
             format!("{function}/{arity}")
         };
     }
-    if let Some((service, method)) = id.strip_prefix("grpc://").and_then(|id| id.split_once('/')) {
+    if let Some((service, method)) = id
+        .strip_prefix("proto-method://")
+        .or_else(|| id.strip_prefix("grpc://"))
+        .and_then(|id| id.split_once('/'))
+    {
         return format!(
             "{}.{}",
             service.rsplit('.').next().unwrap_or(service),
@@ -567,7 +682,7 @@ fn repository(id: &str) -> Option<String> {
     })
 }
 
-fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
+fn evidence_ref(from: &str, to: &str, evidence: &str, provenance: &str) -> EvidenceRef {
     let (mut path, line) = evidence
         .rsplit_once(':')
         .and_then(|(path, line)| {
@@ -588,7 +703,7 @@ fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
             "generated" => EvidenceKind::Generated,
             _ => EvidenceKind::Unknown,
         },
-        repository: repository(from),
+        repository: repository(from).or_else(|| repository(to)),
         path,
         line,
         detail: match provenance {
@@ -620,6 +735,66 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 mod tests {
     use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity};
     use beholder_dto::{EntityKind, EntityOrigin};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn typed_entity_facts_override_relation_hints() {
+        let mut graph = GraphBuilder::default();
+        graph.hint_facts(BTreeMap::from([
+            (
+                "repo://example/rust/lib".into(),
+                (EntityKind::Namespace, None),
+            ),
+            (
+                "repo://example/rust/unrelated".into(),
+                (EntityKind::Callable, None),
+            ),
+        ]));
+        graph.hint("repo://example/rust/lib", EntityKind::Callable);
+
+        let graph = graph.finish();
+        assert_eq!(
+            graph.entity("repo://example/rust/lib").kind,
+            EntityKind::Namespace
+        );
+        assert_eq!(graph.nodes.len(), 1);
+    }
+
+    #[test]
+    fn keeps_strongest_confidence_for_duplicate_edges() {
+        let mut graph = GraphBuilder::default();
+        graph
+            .add_edge("a", "b", "calls", "a.rs:1", 0.6, "unique_name_heuristic")
+            .unwrap();
+        graph
+            .add_edge("a", "b", "calls", "a.rs:2", 1.0, "ast")
+            .unwrap();
+
+        let graph = graph.finish();
+        assert_eq!(graph.edges[0].confidence, 1.0);
+        assert_eq!(graph.edges[0].evidence.len(), 2);
+    }
+
+    #[test]
+    fn attributes_evidence_to_a_repository_owned_target() {
+        let mut graph = GraphBuilder::default();
+        graph
+            .add_edge(
+                "grpc://example.Service/Call",
+                "repo://example/server/elixir/Example.Server/call/2",
+                "implemented_by",
+                "lib/server.ex:4",
+                1.0,
+                "generated",
+            )
+            .unwrap();
+
+        let graph = graph.finish();
+        assert_eq!(
+            graph.edges[0].evidence[0].repository.as_deref(),
+            Some("example/server")
+        );
+    }
 
     #[test]
     fn maps_elixir_modules_and_functions() {

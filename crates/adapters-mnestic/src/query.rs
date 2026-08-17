@@ -1,6 +1,7 @@
 use super::schema::*;
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability};
-use std::{collections::BTreeMap, error::Error};
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 
 pub(super) trait QueryRunner {
     fn run_query(
@@ -77,6 +78,32 @@ pub(super) fn analysis_revision(db: &impl QueryRunner, view: &str) -> Result<u64
         .try_into()?)
 }
 
+pub(super) fn entity_facts(
+    db: &impl QueryRunner,
+    view: &str,
+    entities: &BTreeSet<String>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let entities = DataValue::List(
+        entities
+            .iter()
+            .map(|id| DataValue::List(vec![id.as_str().into()]))
+            .collect(),
+    );
+    query(
+        db,
+        view,
+        "selected_state[state] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, state}\n\
+         requested[id] <- $entities\n\
+         ?[id, kind, metadata] := requested[id], selected_state[state], \
+             *state_entity{state, id, kind, metadata}\n\
+         ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
+             *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
+         :order id",
+        [("entities", entities)],
+    )
+}
+
 pub(super) fn inspect_observations(
     db: &DbInstance,
     relation: Option<&str>,
@@ -95,6 +122,32 @@ pub(super) fn inspect_observations(
              :order relation, from, to"
         ),
         params,
+        ScriptMutability::Immutable,
+    )?)
+}
+
+pub(super) fn inspect_grpc_bindings(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
+    Ok(db.run_script(
+        "selected[view, revision, state, local_symbol, role, service, method, cardinality, evidence, confidence, provenance] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_state{view, revision, state}, \
+             *state_grpc_binding_candidate{\
+                 state, local_symbol, role, service, method, evidence, cardinality, confidence, provenance\
+             }\n\
+         diagnostic[view, revision, local_symbol, role, service, method, evidence, code, detail] := \
+             *analysis_revision_grpc_diagnostic{\
+                 view, revision, local_symbol, role, service, method, evidence, code, detail\
+             }\n\
+         ?[view, local_symbol, role, service, method, cardinality, evidence, confidence, provenance, status, code, detail] := \
+             selected[view, revision, _, local_symbol, role, service, method, cardinality, evidence, confidence, provenance], \
+             diagnostic[view, revision, local_symbol, role, service, method, evidence, code, detail], \
+             status = 'unmatched'\n\
+         ?[view, local_symbol, role, service, method, cardinality, evidence, confidence, provenance, status, code, detail] := \
+             selected[view, revision, _, local_symbol, role, service, method, cardinality, evidence, confidence, provenance], \
+             not diagnostic[view, revision, local_symbol, role, service, method, evidence, _, _], \
+             status = 'resolved', code = '', detail = ''\n\
+         :order view, service, method, role, local_symbol",
+        BTreeMap::new(),
         ScriptMutability::Immutable,
     )?)
 }
@@ -174,6 +227,8 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            entities: Vec::new(),
+            grpc_bindings: Vec::new(),
             observations,
         }
     }
@@ -253,6 +308,11 @@ mod tests {
             "end",
             beholder_dto::DEFAULT_MAX_HOPS,
             crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+            crate::inspection::InspectionResult {
+                headers: Vec::new(),
+                rows: Vec::new(),
+                next: None,
+            },
         )
         .unwrap();
         assert_eq!(result.paths[0].nodes, ["start", "left", "end"]);
@@ -263,6 +323,11 @@ mod tests {
             "end",
             1,
             crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+            crate::inspection::InspectionResult {
+                headers: Vec::new(),
+                rows: Vec::new(),
+                next: None,
+            },
         )
         .unwrap();
         assert!(limited.paths.is_empty());

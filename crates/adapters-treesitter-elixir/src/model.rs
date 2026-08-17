@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+use super::grpc::GrpcModule;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ElixirAnalysis {
     pub(super) modules: Vec<ElixirModule>,
@@ -19,6 +21,7 @@ pub(super) struct ElixirModule {
     pub(super) implements: Vec<ElixirModuleReference>,
     pub(super) aliases: Vec<ElixirAlias>,
     pub(super) references: Vec<ElixirModuleReference>,
+    pub(super) grpc: GrpcModule,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

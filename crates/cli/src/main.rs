@@ -44,6 +44,8 @@ fn index_rust(path: &Path, database_path: &Path) -> Result<(usize, bool), Box<dy
         &[RepositoryFacts {
             state,
             analysis_identity: format!("rust:{FRONTEND_VERSION}:single-file:1"),
+            entities: Vec::new(),
+            grpc_bindings: Vec::new(),
             observations: observations.clone(),
         }],
         &[],
@@ -200,6 +202,7 @@ enum WorkspaceCommand {
 
 #[derive(Clone, Eq, PartialEq, ValueEnum)]
 enum InspectSubject {
+    GrpcBindings,
     Relations,
     Revisions,
     Observations,
@@ -536,6 +539,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             let store = SemanticStore::persistent(&database, false)?;
             let result = match subject {
+                InspectSubject::GrpcBindings => store.inspect_grpc_bindings()?,
                 InspectSubject::Relations => store.inspect_relations()?,
                 InspectSubject::Revisions => store.inspect_revisions()?,
                 InspectSubject::Observations => store.inspect_observations(relation.as_deref())?,

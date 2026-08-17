@@ -85,6 +85,27 @@ enum EntityOrigin {
   ENTITY_ORIGIN_EXTERNAL_DEPENDENCY = 2;
 }
 
+enum ProtoTypeKind {
+  PROTO_TYPE_KIND_UNKNOWN = 0;
+  PROTO_TYPE_KIND_ENUM = 1;
+  PROTO_TYPE_KIND_MESSAGE = 2;
+}
+
+enum RpcCardinality {
+  RPC_CARDINALITY_UNKNOWN = 0;
+  RPC_CARDINALITY_UNARY = 1;
+  RPC_CARDINALITY_CLIENT_STREAMING = 2;
+  RPC_CARDINALITY_SERVER_STREAMING = 3;
+  RPC_CARDINALITY_BIDIRECTIONAL_STREAMING = 4;
+}
+
+message EntityMetadata {
+  oneof metadata {
+    ProtoTypeKind proto_type_kind = 1;
+    RpcCardinality rpc_cardinality = 2;
+  }
+}
+
 enum EvidenceKind {
   EVIDENCE_KIND_UNKNOWN = 0;
   EVIDENCE_KIND_AST = 1;
@@ -96,6 +117,7 @@ enum EvidenceKind {
 
 enum RelationKind {
   RELATION_KIND_UNKNOWN = 0;
+  RELATION_KIND_BINDS_CONTRACT = 16;
   RELATION_KIND_CALLS = 1;
   RELATION_KIND_CALLS_RPC = 2;
   RELATION_KIND_CONSUMED_BY = 3;
@@ -120,6 +142,7 @@ message Entity {
   optional string repository = 4;
   EntityOrigin origin = 5;
   bool test = 6;
+  optional EntityMetadata metadata = 7;
 }
 
 message Evidence {

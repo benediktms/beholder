@@ -32,6 +32,71 @@ pub(super) const CREATE_METADATA_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ENTITY_SCHEMA: &str = r#"
+:create state_entity {
+    state: String,
+    id: String,
+    =>
+    kind: String,
+    metadata: String,
+}
+"#;
+
+pub(super) const CREATE_GRPC_BINDING_SCHEMA: &str = r#"
+:create state_grpc_binding_candidate {
+    state: String,
+    local_symbol: String,
+    role: String,
+    service: String,
+    method: String,
+    evidence: String,
+    =>
+    cardinality: String,
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_REVISION_OBSERVATION_SCHEMA: &str = r#"
+:create analysis_revision_observation {
+    view: String,
+    revision: Int,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_REVISION_ENTITY_SCHEMA: &str = r#"
+:create analysis_revision_entity {
+    view: String,
+    revision: Int,
+    id: String,
+    =>
+    kind: String,
+    metadata: String,
+}
+"#;
+
+pub(super) const CREATE_GRPC_DIAGNOSTIC_SCHEMA: &str = r#"
+:create analysis_revision_grpc_diagnostic {
+    view: String,
+    revision: Int,
+    local_symbol: String,
+    role: String,
+    service: String,
+    method: String,
+    evidence: String,
+    =>
+    code: String,
+    detail: String,
+}
+"#;
+
 pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \
@@ -157,9 +222,7 @@ pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
          context_override[from, relation, unresolved_to, _, evidence, _, _]\n\
      ?[direction, relation, related, evidence, confidence, provenance] := \
          selected_state[state], \
-         *state_observation{\
-             state, from: $entity, relation, to: related, evidence\
-         }, \
+         *state_observation{state, from: $entity, relation, to: related, evidence}, \
          *state_observation_metadata{\
              state, from: $entity, relation, to: related, confidence, provenance\
          }, \
@@ -184,5 +247,19 @@ pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
          context_override[\
              related, relation, _, $entity, evidence, confidence, provenance\
          ], \
+         direction = 'incoming'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_observation{\
+             view: $view, revision, from: $entity, relation, to: related, evidence, \
+             confidence, provenance\
+         }, \
+         direction = 'outgoing'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_observation{\
+             view: $view, revision, from: related, relation, to: $entity, evidence, \
+             confidence, provenance\
+         }, \
          direction = 'incoming'\n\
      :order direction, relation, related";

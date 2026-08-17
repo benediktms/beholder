@@ -105,7 +105,6 @@ The same problem appears with:
 
 * GraphQL schemas and resolvers;
 * Kafka topics and producers/consumers;
-* Avro schemas;
 * generated API clients;
 * HTTP contracts;
 * internal RPC and messaging abstractions.
@@ -153,7 +152,6 @@ Important technologies include:
 Protocol Buffers
 gRPC
 Kafka
-Avro
 GraphQL
 HTTP
 ```
@@ -220,7 +218,7 @@ Elixir handler
     ↓
 Kafka topic
     ↓
-Protobuf or Avro contract
+Protobuf contract
     ↓
 consumer
 ```
@@ -353,7 +351,6 @@ source ranges
 language-specific extraction
 protobuf descriptor ingestion
 GraphQL parsing
-Avro parsing
 incremental changed-file discovery
 procedural symbol resolution
 specialised graph algorithms
@@ -824,15 +821,15 @@ A single user-level daemon, **`beholderd`**, should manage multiple workspaces.
 Conceptually:
 
 ```text
-                     Clients
+                 Client surfaces
 
-            CLI      MCP      IDE
-             │        │        │
-             └────────┼────────┘
-                      │
-                     gRPC
-                      │
-                      ▼
+          Admin CLI       MCP       IDE
+              │            │         │
+              └────────────┼─────────┘
+                           │
+                          gRPC
+                           │
+                           ▼
                 ┌───────────┐
                 │ beholderd │
                 └─────┬─────┘
@@ -875,7 +872,13 @@ query execution
 analysis revision publication
 ```
 
-The CLI, MCP server and future integrations should remain thin clients.
+The CLI, MCP server and future integrations should remain thin clients. The
+CLI is primarily an administrative surface for daemon control, workspace
+management, manual reindexing, cache maintenance, and inspection. MCP is the
+primary semantic surface for context, dependencies, impact, trace, why, and
+open-ended exploration. Existing CLI semantic commands may remain as
+transitional compatibility and debugging surfaces, but new semantic features
+should be designed and exposed through MCP first.
 
 ---
 
@@ -1278,8 +1281,6 @@ subscription
 ```text
 Protobuf message
 Protobuf field
-Avro record
-Avro field
 GraphQL object
 GraphQL input
 OpenAPI schema
@@ -1296,17 +1297,16 @@ Contract identities should be semantic rather than based on filesystem location.
 Examples:
 
 ```text
-proto-message://company.users.v1.User
+proto-type://company.users.v1.User
 
 proto-field://company.users.v1.User/email
 
-grpc://company.users.v1.Users/GetUser
+proto-method://company.users.v1.Users/GetUser
 
 graphql-field://Query/customer
 
 kafka-topic://users.updated.v1
 
-avro-record://company.users.UserUpdated
 ```
 
 Moving a schema file should not recreate the contract.
@@ -1491,7 +1491,6 @@ Initial:
 ```text
 Protobuf
 GraphQL
-Avro
 ```
 
 Potential future systems:
@@ -1559,7 +1558,6 @@ rules/
 
     contracts/
         protobuf.datalog
-        avro.datalog
 
     languages/
         rust.datalog
@@ -1701,11 +1699,10 @@ Billing.fetch_user/2
        │
        │ CALLS_RPC
        ▼
-company.users.v1.Users/GetUser
-       ▲
-       │ IMPLEMENTS_RPC
+grpc://company.users.v1.Users/GetUser
+       ├── BINDS_CONTRACT ──▶ proto-method://company.users.v1.Users/GetUser
        │
-UsersServer.get_user/2
+       └── IMPLEMENTED_BY ──▶ UsersServer.get_user/2
 ```
 
 Evidence may come from:
@@ -1755,36 +1752,7 @@ Producer-to-consumer dependency can then be inferred declaratively.
 
 ---
 
-# 46. Avro
-
-Avro should be modelled as a contract system independent from Kafka.
-
-Expected entities include:
-
-```text
-AvroSchema
-AvroRecord
-AvroField
-AvroEnum
-```
-
-Kafka topics may carry either:
-
-```text
-Protobuf
-```
-
-or:
-
-```text
-Avro
-```
-
-without changing the underlying messaging dependency semantics.
-
----
-
-# 47. GraphQL
+# 46. GraphQL
 
 GraphQL should be a first-class interface and contract domain.
 
@@ -2097,6 +2065,50 @@ CheckoutPage
 → Pricing/GetPrice
 → PricingServer.get_price
 ```
+
+## Open-ended behavior traversal
+
+Pairwise `trace <from> <to>` is useful when both endpoints are known, but
+exploration often starts with only one symbol. Beholder should also support a
+bounded traversal rooted at one entity that discovers reachable behavior
+without requiring a target endpoint in advance.
+
+Conceptually:
+
+```text
+beholder explore <entity>
+```
+
+The traversal should support direction, maximum depth, repository scope,
+minimum confidence, relation kinds, and generated-code visibility. Its result
+should be a deterministic tree or forest of reachable symbols, contracts, and
+repository boundaries, with candidate endpoints, supporting evidence, and
+explicit truncation metadata. Pairwise trace remains the focused way to verify
+one selected path; open-ended traversal is the discovery form.
+
+Where language analysis exposes conditional control flow, traversal must retain
+the branch structure: branch-specific paths for constructs such as `if/else`,
+their guards when known, and convergence after the branches rejoin. This is
+distinct from merely finding multiple unrelated graph edges; full CFG and PDG
+construction remains future advanced static analysis.
+
+Both directions are first-class:
+
+```text
+downstream  what behavior does this entity lead to?
+upstream    what callers and paths lead to this entity?
+```
+
+An upstream query must be able to return all bounded paths that lead to the
+root code point, not only its immediate callers. Because path counts can grow
+quickly in converging graphs, the API must make maximum depth, maximum paths,
+and truncation explicit and deterministic.
+
+MCP is the canonical semantic interface. It should expose the shared query
+operations and structured result shapes as a thin client, so agents and IDEs
+receive identical semantic answers and evidence. The CLI remains available for
+administration and transitional semantic compatibility, but it should not grow
+an independent query model.
 
 ## `impact`
 
@@ -2473,17 +2485,20 @@ canonical RPC resolution
 
 ### Exit criterion
 
-The following works across repository boundaries:
+The following works in both directions across independent contract, Rust
+application, and Elixir application repositories:
 
 ```text
-Elixir caller
+Rust or Elixir caller
       ↓
 canonical RPC
       ↓
-Elixir implementation
+Elixir or Rust implementation
 ```
 
-regardless of where the `.proto` declaration exists.
+The RPC also binds to the canonical Protobuf method regardless of where the
+descriptor exists. Removing and restoring that contract republishes unresolved
+and resolved bindings without reparsing unchanged applications.
 
 Beholder should also successfully analyze its own CLI-to-daemon gRPC API.
 
@@ -2573,16 +2588,29 @@ backend
 
 ---
 
-# 66. Phase 9 — Avro
+# 66. Phase 9 — Query Semantics and Exploration
+
+Make semantic exploration useful when the user knows a starting entity but not
+the eventual endpoint.
 
 Implement:
 
 ```text
-Avro records
-fields
-enums
-Kafka payload mappings
+open-ended behavior traversal
+direction and repository scoping
+bounded deterministic call trees or forests
+candidate endpoint discovery
+evidence-preserving traversal output
+upstream path discovery to a selected code point
+branch-aware paths for conditional control flow
+MCP semantic tools over the shared query API
+administrative CLI integration and transitional semantic compatibility
 ```
+
+The existing pairwise `trace <from> <to>` query remains as a precise path
+verification primitive. This phase adds the discovery-oriented query without
+turning runtime execution into a prerequisite for static analysis. The MCP
+server is a delivery surface, not a second semantic implementation.
 
 ---
 

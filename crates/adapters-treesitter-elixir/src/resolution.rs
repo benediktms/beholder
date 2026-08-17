@@ -3,7 +3,8 @@ use super::model::*;
 use crate::analyze;
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-    DependencyRelation, EntityId, Observation, Provenance, SemanticRelation, StructuralRelation,
+    DependencyRelation, EntityFact, EntityId, EntityKind, Observation, Provenance,
+    SemanticRelation, StructuralRelation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, path::Path};
@@ -122,6 +123,44 @@ pub fn observations_from_analysis(
         }
     }
     observations
+}
+
+pub fn entities_from_analysis(
+    repository: &str,
+    analysis: &ElixirAnalysis,
+    path: &Path,
+) -> Vec<EntityFact> {
+    let source_id = format!(
+        "repo://{repository}/elixir-source/{}",
+        path.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+    );
+    let mut entities = vec![EntityFact::new(source_id, EntityKind::Namespace, None).unwrap()];
+    for module in &analysis.modules {
+        let module_id = format!("repo://{repository}/elixir/{}", module.name);
+        entities.push(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap());
+        for function in &module.functions {
+            entities.push(
+                EntityFact::new(
+                    format!("{module_id}/{}/{}", function.name, function.arity),
+                    EntityKind::Callable,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        for callback in &module.callbacks {
+            entities.push(
+                EntityFact::new(
+                    format!("{module_id}/callback/{}/{}", callback.name, callback.arity),
+                    EntityKind::Callable,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    entities
 }
 
 fn is_generated_source(path: &Path, source: &str) -> bool {
@@ -243,6 +282,19 @@ pub fn generated_observations(
         }
     }
     generated
+}
+
+pub fn generated_entities(observations: &[Observation]) -> Vec<EntityFact> {
+    observations
+        .iter()
+        .filter(|observation| observation.provenance == Provenance::Generated)
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+        })
+        .map(|observation| {
+            EntityFact::new(observation.to.clone(), EntityKind::Callable, None).unwrap()
+        })
+        .collect()
 }
 
 pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<DependencyOverride> {
@@ -404,6 +456,23 @@ pub fn observations(
 mod tests {
     use super::*;
     use beholder_domain::SemanticRelation;
+
+    #[test]
+    fn emits_typed_source_entities() {
+        let analysis = analyze(
+            "defmodule Example.Worker do\n  @callback work(term()) :: term()\n  def run, do: :ok\nend",
+        )
+        .unwrap();
+        let entities = entities_from_analysis("example", &analysis, Path::new("lib/worker.ex"));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "repo://example/elixir/Example.Worker/run/0"
+                && entity.kind == EntityKind::Callable
+        }));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "repo://example/elixir/Example.Worker/callback/work/1"
+                && entity.kind == EntityKind::Callable
+        }));
+    }
 
     #[test]
     fn emits_stable_module_and_function_definitions() {
@@ -692,6 +761,7 @@ mod tests {
             Path::new("lib/my_app/consumer.ex"),
         )
         .unwrap();
+        let entities = generated_entities(&observations);
 
         assert!(
             !observations
@@ -704,6 +774,10 @@ mod tests {
                 && observation.to.as_str() == "repo://payments/elixir/MyApp.Consumer/generated/0"
                 && observation.evidence.as_str() == "lib/my_app/consumer.ex:6"
                 && observation.provenance == Provenance::Generated
+        }));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "repo://payments/elixir/MyApp.Consumer/generated/0"
+                && entity.kind == EntityKind::Callable
         }));
         assert!(!observations.iter().any(|observation| {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Macro"

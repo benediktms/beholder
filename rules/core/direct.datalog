@@ -35,6 +35,19 @@ effective_observation[from, to, relation, evidence, confidence, provenance] :=
 effective_observation[from, resolved_to, relation, evidence, confidence, provenance] :=
     dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
 
+effective_observation[from, to, relation, evidence, confidence, provenance] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    }
+
 direct[from, to, relation, evidence, confidence, provenance] :=
     selected_state[state],
     *state_dependency_observation{state, from, relation, to, evidence},
@@ -44,6 +57,19 @@ direct[from, to, relation, evidence, confidence, provenance] :=
 direct[from, resolved_to, relation, evidence, confidence, provenance] :=
     dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
 
+direct[from, to, relation, evidence, confidence, provenance] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    }
+
 direct_pair[from, to] :=
     selected_state[state],
     *state_dependency_observation{state, from, relation, to, evidence},
@@ -51,3 +77,7 @@ direct_pair[from, to] :=
 
 direct_pair[from, resolved_to] :=
     dependency_override[from, _, _, resolved_to, _, _, _]
+
+direct_pair[from, to] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{view: $view, revision, from, to}

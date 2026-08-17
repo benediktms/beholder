@@ -49,7 +49,7 @@ pub fn resolve_repository_calls(observations: &mut [Observation]) -> Vec<Depende
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{analyze, diagnostics_from_analysis, observations};
+    use crate::{analyze, diagnostics_from_analysis, entities_from_analysis, observations};
     use beholder_domain::{AnalysisDiagnostic, AnalysisDiagnosticSeverity};
     use std::path::Path;
 
@@ -93,6 +93,16 @@ mod tests {
         assert_eq!(ambiguous[0].to.as_str(), "rust-call://helper");
         assert_eq!(ambiguous[0].confidence, Confidence::Exact);
         assert_eq!(ambiguous[0].provenance, Provenance::Ast);
+    }
+
+    #[test]
+    fn emits_typed_source_entities() {
+        let analysis = analyze("mod nested { fn run() {} }").unwrap();
+        let entities = entities_from_analysis("beholder", &analysis, Path::new("src/lib.rs"));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "repo://beholder/rust/lib/nested/run"
+                && entity.kind == beholder_domain::EntityKind::Callable
+        }));
     }
 
     #[test]

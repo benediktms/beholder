@@ -7,6 +7,12 @@ edition.workspace = true
 beholder-domain.workspace = true
 prost = "0.14.4"
 prost-types = "0.14.4"
+protox = "0.9.1"
+rayon.workspace = true
+serde.workspace = true
+serde_yaml = "0.9.34"
+sha2 = "0.10.9"
+ureq = "3.1.4"
 
 [dev-dependencies]
 beholder-adapters-mnestic.workspace = true

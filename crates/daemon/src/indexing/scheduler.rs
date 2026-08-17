@@ -1,21 +1,23 @@
 use crate::workspace_registry::WorkspaceRegistry;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_protobuf::{
-    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, observations as protobuf_observations,
+    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, SourceCompiler, facts as protobuf_facts,
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
     RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
-    generated_observations as elixir_generated_observations,
+    entities_from_analysis as elixir_entities, generated_entities as elixir_generated_entities,
+    generated_observations as elixir_generated_observations, grpc_bindings as elixir_grpc_bindings,
     observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis,
-    diagnostics_from_analysis as rust_diagnostics, observations_from_analysis,
-    resolve_repository_calls as resolve_rust_repository_calls,
+    diagnostics_from_analysis as rust_diagnostics, entities_from_analysis as rust_entities,
+    observations_from_analysis, resolve_repository_calls as resolve_rust_repository_calls,
+    tonic_bindings,
 };
-use beholder_domain::{RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
+use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
 use rayon::prelude::*;
@@ -94,7 +96,7 @@ impl AnalysisVersions {
                 .any(|sources| !sources.elixir.is_empty()),
             repositories
                 .iter()
-                .any(|sources| !sources.protobuf.is_empty()),
+                .any(|sources| !sources.protobuf.is_empty() || !sources.protobuf_source.is_empty()),
         );
         format!("{}:core-rules:{}", key.analysis_identity(), self.rule_pack)
     }
@@ -120,6 +122,7 @@ pub struct IndexScheduler {
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
+    protobuf_compiler: SourceCompiler,
     repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<RepositoryAnalysis>>>,
     analysis_pool: rayon::ThreadPool,
 }
@@ -150,11 +153,7 @@ impl IndexScheduler {
             .ok()
             .and_then(|workers| workers.parse().ok())
             .filter(|workers| *workers > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(4)
-            });
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
         Self::with_workers(cache_dir, workers)
     }
 
@@ -165,6 +164,7 @@ impl IndexScheduler {
             .build()
             .expect("bounded indexing pool should start");
         tracing::info!(workers, "index analysis pool configured");
+        let protobuf_compiler = SourceCompiler::new(cache_dir.clone());
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
@@ -175,6 +175,7 @@ impl IndexScheduler {
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
             elixir_cache: Mutex::new(BTreeMap::new()),
+            protobuf_compiler,
             repository_cache: Mutex::new(BTreeMap::new()),
             analysis_pool,
         }
@@ -234,6 +235,7 @@ impl IndexScheduler {
             .lock()
             .map_err(|_| "Elixir frontend cache lock poisoned")?
             .clear();
+        self.protobuf_compiler.clear_memory()?;
         self.repository_cache
             .lock()
             .map_err(|_| "repository cache lock poisoned")?
@@ -352,9 +354,15 @@ impl IndexScheduler {
                             path.strip_prefix(&repository.base)
                                 .ok()
                                 .filter(|relative| {
-                                    let source = relative.extension().is_some_and(|extension| {
-                                        matches!(extension.to_str(), Some("rs" | "ex" | "exs"))
-                                    }) && !relative.components().any(|component| {
+                                    let source = (relative.extension().is_some_and(|extension| {
+                                        matches!(
+                                            extension.to_str(),
+                                            Some("rs" | "ex" | "exs" | "proto")
+                                        )
+                                    }) || matches!(
+                                        relative.file_name().and_then(|name| name.to_str()),
+                                        Some("buf.yaml" | "buf.lock")
+                                    )) && !relative.components().any(|component| {
                                         matches!(
                                             component.as_os_str().to_str(),
                                             Some(
@@ -577,8 +585,11 @@ impl IndexScheduler {
             return Ok((analysis, CacheStatus::Disk, analysis_identity));
         }
         let mut observations = Vec::new();
+        let mut entities = Vec::<EntityFact>::new();
+        let mut grpc_bindings = Vec::new();
         let mut diagnostics = Vec::new();
-        let rust_analyses = self.analysis_pool.install(|| {
+        let mut rust_analyses = Vec::new();
+        let analyzed_rust = self.analysis_pool.install(|| {
             rust_sources
                 .par_iter()
                 .map(|(path, source)| {
@@ -594,17 +605,31 @@ impl IndexScheduler {
                         "frontend cache lookup"
                     );
                     Ok::<_, String>((
+                        path.as_path(),
+                        analysis.clone(),
                         observations_from_analysis(&state.repository.identity, &analysis, path),
+                        rust_entities(&state.repository.identity, &analysis, path),
                         rust_diagnostics(&analysis, path),
                     ))
                 })
                 .collect::<Vec<_>>()
         });
-        for analysis in rust_analyses {
-            let (source_observations, source_diagnostics) = analysis?;
+        for analysis in analyzed_rust {
+            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+                analysis?;
             observations.extend(source_observations);
+            entities.extend(source_entities);
             diagnostics.extend(source_diagnostics);
+            rust_analyses.push((path, analysis));
         }
+        let rust_sources = rust_analyses
+            .iter()
+            .map(|(path, analysis)| (*path, analysis.as_ref()))
+            .collect::<Vec<_>>();
+        let (source_bindings, source_diagnostics) =
+            tonic_bindings(&state.repository.identity, &rust_sources);
+        grpc_bindings.extend(source_bindings);
+        diagnostics.extend(source_diagnostics);
         resolve_rust_repository_calls(&mut observations);
         let mut elixir_analyses = Vec::new();
         let analyzed_elixir = self.analysis_pool.install(|| {
@@ -626,14 +651,17 @@ impl IndexScheduler {
                         path.as_path(),
                         analysis.clone(),
                         elixir_observations(&state.repository.identity, &analysis, source, path),
+                        elixir_entities(&state.repository.identity, &analysis, path),
                         elixir_diagnostics(&analysis, path),
                     ))
                 })
                 .collect::<Vec<_>>()
         });
         for analysis in analyzed_elixir {
-            let (path, analysis, source_observations, source_diagnostics) = analysis?;
+            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+                analysis?;
             observations.extend(source_observations);
+            entities.extend(source_entities);
             diagnostics.extend(source_diagnostics);
             elixir_analyses.push((path, analysis));
         }
@@ -641,24 +669,38 @@ impl IndexScheduler {
             .iter()
             .map(|(path, analysis)| (*path, analysis.as_ref()))
             .collect::<Vec<_>>();
-        observations.extend(elixir_generated_observations(
+        let generated_observations = elixir_generated_observations(
             &state.repository.identity,
             &elixir_sources,
             &observations,
-        ));
+        );
+        entities.extend(elixir_generated_entities(&generated_observations));
+        observations.extend(generated_observations);
         resolve_elixir_repository_calls(&mut observations, &elixir_sources);
-        let descriptor_observations = self.analysis_pool.install(|| {
+        let (source_bindings, source_diagnostics) =
+            elixir_grpc_bindings(&state.repository.identity, &elixir_sources);
+        grpc_bindings.extend(source_bindings);
+        diagnostics.extend(source_diagnostics);
+        let descriptor_facts = self.analysis_pool.install(|| {
             descriptors
                 .par_iter()
                 .map(|(_, descriptor)| {
-                    protobuf_observations(descriptor).map_err(|error| error.to_string())
+                    protobuf_facts(descriptor).map_err(|error| error.to_string())
                 })
                 .collect::<Vec<_>>()
         });
-        for descriptor in descriptor_observations {
-            observations.extend(descriptor?);
+        for descriptor in descriptor_facts {
+            let descriptor = descriptor?;
+            observations.extend(descriptor.observations);
+            for entity in descriptor.entities {
+                if !entities.contains(&entity) {
+                    entities.push(entity);
+                }
+            }
         }
         let analysis = Arc::new(RepositoryAnalysis {
+            entities,
+            grpc_bindings,
             observations,
             diagnostics,
         });
@@ -700,7 +742,7 @@ fn index_workspace_versioned(
     versions: AnalysisVersions,
 ) -> Result<(usize, bool), Box<dyn Error>> {
     let source_loading_started = Instant::now();
-    let repositories = workspace
+    let mut repositories = workspace
         .repositories
         .iter()
         .map(|repository| {
@@ -726,6 +768,21 @@ fn index_workspace_versioned(
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
+    let protobuf_compilation_started = Instant::now();
+    for (repository, sources) in workspace.repositories.iter().zip(&mut repositories) {
+        let descriptors = scheduler.analysis_pool.install(|| {
+            scheduler
+                .protobuf_compiler
+                .compile_repository(&repository.base, &sources.protobuf_source)
+        })?;
+        for (index, descriptor) in descriptors.into_iter().enumerate() {
+            sources.protobuf.push((
+                PathBuf::from(format!("compiled-protobuf-{index}.binpb")),
+                descriptor.as_ref().clone(),
+            ));
+        }
+    }
+    let protobuf_compilation = protobuf_compilation_started.elapsed();
 
     let mut repository_facts = Vec::new();
     let mut memory_hits = 0;
@@ -740,12 +797,14 @@ fn index_workspace_versioned(
             rust,
             elixir,
             protobuf,
+            protobuf_source,
         } = sources;
-        dirty_source_units +=
-            match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
-                Some(DirtyRepository::Sources(sources)) => sources.len(),
-                Some(DirtyRepository::All) | None => rust.len() + elixir.len() + protobuf.len(),
-            };
+        dirty_source_units += match dirty
+            .and_then(|repositories| repositories.get(&state.repository.identity))
+        {
+            Some(DirtyRepository::Sources(sources)) => sources.len(),
+            Some(DirtyRepository::All) | None => rust.len() + elixir.len() + protobuf_source.len(),
+        };
         let (analysis, cache_status, analysis_identity) = scheduler
             .repository_observations_versioned(&state, &rust, &elixir, &protobuf, versions)?;
         match cache_status {
@@ -763,6 +822,8 @@ fn index_workspace_versioned(
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity,
+            entities: analysis.entities.clone(),
+            grpc_bindings: analysis.grpc_bindings.clone(),
             observations: analysis.observations.clone(),
         });
     }
@@ -796,6 +857,7 @@ fn index_workspace_versioned(
         repository_cache_misses = misses,
         dirty_source_units,
         source_loading_ms = source_loading.as_secs_f64() * 1000.0,
+        protobuf_compilation_ms = protobuf_compilation.as_secs_f64() * 1000.0,
         repository_analysis_ms = repository_analysis.as_secs_f64() * 1000.0,
         workspace_resolution_ms = workspace_resolution.as_secs_f64() * 1000.0,
         publication_ms = publication.as_secs_f64() * 1000.0,
@@ -809,6 +871,7 @@ fn index_workspace_versioned(
 mod tests {
     use super::*;
     use beholder_domain::{LogicalRepository, WorkspaceRepository};
+    use beholder_dto::{EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
     fn test_workspace(name: &str, base: PathBuf) -> Workspace {
@@ -1015,6 +1078,8 @@ mod tests {
                     &[RepositoryFacts {
                         state: state.clone(),
                         analysis_identity: "analysis".into(),
+                        entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
                         observations: analysis.observations.clone(),
                     }],
                     &[],
@@ -1430,6 +1495,40 @@ mod tests {
     }
 
     #[test]
+    fn protobuf_filesystem_events_mark_repository_dirty() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-protobuf-event-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        let changed = repository.join("contract.proto");
+        fs::write(&changed, "syntax = \"proto3\"; message Contract {}").unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
+        let identity = workspace.repositories[0].repository.identity.clone();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+
+        scheduler.add_event(
+            Ok(Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![changed.canonicalize().unwrap()],
+                attrs: Default::default(),
+            }),
+            &Mutex::new(registry),
+        );
+
+        assert_eq!(
+            scheduler.dirty_repositories.lock().unwrap()["main"][&identity],
+            DirtyRepository::Sources(BTreeSet::from([PathBuf::from("contract.proto")]))
+        );
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn elixir_source_units_are_indexed_incrementally() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1572,6 +1671,245 @@ mod tests {
                 .iter()
                 .any(|node| node.id == format!("{module}/before/0"))
         );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn cross_language_grpc_workspace_resolves_both_directions() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-grpc-matrix-{unique}"));
+        let contracts = state.join("contracts");
+        let rust = state.join("rust-app");
+        let elixir = state.join("elixir-app");
+        for directory in [
+            contracts.as_path(),
+            rust.join("src").as_path(),
+            elixir.join("lib").as_path(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let contract_path = contracts.join("matrix.proto");
+        let contract_source = r#"
+            syntax = "proto3";
+            package phase5.v1;
+            message Request {}
+            message Response {}
+            service Bridge {
+              rpc RustToElixir(Request) returns (Response);
+              rpc ElixirToRust(Request) returns (Response);
+            }
+            "#;
+        fs::write(&contract_path, contract_source).unwrap();
+        fs::write(
+            rust.join("src/protocol.rs"),
+            "tonic::include_proto!(\"phase5.v1\");",
+        )
+        .unwrap();
+        fs::write(
+            rust.join("src/generated.rs"),
+            "mod bridge_client { \
+                 pub struct BridgeClient<T>(T); \
+                 impl<T> BridgeClient<T> { \
+                     pub async fn rust_to_elixir(&mut self) {} \
+                     pub async fn elixir_to_rust(&mut self) {} \
+                 } \
+             }",
+        )
+        .unwrap();
+        fs::write(
+            rust.join("src/client.rs"),
+            "use contract::bridge_client::BridgeClient; \
+             async fn rust_to_elixir() { \
+                 let mut client = BridgeClient::new(); \
+                 client.rust_to_elixir().await; \
+             }",
+        )
+        .unwrap();
+        fs::write(
+            rust.join("src/server.rs"),
+            "use contract::bridge_server::{Bridge, BridgeServer}; \
+             struct RustHandler; \
+             impl Bridge for RustHandler { async fn elixir_to_rust(&self) {} }",
+        )
+        .unwrap();
+        fs::write(
+            elixir.join("lib/matrix.pb.ex"),
+            r#"
+            defmodule Phase5.V1.Bridge.Service do
+              use GRPC.Service, name: "phase5.v1.Bridge"
+              rpc :RustToElixir, Phase5.V1.Request, Phase5.V1.Response
+              rpc :ElixirToRust, Phase5.V1.Request, Phase5.V1.Response
+            end
+
+            defmodule Phase5.V1.Bridge.Stub do
+              use GRPC.Stub, service: Phase5.V1.Bridge.Service
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            elixir.join("lib/client.ex"),
+            r#"
+            defmodule Phase5.Client do
+              alias Phase5.V1.Bridge.Stub
+              def elixir_to_rust(channel, request), do: Stub.elixir_to_rust(channel, request)
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            elixir.join("lib/server.ex"),
+            r#"
+            defmodule Phase5.Server do
+              alias Phase5.V1.Bridge.Service
+              use GRPC.Server, service: Service
+              def rust_to_elixir(request, stream), do: {request, stream}
+            end
+            "#,
+        )
+        .unwrap();
+
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let repositories = vec![contracts.clone(), rust.clone(), elixir.clone()];
+        let workspace = registry
+            .register("grpc-matrix".into(), repositories.clone(), Vec::new())
+            .unwrap();
+        let rust_identity = beholder_adapters_git::repository_identity(&rust).unwrap();
+        let elixir_identity = beholder_adapters_git::repository_identity(&elixir).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        scheduler.index(&store, &workspace).unwrap();
+        let metadata = scheduler.query_metadata("grpc-matrix", 1);
+        assert_eq!(metadata.revision, 1);
+        assert_eq!(metadata.view, "grpc-matrix");
+        assert!(!metadata.freshness.stale);
+        assert!(metadata.freshness.dirty_repositories.is_empty());
+
+        let bindings = [
+            (
+                "RustToElixir",
+                format!("repo://{rust_identity}/rust/client/rust_to_elixir"),
+                format!("repo://{elixir_identity}/elixir/Phase5.Server/rust_to_elixir/2"),
+            ),
+            (
+                "ElixirToRust",
+                format!("repo://{elixir_identity}/elixir/Phase5.Client/elixir_to_rust/2"),
+                format!(
+                    "repo://{rust_identity}/rust/server/impl/Bridge-for-RustHandler/elixir_to_rust"
+                ),
+            ),
+        ];
+        for (method, client, server) in &bindings {
+            let operation = format!("grpc://phase5.v1.Bridge/{method}");
+            let contract = format!("proto-method://phase5.v1.Bridge/{method}");
+            let context = store.context("grpc-matrix", &operation).unwrap();
+            assert_eq!(context.metadata.view, "grpc-matrix");
+            for (kind, from, to) in [
+                (RelationKind::CallsRpc, client.as_str(), operation.as_str()),
+                (
+                    RelationKind::BindsContract,
+                    operation.as_str(),
+                    contract.as_str(),
+                ),
+                (
+                    RelationKind::ImplementedBy,
+                    operation.as_str(),
+                    server.as_str(),
+                ),
+            ] {
+                let edge = context
+                    .edges
+                    .iter()
+                    .find(|edge| edge.kind == kind && edge.from == from && edge.to == to)
+                    .unwrap_or_else(|| panic!("missing {kind:?} edge from {from} to {to}"));
+                assert_eq!(edge.confidence, 1.0);
+                if kind != RelationKind::BindsContract {
+                    assert!(
+                        edge.evidence
+                            .iter()
+                            .all(|evidence| evidence.repository.is_some()),
+                        "{edge:#?}"
+                    );
+                }
+                assert!(edge.evidence.iter().any(|evidence| {
+                    matches!(
+                        evidence.source_kind,
+                        EvidenceKind::Descriptor | EvidenceKind::Generated
+                    )
+                }));
+            }
+            for entity in [client, server] {
+                assert!(
+                    context
+                        .nodes
+                        .iter()
+                        .any(|node| { node.id == *entity && node.repository.as_deref().is_some() }),
+                    "missing repository attribution for {entity}"
+                );
+            }
+            let trace = store.trace("grpc-matrix", client, server, 32).unwrap();
+            assert!(trace.paths.iter().any(|path| {
+                path.nodes == [client.as_str(), operation.as_str(), server.as_str()]
+            }));
+            let impact = store.impact("grpc-matrix", &contract, 32).unwrap();
+            for entity in [client, server] {
+                assert!(
+                    impact
+                        .affected
+                        .iter()
+                        .any(|affected| affected.entity == *entity),
+                    "contract impact did not reach {entity}"
+                );
+            }
+        }
+
+        let rust_cache_entries = scheduler.rust_cache.lock().unwrap().len();
+        let elixir_cache_entries = scheduler.elixir_cache.lock().unwrap().len();
+        fs::remove_file(&contract_path).unwrap();
+        let without_contract = registry
+            .register("grpc-matrix".into(), repositories.clone(), Vec::new())
+            .unwrap();
+        scheduler.index(&store, &without_contract).unwrap();
+        assert_eq!(
+            scheduler.rust_cache.lock().unwrap().len(),
+            rust_cache_entries
+        );
+        assert_eq!(
+            scheduler.elixir_cache.lock().unwrap().len(),
+            elixir_cache_entries
+        );
+        let inspection = format!("{:?}", store.inspect_grpc_bindings().unwrap());
+        assert!(inspection.contains("grpc.contract_unmatched"));
+        assert!(!format!("{:?}", store.inspect_relations().unwrap()).contains("calls_rpc"));
+
+        fs::write(&contract_path, contract_source).unwrap();
+        let restored = registry
+            .register("grpc-matrix".into(), repositories, Vec::new())
+            .unwrap();
+        scheduler.index(&store, &restored).unwrap();
+        assert_eq!(
+            scheduler.rust_cache.lock().unwrap().len(),
+            rust_cache_entries
+        );
+        assert_eq!(
+            scheduler.elixir_cache.lock().unwrap().len(),
+            elixir_cache_entries
+        );
+        for (method, _, _) in &bindings {
+            let operation = format!("grpc://phase5.v1.Bridge/{method}");
+            let context = store.context("grpc-matrix", &operation).unwrap();
+            assert!(
+                context
+                    .edges
+                    .iter()
+                    .any(|edge| edge.kind == RelationKind::BindsContract)
+            );
+        }
+
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

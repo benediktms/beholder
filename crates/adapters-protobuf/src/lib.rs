@@ -1,65 +1,90 @@
-use beholder_domain::{Observation, StructuralRelation};
+use beholder_domain::{
+    EntityFact, EntityKind, EntityMetadata, Observation, ProtoTypeKind, RpcCardinality,
+    StructuralRelation,
+};
 use prost::Message;
 use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
 
-pub const FRONTEND_VERSION: &str = "1";
+mod compiler;
 
-pub fn observations(descriptor_set: &[u8]) -> Result<Vec<Observation>, String> {
-    let descriptor_set = FileDescriptorSet::decode(descriptor_set)
-        .map_err(|error| format!("invalid FileDescriptorSet: {error}"))?;
-    let mut observations = Vec::new();
-    for file in descriptor_set.file {
-        append_file(file, &mut observations)?;
-    }
-    Ok(observations)
+pub use compiler::SourceCompiler;
+
+pub const FRONTEND_VERSION: &str = "2";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtobufFacts {
+    pub entities: Vec<EntityFact>,
+    pub observations: Vec<Observation>,
 }
 
-fn append_file(
-    file: FileDescriptorProto,
-    observations: &mut Vec<Observation>,
-) -> Result<(), String> {
+pub fn facts(descriptor_set: &[u8]) -> Result<ProtobufFacts, String> {
+    let descriptor_set = FileDescriptorSet::decode(descriptor_set)
+        .map_err(|error| format!("invalid FileDescriptorSet: {error}"))?;
+    let mut facts = ProtobufFacts {
+        entities: Vec::new(),
+        observations: Vec::new(),
+    };
+    for file in descriptor_set.file {
+        append_file(file, &mut facts)?;
+    }
+    Ok(facts)
+}
+
+pub fn observations(descriptor_set: &[u8]) -> Result<Vec<Observation>, String> {
+    Ok(facts(descriptor_set)?.observations)
+}
+
+fn append_file(file: FileDescriptorProto, facts: &mut ProtobufFacts) -> Result<(), String> {
     let path = required(file.name, "file name")?;
-    let file_id = format!("proto-file://{path}");
     let package = file.package.unwrap_or_default();
 
     for message in file.message_type {
-        append_message(&file_id, &package, message, &path, observations)?;
+        append_message(None, &package, message, &path, facts)?;
     }
     for r#enum in file.enum_type {
         let name = qualified(&package, required(r#enum.name, "enum name")?);
-        observations.push(descriptor(
-            file_id.as_str(),
-            StructuralRelation::Defines,
-            format!("proto-enum://{name}"),
-            &path,
-        ));
+        push_entity(
+            facts,
+            format!("proto-type://{name}"),
+            EntityKind::ProtoType,
+            Some(EntityMetadata::ProtoType {
+                kind: ProtoTypeKind::Enum,
+            }),
+        )?;
     }
     for service in file.service {
         let service_name = qualified(&package, required(service.name, "service name")?);
         let service_id = format!("proto-service://{service_name}");
-        observations.push(descriptor(
-            file_id.as_str(),
-            StructuralRelation::Defines,
-            service_id.as_str(),
-            &path,
-        ));
+        push_entity(facts, service_id.as_str(), EntityKind::ProtoService, None)?;
         for method in service.method {
+            let cardinality = match (method.client_streaming(), method.server_streaming()) {
+                (false, false) => RpcCardinality::Unary,
+                (true, false) => RpcCardinality::ClientStreaming,
+                (false, true) => RpcCardinality::ServerStreaming,
+                (true, true) => RpcCardinality::BidirectionalStreaming,
+            };
             let method_name = required(method.name, "method name")?;
-            let rpc_id = format!("grpc://{service_name}/{method_name}");
-            observations.push(descriptor(
+            let method_id = format!("proto-method://{service_name}/{method_name}");
+            push_entity(
+                facts,
+                method_id.as_str(),
+                EntityKind::ProtoMethod,
+                Some(EntityMetadata::ProtoMethod { cardinality }),
+            )?;
+            facts.observations.push(descriptor(
                 service_id.as_str(),
                 StructuralRelation::Defines,
-                rpc_id.as_str(),
+                method_id.as_str(),
                 &path,
             ));
-            observations.push(descriptor(
-                rpc_id.as_str(),
+            facts.observations.push(descriptor(
+                method_id.as_str(),
                 StructuralRelation::RequestType,
                 message_id(required(method.input_type, "method input type")?),
                 &path,
             ));
-            observations.push(descriptor(
-                rpc_id.as_str(),
+            facts.observations.push(descriptor(
+                method_id.as_str(),
                 StructuralRelation::ResponseType,
                 message_id(required(method.output_type, "method output type")?),
                 &path,
@@ -70,38 +95,59 @@ fn append_file(
 }
 
 fn append_message(
-    parent_id: &str,
+    parent_id: Option<&str>,
     scope: &str,
     message: DescriptorProto,
     path: &str,
-    observations: &mut Vec<Observation>,
+    facts: &mut ProtobufFacts,
 ) -> Result<(), String> {
     let name = qualified(scope, required(message.name, "message name")?);
-    let message_id = format!("proto-message://{name}");
-    observations.push(descriptor(
-        parent_id,
-        StructuralRelation::Defines,
+    let message_id = format!("proto-type://{name}");
+    push_entity(
+        facts,
         message_id.as_str(),
-        path,
-    ));
+        EntityKind::ProtoType,
+        Some(EntityMetadata::ProtoType {
+            kind: ProtoTypeKind::Message,
+        }),
+    )?;
+    if let Some(parent_id) = parent_id {
+        facts.observations.push(descriptor(
+            parent_id,
+            StructuralRelation::Defines,
+            message_id.as_str(),
+            path,
+        ));
+    }
     for field in message.field {
         let field_name = required(field.name, "field name")?;
-        observations.push(descriptor(
-            format!("proto-field://{name}/{field_name}"),
+        let field_id = format!("proto-field://{name}/{field_name}");
+        push_entity(facts, field_id.as_str(), EntityKind::ProtoField, None)?;
+        facts.observations.push(descriptor(
+            field_id,
             StructuralRelation::FieldOf,
             message_id.as_str(),
             path,
         ));
     }
     for nested in message.nested_type {
-        append_message(&message_id, &name, nested, path, observations)?;
+        append_message(Some(&message_id), &name, nested, path, facts)?;
     }
     for r#enum in message.enum_type {
         let enum_name = qualified(&name, required(r#enum.name, "enum name")?);
-        observations.push(descriptor(
+        let enum_id = format!("proto-type://{enum_name}");
+        push_entity(
+            facts,
+            enum_id.as_str(),
+            EntityKind::ProtoType,
+            Some(EntityMetadata::ProtoType {
+                kind: ProtoTypeKind::Enum,
+            }),
+        )?;
+        facts.observations.push(descriptor(
             message_id.as_str(),
             StructuralRelation::Defines,
-            format!("proto-enum://{enum_name}"),
+            enum_id,
             path,
         ));
     }
@@ -132,18 +178,26 @@ fn qualified(scope: &str, name: String) -> String {
 }
 
 fn message_id(name: String) -> String {
-    format!("proto-message://{}", name.trim_start_matches('.'))
+    format!("proto-type://{}", name.trim_start_matches('.'))
+}
+
+fn push_entity(
+    facts: &mut ProtobufFacts,
+    id: impl Into<beholder_domain::EntityId>,
+    kind: EntityKind,
+    metadata: Option<EntityMetadata>,
+) -> Result<(), String> {
+    let entity = EntityFact::new(id, kind, metadata).map_err(str::to_owned)?;
+    if !facts.entities.contains(&entity) {
+        facts.entities.push(entity);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_adapters_mnestic::SemanticStore;
-    use beholder_domain::{
-        Confidence, LogicalRepository, Provenance, RepositoryFacts, RepositoryState,
-        SemanticRelation, WorkspaceView,
-    };
-    use beholder_dto::{EntityKind, EvidenceKind, RelationKind};
+    use beholder_domain::{Confidence, Provenance, SemanticRelation};
     use prost_types::{
         EnumDescriptorProto, FieldDescriptorProto, MethodDescriptorProto, ServiceDescriptorProto,
     };
@@ -186,8 +240,9 @@ mod tests {
         }
         .encode_to_vec();
 
-        let facts = observations(&bytes).unwrap();
+        let facts = facts(&bytes).unwrap();
         let triples = facts
+            .observations
             .iter()
             .map(|fact| (fact.from.as_str(), fact.relation.as_str(), fact.to.as_str()))
             .collect::<BTreeSet<_>>();
@@ -195,33 +250,47 @@ mod tests {
         assert!(triples.contains(&(
             "proto-field://pricing.v1.Quote/amount",
             "field_of",
-            "proto-message://pricing.v1.Quote",
+            "proto-type://pricing.v1.Quote",
         )));
         assert!(triples.contains(&(
-            "proto-message://pricing.v1.Quote",
+            "proto-type://pricing.v1.Quote",
             "defines",
-            "proto-message://pricing.v1.Quote.Tax",
+            "proto-type://pricing.v1.Quote.Tax",
         )));
         assert!(triples.contains(&(
-            "proto-message://pricing.v1.Quote",
+            "proto-type://pricing.v1.Quote",
             "defines",
-            "proto-enum://pricing.v1.Quote.Status",
+            "proto-type://pricing.v1.Quote.Status",
         )));
         assert!(triples.contains(&(
-            "grpc://pricing.v1.Pricing/GetQuote",
+            "proto-method://pricing.v1.Pricing/GetQuote",
             "request_type",
-            "proto-message://pricing.v1.Quote",
+            "proto-type://pricing.v1.Quote",
         )));
         assert!(triples.contains(&(
-            "grpc://pricing.v1.Pricing/GetQuote",
+            "proto-method://pricing.v1.Pricing/GetQuote",
             "response_type",
-            "proto-message://pricing.v1.Quote",
+            "proto-type://pricing.v1.Quote",
         )));
-        assert!(facts.iter().all(|fact| {
+        assert!(facts.observations.iter().all(|fact| {
             fact.confidence == Confidence::Exact
                 && fact.provenance == Provenance::Descriptor
                 && fact.evidence.as_str() == "pricing/v1/pricing.proto"
                 && matches!(fact.relation, SemanticRelation::Structural(_))
+        }));
+        assert!(facts.entities.iter().any(|entity| {
+            entity.id.as_str() == "proto-type://pricing.v1.Quote"
+                && entity.metadata
+                    == Some(EntityMetadata::ProtoType {
+                        kind: ProtoTypeKind::Message,
+                    })
+        }));
+        assert!(facts.entities.iter().any(|entity| {
+            entity.id.as_str() == "proto-method://pricing.v1.Pricing/GetQuote"
+                && entity.metadata
+                    == Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::Unary,
+                    })
         }));
     }
 
@@ -239,7 +308,40 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_facts_survive_typed_context_mapping() {
+    fn indexes_streaming_method_cardinality() {
+        let bytes = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("events.proto".into()),
+                package: Some("events.v1".into()),
+                service: vec![ServiceDescriptorProto {
+                    name: Some("Events".into()),
+                    method: vec![MethodDescriptorProto {
+                        name: Some("Sync".into()),
+                        input_type: Some(".events.v1.Event".into()),
+                        output_type: Some(".events.v1.Event".into()),
+                        client_streaming: Some(true),
+                        server_streaming: Some(true),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
+        let facts = facts(&bytes).unwrap();
+        assert!(facts.entities.iter().any(|entity| {
+            entity.id.as_str() == "proto-method://events.v1.Events/Sync"
+                && entity.metadata
+                    == Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::BidirectionalStreaming,
+                    })
+        }));
+    }
+
+    #[test]
+    fn descriptor_facts_use_transport_neutral_contract_ids() {
         let bytes = FileDescriptorSet {
             file: vec![FileDescriptorProto {
                 name: Some("pricing.proto".into()),
@@ -262,41 +364,23 @@ mod tests {
             }],
         }
         .encode_to_vec();
-        let state = RepositoryState {
-            repository: LogicalRepository {
-                identity: "contracts".into(),
-            },
-            head: Some("abc123".into()),
-            fingerprint: "descriptor-state".into(),
-        };
-        let view = WorkspaceView::new("main", "protobuf:1", vec![state.clone()]).unwrap();
-        let store = SemanticStore::memory().unwrap();
-        store
-            .publish(
-                &view,
-                &[RepositoryFacts {
-                    state,
-                    analysis_identity: "protobuf:1".into(),
-                    observations: observations(&bytes).unwrap(),
-                }],
-                &[],
-            )
-            .unwrap();
-
-        let context = store
-            .context("main", "grpc://pricing.v1.Pricing/GetQuote")
-            .unwrap();
-        assert_eq!(context.root.kind, EntityKind::Rpc);
-        assert_eq!(context.root.name, "Pricing.GetQuote");
-        assert!(context.nodes.iter().any(|node| {
-            node.id == "proto-message://pricing.v1.Quote" && node.kind == EntityKind::ProtoMessage
+        let facts = facts(&bytes).unwrap();
+        assert!(facts.entities.iter().any(|entity| {
+            entity.id.as_str() == "proto-method://pricing.v1.Pricing/GetQuote"
+                && entity.kind == EntityKind::ProtoMethod
         }));
-        assert!(context.edges.iter().any(|edge| {
-            edge.kind == RelationKind::RequestType
-                && edge.evidence.iter().all(|evidence| {
-                    evidence.source_kind == EvidenceKind::Descriptor
-                        && evidence.path.as_deref() == Some("pricing.proto")
-                })
+        assert!(
+            facts
+                .entities
+                .iter()
+                .all(|entity| !entity.id.as_str().starts_with("grpc://"))
+        );
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "proto-method://pricing.v1.Pricing/GetQuote"
+                && observation.relation
+                    == SemanticRelation::Structural(StructuralRelation::RequestType)
+                && observation.to.as_str() == "proto-type://pricing.v1.Quote"
+                && observation.evidence.as_str() == "pricing.proto"
         }));
     }
 }
