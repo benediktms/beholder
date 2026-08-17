@@ -132,18 +132,18 @@ fn context_human(result: &ContextResult, include_tests: bool) -> String {
         if edge.to == result.root.id && is_primary(&entities, &edge.from, include_tests) {
             incoming.push(format!(
                 "  ← {} [{}]",
-                name(&entities, &edge.from),
+                context_name(&entities, &edge.from),
                 incoming_relation(edge.kind.as_str())
             ));
         } else if edge.from == result.root.id && is_primary(&entities, &edge.to, include_tests) {
             outgoing.push(format!(
                 "  → {} [{}]",
-                name(&entities, &edge.to),
+                context_name(&entities, &edge.to),
                 edge.kind.as_str()
             ));
         }
     }
-    let mut output = format!("{}\n", result.root.name);
+    let mut output = format!("{}\n", context_name(&entities, &result.root.id));
     if !incoming.is_empty() {
         output.push_str("\nincoming\n");
         output.push_str(&incoming.join("\n"));
@@ -542,6 +542,32 @@ fn name(entities: &BTreeMap<&str, &EntityRef>, id: &str) -> String {
         .unwrap_or_else(|| id.into())
 }
 
+fn context_name(entities: &BTreeMap<&str, &EntityRef>, id: &str) -> String {
+    entities.get(id).map_or_else(
+        || id.into(),
+        |entity| {
+            let repository = entity.repository.as_deref().unwrap_or("cross-repository");
+            match containing_scope(entity) {
+                Some(scope) => format!("{repository} · {scope} · {}", entity.name),
+                None => format!("{repository} · {}", entity.name),
+            }
+        },
+    )
+}
+
+fn containing_scope(entity: &EntityRef) -> Option<&str> {
+    let repository = entity.repository.as_deref()?;
+    let symbol = entity
+        .id
+        .strip_prefix(&format!("repo://{repository}/"))?
+        .split_once('/')?
+        .1;
+    let scope = symbol.strip_suffix(&format!("/{}", entity.name))?;
+    scope
+        .rsplit('/')
+        .find(|segment| !matches!(*segment, "callback" | "field"))
+}
+
 fn evidence_label(evidence: &EvidenceRef) -> String {
     match (&evidence.path, evidence.line, &evidence.detail) {
         (Some(path), Some(line), _) => format!("{path}:{line}"),
@@ -791,7 +817,34 @@ mod tests {
         assert!(
             context(&result, OutputMode::Human.into())
                 .unwrap()
-                .contains("← CheckoutPage [called by]")
+                .contains("← repo · CheckoutPage [called by]")
+        );
+    }
+
+    #[test]
+    fn context_names_include_repository_and_containing_scope() {
+        let elixir = entity(
+            "repo://repo/elixir/Example.Client/run/1",
+            "run/1",
+            EntityKind::Callable,
+            false,
+        );
+        let rust = entity(
+            "repo://repo/rust/src/client/impl/Client/run",
+            "run",
+            EntityKind::Callable,
+            false,
+        );
+        let nodes = [elixir, rust];
+        let entities = entities(&nodes);
+
+        assert_eq!(
+            context_name(&entities, "repo://repo/elixir/Example.Client/run/1"),
+            "repo · Example.Client · run/1"
+        );
+        assert_eq!(
+            context_name(&entities, "repo://repo/rust/src/client/impl/Client/run"),
+            "repo · Client · run"
         );
     }
 
