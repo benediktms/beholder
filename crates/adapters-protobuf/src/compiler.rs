@@ -356,6 +356,17 @@ fn modules(repository: &Path, files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Module
                 if let Some((path, bytes)) = lock {
                     config_inputs.push((path.clone(), bytes.clone()));
                 }
+                let resolver_roots = roots
+                    .iter()
+                    .map(|root| repository.join(root))
+                    .collect::<Vec<_>>();
+                config_inputs.extend(
+                    protos
+                        .iter()
+                        .filter(|(path, _)| owning_root(path, &roots).is_some())
+                        .map(|(path, bytes)| ((*path).clone(), (*bytes).clone())),
+                );
+                config_inputs.sort_by(|left, right| left.0.cmp(&right.0));
                 Ok(module_configs
                     .into_iter()
                     .zip(roots)
@@ -380,21 +391,14 @@ fn modules(repository: &Path, files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Module
                         if selected.is_empty() {
                             return None;
                         }
-                        let mut inputs = config_inputs.clone();
-                        inputs.extend(
-                            selected
-                                .iter()
-                                .map(|(path, bytes)| ((*path).clone(), (*bytes).clone())),
-                        );
-                        inputs.sort_by(|left, right| left.0.cmp(&right.0));
                         Some(Module {
                             name: root.clone(),
-                            roots: vec![repository.join(root)],
+                            roots: resolver_roots.clone(),
                             protos: selected
                                 .into_iter()
                                 .map(|(path, _)| repository.join(path))
                                 .collect(),
-                            inputs,
+                            inputs: config_inputs.clone(),
                             dependencies: dependencies.clone(),
                         })
                     })
@@ -624,6 +628,40 @@ mod tests {
                 .iter()
                 .any(|entity| { entity.id.as_str() == "proto-type://fresha.types.UUID" })
         );
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn resolves_imports_from_sibling_buf_modules() {
+        let state = temporary("protobuf-sibling-modules");
+        let repository = state.join("repository");
+        fs::create_dir_all(repository.join("api")).unwrap();
+        fs::create_dir_all(repository.join("types")).unwrap();
+        let config = b"version: v2\nmodules:\n  - path: api\n  - path: types\n".to_vec();
+        let service = b"syntax = \"proto3\"; package example; import \"request.proto\"; service Example { rpc Get(Request) returns (Request); }".to_vec();
+        let request = b"syntax = \"proto3\"; package example; message Request {}".to_vec();
+        fs::write(repository.join("buf.yaml"), &config).unwrap();
+        fs::write(repository.join("api/service.proto"), &service).unwrap();
+        fs::write(repository.join("types/request.proto"), &request).unwrap();
+
+        let descriptors = SourceCompiler::new(state.join("cache"))
+            .compile_repository(
+                &repository,
+                &[
+                    (PathBuf::from("buf.yaml"), config),
+                    (PathBuf::from("api/service.proto"), service),
+                    (PathBuf::from("types/request.proto"), request),
+                ],
+            )
+            .unwrap();
+
+        assert!(descriptors.iter().any(|descriptor| {
+            facts(descriptor)
+                .unwrap()
+                .entities
+                .iter()
+                .any(|entity| entity.id.as_str() == "proto-method://example.Example/Get")
+        }));
         fs::remove_dir_all(state).unwrap();
     }
 }
