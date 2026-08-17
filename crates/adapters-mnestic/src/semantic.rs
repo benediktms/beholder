@@ -184,6 +184,11 @@ fn distances(
     for edge in edges {
         let (from, to) = match direction {
             TraversalDirection::Outgoing => (edge.from.as_str(), edge.to.as_str()),
+            TraversalDirection::Incoming
+                if edge.kind == RelationKind::ImplementedBy && edge.from.starts_with("grpc://") =>
+            {
+                (edge.from.as_str(), edge.to.as_str())
+            }
             TraversalDirection::Incoming => (edge.to.as_str(), edge.from.as_str()),
         };
         adjacent.entry(from).or_default().push(to);
@@ -434,6 +439,7 @@ fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error
             ) {
                 ("callable", "") => (EntityKind::Callable, None),
                 ("graphql_field", "") => (EntityKind::GraphqlField, None),
+                ("grpc_operation", "") => (EntityKind::Rpc, None),
                 ("kafka_topic", "") => (EntityKind::KafkaTopic, None),
                 ("namespace", "") => (EntityKind::Namespace, None),
                 ("proto_field", "") => (EntityKind::ProtoField, None),
@@ -575,7 +581,11 @@ fn is_test_entity(id: &str) -> bool {
 }
 
 fn infer_kind(id: &str) -> EntityKind {
-    if id.starts_with("proto-method://") || id.starts_with("rpc/") || id.starts_with("rpc://") {
+    if id.starts_with("grpc://")
+        || id.starts_with("proto-method://")
+        || id.starts_with("rpc/")
+        || id.starts_with("rpc://")
+    {
         EntityKind::Rpc
     } else if id.starts_with("graphql-field://") {
         EntityKind::GraphqlField
@@ -638,6 +648,7 @@ fn entity_name(id: &str) -> String {
     }
     if let Some((service, method)) = id
         .strip_prefix("proto-method://")
+        .or_else(|| id.strip_prefix("grpc://"))
         .and_then(|id| id.split_once('/'))
     {
         return format!(

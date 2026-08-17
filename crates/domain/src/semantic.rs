@@ -198,7 +198,36 @@ pub struct RepositoryFacts {
     pub state: RepositoryState,
     pub analysis_identity: String,
     pub entities: Vec<EntityFact>,
+    pub grpc_bindings: Vec<GrpcBindingCandidate>,
     pub observations: Vec<Observation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GrpcBindingCandidate {
+    pub local_symbol: EntityId,
+    pub role: GrpcBindingRole,
+    pub service: String,
+    pub method: String,
+    pub cardinality: RpcCardinality,
+    pub evidence: Evidence,
+    pub confidence: Confidence,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcBindingRole {
+    Client,
+    Server,
+}
+
+impl GrpcBindingRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -212,6 +241,7 @@ pub struct EntityFact {
 pub enum EntityKind {
     Callable,
     GraphqlField,
+    GrpcOperation,
     KafkaTopic,
     Namespace,
     ProtoField,
@@ -253,6 +283,7 @@ impl EntityFact {
             | (
                 EntityKind::Callable
                 | EntityKind::GraphqlField
+                | EntityKind::GrpcOperation
                 | EntityKind::KafkaTopic
                 | EntityKind::Namespace
                 | EntityKind::ProtoField

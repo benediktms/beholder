@@ -97,6 +97,8 @@ pub(super) fn entity_facts(
          requested[id] <- $entities\n\
          ?[id, kind, metadata] := requested[id], selected_state[state], \
              *state_entity{state, id, kind, metadata}\n\
+         ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
+             *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
          :order id",
         [("entities", entities)],
     )
@@ -124,12 +126,43 @@ pub(super) fn inspect_observations(
     )?)
 }
 
+pub(super) fn inspect_grpc_bindings(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
+    Ok(db.run_script(
+        "selected[view, revision, state, local_symbol, role, service, method, cardinality, evidence, confidence, provenance] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_state{view, revision, state}, \
+             *state_grpc_binding_candidate{\
+                 state, local_symbol, role, service, method, evidence, cardinality, confidence, provenance\
+             }\n\
+         diagnostic[view, revision, local_symbol, role, service, method, evidence, code, detail] := \
+             *analysis_revision_grpc_diagnostic{\
+                 view, revision, local_symbol, role, service, method, evidence, code, detail\
+             }\n\
+         ?[view, local_symbol, role, service, method, cardinality, evidence, confidence, provenance, status, code, detail] := \
+             selected[view, revision, _, local_symbol, role, service, method, cardinality, evidence, confidence, provenance], \
+             diagnostic[view, revision, local_symbol, role, service, method, evidence, code, detail], \
+             status = 'unmatched'\n\
+         ?[view, local_symbol, role, service, method, cardinality, evidence, confidence, provenance, status, code, detail] := \
+             selected[view, revision, _, local_symbol, role, service, method, cardinality, evidence, confidence, provenance], \
+             not diagnostic[view, revision, local_symbol, role, service, method, evidence, _, _], \
+             status = 'resolved', code = '', detail = ''\n\
+         :order view, service, method, role, local_symbol",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?)
+}
+
 pub(super) fn context(
     db: &impl QueryRunner,
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(db, view, CONTEXT_QUERY, [("entity", entity.into())])
+    query(
+        db,
+        view,
+        &format!("{DIRECT_RULES}\n{CONTEXT_QUERY}"),
+        [("entity", entity.into())],
+    )
 }
 
 pub(super) fn trace(
@@ -200,6 +233,7 @@ mod tests {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             entities: Vec::new(),
+            grpc_bindings: Vec::new(),
             observations,
         }
     }

@@ -42,6 +42,61 @@ pub(super) const CREATE_ENTITY_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_GRPC_BINDING_SCHEMA: &str = r#"
+:create state_grpc_binding_candidate {
+    state: String,
+    local_symbol: String,
+    role: String,
+    service: String,
+    method: String,
+    evidence: String,
+    =>
+    cardinality: String,
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_REVISION_OBSERVATION_SCHEMA: &str = r#"
+:create analysis_revision_observation {
+    view: String,
+    revision: Int,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_REVISION_ENTITY_SCHEMA: &str = r#"
+:create analysis_revision_entity {
+    view: String,
+    revision: Int,
+    id: String,
+    =>
+    kind: String,
+    metadata: String,
+}
+"#;
+
+pub(super) const CREATE_GRPC_DIAGNOSTIC_SCHEMA: &str = r#"
+:create analysis_revision_grpc_diagnostic {
+    view: String,
+    revision: Int,
+    local_symbol: String,
+    role: String,
+    service: String,
+    method: String,
+    evidence: String,
+    =>
+    code: String,
+    detail: String,
+}
+"#;
+
 pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \
@@ -152,47 +207,11 @@ pub(super) const SEED_STATES: &str = r#"
 pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
 pub(super) const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
 pub(super) const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
-pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
-         *analysis_revision{view: $view, revision}, \
-         *analysis_revision_state{view: $view, revision, state}\n\
-     context_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
-         *analysis_revision{view: $view, revision}, \
-         *analysis_revision_dependency_override{\
-             view: $view, revision, from, relation, unresolved_to, resolved_to, evidence\
-         }, \
-         *analysis_revision_dependency_override_metadata{\
-             view: $view, revision, from, relation, unresolved_to, confidence, provenance\
-         }\n\
-     overridden[from, relation, unresolved_to, evidence] := \
-         context_override[from, relation, unresolved_to, _, evidence, _, _]\n\
+pub(super) const CONTEXT_QUERY: &str = "\
      ?[direction, relation, related, evidence, confidence, provenance] := \
-         selected_state[state], \
-         *state_observation{\
-             state, from: $entity, relation, to: related, evidence\
-         }, \
-         *state_observation_metadata{\
-             state, from: $entity, relation, to: related, confidence, provenance\
-         }, \
-         not overridden[$entity, relation, related, evidence], \
+         effective_observation[$entity, related, relation, evidence, confidence, provenance], \
          direction = 'outgoing'\n\
      ?[direction, relation, related, evidence, confidence, provenance] := \
-         context_override[\
-             $entity, relation, _, related, evidence, confidence, provenance\
-         ], \
-         direction = 'outgoing'\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         selected_state[state], \
-         *state_observation:by_to{\
-             state, from: related, relation, to: $entity, evidence\
-         }, \
-         *state_observation_metadata:by_to{\
-             state, from: related, relation, to: $entity, confidence, provenance\
-         }, \
-         not overridden[related, relation, $entity, evidence], \
-         direction = 'incoming'\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         context_override[\
-             related, relation, _, $entity, evidence, confidence, provenance\
-         ], \
+         effective_observation[related, $entity, relation, evidence, confidence, provenance], \
          direction = 'incoming'\n\
      :order direction, relation, related";

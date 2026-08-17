@@ -4,8 +4,8 @@ use super::{
     database::{benchmark_database, memory_database, persistent_database},
     inspection::{InspectionResult, inspection_result},
     query::{
-        analysis_revision, context, dependencies, entity_facts, impact, inspect_observations,
-        inspect_relations, inspect_revisions, trace,
+        analysis_revision, context, dependencies, entity_facts, impact, inspect_grpc_bindings,
+        inspect_observations, inspect_relations, inspect_revisions, trace,
     },
     storage::{garbage_collect, publish_observations, view_matches},
 };
@@ -161,6 +161,10 @@ impl SemanticStore {
         relation: Option<&str>,
     ) -> Result<InspectionResult, Box<dyn Error>> {
         inspect_observations(&self.read_db, relation).map(inspection_result)
+    }
+
+    pub fn inspect_grpc_bindings(&self) -> Result<InspectionResult, Box<dyn Error>> {
+        inspect_grpc_bindings(&self.read_db).map(inspection_result)
     }
 
     pub fn context(&self, view: &str, entity: &str) -> Result<ContextResult, Box<dyn Error>> {
@@ -352,6 +356,7 @@ mod tests {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             entities: Vec::new(),
+            grpc_bindings: Vec::new(),
             observations,
         }
     }

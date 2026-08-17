@@ -1,7 +1,8 @@
 use super::schema::*;
 use beholder_domain::{
-    DependencyOverride, EntityFact, EntityKind, EntityMetadata, FactChanges, Observation,
-    ProtoTypeKind, RepositoryFacts, RpcCardinality, WorkspaceView,
+    DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
+    GrpcBindingCandidate, GrpcBindingRole, Observation, ProtoTypeKind, RepositoryFacts,
+    RpcCardinality, SemanticRelation, WorkspaceView,
 };
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
@@ -71,6 +72,7 @@ fn entity_kind(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Callable => "callable",
         EntityKind::GraphqlField => "graphql_field",
+        EntityKind::GrpcOperation => "grpc_operation",
         EntityKind::KafkaTopic => "kafka_topic",
         EntityKind::Namespace => "namespace",
         EntityKind::ProtoField => "proto_field",
@@ -78,6 +80,15 @@ fn entity_kind(kind: EntityKind) -> &'static str {
         EntityKind::ProtoService => "proto_service",
         EntityKind::ProtoType => "proto_type",
         EntityKind::Service => "service",
+    }
+}
+
+fn rpc_cardinality(cardinality: RpcCardinality) -> &'static str {
+    match cardinality {
+        RpcCardinality::BidirectionalStreaming => "bidirectional_streaming",
+        RpcCardinality::ClientStreaming => "client_streaming",
+        RpcCardinality::ServerStreaming => "server_streaming",
+        RpcCardinality::Unary => "unary",
     }
 }
 
@@ -131,6 +142,40 @@ pub(super) fn store_entities(
     Ok(())
 }
 
+pub(super) fn store_grpc_bindings(
+    transaction: &MultiTransaction,
+    state: &str,
+    candidates: &[GrpcBindingCandidate],
+) -> Result<(), Box<dyn Error>> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let rows = candidates
+        .iter()
+        .map(|candidate| {
+            DataValue::List(vec![
+                state.into(),
+                candidate.local_symbol.as_str().into(),
+                candidate.role.as_str().into(),
+                candidate.service.as_str().into(),
+                candidate.method.as_str().into(),
+                candidate.evidence.as_str().into(),
+                rpc_cardinality(candidate.cardinality).into(),
+                candidate.confidence.score().into(),
+                candidate.provenance.as_str().into(),
+            ])
+        })
+        .collect();
+    transaction.run_script(
+        "?[state, local_symbol, role, service, method, evidence, cardinality, confidence, provenance] <- $rows\n\
+         :put state_grpc_binding_candidate {\
+             state, local_symbol, role, service, method, evidence => cardinality, confidence, provenance\
+         }",
+        BTreeMap::from([("rows".into(), DataValue::List(rows))]),
+    )?;
+    Ok(())
+}
+
 pub(super) fn hash_string(hash: &mut Sha256, value: &str) {
     hash.update(value.len().to_le_bytes());
     hash.update(value.as_bytes());
@@ -138,6 +183,8 @@ pub(super) fn hash_string(hash: &mut Sha256, value: &str) {
 
 type NormalizedObservations = BTreeMap<(String, String, String), (String, u64, String)>;
 type NormalizedEntities = BTreeMap<String, (String, String)>;
+type NormalizedGrpcBindings =
+    BTreeMap<(String, String, String, String, String), (String, u64, String)>;
 
 fn normalized_entities(facts: &RepositoryFacts) -> NormalizedEntities {
     facts
@@ -149,6 +196,29 @@ fn normalized_entities(facts: &RepositoryFacts) -> NormalizedEntities {
                 (
                     entity_kind(entity.kind).into(),
                     entity_metadata(entity.metadata).into(),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn normalized_grpc_bindings(facts: &RepositoryFacts) -> NormalizedGrpcBindings {
+    facts
+        .grpc_bindings
+        .iter()
+        .map(|candidate| {
+            (
+                (
+                    candidate.local_symbol.as_str().into(),
+                    candidate.role.as_str().into(),
+                    candidate.service.clone(),
+                    candidate.method.clone(),
+                    candidate.evidence.as_str().into(),
+                ),
+                (
+                    rpc_cardinality(candidate.cardinality).into(),
+                    candidate.confidence.score().to_bits(),
+                    candidate.provenance.as_str().into(),
                 ),
             )
         })
@@ -191,6 +261,22 @@ pub(super) fn analyzed_state(facts: &RepositoryFacts) -> String {
         for value in [&id, &kind, &metadata] {
             hash_string(&mut hash, value);
         }
+    }
+    for ((local, role, service, method, evidence), (cardinality, confidence, provenance)) in
+        normalized_grpc_bindings(facts)
+    {
+        for value in [
+            &local,
+            &role,
+            &service,
+            &method,
+            &evidence,
+            &cardinality,
+            &provenance,
+        ] {
+            hash_string(&mut hash, value);
+        }
+        hash.update(confidence.to_le_bytes());
     }
     format!("{}:{:x}", facts.state.fingerprint, hash.finalize())
 }
@@ -279,10 +365,41 @@ pub(super) fn reusable_current_state(
         .iter()
         .map(|row| Ok((string(row, 0)?, (string(row, 1)?, string(row, 2)?))))
         .collect::<Result<NormalizedEntities, Box<dyn Error>>>()?;
-    Ok(
-        (stored == normalized_observations(facts) && stored_entities == normalized_entities(facts))
-            .then_some(state),
-    )
+    let stored_bindings = transaction.run_script(
+        "?[local_symbol, role, service, method, evidence, cardinality, confidence, provenance] := \
+             *state_grpc_binding_candidate{\
+                 state: $state, local_symbol, role, service, method, evidence, cardinality, \
+                 confidence, provenance\
+             }",
+        BTreeMap::from([("state".into(), state.clone().into())]),
+    )?;
+    let stored_bindings = stored_bindings
+        .rows
+        .iter()
+        .map(|row| {
+            Ok((
+                (
+                    string(row, 0)?,
+                    string(row, 1)?,
+                    string(row, 2)?,
+                    string(row, 3)?,
+                    string(row, 4)?,
+                ),
+                (
+                    string(row, 5)?,
+                    row[6]
+                        .get_float()
+                        .ok_or("stored gRPC binding contains a non-float confidence")?
+                        .to_bits(),
+                    string(row, 7)?,
+                ),
+            ))
+        })
+        .collect::<Result<NormalizedGrpcBindings, Box<dyn Error>>>()?;
+    Ok((stored == normalized_observations(facts)
+        && stored_entities == normalized_entities(facts)
+        && stored_bindings == normalized_grpc_bindings(facts))
+    .then_some(state))
 }
 
 pub(super) fn view_matches(db: &DbInstance, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
@@ -296,6 +413,192 @@ pub(super) fn view_matches(db: &DbInstance, view: &WorkspaceView) -> Result<bool
         ScriptMutability::Immutable,
     )?;
     Ok(rows.rows.first().is_some_and(|row| row[0] == true.into()))
+}
+
+#[derive(Default)]
+struct GrpcResolution {
+    entities: BTreeMap<String, EntityFact>,
+    observations: Vec<Observation>,
+    diagnostics: Vec<GrpcDiagnostic>,
+}
+
+struct GrpcDiagnostic {
+    candidate: GrpcBindingCandidate,
+    code: &'static str,
+    detail: String,
+}
+
+fn resolve_grpc_bindings(
+    repositories: &[RepositoryFacts],
+) -> Result<GrpcResolution, Box<dyn Error>> {
+    let contracts = repositories
+        .iter()
+        .flat_map(|facts| &facts.entities)
+        .filter_map(|entity| {
+            let EntityMetadata::ProtoMethod { cardinality } = entity.metadata? else {
+                return None;
+            };
+            let (service, method) = entity
+                .id
+                .as_str()
+                .strip_prefix("proto-method://")?
+                .split_once('/')?;
+            Some((
+                (
+                    service.to_owned(),
+                    method.to_owned(),
+                    rpc_cardinality(cardinality),
+                ),
+                entity.id.clone(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut resolution = GrpcResolution::default();
+    for candidate in repositories.iter().flat_map(|facts| &facts.grpc_bindings) {
+        if candidate.cardinality != RpcCardinality::Unary {
+            resolution.diagnostics.push(GrpcDiagnostic {
+                candidate: candidate.clone(),
+                code: "grpc.cardinality_unsupported",
+                detail: format!(
+                    "{} streaming is not supported in Phase 5",
+                    rpc_cardinality(candidate.cardinality)
+                ),
+            });
+            continue;
+        }
+        let Some(contract) = contracts.get(&(
+            candidate.service.clone(),
+            candidate.method.clone(),
+            rpc_cardinality(candidate.cardinality),
+        )) else {
+            resolution.diagnostics.push(GrpcDiagnostic {
+                candidate: candidate.clone(),
+                code: "grpc.contract_unmatched",
+                detail: "no matching Protobuf method in the workspace view".into(),
+            });
+            continue;
+        };
+        let operation = format!("grpc://{}/{}", candidate.service, candidate.method);
+        resolution.entities.insert(
+            operation.clone(),
+            EntityFact::new(operation.as_str(), EntityKind::GrpcOperation, None)?,
+        );
+        let observation = |from: &str, relation, to: &str| Observation {
+            from: from.into(),
+            relation: SemanticRelation::Dependency(relation),
+            to: to.into(),
+            evidence: candidate.evidence.clone(),
+            confidence: candidate.confidence,
+            provenance: candidate.provenance,
+        };
+        resolution.observations.push(observation(
+            &operation,
+            DependencyRelation::BindsContract,
+            contract.as_str(),
+        ));
+        resolution.observations.push(match candidate.role {
+            GrpcBindingRole::Client => observation(
+                candidate.local_symbol.as_str(),
+                DependencyRelation::CallsRpc,
+                &operation,
+            ),
+            GrpcBindingRole::Server => observation(
+                &operation,
+                DependencyRelation::ImplementedBy,
+                candidate.local_symbol.as_str(),
+            ),
+        });
+    }
+    Ok(resolution)
+}
+
+fn store_grpc_resolution(
+    transaction: &MultiTransaction,
+    view: &str,
+    resolution: &GrpcResolution,
+) -> Result<(), Box<dyn Error>> {
+    let revision = transaction
+        .run_script(
+            "?[revision] := *analysis_revision{view: $view, revision}",
+            BTreeMap::from([("view".into(), view.into())]),
+        )?
+        .rows
+        .first()
+        .and_then(|row| row[0].get_int())
+        .ok_or("published analysis revision is missing")?;
+    let entity_rows = resolution
+        .entities
+        .values()
+        .map(|entity| {
+            DataValue::List(vec![
+                view.into(),
+                revision.into(),
+                entity.id.as_str().into(),
+                entity_kind(entity.kind).into(),
+                entity_metadata(entity.metadata).into(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if !entity_rows.is_empty() {
+        transaction.run_script(
+            "?[view, revision, id, kind, metadata] <- $rows\n\
+             :put analysis_revision_entity {view, revision, id => kind, metadata}",
+            BTreeMap::from([("rows".into(), DataValue::List(entity_rows))]),
+        )?;
+    }
+    let observation_rows = resolution
+        .observations
+        .iter()
+        .map(|observation| {
+            DataValue::List(vec![
+                view.into(),
+                revision.into(),
+                observation.from.as_str().into(),
+                observation.relation.as_str().into(),
+                observation.to.as_str().into(),
+                observation.evidence.as_str().into(),
+                observation.confidence.score().into(),
+                observation.provenance.as_str().into(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if !observation_rows.is_empty() {
+        transaction.run_script(
+            "?[view, revision, from, relation, to, evidence, confidence, provenance] <- $rows\n\
+             :put analysis_revision_observation {\
+                 view, revision, from, relation, to, evidence => confidence, provenance\
+             }",
+            BTreeMap::from([("rows".into(), DataValue::List(observation_rows))]),
+        )?;
+    }
+    let diagnostic_rows = resolution
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let candidate = &diagnostic.candidate;
+            DataValue::List(vec![
+                view.into(),
+                revision.into(),
+                candidate.local_symbol.as_str().into(),
+                candidate.role.as_str().into(),
+                candidate.service.as_str().into(),
+                candidate.method.as_str().into(),
+                candidate.evidence.as_str().into(),
+                diagnostic.code.into(),
+                diagnostic.detail.as_str().into(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if !diagnostic_rows.is_empty() {
+        transaction.run_script(
+            "?[view, revision, local_symbol, role, service, method, evidence, code, detail] <- $rows\n\
+             :put analysis_revision_grpc_diagnostic {\
+                 view, revision, local_symbol, role, service, method, evidence => code, detail\
+             }",
+            BTreeMap::from([("rows".into(), DataValue::List(diagnostic_rows))]),
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn publish_observations(
@@ -318,6 +621,7 @@ pub(super) fn publish_observations(
     {
         return Err("repository facts do not match the workspace view".into());
     }
+    let resolution = resolve_grpc_bindings(repositories)?;
     let params = BTreeMap::from([
         ("view".into(), view.name.clone().into()),
         ("fingerprint".into(), view.fingerprint().into()),
@@ -361,6 +665,7 @@ pub(super) fn publish_observations(
     let next = repositories
         .iter()
         .flat_map(|facts| &facts.observations)
+        .chain(&resolution.observations)
         .map(|observation| {
             let from = observation.from.as_str().to_owned();
             let relation = observation.relation.as_str().to_owned();
@@ -401,6 +706,7 @@ pub(super) fn publish_observations(
         } else {
             store_observations(&transaction, &desired, &facts.observations)?;
             store_entities(&transaction, &desired, &facts.entities)?;
+            store_grpc_bindings(&transaction, &desired, &facts.grpc_bindings)?;
             desired
         };
         analyzed_states.push(state);
@@ -420,6 +726,7 @@ pub(super) fn publish_observations(
         params,
     )?;
     store_repository_states(&transaction, view, repositories, &analyzed_states)?;
+    store_grpc_resolution(&transaction, &view.name, &resolution)?;
     for override_ in overrides {
         let params = BTreeMap::from([
             ("view".into(), view.name.clone().into()),
@@ -529,6 +836,20 @@ pub(super) fn garbage_collect(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
                      *analysis_revision_state{view, revision, state} \
                  stale_state[state] := \
                      *repository_state{fingerprint: state}, not live_state[state] \
+                 ?[state, local_symbol, role, service, method, evidence] := \
+                     *state_grpc_binding_candidate{\
+                         state, local_symbol, role, service, method, evidence\
+                     }, stale_state[state] \
+                 :rm state_grpc_binding_candidate {\
+                     state, local_symbol, role, service, method, evidence\
+                 } \
+             } \
+             { \
+                 live_state[state] := \
+                     *analysis_revision{view, revision}, \
+                     *analysis_revision_state{view, revision, state} \
+                 stale_state[state] := \
+                     *repository_state{fingerprint: state}, not live_state[state] \
                  ?[state, from, relation, to] := \
                      *state_dependency_observation{state, from, relation, to}, stale_state[state] \
                  :rm state_dependency_observation {state, from, relation, to} \
@@ -563,6 +884,15 @@ pub(super) fn garbage_collect(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
         (
             "analysis_revision_dependency_override_metadata",
             "view, revision, from, relation, unresolved_to",
+        ),
+        (
+            "analysis_revision_observation",
+            "view, revision, from, relation, to, evidence",
+        ),
+        ("analysis_revision_entity", "view, revision, id"),
+        (
+            "analysis_revision_grpc_diagnostic",
+            "view, revision, local_symbol, role, service, method, evidence",
         ),
     ] {
         db.run_script(
@@ -602,8 +932,9 @@ mod tests {
     use crate::SemanticStore;
     use beholder_domain::{
         Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata,
-        FactChanges, LogicalRepository, Observation, ProtoTypeKind, Provenance, RepositoryFacts,
-        RepositoryState, StructuralRelation, WorkspaceView,
+        FactChanges, GrpcBindingCandidate, GrpcBindingRole, LogicalRepository, Observation,
+        ProtoTypeKind, Provenance, RepositoryFacts, RepositoryState, RpcCardinality,
+        StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
     use std::{
@@ -617,6 +948,7 @@ mod tests {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             entities: Vec::new(),
+            grpc_bindings: Vec::new(),
             observations,
         }
     }
@@ -677,6 +1009,141 @@ mod tests {
             })
         );
         assert_eq!(context.nodes.len(), 1);
+    }
+
+    #[test]
+    fn resolves_grpc_candidates_at_publication_and_republishes_unmatched() {
+        let store = SemanticStore::memory().unwrap();
+        let application_state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "application".into(),
+            },
+            head: Some("app-head".into()),
+            fingerprint: "app-state".into(),
+        };
+        let contract_state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "contracts".into(),
+            },
+            head: Some("contract-head".into()),
+            fingerprint: "contract-state".into(),
+        };
+        let view = WorkspaceView::new(
+            "grpc",
+            "analysis",
+            vec![application_state.clone(), contract_state.clone()],
+        )
+        .unwrap();
+        let candidate = |local_symbol: &str,
+                         role: GrpcBindingRole,
+                         evidence: &str,
+                         confidence: Confidence| GrpcBindingCandidate {
+            local_symbol: local_symbol.into(),
+            role,
+            service: "pricing.v1.Pricing".into(),
+            method: "GetQuote".into(),
+            cardinality: RpcCardinality::Unary,
+            evidence: evidence.into(),
+            confidence,
+            provenance: Provenance::Ast,
+        };
+        let application = RepositoryFacts {
+            state: application_state.clone(),
+            analysis_identity: "rust".into(),
+            entities: Vec::new(),
+            grpc_bindings: vec![
+                candidate(
+                    "repo://application/rust/client/get_quote",
+                    GrpcBindingRole::Client,
+                    "src/client.rs:12",
+                    Confidence::Inferred,
+                ),
+                candidate(
+                    "repo://application/rust/server/get_quote",
+                    GrpcBindingRole::Server,
+                    "src/server.rs:24",
+                    Confidence::Exact,
+                ),
+            ],
+            observations: Vec::new(),
+        };
+        let contracts = RepositoryFacts {
+            state: contract_state,
+            analysis_identity: "protobuf".into(),
+            entities: vec![
+                EntityFact::new(
+                    "proto-method://pricing.v1.Pricing/GetQuote",
+                    EntityKind::ProtoMethod,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::Unary,
+                    }),
+                )
+                .unwrap(),
+            ],
+            grpc_bindings: Vec::new(),
+            observations: Vec::new(),
+        };
+        store
+            .publish(&view, &[application.clone(), contracts], &[])
+            .unwrap();
+
+        let operation = "grpc://pricing.v1.Pricing/GetQuote";
+        let context = store.context("grpc", operation).unwrap();
+        assert_eq!(context.root.kind, beholder_dto::EntityKind::Rpc);
+        let binding = context
+            .edges
+            .iter()
+            .find(|edge| edge.kind == beholder_dto::RelationKind::BindsContract)
+            .unwrap();
+        assert_eq!(binding.confidence, 1.0);
+        assert_eq!(binding.evidence.len(), 2);
+        let impacted = store
+            .impact("grpc", "proto-method://pricing.v1.Pricing/GetQuote", 32)
+            .unwrap();
+        for expected in [
+            operation,
+            "repo://application/rust/client/get_quote",
+            "repo://application/rust/server/get_quote",
+        ] {
+            assert!(
+                impacted.nodes.iter().any(|node| node.id == expected),
+                "missing {expected} from {:#?}",
+                impacted.nodes
+            );
+        }
+
+        let replacement_contract_state = RepositoryState {
+            fingerprint: "contract-without-method".into(),
+            ..view.repository_states[1].clone()
+        };
+        let replacement_view = WorkspaceView::new(
+            "grpc",
+            "analysis",
+            vec![application_state, replacement_contract_state.clone()],
+        )
+        .unwrap();
+        store
+            .publish(
+                &replacement_view,
+                &[
+                    application,
+                    RepositoryFacts {
+                        state: replacement_contract_state,
+                        analysis_identity: "protobuf".into(),
+                        entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
+                        observations: Vec::new(),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+
+        assert!(store.context("grpc", operation).unwrap().edges.is_empty());
+        let bindings = format!("{:?}", store.inspect_grpc_bindings().unwrap());
+        assert!(bindings.contains("grpc.contract_unmatched"));
+        assert!(bindings.contains("src/client.rs:12"));
+        assert!(bindings.contains("src/server.rs:24"));
     }
     #[test]
     fn publish_replaces_only_changed_facts() {
@@ -799,6 +1266,7 @@ mod tests {
                         state: state.clone(),
                         analysis_identity: analysis_identity.into(),
                         entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
                         observations: vec![observation.clone()],
                     }],
                     &[],
@@ -873,6 +1341,7 @@ mod tests {
                     state,
                     analysis_identity: "analysis-v2".into(),
                     entities: Vec::new(),
+                    grpc_bindings: Vec::new(),
                     observations: vec![observation],
                 }],
                 &[],
@@ -939,6 +1408,7 @@ mod tests {
                         state: state.clone(),
                         analysis_identity: analysis_identity.into(),
                         entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
                         observations: observations.clone(),
                     }],
                     &[],
@@ -1019,12 +1489,14 @@ mod tests {
                         state: source,
                         analysis_identity: "analysis".into(),
                         entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
                         observations: vec![unresolved.clone()],
                     },
                     RepositoryFacts {
                         state: target,
                         analysis_identity: "analysis".into(),
                         entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
                         observations: vec![Observation::structural(
                             "repo://target/rust/lib",
                             StructuralRelation::Defines,

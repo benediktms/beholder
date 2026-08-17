@@ -675,6 +675,7 @@ impl IndexScheduler {
         }
         let analysis = Arc::new(RepositoryAnalysis {
             entities,
+            grpc_bindings: Vec::new(),
             observations,
             diagnostics,
         });
@@ -780,6 +781,7 @@ fn index_workspace_versioned(
             state,
             analysis_identity,
             entities: analysis.entities.clone(),
+            grpc_bindings: analysis.grpc_bindings.clone(),
             observations: analysis.observations.clone(),
         });
     }
@@ -1033,6 +1035,7 @@ mod tests {
                         state: state.clone(),
                         analysis_identity: "analysis".into(),
                         entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
                         observations: analysis.observations.clone(),
                     }],
                     &[],
