@@ -1,7 +1,7 @@
 use crate::workspace_registry::WorkspaceRegistry;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_protobuf::{
-    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, observations as protobuf_observations,
+    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, facts as protobuf_facts,
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
@@ -15,7 +15,7 @@ use beholder_adapters_treesitter_rust::{
     diagnostics_from_analysis as rust_diagnostics, observations_from_analysis,
     resolve_repository_calls as resolve_rust_repository_calls,
 };
-use beholder_domain::{RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
+use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
 use rayon::prelude::*;
@@ -647,18 +647,26 @@ impl IndexScheduler {
             &observations,
         ));
         resolve_elixir_repository_calls(&mut observations, &elixir_sources);
-        let descriptor_observations = self.analysis_pool.install(|| {
+        let descriptor_facts = self.analysis_pool.install(|| {
             descriptors
                 .par_iter()
                 .map(|(_, descriptor)| {
-                    protobuf_observations(descriptor).map_err(|error| error.to_string())
+                    protobuf_facts(descriptor).map_err(|error| error.to_string())
                 })
                 .collect::<Vec<_>>()
         });
-        for descriptor in descriptor_observations {
-            observations.extend(descriptor?);
+        let mut entities = Vec::<EntityFact>::new();
+        for descriptor in descriptor_facts {
+            let descriptor = descriptor?;
+            observations.extend(descriptor.observations);
+            for entity in descriptor.entities {
+                if !entities.contains(&entity) {
+                    entities.push(entity);
+                }
+            }
         }
         let analysis = Arc::new(RepositoryAnalysis {
+            entities,
             observations,
             diagnostics,
         });
@@ -763,7 +771,7 @@ fn index_workspace_versioned(
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity,
-            entities: Vec::new(),
+            entities: analysis.entities.clone(),
             observations: analysis.observations.clone(),
         });
     }
