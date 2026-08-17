@@ -57,6 +57,46 @@ fn imported_services(
     (clients, servers)
 }
 
+fn client_fields(
+    root: Node<'_>,
+    source: &[u8],
+    clients: &BTreeMap<String, String>,
+) -> BTreeMap<(String, String), String> {
+    let mut fields = BTreeMap::new();
+    walk(root, &mut |node| {
+        if node.kind() != "struct_item" {
+            return;
+        }
+        let Some(owner) = node.child_by_field_name("name") else {
+            return;
+        };
+        let Ok(owner) = owner.utf8_text(source) else {
+            return;
+        };
+        walk(node, &mut |field| {
+            if field.kind() != "field_declaration" {
+                return;
+            }
+            let Some((name, type_)) = field
+                .child_by_field_name("name")
+                .zip(field.child_by_field_name("type"))
+            else {
+                return;
+            };
+            let (Ok(name), Ok(type_)) = (name.utf8_text(source), type_.utf8_text(source)) else {
+                return;
+            };
+            if let Some((_, service)) = clients
+                .iter()
+                .find(|(client, _)| type_.contains(client.as_str()))
+            {
+                fields.insert((owner.into(), name.into()), service.clone());
+            }
+        });
+    });
+    fields
+}
+
 fn walk(node: Node<'_>, visit: &mut impl FnMut(Node<'_>)) {
     visit(node);
     let mut cursor = node.walk();
@@ -91,6 +131,7 @@ pub(super) fn analyze(
     functions: &[(String, String, Node<'_>)],
 ) -> TonicAnalysis {
     let (clients, servers) = imported_services(root, source);
+    let client_fields = client_fields(root, source, &clients);
     let mut analysis = TonicAnalysis::default();
     walk(root, &mut |node| {
         if node.kind() == "macro_invocation"
@@ -117,6 +158,10 @@ pub(super) fn analyze(
         .collect::<BTreeMap<_, _>>();
 
     for (_, qualified_name, function) in functions {
+        let owner = qualified_name
+            .strip_prefix("impl/")
+            .and_then(|name| name.split('/').next())
+            .map(|name| name.rsplit_once("-for-").map_or(name, |(_, type_)| type_));
         let mut local_clients = BTreeMap::new();
         walk(*function, &mut |node| {
             if node.kind() != "let_declaration" {
@@ -172,18 +217,30 @@ pub(super) fn analyze(
             else {
                 return;
             };
-            let service = local_clients.get(receiver).cloned().or_else(|| {
-                (!matches!(method, "expect" | "unwrap")
-                    && has_only_wrapper_calls(receiver_node, source))
-                .then(|| {
-                    returned_clients.iter().find_map(|(name, service)| {
-                        receiver
-                            .contains(&format!("{name}("))
-                            .then(|| service.clone())
-                    })
+            let service = local_clients
+                .get(receiver)
+                .cloned()
+                .or_else(|| {
+                    owner
+                        .zip(receiver.strip_prefix("self."))
+                        .and_then(|(owner, field)| {
+                            client_fields
+                                .get(&(owner.to_owned(), field.to_owned()))
+                                .cloned()
+                        })
                 })
-                .flatten()
-            });
+                .or_else(|| {
+                    (!matches!(method, "expect" | "unwrap")
+                        && has_only_wrapper_calls(receiver_node, source))
+                    .then(|| {
+                        returned_clients.iter().find_map(|(name, service)| {
+                            receiver
+                                .contains(&format!("{name}("))
+                                .then(|| service.clone())
+                        })
+                    })
+                    .flatten()
+                });
             if let Some(service) = service {
                 let line = node.start_position().row + 1;
                 analysis.client_calls.push(TonicBinding {
@@ -428,5 +485,27 @@ mod tests {
             ),
         ]);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn recognizes_client_stored_in_struct_field() {
+        let (candidates, _) = resolved(&[
+            ("src/protocol.rs", "tonic::include_proto!(\"pricing.v1\");"),
+            (
+                "src/client.rs",
+                "use contract::pricing_client::PricingClient; \
+                 struct Client { client: PricingClient<Channel> } \
+                 impl Client { \
+                     async fn quote(&mut self) { self.client.get_quote(()).await; } \
+                 }",
+            ),
+        ]);
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.local_symbol.as_str() == "repo://example/rust/client/impl/Client/quote"
+                && candidate.role == GrpcBindingRole::Client
+                && candidate.service == "pricing.v1.Pricing"
+                && candidate.method == "GetQuote"
+        }));
     }
 }
