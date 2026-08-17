@@ -157,12 +157,7 @@ pub(super) fn context(
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        &format!("{DIRECT_RULES}\n{CONTEXT_QUERY}"),
-        [("entity", entity.into())],
-    )
+    query(db, view, CONTEXT_QUERY, [("entity", entity.into())])
 }
 
 pub(super) fn trace(

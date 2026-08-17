@@ -4,13 +4,45 @@ reachable[from] :=
 
 traversed_edge[from, to, relation, evidence, confidence, provenance] :=
     reachable[to],
-    direct[from, to, relation, evidence, confidence, provenance]
+    selected_state[state],
+    *state_observation:by_to{state, from, relation, to, evidence},
+    *state_dependency_observation{state, from, relation, to, evidence},
+    *state_observation_metadata{state, from, relation, to, confidence, provenance},
+    not overridden[from, relation, to, evidence]
+
+traversed_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
+    reachable[resolved_to],
+    dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
+
+traversed_edge[from, to, relation, evidence, confidence, provenance] :=
+    reachable[to],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    }
 
 traversed_edge[from, to, relation, evidence, confidence, provenance] :=
     reachable[from],
-    direct[from, to, relation, evidence, confidence, provenance],
-    relation = 'implemented_by',
-    starts_with(from, 'grpc://')
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from,
+        relation: 'implemented_by',
+        to,
+        evidence,
+        confidence,
+        provenance,
+    },
+    starts_with(from, 'grpc://'),
+    relation = 'implemented_by'
 
 selected_edge[from, to, relation, evidence, confidence, provenance] :=
     traversed_edge[from, to, relation, evidence, confidence, provenance]

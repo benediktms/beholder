@@ -1090,6 +1090,13 @@ mod tests {
         let operation = "grpc://pricing.v1.Pricing/GetQuote";
         let context = store.context("grpc", operation).unwrap();
         assert_eq!(context.root.kind, beholder_dto::EntityKind::Rpc);
+        for kind in [
+            beholder_dto::RelationKind::BindsContract,
+            beholder_dto::RelationKind::CallsRpc,
+            beholder_dto::RelationKind::ImplementedBy,
+        ] {
+            assert!(context.edges.iter().any(|edge| edge.kind == kind));
+        }
         let binding = context
             .edges
             .iter()

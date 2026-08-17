@@ -207,11 +207,59 @@ pub(super) const SEED_STATES: &str = r#"
 pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
 pub(super) const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
 pub(super) const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
-pub(super) const CONTEXT_QUERY: &str = "\
+pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_state{view: $view, revision, state}\n\
+     context_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_dependency_override{\
+             view: $view, revision, from, relation, unresolved_to, resolved_to, evidence\
+         }, \
+         *analysis_revision_dependency_override_metadata{\
+             view: $view, revision, from, relation, unresolved_to, confidence, provenance\
+         }\n\
+     overridden[from, relation, unresolved_to, evidence] := \
+         context_override[from, relation, unresolved_to, _, evidence, _, _]\n\
      ?[direction, relation, related, evidence, confidence, provenance] := \
-         effective_observation[$entity, related, relation, evidence, confidence, provenance], \
+         selected_state[state], \
+         *state_observation{state, from: $entity, relation, to: related, evidence}, \
+         *state_observation_metadata{\
+             state, from: $entity, relation, to: related, confidence, provenance\
+         }, \
+         not overridden[$entity, relation, related, evidence], \
          direction = 'outgoing'\n\
      ?[direction, relation, related, evidence, confidence, provenance] := \
-         effective_observation[related, $entity, relation, evidence, confidence, provenance], \
+         context_override[\
+             $entity, relation, _, related, evidence, confidence, provenance\
+         ], \
+         direction = 'outgoing'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         selected_state[state], \
+         *state_observation:by_to{\
+             state, from: related, relation, to: $entity, evidence\
+         }, \
+         *state_observation_metadata:by_to{\
+             state, from: related, relation, to: $entity, confidence, provenance\
+         }, \
+         not overridden[related, relation, $entity, evidence], \
+         direction = 'incoming'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         context_override[\
+             related, relation, _, $entity, evidence, confidence, provenance\
+         ], \
+         direction = 'incoming'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_observation{\
+             view: $view, revision, from: $entity, relation, to: related, evidence, \
+             confidence, provenance\
+         }, \
+         direction = 'outgoing'\n\
+     ?[direction, relation, related, evidence, confidence, provenance] := \
+         *analysis_revision{view: $view, revision}, \
+         *analysis_revision_observation{\
+             view: $view, revision, from: related, relation, to: $entity, evidence, \
+             confidence, provenance\
+         }, \
          direction = 'incoming'\n\
      :order direction, relation, related";
