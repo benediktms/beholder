@@ -1701,11 +1701,10 @@ Billing.fetch_user/2
        │
        │ CALLS_RPC
        ▼
-company.users.v1.Users/GetUser
-       ▲
-       │ IMPLEMENTS_RPC
+grpc://company.users.v1.Users/GetUser
+       ├── BINDS_CONTRACT ──▶ proto-method://company.users.v1.Users/GetUser
        │
-UsersServer.get_user/2
+       └── IMPLEMENTED_BY ──▶ UsersServer.get_user/2
 ```
 
 Evidence may come from:
@@ -2473,17 +2472,20 @@ canonical RPC resolution
 
 ### Exit criterion
 
-The following works across repository boundaries:
+The following works in both directions across independent contract, Rust
+application, and Elixir application repositories:
 
 ```text
-Elixir caller
+Rust or Elixir caller
       ↓
 canonical RPC
       ↓
-Elixir implementation
+Elixir or Rust implementation
 ```
 
-regardless of where the `.proto` declaration exists.
+The RPC also binds to the canonical Protobuf method regardless of where the
+descriptor exists. Removing and restoring that contract republishes unresolved
+and resolved bindings without reparsing unchanged applications.
 
 Beholder should also successfully analyze its own CLI-to-daemon gRPC API.
 

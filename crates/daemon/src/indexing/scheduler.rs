@@ -847,6 +847,7 @@ fn index_workspace_versioned(
 mod tests {
     use super::*;
     use beholder_domain::{LogicalRepository, WorkspaceRepository};
+    use beholder_dto::{EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
     fn test_workspace(name: &str, base: PathBuf) -> Workspace {
@@ -1612,6 +1613,244 @@ mod tests {
                 .iter()
                 .any(|node| node.id == format!("{module}/before/0"))
         );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn cross_language_grpc_workspace_resolves_both_directions() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-grpc-matrix-{unique}"));
+        let contracts = state.join("contracts");
+        let rust = state.join("rust-app");
+        let elixir = state.join("elixir-app");
+        for directory in [
+            contracts.as_path(),
+            rust.join("src").as_path(),
+            elixir.join("lib").as_path(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let descriptor = contracts.join("matrix.descriptor.bin");
+        let descriptor_bytes =
+            include_str!("../../../../scripts/fixtures/grpc-matrix.descriptor.hex")
+                .trim()
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>();
+        fs::write(&descriptor, descriptor_bytes).unwrap();
+        fs::write(
+            rust.join("src/protocol.rs"),
+            "tonic::include_proto!(\"phase5.v1\");",
+        )
+        .unwrap();
+        fs::write(
+            rust.join("src/generated.rs"),
+            "mod bridge_client { \
+                 pub struct BridgeClient<T>(T); \
+                 impl<T> BridgeClient<T> { \
+                     pub async fn rust_to_elixir(&mut self) {} \
+                     pub async fn elixir_to_rust(&mut self) {} \
+                 } \
+             }",
+        )
+        .unwrap();
+        fs::write(
+            rust.join("src/client.rs"),
+            "use contract::bridge_client::BridgeClient; \
+             async fn rust_to_elixir() { \
+                 let mut client = BridgeClient::new(); \
+                 client.rust_to_elixir().await; \
+             }",
+        )
+        .unwrap();
+        fs::write(
+            rust.join("src/server.rs"),
+            "use contract::bridge_server::{Bridge, BridgeServer}; \
+             struct RustHandler; \
+             impl Bridge for RustHandler { async fn elixir_to_rust(&self) {} }",
+        )
+        .unwrap();
+        fs::write(
+            elixir.join("lib/matrix.pb.ex"),
+            r#"
+            defmodule Phase5.V1.Bridge.Service do
+              use GRPC.Service, name: "phase5.v1.Bridge"
+              rpc :RustToElixir, Phase5.V1.Request, Phase5.V1.Response
+              rpc :ElixirToRust, Phase5.V1.Request, Phase5.V1.Response
+            end
+
+            defmodule Phase5.V1.Bridge.Stub do
+              use GRPC.Stub, service: Phase5.V1.Bridge.Service
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            elixir.join("lib/client.ex"),
+            r#"
+            defmodule Phase5.Client do
+              alias Phase5.V1.Bridge.Stub
+              def elixir_to_rust(channel, request), do: Stub.elixir_to_rust(channel, request)
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            elixir.join("lib/server.ex"),
+            r#"
+            defmodule Phase5.Server do
+              alias Phase5.V1.Bridge.Service
+              use GRPC.Server, service: Service
+              def rust_to_elixir(request, stream), do: {request, stream}
+            end
+            "#,
+        )
+        .unwrap();
+
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let repositories = vec![contracts.clone(), rust.clone(), elixir.clone()];
+        let workspace = registry
+            .register(
+                "grpc-matrix".into(),
+                repositories.clone(),
+                vec![descriptor.clone()],
+            )
+            .unwrap();
+        let rust_identity = beholder_adapters_git::repository_identity(&rust).unwrap();
+        let elixir_identity = beholder_adapters_git::repository_identity(&elixir).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        scheduler.index(&store, &workspace).unwrap();
+        let metadata = scheduler.query_metadata("grpc-matrix", 1);
+        assert_eq!(metadata.revision, 1);
+        assert_eq!(metadata.view, "grpc-matrix");
+        assert!(!metadata.freshness.stale);
+        assert!(metadata.freshness.dirty_repositories.is_empty());
+
+        let bindings = [
+            (
+                "RustToElixir",
+                format!("repo://{rust_identity}/rust/client/rust_to_elixir"),
+                format!("repo://{elixir_identity}/elixir/Phase5.Server/rust_to_elixir/2"),
+            ),
+            (
+                "ElixirToRust",
+                format!("repo://{elixir_identity}/elixir/Phase5.Client/elixir_to_rust/2"),
+                format!(
+                    "repo://{rust_identity}/rust/server/impl/Bridge-for-RustHandler/elixir_to_rust"
+                ),
+            ),
+        ];
+        for (method, client, server) in &bindings {
+            let operation = format!("grpc://phase5.v1.Bridge/{method}");
+            let contract = format!("proto-method://phase5.v1.Bridge/{method}");
+            let context = store.context("grpc-matrix", &operation).unwrap();
+            assert_eq!(context.metadata.view, "grpc-matrix");
+            for (kind, from, to) in [
+                (RelationKind::CallsRpc, client.as_str(), operation.as_str()),
+                (
+                    RelationKind::BindsContract,
+                    operation.as_str(),
+                    contract.as_str(),
+                ),
+                (
+                    RelationKind::ImplementedBy,
+                    operation.as_str(),
+                    server.as_str(),
+                ),
+            ] {
+                let edge = context
+                    .edges
+                    .iter()
+                    .find(|edge| edge.kind == kind && edge.from == from && edge.to == to)
+                    .unwrap_or_else(|| panic!("missing {kind:?} edge from {from} to {to}"));
+                assert_eq!(edge.confidence, 1.0);
+                if kind != RelationKind::BindsContract {
+                    assert!(
+                        edge.evidence
+                            .iter()
+                            .all(|evidence| evidence.repository.is_some()),
+                        "{edge:#?}"
+                    );
+                }
+                assert!(edge.evidence.iter().any(|evidence| {
+                    matches!(
+                        evidence.source_kind,
+                        EvidenceKind::Descriptor | EvidenceKind::Generated
+                    )
+                }));
+            }
+            for entity in [client, server] {
+                assert!(
+                    context
+                        .nodes
+                        .iter()
+                        .any(|node| { node.id == *entity && node.repository.as_deref().is_some() }),
+                    "missing repository attribution for {entity}"
+                );
+            }
+            let trace = store.trace("grpc-matrix", client, server, 32).unwrap();
+            assert!(trace.paths.iter().any(|path| {
+                path.nodes == [client.as_str(), operation.as_str(), server.as_str()]
+            }));
+            let impact = store.impact("grpc-matrix", &contract, 32).unwrap();
+            for entity in [client, server] {
+                assert!(
+                    impact
+                        .affected
+                        .iter()
+                        .any(|affected| affected.entity == *entity),
+                    "contract impact did not reach {entity}"
+                );
+            }
+        }
+
+        let rust_cache_entries = scheduler.rust_cache.lock().unwrap().len();
+        let elixir_cache_entries = scheduler.elixir_cache.lock().unwrap().len();
+        let without_contract = registry
+            .register("grpc-matrix".into(), repositories.clone(), Vec::new())
+            .unwrap();
+        scheduler.index(&store, &without_contract).unwrap();
+        assert_eq!(
+            scheduler.rust_cache.lock().unwrap().len(),
+            rust_cache_entries
+        );
+        assert_eq!(
+            scheduler.elixir_cache.lock().unwrap().len(),
+            elixir_cache_entries
+        );
+        let inspection = format!("{:?}", store.inspect_grpc_bindings().unwrap());
+        assert!(inspection.contains("grpc.contract_unmatched"));
+        assert!(!format!("{:?}", store.inspect_relations().unwrap()).contains("calls_rpc"));
+
+        let restored = registry
+            .register("grpc-matrix".into(), repositories, vec![descriptor])
+            .unwrap();
+        scheduler.index(&store, &restored).unwrap();
+        assert_eq!(
+            scheduler.rust_cache.lock().unwrap().len(),
+            rust_cache_entries
+        );
+        assert_eq!(
+            scheduler.elixir_cache.lock().unwrap().len(),
+            elixir_cache_entries
+        );
+        for (method, _, _) in &bindings {
+            let operation = format!("grpc://phase5.v1.Bridge/{method}");
+            let context = store.context("grpc-matrix", &operation).unwrap();
+            assert!(
+                context
+                    .edges
+                    .iter()
+                    .any(|edge| edge.kind == RelationKind::BindsContract)
+            );
+        }
+
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }
