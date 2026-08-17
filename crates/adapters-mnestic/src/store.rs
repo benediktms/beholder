@@ -4,8 +4,8 @@ use super::{
     database::{benchmark_database, memory_database, persistent_database},
     inspection::{InspectionResult, inspection_result},
     query::{
-        analysis_revision, context, dependencies, impact, inspect_observations, inspect_relations,
-        inspect_revisions, trace,
+        analysis_revision, context, dependencies, entity_facts, impact, inspect_observations,
+        inspect_relations, inspect_revisions, trace,
     },
     storage::{garbage_collect, publish_observations, view_matches},
 };
@@ -151,6 +151,7 @@ impl SemanticStore {
             view,
             entity,
             inspection_result(context(&self.read_db, view, entity)?),
+            inspection_result(entity_facts(&self.read_db, view)?),
         )
     }
 
@@ -164,6 +165,7 @@ impl SemanticStore {
                 view,
                 entity,
                 inspection_result(context(transaction, view, entity)?),
+                inspection_result(entity_facts(transaction, view)?),
             )
         })
     }
@@ -181,6 +183,7 @@ impl SemanticStore {
             to,
             max_hops,
             inspection_result(trace(&self.read_db, view, from, to)?),
+            inspection_result(entity_facts(&self.read_db, view)?),
         )
     }
 
@@ -198,6 +201,7 @@ impl SemanticStore {
                 to,
                 max_hops,
                 inspection_result(trace(transaction, view, from, to)?),
+                inspection_result(entity_facts(transaction, view)?),
             )
         })
     }
@@ -213,6 +217,7 @@ impl SemanticStore {
             entity,
             max_hops,
             inspection_result(impact(&self.read_db, view, entity)?),
+            inspection_result(entity_facts(&self.read_db, view)?),
         )
     }
 
@@ -228,6 +233,7 @@ impl SemanticStore {
                 entity,
                 max_hops,
                 inspection_result(impact(transaction, view, entity)?),
+                inspection_result(entity_facts(transaction, view)?),
             )
         })
     }
@@ -243,6 +249,7 @@ impl SemanticStore {
             entity,
             max_hops,
             inspection_result(dependencies(&self.read_db, view, entity)?),
+            inspection_result(entity_facts(&self.read_db, view)?),
         )
     }
 
@@ -258,6 +265,7 @@ impl SemanticStore {
                 entity,
                 max_hops,
                 inspection_result(dependencies(transaction, view, entity)?),
+                inspection_result(entity_facts(transaction, view)?),
             )
         })
     }

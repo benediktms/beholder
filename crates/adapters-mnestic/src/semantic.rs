@@ -20,8 +20,10 @@ pub(super) fn context(
     view: &str,
     entity: &str,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<ContextResult, Box<dyn Error>> {
     let mut graph = GraphBuilder::default();
+    graph.hint_facts(entity_kinds(entities)?);
     graph.hint(entity, infer_kind(entity));
     for row in result.rows {
         let direction = text(&row, 0, "context direction")?;
@@ -58,9 +60,10 @@ pub(super) fn dependencies(
     entity: &str,
     max_hops: u32,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<DependenciesResult, Box<dyn Error>> {
     let (entries, output, truncated) =
-        closure(result, entity, max_hops, TraversalDirection::Outgoing)?;
+        closure(result, entities, entity, max_hops, TraversalDirection::Outgoing)?;
     Ok(DependenciesResult {
         schema: DEPENDENCIES_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -86,9 +89,10 @@ pub(super) fn impact(
     entity: &str,
     max_hops: u32,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<ImpactResult, Box<dyn Error>> {
     let (entries, output, truncated) =
-        closure(result, entity, max_hops, TraversalDirection::Incoming)?;
+        closure(result, entities, entity, max_hops, TraversalDirection::Incoming)?;
     Ok(ImpactResult {
         schema: IMPACT_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -111,11 +115,12 @@ pub(super) fn impact(
 
 fn closure(
     result: InspectionResult,
+    entities: InspectionResult,
     root: &str,
     max_hops: u32,
     direction: TraversalDirection,
 ) -> Result<Closure, Box<dyn Error>> {
-    let mut output = graph(result, &[root])?;
+    let mut output = graph(result, entities, &[root])?;
     let (distances, truncated) = distances(root, &output.edges, max_hops, direction);
     output.nodes.retain(|node| distances.contains_key(&node.id));
     output
@@ -129,8 +134,13 @@ fn closure(
     Ok((entries, output, truncated))
 }
 
-fn graph(result: InspectionResult, roots: &[&str]) -> Result<GraphOutput, Box<dyn Error>> {
+fn graph(
+    result: InspectionResult,
+    entities: InspectionResult,
+    roots: &[&str],
+) -> Result<GraphOutput, Box<dyn Error>> {
     let mut graph = GraphBuilder::default();
+    graph.hint_facts(entity_kinds(entities)?);
     for root in roots {
         graph.hint(root, infer_kind(root));
     }
@@ -194,8 +204,9 @@ pub(super) fn trace(
     to: &str,
     max_hops: u32,
     result: InspectionResult,
+    entities: InspectionResult,
 ) -> Result<TraceResult, Box<dyn Error>> {
-    let mut output = graph(result, &[from, to])?;
+    let mut output = graph(result, entities, &[from, to])?;
     let (path, truncated) = shortest_path(from, to, max_hops, &output.edges);
     let paths = path.into_iter().collect::<Vec<_>>();
     let path_nodes = paths
@@ -301,6 +312,10 @@ struct EdgeData {
 }
 
 impl GraphBuilder {
+    fn hint_facts(&mut self, facts: BTreeMap<String, EntityKind>) {
+        self.kinds.extend(facts);
+    }
+
     fn hint(&mut self, id: &str, kind: EntityKind) {
         let current = self.kinds.entry(id.into()).or_insert(EntityKind::Unknown);
         if kind_priority(kind) > kind_priority(*current) {
@@ -383,6 +398,32 @@ impl GraphBuilder {
             .collect();
         GraphOutput { nodes, edges }
     }
+}
+
+fn entity_kinds(result: InspectionResult) -> Result<BTreeMap<String, EntityKind>, Box<dyn Error>> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let id = text(row, 0, "entity id")?.to_owned();
+            let kind = match (text(row, 1, "entity kind")?, text(row, 2, "entity metadata")?) {
+                ("callable", "") => EntityKind::Callable,
+                ("graphql_field", "") => EntityKind::GraphqlField,
+                ("kafka_topic", "") => EntityKind::KafkaTopic,
+                ("namespace", "") => EntityKind::Namespace,
+                ("proto_field", "") => EntityKind::ProtoField,
+                ("proto_method", "rpc_cardinality:unary") => EntityKind::Rpc,
+                ("proto_service", "") => EntityKind::ProtoService,
+                ("proto_type", "proto_type:enum") => EntityKind::ProtoEnum,
+                ("proto_type", "proto_type:message") => EntityKind::ProtoMessage,
+                ("service", "") => EntityKind::Service,
+                (kind, metadata) => {
+                    return Err(format!("invalid persisted entity fact {kind} with {metadata}").into());
+                }
+            };
+            Ok((id, kind))
+        })
+        .collect()
 }
 
 fn kind_priority(kind: EntityKind) -> u8 {

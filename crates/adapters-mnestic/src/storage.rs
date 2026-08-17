@@ -649,6 +649,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.rows, vec![["proto_type".into(), "proto_type:message".into()]]);
+        assert_eq!(
+            store
+                .context("main", "proto-type://pricing.v1.Quote")
+                .unwrap()
+                .root
+                .kind,
+            beholder_dto::EntityKind::ProtoMessage
+        );
     }
     #[test]
     fn publish_replaces_only_changed_facts() {

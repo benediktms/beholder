@@ -77,6 +77,21 @@ pub(super) fn analysis_revision(db: &impl QueryRunner, view: &str) -> Result<u64
         .try_into()?)
 }
 
+pub(super) fn entity_facts(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
+    query(
+        db,
+        view,
+        "selected_state[state] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, state}\n\
+         ?[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}\n\
+         :order id",
+        [],
+    )
+}
+
 pub(super) fn inspect_observations(
     db: &DbInstance,
     relation: Option<&str>,
@@ -254,6 +269,11 @@ mod tests {
             "end",
             beholder_dto::DEFAULT_MAX_HOPS,
             crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+            crate::inspection::InspectionResult {
+                headers: Vec::new(),
+                rows: Vec::new(),
+                next: None,
+            },
         )
         .unwrap();
         assert_eq!(result.paths[0].nodes, ["start", "left", "end"]);
@@ -264,6 +284,11 @@ mod tests {
             "end",
             1,
             crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+            crate::inspection::InspectionResult {
+                headers: Vec::new(),
+                rows: Vec::new(),
+                next: None,
+            },
         )
         .unwrap();
         assert!(limited.paths.is_empty());
