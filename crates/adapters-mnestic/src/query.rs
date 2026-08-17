@@ -1,6 +1,7 @@
 use super::schema::*;
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability};
-use std::{collections::BTreeMap, error::Error};
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 
 pub(super) trait QueryRunner {
     fn run_query(
@@ -80,15 +81,24 @@ pub(super) fn analysis_revision(db: &impl QueryRunner, view: &str) -> Result<u64
 pub(super) fn entity_facts(
     db: &impl QueryRunner,
     view: &str,
+    entities: &BTreeSet<String>,
 ) -> Result<NamedRows, Box<dyn Error>> {
+    let entities = DataValue::List(
+        entities
+            .iter()
+            .map(|id| DataValue::List(vec![id.as_str().into()]))
+            .collect(),
+    );
     query(
         db,
         view,
         "selected_state[state] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view: $view, revision, state}\n\
-         ?[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}\n\
+         requested[id] <- $entities\n\
+         ?[id, kind, metadata] := requested[id], selected_state[state], \
+             *state_entity{state, id, kind, metadata}\n\
          :order id",
-        [],
+        [("entities", entities)],
     )
 }
 

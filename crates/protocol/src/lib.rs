@@ -209,6 +209,11 @@ fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'s
                 cardinality: match v1::RpcCardinality::try_from(value)
                     .map_err(|_| "unknown RPC cardinality")?
                 {
+                    v1::RpcCardinality::BidirectionalStreaming => {
+                        dto::RpcCardinality::BidirectionalStreaming
+                    }
+                    v1::RpcCardinality::ClientStreaming => dto::RpcCardinality::ClientStreaming,
+                    v1::RpcCardinality::ServerStreaming => dto::RpcCardinality::ServerStreaming,
                     v1::RpcCardinality::Unary => dto::RpcCardinality::Unary,
                     v1::RpcCardinality::Unknown => return Err("RPC cardinality is missing"),
                 },
@@ -227,6 +232,11 @@ fn protocol_entity_metadata(value: dto::EntityMetadata) -> v1::EntityMetadata {
         }
         dto::EntityMetadata::ProtoMethod { cardinality } => {
             v1::entity_metadata::Metadata::RpcCardinality(match cardinality {
+                dto::RpcCardinality::BidirectionalStreaming => {
+                    v1::RpcCardinality::BidirectionalStreaming as i32
+                }
+                dto::RpcCardinality::ClientStreaming => v1::RpcCardinality::ClientStreaming as i32,
+                dto::RpcCardinality::ServerStreaming => v1::RpcCardinality::ServerStreaming as i32,
                 dto::RpcCardinality::Unary => v1::RpcCardinality::Unary as i32,
             })
         }

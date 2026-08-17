@@ -30,10 +30,7 @@ pub fn observations(descriptor_set: &[u8]) -> Result<Vec<Observation>, String> {
     Ok(facts(descriptor_set)?.observations)
 }
 
-fn append_file(
-    file: FileDescriptorProto,
-    facts: &mut ProtobufFacts,
-) -> Result<(), String> {
+fn append_file(file: FileDescriptorProto, facts: &mut ProtobufFacts) -> Result<(), String> {
     let path = required(file.name, "file name")?;
     let package = file.package.unwrap_or_default();
 
@@ -56,18 +53,19 @@ fn append_file(
         let service_id = format!("proto-service://{service_name}");
         push_entity(facts, service_id.as_str(), EntityKind::ProtoService, None)?;
         for method in service.method {
-            if method.client_streaming() || method.server_streaming() {
-                return Err("streaming protobuf methods are not supported".into());
-            }
+            let cardinality = match (method.client_streaming(), method.server_streaming()) {
+                (false, false) => RpcCardinality::Unary,
+                (true, false) => RpcCardinality::ClientStreaming,
+                (false, true) => RpcCardinality::ServerStreaming,
+                (true, true) => RpcCardinality::BidirectionalStreaming,
+            };
             let method_name = required(method.name, "method name")?;
             let method_id = format!("proto-method://{service_name}/{method_name}");
             push_entity(
                 facts,
                 method_id.as_str(),
                 EntityKind::ProtoMethod,
-                Some(EntityMetadata::ProtoMethod {
-                    cardinality: RpcCardinality::Unary,
-                }),
+                Some(EntityMetadata::ProtoMethod { cardinality }),
             )?;
             facts.observations.push(descriptor(
                 service_id.as_str(),
@@ -195,9 +193,7 @@ fn push_entity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::{
-        Confidence, Provenance, SemanticRelation,
-    };
+    use beholder_domain::{Confidence, Provenance, SemanticRelation};
     use prost_types::{
         EnumDescriptorProto, FieldDescriptorProto, MethodDescriptorProto, ServiceDescriptorProto,
     };
@@ -308,6 +304,39 @@ mod tests {
     }
 
     #[test]
+    fn indexes_streaming_method_cardinality() {
+        let bytes = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("events.proto".into()),
+                package: Some("events.v1".into()),
+                service: vec![ServiceDescriptorProto {
+                    name: Some("Events".into()),
+                    method: vec![MethodDescriptorProto {
+                        name: Some("Sync".into()),
+                        input_type: Some(".events.v1.Event".into()),
+                        output_type: Some(".events.v1.Event".into()),
+                        client_streaming: Some(true),
+                        server_streaming: Some(true),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
+        let facts = facts(&bytes).unwrap();
+        assert!(facts.entities.iter().any(|entity| {
+            entity.id.as_str() == "proto-method://events.v1.Events/Sync"
+                && entity.metadata
+                    == Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::BidirectionalStreaming,
+                    })
+        }));
+    }
+
+    #[test]
     fn descriptor_facts_use_transport_neutral_contract_ids() {
         let bytes = FileDescriptorSet {
             file: vec![FileDescriptorProto {
@@ -336,13 +365,16 @@ mod tests {
             entity.id.as_str() == "proto-method://pricing.v1.Pricing/GetQuote"
                 && entity.kind == EntityKind::ProtoMethod
         }));
-        assert!(facts
-            .entities
-            .iter()
-            .all(|entity| !entity.id.as_str().starts_with("grpc://")));
+        assert!(
+            facts
+                .entities
+                .iter()
+                .all(|entity| !entity.id.as_str().starts_with("grpc://"))
+        );
         assert!(facts.observations.iter().any(|observation| {
             observation.from.as_str() == "proto-method://pricing.v1.Pricing/GetQuote"
-                && observation.relation == SemanticRelation::Structural(StructuralRelation::RequestType)
+                && observation.relation
+                    == SemanticRelation::Structural(StructuralRelation::RequestType)
                 && observation.to.as_str() == "proto-type://pricing.v1.Quote"
                 && observation.evidence.as_str() == "pricing.proto"
         }));

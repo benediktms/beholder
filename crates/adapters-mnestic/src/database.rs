@@ -15,7 +15,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
-    db.run_script(CREATE_ENTITY_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)?;
+    db.run_script(
+        CREATE_ENTITY_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
     db.run_script(
         CREATE_OBSERVATION_TO_INDEX,
         BTreeMap::new(),
@@ -130,7 +134,11 @@ pub(super) fn persistent_database(
             .iter()
             .any(|row| row[0].get_str() == Some("state_entity"))
     {
-        db.run_script(CREATE_ENTITY_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)?;
+        db.run_script(
+            CREATE_ENTITY_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
     }
     if initialize
         && !relations

@@ -21,12 +21,12 @@ crate boundary, and Mnestic remains unaware of descriptors.
 
 Canonical entities use ownership-neutral IDs:
 
-- `proto-file://<descriptor path>`
-- `proto-message://<fully qualified name>`
+- `proto-type://<fully qualified name>` with message or enum metadata
 - `proto-field://<fully qualified message>/<field name>`
-- `proto-enum://<fully qualified name>`
 - `proto-service://<fully qualified service>`
-- `grpc://<fully qualified service>/<method>`
+- `proto-method://<fully qualified service>/<method>` with RPC cardinality metadata
+
+Descriptor paths remain evidence rather than entity identity.
 
 The adapter emits `defines`, `field_of`, `request_type`, and `response_type` as
 structural facts with exact descriptor evidence. They are available to typed

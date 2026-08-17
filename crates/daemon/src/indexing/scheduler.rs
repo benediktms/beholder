@@ -6,8 +6,7 @@ use beholder_adapters_protobuf::{
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
     RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
-    entities_from_analysis as elixir_entities,
-    generated_entities as elixir_generated_entities,
+    entities_from_analysis as elixir_entities, generated_entities as elixir_generated_entities,
     generated_observations as elixir_generated_observations,
     observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
@@ -15,8 +14,7 @@ use beholder_adapters_treesitter_elixir::{
 use beholder_adapters_treesitter_rust::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis,
     diagnostics_from_analysis as rust_diagnostics, entities_from_analysis as rust_entities,
-    observations_from_analysis,
-    resolve_repository_calls as resolve_rust_repository_calls,
+    observations_from_analysis, resolve_repository_calls as resolve_rust_repository_calls,
 };
 use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
@@ -639,7 +637,8 @@ impl IndexScheduler {
                 .collect::<Vec<_>>()
         });
         for analysis in analyzed_elixir {
-            let (path, analysis, source_observations, source_entities, source_diagnostics) = analysis?;
+            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+                analysis?;
             observations.extend(source_observations);
             entities.extend(source_entities);
             diagnostics.extend(source_diagnostics);

@@ -476,14 +476,14 @@ mod tests {
         let protobuf = client
             .context(EntityRequest {
                 workspace: "main".into(),
-                entity: "grpc://pricing.v1.Pricing/GetQuote".into(),
+                entity: "proto-method://pricing.v1.Pricing/GetQuote".into(),
             })
             .await
             .unwrap()
             .into_inner();
         assert_eq!(protobuf.root.unwrap().kind, EntityKind::Rpc as i32);
         assert!(protobuf.nodes.iter().any(|node| {
-            node.id == "proto-message://pricing.v1.Request"
+            node.id == "proto-type://pricing.v1.Request"
                 && node.kind == EntityKind::ProtoMessage as i32
         }));
         assert!(protobuf.edges.iter().any(|edge| {
@@ -514,7 +514,7 @@ mod tests {
                 let context = client
                     .context(EntityRequest {
                         workspace: "main".into(),
-                        entity: "grpc://pricing.v1.Pricing/GetPrice".into(),
+                        entity: "proto-method://pricing.v1.Pricing/GetPrice".into(),
                     })
                     .await
                     .unwrap()

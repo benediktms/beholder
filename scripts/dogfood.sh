@@ -203,8 +203,8 @@ if grep -Fq '/generated/1' <<<"$macro_result"; then
 fi
 echo 'Checking Protobuf descriptor indexing...' >&2
 result="$(target/debug/beholder context --json --workspace main \
-    'grpc://pricing.v1.Pricing/GetQuote')"
-for expected in '"kind":"rpc"' 'proto-message://pricing.v1.Request' '"kind":"request_type"' '"source":"descriptor"'; do
+    'proto-method://pricing.v1.Pricing/GetQuote')"
+for expected in '"kind":"rpc"' 'proto-type://pricing.v1.Request' '"kind":"request_type"' '"source":"descriptor"'; do
     if ! grep -Fq "$expected" <<<"$result"; then
         printf 'expected %s in Protobuf context:\n%s\n' "$expected" "$result" >&2
         exit 1

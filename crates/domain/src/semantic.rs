@@ -235,6 +235,9 @@ pub enum ProtoTypeKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RpcCardinality {
+    BidirectionalStreaming,
+    ClientStreaming,
+    ServerStreaming,
     Unary,
 }
 
@@ -247,14 +250,16 @@ impl EntityFact {
         match (kind, metadata) {
             (EntityKind::ProtoMethod, Some(EntityMetadata::ProtoMethod { .. }))
             | (EntityKind::ProtoType, Some(EntityMetadata::ProtoType { .. }))
-            | (EntityKind::Callable
-            | EntityKind::GraphqlField
-            | EntityKind::KafkaTopic
-            | EntityKind::Namespace
-            | EntityKind::ProtoField
-            | EntityKind::ProtoService
-            | EntityKind::Service,
-            None) => Ok(Self {
+            | (
+                EntityKind::Callable
+                | EntityKind::GraphqlField
+                | EntityKind::KafkaTopic
+                | EntityKind::Namespace
+                | EntityKind::ProtoField
+                | EntityKind::ProtoService
+                | EntityKind::Service,
+                None,
+            ) => Ok(Self {
                 id: id.into(),
                 kind,
                 metadata,
@@ -270,22 +275,26 @@ mod entity_fact_tests {
 
     #[test]
     fn rejects_incompatible_metadata() {
-        assert!(EntityFact::new(
-            "proto-type://example.v1.Quote",
-            EntityKind::ProtoType,
-            Some(EntityMetadata::ProtoMethod {
-                cardinality: RpcCardinality::Unary,
-            }),
-        )
-        .is_err());
-        assert!(EntityFact::new(
-            "proto-type://example.v1.Quote",
-            EntityKind::ProtoType,
-            Some(EntityMetadata::ProtoType {
-                kind: ProtoTypeKind::Message,
-            }),
-        )
-        .is_ok());
+        assert!(
+            EntityFact::new(
+                "proto-type://example.v1.Quote",
+                EntityKind::ProtoType,
+                Some(EntityMetadata::ProtoMethod {
+                    cardinality: RpcCardinality::Unary,
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            EntityFact::new(
+                "proto-type://example.v1.Quote",
+                EntityKind::ProtoType,
+                Some(EntityMetadata::ProtoType {
+                    kind: ProtoTypeKind::Message,
+                }),
+            )
+            .is_ok()
+        );
     }
 }
 

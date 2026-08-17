@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 
 type EdgeKey = (String, String, RelationKind);
+type EntityFactMap = BTreeMap<String, (EntityKind, Option<EntityMetadata>)>;
 type Closure = (Vec<(String, u32)>, GraphOutput, bool);
 #[derive(Clone, Copy)]
 enum TraversalDirection {
@@ -63,8 +64,13 @@ pub(super) fn dependencies(
     result: InspectionResult,
     entities: InspectionResult,
 ) -> Result<DependenciesResult, Box<dyn Error>> {
-    let (entries, output, truncated) =
-        closure(result, entities, entity, max_hops, TraversalDirection::Outgoing)?;
+    let (entries, output, truncated) = closure(
+        result,
+        entities,
+        entity,
+        max_hops,
+        TraversalDirection::Outgoing,
+    )?;
     Ok(DependenciesResult {
         schema: DEPENDENCIES_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -92,8 +98,13 @@ pub(super) fn impact(
     result: InspectionResult,
     entities: InspectionResult,
 ) -> Result<ImpactResult, Box<dyn Error>> {
-    let (entries, output, truncated) =
-        closure(result, entities, entity, max_hops, TraversalDirection::Incoming)?;
+    let (entries, output, truncated) = closure(
+        result,
+        entities,
+        entity,
+        max_hops,
+        TraversalDirection::Incoming,
+    )?;
     Ok(ImpactResult {
         schema: IMPACT_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -303,9 +314,9 @@ fn shortest_path(
 #[derive(Default)]
 struct GraphBuilder {
     edges: BTreeMap<EdgeKey, EdgeData>,
+    facts: EntityFactMap,
     kinds: BTreeMap<String, EntityKind>,
     metadata: BTreeMap<String, EntityMetadata>,
-    explicit_kinds: BTreeSet<String>,
     origins: BTreeMap<String, EntityOrigin>,
 }
 
@@ -315,18 +326,16 @@ struct EdgeData {
 }
 
 impl GraphBuilder {
-    fn hint_facts(&mut self, facts: BTreeMap<String, (EntityKind, Option<EntityMetadata>)>) {
-        self.explicit_kinds.extend(facts.keys().cloned());
-        for (id, (kind, metadata)) in facts {
-            self.kinds.insert(id.clone(), kind);
-            if let Some(metadata) = metadata {
-                self.metadata.insert(id, metadata);
-            }
-        }
+    fn hint_facts(&mut self, facts: EntityFactMap) {
+        self.facts = facts;
     }
 
     fn hint(&mut self, id: &str, kind: EntityKind) {
-        if self.explicit_kinds.contains(id) {
+        if let Some((kind, metadata)) = self.facts.get(id).copied() {
+            self.kinds.insert(id.into(), kind);
+            if let Some(metadata) = metadata {
+                self.metadata.insert(id.into(), metadata);
+            }
             return;
         }
         let current = self.kinds.entry(id.into()).or_insert(EntityKind::Unknown);
@@ -413,27 +422,63 @@ impl GraphBuilder {
     }
 }
 
-fn entity_kinds(
-    result: InspectionResult,
-) -> Result<BTreeMap<String, (EntityKind, Option<EntityMetadata>)>, Box<dyn Error>> {
+fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error>> {
     result
         .rows
         .iter()
         .map(|row| {
             let id = text(row, 0, "entity id")?.to_owned();
-            let entity = match (text(row, 1, "entity kind")?, text(row, 2, "entity metadata")?) {
+            let entity = match (
+                text(row, 1, "entity kind")?,
+                text(row, 2, "entity metadata")?,
+            ) {
                 ("callable", "") => (EntityKind::Callable, None),
                 ("graphql_field", "") => (EntityKind::GraphqlField, None),
                 ("kafka_topic", "") => (EntityKind::KafkaTopic, None),
                 ("namespace", "") => (EntityKind::Namespace, None),
                 ("proto_field", "") => (EntityKind::ProtoField, None),
-                ("proto_method", "rpc_cardinality:unary") => (EntityKind::Rpc, Some(EntityMetadata::ProtoMethod { cardinality: RpcCardinality::Unary })),
+                ("proto_method", "rpc_cardinality:bidirectional_streaming") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::BidirectionalStreaming,
+                    }),
+                ),
+                ("proto_method", "rpc_cardinality:client_streaming") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::ClientStreaming,
+                    }),
+                ),
+                ("proto_method", "rpc_cardinality:server_streaming") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::ServerStreaming,
+                    }),
+                ),
+                ("proto_method", "rpc_cardinality:unary") => (
+                    EntityKind::Rpc,
+                    Some(EntityMetadata::ProtoMethod {
+                        cardinality: RpcCardinality::Unary,
+                    }),
+                ),
                 ("proto_service", "") => (EntityKind::ProtoService, None),
-                ("proto_type", "proto_type:enum") => (EntityKind::ProtoEnum, Some(EntityMetadata::ProtoType { type_kind: ProtoTypeKind::Enum })),
-                ("proto_type", "proto_type:message") => (EntityKind::ProtoMessage, Some(EntityMetadata::ProtoType { type_kind: ProtoTypeKind::Message })),
+                ("proto_type", "proto_type:enum") => (
+                    EntityKind::ProtoEnum,
+                    Some(EntityMetadata::ProtoType {
+                        type_kind: ProtoTypeKind::Enum,
+                    }),
+                ),
+                ("proto_type", "proto_type:message") => (
+                    EntityKind::ProtoMessage,
+                    Some(EntityMetadata::ProtoType {
+                        type_kind: ProtoTypeKind::Message,
+                    }),
+                ),
                 ("service", "") => (EntityKind::Service, None),
                 (kind, metadata) => {
-                    return Err(format!("invalid persisted entity fact {kind} with {metadata}").into());
+                    return Err(
+                        format!("invalid persisted entity fact {kind} with {metadata}").into(),
+                    );
                 }
             };
             Ok((id, entity))
@@ -530,7 +575,7 @@ fn is_test_entity(id: &str) -> bool {
 }
 
 fn infer_kind(id: &str) -> EntityKind {
-    if id.starts_with("grpc://") || id.starts_with("rpc/") || id.starts_with("rpc://") {
+    if id.starts_with("proto-method://") || id.starts_with("rpc/") || id.starts_with("rpc://") {
         EntityKind::Rpc
     } else if id.starts_with("graphql-field://") {
         EntityKind::GraphqlField
@@ -543,14 +588,8 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::Callable
     } else if id.starts_with("elixir-module://") || id.starts_with("erlang-module://") {
         EntityKind::Namespace
-    } else if id.starts_with("proto-file://") {
-        EntityKind::ProtoFile
-    } else if id.starts_with("proto-message://") {
-        EntityKind::ProtoMessage
     } else if id.starts_with("proto-field://") {
         EntityKind::ProtoField
-    } else if id.starts_with("proto-enum://") {
-        EntityKind::ProtoEnum
     } else if id.starts_with("proto-service://") {
         EntityKind::ProtoService
     } else if id.contains("/elixir-source/") {
@@ -597,7 +636,10 @@ fn entity_name(id: &str) -> String {
             format!("{function}/{arity}")
         };
     }
-    if let Some((service, method)) = id.strip_prefix("grpc://").and_then(|id| id.split_once('/')) {
+    if let Some((service, method)) = id
+        .strip_prefix("proto-method://")
+        .and_then(|id| id.split_once('/'))
+    {
         return format!(
             "{}.{}",
             service.rsplit('.').next().unwrap_or(service),
@@ -687,16 +729,24 @@ mod tests {
     #[test]
     fn typed_entity_facts_override_relation_hints() {
         let mut graph = GraphBuilder::default();
-        graph.hint_facts(BTreeMap::from([(
-            "repo://example/rust/lib".into(),
-            (EntityKind::Namespace, None),
-        )]));
+        graph.hint_facts(BTreeMap::from([
+            (
+                "repo://example/rust/lib".into(),
+                (EntityKind::Namespace, None),
+            ),
+            (
+                "repo://example/rust/unrelated".into(),
+                (EntityKind::Callable, None),
+            ),
+        ]));
         graph.hint("repo://example/rust/lib", EntityKind::Callable);
 
+        let graph = graph.finish();
         assert_eq!(
-            graph.finish().entity("repo://example/rust/lib").kind,
+            graph.entity("repo://example/rust/lib").kind,
             EntityKind::Namespace
         );
+        assert_eq!(graph.nodes.len(), 1);
     }
 
     #[test]

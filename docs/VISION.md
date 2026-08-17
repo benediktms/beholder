@@ -1296,11 +1296,11 @@ Contract identities should be semantic rather than based on filesystem location.
 Examples:
 
 ```text
-proto-message://company.users.v1.User
+proto-type://company.users.v1.User
 
 proto-field://company.users.v1.User/email
 
-grpc://company.users.v1.Users/GetUser
+proto-method://company.users.v1.Users/GetUser
 
 graphql-field://Query/customer
 

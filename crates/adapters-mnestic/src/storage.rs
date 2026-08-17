@@ -85,6 +85,15 @@ fn entity_metadata(metadata: Option<EntityMetadata>) -> &'static str {
     match metadata {
         None => "",
         Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::BidirectionalStreaming,
+        }) => "rpc_cardinality:bidirectional_streaming",
+        Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::ClientStreaming,
+        }) => "rpc_cardinality:client_streaming",
+        Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::ServerStreaming,
+        }) => "rpc_cardinality:server_streaming",
+        Some(EntityMetadata::ProtoMethod {
             cardinality: RpcCardinality::Unary,
         }) => "rpc_cardinality:unary",
         Some(EntityMetadata::ProtoType {
@@ -270,9 +279,10 @@ pub(super) fn reusable_current_state(
         .iter()
         .map(|row| Ok((string(row, 0)?, (string(row, 1)?, string(row, 2)?))))
         .collect::<Result<NormalizedEntities, Box<dyn Error>>>()?;
-    Ok((stored == normalized_observations(facts)
-        && stored_entities == normalized_entities(facts))
-        .then_some(state))
+    Ok(
+        (stored == normalized_observations(facts) && stored_entities == normalized_entities(facts))
+            .then_some(state),
+    )
 }
 
 pub(super) fn view_matches(db: &DbInstance, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
@@ -591,9 +601,9 @@ mod tests {
     use super::*;
     use crate::SemanticStore;
     use beholder_domain::{
-        Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind,
-        EntityMetadata, FactChanges, LogicalRepository, Observation, ProtoTypeKind, Provenance,
-        RepositoryFacts, RepositoryState, StructuralRelation, WorkspaceView,
+        Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata,
+        FactChanges, LogicalRepository, Observation, ProtoTypeKind, Provenance, RepositoryFacts,
+        RepositoryState, StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
     use std::{
@@ -637,6 +647,9 @@ mod tests {
             )
             .unwrap(),
         );
+        facts.entities.push(
+            EntityFact::new("repo://example/rust/unrelated", EntityKind::Callable, None).unwrap(),
+        );
         let state = analyzed_state(&facts);
         store.publish(&view, &[facts], &[]).unwrap();
 
@@ -648,11 +661,14 @@ mod tests {
                 ScriptMutability::Immutable,
             )
             .unwrap();
-        assert_eq!(rows.rows, vec![["proto_type".into(), "proto_type:message".into()]]);
-        let root = store
+        assert_eq!(
+            rows.rows,
+            vec![["proto_type".into(), "proto_type:message".into()]]
+        );
+        let context = store
             .context("main", "proto-type://pricing.v1.Quote")
-            .unwrap()
-            .root;
+            .unwrap();
+        let root = context.root;
         assert_eq!(root.kind, beholder_dto::EntityKind::ProtoMessage);
         assert_eq!(
             root.metadata,
@@ -660,6 +676,7 @@ mod tests {
                 type_kind: beholder_dto::ProtoTypeKind::Message,
             })
         );
+        assert_eq!(context.nodes.len(), 1);
     }
     #[test]
     fn publish_replaces_only_changed_facts() {
@@ -778,11 +795,11 @@ mod tests {
             store
                 .publish(
                     &view,
-                &[RepositoryFacts {
-                    state: state.clone(),
-                    analysis_identity: analysis_identity.into(),
-                    entities: Vec::new(),
-                    observations: vec![observation.clone()],
+                    &[RepositoryFacts {
+                        state: state.clone(),
+                        analysis_identity: analysis_identity.into(),
+                        entities: Vec::new(),
+                        observations: vec![observation.clone()],
                     }],
                     &[],
                 )
@@ -918,11 +935,11 @@ mod tests {
             store
                 .publish(
                     &view,
-                &[RepositoryFacts {
-                    state: state.clone(),
-                    analysis_identity: analysis_identity.into(),
-                    entities: Vec::new(),
-                    observations: observations.clone(),
+                    &[RepositoryFacts {
+                        state: state.clone(),
+                        analysis_identity: analysis_identity.into(),
+                        entities: Vec::new(),
+                        observations: observations.clone(),
                     }],
                     &[],
                 )

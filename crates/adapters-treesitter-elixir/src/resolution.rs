@@ -132,16 +132,27 @@ pub fn entities_from_analysis(
 ) -> Vec<EntityFact> {
     let source_id = format!(
         "repo://{repository}/elixir-source/{}",
-        path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+        path.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/")
     );
     let mut entities = vec![EntityFact::new(source_id, EntityKind::Namespace, None).unwrap()];
     for module in &analysis.modules {
         let module_id = format!("repo://{repository}/elixir/{}", module.name);
         entities.push(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap());
-        for function in module.functions.iter().chain(&module.callbacks) {
+        for function in &module.functions {
             entities.push(
                 EntityFact::new(
                     format!("{module_id}/{}/{}", function.name, function.arity),
+                    EntityKind::Callable,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        for callback in &module.callbacks {
+            entities.push(
+                EntityFact::new(
+                    format!("{module_id}/callback/{}/{}", callback.name, callback.arity),
                     EntityKind::Callable,
                     None,
                 )
@@ -448,10 +459,17 @@ mod tests {
 
     #[test]
     fn emits_typed_source_entities() {
-        let analysis = analyze("defmodule Example.Worker do\n  def run, do: :ok\nend").unwrap();
+        let analysis = analyze(
+            "defmodule Example.Worker do\n  @callback work(term()) :: term()\n  def run, do: :ok\nend",
+        )
+        .unwrap();
         let entities = entities_from_analysis("example", &analysis, Path::new("lib/worker.ex"));
         assert!(entities.iter().any(|entity| {
             entity.id.as_str() == "repo://example/elixir/Example.Worker/run/0"
+                && entity.kind == EntityKind::Callable
+        }));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "repo://example/elixir/Example.Worker/callback/work/1"
                 && entity.kind == EntityKind::Callable
         }));
     }
