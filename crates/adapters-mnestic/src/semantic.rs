@@ -373,7 +373,7 @@ impl GraphBuilder {
                 _ => {}
             }
         }
-        let evidence = evidence_ref(from, evidence, provenance);
+        let evidence = evidence_ref(from, to, evidence, provenance);
         self.edges
             .entry(key.clone())
             .and_modify(|edge| {
@@ -682,7 +682,7 @@ fn repository(id: &str) -> Option<String> {
     })
 }
 
-fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
+fn evidence_ref(from: &str, to: &str, evidence: &str, provenance: &str) -> EvidenceRef {
     let (mut path, line) = evidence
         .rsplit_once(':')
         .and_then(|(path, line)| {
@@ -703,7 +703,7 @@ fn evidence_ref(from: &str, evidence: &str, provenance: &str) -> EvidenceRef {
             "generated" => EvidenceKind::Generated,
             _ => EvidenceKind::Unknown,
         },
-        repository: repository(from),
+        repository: repository(from).or_else(|| repository(to)),
         path,
         line,
         detail: match provenance {
@@ -773,6 +773,27 @@ mod tests {
         let graph = graph.finish();
         assert_eq!(graph.edges[0].confidence, 1.0);
         assert_eq!(graph.edges[0].evidence.len(), 2);
+    }
+
+    #[test]
+    fn attributes_evidence_to_a_repository_owned_target() {
+        let mut graph = GraphBuilder::default();
+        graph
+            .add_edge(
+                "grpc://example.Service/Call",
+                "repo://example/server/elixir/Example.Server/call/2",
+                "implemented_by",
+                "lib/server.ex:4",
+                1.0,
+                "generated",
+            )
+            .unwrap();
+
+        let graph = graph.finish();
+        assert_eq!(
+            graph.edges[0].evidence[0].repository.as_deref(),
+            Some("example/server")
+        );
     }
 
     #[test]
