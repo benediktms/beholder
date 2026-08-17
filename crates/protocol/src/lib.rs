@@ -193,6 +193,49 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
     )
 }
 
+fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'static str> {
+    match value.metadata.ok_or("entity metadata is missing")? {
+        v1::entity_metadata::Metadata::ProtoTypeKind(value) => Ok(dto::EntityMetadata::ProtoType {
+            type_kind: match v1::ProtoTypeKind::try_from(value)
+                .map_err(|_| "unknown Protobuf type kind")?
+            {
+                v1::ProtoTypeKind::Enum => dto::ProtoTypeKind::Enum,
+                v1::ProtoTypeKind::Message => dto::ProtoTypeKind::Message,
+                v1::ProtoTypeKind::Unknown => return Err("Protobuf type kind is missing"),
+            },
+        }),
+        v1::entity_metadata::Metadata::RpcCardinality(value) => {
+            Ok(dto::EntityMetadata::ProtoMethod {
+                cardinality: match v1::RpcCardinality::try_from(value)
+                    .map_err(|_| "unknown RPC cardinality")?
+                {
+                    v1::RpcCardinality::Unary => dto::RpcCardinality::Unary,
+                    v1::RpcCardinality::Unknown => return Err("RPC cardinality is missing"),
+                },
+            })
+        }
+    }
+}
+
+fn protocol_entity_metadata(value: dto::EntityMetadata) -> v1::EntityMetadata {
+    let metadata = match value {
+        dto::EntityMetadata::ProtoType { type_kind } => {
+            v1::entity_metadata::Metadata::ProtoTypeKind(match type_kind {
+                dto::ProtoTypeKind::Enum => v1::ProtoTypeKind::Enum as i32,
+                dto::ProtoTypeKind::Message => v1::ProtoTypeKind::Message as i32,
+            })
+        }
+        dto::EntityMetadata::ProtoMethod { cardinality } => {
+            v1::entity_metadata::Metadata::RpcCardinality(match cardinality {
+                dto::RpcCardinality::Unary => v1::RpcCardinality::Unary as i32,
+            })
+        }
+    };
+    v1::EntityMetadata {
+        metadata: Some(metadata),
+    }
+}
+
 impl From<dto::EntityRef> for v1::Entity {
     fn from(value: dto::EntityRef) -> Self {
         Self {
@@ -202,6 +245,7 @@ impl From<dto::EntityRef> for v1::Entity {
             repository: value.repository,
             origin: v1::EntityOrigin::from(value.origin) as i32,
             test: value.test,
+            metadata: value.metadata.map(protocol_entity_metadata),
         }
     }
 }
@@ -217,6 +261,7 @@ impl TryFrom<v1::Entity> for dto::EntityRef {
             repository: value.repository,
             origin: entity_origin(value.origin)?,
             test: value.test,
+            metadata: value.metadata.map(entity_metadata).transpose()?,
         })
     }
 }
@@ -676,6 +721,9 @@ mod tests {
                 repository: None,
                 origin: dto::EntityOrigin::Source,
                 test: false,
+                metadata: Some(dto::EntityMetadata::ProtoMethod {
+                    cardinality: dto::RpcCardinality::Unary,
+                }),
             }],
             edges: vec![dto::SemanticEdge {
                 id: "e1".into(),

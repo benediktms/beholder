@@ -73,6 +73,26 @@ pub enum EntityOrigin {
     ExternalDependency,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtoTypeKind {
+    Enum,
+    Message,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcCardinality {
+    Unary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EntityMetadata {
+    ProtoMethod { cardinality: RpcCardinality },
+    ProtoType { type_kind: ProtoTypeKind },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EntityRef {
     pub id: String,
@@ -81,6 +101,7 @@ pub struct EntityRef {
     pub repository: Option<String>,
     pub origin: EntityOrigin,
     pub test: bool,
+    pub metadata: Option<EntityMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]

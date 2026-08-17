@@ -1,9 +1,10 @@
 use crate::{InspectionResult, InspectionValue};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
-    EntityKind, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef, IMPACT_SCHEMA_V2,
-    ImpactRef, ImpactResult, PathQuery, QueryMetadata, RelationKind, SemanticEdge, SemanticPath,
-    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata,
+    EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
+    IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, ProtoTypeKind, QueryMetadata,
+    RelationKind, RpcCardinality, SemanticEdge, SemanticPath, TRACE_SCHEMA_V2, TraceResult,
+    TraversalMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -303,6 +304,7 @@ fn shortest_path(
 struct GraphBuilder {
     edges: BTreeMap<EdgeKey, EdgeData>,
     kinds: BTreeMap<String, EntityKind>,
+    metadata: BTreeMap<String, EntityMetadata>,
     explicit_kinds: BTreeSet<String>,
     origins: BTreeMap<String, EntityOrigin>,
 }
@@ -313,9 +315,14 @@ struct EdgeData {
 }
 
 impl GraphBuilder {
-    fn hint_facts(&mut self, facts: BTreeMap<String, EntityKind>) {
+    fn hint_facts(&mut self, facts: BTreeMap<String, (EntityKind, Option<EntityMetadata>)>) {
         self.explicit_kinds.extend(facts.keys().cloned());
-        self.kinds.extend(facts);
+        for (id, (kind, metadata)) in facts {
+            self.kinds.insert(id.clone(), kind);
+            if let Some(metadata) = metadata {
+                self.metadata.insert(id, metadata);
+            }
+        }
     }
 
     fn hint(&mut self, id: &str, kind: EntityKind) {
@@ -382,6 +389,7 @@ impl GraphBuilder {
                         .copied()
                         .unwrap_or_else(|| infer_kind(&id)),
                     self.origins.get(&id).copied(),
+                    self.metadata.get(&id).copied(),
                 )
             })
             .collect::<Vec<_>>();
@@ -405,28 +413,30 @@ impl GraphBuilder {
     }
 }
 
-fn entity_kinds(result: InspectionResult) -> Result<BTreeMap<String, EntityKind>, Box<dyn Error>> {
+fn entity_kinds(
+    result: InspectionResult,
+) -> Result<BTreeMap<String, (EntityKind, Option<EntityMetadata>)>, Box<dyn Error>> {
     result
         .rows
         .iter()
         .map(|row| {
             let id = text(row, 0, "entity id")?.to_owned();
-            let kind = match (text(row, 1, "entity kind")?, text(row, 2, "entity metadata")?) {
-                ("callable", "") => EntityKind::Callable,
-                ("graphql_field", "") => EntityKind::GraphqlField,
-                ("kafka_topic", "") => EntityKind::KafkaTopic,
-                ("namespace", "") => EntityKind::Namespace,
-                ("proto_field", "") => EntityKind::ProtoField,
-                ("proto_method", "rpc_cardinality:unary") => EntityKind::Rpc,
-                ("proto_service", "") => EntityKind::ProtoService,
-                ("proto_type", "proto_type:enum") => EntityKind::ProtoEnum,
-                ("proto_type", "proto_type:message") => EntityKind::ProtoMessage,
-                ("service", "") => EntityKind::Service,
+            let entity = match (text(row, 1, "entity kind")?, text(row, 2, "entity metadata")?) {
+                ("callable", "") => (EntityKind::Callable, None),
+                ("graphql_field", "") => (EntityKind::GraphqlField, None),
+                ("kafka_topic", "") => (EntityKind::KafkaTopic, None),
+                ("namespace", "") => (EntityKind::Namespace, None),
+                ("proto_field", "") => (EntityKind::ProtoField, None),
+                ("proto_method", "rpc_cardinality:unary") => (EntityKind::Rpc, Some(EntityMetadata::ProtoMethod { cardinality: RpcCardinality::Unary })),
+                ("proto_service", "") => (EntityKind::ProtoService, None),
+                ("proto_type", "proto_type:enum") => (EntityKind::ProtoEnum, Some(EntityMetadata::ProtoType { type_kind: ProtoTypeKind::Enum })),
+                ("proto_type", "proto_type:message") => (EntityKind::ProtoMessage, Some(EntityMetadata::ProtoType { type_kind: ProtoTypeKind::Message })),
+                ("service", "") => (EntityKind::Service, None),
                 (kind, metadata) => {
                     return Err(format!("invalid persisted entity fact {kind} with {metadata}").into());
                 }
             };
-            Ok((id, kind))
+            Ok((id, entity))
         })
         .collect()
 }
@@ -464,10 +474,15 @@ impl GraphOutput {
 }
 
 fn entity_ref(id: &str, kind: EntityKind) -> EntityRef {
-    entity_ref_with_origin(id, kind, None)
+    entity_ref_with_origin(id, kind, None, None)
 }
 
-fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigin>) -> EntityRef {
+fn entity_ref_with_origin(
+    id: &str,
+    kind: EntityKind,
+    origin: Option<EntityOrigin>,
+    metadata: Option<EntityMetadata>,
+) -> EntityRef {
     EntityRef {
         id: id.into(),
         kind,
@@ -486,6 +501,7 @@ fn entity_ref_with_origin(id: &str, kind: EntityKind, origin: Option<EntityOrigi
             }
         }),
         test: is_test_entity(id),
+        metadata,
     }
 }
 
@@ -671,7 +687,10 @@ mod tests {
     #[test]
     fn typed_entity_facts_override_relation_hints() {
         let mut graph = GraphBuilder::default();
-        graph.hint_facts(BTreeMap::from([("repo://example/rust/lib".into(), EntityKind::Namespace)]));
+        graph.hint_facts(BTreeMap::from([(
+            "repo://example/rust/lib".into(),
+            (EntityKind::Namespace, None),
+        )]));
         graph.hint("repo://example/rust/lib", EntityKind::Callable);
 
         assert_eq!(

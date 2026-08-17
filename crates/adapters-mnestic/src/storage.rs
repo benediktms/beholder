@@ -649,13 +649,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.rows, vec![["proto_type".into(), "proto_type:message".into()]]);
+        let root = store
+            .context("main", "proto-type://pricing.v1.Quote")
+            .unwrap()
+            .root;
+        assert_eq!(root.kind, beholder_dto::EntityKind::ProtoMessage);
         assert_eq!(
-            store
-                .context("main", "proto-type://pricing.v1.Quote")
-                .unwrap()
-                .root
-                .kind,
-            beholder_dto::EntityKind::ProtoMessage
+            root.metadata,
+            Some(beholder_dto::EntityMetadata::ProtoType {
+                type_kind: beholder_dto::ProtoTypeKind::Message,
+            })
         );
     }
     #[test]

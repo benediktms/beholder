@@ -657,6 +657,7 @@ mod tests {
                 EntityOrigin::Source
             },
             test: false,
+            metadata: None,
         }
     }
 
