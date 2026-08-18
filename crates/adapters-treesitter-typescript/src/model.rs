@@ -1,0 +1,150 @@
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLanguage {
+    JavaScript,
+    Jsx,
+    TypeScript,
+    Tsx,
+}
+
+impl SourceLanguage {
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path.extension()?.to_str()? {
+            "js" => Some(Self::JavaScript),
+            "jsx" => Some(Self::Jsx),
+            "ts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            _ => None,
+        }
+    }
+
+    pub fn id_segment(self) -> &'static str {
+        match self {
+            Self::JavaScript | Self::Jsx => "javascript",
+            Self::TypeScript | Self::Tsx => "typescript",
+        }
+    }
+
+    pub fn cache_version(self) -> &'static str {
+        match self {
+            Self::JavaScript => "18-javascript",
+            Self::Jsx => "18-jsx",
+            Self::TypeScript => "18-typescript",
+            Self::Tsx => "18-tsx",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TypescriptAnalysis {
+    pub(super) language: SourceLanguage,
+    pub(super) calls: Vec<Call>,
+    pub(super) definitions: Vec<Definition>,
+    pub(super) imports: Vec<Import>,
+    pub(super) exports: Vec<Export>,
+    pub(super) parse_error_lines: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TypescriptRepository {
+    pub(super) repository: String,
+    pub(super) sources: Vec<(PathBuf, TypescriptAnalysis)>,
+    pub(super) manifests: Vec<(PathBuf, String)>,
+    pub(super) configs: Vec<(PathBuf, String)>,
+}
+
+impl TypescriptRepository {
+    pub fn new(
+        repository: impl Into<String>,
+        sources: Vec<(PathBuf, TypescriptAnalysis)>,
+        manifests: Vec<(PathBuf, String)>,
+        configs: Vec<(PathBuf, String)>,
+    ) -> Self {
+        Self {
+            repository: repository.into(),
+            sources,
+            manifests,
+            configs,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) enum DefinitionKind {
+    Namespace,
+    Callable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Definition {
+    pub(super) qualified_name: String,
+    pub(super) kind: DefinitionKind,
+    pub(super) line: usize,
+    pub(super) calls: Vec<Call>,
+    pub(super) bindings: Vec<Binding>,
+    pub(super) alias_bindings: Vec<AliasBinding>,
+    pub(super) factory_bindings: Vec<FactoryBinding>,
+    pub(super) factory: Option<String>,
+    pub(super) base: Option<String>,
+    pub(super) return_type: Option<String>,
+    pub(super) exported: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Binding {
+    pub(super) receiver: String,
+    pub(super) type_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct AliasBinding {
+    pub(super) receiver: String,
+    pub(super) source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct FactoryBinding {
+    pub(super) receiver: String,
+    pub(super) factory: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Import {
+    pub(super) source: String,
+    pub(super) bindings: Vec<ImportBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ImportBinding {
+    pub(super) imported: String,
+    pub(super) local: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Export {
+    pub(super) source: Option<String>,
+    pub(super) local: String,
+    pub(super) exported: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) enum CallKind {
+    Direct,
+    Member,
+    Constructor,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Call {
+    pub(super) kind: CallKind,
+    pub(super) receiver: Option<String>,
+    pub(super) name: String,
+    pub(super) line: usize,
+}

@@ -15,6 +15,21 @@ pub(super) fn store_observations(
     state: &str,
     observations: &[Observation],
 ) -> Result<(), Box<dyn Error>> {
+    let observations = observations
+        .iter()
+        .map(|observation| {
+            (
+                (
+                    observation.from.as_str(),
+                    observation.relation.as_str(),
+                    observation.to.as_str(),
+                ),
+                observation,
+            )
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect::<Vec<_>>();
     for observations in observations.chunks(OBSERVATION_BATCH_SIZE) {
         let rows = observations
             .iter()
@@ -1009,6 +1024,39 @@ mod tests {
             })
         );
         assert_eq!(context.nodes.len(), 1);
+    }
+
+    #[test]
+    fn stores_one_row_for_duplicate_semantic_edges() {
+        let store = SemanticStore::memory().unwrap();
+        let transaction = store.db.multi_transaction(true);
+        let observations = vec![
+            Observation::dependency(
+                "repo/source",
+                DependencyRelation::Calls,
+                "repo/target",
+                "src/lib.rs:1",
+            ),
+            Observation::dependency(
+                "repo/source",
+                DependencyRelation::Calls,
+                "repo/target",
+                "src/lib.rs:2",
+            ),
+        ];
+
+        store_observations(&transaction, "state", &observations).unwrap();
+        transaction.commit().unwrap();
+
+        let rows = store
+            .db
+            .run_script(
+                "?[evidence] := *state_observation{state: 'state', evidence}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(rows.rows, vec![vec!["src/lib.rs:2".into()]]);
     }
 
     #[test]

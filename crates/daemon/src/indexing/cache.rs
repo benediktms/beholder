@@ -1,3 +1,4 @@
+use beholder_adapters_treesitter_typescript::TypescriptRepository;
 use beholder_domain::{AnalysisDiagnostic, EntityFact, GrpcBindingCandidate, Observation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,6 +14,7 @@ pub(super) struct RepositoryAnalysisKey {
     pub(super) fingerprint: String,
     pub(super) rust: Option<(&'static str, &'static str)>,
     pub(super) elixir: Option<(&'static str, &'static str)>,
+    pub(super) typescript: Option<(&'static str, &'static str)>,
     pub(super) protobuf: Option<&'static str>,
 }
 
@@ -23,6 +25,8 @@ pub(super) struct RepositoryAnalysis {
     pub(super) grpc_bindings: Vec<GrpcBindingCandidate>,
     pub(super) observations: Vec<Observation>,
     pub(super) diagnostics: Vec<AnalysisDiagnostic>,
+    #[serde(default)]
+    pub(super) typescript: Option<TypescriptRepository>,
 }
 
 impl SourceAnalysisKey {
@@ -42,6 +46,9 @@ impl RepositoryAnalysisKey {
         }
         if let Some((frontend, resolver)) = self.elixir {
             languages.push(format!("elixir:{frontend}:{resolver}"));
+        }
+        if let Some((frontend, resolver)) = self.typescript {
+            languages.push(format!("typescript:{frontend}:{resolver}"));
         }
         if let Some(frontend) = self.protobuf {
             languages.push(format!("protobuf:{frontend}"));

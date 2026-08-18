@@ -676,8 +676,12 @@ fn entity_name(id: &str) -> String {
 fn repository(id: &str) -> Option<String> {
     id.strip_prefix("repo://").and_then(|rest| {
         rest.rsplit_once("/elixir-source/")
+            .or_else(|| rest.rsplit_once("/typescript-source/"))
+            .or_else(|| rest.rsplit_once("/javascript-source/"))
             .or_else(|| rest.rsplit_once("/rust/"))
             .or_else(|| rest.rsplit_once("/elixir/"))
+            .or_else(|| rest.rsplit_once("/typescript/"))
+            .or_else(|| rest.rsplit_once("/javascript/"))
             .map(|(repository, _)| repository.into())
     })
 }
@@ -824,6 +828,15 @@ mod tests {
             source.repository.as_deref(),
             Some("github.com/example/elixir")
         );
+    }
+
+    #[test]
+    fn maps_typescript_repositories() {
+        let entity = entity_ref(
+            "repo://github.com/example/app/typescript/src/client/run",
+            EntityKind::Callable,
+        );
+        assert_eq!(entity.repository.as_deref(), Some("github.com/example/app"));
     }
 
     #[test]

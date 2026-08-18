@@ -17,6 +17,16 @@ use beholder_adapters_treesitter_rust::{
     observations_from_analysis, resolve_repository_calls as resolve_rust_repository_calls,
     tonic_bindings,
 };
+use beholder_adapters_treesitter_typescript::{
+    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION,
+    RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
+    TypescriptRepository, diagnostics_from_analysis as typescript_diagnostics,
+    entities_from_analysis as typescript_entities,
+    observations_from_analysis as typescript_observations,
+    resolve_repository_calls as resolve_typescript_repository_calls,
+    resolve_workspace_calls as resolve_typescript_workspace_calls,
+    unresolved_call_diagnostics as unresolved_typescript_call_diagnostics,
+};
 use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
@@ -44,8 +54,10 @@ mod pipeline;
 mod rust_analysis;
 #[path = "sources.rs"]
 mod sources;
+#[path = "typescript_analysis.rs"]
+mod typescript_analysis;
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
-use sources::{RepositorySources, repository_sources};
+use sources::{RepositorySources, is_index_input, repository_sources};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
@@ -58,6 +70,8 @@ struct AnalysisVersions {
     rust_resolver: &'static str,
     elixir_frontend: &'static str,
     elixir_resolver: &'static str,
+    typescript_frontend: &'static str,
+    typescript_resolver: &'static str,
     protobuf_frontend: &'static str,
     rule_pack: &'static str,
 }
@@ -67,6 +81,8 @@ const CURRENT_ANALYSIS_VERSIONS: AnalysisVersions = AnalysisVersions {
     rust_resolver: RESOLVER_VERSION,
     elixir_frontend: ELIXIR_FRONTEND_VERSION,
     elixir_resolver: ELIXIR_RESOLVER_VERSION,
+    typescript_frontend: TYPESCRIPT_FRONTEND_VERSION,
+    typescript_resolver: TYPESCRIPT_RESOLVER_VERSION,
     protobuf_frontend: PROTOBUF_FRONTEND_VERSION,
     rule_pack: CORE_RULE_PACK_VERSION,
 };
@@ -77,12 +93,15 @@ impl AnalysisVersions {
         fingerprint: String,
         has_rust: bool,
         has_elixir: bool,
+        has_typescript: bool,
         has_protobuf: bool,
     ) -> RepositoryAnalysisKey {
         RepositoryAnalysisKey {
             fingerprint,
             rust: has_rust.then_some((self.rust_frontend, self.rust_resolver)),
             elixir: has_elixir.then_some((self.elixir_frontend, self.elixir_resolver)),
+            typescript: has_typescript
+                .then_some((self.typescript_frontend, self.typescript_resolver)),
             protobuf: has_protobuf.then_some(self.protobuf_frontend),
         }
     }
@@ -94,6 +113,9 @@ impl AnalysisVersions {
             repositories
                 .iter()
                 .any(|sources| !sources.elixir.is_empty()),
+            repositories
+                .iter()
+                .any(|sources| !sources.typescript.is_empty()),
             repositories
                 .iter()
                 .any(|sources| !sources.protobuf.is_empty() || !sources.protobuf_source.is_empty()),
@@ -122,6 +144,7 @@ pub struct IndexScheduler {
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
+    typescript_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<TypescriptAnalysis>>>,
     protobuf_compiler: SourceCompiler,
     repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<RepositoryAnalysis>>>,
     analysis_pool: rayon::ThreadPool,
@@ -136,6 +159,16 @@ enum DirtyRepository {
 struct ActiveIndex<'a> {
     active_workspace: &'a Mutex<Option<String>>,
     idle: &'a Condvar,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RepositoryAnalysisSources<'a> {
+    rust: &'a [(PathBuf, String)],
+    elixir: &'a [(PathBuf, String)],
+    typescript: &'a [(PathBuf, String, SourceLanguage)],
+    typescript_manifests: &'a [(PathBuf, String)],
+    typescript_configs: &'a [(PathBuf, String)],
+    descriptors: &'a [(PathBuf, Vec<u8>)],
 }
 
 impl Drop for ActiveIndex<'_> {
@@ -175,6 +208,7 @@ impl IndexScheduler {
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
             elixir_cache: Mutex::new(BTreeMap::new()),
+            typescript_cache: Mutex::new(BTreeMap::new()),
             protobuf_compiler,
             repository_cache: Mutex::new(BTreeMap::new()),
             analysis_pool,
@@ -234,6 +268,10 @@ impl IndexScheduler {
         self.elixir_cache
             .lock()
             .map_err(|_| "Elixir frontend cache lock poisoned")?
+            .clear();
+        self.typescript_cache
+            .lock()
+            .map_err(|_| "TypeScript frontend cache lock poisoned")?
             .clear();
         self.protobuf_compiler.clear_memory()?;
         self.repository_cache
@@ -354,27 +392,7 @@ impl IndexScheduler {
                             path.strip_prefix(&repository.base)
                                 .ok()
                                 .filter(|relative| {
-                                    let source = (relative.extension().is_some_and(|extension| {
-                                        matches!(
-                                            extension.to_str(),
-                                            Some("rs" | "ex" | "exs" | "proto")
-                                        )
-                                    }) || matches!(
-                                        relative.file_name().and_then(|name| name.to_str()),
-                                        Some("buf.yaml" | "buf.lock")
-                                    )) && !relative.components().any(|component| {
-                                        matches!(
-                                            component.as_os_str().to_str(),
-                                            Some(
-                                                ".git"
-                                                    | "target"
-                                                    | "_build"
-                                                    | "deps"
-                                                    | "node_modules"
-                                            )
-                                        )
-                                    });
-                                    source
+                                    is_index_input(relative)
                                         || workspace.protobuf_descriptors.iter().any(|descriptor| {
                                             descriptor.repository == repository.repository
                                                 && descriptor.path == *path
@@ -524,6 +542,14 @@ impl IndexScheduler {
         elixir_analysis::analysis_versioned(self, source, frontend_version)
     }
 
+    fn typescript_analysis_versioned(
+        &self,
+        source: &str,
+        language: SourceLanguage,
+    ) -> Cached<TypescriptAnalysis> {
+        typescript_analysis::analysis_versioned(self, source, language)
+    }
+
     fn cache_path(&self, language: &str, key: &SourceAnalysisKey) -> PathBuf {
         let hash = key
             .content_hash
@@ -539,15 +565,22 @@ impl IndexScheduler {
     fn repository_observations_versioned(
         &self,
         state: &RepositoryState,
-        rust_sources: &[(PathBuf, String)],
-        elixir_sources: &[(PathBuf, String)],
-        descriptors: &[(PathBuf, Vec<u8>)],
+        sources: RepositoryAnalysisSources<'_>,
         versions: AnalysisVersions,
     ) -> Result<(Arc<RepositoryAnalysis>, CacheStatus, String), Box<dyn Error>> {
+        let RepositoryAnalysisSources {
+            rust: rust_sources,
+            elixir: elixir_sources,
+            typescript: typescript_sources,
+            typescript_manifests,
+            typescript_configs,
+            descriptors,
+        } = sources;
         let key = versions.repository_key(
             state.fingerprint.clone(),
             !rust_sources.is_empty(),
             !elixir_sources.is_empty(),
+            !typescript_sources.is_empty(),
             !descriptors.is_empty(),
         );
         let analysis_identity = key.analysis_identity();
@@ -563,6 +596,7 @@ impl IndexScheduler {
         }
         let (rust_frontend, rust_resolver) = key.rust.unwrap_or(("_", "_"));
         let (elixir_frontend, elixir_resolver) = key.elixir.unwrap_or(("_", "_"));
+        let (typescript_frontend, typescript_resolver) = key.typescript.unwrap_or(("_", "_"));
         let path = self
             .cache_dir
             .join("repository")
@@ -571,6 +605,8 @@ impl IndexScheduler {
             .join(rust_resolver)
             .join(elixir_frontend)
             .join(elixir_resolver)
+            .join(typescript_frontend)
+            .join(typescript_resolver)
             .join(key.protobuf.unwrap_or("_"))
             .join(format!("{}.json", state.fingerprint));
         if let Ok(bytes) = fs::read(&path)
@@ -681,6 +717,75 @@ impl IndexScheduler {
             elixir_grpc_bindings(&state.repository.identity, &elixir_sources);
         grpc_bindings.extend(source_bindings);
         diagnostics.extend(source_diagnostics);
+        let mut typescript_analyses = Vec::new();
+        let analyzed_typescript = self.analysis_pool.install(|| {
+            typescript_sources
+                .par_iter()
+                .map(|(path, source, language)| {
+                    let (analysis, cache_status) = self
+                        .typescript_analysis_versioned(source, *language)
+                        .map_err(|error| {
+                            format!("failed to analyze {}: {error}", path.display())
+                        })?;
+                    tracing::debug!(
+                        repository = %state.repository.identity,
+                        path = %path.display(),
+                        ?cache_status,
+                        "frontend cache lookup"
+                    );
+                    Ok::<_, String>((
+                        path.as_path(),
+                        analysis.clone(),
+                        typescript_observations(
+                            &state.repository.identity,
+                            &analysis,
+                            source,
+                            path,
+                        ),
+                        typescript_entities(&state.repository.identity, &analysis, path),
+                        typescript_diagnostics(&analysis, path),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+        for analysis in analyzed_typescript {
+            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+                analysis?;
+            observations.extend(source_observations);
+            entities.extend(source_entities);
+            diagnostics.extend(source_diagnostics);
+            typescript_analyses.push((path, analysis));
+        }
+        let typescript_sources = typescript_analyses
+            .iter()
+            .map(|(path, analysis)| (*path, analysis.as_ref()))
+            .collect::<Vec<_>>();
+        let typescript_manifest_refs = typescript_manifests
+            .iter()
+            .map(|(path, source)| (path.as_path(), source.as_str()))
+            .collect::<Vec<_>>();
+        let typescript_config_refs = typescript_configs
+            .iter()
+            .map(|(path, source)| (path.as_path(), source.as_str()))
+            .collect::<Vec<_>>();
+        resolve_typescript_repository_calls(
+            &state.repository.identity,
+            &mut observations,
+            &typescript_sources,
+            &typescript_manifest_refs,
+            &typescript_config_refs,
+        );
+        let typescript = (!typescript_analyses.is_empty()).then(|| {
+            TypescriptRepository::new(
+                state.repository.identity.clone(),
+                typescript_analyses
+                    .iter()
+                    .map(|(path, analysis)| ((*path).to_path_buf(), analysis.as_ref().clone()))
+                    .collect(),
+                typescript_manifests.to_vec(),
+                typescript_configs.to_vec(),
+            )
+        });
         let descriptor_facts = self.analysis_pool.install(|| {
             descriptors
                 .par_iter()
@@ -703,6 +808,7 @@ impl IndexScheduler {
             grpc_bindings,
             observations,
             diagnostics,
+            typescript,
         });
         if let Some(parent) = path.parent()
             && fs::create_dir_all(parent).is_ok()
@@ -790,23 +896,44 @@ fn index_workspace_versioned(
     let mut misses = 0;
     let mut dirty_source_units = 0;
     let mut diagnostics = Vec::new();
+    let mut typescript_repositories = Vec::new();
     let repository_analysis_started = Instant::now();
     for sources in repositories {
         let RepositorySources {
             state,
             rust,
             elixir,
+            typescript,
+            typescript_manifests,
+            typescript_configs,
             protobuf,
             protobuf_source,
         } = sources;
-        dirty_source_units += match dirty
-            .and_then(|repositories| repositories.get(&state.repository.identity))
-        {
-            Some(DirtyRepository::Sources(sources)) => sources.len(),
-            Some(DirtyRepository::All) | None => rust.len() + elixir.len() + protobuf_source.len(),
-        };
+        dirty_source_units +=
+            match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
+                Some(DirtyRepository::Sources(sources)) => sources.len(),
+                Some(DirtyRepository::All) | None => {
+                    rust.len()
+                        + elixir.len()
+                        + typescript.len()
+                        + typescript_manifests.len()
+                        + typescript_configs.len()
+                        + protobuf_source.len()
+                }
+            };
         let (analysis, cache_status, analysis_identity) = scheduler
-            .repository_observations_versioned(&state, &rust, &elixir, &protobuf, versions)?;
+            .repository_observations_versioned(
+                &state,
+                RepositoryAnalysisSources {
+                    rust: &rust,
+                    elixir: &elixir,
+                    typescript: &typescript,
+                    typescript_manifests: &typescript_manifests,
+                    typescript_configs: &typescript_configs,
+                    descriptors: &protobuf,
+                },
+                versions,
+            )?;
         match cache_status {
             CacheStatus::Memory => memory_hits += 1,
             CacheStatus::Disk => disk_hits += 1,
@@ -819,6 +946,9 @@ fn index_workspace_versioned(
                 .cloned()
                 .map(|diagnostic| (state.repository.identity.clone(), diagnostic)),
         );
+        if let Some(typescript) = &analysis.typescript {
+            typescript_repositories.push(typescript.clone());
+        }
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity,
@@ -835,6 +965,11 @@ fn index_workspace_versioned(
         .collect::<Vec<_>>();
     let mut overrides = resolve_rust_repository_calls(&mut all_observations);
     overrides.extend(resolve_workspace_modules(&all_observations));
+    overrides.extend(resolve_typescript_workspace_calls(
+        &mut all_observations,
+        &typescript_repositories,
+    ));
+    diagnostics.extend(unresolved_typescript_call_diagnostics(&all_observations));
     let workspace_resolution = workspace_resolution_started.elapsed();
     let publication_started = Instant::now();
     let changes = store.publish(&view, &repository_facts, &overrides)?;
@@ -952,6 +1087,267 @@ mod tests {
     }
 
     #[test]
+    fn typescript_frontend_cache_reuses_disk_and_separates_grammars() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-typescript-cache-{unique}"));
+        let source = "export function shared() {}";
+        let scheduler = IndexScheduler::new(cache.clone());
+
+        assert_eq!(
+            scheduler
+                .typescript_analysis_versioned(source, SourceLanguage::TypeScript)
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+        assert_eq!(
+            scheduler
+                .typescript_analysis_versioned(source, SourceLanguage::TypeScript)
+                .unwrap()
+                .1,
+            CacheStatus::Memory
+        );
+        assert_eq!(
+            scheduler
+                .typescript_analysis_versioned(source, SourceLanguage::JavaScript)
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        for language in [SourceLanguage::TypeScript, SourceLanguage::JavaScript] {
+            assert_eq!(
+                scheduler
+                    .typescript_analysis_versioned(source, language)
+                    .unwrap()
+                    .1,
+                CacheStatus::Disk
+            );
+        }
+        drop(scheduler);
+        fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn indexes_javascript_and_typescript_through_the_workspace_pipeline() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-typescript-index-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        for directory in [
+            "packages/app/src",
+            "packages/shell/src",
+            "packages/i18n/src",
+        ] {
+            fs::create_dir_all(repository.join(directory)).unwrap();
+        }
+        fs::write(
+            repository.join("src/service.ts"),
+            "export function helper() {} export class Worker { run() { helper(); this.stop(); } stop() {} }",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("src/component.tsx"),
+            "export const Component = (): JSX.Element => <main />",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("src/legacy.js"),
+            "export const legacy = () => undefined",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("src/view.jsx"),
+            "export const View = () => <main />",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("packages/shell/package.json"),
+            r#"{"name":"@example/shell"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repository.join("packages/i18n/package.json"),
+            r#"{"name":"@example/i18n"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repository.join("packages/app/src/start.ts"),
+            "import { loadLocale } from '@example/shell/src/loadLocale'; import { setLocale } from '@i18n/current'; export function start() { loadLocale(); setLocale(); }",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("tsconfig.json"),
+            r#"{
+                // TypeScript accepts comments and trailing commas.
+                "compilerOptions": {
+                    "baseUrl": ".",
+                    "paths": { "@i18n/*": ["packages/i18n/src/*"], },
+                },
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            repository.join("packages/shell/src/loadLocale.ts"),
+            "import { setLocale } from '@example/i18n/src/current'; export function loadLocale() { setLocale(); }",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("packages/i18n/src/current.ts"),
+            "export function setLocale() {}",
+        )
+        .unwrap();
+        let workspace = test_workspace("main", repository);
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::memory().unwrap();
+
+        assert!(scheduler.index(&store, &workspace).unwrap().1);
+        assert_eq!(scheduler.typescript_cache.lock().unwrap().len(), 7);
+        let stored = store.inspect_observations(Some("calls")).unwrap();
+        let has_call = |target: &str| {
+            stored.rows.iter().any(|row| {
+                row[1]
+                    .as_str()
+                    .is_some_and(|from| from.ends_with("/typescript/src/service/Worker/run"))
+                    && row[3].as_str().is_some_and(|to| to.ends_with(target))
+            })
+        };
+        assert!(has_call("/typescript/src/service/helper"), "{stored:?}");
+        assert!(
+            has_call("/typescript/src/service/Worker/stop"),
+            "{stored:?}"
+        );
+        assert!(
+            stored.rows.iter().any(|row| {
+                row[1]
+                    .as_str()
+                    .is_some_and(|from| from.ends_with("/typescript/packages/app/src/start/start"))
+                    && row[3].as_str().is_some_and(|to| {
+                        to.ends_with("/typescript/packages/shell/src/loadLocale/loadLocale")
+                    })
+            }),
+            "{stored:?}"
+        );
+        assert!(
+            stored.rows.iter().any(|row| {
+                row[1]
+                    .as_str()
+                    .is_some_and(|from| from.ends_with("/typescript/packages/app/src/start/start"))
+                    && row[3].as_str().is_some_and(|to| {
+                        to.ends_with("/typescript/packages/i18n/src/current/setLocale")
+                    })
+            }),
+            "{stored:?}"
+        );
+        assert!(
+            stored.rows.iter().any(|row| {
+                row[1].as_str().is_some_and(|from| {
+                    from.ends_with("/typescript/packages/shell/src/loadLocale/loadLocale")
+                }) && row[3].as_str().is_some_and(|to| {
+                    to.ends_with("/typescript/packages/i18n/src/current/setLocale")
+                })
+            }),
+            "{stored:?}"
+        );
+        let observations = format!("{:?}", store.inspect_observations(None).unwrap());
+        assert!(observations.contains("/typescript/src/component/Component"));
+        assert!(observations.contains("/javascript/src/legacy/legacy"));
+        assert!(observations.contains("/javascript/src/view/View"));
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn resolves_typescript_workspace_packages_across_repositories() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-typescript-workspace-{unique}"));
+        let consumer = state.join("consumer");
+        let provider = state.join("provider");
+        fs::create_dir_all(consumer.join("src")).unwrap();
+        fs::create_dir_all(provider.join("src")).unwrap();
+        fs::write(
+            consumer.join("src/start.ts"),
+            "import { Service, work } from '@example/provider'; export function start(service: Service) { work(); service.execute(); }",
+        )
+        .unwrap();
+        fs::write(
+            provider.join("package.json"),
+            r#"{"name":"@example/provider"}"#,
+        )
+        .unwrap();
+        fs::write(
+            provider.join("src/index.ts"),
+            "export { Service, work } from './impl';",
+        )
+        .unwrap();
+        fs::write(
+            provider.join("src/impl.ts"),
+            "export class Service { execute() {} } export function work() {}",
+        )
+        .unwrap();
+        let workspace = Workspace::new(
+            "main",
+            [("consumer", consumer), ("provider", provider)]
+                .into_iter()
+                .map(|(identity, base)| WorkspaceRepository {
+                    repository: LogicalRepository {
+                        identity: identity.into(),
+                    },
+                    display_name: identity.into(),
+                    base,
+                    alternatives: Vec::new(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let cache = state.join("cache");
+
+        for _ in 0..2 {
+            let scheduler = IndexScheduler::new(cache.clone());
+            let store = SemanticStore::memory().unwrap();
+            assert!(scheduler.index(&store, &workspace).unwrap().1);
+            let cached = scheduler.repository_cache.lock().unwrap();
+            let repositories = cached
+                .values()
+                .filter_map(|analysis| analysis.typescript.clone())
+                .collect::<Vec<_>>();
+            let mut observations = cached
+                .values()
+                .flat_map(|analysis| analysis.observations.iter().cloned())
+                .collect::<Vec<_>>();
+            let overrides = resolve_typescript_workspace_calls(&mut observations, &repositories);
+            assert_eq!(overrides.len(), 2, "{repositories:?} {observations:?}");
+            let caller = overrides[0].from.clone();
+            drop(cached);
+            let context = store.context("main", caller.as_str()).unwrap();
+            for target in [
+                "/typescript/src/impl/work",
+                "/typescript/src/impl/Service/execute",
+            ] {
+                assert!(
+                    context.edges.iter().any(|edge| {
+                        edge.from == caller.as_str()
+                            && edge.to.starts_with("repo://local://")
+                            && edge.to.ends_with(target)
+                    }),
+                    "{context:?}"
+                );
+            }
+        }
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn repository_cache_ignores_versions_for_absent_languages() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -973,9 +1369,10 @@ mod tests {
         let (first, first_status, first_identity) = scheduler
             .repository_observations_versioned(
                 &state,
-                &sources,
-                &[],
-                &[],
+                RepositoryAnalysisSources {
+                    rust: &sources,
+                    ..Default::default()
+                },
                 CURRENT_ANALYSIS_VERSIONS,
             )
             .unwrap();
@@ -986,7 +1383,14 @@ mod tests {
             ..CURRENT_ANALYSIS_VERSIONS
         };
         let (second, second_status, second_identity) = scheduler
-            .repository_observations_versioned(&state, &sources, &[], &[], irrelevant_versions)
+            .repository_observations_versioned(
+                &state,
+                RepositoryAnalysisSources {
+                    rust: &sources,
+                    ..Default::default()
+                },
+                irrelevant_versions,
+            )
             .unwrap();
 
         assert_eq!(first_status, CacheStatus::Miss);
@@ -1006,7 +1410,14 @@ mod tests {
         let scheduler = IndexScheduler::new(cache.clone());
         assert_eq!(
             scheduler
-                .repository_observations_versioned(&state, &sources, &[], &[], irrelevant_versions,)
+                .repository_observations_versioned(
+                    &state,
+                    RepositoryAnalysisSources {
+                        rust: &sources,
+                        ..Default::default()
+                    },
+                    irrelevant_versions,
+                )
                 .unwrap()
                 .1,
             CacheStatus::Disk
@@ -1015,9 +1426,10 @@ mod tests {
             scheduler
                 .repository_observations_versioned(
                     &state,
-                    &sources,
-                    &[],
-                    &[],
+                    RepositoryAnalysisSources {
+                        rust: &sources,
+                        ..Default::default()
+                    },
                     AnalysisVersions {
                         rust_resolver: "old",
                         ..CURRENT_ANALYSIS_VERSIONS
@@ -1030,6 +1442,7 @@ mod tests {
         scheduler.clear_cache().unwrap();
         assert!(scheduler.rust_cache.lock().unwrap().is_empty());
         assert!(scheduler.elixir_cache.lock().unwrap().is_empty());
+        assert!(scheduler.typescript_cache.lock().unwrap().is_empty());
         assert!(scheduler.repository_cache.lock().unwrap().is_empty());
         assert!(!cache.exists());
     }
@@ -1063,9 +1476,10 @@ mod tests {
             let (analysis, status, _) = scheduler
                 .repository_observations_versioned(
                     &state,
-                    &[],
-                    &sources,
-                    &[],
+                    RepositoryAnalysisSources {
+                        elixir: &sources,
+                        ..Default::default()
+                    },
                     CURRENT_ANALYSIS_VERSIONS,
                 )
                 .unwrap();
@@ -1159,6 +1573,8 @@ mod tests {
             rust_resolver: "rust-resolver-1",
             elixir_frontend: "elixir-1",
             elixir_resolver: "elixir-resolver-1",
+            typescript_frontend: "typescript-1",
+            typescript_resolver: "typescript-resolver-1",
             protobuf_frontend: "protobuf-1",
             rule_pack: "rules-1",
         };
@@ -1167,60 +1583,88 @@ mod tests {
             rust_resolver: "rust-resolver-2",
             elixir_frontend: "elixir-2",
             elixir_resolver: "elixir-resolver-2",
+            typescript_frontend: "typescript-2",
+            typescript_resolver: "typescript-resolver-2",
             protobuf_frontend: "protobuf-2",
             ..versions
         };
 
         for (languages, expected) in [
-            ((true, false, false), "rust:rust-1:rust-resolver-1"),
-            ((false, true, false), "elixir:elixir-1:elixir-resolver-1"),
-            ((false, false, true), "protobuf:protobuf-1"),
-            ((false, false, false), "none"),
+            ((true, false, false, false), "rust:rust-1:rust-resolver-1"),
+            (
+                (false, true, false, false),
+                "elixir:elixir-1:elixir-resolver-1",
+            ),
+            (
+                (false, false, true, false),
+                "typescript:typescript-1:typescript-resolver-1",
+            ),
+            ((false, false, false, true), "protobuf:protobuf-1"),
+            ((false, false, false, false), "none"),
         ] {
-            let (rust, elixir, protobuf) = languages;
-            let key = versions.repository_key("state".into(), rust, elixir, protobuf);
+            let (rust, elixir, typescript, protobuf) = languages;
+            let key = versions.repository_key("state".into(), rust, elixir, typescript, protobuf);
             assert_eq!(key.analysis_identity(), expected);
-            if rust || elixir || protobuf {
+            if rust || elixir || typescript || protobuf {
                 assert_ne!(
                     key,
-                    changed.repository_key("state".into(), rust, elixir, protobuf)
+                    changed.repository_key("state".into(), rust, elixir, typescript, protobuf)
                 );
             }
         }
 
         assert_eq!(
-            versions.repository_key("state".into(), true, false, false),
+            versions.repository_key("state".into(), true, false, false, false),
             AnalysisVersions {
+                elixir_frontend: "irrelevant",
+                elixir_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                typescript_frontend: "irrelevant",
+                typescript_resolver: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), true, false, false, false)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), false, true, false, false),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                typescript_frontend: "irrelevant",
+                typescript_resolver: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), false, true, false, false)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), false, false, true, false),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
                 protobuf_frontend: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), true, false, false)
+            .repository_key("state".into(), false, false, true, false)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, true, false),
-            AnalysisVersions {
-                rust_frontend: "irrelevant",
-                rust_resolver: "irrelevant",
-                protobuf_frontend: "irrelevant",
-                rule_pack: "irrelevant",
-                ..versions
-            }
-            .repository_key("state".into(), false, true, false)
-        );
-        assert_eq!(
-            versions.repository_key("state".into(), false, false, true),
+            versions.repository_key("state".into(), false, false, false, true),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
+                typescript_frontend: "irrelevant",
+                typescript_resolver: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, true)
+            .repository_key("state".into(), false, false, false, true)
         );
     }
 
@@ -1242,6 +1686,8 @@ mod tests {
             rust_resolver: "1",
             elixir_frontend: "1",
             elixir_resolver: "1",
+            typescript_frontend: "1",
+            typescript_resolver: "1",
             protobuf_frontend: "1",
             rule_pack: "1",
         };
@@ -1327,6 +1773,8 @@ mod tests {
             rust_resolver: "1",
             elixir_frontend: "1",
             elixir_resolver: "1",
+            typescript_frontend: "1",
+            typescript_resolver: "1",
             protobuf_frontend: "1",
             rule_pack: "1",
         };

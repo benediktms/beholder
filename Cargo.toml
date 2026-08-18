@@ -13,6 +13,7 @@ members = [
     "crates/adapters-git",
     "crates/adapters-treesitter-elixir",
     "crates/adapters-treesitter-rust",
+    "crates/adapters-treesitter-typescript",
     "crates/domain",
     "crates/dto",
 ]
@@ -27,9 +28,12 @@ beholder-adapters-git = { path = "crates/adapters-git" }
 beholder-adapters-protobuf = { path = "crates/adapters-protobuf" }
 beholder-adapters-treesitter-elixir = { path = "crates/adapters-treesitter-elixir" }
 beholder-adapters-treesitter-rust = { path = "crates/adapters-treesitter-rust" }
+beholder-adapters-treesitter-typescript = { path = "crates/adapters-treesitter-typescript" }
 beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }
 beholder-daemon-client = { path = "crates/daemon-client" }
 beholder-protocol = { path = "crates/protocol" }
 rayon = "1.10.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+jsonc-parser = { version = "0.33.1", features = ["serde"] }

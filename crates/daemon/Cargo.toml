@@ -13,6 +13,7 @@ beholder-adapters-mnestic = { workspace = true, features = ["sqlite"] }
 beholder-adapters-protobuf.workspace = true
 beholder-adapters-treesitter-elixir.workspace = true
 beholder-adapters-treesitter-rust.workspace = true
+beholder-adapters-treesitter-typescript.workspace = true
 beholder-daemon-client.workspace = true
 beholder-domain.workspace = true
 beholder-dto.workspace = true
@@ -20,7 +21,7 @@ beholder-protocol.workspace = true
 notify = "8.2.0"
 rayon.workspace = true
 serde.workspace = true
-serde_json = "1.0.149"
+serde_json.workspace = true
 sha2 = "0.10.9"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
