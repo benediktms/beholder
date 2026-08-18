@@ -250,11 +250,13 @@ pub fn resolve_repository_calls(
         .collect::<BTreeMap<_, _>>();
     let packages = package_roots(manifests);
     let aliases = path_aliases(configs);
-    let mut exports = BTreeMap::<(PathBuf, String), EntityId>::new();
+    let mut symbols = BTreeMap::<(PathBuf, String), EntityId>::new();
+    let mut origins = BTreeMap::<(PathBuf, String), (PathBuf, String)>::new();
     let mut members = BTreeMap::<(PathBuf, String, String), EntityId>::new();
     let mut caller_files = BTreeMap::<String, &Path>::new();
     let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
     let mut file_imports = BTreeMap::<PathBuf, &[Import]>::new();
+    let mut file_exports = BTreeMap::<PathBuf, &[Export]>::new();
     for (path, analysis) in sources {
         let module_id = format!(
             "repo://{}/{}/{}",
@@ -263,6 +265,7 @@ pub fn resolve_repository_calls(
             source_stem(path)
         );
         file_imports.insert((*path).to_path_buf(), &analysis.imports);
+        file_exports.insert((*path).to_path_buf(), &analysis.exports);
         let exported_namespaces = analysis
             .definitions
             .iter()
@@ -273,11 +276,12 @@ pub fn resolve_repository_calls(
             .collect::<Vec<_>>();
         for definition in &analysis.definitions {
             let id = format!("{module_id}/{}", definition.qualified_name);
-            if definition.exported && !definition.qualified_name.contains('/') {
-                exports.insert(
-                    ((*path).to_path_buf(), definition.qualified_name.clone()),
-                    EntityId::from(id.clone()),
-                );
+            if !definition.qualified_name.contains('/') {
+                let key = ((*path).to_path_buf(), definition.qualified_name.clone());
+                symbols.insert(key.clone(), EntityId::from(id.clone()));
+                if definition.exported {
+                    origins.insert(key.clone(), key);
+                }
             }
             if let Some((namespace, member)) = definition.qualified_name.rsplit_once('/')
                 && exported_namespaces.contains(&namespace)
@@ -297,6 +301,81 @@ pub fn resolve_repository_calls(
             }
         }
     }
+
+    for _ in 0..=sources.len() {
+        let mut changed = false;
+        for (path, exports) in &file_exports {
+            for export in *exports {
+                let Some(source) = export.source.as_deref() else {
+                    let key = (path.clone(), export.local.clone());
+                    let origin = symbols.contains_key(&key).then_some(key).or_else(|| {
+                        file_imports.get(path).and_then(|imports| {
+                            imports.iter().find_map(|import| {
+                                let binding = import
+                                    .bindings
+                                    .iter()
+                                    .find(|binding| binding.local == export.local)?;
+                                let imported_file = imported_file(
+                                    path,
+                                    &import.source,
+                                    &packages,
+                                    &aliases,
+                                    &files,
+                                )?;
+                                origins
+                                    .get(&(imported_file, binding.imported.clone()))
+                                    .cloned()
+                            })
+                        })
+                    });
+                    if let Some(origin) = origin {
+                        changed |= origins
+                            .insert((path.clone(), export.exported.clone()), origin.clone())
+                            .as_ref()
+                            != Some(&origin);
+                    }
+                    continue;
+                };
+                let Some(exported_file) = imported_file(path, source, &packages, &aliases, &files)
+                else {
+                    continue;
+                };
+                if export.local == "*" {
+                    let exported = origins
+                        .iter()
+                        .filter(|((origin_file, name), _)| {
+                            origin_file == &exported_file && name != "default"
+                        })
+                        .map(|((_, name), origin)| (name.clone(), origin.clone()))
+                        .collect::<Vec<_>>();
+                    for (name, origin) in exported {
+                        changed |= origins
+                            .insert((path.clone(), name), origin.clone())
+                            .as_ref()
+                            != Some(&origin);
+                    }
+                } else if let Some(origin) =
+                    origins.get(&(exported_file, export.local.clone())).cloned()
+                {
+                    changed |= origins
+                        .insert((path.clone(), export.exported.clone()), origin.clone())
+                        .as_ref()
+                        != Some(&origin);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let exports = origins
+        .iter()
+        .filter_map(|(export, origin)| {
+            symbols
+                .get(origin)
+                .map(|entity| (export.clone(), entity.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
@@ -364,8 +443,13 @@ pub fn resolve_repository_calls(
                         imported_file(caller_file, &import.source, &packages, &aliases, &files)?;
                     Some((file, binding.imported.as_str()))
                 });
-                let (file, type_name) =
+                let (mut file, mut type_name) =
                     imported_type.unwrap_or_else(|| ((*caller_file).to_path_buf(), type_name));
+                let origin = origins.get(&(file.clone(), type_name.to_owned()));
+                if let Some((origin_file, origin_name)) = origin {
+                    file = origin_file.clone();
+                    type_name = origin_name;
+                }
                 members.get(&(file, type_name.to_owned(), name.to_owned()))
             });
         if let Some(target) = candidate {
@@ -415,6 +499,26 @@ mod tests {
             (
                 Path::new("packages/app/src/class-consumer.ts"),
                 "import { Service } from './service'; export class InjectedConsumer { constructor(private readonly service: Service) {} run() { this.service.execute(); } } export class FieldConsumer { private service: Service; run() { this.service.execute(); } }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/default-service.ts"),
+                "export default class DefaultService { execute() {} }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/barrel-functions.ts"),
+                "export function ping() {}",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/index.ts"),
+                "import DefaultService from './default-service'; export { DefaultService as ImportedBarrelService }; export { default as BarrelService } from './default-service'; export * from './barrel-functions';",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/barrel-consumer.ts"),
+                "import { BarrelService, ImportedBarrelService, ping } from './index'; export function useBarrel(service: BarrelService) { service.execute(); ping(); } export function useImportedBarrel(service: ImportedBarrelService) { service.execute(); }",
                 SourceLanguage::TypeScript,
             ),
         ];
@@ -493,5 +597,20 @@ mod tests {
                         == "repo://example/typescript/packages/app/src/service/Service/execute"
             }));
         }
+        let barrel_caller = "repo://example/typescript/packages/app/src/barrel-consumer/useBarrel";
+        for target in [
+            "repo://example/typescript/packages/app/src/default-service/DefaultService/execute",
+            "repo://example/typescript/packages/app/src/barrel-functions/ping",
+        ] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str() == barrel_caller && observation.to.as_str() == target
+            }));
+        }
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/barrel-consumer/useImportedBarrel"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/default-service/DefaultService/execute"
+        }));
     }
 }

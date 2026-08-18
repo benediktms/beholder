@@ -30,10 +30,10 @@ impl SourceLanguage {
 
     pub fn cache_version(self) -> &'static str {
         match self {
-            Self::JavaScript => "3-javascript",
-            Self::Jsx => "3-jsx",
-            Self::TypeScript => "3-typescript",
-            Self::Tsx => "3-tsx",
+            Self::JavaScript => "4-javascript",
+            Self::Jsx => "4-jsx",
+            Self::TypeScript => "4-typescript",
+            Self::Tsx => "4-tsx",
         }
     }
 }
@@ -43,6 +43,7 @@ pub struct TypescriptAnalysis {
     pub(super) language: SourceLanguage,
     pub(super) definitions: Vec<Definition>,
     pub(super) imports: Vec<Import>,
+    pub(super) exports: Vec<Export>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -77,6 +78,13 @@ pub(super) struct Import {
 pub(super) struct ImportBinding {
     pub(super) imported: String,
     pub(super) local: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Export {
+    pub(super) source: Option<String>,
+    pub(super) local: String,
+    pub(super) exported: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -294,6 +294,62 @@ fn collect_imports(node: Node<'_>, source: &[u8], imports: &mut Vec<Import>) {
     }
 }
 
+fn collect_exports(node: Node<'_>, source: &[u8], exports: &mut Vec<Export>) {
+    if node.kind() == "export_statement" {
+        let export_source = node
+            .child_by_field_name("source")
+            .and_then(|source_node| string_value(source_node, source));
+        if text(node, source).is_some_and(|statement| statement.starts_with("export default"))
+            && let Some(local) = node
+                .child_by_field_name("declaration")
+                .and_then(|declaration| declaration.child_by_field_name("name"))
+                .and_then(|name| text(name, source))
+        {
+            exports.push(Export {
+                source: None,
+                local: local.into(),
+                exported: "default".into(),
+            });
+        }
+        if let Some(clause) = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "export_clause")
+        {
+            let mut cursor = clause.walk();
+            for specifier in clause.named_children(&mut cursor) {
+                let Some(local) = specifier
+                    .child_by_field_name("name")
+                    .and_then(|name| text(name, source))
+                else {
+                    continue;
+                };
+                let exported = specifier
+                    .child_by_field_name("alias")
+                    .and_then(|alias| text(alias, source))
+                    .unwrap_or(local);
+                exports.push(Export {
+                    source: export_source.clone(),
+                    local: local.into(),
+                    exported: exported.into(),
+                });
+            }
+        } else if export_source.is_some()
+            && text(node, source).is_some_and(|statement| statement.starts_with("export *"))
+        {
+            exports.push(Export {
+                source: export_source,
+                local: "*".into(),
+                exported: "*".into(),
+            });
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_exports(child, source, exports);
+    }
+}
+
 fn collect_definitions(
     node: Node<'_>,
     source: &[u8],
@@ -408,6 +464,7 @@ pub fn analyze(
     }
     let mut definitions = Vec::new();
     let mut imports = Vec::new();
+    let mut exports = Vec::new();
     collect_definitions(
         tree.root_node(),
         source.as_bytes(),
@@ -415,10 +472,12 @@ pub fn analyze(
         &mut definitions,
     );
     collect_imports(tree.root_node(), source.as_bytes(), &mut imports);
+    collect_exports(tree.root_node(), source.as_bytes(), &mut exports);
     Ok(TypescriptAnalysis {
         language,
         definitions,
         imports,
+        exports,
     })
 }
 
