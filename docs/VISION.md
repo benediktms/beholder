@@ -2504,36 +2504,49 @@ Beholder should also successfully analyze its own CLI-to-daemon gRPC API.
 
 ---
 
-# 63. Phase 6 — Kafka + Protobuf
+# 63. Phase 6 — JavaScript and TypeScript Foundation
 
 Implement:
 
 ```text
-topic identities
-publishers
-consumers
-protobuf envelopes
-internal Kafka wrappers
-internal topic registry
+JavaScript and TypeScript symbols
+functions, classes, interfaces, methods, and decorators
+imports, exports, re-exports, package exports, and tsconfig path aliases
+type-aware receiver, inheritance, assignment, factory, and callback resolution
+asynchronous calls and JSX
+checked-in generated source and test visibility
 ```
 
 ### Exit criterion
 
-Beholder can answer:
-
-```text
-Who publishes this event?
-
-Who consumes it?
-
-What payload does this topic carry?
-
-What is the blast radius of changing this message?
-```
+A source-backed call path crosses independent JavaScript or TypeScript
+repositories through a shared package. Representative functional, class-based,
+dependency-injected, asynchronous, and JSX paths resolve without compiler or
+language-service execution; unsupported receiver flow remains explicit and
+diagnosed rather than guessed.
 
 ---
 
-# 64. Phase 7 — GraphQL Backend-for-Frontend
+# 64. Phase 7 — TypeScript Protobuf and gRPC
+
+Implement:
+
+```text
+TypeScript generated Protobuf identities
+TypeScript gRPC client observations
+TypeScript gRPC server observations
+canonical RPC and message resolution
+```
+
+### Exit criterion
+
+A TypeScript caller traverses its generated client to a canonical RPC and from
+there to an implementation in another registered repository. The contract
+identity remains independent of generated-code layout.
+
+---
+
+# 65. Phase 8 — GraphQL
 
 Implement:
 
@@ -2543,29 +2556,7 @@ types
 fields
 inputs
 Elixir resolver mappings
-```
-
-### Exit criterion
-
-The following dependency is traversable:
-
-```text
-GraphQL field
-      ↓
-BFF resolver
-      ↓
-backend dependency
-```
-
----
-
-# 65. Phase 8 — TypeScript and Web GraphQL
-
-Implement:
-
-```text
-TypeScript symbols
-calls
+TypeScript gateway resolvers and schema stitching
 GraphQL operations
 schema selections
 generated GraphQL clients
@@ -2579,9 +2570,9 @@ A path can be traced:
 ```text
 web feature
     ↓
-GraphQL
+GraphQL operation and field
     ↓
-BFF
+gateway and backend resolver
     ↓
 backend
 ```
@@ -2623,6 +2614,20 @@ Add legacy backend support, prioritising the relationships required for workspac
 # 68. Phase 11 — Swift and Kotlin
 
 Add enough language and GraphQL-client support to connect native applications into the central GraphQL dependency graph.
+
+---
+
+# 69. Post-MVP — Kafka + Protobuf and Convention Resolvers
+
+Kafka support follows the MVP because recognizing publishers, consumers,
+topics, payloads, and internal wrappers generically first requires the
+workspace-configurable convention/resolver layer. Beholder's ontology remains
+fixed; configuration customizes recognition rather than inventing relations.
+
+The eventual implementation should cover canonical topic identities,
+publishers, consumers, Protobuf envelopes, payload relationships, and the
+blast radius of changing a carried message without relying on runtime
+environment variables.
 
 ### Exit criterion
 
