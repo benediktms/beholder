@@ -17,6 +17,8 @@ pub(super) enum DefinitionKind {
 pub(super) struct Definition {
     pub(super) qualified_name: String,
     pub(super) kind: DefinitionKind,
+    pub(super) return_type: Option<String>,
+    pub(super) base_types: Vec<String>,
     pub(super) line: usize,
     pub(super) parameters: Vec<Parameter>,
     pub(super) locals: Vec<Binding>,
@@ -52,6 +54,7 @@ pub(super) enum CallKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Call {
+    pub(super) expression: String,
     pub(super) kind: CallKind,
     pub(super) receiver: Option<String>,
     pub(super) name: String,

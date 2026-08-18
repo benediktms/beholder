@@ -1,5 +1,5 @@
-pub const FRONTEND_VERSION: &str = "5";
-pub const RESOLVER_VERSION: &str = "10";
+pub const FRONTEND_VERSION: &str = "6";
+pub const RESOLVER_VERSION: &str = "11";
 
 mod analysis;
 mod dotnet_di;

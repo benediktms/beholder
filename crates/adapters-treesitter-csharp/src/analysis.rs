@@ -137,6 +137,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
             let function = node.child_by_field_name("function")?;
             if function.kind() == "member_access_expression" {
                 return Some(Call {
+                    expression: text(node, source)?.into(),
                     kind: CallKind::Member,
                     receiver: function
                         .child_by_field_name("expression")
@@ -149,6 +150,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                 });
             }
             Some(Call {
+                expression: text(node, source)?.into(),
                 kind: CallKind::Direct,
                 receiver: None,
                 name: simple_name(function, source)?,
@@ -158,6 +160,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
             })
         }
         "object_creation_expression" => Some(Call {
+            expression: text(node, source)?.into(),
             kind: CallKind::Constructor,
             receiver: None,
             name: node
@@ -279,6 +282,27 @@ fn collect_definitions(
     definitions.push(Definition {
         qualified_name,
         kind,
+        return_type: (kind == DefinitionKind::Callable)
+            .then(|| {
+                node.child_by_field_name("returns")
+                    .and_then(|returns| text(returns, source))
+                    .map(str::to_owned)
+            })
+            .flatten(),
+        base_types: if kind == DefinitionKind::Type {
+            node.named_children(&mut node.walk())
+                .find(|child| child.kind() == "base_list")
+                .map(|bases| {
+                    let mut cursor = bases.walk();
+                    bases
+                        .named_children(&mut cursor)
+                        .filter_map(|base| text(base, source).map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         line: node.start_position().row + 1,
         parameters: if kind == DefinitionKind::Callable {
             parameters(node, source)

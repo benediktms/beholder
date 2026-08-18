@@ -124,7 +124,41 @@ fn argument_match_score(caller: &Definition, target: &Definition, call: &Call) -
         .count()
 }
 
-fn target_matches(caller: &Definition, target: &Definition, call: &Call) -> bool {
+fn type_matches(
+    actual: &str,
+    expected: &str,
+    inheritance: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let actual = simple_type_name(actual);
+    let expected = simple_type_name(expected);
+    actual == expected
+        || inheritance
+            .get(actual)
+            .is_some_and(|bases| bases.contains(expected))
+}
+
+fn collect_base_types(
+    type_name: &str,
+    direct: &BTreeMap<String, BTreeSet<String>>,
+    inherited: &mut BTreeSet<String>,
+) {
+    let Some(bases) = direct.get(type_name) else {
+        return;
+    };
+    for base in bases {
+        if inherited.insert(base.clone()) {
+            collect_base_types(base, direct, inherited);
+        }
+    }
+}
+
+fn target_matches(
+    caller: &Definition,
+    target: &Definition,
+    call: &Call,
+    returned_receiver_type: Option<&str>,
+    inheritance: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
     if callable_name(target)
         != if call.kind == CallKind::Constructor {
             simple_type_name(&call.name)
@@ -145,36 +179,35 @@ fn target_matches(caller: &Definition, target: &Definition, call: &Call) -> bool
         }
         CallKind::Member => {
             let receiver = call.receiver.as_deref().unwrap_or_default();
-            caller
-                .parameters
-                .iter()
-                .map(|parameter| (&parameter.name, &parameter.type_name))
-                .chain(
-                    caller
-                        .locals
-                        .iter()
-                        .map(|binding| (&binding.name, &binding.type_name)),
-                )
-                .find(|(name, _)| name.as_str() == receiver)
-                .zip(target.parameters.first())
-                .is_some_and(|((_, receiver_type), first)| {
-                    first.is_extension
-                        && simple_type_name(&first.type_name) == simple_type_name(receiver_type)
-                })
-                || caller
-                    .locals
+            let receiver_type = returned_receiver_type.or_else(|| {
+                caller
+                    .parameters
                     .iter()
-                    .find(|binding| binding.name == receiver)
-                    .is_some_and(|binding| {
-                        parent(&target.qualified_name)
-                            .rsplit('/')
-                            .next()
-                            .is_some_and(|owner| owner == simple_type_name(&binding.type_name))
-                    })
+                    .map(|parameter| (&parameter.name, &parameter.type_name))
+                    .chain(
+                        caller
+                            .locals
+                            .iter()
+                            .map(|binding| (&binding.name, &binding.type_name)),
+                    )
+                    .find(|(name, _)| name.as_str() == receiver)
+                    .map(|(_, type_)| type_.as_str())
+            });
+            receiver_type
+                .zip(target.parameters.first())
+                .is_some_and(|(receiver_type, first)| {
+                    first.is_extension && type_matches(receiver_type, &first.type_name, inheritance)
+                })
+                || receiver_type.is_some_and(|receiver_type| {
+                    parent(&target.qualified_name)
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|owner| type_matches(receiver_type, owner, inheritance))
+                })
                 || parent(&target.qualified_name)
                     .rsplit('/')
                     .next()
-                    .is_some_and(|owner| owner == simple_type_name(receiver))
+                    .is_some_and(|owner| type_matches(receiver, owner, inheritance))
         }
     };
     owner_matches && call_is_applicable(target, call)
@@ -213,18 +246,42 @@ pub fn resolve_repository_calls(
         }
     }
     let mut observations = Vec::new();
+    let mut inheritance_cache = BTreeMap::new();
     for source in sources {
         let visible = visibility
             .get(source.assembly)
             .cloned()
             .unwrap_or_else(|| BTreeSet::from([source.assembly.into()]));
+        let inheritance = inheritance_cache.entry(source.assembly).or_insert_with(|| {
+            let direct = types
+                .iter()
+                .filter_map(|(name, definitions)| {
+                    let bases = definitions
+                        .iter()
+                        .filter(|(candidate, _)| visible.contains(candidate.assembly))
+                        .flat_map(|(_, definition)| definition.base_types.iter())
+                        .map(|base| simple_type_name(base).to_owned())
+                        .collect::<BTreeSet<_>>();
+                    (!bases.is_empty()).then(|| ((*name).to_owned(), bases))
+                })
+                .collect::<BTreeMap<_, _>>();
+            direct
+                .keys()
+                .map(|name| {
+                    let mut inherited = BTreeSet::new();
+                    collect_base_types(name, &direct, &mut inherited);
+                    (name.clone(), inherited)
+                })
+                .collect()
+        });
         for caller in source
             .analysis
             .definitions
             .iter()
             .filter(|definition| definition.kind == DefinitionKind::Callable)
         {
-            for call in &caller.calls {
+            let mut returned_types = BTreeMap::<&str, &str>::new();
+            for call in caller.calls.iter().rev() {
                 let lookup_name = if call.kind == CallKind::Constructor {
                     simple_type_name(&call.name)
                 } else {
@@ -235,7 +292,16 @@ pub fn resolve_repository_calls(
                     .into_iter()
                     .flatten()
                     .filter(|(candidate, target)| {
-                        visible.contains(candidate.assembly) && target_matches(caller, target, call)
+                        visible.contains(candidate.assembly)
+                            && target_matches(
+                                caller,
+                                target,
+                                call,
+                                call.receiver
+                                    .as_deref()
+                                    .and_then(|receiver| returned_types.get(receiver).copied()),
+                                inheritance,
+                            )
                     })
                     .copied()
                     .map(|candidate| {
@@ -267,6 +333,9 @@ pub fn resolve_repository_calls(
                         id(repository, target_source, target),
                         format!("{}:{}", source.path.display(), call.line),
                     ));
+                    if let Some(return_type) = target.return_type.as_deref() {
+                        returned_types.insert(&call.expression, return_type);
+                    }
                 }
                 let Some(registration) = dotnet_di::registration(caller, call) else {
                     continue;
@@ -379,9 +448,9 @@ mod tests {
         )
         .unwrap();
         let core_project = parse_project(Path::new("Core/Core.csproj"), "<Project />").unwrap();
-        let app = analyze("static class Syntax { static void Start(string text) { Parse(text, flag: null); SourceText.From(text); var source = new Core.SourceText(); source.Read(); var derived = new Core.Derived(); Accept(derived); } static void Parse(string text, object? flag) {} static void Parse(SourceText text, object? flag) {} static void Accept(Core.Base value) {} }").unwrap();
+        let app = analyze("static class Syntax { static void Start(string text) { Parse(text, flag: null); SourceText.From(text); var source = new Core.SourceText(); source.Read(); var derived = new Core.Derived(); Accept(derived); Core.Factory.Make().Inherited(); } static void Parse(string text, object? flag) {} static void Parse(SourceText text, object? flag) {} static void Accept(Core.Base value) {} }").unwrap();
         let core = analyze(
-            "namespace Core { class SourceText { public static SourceText From(string text) { return new SourceText(); } public SourceText() {} public void Read() {} } class Base {} class Derived : Base {} }",
+            "namespace Core { class SourceText { public static SourceText From(string text) { return new SourceText(); } public SourceText() {} public void Read() {} } class Base { public void Inherited() {} } class Derived : Base {} static class Factory { public static Derived Make() { return new Derived(); } } }",
         )
         .unwrap();
         let sources = [
@@ -436,6 +505,13 @@ mod tests {
                         .to
                         .as_str()
                         .ends_with("/Syntax/Accept(Core.Base)")
+            }),
+            "{observations:#?}"
+        );
+        assert!(
+            observations.iter().any(|observation| {
+                observation.from.as_str().ends_with("/Syntax/Start(string)")
+                    && observation.to.as_str().ends_with("/Base/Inherited()")
             }),
             "{observations:#?}"
         );
