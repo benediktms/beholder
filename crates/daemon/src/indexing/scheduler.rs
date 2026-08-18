@@ -49,7 +49,10 @@ use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -164,6 +167,7 @@ pub struct IndexScheduler {
     idle: Condvar,
     changed: Notify,
     shutdown: Notify,
+    checkpointing: AtomicBool,
     cache_dir: PathBuf,
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
@@ -230,6 +234,7 @@ impl IndexScheduler {
             idle: Condvar::new(),
             changed: Notify::new(),
             shutdown: Notify::new(),
+            checkpointing: AtomicBool::new(false),
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
             elixir_cache: Mutex::new(BTreeMap::new()),
@@ -466,6 +471,33 @@ impl IndexScheduler {
         self.shutdown.notify_one();
     }
 
+    pub fn schedule_checkpoint(self: &Arc<Self>, store: Arc<SemanticStore>) {
+        if self.checkpointing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let scheduler = self.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("beholder-checkpoint".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let result = scheduler
+                    .begin("checkpoint")
+                    .and_then(|_active| store.checkpoint());
+                scheduler.checkpointing.store(false, Ordering::Release);
+                match result {
+                    Ok(()) => tracing::info!(
+                        checkpoint_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        "Mnestic checkpoint completed"
+                    ),
+                    Err(error) => tracing::warn!(%error, "Mnestic checkpoint failed"),
+                }
+            })
+        {
+            self.checkpointing.store(false, Ordering::Release);
+            tracing::warn!(%error, "Mnestic checkpoint worker failed to start");
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn block_indexing(&self) -> impl Drop + '_ {
         self.begin("test blocker").unwrap()
@@ -506,12 +538,15 @@ impl IndexScheduler {
             }
             let scheduler = self.clone();
             let store = store.clone();
+            let checkpoint_store = store.clone();
             let workspaces = workspaces.clone();
             if let Err(error) =
                 tokio::task::spawn_blocking(move || scheduler.reindex_dirty(&store, &workspaces))
                     .await
             {
                 tracing::error!(%error, "index worker failed");
+            } else {
+                self.schedule_checkpoint(checkpoint_store);
             }
         }
     }
@@ -1137,11 +1172,6 @@ fn index_workspace_versioned(
     let publication_started = Instant::now();
     let changes = store.publish(&view, &repository_facts, &overrides)?;
     let publication = publication_started.elapsed();
-    let checkpoint_started = Instant::now();
-    if let Err(error) = store.checkpoint() {
-        tracing::warn!(workspace = %workspace.name, %error, "Mnestic checkpoint failed");
-    }
-    let checkpoint = checkpoint_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &diagnostics);
     tracing::info!(
         workspace = %workspace.name,
@@ -1159,7 +1189,6 @@ fn index_workspace_versioned(
         repository_analysis_ms = repository_analysis.as_secs_f64() * 1000.0,
         workspace_resolution_ms = workspace_resolution.as_secs_f64() * 1000.0,
         publication_ms = publication.as_secs_f64() * 1000.0,
-        checkpoint_ms = checkpoint.as_secs_f64() * 1000.0,
         "workspace indexed"
     );
     Ok((observation_count, true))

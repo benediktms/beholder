@@ -166,6 +166,9 @@ impl Daemon for BeholderDaemon {
         .await
         .map_err(|error| Status::internal(format!("index worker failed: {error}")))?
         .map_err(Status::failed_precondition)?;
+        if published {
+            self.scheduler.schedule_checkpoint(self.store.clone());
+        }
         Ok(Response::new(ReindexWorkspaceResponse {
             observation_count: observation_count
                 .try_into()
