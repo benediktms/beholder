@@ -455,7 +455,7 @@ fn collect_definitions(
     definitions: &mut Vec<Definition>,
 ) {
     match node.kind() {
-        "class_declaration" => {
+        "class_declaration" | "interface_declaration" => {
             let Some(name) = node
                 .child_by_field_name("name")
                 .and_then(|name| text(name, source))
@@ -464,17 +464,19 @@ fn collect_definitions(
             };
             let class_name = qualified(scope, name);
             let mut class = definition(node, None, source, scope, name, DefinitionKind::Namespace);
-            class.base = node
-                .named_children(&mut node.walk())
-                .find(|child| child.kind() == "class_heritage")
-                .and_then(|heritage| {
-                    heritage
-                        .named_children(&mut heritage.walk())
-                        .find(|child| child.kind() == "extends_clause")
-                })
-                .and_then(|extends| extends.child_by_field_name("value"))
-                .and_then(|base| text(base, source))
-                .map(str::to_owned);
+            if node.kind() == "class_declaration" {
+                class.base = node
+                    .named_children(&mut node.walk())
+                    .find(|child| child.kind() == "class_heritage")
+                    .and_then(|heritage| {
+                        heritage
+                            .named_children(&mut heritage.walk())
+                            .find(|child| child.kind() == "extends_clause")
+                    })
+                    .and_then(|extends| extends.child_by_field_name("value"))
+                    .and_then(|base| text(base, source))
+                    .map(str::to_owned);
+            }
             definitions.push(class);
             scope.push(name.into());
             if let Some(body) = node.child_by_field_name("body") {
@@ -497,7 +499,11 @@ fn collect_definitions(
             scope.pop();
             return;
         }
-        "function_declaration" | "generator_function_declaration" | "method_definition" => {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "method_definition"
+        | "method_signature"
+        | "abstract_method_signature" => {
             let Some(name) = node
                 .child_by_field_name("name")
                 .and_then(|name| text(name, source))
@@ -537,6 +543,20 @@ fn collect_definitions(
                     name,
                     DefinitionKind::Callable,
                 ));
+                return;
+            }
+            if let Some(base) = value
+                .filter(|value| value.kind() == "new_expression")
+                .and_then(|value| value.child_by_field_name("constructor"))
+                .and_then(|constructor| text(constructor, source))
+                && let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| text(name, source))
+            {
+                let mut instance =
+                    definition(node, None, source, scope, name, DefinitionKind::Namespace);
+                instance.base = Some(base.into());
+                definitions.push(instance);
                 return;
             }
             if let Some(factory) = value

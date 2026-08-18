@@ -1062,6 +1062,26 @@ mod tests {
                 "import { makeService, inferService } from './service-factory'; export function explicitReturn() { const service = makeService(); service.execute(); } export function inferredReturn() { const service = inferService(); service.execute(); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/service-singleton.ts"),
+                "import { Service } from './service'; export const serviceSingleton = new Service();",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/singleton-consumer.ts"),
+                "import { serviceSingleton } from './service-singleton'; export function singleton() { serviceSingleton.execute(); }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/sender.ts"),
+                "export interface Sender { send(message: string): Promise<void>; }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/interface-consumer.ts"),
+                "import { Sender } from './sender'; export function send(sender: Sender) { sender.send('hello'); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1190,6 +1210,18 @@ mod tests {
                         == "repo://example/typescript/packages/app/src/service/Service/execute"
             }));
         }
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/singleton-consumer/singleton"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/service/Service/execute"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/interface-consumer/send"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/sender/Sender/send"
+        }));
     }
 
     #[test]
