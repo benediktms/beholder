@@ -117,6 +117,21 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
     }
 }
 
+fn collect_decorator_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) {
+    let mut cursor = node.walk();
+    for decorator in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+    {
+        collect_calls(decorator, source, decorator, calls);
+    }
+    let mut sibling = node.prev_named_sibling();
+    while let Some(decorator) = sibling.filter(|sibling| sibling.kind() == "decorator") {
+        collect_calls(decorator, source, decorator, calls);
+        sibling = decorator.prev_named_sibling();
+    }
+}
+
 fn type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     if node.kind() == "type_identifier" {
         return text(node, source).map(str::to_owned);
@@ -390,6 +405,7 @@ fn definition(
     if let Some(body) = body {
         collect_calls(body, source, body, &mut calls);
     }
+    collect_decorator_calls(node, source, &mut calls);
     collect_bindings(node, source, node, &mut bindings);
     collect_alias_bindings(node, source, node, &mut alias_bindings);
     collect_factory_bindings(node, source, node, &mut factory_bindings);
@@ -814,7 +830,7 @@ pub fn observations_from_analysis(
             id.clone(),
             format!("{}:{}", path.display(), definition.line),
         ));
-        if definition.kind != DefinitionKind::Callable {
+        if definition.kind != DefinitionKind::Callable && definition.calls.is_empty() {
             continue;
         }
         let scope = parent_name.unwrap_or_default();
@@ -986,5 +1002,44 @@ mod tests {
             diagnostics_from_analysis(&analysis, Path::new("src/broken.ts"))[0].code,
             "typescript.parse_recovery"
         );
+    }
+
+    #[test]
+    fn preserves_decorator_invocations_as_calls() {
+        let source = "function controller() {} function traced() {} function helper() {} @controller() class Api { @traced() run() { helper(); } }";
+        let calls = observations(source, "src/decorated.ts")
+            .into_iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| {
+                (
+                    observation.from.as_str().to_owned(),
+                    observation.to.as_str().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for expected in [
+            (
+                "repo://example/typescript/src/decorated/Api",
+                "repo://example/typescript/src/decorated/controller",
+            ),
+            (
+                "repo://example/typescript/src/decorated/Api/run",
+                "repo://example/typescript/src/decorated/traced",
+            ),
+            (
+                "repo://example/typescript/src/decorated/Api/run",
+                "repo://example/typescript/src/decorated/helper",
+            ),
+        ] {
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.0 == expected.0 && call.1 == expected.1),
+                "missing {expected:?}: {calls:?}"
+            );
+        }
     }
 }
