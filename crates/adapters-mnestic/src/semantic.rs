@@ -439,6 +439,7 @@ fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error
             ) {
                 ("callable", "") => (EntityKind::Callable, None),
                 ("graphql_field", "") => (EntityKind::GraphqlField, None),
+                ("graphql_operation", "") => (EntityKind::GraphqlOperation, None),
                 ("grpc_operation", "") => (EntityKind::Rpc, None),
                 ("kafka_topic", "") => (EntityKind::KafkaTopic, None),
                 ("namespace", "") => (EntityKind::Namespace, None),
@@ -499,6 +500,7 @@ fn kind_priority(kind: EntityKind) -> u8 {
         EntityKind::Namespace => 1,
         EntityKind::Callable => 2,
         EntityKind::GraphqlField
+        | EntityKind::GraphqlOperation
         | EntityKind::KafkaTopic
         | EntityKind::Rpc
         | EntityKind::Service
@@ -592,6 +594,8 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::Rpc
     } else if id.starts_with("graphql-field://") {
         EntityKind::GraphqlField
+    } else if id.starts_with("graphql-operation://") {
+        EntityKind::GraphqlOperation
     } else if id.starts_with("kafka-topic://") {
         EntityKind::KafkaTopic
     } else if id.contains("/unity-prefab/") {

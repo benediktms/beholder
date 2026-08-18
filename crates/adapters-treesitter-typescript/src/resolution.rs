@@ -1,7 +1,8 @@
 use super::model::*;
+use beholder_adapters_graphql::{GraphqlSource, facts as graphql_facts};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-    DependencyRelation, EntityId, Observation, Provenance, SemanticRelation,
+    DependencyRelation, EntityId, EntityKind, Observation, Provenance, SemanticRelation,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -1302,17 +1303,105 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
     }
 }
 
+fn graphql_operation_uses(
+    repository: &str,
+    sources: &[(&Path, &TypescriptAnalysis)],
+    index: &RepositoryIndex<'_>,
+) -> Vec<Observation> {
+    let mut operations = BTreeMap::<EntityId, Vec<EntityId>>::new();
+    for (path, analysis) in sources {
+        let module_id = format!(
+            "repo://{}/{}/{}",
+            repository,
+            analysis.language.id_segment(),
+            source_stem(path)
+        );
+        for document in &analysis.graphql_documents {
+            let facts = graphql_facts(
+                repository,
+                &[GraphqlSource {
+                    path,
+                    source: &document.source,
+                    owner: None,
+                }],
+            );
+            operations.insert(
+                EntityId::from(format!("{module_id}/{}", document.binding)),
+                facts
+                    .entities
+                    .into_iter()
+                    .filter(|entity| entity.kind == EntityKind::GraphqlOperation)
+                    .map(|entity| entity.id)
+                    .collect(),
+            );
+        }
+    }
+    let mut observations = Vec::new();
+    for (path, analysis) in sources {
+        let module_id = format!(
+            "repo://{}/{}/{}",
+            repository,
+            analysis.language.id_segment(),
+            source_stem(path)
+        );
+        let imports = index.file_imports.get(*path).copied().unwrap_or_default();
+        for definition in &analysis.definitions {
+            if definition.kind != DefinitionKind::Callable {
+                continue;
+            }
+            let caller = format!("{module_id}/{}", definition.qualified_name);
+            for call in &definition.calls {
+                for argument in &call.arguments {
+                    let local = EntityId::from(format!("{module_id}/{argument}"));
+                    let target = operations
+                        .contains_key(&local)
+                        .then_some(local)
+                        .or_else(|| {
+                            imports.iter().find_map(|import| {
+                                let binding = import.bindings.iter().find(|binding| {
+                                    binding.local == *argument && binding.imported != "*"
+                                })?;
+                                let file = imported_file(
+                                    path,
+                                    &import.source,
+                                    &index.packages,
+                                    &index.aliases,
+                                    &index.files,
+                                )?;
+                                index
+                                    .exports
+                                    .get(&(file, binding.imported.clone()))
+                                    .cloned()
+                            })
+                        });
+                    let Some(selected) = target.and_then(|target| operations.get(&target)) else {
+                        continue;
+                    };
+                    observations.extend(selected.iter().map(|operation| {
+                        Observation::dependency(
+                            caller.clone(),
+                            DependencyRelation::Uses,
+                            operation.clone(),
+                            format!("{}:{}", path.display(), call.line),
+                        )
+                    }));
+                }
+            }
+        }
+    }
+    observations
+}
+
 pub fn resolve_repository_calls(
     repository: &str,
-    observations: &mut [Observation],
+    observations: &mut Vec<Observation>,
     sources: &[(&Path, &TypescriptAnalysis)],
     manifests: &[(&Path, &str)],
     configs: &[(&Path, &str)],
 ) {
-    resolve_observations(
-        observations,
-        &repository_index(repository, sources, manifests, configs),
-    );
+    let index = repository_index(repository, sources, manifests, configs);
+    observations.extend(graphql_operation_uses(repository, sources, &index));
+    resolve_observations(observations, &index);
 }
 
 fn workspace_imported_file(

@@ -1,0 +1,8 @@
+[package]
+name = "beholder-adapters-graphql"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apollo-parser.workspace = true
+beholder-domain.workspace = true

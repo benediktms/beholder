@@ -142,6 +142,7 @@ impl From<dto::EntityKind> for v1::EntityKind {
         match value {
             dto::EntityKind::Callable => Self::Callable,
             dto::EntityKind::GraphqlField => Self::GraphqlField,
+            dto::EntityKind::GraphqlOperation => Self::GraphqlOperation,
             dto::EntityKind::KafkaTopic => Self::KafkaTopic,
             dto::EntityKind::Namespace => Self::Namespace,
             dto::EntityKind::ProtoEnum => Self::ProtoEnum,
@@ -180,6 +181,7 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
         match v1::EntityKind::try_from(value).map_err(|_| "unknown entity kind")? {
             v1::EntityKind::Callable => dto::EntityKind::Callable,
             v1::EntityKind::GraphqlField => dto::EntityKind::GraphqlField,
+            v1::EntityKind::GraphqlOperation => dto::EntityKind::GraphqlOperation,
             v1::EntityKind::KafkaTopic => dto::EntityKind::KafkaTopic,
             v1::EntityKind::Namespace => dto::EntityKind::Namespace,
             v1::EntityKind::ProtoEnum => dto::EntityKind::ProtoEnum,

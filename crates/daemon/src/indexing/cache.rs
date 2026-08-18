@@ -17,6 +17,7 @@ pub(super) struct RepositoryAnalysisKey {
     pub(super) elixir: Option<(&'static str, &'static str)>,
     pub(super) csharp: Option<(&'static str, &'static str)>,
     pub(super) typescript: Option<(&'static str, &'static str)>,
+    pub(super) graphql: Option<&'static str>,
     pub(super) protobuf: Option<&'static str>,
 }
 
@@ -59,6 +60,9 @@ impl RepositoryAnalysisKey {
         }
         if let Some(frontend) = self.protobuf {
             languages.push(format!("protobuf:{frontend}"));
+        }
+        if let Some(frontend) = self.graphql {
+            languages.push(format!("graphql:{frontend}"));
         }
         if languages.is_empty() {
             "none".into()

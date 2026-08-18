@@ -53,6 +53,7 @@ pub struct TraversalMetadata {
 pub enum EntityKind {
     Callable,
     GraphqlField,
+    GraphqlOperation,
     KafkaTopic,
     Namespace,
     ProtoEnum,

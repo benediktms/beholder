@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 beholder-adapters-git.workspace = true
+beholder-adapters-graphql.workspace = true
 beholder-adapters-mnestic = { workspace = true, features = ["sqlite"] }
 beholder-adapters-protobuf.workspace = true
 beholder-adapters-treesitter-elixir.workspace = true

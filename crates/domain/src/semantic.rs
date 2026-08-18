@@ -241,6 +241,7 @@ pub struct EntityFact {
 pub enum EntityKind {
     Callable,
     GraphqlField,
+    GraphqlOperation,
     GrpcOperation,
     KafkaTopic,
     Namespace,
@@ -284,6 +285,7 @@ impl EntityFact {
             | (
                 EntityKind::Callable
                 | EntityKind::GraphqlField
+                | EntityKind::GraphqlOperation
                 | EntityKind::GrpcOperation
                 | EntityKind::KafkaTopic
                 | EntityKind::Namespace

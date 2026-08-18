@@ -87,6 +87,7 @@ fn entity_kind(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Callable => "callable",
         EntityKind::GraphqlField => "graphql_field",
+        EntityKind::GraphqlOperation => "graphql_operation",
         EntityKind::GrpcOperation => "grpc_operation",
         EntityKind::KafkaTopic => "kafka_topic",
         EntityKind::Namespace => "namespace",

@@ -608,6 +608,7 @@ fn kind_label(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Callable => "callables",
         EntityKind::GraphqlField => "GraphQL",
+        EntityKind::GraphqlOperation => "GraphQL operations",
         EntityKind::KafkaTopic => "Kafka",
         EntityKind::Namespace => "namespaces",
         EntityKind::ProtoEnum => "Protobuf enums",

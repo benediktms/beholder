@@ -9,6 +9,7 @@ members = [
     "crates/presentation",
     "crates/shell-mnestic",
     "crates/adapters-mnestic",
+    "crates/adapters-graphql",
     "crates/adapters-protobuf",
     "crates/adapters-git",
     "crates/adapters-treesitter-elixir",
@@ -24,6 +25,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+apollo-parser = "0.8.6"
+beholder-adapters-graphql = { path = "crates/adapters-graphql" }
 beholder-adapters-mnestic = { path = "crates/adapters-mnestic", default-features = false }
 beholder-adapters-git = { path = "crates/adapters-git" }
 beholder-adapters-protobuf = { path = "crates/adapters-protobuf" }
