@@ -8,7 +8,7 @@ use beholder_domain::{
 };
 use std::{collections::BTreeMap, path::Path};
 
-pub const FRONTEND_VERSION: &str = "2";
+pub const FRONTEND_VERSION: &str = "3";
 
 #[derive(Clone, Copy)]
 pub struct GraphqlSource<'a> {
@@ -44,12 +44,33 @@ fn root_type(operation: &cst::OperationDefinition) -> &'static str {
     let Some(kind) = operation.operation_type() else {
         return "Query";
     };
+    operation_type_name(&kind)
+}
+
+fn operation_type_name(kind: &cst::OperationType) -> &'static str {
     if kind.mutation_token().is_some() {
         "Mutation"
     } else if kind.subscription_token().is_some() {
         "Subscription"
     } else {
         "Query"
+    }
+}
+
+fn record_root_types(
+    roots: &mut BTreeMap<String, &'static str>,
+    definitions: impl Iterator<Item = cst::RootOperationTypeDefinition>,
+) {
+    for definition in definitions {
+        let Some((operation, name)) = definition
+            .operation_type()
+            .zip(definition.named_type().and_then(|named| named.name()))
+        else {
+            continue;
+        };
+        roots
+            .entry(name.text().to_string())
+            .or_insert_with(|| operation_type_name(&operation));
     }
 }
 
@@ -60,8 +81,13 @@ fn field_entities(
     source: GraphqlSource<'_>,
     type_name: cst::Name,
     fields: Option<cst::FieldsDefinition>,
+    roots: &BTreeMap<String, &'static str>,
 ) {
-    let type_name = type_name.text().to_string();
+    let declared_type_name = type_name.text().to_string();
+    let type_name = roots
+        .get(&declared_type_name)
+        .copied()
+        .unwrap_or(declared_type_name.as_str());
     for field in fields
         .into_iter()
         .flat_map(|fields| fields.field_definitions())
@@ -168,8 +194,25 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
     let mut facts = GraphqlFacts::default();
     let mut entities = BTreeMap::new();
     let mut stitched_fields = Vec::new();
-    for source in sources {
-        let syntax = Parser::new(source.source).parse();
+    let parsed = sources
+        .iter()
+        .map(|source| (*source, Parser::new(source.source).parse()))
+        .collect::<Vec<_>>();
+    let mut roots = BTreeMap::new();
+    for (_, syntax) in &parsed {
+        for definition in syntax.document().definitions() {
+            match definition {
+                cst::Definition::SchemaDefinition(schema) => {
+                    record_root_types(&mut roots, schema.root_operation_type_definitions())
+                }
+                cst::Definition::SchemaExtension(schema) => {
+                    record_root_types(&mut roots, schema.root_operation_type_definitions())
+                }
+                _ => {}
+            }
+        }
+    }
+    for (source, syntax) in parsed {
         for error in syntax.errors() {
             let error_line = u32::try_from(
                 source.source[..error.index().min(source.source.len())]
@@ -195,9 +238,10 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                             &mut facts,
                             &mut entities,
                             &mut stitched_fields,
-                            *source,
+                            source,
                             name,
                             object.fields_definition(),
+                            &roots,
                         );
                     }
                 }
@@ -207,14 +251,15 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                             &mut facts,
                             &mut entities,
                             &mut stitched_fields,
-                            *source,
+                            source,
                             name,
                             object.fields_definition(),
+                            &roots,
                         );
                     }
                 }
                 cst::Definition::OperationDefinition(operation) => {
-                    operation_facts(&mut facts, &mut entities, *source, operation);
+                    operation_facts(&mut facts, &mut entities, source, operation);
                 }
                 _ => {}
             }
@@ -244,12 +289,12 @@ mod tests {
     fn maps_schema_fields_and_operation_root_selections() {
         let schema = GraphqlSource {
             path: Path::new("schema.graphql"),
-            source: "type Query { packageTemplatePreview: Package location: Location }",
+            source: "schema { query: RootQuery } type RootQuery { packageTemplatePreview: Package location: Location }",
             owner: Some("repo://gateway/graphql-source/schema.graphql"),
         };
         let operation = GraphqlSource {
             path: Path::new("PackageDetail.gql.tsx"),
-            source: "query Packages_Detail_Query { packageTemplatePreview { id } location { id } }",
+            source: "query Packages_Detail_Query { preview: packageTemplatePreview { id } location { id } }",
             owner: Some("repo://spa/typescript/PackageDetail.gql"),
         };
 
@@ -272,7 +317,7 @@ mod tests {
     fn maps_composed_fields_to_their_source_field() {
         let upstream = GraphqlSource {
             path: Path::new("compose/schemas/Checkout.graphql"),
-            source: "type Mutation { initializeOrder: ID }",
+            source: "schema { mutation: RootMutationType } type RootMutationType { initializeOrder: ID }",
             owner: None,
         };
         let composed = GraphqlSource {
