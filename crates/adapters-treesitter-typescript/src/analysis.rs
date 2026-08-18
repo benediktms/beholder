@@ -126,6 +126,23 @@ fn type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
         .find_map(|child| type_name(child, source))
 }
 
+fn return_type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    if let Some(generic) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "generic_type")
+        && generic
+            .child_by_field_name("name")
+            .and_then(|name| text(name, source))
+            == Some("Promise")
+    {
+        return generic
+            .child_by_field_name("type_arguments")
+            .and_then(|arguments| type_name(arguments, source));
+    }
+    type_name(node, source)
+}
+
 fn binding(node: Node<'_>, source: &[u8]) -> Option<Binding> {
     let receiver = node
         .child_by_field_name("name")
@@ -200,6 +217,13 @@ fn collect_factory_bindings(
             .and_then(|name| text(name, source))
         && let Some(factory) = node
             .child_by_field_name("value")
+            .and_then(|value| {
+                if value.kind() == "await_expression" {
+                    value.named_child(0)
+                } else {
+                    Some(value)
+                }
+            })
             .filter(|value| value.kind() == "call_expression")
             .and_then(|value| value.child_by_field_name("function"))
             .filter(|function| function.kind() == "identifier")
@@ -371,7 +395,7 @@ fn definition(
     collect_factory_bindings(node, source, node, &mut factory_bindings);
     let return_type = node
         .child_by_field_name("return_type")
-        .and_then(|annotation| type_name(annotation, source))
+        .and_then(|annotation| return_type_name(annotation, source))
         .or_else(|| returned_constructor(node, source, node));
     Definition {
         qualified_name: qualified(scope, name),

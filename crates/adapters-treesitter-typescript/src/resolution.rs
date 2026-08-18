@@ -1254,6 +1254,16 @@ mod tests {
                 "import { packageRoot } from '@example/exported'; import { packageTool } from '@example/exported/tool'; export function useExportMap() { packageRoot(); packageTool(); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/async-service-factory.ts"),
+                "import { Service } from './service'; export async function makeAsyncService(): Promise<Service> { return new Service(); }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/awaited-service-consumer.ts"),
+                "import { makeAsyncService } from './async-service-factory'; export async function awaitedService() { const service = await makeAsyncService(); service.execute(); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1418,6 +1428,12 @@ mod tests {
                     && observation.to.as_str() == target
             }));
         }
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/awaited-service-consumer/awaitedService"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/service/Service/execute"
+        }));
     }
 
     #[test]

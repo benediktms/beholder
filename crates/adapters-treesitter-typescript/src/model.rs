@@ -30,10 +30,10 @@ impl SourceLanguage {
 
     pub fn cache_version(self) -> &'static str {
         match self {
-            Self::JavaScript => "10-javascript",
-            Self::Jsx => "10-jsx",
-            Self::TypeScript => "10-typescript",
-            Self::Tsx => "10-tsx",
+            Self::JavaScript => "11-javascript",
+            Self::Jsx => "11-jsx",
+            Self::TypeScript => "11-typescript",
+            Self::Tsx => "11-tsx",
         }
     }
 }
