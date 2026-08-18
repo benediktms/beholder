@@ -241,6 +241,7 @@ fn definition(
         calls,
         bindings,
         factory: None,
+        base: None,
         exported: is_exported(node),
     }
 }
@@ -386,14 +387,19 @@ fn collect_definitions(
                 return;
             };
             let class_name = qualified(scope, name);
-            definitions.push(definition(
-                node,
-                None,
-                source,
-                scope,
-                name,
-                DefinitionKind::Namespace,
-            ));
+            let mut class = definition(node, None, source, scope, name, DefinitionKind::Namespace);
+            class.base = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "class_heritage")
+                .and_then(|heritage| {
+                    heritage
+                        .named_children(&mut heritage.walk())
+                        .find(|child| child.kind() == "extends_clause")
+                })
+                .and_then(|extends| extends.child_by_field_name("value"))
+                .and_then(|base| text(base, source))
+                .map(str::to_owned);
+            definitions.push(class);
             scope.push(name.into());
             if let Some(body) = node.child_by_field_name("body") {
                 let bindings = class_bindings(body, source);
