@@ -11,6 +11,7 @@ use std::{
 pub(super) type RustSources = Vec<(PathBuf, String)>;
 pub(super) type ElixirSources = Vec<(PathBuf, String)>;
 pub(super) type CsharpSources = Vec<(PathBuf, Vec<u8>)>;
+pub(super) type CsharpProjects = Vec<(PathBuf, String)>;
 pub(super) type TypescriptSources = Vec<(PathBuf, String, SourceLanguage)>;
 pub(super) type TypescriptManifests = Vec<(PathBuf, String)>;
 pub(super) type TypescriptConfigs = Vec<(PathBuf, String)>;
@@ -23,6 +24,7 @@ pub(super) struct RepositorySources {
     pub(super) rust: RustSources,
     pub(super) elixir: ElixirSources,
     pub(super) csharp: CsharpSources,
+    pub(super) csharp_projects: CsharpProjects,
     pub(super) typescript: TypescriptSources,
     pub(super) typescript_manifests: TypescriptManifests,
     pub(super) typescript_configs: TypescriptConfigs,
@@ -66,6 +68,7 @@ pub(super) fn is_index_input(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             matches!(name, "buf.yaml" | "buf.lock" | "package.json")
+                || name.ends_with(".csproj")
                 || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
                     && name.ends_with(".json"))
         }))
@@ -185,6 +188,19 @@ pub(super) fn repository_sources(
         .into_iter()
         .map(|path| Ok((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?)))
         .collect::<Result<CsharpSources, Box<dyn Error>>>()?;
+    let (csharp_project_files, sources): (Vec<_>, Vec<_>) = sources.into_iter().partition(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "csproj")
+    });
+    let csharp_projects = csharp_project_files
+        .into_iter()
+        .map(|path| {
+            Ok((
+                path.strip_prefix(root)?.to_path_buf(),
+                fs::read_to_string(path)?,
+            ))
+        })
+        .collect::<Result<CsharpProjects, Box<dyn Error>>>()?;
     let sources = sources
         .into_iter()
         .map(|path| {
@@ -221,6 +237,11 @@ pub(super) fn repository_sources(
                     .map(|(path, source)| (path.as_path(), source.as_slice())),
             )
             .chain(
+                csharp_projects
+                    .iter()
+                    .map(|(path, source)| (path.as_path(), source.as_bytes())),
+            )
+            .chain(
                 typescript
                     .iter()
                     .map(|(path, source, _)| (path.as_path(), source.as_bytes())),
@@ -251,6 +272,7 @@ pub(super) fn repository_sources(
         rust,
         elixir,
         csharp,
+        csharp_projects,
         typescript,
         typescript_manifests,
         typescript_configs,
@@ -371,6 +393,11 @@ mod tests {
         }
         fs::write(repository.join("src/Program.cs"), "class Program {}").unwrap();
         fs::write(
+            repository.join("src/App.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+        )
+        .unwrap();
+        fs::write(
             repository.join("src/sjis.cs"),
             [b'c', b'l', b'a', b's', b's', b' ', 0x83, 0x65, 0x83, 0x58],
         )
@@ -380,6 +407,7 @@ mod tests {
 
         let sources = repository_sources(&repository, &[]).unwrap();
         assert_eq!(sources.csharp.len(), 2);
+        assert_eq!(sources.csharp_projects.len(), 1);
         assert_eq!(sources.csharp[0].0, Path::new("src/Program.cs"));
         let (_, lossy) = decode_csharp_source(&sources.csharp[1].1);
         assert!(lossy);

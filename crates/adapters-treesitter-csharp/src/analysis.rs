@@ -34,21 +34,33 @@ fn declaration_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     if declaration_kind(node) != Some(DefinitionKind::Callable) {
         return Some(name.replace('.', "/"));
     }
-    let parameters = node
-        .child_by_field_name("parameters")
+    let parameters = parameters(node, source)
+        .into_iter()
+        .map(|parameter| parameter.type_name)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("{name}({parameters})"))
+}
+
+fn parameters(node: Node<'_>, source: &[u8]) -> Vec<Parameter> {
+    node.child_by_field_name("parameters")
         .map(|parameters| {
             let mut cursor = parameters.walk();
             parameters
                 .named_children(&mut cursor)
                 .filter(|parameter| parameter.kind() == "parameter")
-                .filter_map(|parameter| parameter.child_by_field_name("type"))
-                .filter_map(|kind| text(kind, source))
-                .map(str::trim)
+                .filter_map(|parameter| {
+                    Some(Parameter {
+                        name: text(parameter.child_by_field_name("name")?, source)?.into(),
+                        type_name: text(parameter.child_by_field_name("type")?, source)?
+                            .trim()
+                            .into(),
+                        is_extension: text(parameter, source)?.trim_start().starts_with("this "),
+                    })
+                })
                 .collect::<Vec<_>>()
-                .join(",")
         })
-        .unwrap_or_default();
-    Some(format!("{name}({parameters})"))
+        .unwrap_or_default()
 }
 
 fn simple_name(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -154,6 +166,11 @@ fn collect_definitions(
         qualified_name,
         kind,
         line: node.start_position().row + 1,
+        parameters: if kind == DefinitionKind::Callable {
+            parameters(node, source)
+        } else {
+            Vec::new()
+        },
         calls,
     });
     let mut nested_scope = scope.to_vec();
@@ -211,7 +228,7 @@ pub fn diagnostics_from_analysis(
         .collect()
 }
 
-fn source_stem(path: &Path) -> String {
+pub(crate) fn source_stem(path: &Path) -> String {
     path.with_extension("")
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
@@ -258,11 +275,15 @@ fn local_target(
 
 pub fn observations_from_analysis(
     repository: &str,
+    assembly: &str,
     analysis: &CsharpAnalysis,
     source: &str,
     path: &Path,
 ) -> Vec<Observation> {
-    let module_id = format!("repo://{repository}/csharp/{}", source_stem(path));
+    let module_id = format!(
+        "repo://{repository}/csharp/{assembly}/{}",
+        source_stem(path)
+    );
     let source_id = format!("repo://{repository}/csharp-source/{}", path.display());
     let ids = analysis
         .definitions
@@ -318,10 +339,14 @@ pub fn observations_from_analysis(
 
 pub fn entities_from_analysis(
     repository: &str,
+    assembly: &str,
     analysis: &CsharpAnalysis,
     path: &Path,
 ) -> Vec<EntityFact> {
-    let module_id = format!("repo://{repository}/csharp/{}", source_stem(path));
+    let module_id = format!(
+        "repo://{repository}/csharp/{assembly}/{}",
+        source_stem(path)
+    );
     std::iter::once(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap())
         .chain(analysis.definitions.iter().map(|definition| {
             EntityFact::new(
@@ -359,8 +384,13 @@ public sealed class Worker
 }
 "#;
         let analysis = analyze(source).unwrap();
-        let observations =
-            observations_from_analysis("example", &analysis, source, Path::new("src/Runner.cs"));
+        let observations = observations_from_analysis(
+            "example",
+            "Example.App",
+            &analysis,
+            source,
+            Path::new("src/Runner.cs"),
+        );
 
         assert!(analysis.parse_error_lines.is_empty());
         assert!(
@@ -404,8 +434,13 @@ public sealed class Worker
     fn does_not_publish_unresolved_calls_as_exact_edges() {
         let source = "class Runner { void Run() { External.Call(); } }";
         let analysis = analyze(source).unwrap();
-        let observations =
-            observations_from_analysis("example", &analysis, source, Path::new("src/Runner.cs"));
+        let observations = observations_from_analysis(
+            "example",
+            "Example.App",
+            &analysis,
+            source,
+            Path::new("src/Runner.cs"),
+        );
 
         assert!(!observations.iter().any(|observation| {
             observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)

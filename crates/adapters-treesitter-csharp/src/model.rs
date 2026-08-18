@@ -17,7 +17,15 @@ pub(super) struct Definition {
     pub(super) qualified_name: String,
     pub(super) kind: DefinitionKind,
     pub(super) line: usize,
+    pub(super) parameters: Vec<Parameter>,
     pub(super) calls: Vec<Call>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Parameter {
+    pub(super) name: String,
+    pub(super) type_name: String,
+    pub(super) is_extension: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

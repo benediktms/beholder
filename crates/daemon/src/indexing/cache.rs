@@ -1,3 +1,4 @@
+use beholder_adapters_treesitter_csharp::CsharpProject;
 use beholder_adapters_treesitter_typescript::TypescriptRepository;
 use beholder_domain::{AnalysisDiagnostic, EntityFact, GrpcBindingCandidate, Observation};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,8 @@ pub(super) struct RepositoryAnalysisKey {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RepositoryAnalysis {
+    #[serde(default)]
+    pub(super) csharp_projects: Vec<CsharpProject>,
     pub(super) entities: Vec<EntityFact>,
     #[serde(default)]
     pub(super) grpc_bindings: Vec<GrpcBindingCandidate>,

@@ -4,9 +4,12 @@ use beholder_adapters_protobuf::{
     FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, SourceCompiler, facts as protobuf_facts,
 };
 use beholder_adapters_treesitter_csharp::{
-    CsharpAnalysis, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
+    CsharpAnalysis, CsharpProject, CsharpSource, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
     RESOLVER_VERSION as CSHARP_RESOLVER_VERSION, diagnostics_from_analysis as csharp_diagnostics,
     entities_from_analysis as csharp_entities, observations_from_analysis as csharp_observations,
+    parse_project as parse_csharp_project,
+    resolve_repository_calls as resolve_csharp_repository_calls,
+    source_assemblies as csharp_source_assemblies,
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
@@ -133,7 +136,7 @@ impl AnalysisVersions {
                 .any(|sources| !sources.elixir.is_empty()),
             repositories
                 .iter()
-                .any(|sources| !sources.csharp.is_empty()),
+                .any(|sources| !sources.csharp.is_empty() || !sources.csharp_projects.is_empty()),
             repositories
                 .iter()
                 .any(|sources| !sources.typescript.is_empty()),
@@ -186,6 +189,7 @@ struct RepositoryAnalysisSources<'a> {
     rust: &'a [(PathBuf, String)],
     elixir: &'a [(PathBuf, String)],
     csharp: &'a [(PathBuf, Vec<u8>)],
+    csharp_projects: &'a [(PathBuf, String)],
     typescript: &'a [(PathBuf, String, SourceLanguage)],
     typescript_manifests: &'a [(PathBuf, String)],
     typescript_configs: &'a [(PathBuf, String)],
@@ -597,6 +601,7 @@ impl IndexScheduler {
             rust: rust_sources,
             elixir: elixir_sources,
             csharp: csharp_sources,
+            csharp_projects,
             typescript: typescript_sources,
             typescript_manifests,
             typescript_configs,
@@ -606,7 +611,7 @@ impl IndexScheduler {
             state.fingerprint.clone(),
             !rust_sources.is_empty(),
             !elixir_sources.is_empty(),
-            !csharp_sources.is_empty(),
+            !csharp_sources.is_empty() || !csharp_projects.is_empty(),
             !typescript_sources.is_empty(),
             !descriptors.is_empty(),
         );
@@ -641,6 +646,10 @@ impl IndexScheduler {
         let mut entities = Vec::<EntityFact>::new();
         let mut grpc_bindings = Vec::new();
         let mut diagnostics = Vec::new();
+        let csharp_projects = csharp_projects
+            .iter()
+            .map(|(path, source)| parse_csharp_project(path, source))
+            .collect::<Result<Vec<CsharpProject>, _>>()?;
         let mut rust_analyses = Vec::new();
         let analyzed_rust = self.analysis_pool.install(|| {
             rust_sources
@@ -762,20 +771,68 @@ impl IndexScheduler {
                             ),
                         });
                     }
+                    let assemblies = csharp_source_assemblies(&csharp_projects, path);
+                    let observations = assemblies
+                        .iter()
+                        .flat_map(|assembly| {
+                            csharp_observations(
+                                &state.repository.identity,
+                                assembly,
+                                &analysis,
+                                &source,
+                                path,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let entities = assemblies
+                        .iter()
+                        .flat_map(|assembly| {
+                            csharp_entities(&state.repository.identity, assembly, &analysis, path)
+                        })
+                        .collect::<Vec<_>>();
                     Ok::<_, String>((
-                        csharp_observations(&state.repository.identity, &analysis, &source, path),
-                        csharp_entities(&state.repository.identity, &analysis, path),
+                        path.clone(),
+                        analysis,
+                        assemblies,
+                        observations,
+                        entities,
                         source_diagnostics,
                     ))
                 })
                 .collect::<Vec<_>>()
         });
+        let mut csharp_repository_sources = Vec::new();
         for analysis in analyzed_csharp {
-            let (source_observations, source_entities, source_diagnostics) = analysis?;
+            let (
+                path,
+                analysis,
+                assemblies,
+                source_observations,
+                source_entities,
+                source_diagnostics,
+            ) = analysis?;
             observations.extend(source_observations);
             entities.extend(source_entities);
             diagnostics.extend(source_diagnostics);
+            csharp_repository_sources.extend(
+                assemblies
+                    .into_iter()
+                    .map(|assembly| (path.clone(), assembly, analysis.clone())),
+            );
         }
+        let csharp_repository_source_refs = csharp_repository_sources
+            .iter()
+            .map(|(path, assembly, analysis)| CsharpSource {
+                path,
+                assembly,
+                analysis,
+            })
+            .collect::<Vec<_>>();
+        observations.extend(resolve_csharp_repository_calls(
+            &state.repository.identity,
+            &csharp_projects,
+            &csharp_repository_source_refs,
+        ));
         let mut typescript_analyses = Vec::new();
         let analyzed_typescript = self.analysis_pool.install(|| {
             typescript_sources
@@ -871,6 +928,7 @@ impl IndexScheduler {
             }
         }
         let analysis = Arc::new(RepositoryAnalysis {
+            csharp_projects,
             entities,
             grpc_bindings,
             observations,
@@ -994,6 +1052,7 @@ fn index_workspace_versioned(
             rust,
             elixir,
             csharp,
+            csharp_projects,
             typescript,
             typescript_manifests,
             typescript_configs,
@@ -1009,6 +1068,7 @@ fn index_workspace_versioned(
                     rust.len()
                         + elixir.len()
                         + csharp.len()
+                        + csharp_projects.len()
                         + typescript.len()
                         + typescript_manifests.len()
                         + typescript_configs.len()
@@ -1022,6 +1082,7 @@ fn index_workspace_versioned(
                     rust: &rust,
                     elixir: &elixir,
                     csharp: &csharp,
+                    csharp_projects: &csharp_projects,
                     typescript: &typescript,
                     typescript_manifests: &typescript_manifests,
                     typescript_configs: &typescript_configs,
@@ -1410,6 +1471,11 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            repository.join("src/App.csproj"),
+            "<Project><PropertyGroup><AssemblyName>Example.App</AssemblyName></PropertyGroup></Project>",
+        )
+        .unwrap();
+        fs::write(
             repository.join("broken.proto"),
             "syntax = \"proto3\"; import \"missing.proto\"; message Broken {}",
         )
@@ -1423,12 +1489,11 @@ mod tests {
         let stored = store.inspect_observations(Some("calls")).unwrap();
         assert!(
             stored.rows.iter().any(|row| {
-                row[1]
-                    .as_str()
-                    .is_some_and(|from| from.ends_with("/csharp/src/Program/Demo/Program/Run()"))
-                    && row[3]
-                        .as_str()
-                        .is_some_and(|to| to.ends_with("/csharp/src/Program/Demo/Program/Helper()"))
+                row[1].as_str().is_some_and(|from| {
+                    from.ends_with("/csharp/Example.App/src/Program/Demo/Program/Run()")
+                }) && row[3].as_str().is_some_and(|to| {
+                    to.ends_with("/csharp/Example.App/src/Program/Demo/Program/Helper()")
+                })
             }),
             "{stored:?}"
         );
