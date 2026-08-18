@@ -1,7 +1,8 @@
-pub const FRONTEND_VERSION: &str = "2";
-pub const RESOLVER_VERSION: &str = "4";
+pub const FRONTEND_VERSION: &str = "3";
+pub const RESOLVER_VERSION: &str = "7";
 
 mod analysis;
+mod dotnet_di;
 mod model;
 mod project;
 mod resolution;

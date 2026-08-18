@@ -12,14 +12,15 @@ fn text<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
 
 fn declaration_kind(node: Node<'_>) -> Option<DefinitionKind> {
     match node.kind() {
-        "namespace_declaration"
-        | "file_scoped_namespace_declaration"
-        | "class_declaration"
+        "namespace_declaration" | "file_scoped_namespace_declaration" => {
+            Some(DefinitionKind::Namespace)
+        }
+        "class_declaration"
         | "struct_declaration"
         | "interface_declaration"
         | "record_declaration"
         | "enum_declaration"
-        | "delegate_declaration" => Some(DefinitionKind::Namespace),
+        | "delegate_declaration" => Some(DefinitionKind::Type),
         "method_declaration"
         | "constructor_declaration"
         | "local_function_statement"
@@ -71,6 +72,26 @@ fn simple_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     Some(name.split('<').next().unwrap_or(name).trim().to_owned())
 }
 
+fn type_arguments(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let generic = if node.kind() == "generic_name" {
+        Some(node)
+    } else {
+        node.child_by_field_name("name")
+            .filter(|name| name.kind() == "generic_name")
+    };
+    let Some(arguments) = generic.and_then(|generic| {
+        generic
+            .named_children(&mut generic.walk())
+            .find(|child| child.kind() == "type_argument_list")
+    }) else {
+        return Vec::new();
+    };
+    arguments
+        .named_children(&mut arguments.walk())
+        .filter_map(|argument| text(argument, source).map(str::to_owned))
+        .collect()
+}
+
 fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
     match node.kind() {
         "invocation_expression" => {
@@ -83,6 +104,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                         .and_then(|receiver| text(receiver, source))
                         .map(str::to_owned),
                     name: simple_name(function, source)?,
+                    type_arguments: type_arguments(function, source),
                     line: node.start_position().row + 1,
                 });
             }
@@ -90,6 +112,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                 kind: CallKind::Direct,
                 receiver: None,
                 name: simple_name(function, source)?,
+                type_arguments: type_arguments(function, source),
                 line: node.start_position().row + 1,
             })
         }
@@ -100,6 +123,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                 .child_by_field_name("type")
                 .and_then(|kind| text(kind, source))?
                 .to_owned(),
+            type_arguments: Vec::new(),
             line: node.start_position().row + 1,
         }),
         _ => None,
@@ -352,7 +376,7 @@ pub fn entities_from_analysis(
             EntityFact::new(
                 format!("{module_id}/{}", definition.qualified_name),
                 match definition.kind {
-                    DefinitionKind::Namespace => EntityKind::Namespace,
+                    DefinitionKind::Namespace | DefinitionKind::Type => EntityKind::Namespace,
                     DefinitionKind::Callable => EntityKind::Callable,
                 },
                 None,

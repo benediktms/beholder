@@ -9,6 +9,7 @@ pub struct CsharpAnalysis {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum DefinitionKind {
     Namespace,
+    Type,
     Callable,
 }
 
@@ -40,5 +41,6 @@ pub(super) struct Call {
     pub(super) kind: CallKind,
     pub(super) receiver: Option<String>,
     pub(super) name: String,
+    pub(super) type_arguments: Vec<String>,
     pub(super) line: usize,
 }
