@@ -52,6 +52,8 @@ pub struct TraversalMetadata {
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Callable,
+    GraphqlArgument,
+    GraphqlEnumValue,
     GraphqlField,
     GraphqlOperation,
     GraphqlType,

@@ -141,6 +141,8 @@ impl From<dto::EntityKind> for v1::EntityKind {
     fn from(value: dto::EntityKind) -> Self {
         match value {
             dto::EntityKind::Callable => Self::Callable,
+            dto::EntityKind::GraphqlArgument => Self::GraphqlArgument,
+            dto::EntityKind::GraphqlEnumValue => Self::GraphqlEnumValue,
             dto::EntityKind::GraphqlField => Self::GraphqlField,
             dto::EntityKind::GraphqlOperation => Self::GraphqlOperation,
             dto::EntityKind::GraphqlType => Self::GraphqlType,
@@ -181,6 +183,8 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
     Ok(
         match v1::EntityKind::try_from(value).map_err(|_| "unknown entity kind")? {
             v1::EntityKind::Callable => dto::EntityKind::Callable,
+            v1::EntityKind::GraphqlArgument => dto::EntityKind::GraphqlArgument,
+            v1::EntityKind::GraphqlEnumValue => dto::EntityKind::GraphqlEnumValue,
             v1::EntityKind::GraphqlField => dto::EntityKind::GraphqlField,
             v1::EntityKind::GraphqlOperation => dto::EntityKind::GraphqlOperation,
             v1::EntityKind::GraphqlType => dto::EntityKind::GraphqlType,
@@ -777,6 +781,24 @@ mod tests {
                     metadata: Some(dto::EntityMetadata::GraphqlType {
                         type_kind: dto::GraphqlTypeKind::Input,
                     }),
+                },
+                dto::EntityRef {
+                    id: "graphql-argument://Mutation/createOrder/input".into(),
+                    kind: dto::EntityKind::GraphqlArgument,
+                    name: "input".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: None,
+                },
+                dto::EntityRef {
+                    id: "graphql-enum-value://OrderMode/PREVIEW".into(),
+                    kind: dto::EntityKind::GraphqlEnumValue,
+                    name: "PREVIEW".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: None,
                 },
             ],
             edges: vec![dto::SemanticEdge {

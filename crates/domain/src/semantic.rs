@@ -240,6 +240,8 @@ pub struct EntityFact {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum EntityKind {
     Callable,
+    GraphqlArgument,
+    GraphqlEnumValue,
     GraphqlField,
     GraphqlOperation,
     GraphqlType,
@@ -297,6 +299,8 @@ impl EntityFact {
             | (EntityKind::ProtoType, Some(EntityMetadata::ProtoType { .. }))
             | (
                 EntityKind::Callable
+                | EntityKind::GraphqlArgument
+                | EntityKind::GraphqlEnumValue
                 | EntityKind::GraphqlField
                 | EntityKind::GraphqlOperation
                 | EntityKind::GrpcOperation

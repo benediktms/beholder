@@ -6,9 +6,12 @@ use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     EntityMetadata, GraphqlTypeKind, Observation, StructuralRelation,
 };
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
-pub const FRONTEND_VERSION: &str = "4";
+pub const FRONTEND_VERSION: &str = "5";
 
 #[derive(Clone, Copy)]
 pub struct GraphqlSource<'a> {
@@ -84,6 +87,7 @@ fn field_entities(
     roots: &BTreeMap<String, &'static str>,
 ) {
     let declared_type_name = type_name.text().to_string();
+    let owner_type_id = format!("graphql-type://{declared_type_name}");
     let type_name = roots
         .get(&declared_type_name)
         .copied()
@@ -99,6 +103,66 @@ fn field_entities(
         entities.entry(id.clone()).or_insert_with(|| {
             EntityFact::new(id.clone(), EntityKind::GraphqlField, None).unwrap()
         });
+        facts.observations.push(Observation::structural(
+            id.clone(),
+            StructuralRelation::FieldOf,
+            owner_type_id.clone(),
+            evidence(source, &field),
+        ));
+        if let Some(ty) = field.ty() {
+            type_relationship(
+                facts,
+                entities,
+                source,
+                &id,
+                &ty,
+                StructuralRelation::ResponseType,
+                &field,
+            );
+        }
+        for argument in field
+            .arguments_definition()
+            .into_iter()
+            .flat_map(|arguments| arguments.input_value_definitions())
+        {
+            let Some(argument_name) = argument.name() else {
+                continue;
+            };
+            let argument_id = format!(
+                "graphql-argument://{type_name}/{}/{}",
+                name.text(),
+                argument_name.text()
+            );
+            entities.entry(argument_id.clone()).or_insert_with(|| {
+                EntityFact::new(argument_id.clone(), EntityKind::GraphqlArgument, None).unwrap()
+            });
+            facts.observations.push(Observation::structural(
+                argument_id.clone(),
+                StructuralRelation::FieldOf,
+                id.clone(),
+                evidence(source, &argument),
+            ));
+            if let Some(ty) = argument.ty() {
+                type_relationship(
+                    facts,
+                    entities,
+                    source,
+                    &argument_id,
+                    &ty,
+                    StructuralRelation::RequestType,
+                    &argument,
+                );
+                type_relationship(
+                    facts,
+                    entities,
+                    source,
+                    &id,
+                    &ty,
+                    StructuralRelation::RequestType,
+                    &argument,
+                );
+            }
+        }
         if let Some(owner) = source.owner {
             facts.observations.push(Observation::structural(
                 owner,
@@ -113,6 +177,102 @@ fn field_entities(
                 format!("graphql-field://{type_name}/{upstream}"),
                 evidence(source, &field),
             ));
+        }
+    }
+}
+
+fn named_type_name(ty: &cst::Type) -> Option<String> {
+    match ty {
+        cst::Type::NamedType(named) => named.name().map(|name| name.text().to_string()),
+        cst::Type::ListType(list) => list.ty().and_then(|ty| named_type_name(&ty)),
+        cst::Type::NonNullType(non_null) => non_null
+            .named_type()
+            .and_then(|named| named.name())
+            .map(|name| name.text().to_string())
+            .or_else(|| {
+                non_null
+                    .list_type()
+                    .and_then(|list| list.ty())
+                    .and_then(|ty| named_type_name(&ty))
+            }),
+    }
+}
+
+fn type_relationship(
+    facts: &mut GraphqlFacts,
+    entities: &mut BTreeMap<String, EntityFact>,
+    source: GraphqlSource<'_>,
+    from: &str,
+    ty: &cst::Type,
+    structural: StructuralRelation,
+    node: &impl CstNode,
+) {
+    let Some(name) = named_type_name(ty) else {
+        return;
+    };
+    let type_id = format!("graphql-type://{name}");
+    if matches!(name.as_str(), "Boolean" | "Float" | "ID" | "Int" | "String") {
+        entities.entry(type_id.clone()).or_insert_with(|| {
+            EntityFact::new(
+                type_id.clone(),
+                EntityKind::GraphqlType,
+                Some(EntityMetadata::GraphqlType {
+                    kind: GraphqlTypeKind::Scalar,
+                }),
+            )
+            .unwrap()
+        });
+    }
+    let evidence = evidence(source, node);
+    facts.observations.push(Observation::structural(
+        from,
+        structural,
+        type_id.clone(),
+        evidence.clone(),
+    ));
+    facts.observations.push(Observation::dependency(
+        from,
+        DependencyRelation::Uses,
+        type_id,
+        evidence,
+    ));
+}
+
+fn input_field_entities(
+    facts: &mut GraphqlFacts,
+    entities: &mut BTreeMap<String, EntityFact>,
+    source: GraphqlSource<'_>,
+    type_name: &str,
+    fields: Option<cst::InputFieldsDefinition>,
+) {
+    let owner_type_id = format!("graphql-type://{type_name}");
+    for field in fields
+        .into_iter()
+        .flat_map(|fields| fields.input_value_definitions())
+    {
+        let Some(name) = field.name() else {
+            continue;
+        };
+        let id = format!("graphql-field://{type_name}/{}", name.text());
+        entities.entry(id.clone()).or_insert_with(|| {
+            EntityFact::new(id.clone(), EntityKind::GraphqlField, None).unwrap()
+        });
+        facts.observations.push(Observation::structural(
+            id.clone(),
+            StructuralRelation::FieldOf,
+            owner_type_id.clone(),
+            evidence(source, &field),
+        ));
+        if let Some(ty) = field.ty() {
+            type_relationship(
+                facts,
+                entities,
+                source,
+                &id,
+                &ty,
+                StructuralRelation::RequestType,
+                &field,
+            );
         }
     }
 }
@@ -134,6 +294,74 @@ fn type_entity(
         )
         .unwrap()
     });
+}
+
+fn implements_interfaces(
+    facts: &mut GraphqlFacts,
+    source: GraphqlSource<'_>,
+    type_name: &str,
+    interfaces: Option<cst::ImplementsInterfaces>,
+) {
+    let type_id = format!("graphql-type://{type_name}");
+    for interface in interfaces.into_iter().flat_map(|value| value.named_types()) {
+        let Some(name) = interface.name() else {
+            continue;
+        };
+        facts.observations.push(Observation::dependency(
+            type_id.clone(),
+            DependencyRelation::Implements,
+            format!("graphql-type://{}", name.text()),
+            evidence(source, &interface),
+        ));
+    }
+}
+
+fn union_members(
+    facts: &mut GraphqlFacts,
+    source: GraphqlSource<'_>,
+    union_name: &str,
+    members: Option<cst::UnionMemberTypes>,
+) {
+    let union_id = format!("graphql-type://{union_name}");
+    for member in members.into_iter().flat_map(|value| value.named_types()) {
+        let Some(name) = member.name() else {
+            continue;
+        };
+        facts.observations.push(Observation::dependency(
+            union_id.clone(),
+            DependencyRelation::Uses,
+            format!("graphql-type://{}", name.text()),
+            evidence(source, &member),
+        ));
+    }
+}
+
+fn enum_values(
+    facts: &mut GraphqlFacts,
+    entities: &mut BTreeMap<String, EntityFact>,
+    source: GraphqlSource<'_>,
+    enum_name: &str,
+    values: Option<cst::EnumValuesDefinition>,
+) {
+    let enum_id = format!("graphql-type://{enum_name}");
+    for value in values
+        .into_iter()
+        .flat_map(|values| values.enum_value_definitions())
+    {
+        let Some(name) = value.enum_value() else {
+            continue;
+        };
+        let id = format!("graphql-enum-value://{enum_name}/{}", name.syntax().text());
+        entities.entry(id.clone()).or_insert_with(|| {
+            EntityFact::new(id.clone(), EntityKind::GraphqlEnumValue, None).unwrap()
+        });
+        facts.observations.push(Observation::structural(
+            id,
+            StructuralRelation::FieldOf,
+            enum_id.clone(),
+            evidence(source, &value),
+        ));
+    }
 }
 
 fn directive_argument(
@@ -167,6 +395,7 @@ fn operation_facts(
     entities: &mut BTreeMap<String, EntityFact>,
     source: GraphqlSource<'_>,
     operation: cst::OperationDefinition,
+    fragments: &BTreeMap<String, cst::FragmentDefinition>,
 ) {
     let name = operation
         .name()
@@ -184,28 +413,118 @@ fn operation_facts(
             evidence(source, &operation),
         ));
     }
-    let root = root_type(&operation);
-    for selection in operation
-        .selection_set()
+    for variable in operation
+        .variable_definitions()
         .into_iter()
-        .flat_map(|selection_set| selection_set.selections())
+        .flat_map(|variables| variables.variable_definitions())
     {
-        let cst::Selection::Field(field) = selection else {
+        let Some(variable_name) = variable.variable().and_then(|variable| variable.name()) else {
             continue;
         };
-        let Some(name) = field.name() else {
-            continue;
-        };
-        let field_id = format!("graphql-field://{root}/{}", name.text());
-        entities.entry(field_id.clone()).or_insert_with(|| {
-            EntityFact::new(field_id.clone(), EntityKind::GraphqlField, None).unwrap()
+        let argument_id = format!(
+            "graphql-argument://operation/{name}/{}",
+            variable_name.text()
+        );
+        entities.entry(argument_id.clone()).or_insert_with(|| {
+            EntityFact::new(argument_id.clone(), EntityKind::GraphqlArgument, None).unwrap()
         });
-        facts.observations.push(Observation::dependency(
+        facts.observations.push(Observation::structural(
+            argument_id.clone(),
+            StructuralRelation::FieldOf,
             operation_id.clone(),
-            DependencyRelation::Selects,
-            field_id,
-            evidence(source, &field),
+            evidence(source, &variable),
         ));
+        if let Some(ty) = variable.ty() {
+            type_relationship(
+                facts,
+                entities,
+                source,
+                &argument_id,
+                &ty,
+                StructuralRelation::RequestType,
+                &variable,
+            );
+            type_relationship(
+                facts,
+                entities,
+                source,
+                &operation_id,
+                &ty,
+                StructuralRelation::RequestType,
+                &variable,
+            );
+        }
+    }
+    let root = root_type(&operation);
+    if let Some(selections) = operation.selection_set() {
+        root_selection_facts(
+            &mut RootSelectionFacts {
+                facts,
+                entities,
+                source,
+                operation_id: &operation_id,
+                root,
+                fragments,
+                visited: BTreeSet::new(),
+            },
+            selections,
+        );
+    }
+}
+
+struct RootSelectionFacts<'a, 'source> {
+    facts: &'a mut GraphqlFacts,
+    entities: &'a mut BTreeMap<String, EntityFact>,
+    source: GraphqlSource<'source>,
+    operation_id: &'a str,
+    root: &'a str,
+    fragments: &'a BTreeMap<String, cst::FragmentDefinition>,
+    visited: BTreeSet<String>,
+}
+
+fn root_selection_facts(context: &mut RootSelectionFacts<'_, '_>, selections: cst::SelectionSet) {
+    for selection in selections.selections() {
+        match selection {
+            cst::Selection::Field(field) => {
+                let Some(name) = field.name() else {
+                    continue;
+                };
+                let field_id = format!("graphql-field://{}/{}", context.root, name.text());
+                context.entities.entry(field_id.clone()).or_insert_with(|| {
+                    EntityFact::new(field_id.clone(), EntityKind::GraphqlField, None).unwrap()
+                });
+                context.facts.observations.push(Observation::dependency(
+                    context.operation_id,
+                    DependencyRelation::Selects,
+                    field_id,
+                    evidence(context.source, &field),
+                ));
+            }
+            cst::Selection::FragmentSpread(spread) => {
+                let Some(name) = spread
+                    .fragment_name()
+                    .and_then(|fragment| fragment.name())
+                    .map(|name| name.text().to_string())
+                else {
+                    continue;
+                };
+                if !context.visited.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(selections) = context
+                    .fragments
+                    .get(&name)
+                    .and_then(|fragment| fragment.selection_set())
+                {
+                    root_selection_facts(context, selections);
+                }
+            }
+            cst::Selection::InlineFragment(fragment) => {
+                if let Some(selections) = fragment.selection_set() {
+                    root_selection_facts(context, selections);
+                }
+            }
+        }
     }
 }
 
@@ -218,6 +537,7 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
         .map(|source| (*source, Parser::new(source.source).parse()))
         .collect::<Vec<_>>();
     let mut roots = BTreeMap::new();
+    let mut fragments = BTreeMap::new();
     for (_, syntax) in &parsed {
         for definition in syntax.document().definitions() {
             match definition {
@@ -226,6 +546,14 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                 }
                 cst::Definition::SchemaExtension(schema) => {
                     record_root_types(&mut roots, schema.root_operation_type_definitions())
+                }
+                cst::Definition::FragmentDefinition(fragment) => {
+                    if let Some(name) = fragment
+                        .fragment_name()
+                        .and_then(|fragment| fragment.name())
+                    {
+                        fragments.entry(name.text().to_string()).or_insert(fragment);
+                    }
                 }
                 _ => {}
             }
@@ -254,6 +582,12 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                 cst::Definition::ObjectTypeDefinition(object) => {
                     if let Some(name) = object.name() {
                         type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Object);
+                        implements_interfaces(
+                            &mut facts,
+                            source,
+                            &name.text(),
+                            object.implements_interfaces(),
+                        );
                         field_entities(
                             &mut facts,
                             &mut entities,
@@ -268,6 +602,12 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                 cst::Definition::ObjectTypeExtension(object) => {
                     if let Some(name) = object.name() {
                         type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Object);
+                        implements_interfaces(
+                            &mut facts,
+                            source,
+                            &name.text(),
+                            object.implements_interfaces(),
+                        );
                         field_entities(
                             &mut facts,
                             &mut entities,
@@ -280,28 +620,122 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                     }
                 }
                 cst::Definition::InputObjectTypeDefinition(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Input)
+                    if let Some(name) = definition.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Input);
+                        input_field_entities(
+                            &mut facts,
+                            &mut entities,
+                            source,
+                            &name.text(),
+                            definition.input_fields_definition(),
+                        );
+                    }
                 }
                 cst::Definition::InputObjectTypeExtension(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Input)
+                    if let Some(name) = definition.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Input);
+                        input_field_entities(
+                            &mut facts,
+                            &mut entities,
+                            source,
+                            &name.text(),
+                            definition.input_fields_definition(),
+                        );
+                    }
                 }
                 cst::Definition::InterfaceTypeDefinition(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Interface)
+                    if let Some(name) = definition.name() {
+                        type_entity(
+                            &mut entities,
+                            Some(name.clone()),
+                            GraphqlTypeKind::Interface,
+                        );
+                        implements_interfaces(
+                            &mut facts,
+                            source,
+                            &name.text(),
+                            definition.implements_interfaces(),
+                        );
+                        field_entities(
+                            &mut facts,
+                            &mut entities,
+                            &mut stitched_fields,
+                            source,
+                            name,
+                            definition.fields_definition(),
+                            &roots,
+                        );
+                    }
                 }
                 cst::Definition::InterfaceTypeExtension(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Interface)
+                    if let Some(name) = definition.name() {
+                        type_entity(
+                            &mut entities,
+                            Some(name.clone()),
+                            GraphqlTypeKind::Interface,
+                        );
+                        implements_interfaces(
+                            &mut facts,
+                            source,
+                            &name.text(),
+                            definition.implements_interfaces(),
+                        );
+                        field_entities(
+                            &mut facts,
+                            &mut entities,
+                            &mut stitched_fields,
+                            source,
+                            name,
+                            definition.fields_definition(),
+                            &roots,
+                        );
+                    }
                 }
                 cst::Definition::UnionTypeDefinition(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Union)
+                    if let Some(name) = definition.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Union);
+                        union_members(
+                            &mut facts,
+                            source,
+                            &name.text(),
+                            definition.union_member_types(),
+                        );
+                    }
                 }
                 cst::Definition::UnionTypeExtension(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Union)
+                    if let Some(name) = definition.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Union);
+                        union_members(
+                            &mut facts,
+                            source,
+                            &name.text(),
+                            definition.union_member_types(),
+                        );
+                    }
                 }
                 cst::Definition::EnumTypeDefinition(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Enum)
+                    if let Some(name) = definition.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Enum);
+                        enum_values(
+                            &mut facts,
+                            &mut entities,
+                            source,
+                            &name.text(),
+                            definition.enum_values_definition(),
+                        );
+                    }
                 }
                 cst::Definition::EnumTypeExtension(definition) => {
-                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Enum)
+                    if let Some(name) = definition.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Enum);
+                        enum_values(
+                            &mut facts,
+                            &mut entities,
+                            source,
+                            &name.text(),
+                            definition.enum_values_definition(),
+                        );
+                    }
                 }
                 cst::Definition::ScalarTypeDefinition(definition) => {
                     type_entity(&mut entities, definition.name(), GraphqlTypeKind::Scalar)
@@ -310,7 +744,7 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                     type_entity(&mut entities, definition.name(), GraphqlTypeKind::Scalar)
                 }
                 cst::Definition::OperationDefinition(operation) => {
-                    operation_facts(&mut facts, &mut entities, source, operation);
+                    operation_facts(&mut facts, &mut entities, source, operation, &fragments);
                 }
                 _ => {}
             }
@@ -340,12 +774,12 @@ mod tests {
     fn maps_schema_fields_and_operation_root_selections() {
         let schema = GraphqlSource {
             path: Path::new("schema.graphql"),
-            source: "schema { query: RootQuery } type RootQuery { packageTemplatePreview: Package location: Location } input Filter { query: String } interface Node { id: ID! } type Package implements Node { id: ID! } union Search = Package enum Sort { ASC } scalar Date",
+            source: "schema { query: RootQuery } type RootQuery { packageTemplatePreview(filter: Filter, sort: Sort!): Package location: Location } input Filter { query: String } interface Node { id: ID! } type Package implements Node { id: ID! } union Search = Package enum Sort { ASC } scalar Date",
             owner: Some("repo://gateway/graphql-source/schema.graphql"),
         };
         let operation = GraphqlSource {
             path: Path::new("PackageDetail.gql.tsx"),
-            source: "query Packages_Detail_Query { preview: packageTemplatePreview { id } location { id } }",
+            source: "query Packages_Detail_Query($filter: Filter) { ...RootFields ... on RootQuery { location { id } } } fragment RootFields on RootQuery { preview: packageTemplatePreview(filter: $filter) { id } }",
             owner: Some("repo://spa/typescript/PackageDetail.gql"),
         };
 
@@ -375,6 +809,73 @@ mod tests {
                     == beholder_domain::SemanticRelation::Dependency(DependencyRelation::Selects)
                 && observation.to.as_str() == "graphql-field://Query/packageTemplatePreview"
         }));
+        for (from, relation, to) in [
+            (
+                "graphql-field://Query/packageTemplatePreview",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::FieldOf),
+                "graphql-type://RootQuery",
+            ),
+            (
+                "graphql-field://Query/packageTemplatePreview",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::RequestType),
+                "graphql-type://Filter",
+            ),
+            (
+                "graphql-field://Query/packageTemplatePreview",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::ResponseType),
+                "graphql-type://Package",
+            ),
+            (
+                "graphql-argument://Query/packageTemplatePreview/filter",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::FieldOf),
+                "graphql-field://Query/packageTemplatePreview",
+            ),
+            (
+                "graphql-argument://Query/packageTemplatePreview/filter",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::RequestType),
+                "graphql-type://Filter",
+            ),
+            (
+                "graphql-field://Filter/query",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::RequestType),
+                "graphql-type://String",
+            ),
+            (
+                "graphql-field://Filter/query",
+                beholder_domain::SemanticRelation::Dependency(DependencyRelation::Uses),
+                "graphql-type://String",
+            ),
+            (
+                "graphql-type://Package",
+                beholder_domain::SemanticRelation::Dependency(DependencyRelation::Implements),
+                "graphql-type://Node",
+            ),
+            (
+                "graphql-type://Search",
+                beholder_domain::SemanticRelation::Dependency(DependencyRelation::Uses),
+                "graphql-type://Package",
+            ),
+            (
+                "graphql-enum-value://Sort/ASC",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::FieldOf),
+                "graphql-type://Sort",
+            ),
+            (
+                "graphql-operation://Packages_Detail_Query",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::RequestType),
+                "graphql-type://Filter",
+            ),
+        ] {
+            assert!(
+                facts.observations.iter().any(|observation| {
+                    observation.from.as_str() == from
+                        && observation.relation == relation
+                        && observation.to.as_str() == to
+                }),
+                "missing {from} {} {to}",
+                relation.as_str()
+            );
+        }
         assert!(facts.diagnostics.is_empty());
     }
 

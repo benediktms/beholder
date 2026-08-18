@@ -86,6 +86,8 @@ pub(super) fn store_observations(
 fn entity_kind(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Callable => "callable",
+        EntityKind::GraphqlArgument => "graphql_argument",
+        EntityKind::GraphqlEnumValue => "graphql_enum_value",
         EntityKind::GraphqlField => "graphql_field",
         EntityKind::GraphqlOperation => "graphql_operation",
         EntityKind::GraphqlType => "graphql_type",
@@ -1020,6 +1022,22 @@ mod tests {
         facts.entities.push(
             EntityFact::new("repo://example/rust/unrelated", EntityKind::Callable, None).unwrap(),
         );
+        facts.entities.push(
+            EntityFact::new(
+                "graphql-argument://Mutation/createOrder/input",
+                EntityKind::GraphqlArgument,
+                None,
+            )
+            .unwrap(),
+        );
+        facts.entities.push(
+            EntityFact::new(
+                "graphql-enum-value://OrderMode/PREVIEW",
+                EntityKind::GraphqlEnumValue,
+                None,
+            )
+            .unwrap(),
+        );
         let state = analyzed_state(&facts);
         store.publish(&view, &[facts], &[]).unwrap();
 
@@ -1047,6 +1065,22 @@ mod tests {
             })
         );
         assert_eq!(context.nodes.len(), 1);
+        assert_eq!(
+            store
+                .context("main", "graphql-argument://Mutation/createOrder/input")
+                .unwrap()
+                .root
+                .kind,
+            beholder_dto::EntityKind::GraphqlArgument
+        );
+        assert_eq!(
+            store
+                .context("main", "graphql-enum-value://OrderMode/PREVIEW")
+                .unwrap()
+                .root
+                .kind,
+            beholder_dto::EntityKind::GraphqlEnumValue
+        );
     }
 
     #[test]

@@ -1846,7 +1846,7 @@ mod tests {
         };
         let graphql = vec![(
             PathBuf::from("src/package.graphql"),
-            "type Mutation { initializeOrder: ID } input InitializeOrderInput { id: ID! } query Package { packageTemplatePreview { id } }"
+            "type Mutation { initializeOrder(input: InitializeOrderInput!, mode: OrderMode): ID } input InitializeOrderInput { id: ID! } enum OrderMode { PREVIEW COMMIT } query Package { packageTemplatePreview { id } }"
                 .into(),
         )];
         let elixir = vec![(
@@ -1907,6 +1907,22 @@ mod tests {
                     == Some(beholder_domain::EntityMetadata::GraphqlType {
                         kind: beholder_domain::GraphqlTypeKind::Input,
                     })
+        }));
+        assert!(analysis.entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-argument://Mutation/initializeOrder/input"
+                && entity.kind == beholder_domain::EntityKind::GraphqlArgument
+        }));
+        assert!(analysis.entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-enum-value://OrderMode/PREVIEW"
+                && entity.kind == beholder_domain::EntityKind::GraphqlEnumValue
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Mutation/initializeOrder"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Structural(
+                        beholder_domain::StructuralRelation::RequestType,
+                    )
+                && observation.to.as_str() == "graphql-type://InitializeOrderInput"
         }));
         scheduler.clear_cache().unwrap();
     }

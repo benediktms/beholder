@@ -438,6 +438,8 @@ fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error
                 text(row, 2, "entity metadata")?,
             ) {
                 ("callable", "") => (EntityKind::Callable, None),
+                ("graphql_argument", "") => (EntityKind::GraphqlArgument, None),
+                ("graphql_enum_value", "") => (EntityKind::GraphqlEnumValue, None),
                 ("graphql_field", "") => (EntityKind::GraphqlField, None),
                 ("graphql_operation", "") => (EntityKind::GraphqlOperation, None),
                 ("graphql_type", "graphql_type:enum") => (
@@ -535,7 +537,9 @@ fn kind_priority(kind: EntityKind) -> u8 {
         EntityKind::Unknown => 0,
         EntityKind::Namespace => 1,
         EntityKind::Callable => 2,
-        EntityKind::GraphqlField
+        EntityKind::GraphqlArgument
+        | EntityKind::GraphqlEnumValue
+        | EntityKind::GraphqlField
         | EntityKind::GraphqlOperation
         | EntityKind::GraphqlType
         | EntityKind::KafkaTopic
@@ -631,6 +635,10 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::Rpc
     } else if id.starts_with("graphql-field://") {
         EntityKind::GraphqlField
+    } else if id.starts_with("graphql-argument://") {
+        EntityKind::GraphqlArgument
+    } else if id.starts_with("graphql-enum-value://") {
+        EntityKind::GraphqlEnumValue
     } else if id.starts_with("graphql-operation://") {
         EntityKind::GraphqlOperation
     } else if id.starts_with("graphql-type://") {
