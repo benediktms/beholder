@@ -215,6 +215,51 @@ fn collect_factory_bindings(
     }
 }
 
+fn collect_alias_bindings(
+    node: Node<'_>,
+    source: &[u8],
+    root: Node<'_>,
+    bindings: &mut Vec<AliasBinding>,
+) {
+    if node != root
+        && matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function_declaration"
+                | "method_definition"
+        )
+    {
+        return;
+    }
+    let pair = match node.kind() {
+        "variable_declarator" => (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("value"),
+        ),
+        "assignment_expression" => (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ),
+        _ => (None, None),
+    };
+    if let (Some(receiver), Some(value)) = pair
+        && matches!(receiver.kind(), "identifier" | "member_expression")
+        && matches!(value.kind(), "identifier" | "member_expression")
+        && let (Some(receiver), Some(source_name)) = (text(receiver, source), text(value, source))
+    {
+        bindings.push(AliasBinding {
+            receiver: receiver.into(),
+            source: source_name.into(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_alias_bindings(child, source, root, bindings);
+    }
+}
+
 fn returned_constructor(node: Node<'_>, source: &[u8], root: Node<'_>) -> Option<String> {
     if node != root
         && matches!(
@@ -263,6 +308,10 @@ fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
         let Some(parameters) = child.child_by_field_name("parameters") else {
             continue;
         };
+        let parameter_bindings = parameters
+            .named_children(&mut parameters.walk())
+            .filter_map(|parameter| binding(parameter, source))
+            .collect::<Vec<_>>();
         let mut parameter_cursor = parameters.walk();
         for parameter in parameters.named_children(&mut parameter_cursor) {
             let mut modifier_cursor = parameter.walk();
@@ -284,6 +333,19 @@ fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
                 bindings.push(binding);
             }
         }
+        if let Some(body) = child.child_by_field_name("body") {
+            let mut aliases = Vec::new();
+            collect_alias_bindings(body, source, body, &mut aliases);
+            bindings.extend(aliases.into_iter().filter_map(|alias| {
+                let parameter = parameter_bindings
+                    .iter()
+                    .find(|binding| binding.receiver == alias.source)?;
+                alias.receiver.starts_with("this.").then(|| Binding {
+                    receiver: alias.receiver,
+                    type_name: parameter.type_name.clone(),
+                })
+            }));
+        }
     }
     bindings
 }
@@ -298,11 +360,13 @@ fn definition(
 ) -> Definition {
     let mut calls = Vec::new();
     let mut bindings = Vec::new();
+    let mut alias_bindings = Vec::new();
     let mut factory_bindings = Vec::new();
     if let Some(body) = body {
         collect_calls(body, source, body, &mut calls);
     }
     collect_bindings(node, source, node, &mut bindings);
+    collect_alias_bindings(node, source, node, &mut alias_bindings);
     collect_factory_bindings(node, source, node, &mut factory_bindings);
     let return_type = node
         .child_by_field_name("return_type")
@@ -314,6 +378,7 @@ fn definition(
         line: node.start_position().row + 1,
         calls,
         bindings,
+        alias_bindings,
         factory_bindings,
         factory: None,
         base: None,

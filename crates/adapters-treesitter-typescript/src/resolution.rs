@@ -252,6 +252,7 @@ struct RepositoryIndex<'a> {
     caller_files: BTreeMap<String, PathBuf>,
     caller_owners: BTreeMap<String, (PathBuf, String)>,
     caller_bindings: BTreeMap<String, &'a [Binding]>,
+    caller_alias_bindings: BTreeMap<String, &'a [AliasBinding]>,
     caller_factory_bindings: BTreeMap<String, &'a [FactoryBinding]>,
     file_imports: BTreeMap<PathBuf, &'a [Import]>,
 }
@@ -277,6 +278,7 @@ fn repository_index<'a>(
     let mut caller_files = BTreeMap::<String, PathBuf>::new();
     let mut caller_owners = BTreeMap::<String, (PathBuf, String)>::new();
     let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
+    let mut caller_alias_bindings = BTreeMap::<String, &[AliasBinding]>::new();
     let mut caller_factory_bindings = BTreeMap::<String, &[FactoryBinding]>::new();
     let mut file_imports = BTreeMap::<PathBuf, &[Import]>::new();
     let mut file_exports = BTreeMap::<PathBuf, &[Export]>::new();
@@ -340,6 +342,7 @@ fn repository_index<'a>(
             if definition.kind == DefinitionKind::Callable {
                 caller_files.insert(id.clone(), (*path).to_path_buf());
                 caller_bindings.insert(id.clone(), &definition.bindings);
+                caller_alias_bindings.insert(id.clone(), &definition.alias_bindings);
                 caller_factory_bindings.insert(id, &definition.factory_bindings);
                 if let Some((owner, member)) = definition.qualified_name.rsplit_once('/')
                     && !member.contains('/')
@@ -547,6 +550,7 @@ fn repository_index<'a>(
         caller_files,
         caller_owners,
         caller_bindings,
+        caller_alias_bindings,
         caller_factory_bindings,
         file_imports,
     }
@@ -602,15 +606,31 @@ fn receiver_type(
     receiver: &str,
 ) -> Option<(PathBuf, String)> {
     let file = index.caller_files.get(caller)?;
-    if let Some(type_name) = index
-        .caller_bindings
+    let aliases = index
+        .caller_alias_bindings
         .get(caller)
-        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
-        .map(|binding| binding.type_name.as_str())
-    {
-        return imported_origin(index, file, type_name)
-            .or_else(|| Some((file.clone(), type_name.to_owned())))
-            .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
+        .copied()
+        .unwrap_or_default();
+    let mut receiver = receiver;
+    for _ in 0..=aliases.len() {
+        if let Some(type_name) = index
+            .caller_bindings
+            .get(caller)
+            .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+            .map(|binding| binding.type_name.as_str())
+        {
+            return imported_origin(index, file, type_name)
+                .or_else(|| Some((file.clone(), type_name.to_owned())))
+                .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
+        }
+        let Some(source) = aliases
+            .iter()
+            .find(|binding| binding.receiver == receiver)
+            .map(|binding| binding.source.as_str())
+        else {
+            break;
+        };
+        receiver = source;
     }
     let factory = index
         .caller_factory_bindings
@@ -1082,6 +1102,11 @@ mod tests {
                 "import { Sender } from './sender'; export function send(sender: Sender) { sender.send('hello'); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/alias-consumer.ts"),
+                "import { Service } from './service'; export function aliasedService(service: Service) { const first = service; let second; second = first; second.execute(); } export class AssignedConsumer { private service; constructor(service: Service) { this.service = service; } run() { this.service.execute(); } }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1222,6 +1247,14 @@ mod tests {
                 && observation.to.as_str()
                     == "repo://example/typescript/packages/app/src/sender/Sender/send"
         }));
+        for caller in ["aliasedService", "AssignedConsumer/run"] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == format!("repo://example/typescript/packages/app/src/alias-consumer/{caller}")
+                    && observation.to.as_str()
+                        == "repo://example/typescript/packages/app/src/service/Service/execute"
+            }));
+        }
     }
 
     #[test]
