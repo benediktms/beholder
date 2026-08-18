@@ -3,18 +3,20 @@ use beholder_domain::{DependencyRelation, EntityId, Observation, SemanticRelatio
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
 };
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TsConfig {
+    #[serde(default)]
+    extends: OneOrMany,
     #[serde(default)]
     compiler_options: CompilerOptions,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CompilerOptions {
     base_url: Option<PathBuf>,
@@ -22,10 +24,18 @@ struct CompilerOptions {
     paths: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Clone, Default, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+    #[default]
+    None,
+}
+
 struct PathAliases {
     directory: PathBuf,
-    base_url: PathBuf,
-    paths: BTreeMap<String, Vec<String>>,
+    paths: BTreeMap<String, Vec<PathBuf>>,
 }
 
 fn normalized(path: &Path) -> PathBuf {
@@ -64,27 +74,81 @@ fn package_roots(manifests: &[(&Path, &str)]) -> BTreeMap<String, PathBuf> {
 }
 
 fn path_aliases(configs: &[(&Path, &str)]) -> Vec<PathAliases> {
-    configs
+    let configs = configs
         .iter()
         .filter_map(|(path, source)| {
             let config =
                 jsonc_parser::parse_to_serde_value::<TsConfig>(source, &Default::default()).ok()?;
-            let directory = path.parent().unwrap_or(Path::new("")).to_path_buf();
-            let base_url = normalized(
-                &directory.join(
-                    config
-                        .compiler_options
-                        .base_url
-                        .unwrap_or_else(|| PathBuf::from(".")),
-                ),
-            );
-            Some(PathAliases {
-                directory,
-                base_url,
-                paths: config.compiler_options.paths,
-            })
+            Some(((*path).to_path_buf(), config))
+        })
+        .collect::<BTreeMap<_, _>>();
+    configs
+        .keys()
+        .filter(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("tsconfig.json" | "jsconfig.json")
+            )
+        })
+        .map(|path| PathAliases {
+            directory: path.parent().unwrap_or(Path::new("")).to_path_buf(),
+            paths: effective_paths(path, &configs, &mut BTreeSet::new()),
         })
         .collect()
+}
+
+fn effective_paths(
+    path: &Path,
+    configs: &BTreeMap<PathBuf, TsConfig>,
+    visiting: &mut BTreeSet<PathBuf>,
+) -> BTreeMap<String, Vec<PathBuf>> {
+    if !visiting.insert(path.to_path_buf()) {
+        return BTreeMap::new();
+    }
+    let Some(config) = configs.get(path) else {
+        return BTreeMap::new();
+    };
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let extended = match &config.extends {
+        OneOrMany::One(path) => std::slice::from_ref(path),
+        OneOrMany::Many(paths) => paths,
+        OneOrMany::None => &[],
+    };
+    let mut paths = extended
+        .iter()
+        .filter(|extended| extended.starts_with('.'))
+        .filter_map(|extended| {
+            let mut path = normalized(&directory.join(extended));
+            if path.extension().is_none() {
+                path.set_extension("json");
+            }
+            configs.contains_key(&path).then_some(path)
+        })
+        .flat_map(|parent| effective_paths(&parent, configs, visiting))
+        .collect::<BTreeMap<_, _>>();
+    let base_url = normalized(
+        &directory.join(
+            config
+                .compiler_options
+                .base_url
+                .as_deref()
+                .unwrap_or(Path::new(".")),
+        ),
+    );
+    paths.extend(
+        config
+            .compiler_options
+            .paths
+            .iter()
+            .map(|(pattern, targets)| {
+                (
+                    pattern.clone(),
+                    targets.iter().map(|target| base_url.join(target)).collect(),
+                )
+            }),
+    );
+    visiting.remove(path);
+    paths
 }
 
 fn alias_targets(caller: &Path, source: &str, aliases: &[PathAliases]) -> Vec<PathBuf> {
@@ -115,7 +179,9 @@ fn alias_targets(caller: &Path, source: &str, aliases: &[PathAliases]) -> Vec<Pa
         .into_iter()
         .flat_map(|(_, capture, targets)| {
             targets.iter().map(move |target| {
-                normalized(&config.base_url.join(target.replacen('*', capture, 1)))
+                normalized(&PathBuf::from(
+                    target.to_string_lossy().replacen('*', capture, 1),
+                ))
             })
         })
         .collect()
@@ -371,16 +437,22 @@ mod tests {
                 Path::new("packages/shell/package.json"),
                 r#"{"name":"@example/shell"}"#,
             )],
-            &[(
-                Path::new("tsconfig.json"),
-                r#"{
-                    // TypeScript accepts comments and trailing commas.
-                    "compilerOptions": {
-                        "baseUrl": ".",
-                        "paths": { "@shell/*": ["packages/shell/src/*"], },
-                    },
-                }"#,
-            )],
+            &[
+                (
+                    Path::new("tsconfig.json"),
+                    r#"{
+                        // TypeScript accepts comments and trailing commas.
+                        "compilerOptions": {
+                            "baseUrl": ".",
+                            "paths": { "@shell/*": ["packages/shell/src/*"], },
+                        },
+                    }"#,
+                ),
+                (
+                    Path::new("packages/app/tsconfig.json"),
+                    r#"{ "extends": "../../tsconfig.json" }"#,
+                ),
+            ],
         );
 
         assert!(observations.iter().any(|observation| {
