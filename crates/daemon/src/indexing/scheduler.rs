@@ -31,10 +31,11 @@ use beholder_adapters_treesitter_rust::{
     tonic_bindings,
 };
 use beholder_adapters_treesitter_typescript::{
-    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION,
+    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION, GraphqlResolverInput, GraphqlResolverSource,
     GrpcBindingInput as TypescriptGrpcBindingInput,
     RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
-    TypescriptRepository, diagnostics_from_analysis as typescript_diagnostics,
+    TypescriptRepository, collect_graphql_resolvers as collect_typescript_graphql_resolvers,
+    diagnostics_from_analysis as typescript_diagnostics,
     entities_from_analysis as typescript_entities, grpc_bindings as typescript_grpc_bindings,
     observations_from_analysis as typescript_observations,
     resolve_repository_calls as resolve_typescript_repository_calls,
@@ -952,6 +953,7 @@ impl IndexScheduler {
                     Ok::<_, String>((
                         path.as_path(),
                         analysis.clone(),
+                        source.as_str(),
                         typescript_observations(
                             &state.repository.identity,
                             &analysis,
@@ -965,16 +967,16 @@ impl IndexScheduler {
                 .collect::<Vec<_>>()
         });
         for analysis in analyzed_typescript {
-            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+            let (path, analysis, source, source_observations, source_entities, source_diagnostics) =
                 analysis?;
             observations.extend(source_observations);
             entities.extend(source_entities);
             diagnostics.extend(source_diagnostics);
-            typescript_analyses.push((path, analysis));
+            typescript_analyses.push((path, analysis, source));
         }
         let typescript_sources = typescript_analyses
             .iter()
-            .map(|(path, analysis)| (*path, analysis.as_ref()))
+            .map(|(path, analysis, _)| (*path, analysis.as_ref()))
             .collect::<Vec<_>>();
         let typescript_manifest_refs = typescript_manifests
             .iter()
@@ -984,6 +986,22 @@ impl IndexScheduler {
             .iter()
             .map(|(path, source)| (path.as_path(), source.as_str()))
             .collect::<Vec<_>>();
+        let typescript_graphql_sources = typescript_analyses
+            .iter()
+            .map(|(path, analysis, source)| GraphqlResolverSource {
+                path,
+                analysis,
+                source,
+            })
+            .collect::<Vec<_>>();
+        let graphql_resolvers = collect_typescript_graphql_resolvers(GraphqlResolverInput {
+            repository: &state.repository.identity,
+            sources: &typescript_graphql_sources,
+            manifests: &typescript_manifest_refs,
+        });
+        observations.extend(graphql_resolvers.observations);
+        entities.extend(graphql_resolvers.entities);
+        diagnostics.extend(graphql_resolvers.diagnostics);
         resolve_typescript_repository_calls(
             &state.repository.identity,
             &mut observations,
@@ -1004,7 +1022,7 @@ impl IndexScheduler {
                 state.repository.identity.clone(),
                 typescript_analyses
                     .iter()
-                    .map(|(path, analysis)| ((*path).to_path_buf(), analysis.as_ref().clone()))
+                    .map(|(path, analysis, _)| ((*path).to_path_buf(), analysis.as_ref().clone()))
                     .collect(),
                 typescript_manifests.to_vec(),
                 typescript_configs.to_vec(),

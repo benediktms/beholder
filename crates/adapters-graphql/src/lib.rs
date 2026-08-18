@@ -774,12 +774,12 @@ mod tests {
     fn maps_schema_fields_and_operation_root_selections() {
         let schema = GraphqlSource {
             path: Path::new("schema.graphql"),
-            source: "schema { query: RootQuery } type RootQuery { packageTemplatePreview(filter: Filter, sort: Sort!): Package location: Location } input Filter { query: String } interface Node { id: ID! } type Package implements Node { id: ID! } union Search = Package enum Sort { ASC } scalar Date",
+            source: "schema { query: RootQuery subscription: RootSubscription } type RootQuery { packageTemplatePreview(filter: Filter, sort: Sort!): Package location: Location } type RootSubscription { typing(conversationId: ID!): String } input Filter { query: String } interface Node { id: ID! } type Package implements Node { id: ID! } union Search = Package enum Sort { ASC } scalar Date",
             owner: Some("repo://gateway/graphql-source/schema.graphql"),
         };
         let operation = GraphqlSource {
             path: Path::new("PackageDetail.gql.tsx"),
-            source: "query Packages_Detail_Query($filter: Filter) { ...RootFields ... on RootQuery { location { id } } } fragment RootFields on RootQuery { preview: packageTemplatePreview(filter: $filter) { id } }",
+            source: "query Packages_Detail_Query($filter: Filter) { ...RootFields ... on RootQuery { location { id } } } fragment RootFields on RootQuery { preview: packageTemplatePreview(filter: $filter) { id } } subscription Typing($conversationId: ID!) { typing(conversationId: $conversationId) }",
             owner: Some("repo://spa/typescript/PackageDetail.gql"),
         };
 
@@ -808,6 +808,12 @@ mod tests {
                 && observation.relation
                     == beholder_domain::SemanticRelation::Dependency(DependencyRelation::Selects)
                 && observation.to.as_str() == "graphql-field://Query/packageTemplatePreview"
+        }));
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-operation://Typing"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(DependencyRelation::Selects)
+                && observation.to.as_str() == "graphql-field://Subscription/typing"
         }));
         for (from, relation, to) in [
             (
@@ -864,6 +870,11 @@ mod tests {
                 "graphql-operation://Packages_Detail_Query",
                 beholder_domain::SemanticRelation::Structural(StructuralRelation::RequestType),
                 "graphql-type://Filter",
+            ),
+            (
+                "graphql-field://Subscription/typing",
+                beholder_domain::SemanticRelation::Structural(StructuralRelation::FieldOf),
+                "graphql-type://RootSubscription",
             ),
         ] {
             assert!(

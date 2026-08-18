@@ -145,44 +145,6 @@ fn collect_graphql_documents(node: Node<'_>, source: &[u8], documents: &mut Vec<
     }
 }
 
-fn graphql_annotation(comment: &str) -> Option<(&'static str, String)> {
-    for line in comment.lines() {
-        let line = line.trim().trim_start_matches('*').trim();
-        for (tag, root_type) in [
-            ("@gqlQueryField", "Query"),
-            ("@gqlMutationField", "Mutation"),
-            ("@gqlSubscriptionField", "Subscription"),
-        ] {
-            if let Some(field) = line.strip_prefix(tag).map(str::trim)
-                && !field.is_empty()
-            {
-                return Some((root_type, field.into()));
-            }
-        }
-    }
-    None
-}
-
-fn graphql_resolver(
-    node: Node<'_>,
-    source: &[u8],
-    scope: &[String],
-    name: &str,
-) -> Option<GraphqlResolver> {
-    let prefix = std::str::from_utf8(source.get(..node.start_byte())?).ok()?;
-    let comment = prefix.rsplit_once("/**")?.1;
-    let (comment, trailing) = comment.rsplit_once("*/")?;
-    (trailing.trim().is_empty() || trailing.trim_start().starts_with('@'))
-        .then_some(comment)
-        .and_then(graphql_annotation)
-        .map(|(root_type, field)| GraphqlResolver {
-            root_type: root_type.into(),
-            field,
-            definition: qualified(scope, name),
-            line: node.start_position().row + 1,
-        })
-}
-
 fn collect_string_constants(node: Node<'_>, source: &[u8], constants: &mut Vec<StringConstant>) {
     if node.kind() == "variable_declarator"
         && let (Some(name), Some(value)) = (
@@ -943,48 +905,6 @@ fn collect_definitions(
     }
 }
 
-fn collect_graphql_resolvers(
-    node: Node<'_>,
-    source: &[u8],
-    scope: &mut Vec<String>,
-    resolvers: &mut Vec<GraphqlResolver>,
-) {
-    match node.kind() {
-        "class_declaration" => {
-            let Some(name) = node
-                .child_by_field_name("name")
-                .and_then(|name| text(name, source))
-            else {
-                return;
-            };
-            scope.push(name.into());
-            if let Some(body) = node.child_by_field_name("body") {
-                let mut cursor = body.walk();
-                for child in body.named_children(&mut cursor) {
-                    collect_graphql_resolvers(child, source, scope, resolvers);
-                }
-            }
-            scope.pop();
-            return;
-        }
-        "method_definition" => {
-            if let Some(name) = node
-                .child_by_field_name("name")
-                .and_then(|name| text(name, source))
-                && let Some(resolver) = graphql_resolver(node, source, scope, name)
-            {
-                resolvers.push(resolver);
-            }
-            return;
-        }
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_graphql_resolvers(child, source, scope, resolvers);
-    }
-}
-
 fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>) {
     if node.is_error() || node.is_missing() {
         lines.push(node.start_position().row + 1);
@@ -1015,7 +935,6 @@ pub fn analyze(
     let mut exports = Vec::new();
     let mut string_constants = Vec::new();
     let mut graphql_documents = Vec::new();
-    let mut graphql_resolvers = Vec::new();
     let mut parse_error_lines = Vec::new();
     collect_definitions(
         tree.root_node(),
@@ -1045,12 +964,6 @@ pub fn analyze(
     collect_exports(tree.root_node(), source.as_bytes(), &mut exports);
     collect_string_constants(tree.root_node(), source.as_bytes(), &mut string_constants);
     collect_graphql_documents(tree.root_node(), source.as_bytes(), &mut graphql_documents);
-    collect_graphql_resolvers(
-        tree.root_node(),
-        source.as_bytes(),
-        &mut Vec::new(),
-        &mut graphql_resolvers,
-    );
     let (nest_modules, nest_providers) = nestjs_di::extract(tree.root_node(), source.as_bytes());
     collect_parse_errors(tree.root_node(), &mut parse_error_lines);
     parse_error_lines.sort_unstable();
@@ -1063,7 +976,6 @@ pub fn analyze(
         exports,
         string_constants,
         graphql_documents,
-        graphql_resolvers,
         nest_modules,
         nest_providers,
         parse_error_lines,
@@ -1087,7 +999,7 @@ pub fn diagnostics_from_analysis(
         .collect()
 }
 
-fn source_stem(path: &Path) -> String {
+pub(super) fn source_stem(path: &Path) -> String {
     path.with_extension("")
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
@@ -1163,16 +1075,6 @@ pub fn observations_from_analysis(
                 DependencyRelation::Calls,
                 target,
                 format!("{}:{}", path.display(), call.line),
-            ));
-        }
-    }
-    for resolver in &analysis.graphql_resolvers {
-        if let Some(definition) = ids.get(&resolver.definition) {
-            observations.push(Observation::dependency(
-                format!("graphql-field://{}/{}", resolver.root_type, resolver.field),
-                DependencyRelation::ResolvedBy,
-                definition.clone(),
-                format!("{}:{}", path.display(), resolver.line),
             ));
         }
     }
@@ -1256,14 +1158,6 @@ pub fn entities_from_analysis(
             .entities,
         );
     }
-    entities.extend(analysis.graphql_resolvers.iter().map(|resolver| {
-        EntityFact::new(
-            format!("graphql-field://{}/{}", resolver.root_type, resolver.field),
-            EntityKind::GraphqlField,
-            None,
-        )
-        .unwrap()
-    }));
     entities.sort_by(|left, right| left.id.cmp(&right.id));
     entities.dedup();
     entities
@@ -1460,10 +1354,24 @@ mod tests {
             &[],
             &[],
         );
+        let grats = crate::collect_graphql_resolvers(crate::GraphqlResolverInput {
+            repository: "example",
+            sources: &[crate::GraphqlResolverSource {
+                path: resolver_path,
+                analysis: &resolver_analysis,
+                source: resolver,
+            }],
+            manifests: &[(
+                Path::new("package.json"),
+                r#"{"dependencies":{"grats":"0.0.34"}}"#,
+            )],
+        });
         let entities = sources
             .iter()
             .flat_map(|(path, analysis, _)| entities_from_analysis("example", analysis, path))
+            .chain(grats.entities)
             .collect::<Vec<_>>();
+        observations.extend(grats.observations);
 
         assert!(entities.iter().any(|entity| {
             entity.id.as_str() == "graphql-operation://Packages_Detail_Query"
