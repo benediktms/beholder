@@ -13,6 +13,7 @@ beholder-adapters-mnestic = { workspace = true, features = ["sqlite"] }
 beholder-adapters-protobuf.workspace = true
 beholder-adapters-treesitter-elixir.workspace = true
 beholder-adapters-treesitter-rust.workspace = true
+beholder-adapters-treesitter-csharp.workspace = true
 beholder-adapters-treesitter-typescript.workspace = true
 beholder-daemon-client.workspace = true
 beholder-domain.workspace = true

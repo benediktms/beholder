@@ -1,14 +1,20 @@
 use beholder_adapters_git::repository_state_bytes;
+use beholder_adapters_treesitter_csharp::{UnityPrefab, parse_unity_meta, parse_unity_prefab};
 use beholder_adapters_treesitter_typescript::SourceLanguage;
 use beholder_domain::RepositoryState;
 use std::{
+    borrow::Cow,
     error::Error,
-    fs,
+    fs::{self, File},
+    io::BufReader,
     path::{Path, PathBuf},
 };
 
 pub(super) type RustSources = Vec<(PathBuf, String)>;
 pub(super) type ElixirSources = Vec<(PathBuf, String)>;
+pub(super) type CsharpSources = Vec<(PathBuf, Vec<u8>)>;
+pub(super) type CsharpProjects = Vec<(PathBuf, String)>;
+pub(super) type UnityMetas = Vec<(PathBuf, String, Vec<u8>)>;
 pub(super) type TypescriptSources = Vec<(PathBuf, String, SourceLanguage)>;
 pub(super) type TypescriptManifests = Vec<(PathBuf, String)>;
 pub(super) type TypescriptConfigs = Vec<(PathBuf, String)>;
@@ -20,6 +26,11 @@ pub(super) struct RepositorySources {
     pub(super) state: RepositoryState,
     pub(super) rust: RustSources,
     pub(super) elixir: ElixirSources,
+    pub(super) csharp: CsharpSources,
+    pub(super) csharp_projects: CsharpProjects,
+    pub(super) unity_prefabs: Vec<UnityPrefab>,
+    pub(super) unity_script_metas: UnityMetas,
+    pub(super) unity_prefab_metas: UnityMetas,
     pub(super) typescript: TypescriptSources,
     pub(super) typescript_manifests: TypescriptManifests,
     pub(super) typescript_configs: TypescriptConfigs,
@@ -35,11 +46,13 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
             | ".next-server"
             | ".turbo"
             | "_build"
+            | "bin"
             | "build"
             | "coverage"
             | "deps"
             | "dist"
             | "node_modules"
+            | "obj"
             | "storybook-static"
             | "target"
     )
@@ -54,16 +67,54 @@ pub(super) fn is_index_input(path: &Path) -> bool {
     }) && (path.extension().is_some_and(|extension| {
         matches!(
             extension.to_str(),
-            Some("rs" | "ex" | "exs" | "js" | "jsx" | "ts" | "tsx" | "proto")
+            Some("rs" | "ex" | "exs" | "cs" | "js" | "jsx" | "ts" | "tsx" | "proto")
         )
     }) || path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             matches!(name, "buf.yaml" | "buf.lock" | "package.json")
+                || name.ends_with(".csproj")
+                || name.ends_with(".asmdef")
+                || name.ends_with(".prefab")
+                || name.ends_with(".cs.meta")
+                || name.ends_with(".prefab.meta")
                 || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
                     && name.ends_with(".json"))
         }))
+}
+
+pub(super) fn decode_csharp_source(bytes: &[u8]) -> (Cow<'_, str>, bool) {
+    if let Some(bytes) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
+        return match std::str::from_utf8(bytes) {
+            Ok(source) => (Cow::Borrowed(source), false),
+            Err(_) => (String::from_utf8_lossy(bytes), true),
+        };
+    }
+    for (bom, little_endian) in [(&[0xff, 0xfe][..], true), (&[0xfe, 0xff][..], false)] {
+        let Some(bytes) = bytes.strip_prefix(bom) else {
+            continue;
+        };
+        let mut chunks = bytes.chunks_exact(2);
+        let units = chunks
+            .by_ref()
+            .map(|bytes| {
+                if little_endian {
+                    u16::from_le_bytes([bytes[0], bytes[1]])
+                } else {
+                    u16::from_be_bytes([bytes[0], bytes[1]])
+                }
+            })
+            .collect::<Vec<_>>();
+        return match String::from_utf16(&units) {
+            Ok(source) if chunks.remainder().is_empty() => (Cow::Owned(source), false),
+            _ => (Cow::Owned(String::from_utf16_lossy(&units)), true),
+        };
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(source) => (Cow::Borrowed(source), false),
+        Err(_) => (String::from_utf8_lossy(bytes), true),
+    }
 }
 
 fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
@@ -140,6 +191,60 @@ pub(super) fn repository_sources(
             Ok((relative_path, fs::read_to_string(path)?, language))
         })
         .collect::<Result<TypescriptSources, Box<dyn Error>>>()?;
+    let (csharp_files, sources): (Vec<_>, Vec<_>) = sources
+        .into_iter()
+        .partition(|path| path.extension().is_some_and(|extension| extension == "cs"));
+    let csharp = csharp_files
+        .into_iter()
+        .map(|path| Ok((path.strip_prefix(root)?.to_path_buf(), fs::read(path)?)))
+        .collect::<Result<CsharpSources, Box<dyn Error>>>()?;
+    let (csharp_project_files, sources): (Vec<_>, Vec<_>) = sources.into_iter().partition(|path| {
+        path.extension()
+            .is_some_and(|extension| matches!(extension.to_str(), Some("csproj" | "asmdef")))
+    });
+    let csharp_projects = csharp_project_files
+        .into_iter()
+        .map(|path| {
+            Ok((
+                path.strip_prefix(root)?.to_path_buf(),
+                fs::read_to_string(path)?,
+            ))
+        })
+        .collect::<Result<CsharpProjects, Box<dyn Error>>>()?;
+    let (unity_asset_files, sources): (Vec<_>, Vec<_>) = sources.into_iter().partition(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.ends_with(".prefab")
+                    || name.ends_with(".cs.meta")
+                    || name.ends_with(".prefab.meta")
+            })
+    });
+    let mut unity_prefabs = Vec::new();
+    let mut unity_script_metas = Vec::new();
+    let mut unity_prefab_metas = Vec::new();
+    for path in unity_asset_files {
+        let relative = path.strip_prefix(root)?.to_path_buf();
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.ends_with(".prefab") {
+            unity_prefabs.push(parse_unity_prefab(
+                &relative,
+                BufReader::new(File::open(path)?),
+            )?);
+        } else if let Some((guid, fingerprint)) =
+            parse_unity_meta(BufReader::new(File::open(path)?))?
+        {
+            let asset_path = relative.with_extension("");
+            if name.ends_with(".cs.meta") {
+                unity_script_metas.push((asset_path, guid, fingerprint));
+            } else {
+                unity_prefab_metas.push((asset_path, guid, fingerprint));
+            }
+        }
+    }
     let sources = sources
         .into_iter()
         .map(|path| {
@@ -171,6 +276,31 @@ pub(super) fn repository_sources(
                     .map(|(path, source)| (path.as_path(), source.as_bytes())),
             )
             .chain(
+                csharp
+                    .iter()
+                    .map(|(path, source)| (path.as_path(), source.as_slice())),
+            )
+            .chain(
+                csharp_projects
+                    .iter()
+                    .map(|(path, source)| (path.as_path(), source.as_bytes())),
+            )
+            .chain(
+                unity_prefabs
+                    .iter()
+                    .map(|prefab| (prefab.path.as_path(), prefab.fingerprint.as_slice())),
+            )
+            .chain(
+                unity_script_metas
+                    .iter()
+                    .map(|(path, _, bytes)| (path.as_path(), bytes.as_slice())),
+            )
+            .chain(
+                unity_prefab_metas
+                    .iter()
+                    .map(|(path, _, bytes)| (path.as_path(), bytes.as_slice())),
+            )
+            .chain(
                 typescript
                     .iter()
                     .map(|(path, source, _)| (path.as_path(), source.as_bytes())),
@@ -200,6 +330,11 @@ pub(super) fn repository_sources(
         state,
         rust,
         elixir,
+        csharp,
+        csharp_projects,
+        unity_prefabs,
+        unity_script_metas,
+        unity_prefab_metas,
         typescript,
         typescript_manifests,
         typescript_configs,
@@ -305,6 +440,44 @@ mod tests {
         .unwrap();
         let renamed = repository_sources(&repository, &[]).unwrap();
         assert_ne!(sources.state.fingerprint, renamed.state.fingerprint);
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn discovers_csharp_but_skips_build_outputs() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repository = std::env::temp_dir().join(format!("beholder-csharp-sources-{unique}"));
+        for directory in ["src", "bin", "obj"] {
+            fs::create_dir_all(repository.join(directory)).unwrap();
+        }
+        fs::write(repository.join("src/Program.cs"), "class Program {}").unwrap();
+        fs::write(
+            repository.join("src/App.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("src/App.asmdef"),
+            r#"{"name":"Example.App"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repository.join("src/sjis.cs"),
+            [b'c', b'l', b'a', b's', b's', b' ', 0x83, 0x65, 0x83, 0x58],
+        )
+        .unwrap();
+        fs::write(repository.join("bin/Generated.cs"), "class Ignored {}").unwrap();
+        fs::write(repository.join("obj/Generated.cs"), "class Ignored {}").unwrap();
+
+        let sources = repository_sources(&repository, &[]).unwrap();
+        assert_eq!(sources.csharp.len(), 2);
+        assert_eq!(sources.csharp_projects.len(), 2);
+        assert_eq!(sources.csharp[0].0, Path::new("src/Program.cs"));
+        let (_, lossy) = decode_csharp_source(&sources.csharp[1].1);
+        assert!(lossy);
         fs::remove_dir_all(repository).unwrap();
     }
 }

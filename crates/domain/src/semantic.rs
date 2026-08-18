@@ -249,6 +249,7 @@ pub enum EntityKind {
     ProtoService,
     ProtoType,
     Service,
+    UnityPrefab,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -288,7 +289,8 @@ impl EntityFact {
                 | EntityKind::Namespace
                 | EntityKind::ProtoField
                 | EntityKind::ProtoService
-                | EntityKind::Service,
+                | EntityKind::Service
+                | EntityKind::UnityPrefab,
                 None,
             ) => Ok(Self {
                 id: id.into(),

@@ -1,3 +1,4 @@
+use beholder_adapters_treesitter_csharp::CsharpProject;
 use beholder_adapters_treesitter_typescript::TypescriptRepository;
 use beholder_domain::{AnalysisDiagnostic, EntityFact, GrpcBindingCandidate, Observation};
 use serde::{Deserialize, Serialize};
@@ -14,12 +15,15 @@ pub(super) struct RepositoryAnalysisKey {
     pub(super) fingerprint: String,
     pub(super) rust: Option<(&'static str, &'static str)>,
     pub(super) elixir: Option<(&'static str, &'static str)>,
+    pub(super) csharp: Option<(&'static str, &'static str)>,
     pub(super) typescript: Option<(&'static str, &'static str)>,
     pub(super) protobuf: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RepositoryAnalysis {
+    #[serde(default)]
+    pub(super) csharp_projects: Vec<CsharpProject>,
     pub(super) entities: Vec<EntityFact>,
     #[serde(default)]
     pub(super) grpc_bindings: Vec<GrpcBindingCandidate>,
@@ -46,6 +50,9 @@ impl RepositoryAnalysisKey {
         }
         if let Some((frontend, resolver)) = self.elixir {
             languages.push(format!("elixir:{frontend}:{resolver}"));
+        }
+        if let Some((frontend, resolver)) = self.csharp {
+            languages.push(format!("csharp:{frontend}:{resolver}"));
         }
         if let Some((frontend, resolver)) = self.typescript {
             languages.push(format!("typescript:{frontend}:{resolver}"));

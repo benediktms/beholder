@@ -175,7 +175,14 @@ fn dependencies_human(result: &DependenciesResult, include_tests: bool) -> Strin
     let dependencies = result
         .dependencies
         .iter()
-        .filter(|dependency| is_primary(&entities, &dependency.entity, include_tests))
+        .filter(|dependency| {
+            (result.root.kind == EntityKind::UnityPrefab
+                && dependency.hops == 1
+                && entities
+                    .get(dependency.entity.as_str())
+                    .is_none_or(|entity| include_tests || !entity.test))
+                || is_primary(&entities, &dependency.entity, include_tests)
+        })
         .collect::<Vec<_>>();
     for dependency in &dependencies {
         let _ = writeln!(
@@ -610,6 +617,7 @@ fn kind_label(kind: EntityKind) -> &'static str {
         EntityKind::ProtoService => "Protobuf services",
         EntityKind::Rpc => "RPCs",
         EntityKind::Service => "services",
+        EntityKind::UnityPrefab => "Unity prefabs",
         EntityKind::Unknown => "other",
     }
 }
@@ -866,6 +874,56 @@ mod tests {
             name(&names, "repo://repo/rust/src/client/impl/Client/run"),
             "repo · Client · run"
         );
+    }
+
+    #[test]
+    fn prefab_dependencies_show_direct_script_types() {
+        let root = entity(
+            "repo://repo/unity-prefab/Assets/Player.prefab",
+            "Player.prefab",
+            EntityKind::UnityPrefab,
+            false,
+        );
+        let script = entity(
+            "repo://repo/csharp/Assembly-CSharp/Assets/Player/Game/Player",
+            "Player",
+            EntityKind::Namespace,
+            false,
+        );
+        let mut external = entity(
+            "unity://Unity.InputSystem/UnityEngine/InputSystem/PlayerInput",
+            "PlayerInput",
+            EntityKind::Namespace,
+            false,
+        );
+        external.repository = None;
+        external.origin = EntityOrigin::ExternalDependency;
+        let result = DependenciesResult {
+            schema: DEPENDENCIES_SCHEMA_V2.into(),
+            metadata: QueryMetadata::completed("main", 42),
+            query: EntityQuery {
+                entity: root.id.clone(),
+            },
+            traversal: traversal(),
+            root: root.clone(),
+            dependencies: vec![
+                beholder_dto::DependencyRef {
+                    entity: script.id.clone(),
+                    hops: 1,
+                },
+                beholder_dto::DependencyRef {
+                    entity: external.id.clone(),
+                    hops: 1,
+                },
+            ],
+            nodes: vec![root, script, external],
+            edges: Vec::new(),
+        };
+
+        let output = dependencies(&result, OutputMode::Human.into()).unwrap();
+        assert!(output.contains("Game · Player"));
+        assert!(output.contains("cross-repository · PlayerInput"));
+        assert!(output.contains("2 dependencies"));
     }
 
     #[test]

@@ -293,6 +293,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "beholder-adapters-treesitter-csharp"
+version = "0.1.0"
+dependencies = [
+ "beholder-domain",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+]
+
+[[package]]
 name = "beholder-adapters-treesitter-elixir"
 version = "0.1.0"
 dependencies = [
@@ -347,6 +359,7 @@ dependencies = [
  "beholder-adapters-git",
  "beholder-adapters-mnestic",
  "beholder-adapters-protobuf",
+ "beholder-adapters-treesitter-csharp",
  "beholder-adapters-treesitter-elixir",
  "beholder-adapters-treesitter-rust",
  "beholder-adapters-treesitter-typescript",
@@ -2878,6 +2891,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2054ccb02f454fcb2bc81e343aa0a171636a6331003fd5ec24c47a10966634b7"
 
 [[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3854,6 +3876,16 @@ dependencies = [
  "regex-syntax",
  "serde_json",
  "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c-sharp"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1aac67f1ad71de1d6d39708d34811081c26dfa495658de6c14c34200849357c"
+dependencies = [
+ "cc",
  "tree-sitter-language",
 ]
 

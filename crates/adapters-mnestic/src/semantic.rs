@@ -481,6 +481,7 @@ fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error
                     }),
                 ),
                 ("service", "") => (EntityKind::Service, None),
+                ("unity_prefab", "") => (EntityKind::UnityPrefab, None),
                 (kind, metadata) => {
                     return Err(
                         format!("invalid persisted entity fact {kind} with {metadata}").into(),
@@ -505,7 +506,8 @@ fn kind_priority(kind: EntityKind) -> u8 {
         | EntityKind::ProtoField
         | EntityKind::ProtoFile
         | EntityKind::ProtoMessage
-        | EntityKind::ProtoService => 3,
+        | EntityKind::ProtoService
+        | EntityKind::UnityPrefab => 3,
     }
 }
 
@@ -545,6 +547,7 @@ fn entity_ref_with_origin(
                 || id.starts_with("elixir-call://")
                 || id.starts_with("elixir-module://")
                 || id.starts_with("erlang-module://")
+                || id.starts_with("unity://")
             {
                 EntityOrigin::ExternalDependency
             } else {
@@ -591,6 +594,8 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::GraphqlField
     } else if id.starts_with("kafka-topic://") {
         EntityKind::KafkaTopic
+    } else if id.contains("/unity-prefab/") {
+        EntityKind::UnityPrefab
     } else if id.starts_with("rust-call://")
         || id.starts_with("rust-method://")
         || id.starts_with("elixir-call://")
@@ -678,10 +683,13 @@ fn repository(id: &str) -> Option<String> {
         rest.rsplit_once("/elixir-source/")
             .or_else(|| rest.rsplit_once("/typescript-source/"))
             .or_else(|| rest.rsplit_once("/javascript-source/"))
+            .or_else(|| rest.rsplit_once("/csharp-source/"))
+            .or_else(|| rest.rsplit_once("/unity-prefab/"))
             .or_else(|| rest.rsplit_once("/rust/"))
             .or_else(|| rest.rsplit_once("/elixir/"))
             .or_else(|| rest.rsplit_once("/typescript/"))
             .or_else(|| rest.rsplit_once("/javascript/"))
+            .or_else(|| rest.rsplit_once("/csharp/"))
             .map(|(repository, _)| repository.into())
     })
 }
@@ -762,6 +770,18 @@ mod tests {
             EntityKind::Namespace
         );
         assert_eq!(graph.nodes.len(), 1);
+    }
+
+    #[test]
+    fn treats_unity_callbacks_as_external_dependencies() {
+        assert_eq!(
+            entity_ref(
+                "unity://UnityEngine.MonoBehaviour/Update()",
+                EntityKind::Callable
+            )
+            .origin,
+            EntityOrigin::ExternalDependency
+        );
     }
 
     #[test]
