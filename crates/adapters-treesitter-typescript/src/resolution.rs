@@ -1292,6 +1292,21 @@ mod tests {
                 "import { makeAsyncService } from './async-service-factory'; export async function awaitedService() { const service = await makeAsyncService(); service.execute(); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/object-api.ts"),
+                "export const api = { run() {}, stop: () => undefined };",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/object-consumer.ts"),
+                "import { api } from './object-api'; export function useObject() { api.run(); api.stop(); }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/returned-closure.ts"),
+                "function work() {} export function createWorker() { return () => work(); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1461,6 +1476,22 @@ mod tests {
                 == "repo://example/typescript/packages/app/src/awaited-service-consumer/awaitedService"
                 && observation.to.as_str()
                     == "repo://example/typescript/packages/app/src/service/Service/execute"
+        }));
+        for target in [
+            "repo://example/typescript/packages/app/src/object-api/api/run",
+            "repo://example/typescript/packages/app/src/object-api/api/stop",
+        ] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == "repo://example/typescript/packages/app/src/object-consumer/useObject"
+                    && observation.to.as_str() == target
+            }));
+        }
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/returned-closure/createWorker"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/returned-closure/work"
         }));
     }
 

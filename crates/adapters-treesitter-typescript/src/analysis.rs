@@ -80,7 +80,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
         ) || (node.kind() == "arrow_function"
             && node
                 .parent()
-                .is_none_or(|parent| parent.kind() != "arguments")))
+                .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
     {
         return;
     }
@@ -649,6 +649,24 @@ fn collect_definitions(
                     name,
                     DefinitionKind::Callable,
                 ));
+                return;
+            }
+            if let Some(object) = value.filter(|value| value.kind() == "object")
+                && let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| text(name, source))
+            {
+                definitions.push(definition(
+                    node,
+                    None,
+                    source,
+                    scope,
+                    name,
+                    DefinitionKind::Namespace,
+                ));
+                scope.push(name.into());
+                collect_definitions(object, source, scope, definitions);
+                scope.pop();
                 return;
             }
             if let Some(base) = value
