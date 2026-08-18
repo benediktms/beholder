@@ -597,10 +597,14 @@ fn collect_definitions(
                             .map(str::to_owned)
                     });
             }
+            let body = node.child_by_field_name("body");
+            let bindings = body
+                .map(|body| class_bindings(body, source))
+                .unwrap_or_default();
+            class.bindings.extend(bindings.iter().cloned());
             definitions.push(class);
             scope.push(name.into());
-            if let Some(body) = node.child_by_field_name("body") {
-                let bindings = class_bindings(body, source);
+            if let Some(body) = body {
                 let first_definition = definitions.len();
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {

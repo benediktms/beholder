@@ -331,6 +331,7 @@ struct RepositoryIndex<'a> {
     origins: BTreeMap<(PathBuf, String), (PathBuf, String)>,
     members: BTreeMap<(PathBuf, String, String), EntityId>,
     bases: BTreeMap<(PathBuf, String), (PathBuf, String)>,
+    field_types: BTreeMap<(PathBuf, String, String), (PathBuf, String)>,
     return_types: BTreeMap<(PathBuf, String), (PathBuf, String)>,
     caller_files: BTreeMap<String, PathBuf>,
     caller_owners: BTreeMap<String, (PathBuf, String)>,
@@ -356,6 +357,7 @@ fn repository_index<'a>(
     let mut origins = BTreeMap::<(PathBuf, String), (PathBuf, String)>::new();
     let mut members = BTreeMap::<(PathBuf, String, String), EntityId>::new();
     let mut raw_bases = BTreeMap::<(PathBuf, String), String>::new();
+    let mut raw_field_types = BTreeMap::<(PathBuf, String, String), String>::new();
     let mut raw_return_types = BTreeMap::<(PathBuf, String), String>::new();
     let mut factories = BTreeMap::<(PathBuf, String), String>::new();
     let mut caller_files = BTreeMap::<String, PathBuf>::new();
@@ -402,6 +404,18 @@ fn repository_index<'a>(
                         ((*path).to_path_buf(), definition.qualified_name.clone()),
                         base.clone(),
                     );
+                }
+                for binding in &definition.bindings {
+                    if let Some(field) = binding.receiver.strip_prefix("this.") {
+                        raw_field_types.insert(
+                            (
+                                (*path).to_path_buf(),
+                                definition.qualified_name.clone(),
+                                field.into(),
+                            ),
+                            binding.type_name.clone(),
+                        );
+                    }
                 }
                 if let Some(return_type) = &definition.return_type {
                     raw_return_types.insert(
@@ -539,6 +553,30 @@ fn repository_index<'a>(
             Some((callable, origin))
         })
         .collect::<BTreeMap<_, _>>();
+    let field_types = raw_field_types
+        .into_iter()
+        .filter_map(|((file, owner, field), type_name)| {
+            let origin = file_imports
+                .get(&file)
+                .and_then(|imports| {
+                    imports.iter().find_map(|import| {
+                        let binding = import.bindings.iter().find(|binding| {
+                            binding.local == type_name && binding.imported != "*"
+                        })?;
+                        let imported_file =
+                            imported_file(&file, &import.source, &packages, &aliases, &files)?;
+                        origins
+                            .get(&(imported_file, binding.imported.clone()))
+                            .cloned()
+                    })
+                })
+                .or_else(|| {
+                    let key = (file.clone(), type_name);
+                    symbols.contains_key(&key).then_some(key)
+                })?;
+            Some(((file, owner, field), origin))
+        })
+        .collect::<BTreeMap<_, _>>();
     for ((file, namespace), factory) in &factories {
         let local_origin = origins
             .get(&(file.clone(), factory.clone()))
@@ -629,6 +667,7 @@ fn repository_index<'a>(
         origins,
         members,
         bases,
+        field_types,
         return_types,
         caller_files,
         caller_owners,
@@ -651,6 +690,26 @@ fn member_entity<'a>(
             .get(&(file.clone(), owner.clone(), name.into()))
         {
             return Some(member);
+        }
+        let base = index.bases.get(&(file, owner))?;
+        file = base.0.clone();
+        owner = base.1.clone();
+    }
+    None
+}
+
+fn field_type(
+    index: &RepositoryIndex<'_>,
+    mut file: PathBuf,
+    mut owner: String,
+    name: &str,
+) -> Option<(PathBuf, String)> {
+    for _ in 0..=index.bases.len() {
+        if let Some(field_type) = index
+            .field_types
+            .get(&(file.clone(), owner.clone(), name.into()))
+        {
+            return Some(field_type.clone());
         }
         let base = index.bases.get(&(file, owner))?;
         file = base.0.clone();
@@ -700,17 +759,38 @@ fn receiver_type(
             .or_else(|| Some((file.clone(), type_name.to_owned())))
             .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
     }
-    let factory = index
+    if let Some(factory) = index
         .caller_factory_bindings
-        .get(caller)?
-        .iter()
-        .find(|binding| binding.receiver == receiver)?
-        .factory
-        .as_str();
-    let factory_origin = imported_origin(index, file, factory)
-        .or_else(|| Some((file.clone(), factory.to_owned())))
-        .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin))?;
-    index.return_types.get(&factory_origin).cloned()
+        .get(caller)
+        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+        .map(|binding| binding.factory.as_str())
+    {
+        let factory_origin = imported_origin(index, file, factory)
+            .or_else(|| Some((file.clone(), factory.to_owned())))
+            .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin))?;
+        if let Some(return_type) = index.return_types.get(&factory_origin) {
+            return Some(return_type.clone());
+        }
+    }
+    let parts = receiver.split('.').collect::<Vec<_>>();
+    for prefix_length in (1..parts.len()).rev() {
+        let prefix = parts[..prefix_length].join(".");
+        let Some(mut current) = receiver_type(index, caller, &prefix) else {
+            continue;
+        };
+        let mut resolved = true;
+        for field in &parts[prefix_length..] {
+            let Some(next) = field_type(index, current.0.clone(), current.1.clone(), field) else {
+                resolved = false;
+                break;
+            };
+            current = next;
+        }
+        if resolved {
+            return Some(current);
+        }
+    }
+    None
 }
 
 fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -> String {
@@ -1327,6 +1407,16 @@ mod tests {
                 "import { ChildSender } from './child-sender'; export function inheritedInterface(sender: ChildSender) { sender.send('hello'); sender.close(); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/client.ts"),
+                "import { Service } from './service'; export class Client { service: Service; }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/nested-consumer.ts"),
+                "import { Client } from './client'; import { Service } from './service'; function callWithCache<T>(load: () => Promise<T>) { return load(); } export function nested(client: Client) { client.service.execute(); } export function optional(service: Service) { service?.execute(); } export function callback(service: Service) { return callWithCache(async () => service.execute()); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1527,6 +1617,16 @@ mod tests {
                 observation.from.as_str()
                     == "repo://example/typescript/packages/app/src/interface-inheritance-consumer/inheritedInterface"
                     && observation.to.as_str() == target
+            }));
+        }
+        for caller in ["nested", "optional", "callback"] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == format!(
+                        "repo://example/typescript/packages/app/src/nested-consumer/{caller}"
+                    )
+                    && observation.to.as_str()
+                        == "repo://example/typescript/packages/app/src/service/Service/execute"
             }));
         }
     }
