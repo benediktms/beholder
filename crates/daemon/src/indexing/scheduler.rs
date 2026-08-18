@@ -19,8 +19,9 @@ use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
     RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
     entities_from_analysis as elixir_entities, generated_entities as elixir_generated_entities,
-    generated_observations as elixir_generated_observations, grpc_bindings as elixir_grpc_bindings,
-    observations_from_analysis as elixir_observations,
+    generated_observations as elixir_generated_observations,
+    graphql_resolver_bindings as elixir_graphql_resolver_bindings,
+    grpc_bindings as elixir_grpc_bindings, observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
@@ -41,8 +42,8 @@ use beholder_adapters_treesitter_typescript::{
     unresolved_call_diagnostics as unresolved_typescript_call_diagnostics,
 };
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, EntityFact, RepositoryFacts, RepositoryState,
-    Workspace, WorkspaceView,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
+    Observation, RepositoryFacts, RepositoryState, Workspace, WorkspaceView,
 };
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
@@ -930,6 +931,8 @@ impl IndexScheduler {
             &csharp_projects,
             &csharp_repository_source_refs,
         ));
+        let graphql_resolver_bindings =
+            elixir_graphql_resolver_bindings(&state.repository.identity, &elixir_sources);
         let mut typescript_analyses = Vec::new();
         let analyzed_typescript = self.analysis_pool.install(|| {
             typescript_sources
@@ -1019,6 +1022,36 @@ impl IndexScheduler {
         entities.extend(graphql.entities);
         observations.extend(graphql.observations);
         diagnostics.extend(graphql.diagnostics);
+        let graphql_fields = entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::GraphqlField)
+            .filter_map(|entity| {
+                let path = entity.id.as_str().strip_prefix("graphql-field://")?;
+                let (parent, field) = path.split_once('/')?;
+                matches!(parent, "Query" | "Mutation" | "Subscription")
+                    .then_some((field, entity.id.as_str()))
+            })
+            .fold(
+                BTreeMap::<_, BTreeSet<_>>::new(),
+                |mut fields, (name, id)| {
+                    fields.entry(name).or_default().insert(id);
+                    fields
+                },
+            );
+        observations.extend(graphql_resolver_bindings.into_iter().filter_map(|binding| {
+            let fields = graphql_fields.get(binding.field.as_str())?;
+            let mut fields = fields.iter();
+            let field = fields.next()?;
+            if fields.next().is_some() {
+                return None;
+            }
+            Some(Observation::dependency(
+                *field,
+                DependencyRelation::ResolvedBy,
+                binding.resolver,
+                binding.evidence,
+            ))
+        }));
         let descriptor_facts = self.analysis_pool.install(|| {
             descriptors
                 .par_iter()
@@ -1813,7 +1846,22 @@ mod tests {
         };
         let graphql = vec![(
             PathBuf::from("src/package.graphql"),
-            "query Package { packageTemplatePreview { id } }".into(),
+            "type Mutation { initializeOrder: ID } query Package { packageTemplatePreview { id } }"
+                .into(),
+        )];
+        let elixir = vec![(
+            PathBuf::from("lib/schema/mutations.ex"),
+            r#"
+            defmodule Checkout.Schema.Mutations do
+              field :initialize_order, :initialize_order_payload do
+                resolve(&Checkout.Resolvers.InitializeOrder.run/3)
+              end
+            end
+            defmodule Checkout.Resolvers.InitializeOrder do
+              def run(_, _, _), do: :ok
+            end
+            "#
+            .into(),
         )];
         let scheduler = IndexScheduler::new(cache.clone());
         let (analysis, status, identity) = scheduler
@@ -1821,6 +1869,7 @@ mod tests {
                 &state,
                 RepositoryAnalysisSources {
                     graphql: &graphql,
+                    elixir: &elixir,
                     ..Default::default()
                 },
                 CURRENT_ANALYSIS_VERSIONS,
@@ -1828,7 +1877,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, CacheStatus::Miss);
-        assert_eq!(identity, format!("graphql:{GRAPHQL_FRONTEND_VERSION}"));
+        assert_eq!(
+            identity,
+            format!(
+                "elixir:{ELIXIR_FRONTEND_VERSION}:{ELIXIR_RESOLVER_VERSION}:graphql:{GRAPHQL_FRONTEND_VERSION}"
+            )
+        );
         assert!(analysis.observations.iter().any(|observation| {
             observation.from.as_str() == "graphql-operation://Package"
                 && observation.relation
@@ -1836,6 +1890,15 @@ mod tests {
                         beholder_domain::DependencyRelation::Selects,
                     )
                 && observation.to.as_str() == "graphql-field://Query/packageTemplatePreview"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Mutation/initializeOrder"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str()
+                    == "repo://repo/elixir/Checkout.Resolvers.InitializeOrder/run/3"
         }));
         scheduler.clear_cache().unwrap();
     }

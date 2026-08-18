@@ -1,11 +1,13 @@
-pub const FRONTEND_VERSION: &str = "12";
+pub const FRONTEND_VERSION: &str = "13";
 pub const RESOLVER_VERSION: &str = "8";
 
+mod absinthe;
 mod analysis;
 mod grpc;
 mod model;
 mod resolution;
 
+pub use absinthe::{GraphqlResolverBinding, bindings as graphql_resolver_bindings};
 pub use analysis::analyze;
 pub use grpc::bindings as grpc_bindings;
 pub use model::ElixirAnalysis;

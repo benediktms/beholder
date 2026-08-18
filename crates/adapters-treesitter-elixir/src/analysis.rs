@@ -674,6 +674,7 @@ fn push_module(
         aliases: inherited_aliases,
         references: Vec::new(),
         grpc: Default::default(),
+        absinthe_resolvers: Vec::new(),
     });
     module
 }
@@ -703,6 +704,9 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
             let aliases = modules[module].aliases.clone();
             let name = modules[module].name.clone();
             super::grpc::observe_call(&mut modules[module].grpc, node, source, &aliases, &name);
+            if let Some(resolver) = absinthe_resolver(node, source) {
+                modules[module].absinthe_resolvers.push(resolver);
+            }
         }
         match call_target(node, source) {
             Some("defmodule" | "defprotocol") => {
@@ -903,6 +907,43 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
     for child in node.named_children(&mut cursor) {
         collect(child, source, module, modules);
     }
+}
+
+fn find_resolve_capture(node: Node<'_>, source: &[u8]) -> Option<(String, usize)> {
+    if node.kind() == "call"
+        && call_target(node, source) == Some("resolve")
+        && let Some(capture) = arguments(node)
+            .and_then(|arguments| arguments.named_child(0))
+            .and_then(|capture| text(capture, source))
+    {
+        return Some((capture.into(), node.start_position().row + 1));
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| find_resolve_capture(child, source))
+}
+
+fn absinthe_resolver(node: Node<'_>, source: &[u8]) -> Option<AbsintheResolver> {
+    if call_target(node, source) != Some("field") || !has_do_block(node) {
+        return None;
+    }
+    let field = arguments(node)
+        .and_then(|arguments| arguments.named_child(0))
+        .filter(|field| field.kind() == "atom")
+        .and_then(|field| text(field, source))?
+        .trim_start_matches(':')
+        .to_owned();
+    let (capture, line) = find_resolve_capture(node, source)?;
+    let (target, arity) = capture.strip_prefix('&')?.rsplit_once('/')?;
+    let arity = arity.parse().ok()?;
+    let (module, function) = target.rsplit_once('.')?;
+    Some(AbsintheResolver {
+        field,
+        module: module.into(),
+        function: function.into(),
+        arity,
+        line,
+    })
 }
 
 pub fn analyze(source: &str) -> Result<ElixirAnalysis, Box<dyn Error>> {

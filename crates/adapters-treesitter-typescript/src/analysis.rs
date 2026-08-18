@@ -109,6 +109,7 @@ fn collect_graphql_documents(node: Node<'_>, source: &[u8], documents: &mut Vec<
     {
         let arguments = arguments
             .named_children(&mut arguments.walk())
+            .filter(|argument| argument.kind() != "comment")
             .collect::<Vec<_>>();
         if let [document] = arguments.as_slice()
             && matches!(document.kind(), "template_string" | "string")
@@ -1417,7 +1418,7 @@ mod tests {
             export const Packages_Detail_Query = gql(`
               query Packages_Detail_Query { packageTemplatePreview { id } }
             `);
-            export const Tada_Query = graphql("query Tada_Query { location { id } }");
+            export const Tada_Query = graphql(/* GraphQL */ "query Tada_Query { location { id } }");
         "#;
         let component = r#"
             import { Packages_Detail_Query } from './PackageDetail.gql';
