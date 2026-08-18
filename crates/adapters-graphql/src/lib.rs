@@ -8,7 +8,7 @@ use beholder_domain::{
 };
 use std::{collections::BTreeMap, path::Path};
 
-pub const FRONTEND_VERSION: &str = "1";
+pub const FRONTEND_VERSION: &str = "2";
 
 #[derive(Clone, Copy)]
 pub struct GraphqlSource<'a> {
@@ -56,6 +56,7 @@ fn root_type(operation: &cst::OperationDefinition) -> &'static str {
 fn field_entities(
     facts: &mut GraphqlFacts,
     entities: &mut BTreeMap<String, EntityFact>,
+    stitched_fields: &mut Vec<(String, String, String)>,
     source: GraphqlSource<'_>,
     type_name: cst::Name,
     fields: Option<cst::FieldsDefinition>,
@@ -76,11 +77,44 @@ fn field_entities(
             facts.observations.push(Observation::structural(
                 owner,
                 StructuralRelation::Defines,
+                id.clone(),
+                evidence(source, &field),
+            ));
+        }
+        if let Some(upstream) = stitched_field(&field) {
+            stitched_fields.push((
                 id,
+                format!("graphql-field://{type_name}/{upstream}"),
                 evidence(source, &field),
             ));
         }
     }
+}
+
+fn directive_argument(
+    field: &cst::FieldDefinition,
+    directive_name: &str,
+    argument_name: &str,
+) -> Option<String> {
+    let directive = field.directives()?.directives().find(|directive| {
+        directive
+            .name()
+            .is_some_and(|name| name.text() == directive_name)
+    })?;
+    let value = directive.arguments()?.arguments().find_map(|argument| {
+        (argument
+            .name()
+            .is_some_and(|name| name.text() == argument_name))
+        .then(|| argument.value())
+        .flatten()
+    })?;
+    Some(value.syntax().text().to_string().trim_matches('"').into())
+}
+
+fn stitched_field(field: &cst::FieldDefinition) -> Option<String> {
+    directive_argument(field, "source", "subgraph")?;
+    directive_argument(field, "join__field", "graph")?;
+    directive_argument(field, "source", "name")
 }
 
 fn operation_facts(
@@ -133,6 +167,7 @@ fn operation_facts(
 pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
     let mut facts = GraphqlFacts::default();
     let mut entities = BTreeMap::new();
+    let mut stitched_fields = Vec::new();
     for source in sources {
         let syntax = Parser::new(source.source).parse();
         for error in syntax.errors() {
@@ -159,6 +194,7 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                         field_entities(
                             &mut facts,
                             &mut entities,
+                            &mut stitched_fields,
                             *source,
                             name,
                             object.fields_definition(),
@@ -170,6 +206,7 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                         field_entities(
                             &mut facts,
                             &mut entities,
+                            &mut stitched_fields,
                             *source,
                             name,
                             object.fields_definition(),
@@ -183,6 +220,18 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
             }
         }
     }
+    facts.observations.extend(
+        stitched_fields
+            .into_iter()
+            .filter(|(gateway, upstream, _)| {
+                gateway != upstream
+                    && entities.contains_key(gateway)
+                    && entities.contains_key(upstream)
+            })
+            .map(|(gateway, upstream, evidence)| {
+                Observation::dependency(gateway, DependencyRelation::ResolvedBy, upstream, evidence)
+            }),
+    );
     facts.entities = entities.into_values().collect();
     facts
 }
@@ -217,5 +266,34 @@ mod tests {
                 && observation.to.as_str() == "graphql-field://Query/packageTemplatePreview"
         }));
         assert!(facts.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn maps_composed_fields_to_their_source_field() {
+        let upstream = GraphqlSource {
+            path: Path::new("compose/schemas/Checkout.graphql"),
+            source: "type Mutation { initializeOrder: ID }",
+            owner: None,
+        };
+        let composed = GraphqlSource {
+            path: Path::new("supergraph.graphql"),
+            source: r#"
+                type Mutation {
+                  Checkout_initializeOrder: ID
+                    @source(name: "initializeOrder", subgraph: "Checkout")
+                    @join__field(graph: CHECKOUT)
+                }
+            "#,
+            owner: None,
+        };
+
+        let facts = facts("gateway", &[upstream, composed]);
+
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Mutation/Checkout_initializeOrder"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
+                && observation.to.as_str() == "graphql-field://Mutation/initializeOrder"
+        }));
     }
 }
