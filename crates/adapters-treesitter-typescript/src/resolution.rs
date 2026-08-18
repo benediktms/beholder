@@ -354,6 +354,22 @@ struct RepositoryIndex<'a> {
     file_imports: BTreeMap<PathBuf, &'a [Import]>,
 }
 
+type Origin = (PathBuf, String);
+type Origins = BTreeMap<Origin, Origin>;
+
+fn insert_origin(
+    origins: &mut Origins,
+    origins_by_file: &mut BTreeMap<PathBuf, BTreeMap<String, Origin>>,
+    export: Origin,
+    origin: Origin,
+) -> bool {
+    origins_by_file
+        .entry(export.0.clone())
+        .or_default()
+        .insert(export.1.clone(), origin.clone());
+    origins.insert(export, origin.clone()).as_ref() != Some(&origin)
+}
+
 fn repository_index<'a>(
     repository: &str,
     sources: &[(&Path, &'a TypescriptAnalysis)],
@@ -367,7 +383,8 @@ fn repository_index<'a>(
     let packages = package_index(manifests);
     let aliases = path_aliases(configs);
     let mut symbols = BTreeMap::<(PathBuf, String), EntityId>::new();
-    let mut origins = BTreeMap::<(PathBuf, String), (PathBuf, String)>::new();
+    let mut origins = Origins::new();
+    let mut origins_by_file = BTreeMap::<PathBuf, BTreeMap<String, Origin>>::new();
     let mut members = BTreeMap::<(PathBuf, String, String), EntityId>::new();
     let mut raw_bases = BTreeMap::<(PathBuf, String), String>::new();
     let mut raw_field_types = BTreeMap::<(PathBuf, String, String), String>::new();
@@ -389,6 +406,10 @@ fn repository_index<'a>(
         );
         file_imports.insert((*path).to_path_buf(), &analysis.imports);
         file_exports.insert((*path).to_path_buf(), &analysis.exports);
+        caller_files.insert(module_id.clone(), (*path).to_path_buf());
+        caller_bindings.insert(module_id.clone(), &[]);
+        caller_alias_bindings.insert(module_id.clone(), &[]);
+        caller_factory_bindings.insert(module_id.clone(), &[]);
         let member_owners = analysis
             .definitions
             .iter()
@@ -404,7 +425,7 @@ fn repository_index<'a>(
                 let key = ((*path).to_path_buf(), definition.qualified_name.clone());
                 symbols.insert(key.clone(), EntityId::from(id.clone()));
                 if definition.exported {
-                    origins.insert(key.clone(), key);
+                    insert_origin(&mut origins, &mut origins_by_file, key.clone(), key);
                 }
                 if let Some(factory) = &definition.factory {
                     factories.insert(
@@ -494,10 +515,12 @@ fn repository_index<'a>(
                         })
                     });
                     if let Some(origin) = origin {
-                        changed |= origins
-                            .insert((path.clone(), export.exported.clone()), origin.clone())
-                            .as_ref()
-                            != Some(&origin);
+                        changed |= insert_origin(
+                            &mut origins,
+                            &mut origins_by_file,
+                            (path.clone(), export.exported.clone()),
+                            origin,
+                        );
                     }
                     continue;
                 };
@@ -506,26 +529,30 @@ fn repository_index<'a>(
                     continue;
                 };
                 if export.local == "*" {
-                    let exported = origins
-                        .iter()
-                        .filter(|((origin_file, name), _)| {
-                            origin_file == &exported_file && name != "default"
-                        })
-                        .map(|((_, name), origin)| (name.clone(), origin.clone()))
+                    let exported = origins_by_file
+                        .get(&exported_file)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(name, _)| name.as_str() != "default")
+                        .map(|(name, origin)| (name.clone(), origin.clone()))
                         .collect::<Vec<_>>();
                     for (name, origin) in exported {
-                        changed |= origins
-                            .insert((path.clone(), name), origin.clone())
-                            .as_ref()
-                            != Some(&origin);
+                        changed |= insert_origin(
+                            &mut origins,
+                            &mut origins_by_file,
+                            (path.clone(), name),
+                            origin,
+                        );
                     }
                 } else if let Some(origin) =
                     origins.get(&(exported_file, export.local.clone())).cloned()
                 {
-                    changed |= origins
-                        .insert((path.clone(), export.exported.clone()), origin.clone())
-                        .as_ref()
-                        != Some(&origin);
+                    changed |= insert_origin(
+                        &mut origins,
+                        &mut origins_by_file,
+                        (path.clone(), export.exported.clone()),
+                        origin,
+                    );
                 }
             }
         }
@@ -759,6 +786,23 @@ fn receiver_type(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
+    cache: &mut BTreeMap<(String, String), Option<(PathBuf, String)>>,
+) -> Option<(PathBuf, String)> {
+    let key = (caller.to_owned(), receiver.to_owned());
+    if let Some(resolved) = cache.get(&key) {
+        return resolved.clone();
+    }
+    cache.insert(key.clone(), None);
+    let resolved = receiver_type_uncached(index, caller, receiver, cache);
+    cache.insert(key, resolved.clone());
+    resolved
+}
+
+fn receiver_type_uncached(
+    index: &RepositoryIndex<'_>,
+    caller: &str,
+    receiver: &str,
+    cache: &mut BTreeMap<(String, String), Option<(PathBuf, String)>>,
 ) -> Option<(PathBuf, String)> {
     let file = index.caller_files.get(caller)?;
     let receiver = aliased_receiver(index, caller, receiver);
@@ -788,7 +832,7 @@ fn receiver_type(
     let parts = receiver.split('.').collect::<Vec<_>>();
     for prefix_length in (1..parts.len()).rev() {
         let prefix = parts[..prefix_length].join(".");
-        let Some(mut current) = receiver_type(index, caller, &prefix) else {
+        let Some(mut current) = receiver_type(index, caller, &prefix, cache) else {
             continue;
         };
         let mut resolved = true;
@@ -827,6 +871,7 @@ fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -
 }
 
 fn resolve_observations(observations: &mut [Observation], index: &RepositoryIndex<'_>) {
+    let mut receiver_types = BTreeMap::new();
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
     }) {
@@ -896,7 +941,12 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             })
             .or_else(|| {
                 let receiver = receiver?;
-                let (file, type_name) = receiver_type(index, observation.from.as_str(), receiver)?;
+                let (file, type_name) = receiver_type(
+                    index,
+                    observation.from.as_str(),
+                    receiver,
+                    &mut receiver_types,
+                )?;
                 member_entity(index, file, type_name, name)
             })
             .or_else(|| {
@@ -970,6 +1020,9 @@ pub fn resolve_workspace_calls(
     observations: &mut [Observation],
     repositories: &[TypescriptRepository],
 ) -> Vec<DependencyOverride> {
+    if repositories.len() < 2 {
+        return Vec::new();
+    }
     let indexes = repositories
         .iter()
         .map(|repository| {
@@ -1226,6 +1279,24 @@ mod tests {
     }
 
     #[test]
+    fn bounds_unresolved_nested_receiver_resolution() {
+        let receiver = std::iter::once("root")
+            .chain((0..24).map(|_| "field"))
+            .collect::<Vec<_>>()
+            .join(".");
+        let source = format!("export function run() {{ {receiver}.execute(); }}");
+        let path = Path::new("src/run.ts");
+        let analysis = analyze(&source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, &source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        assert!(observations.iter().any(|observation| {
+            observation.to.as_str() == format!("typescript-method://{receiver}/execute")
+        }));
+    }
+
+    #[test]
     fn resolves_relative_workspace_package_and_tsconfig_imports() {
         let fixtures = [
             (
@@ -1236,6 +1307,11 @@ mod tests {
             (
                 Path::new("packages/shell/src/loadLocale.ts"),
                 "import { setLocale } from './current'; export function loadLocale() { setLocale(); }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/instrumentation-client.ts"),
+                "import { loadLocale } from '@example/shell/src/loadLocale'; loadLocale();",
                 SourceLanguage::TypeScript,
             ),
             (
@@ -1494,6 +1570,12 @@ mod tests {
         }));
         assert!(observations.iter().any(|observation| {
             observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/instrumentation-client"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/shell/src/loadLocale/loadLocale"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
                 == "repo://example/typescript/packages/shell/src/loadLocale/loadLocale"
                 && observation.to.as_str()
                     == "repo://example/typescript/packages/shell/src/current/setLocale"
@@ -1741,6 +1823,24 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn skips_workspace_resolution_for_one_repository() {
+        let source = "export function run() { missing(); }";
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let repositories = vec![TypescriptRepository::new(
+            "example",
+            vec![(PathBuf::from("src/run.ts"), analysis.clone())],
+            vec![],
+            vec![],
+        )];
+        let mut observations =
+            observations_from_analysis("example", &analysis, source, Path::new("src/run.ts"));
+        let before = observations.clone();
+
+        assert!(resolve_workspace_calls(&mut observations, &repositories).is_empty());
+        assert_eq!(observations, before);
     }
 
     #[test]

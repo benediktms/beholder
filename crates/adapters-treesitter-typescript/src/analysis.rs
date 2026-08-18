@@ -801,6 +801,7 @@ pub fn analyze(
         .parse(source, None)
         .ok_or("JavaScript/TypeScript parser returned no tree")?;
     let mut definitions = Vec::new();
+    let mut calls = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut parse_error_lines = Vec::new();
@@ -810,6 +811,24 @@ pub fn analyze(
         &mut Vec::new(),
         &mut definitions,
     );
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for statement in root
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "expression_statement")
+    {
+        let Some(expression) = statement.named_child(0) else {
+            continue;
+        };
+        let kind = match expression.kind() {
+            "call_expression" => CallKind::Direct,
+            "new_expression" => CallKind::Constructor,
+            _ => continue,
+        };
+        if let Some(call) = call(expression, source.as_bytes(), kind) {
+            calls.push(call);
+        }
+    }
     collect_imports(tree.root_node(), source.as_bytes(), &mut imports);
     collect_exports(tree.root_node(), source.as_bytes(), &mut exports);
     collect_parse_errors(tree.root_node(), &mut parse_error_lines);
@@ -817,6 +836,7 @@ pub fn analyze(
     parse_error_lines.dedup();
     Ok(TypescriptAnalysis {
         language,
+        calls,
         definitions,
         imports,
         exports,
@@ -884,6 +904,14 @@ pub fn observations_from_analysis(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    for call in &analysis.calls {
+        observations.push(Observation::dependency(
+            module_id.clone(),
+            DependencyRelation::Calls,
+            observation_target(analysis.language.id_segment(), &ids, "", call),
+            format!("{}:{}", path.display(), call.line),
+        ));
+    }
     for definition in &analysis.definitions {
         let id = &ids[&definition.qualified_name];
         let parent_name = definition
@@ -904,29 +932,7 @@ pub fn observations_from_analysis(
         }
         let scope = parent_name.unwrap_or_default();
         for call in &definition.calls {
-            let target = match call.kind {
-                CallKind::Direct => ids
-                    .get(&qualified(
-                        &scope.split('/').map(str::to_owned).collect::<Vec<_>>(),
-                        &call.name,
-                    ))
-                    .or_else(|| ids.get(&call.name))
-                    .cloned()
-                    .unwrap_or_else(|| format!("{language}-call://{}", call.name)),
-                CallKind::Member if call.receiver.as_deref() == Some("this") => ids
-                    .get(&format!("{scope}/{}", call.name))
-                    .cloned()
-                    .unwrap_or_else(|| format!("{language}-method://this/{}", call.name)),
-                CallKind::Member => format!(
-                    "{language}-method://{}/{}",
-                    call.receiver.as_deref().unwrap_or("_"),
-                    call.name
-                ),
-                CallKind::Constructor => ids
-                    .get(&call.name)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{language}-constructor://{}", call.name)),
-            };
+            let target = observation_target(language, &ids, scope, call);
             observations.push(Observation::dependency(
                 id.clone(),
                 DependencyRelation::Calls,
@@ -941,6 +947,37 @@ pub fn observations_from_analysis(
         }
     }
     observations
+}
+
+fn observation_target(
+    language: &str,
+    ids: &BTreeMap<String, String>,
+    scope: &str,
+    call: &Call,
+) -> String {
+    match call.kind {
+        CallKind::Direct => ids
+            .get(&qualified(
+                &scope.split('/').map(str::to_owned).collect::<Vec<_>>(),
+                &call.name,
+            ))
+            .or_else(|| ids.get(&call.name))
+            .cloned()
+            .unwrap_or_else(|| format!("{language}-call://{}", call.name)),
+        CallKind::Member if call.receiver.as_deref() == Some("this") => ids
+            .get(&format!("{scope}/{}", call.name))
+            .cloned()
+            .unwrap_or_else(|| format!("{language}-method://this/{}", call.name)),
+        CallKind::Member => format!(
+            "{language}-method://{}/{}",
+            call.receiver.as_deref().unwrap_or("_"),
+            call.name
+        ),
+        CallKind::Constructor => ids
+            .get(&call.name)
+            .cloned()
+            .unwrap_or_else(|| format!("{language}-constructor://{}", call.name)),
+    }
 }
 
 pub fn entities_from_analysis(

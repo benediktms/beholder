@@ -32,6 +32,7 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
         name,
         ".git"
             | ".next"
+            | ".next-server"
             | ".turbo"
             | "_build"
             | "build"
@@ -39,6 +40,7 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
             | "deps"
             | "dist"
             | "node_modules"
+            | "storybook-static"
             | "target"
     )
 }
@@ -253,7 +255,14 @@ mod tests {
             .unwrap()
             .as_nanos();
         let repository = std::env::temp_dir().join(format!("beholder-typescript-sources-{unique}"));
-        for directory in ["src", "node_modules/package", "dist", ".next"] {
+        for directory in [
+            "src",
+            "node_modules/package",
+            "dist",
+            ".next",
+            ".next-server",
+            "storybook-static",
+        ] {
             fs::create_dir_all(repository.join(directory)).unwrap();
         }
         for path in ["src/a.js", "src/b.jsx", "src/c.ts", "src/d.tsx"] {
@@ -273,6 +282,8 @@ mod tests {
             "node_modules/package/index.ts",
             "dist/index.js",
             ".next/index.js",
+            ".next-server/index.js",
+            "storybook-static/index.js",
         ] {
             fs::write(repository.join(path), "export function ignored() {}").unwrap();
         }
