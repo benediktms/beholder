@@ -104,21 +104,32 @@ fn collect_graphql_documents(node: Node<'_>, source: &[u8], documents: &mut Vec<
         && value
             .child_by_field_name("function")
             .and_then(|function| text(function, source))
-            == Some("gql")
+            .is_some_and(|function| matches!(function, "gql" | "graphql"))
         && let Some(arguments) = value.child_by_field_name("arguments")
     {
         let arguments = arguments
             .named_children(&mut arguments.walk())
             .collect::<Vec<_>>();
         if let [document] = arguments.as_slice()
-            && document.kind() == "template_string"
-            && document
-                .named_children(&mut document.walk())
-                .all(|child| child.kind() != "template_substitution")
+            && matches!(document.kind(), "template_string" | "string")
+            && (document.kind() != "template_string"
+                || document
+                    .named_children(&mut document.walk())
+                    .all(|child| child.kind() != "template_substitution"))
             && let (Some(binding), Some(document)) = (text(name, source), text(*document, source))
             && let Some(document) = document
                 .strip_prefix('`')
                 .and_then(|text| text.strip_suffix('`'))
+                .or_else(|| {
+                    document
+                        .strip_prefix('"')
+                        .and_then(|text| text.strip_suffix('"'))
+                })
+                .or_else(|| {
+                    document
+                        .strip_prefix('\'')
+                        .and_then(|text| text.strip_suffix('\''))
+                })
         {
             documents.push(GraphqlDocument {
                 binding: binding.into(),
@@ -1406,6 +1417,7 @@ mod tests {
             export const Packages_Detail_Query = gql(`
               query Packages_Detail_Query { packageTemplatePreview { id } }
             `);
+            export const Tada_Query = graphql("query Tada_Query { location { id } }");
         "#;
         let component = r#"
             import { Packages_Detail_Query } from './PackageDetail.gql';
@@ -1454,6 +1466,10 @@ mod tests {
 
         assert!(entities.iter().any(|entity| {
             entity.id.as_str() == "graphql-operation://Packages_Detail_Query"
+                && entity.kind == EntityKind::GraphqlOperation
+        }));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-operation://Tada_Query"
                 && entity.kind == EntityKind::GraphqlOperation
         }));
         for (from, relation, to) in [
