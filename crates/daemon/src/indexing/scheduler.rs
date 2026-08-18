@@ -43,7 +43,8 @@ use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fs,
+    fs::{self, File},
+    io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
@@ -645,8 +646,9 @@ impl IndexScheduler {
             .join(typescript_resolver)
             .join(key.protobuf.unwrap_or("_"))
             .join(format!("{}.json", state.fingerprint));
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(analysis) = serde_json::from_slice::<RepositoryAnalysis>(&bytes)
+        if let Ok(file) = File::open(&path)
+            && let Ok(analysis) =
+                serde_json::from_reader::<_, RepositoryAnalysis>(BufReader::new(file))
         {
             let analysis = Arc::new(analysis);
             self.repository_cache
@@ -898,9 +900,12 @@ impl IndexScheduler {
         });
         if let Some(parent) = path.parent()
             && fs::create_dir_all(parent).is_ok()
-            && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
+            && let Ok(file) = File::create(path)
         {
-            let _ = fs::write(path, bytes);
+            let mut writer = BufWriter::new(file);
+            if serde_json::to_writer(&mut writer, analysis.as_ref()).is_ok() {
+                let _ = writer.flush();
+            }
         }
         self.repository_cache
             .lock()

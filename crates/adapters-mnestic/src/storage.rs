@@ -8,7 +8,7 @@ use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, error::Error};
 
-const OBSERVATION_BATCH_SIZE: usize = 10_000;
+const FACT_BATCH_SIZE: usize = 10_000;
 
 pub(super) fn store_observations(
     transaction: &MultiTransaction,
@@ -30,7 +30,7 @@ pub(super) fn store_observations(
         .collect::<BTreeMap<_, _>>()
         .into_values()
         .collect::<Vec<_>>();
-    for observations in observations.chunks(OBSERVATION_BATCH_SIZE) {
+    for observations in observations.chunks(FACT_BATCH_SIZE) {
         let rows = observations
             .iter()
             .map(|observation| {
@@ -136,18 +136,18 @@ pub(super) fn store_entities(
     state: &str,
     entities: &[EntityFact],
 ) -> Result<(), Box<dyn Error>> {
-    let rows = entities
-        .iter()
-        .map(|entity| {
-            DataValue::List(vec![
-                state.into(),
-                entity.id.as_str().into(),
-                entity_kind(entity.kind).into(),
-                entity_metadata(entity.metadata).into(),
-            ])
-        })
-        .collect();
-    if !entities.is_empty() {
+    for entities in entities.chunks(FACT_BATCH_SIZE) {
+        let rows = entities
+            .iter()
+            .map(|entity| {
+                DataValue::List(vec![
+                    state.into(),
+                    entity.id.as_str().into(),
+                    entity_kind(entity.kind).into(),
+                    entity_metadata(entity.metadata).into(),
+                ])
+            })
+            .collect();
         transaction.run_script(
             "?[state, id, kind, metadata] <- $rows\n\
              :put state_entity {state, id => kind, metadata}",
@@ -1024,6 +1024,38 @@ mod tests {
             })
         );
         assert_eq!(context.nodes.len(), 1);
+    }
+
+    #[test]
+    fn stores_entities_across_batch_boundaries() {
+        let store = SemanticStore::memory().unwrap();
+        let transaction = store.db.multi_transaction(true);
+        let entities = (0..=FACT_BATCH_SIZE)
+            .map(|index| {
+                EntityFact::new(
+                    format!("repo://example/entity/{index}"),
+                    EntityKind::Callable,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        store_entities(&transaction, "state", &entities).unwrap();
+        transaction.commit().unwrap();
+
+        let rows = store
+            .db
+            .run_script(
+                "?[count(id)] := *state_entity{state: 'state', id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(
+            rows.rows[0][0].get_int(),
+            Some((FACT_BATCH_SIZE + 1) as i64)
+        );
     }
 
     #[test]
