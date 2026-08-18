@@ -69,20 +69,32 @@ struct Package {
 }
 
 fn package_index(manifests: &[(&Path, &str)]) -> BTreeMap<String, Package> {
-    manifests
-        .iter()
-        .filter_map(|(path, source)| {
-            let manifest = serde_json::from_str::<Value>(source).ok()?;
-            let name = manifest.get("name")?.as_str()?.to_owned();
-            Some((
-                name,
-                Package {
-                    root: path.parent().unwrap_or(Path::new("")).to_path_buf(),
-                    manifest,
-                },
-            ))
-        })
-        .collect()
+    let mut packages = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for (path, source) in manifests {
+        let Ok(manifest) = serde_json::from_str::<Value>(source) else {
+            continue;
+        };
+        let Some(name) = manifest
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if ambiguous.contains(&name) {
+            continue;
+        }
+        let package = Package {
+            root: path.parent().unwrap_or(Path::new("")).to_path_buf(),
+            manifest,
+        };
+        if packages.insert(name.clone(), package).is_some() {
+            packages.remove(&name);
+            ambiguous.insert(name);
+        }
+    }
+    packages
 }
 
 fn string_targets(value: &Value, targets: &mut Vec<PathBuf>) {
@@ -1200,6 +1212,18 @@ pub fn unresolved_call_diagnostics(
 mod tests {
     use super::*;
     use crate::{analyze, observations_from_analysis};
+
+    #[test]
+    fn rejects_ambiguous_repository_package_names() {
+        let packages = package_index(&[
+            (Path::new("one/package.json"), r#"{"name":"duplicate"}"#),
+            (Path::new("two/package.json"), r#"{"name":"duplicate"}"#),
+            (Path::new("three/package.json"), r#"{"name":"unique"}"#),
+        ]);
+
+        assert!(!packages.contains_key("duplicate"));
+        assert!(packages.contains_key("unique"));
+    }
 
     #[test]
     fn resolves_relative_workspace_package_and_tsconfig_imports() {
