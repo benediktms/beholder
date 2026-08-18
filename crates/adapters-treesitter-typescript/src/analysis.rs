@@ -22,6 +22,16 @@ fn callable_value(node: Node<'_>) -> bool {
     matches!(node.kind(), "arrow_function" | "function_expression")
 }
 
+fn is_exported(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "export_statement" {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
 fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     let target = node.child_by_field_name(match kind {
         CallKind::Constructor => "constructor",
@@ -103,6 +113,77 @@ fn definition(
         kind,
         line: node.start_position().row + 1,
         calls,
+        exported: is_exported(node),
+    }
+}
+
+fn string_value(node: Node<'_>, source: &[u8]) -> Option<String> {
+    text(node, source).map(|value| value.trim_matches(['\'', '"']).into())
+}
+
+fn collect_imports(node: Node<'_>, source: &[u8], imports: &mut Vec<Import>) {
+    if node.kind() == "import_statement"
+        && let Some(source_name) = node
+            .child_by_field_name("source")
+            .and_then(|source_node| string_value(source_node, source))
+    {
+        let mut bindings = Vec::new();
+        if let Some(clause) = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "import_clause")
+        {
+            let mut cursor = clause.walk();
+            for child in clause.named_children(&mut cursor) {
+                match child.kind() {
+                    "identifier" => bindings.push(ImportBinding {
+                        imported: "default".into(),
+                        local: text(child, source).unwrap_or_default().into(),
+                    }),
+                    "named_imports" => {
+                        let mut import_cursor = child.walk();
+                        for specifier in child.named_children(&mut import_cursor) {
+                            if specifier.kind() != "import_specifier" {
+                                continue;
+                            }
+                            let Some(imported) = specifier
+                                .child_by_field_name("name")
+                                .and_then(|name| text(name, source))
+                            else {
+                                continue;
+                            };
+                            let local = specifier
+                                .child_by_field_name("alias")
+                                .and_then(|alias| text(alias, source))
+                                .unwrap_or(imported);
+                            bindings.push(ImportBinding {
+                                imported: imported.into(),
+                                local: local.into(),
+                            });
+                        }
+                    }
+                    "namespace_import" => {
+                        if let Some(local) =
+                            child.named_child(0).and_then(|name| text(name, source))
+                        {
+                            bindings.push(ImportBinding {
+                                imported: "*".into(),
+                                local: local.into(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        imports.push(Import {
+            source: source_name,
+            bindings,
+        });
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_imports(child, source, imports);
     }
 }
 
@@ -207,15 +288,18 @@ pub fn analyze(
         return Err("failed to parse JavaScript/TypeScript source".into());
     }
     let mut definitions = Vec::new();
+    let mut imports = Vec::new();
     collect_definitions(
         tree.root_node(),
         source.as_bytes(),
         &mut Vec::new(),
         &mut definitions,
     );
+    collect_imports(tree.root_node(), source.as_bytes(), &mut imports);
     Ok(TypescriptAnalysis {
         language,
         definitions,
+        imports,
     })
 }
 

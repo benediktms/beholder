@@ -317,7 +317,9 @@ name = "beholder-adapters-treesitter-typescript"
 version = "0.1.0"
 dependencies = [
  "beholder-domain",
+ "jsonc-parser",
  "serde",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
@@ -2012,6 +2014,15 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonc-parser"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0560e3f9a9a03ea6b6e90b41138c5db9e21526c99eb192c1a26c68176593285"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

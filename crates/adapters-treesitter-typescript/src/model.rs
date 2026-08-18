@@ -42,6 +42,7 @@ impl SourceLanguage {
 pub struct TypescriptAnalysis {
     pub(super) language: SourceLanguage,
     pub(super) definitions: Vec<Definition>,
+    pub(super) imports: Vec<Import>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -56,6 +57,19 @@ pub(super) struct Definition {
     pub(super) kind: DefinitionKind,
     pub(super) line: usize,
     pub(super) calls: Vec<Call>,
+    pub(super) exported: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Import {
+    pub(super) source: String,
+    pub(super) bindings: Vec<ImportBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ImportBinding {
+    pub(super) imported: String,
+    pub(super) local: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
