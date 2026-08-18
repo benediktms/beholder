@@ -941,12 +941,36 @@ fn index_workspace_versioned(
         return Ok((0, false));
     }
     let protobuf_compilation_started = Instant::now();
+    let mut diagnostics = Vec::new();
     for (repository, sources) in workspace.repositories.iter().zip(&mut repositories) {
         let descriptors = scheduler.analysis_pool.install(|| {
             scheduler
                 .protobuf_compiler
                 .compile_repository(&repository.base, &sources.protobuf_source)
-        })?;
+        });
+        let descriptors = match descriptors {
+            Ok(descriptors) => descriptors,
+            Err(error)
+                if !sources.rust.is_empty()
+                    || !sources.elixir.is_empty()
+                    || !sources.csharp.is_empty()
+                    || !sources.typescript.is_empty()
+                    || !sources.protobuf.is_empty() =>
+            {
+                diagnostics.push((
+                    sources.state.repository.identity.clone(),
+                    AnalysisDiagnostic {
+                        code: "protobuf.compile_failed".into(),
+                        severity: AnalysisDiagnosticSeverity::Warning,
+                        path: PathBuf::from("."),
+                        line: None,
+                        detail: Some(error),
+                    },
+                ));
+                Vec::new()
+            }
+            Err(error) => return Err(error.into()),
+        };
         for (index, descriptor) in descriptors.into_iter().enumerate() {
             sources.protobuf.push((
                 PathBuf::from(format!("compiled-protobuf-{index}.binpb")),
@@ -961,7 +985,6 @@ fn index_workspace_versioned(
     let mut disk_hits = 0;
     let mut misses = 0;
     let mut dirty_source_units = 0;
-    let mut diagnostics = Vec::new();
     let mut typescript_repositories = Vec::new();
     let mut needs_workspace_resolution = false;
     let repository_analysis_started = Instant::now();
@@ -1373,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn indexes_csharp_through_the_workspace_pipeline() {
+    fn indexes_csharp_when_unrelated_protobuf_fails() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -1384,6 +1407,11 @@ mod tests {
         fs::write(
             repository.join("src/Program.cs"),
             "namespace Demo; class Program { void Run() { Helper(); } void Helper() {} }",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("broken.proto"),
+            "syntax = \"proto3\"; import \"missing.proto\"; message Broken {}",
         )
         .unwrap();
         let workspace = test_workspace("main", repository);
