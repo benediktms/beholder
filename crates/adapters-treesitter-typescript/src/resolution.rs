@@ -1303,7 +1303,7 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
     }
 }
 
-fn graphql_operation_uses(
+fn graphql_operation_calls(
     repository: &str,
     sources: &[(&Path, &TypescriptAnalysis)],
     index: &RepositoryIndex<'_>,
@@ -1380,7 +1380,7 @@ fn graphql_operation_uses(
                     observations.extend(selected.iter().map(|operation| {
                         Observation::dependency(
                             caller.clone(),
-                            DependencyRelation::Uses,
+                            DependencyRelation::CallsGraphql,
                             operation.clone(),
                             format!("{}:{}", path.display(), call.line),
                         )
@@ -1400,7 +1400,7 @@ pub fn resolve_repository_calls(
     configs: &[(&Path, &str)],
 ) {
     let index = repository_index(repository, sources, manifests, configs);
-    observations.extend(graphql_operation_uses(repository, sources, &index));
+    observations.extend(graphql_operation_calls(repository, sources, &index));
     resolve_observations(observations, &index);
 }
 

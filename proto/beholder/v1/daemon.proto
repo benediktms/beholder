@@ -94,6 +94,13 @@ enum GraphqlTypeKind {
   GRAPHQL_TYPE_KIND_UNION = 6;
 }
 
+enum GraphqlOperationKind {
+  GRAPHQL_OPERATION_KIND_UNKNOWN = 0;
+  GRAPHQL_OPERATION_KIND_MUTATION = 1;
+  GRAPHQL_OPERATION_KIND_QUERY = 2;
+  GRAPHQL_OPERATION_KIND_SUBSCRIPTION = 3;
+}
+
 enum EntityOrigin {
   ENTITY_ORIGIN_SOURCE = 0;
   ENTITY_ORIGIN_GENERATED = 1;
@@ -119,6 +126,7 @@ message EntityMetadata {
     ProtoTypeKind proto_type_kind = 1;
     RpcCardinality rpc_cardinality = 2;
     GraphqlTypeKind graphql_type_kind = 3;
+    GraphqlOperationKind graphql_operation_kind = 4;
   }
 }
 
@@ -149,6 +157,7 @@ enum RelationKind {
   RELATION_KIND_IMPORTS = 13;
   RELATION_KIND_REQUIRES = 14;
   RELATION_KIND_IMPLEMENTS = 15;
+  RELATION_KIND_CALLS_GRAPHQL = 17;
 }
 
 message Entity {

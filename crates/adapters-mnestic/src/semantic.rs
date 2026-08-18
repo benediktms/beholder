@@ -2,9 +2,9 @@ use crate::{InspectionResult, InspectionValue};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
     EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
-    GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, ProtoTypeKind,
-    QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath, TRACE_SCHEMA_V2,
-    TraceResult, TraversalMetadata,
+    GraphqlOperationKind, GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery,
+    ProtoTypeKind, QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath,
+    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -442,6 +442,24 @@ fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error
                 ("graphql_enum_value", "") => (EntityKind::GraphqlEnumValue, None),
                 ("graphql_field", "") => (EntityKind::GraphqlField, None),
                 ("graphql_operation", "") => (EntityKind::GraphqlOperation, None),
+                ("graphql_operation", "graphql_operation:mutation") => (
+                    EntityKind::GraphqlOperation,
+                    Some(EntityMetadata::GraphqlOperation {
+                        operation_kind: GraphqlOperationKind::Mutation,
+                    }),
+                ),
+                ("graphql_operation", "graphql_operation:query") => (
+                    EntityKind::GraphqlOperation,
+                    Some(EntityMetadata::GraphqlOperation {
+                        operation_kind: GraphqlOperationKind::Query,
+                    }),
+                ),
+                ("graphql_operation", "graphql_operation:subscription") => (
+                    EntityKind::GraphqlOperation,
+                    Some(EntityMetadata::GraphqlOperation {
+                        operation_kind: GraphqlOperationKind::Subscription,
+                    }),
+                ),
                 ("graphql_type", "graphql_type:enum") => (
                     EntityKind::GraphqlType,
                     Some(EntityMetadata::GraphqlType {
@@ -682,6 +700,8 @@ fn relation_kind_hint(relation: &str, source: bool, id: &str) -> EntityKind {
     match (relation, source) {
         ("defines", true) => EntityKind::Namespace,
         ("defines", false) | ("calls", _) | ("implemented_by", false) => EntityKind::Callable,
+        ("calls_graphql", true) => EntityKind::Callable,
+        ("calls_graphql", false) => EntityKind::GraphqlOperation,
         ("calls_rpc", false) | ("implemented_by", true) => EntityKind::Rpc,
         ("selects", false) | ("resolved_by", true) => EntityKind::GraphqlField,
         _ => EntityKind::Unknown,

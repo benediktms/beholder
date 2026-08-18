@@ -34,6 +34,19 @@ fn is_exported(mut node: Node<'_>) -> bool {
     false
 }
 
+fn collect_identifiers(node: Node<'_>, source: &[u8], identifiers: &mut Vec<String>) {
+    if node.kind() == "identifier" {
+        if let Some(identifier) = text(node, source) {
+            identifiers.push(identifier.into());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_identifiers(child, source, identifiers);
+    }
+}
+
 fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     let (receiver, name, kind): (Option<String>, String, CallKind) = match target.kind() {
         "identifier" => (None, text(target, source)?.into(), kind),
@@ -76,7 +89,16 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
                     })
                     .collect()
             })
-            .unwrap_or_default(),
+            .unwrap_or_else(|| {
+                let mut identifiers = Vec::new();
+                if matches!(
+                    node.kind(),
+                    "jsx_opening_element" | "jsx_self_closing_element"
+                ) {
+                    collect_identifiers(node, source, &mut identifiers);
+                }
+                identifiers
+            }),
         type_arguments: preserve_type_arguments
             .then(|| {
                 let arguments = node.child_by_field_name("type_arguments")?;
@@ -1312,12 +1334,16 @@ mod tests {
             export const Packages_Detail_Query = gql(`
               query Packages_Detail_Query { packageTemplatePreview { id } }
             `);
+            export const PaymentCompleted = gql(`
+              subscription PaymentCompleted { paymentCompleted { id } }
+            `);
             export const Tada_Query = graphql(/* GraphQL */ "query Tada_Query { location { id } }");
         "#;
         let component = r#"
-            import { Packages_Detail_Query } from './PackageDetail.gql';
+            import { Packages_Detail_Query, PaymentCompleted } from './PackageDetail.gql';
             export function PackageDetail() {
-              return useSWRGQL(Packages_Detail_Query, variables);
+              useSWRGQL(Packages_Detail_Query, variables);
+              return <Checkout subscription={enabled ? PaymentCompleted : null} />;
             }
         "#;
         let resolver = r#"
@@ -1384,13 +1410,18 @@ mod tests {
         for (from, relation, to) in [
             (
                 "repo://example/typescript/src/PackageDetail/PackageDetail",
-                DependencyRelation::Uses,
+                DependencyRelation::CallsGraphql,
                 "graphql-operation://Packages_Detail_Query",
             ),
             (
                 "graphql-operation://Packages_Detail_Query",
                 DependencyRelation::Selects,
                 "graphql-field://Query/packageTemplatePreview",
+            ),
+            (
+                "repo://example/typescript/src/PackageDetail/PackageDetail",
+                DependencyRelation::CallsGraphql,
+                "graphql-operation://PaymentCompleted",
             ),
             (
                 "graphql-field://Query/packageTemplatePreview",

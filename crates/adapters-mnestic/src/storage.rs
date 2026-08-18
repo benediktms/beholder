@@ -1,8 +1,8 @@
 use super::schema::*;
 use beholder_domain::{
     DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
-    GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, Observation, ProtoTypeKind,
-    RepositoryFacts, RpcCardinality, SemanticRelation, WorkspaceView,
+    GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, Observation,
+    ProtoTypeKind, RepositoryFacts, RpcCardinality, SemanticRelation, WorkspaceView,
 };
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
@@ -115,6 +115,15 @@ fn rpc_cardinality(cardinality: RpcCardinality) -> &'static str {
 fn entity_metadata(metadata: Option<EntityMetadata>) -> &'static str {
     match metadata {
         None => "",
+        Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Mutation,
+        }) => "graphql_operation:mutation",
+        Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Query,
+        }) => "graphql_operation:query",
+        Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Subscription,
+        }) => "graphql_operation:subscription",
         Some(EntityMetadata::GraphqlType {
             kind: GraphqlTypeKind::Enum,
         }) => "graphql_type:enum",
@@ -1038,6 +1047,16 @@ mod tests {
             )
             .unwrap(),
         );
+        facts.entities.push(
+            EntityFact::new(
+                "graphql-operation://CreateOrder",
+                EntityKind::GraphqlOperation,
+                Some(EntityMetadata::GraphqlOperation {
+                    kind: GraphqlOperationKind::Mutation,
+                }),
+            )
+            .unwrap(),
+        );
         let state = analyzed_state(&facts);
         store.publish(&view, &[facts], &[]).unwrap();
 
@@ -1080,6 +1099,16 @@ mod tests {
                 .root
                 .kind,
             beholder_dto::EntityKind::GraphqlEnumValue
+        );
+        assert_eq!(
+            store
+                .context("main", "graphql-operation://CreateOrder")
+                .unwrap()
+                .root
+                .metadata,
+            Some(beholder_dto::EntityMetadata::GraphqlOperation {
+                operation_kind: beholder_dto::GraphqlOperationKind::Mutation,
+            })
         );
     }
 

@@ -1,5 +1,5 @@
 pub const FRONTEND_VERSION: &str = "27";
-pub const RESOLVER_VERSION: &str = "16";
+pub const RESOLVER_VERSION: &str = "18";
 
 mod analysis;
 mod graphql;

@@ -4,14 +4,14 @@ use apollo_parser::{
 };
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    EntityMetadata, GraphqlTypeKind, Observation, StructuralRelation,
+    EntityMetadata, GraphqlOperationKind, GraphqlTypeKind, Observation, StructuralRelation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
 
-pub const FRONTEND_VERSION: &str = "5";
+pub const FRONTEND_VERSION: &str = "6";
 
 #[derive(Clone, Copy)]
 pub struct GraphqlSource<'a> {
@@ -402,8 +402,19 @@ fn operation_facts(
         .map(|name| name.text().to_string())
         .unwrap_or_else(|| format!("anonymous@{}", source.path.display()));
     let operation_id = format!("graphql-operation://{name}");
+    let root = root_type(&operation);
+    let kind = match root {
+        "Mutation" => GraphqlOperationKind::Mutation,
+        "Subscription" => GraphqlOperationKind::Subscription,
+        _ => GraphqlOperationKind::Query,
+    };
     entities.entry(operation_id.clone()).or_insert_with(|| {
-        EntityFact::new(operation_id.clone(), EntityKind::GraphqlOperation, None).unwrap()
+        EntityFact::new(
+            operation_id.clone(),
+            EntityKind::GraphqlOperation,
+            Some(EntityMetadata::GraphqlOperation { kind }),
+        )
+        .unwrap()
     });
     if let Some(owner) = source.owner {
         facts.observations.push(Observation::structural(
@@ -455,7 +466,6 @@ fn operation_facts(
             );
         }
     }
-    let root = root_type(&operation);
     if let Some(selections) = operation.selection_set() {
         root_selection_facts(
             &mut RootSelectionFacts {
@@ -788,6 +798,18 @@ mod tests {
         assert!(facts.entities.iter().any(|entity| {
             entity.id.as_str() == "graphql-operation://Packages_Detail_Query"
                 && entity.kind == EntityKind::GraphqlOperation
+                && entity.metadata
+                    == Some(EntityMetadata::GraphqlOperation {
+                        kind: GraphqlOperationKind::Query,
+                    })
+        }));
+        assert!(facts.entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-operation://Typing"
+                && entity.kind == EntityKind::GraphqlOperation
+                && entity.metadata
+                    == Some(EntityMetadata::GraphqlOperation {
+                        kind: GraphqlOperationKind::Subscription,
+                    })
         }));
         for (name, kind) in [
             ("RootQuery", GraphqlTypeKind::Object),

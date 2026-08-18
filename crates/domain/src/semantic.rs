@@ -127,6 +127,7 @@ pub enum StructuralRelation {
 pub enum DependencyRelation {
     BindsContract,
     Calls,
+    CallsGraphql,
     CallsRpc,
     ConsumedBy,
     Implements,
@@ -144,6 +145,7 @@ impl DependencyRelation {
         match self {
             Self::BindsContract => "binds_contract",
             Self::Calls => "calls",
+            Self::CallsGraphql => "calls_graphql",
             Self::CallsRpc => "calls_rpc",
             Self::ConsumedBy => "consumed_by",
             Self::Implements => "implements",
@@ -258,9 +260,17 @@ pub enum EntityKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum EntityMetadata {
+    GraphqlOperation { kind: GraphqlOperationKind },
     GraphqlType { kind: GraphqlTypeKind },
     ProtoMethod { cardinality: RpcCardinality },
     ProtoType { kind: ProtoTypeKind },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GraphqlOperationKind {
+    Mutation,
+    Query,
+    Subscription,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -294,7 +304,8 @@ impl EntityFact {
         metadata: Option<EntityMetadata>,
     ) -> Result<Self, &'static str> {
         match (kind, metadata) {
-            (EntityKind::GraphqlType, Some(EntityMetadata::GraphqlType { .. }))
+            (EntityKind::GraphqlOperation, Some(EntityMetadata::GraphqlOperation { .. }))
+            | (EntityKind::GraphqlType, Some(EntityMetadata::GraphqlType { .. }))
             | (EntityKind::ProtoMethod, Some(EntityMetadata::ProtoMethod { .. }))
             | (EntityKind::ProtoType, Some(EntityMetadata::ProtoType { .. }))
             | (
@@ -302,7 +313,6 @@ impl EntityFact {
                 | EntityKind::GraphqlArgument
                 | EntityKind::GraphqlEnumValue
                 | EntityKind::GraphqlField
-                | EntityKind::GraphqlOperation
                 | EntityKind::GrpcOperation
                 | EntityKind::KafkaTopic
                 | EntityKind::Namespace
