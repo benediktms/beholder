@@ -1,10 +1,12 @@
 use beholder_adapters_git::repository_state_bytes;
+use beholder_adapters_treesitter_csharp::{UnityPrefab, parse_unity_meta, parse_unity_prefab};
 use beholder_adapters_treesitter_typescript::SourceLanguage;
 use beholder_domain::RepositoryState;
 use std::{
     borrow::Cow,
     error::Error,
-    fs,
+    fs::{self, File},
+    io::BufReader,
     path::{Path, PathBuf},
 };
 
@@ -12,6 +14,7 @@ pub(super) type RustSources = Vec<(PathBuf, String)>;
 pub(super) type ElixirSources = Vec<(PathBuf, String)>;
 pub(super) type CsharpSources = Vec<(PathBuf, Vec<u8>)>;
 pub(super) type CsharpProjects = Vec<(PathBuf, String)>;
+pub(super) type UnityMetas = Vec<(PathBuf, String, Vec<u8>)>;
 pub(super) type TypescriptSources = Vec<(PathBuf, String, SourceLanguage)>;
 pub(super) type TypescriptManifests = Vec<(PathBuf, String)>;
 pub(super) type TypescriptConfigs = Vec<(PathBuf, String)>;
@@ -25,6 +28,9 @@ pub(super) struct RepositorySources {
     pub(super) elixir: ElixirSources,
     pub(super) csharp: CsharpSources,
     pub(super) csharp_projects: CsharpProjects,
+    pub(super) unity_prefabs: Vec<UnityPrefab>,
+    pub(super) unity_script_metas: UnityMetas,
+    pub(super) unity_prefab_metas: UnityMetas,
     pub(super) typescript: TypescriptSources,
     pub(super) typescript_manifests: TypescriptManifests,
     pub(super) typescript_configs: TypescriptConfigs,
@@ -70,6 +76,9 @@ pub(super) fn is_index_input(path: &Path) -> bool {
             matches!(name, "buf.yaml" | "buf.lock" | "package.json")
                 || name.ends_with(".csproj")
                 || name.ends_with(".asmdef")
+                || name.ends_with(".prefab")
+                || name.ends_with(".cs.meta")
+                || name.ends_with(".prefab.meta")
                 || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
                     && name.ends_with(".json"))
         }))
@@ -202,6 +211,40 @@ pub(super) fn repository_sources(
             ))
         })
         .collect::<Result<CsharpProjects, Box<dyn Error>>>()?;
+    let (unity_asset_files, sources): (Vec<_>, Vec<_>) = sources.into_iter().partition(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.ends_with(".prefab")
+                    || name.ends_with(".cs.meta")
+                    || name.ends_with(".prefab.meta")
+            })
+    });
+    let mut unity_prefabs = Vec::new();
+    let mut unity_script_metas = Vec::new();
+    let mut unity_prefab_metas = Vec::new();
+    for path in unity_asset_files {
+        let relative = path.strip_prefix(root)?.to_path_buf();
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.ends_with(".prefab") {
+            unity_prefabs.push(parse_unity_prefab(
+                &relative,
+                BufReader::new(File::open(path)?),
+            )?);
+        } else if let Some((guid, fingerprint)) =
+            parse_unity_meta(BufReader::new(File::open(path)?))?
+        {
+            let asset_path = relative.with_extension("");
+            if name.ends_with(".cs.meta") {
+                unity_script_metas.push((asset_path, guid, fingerprint));
+            } else {
+                unity_prefab_metas.push((asset_path, guid, fingerprint));
+            }
+        }
+    }
     let sources = sources
         .into_iter()
         .map(|path| {
@@ -243,6 +286,21 @@ pub(super) fn repository_sources(
                     .map(|(path, source)| (path.as_path(), source.as_bytes())),
             )
             .chain(
+                unity_prefabs
+                    .iter()
+                    .map(|prefab| (prefab.path.as_path(), prefab.fingerprint.as_slice())),
+            )
+            .chain(
+                unity_script_metas
+                    .iter()
+                    .map(|(path, _, bytes)| (path.as_path(), bytes.as_slice())),
+            )
+            .chain(
+                unity_prefab_metas
+                    .iter()
+                    .map(|(path, _, bytes)| (path.as_path(), bytes.as_slice())),
+            )
+            .chain(
                 typescript
                     .iter()
                     .map(|(path, source, _)| (path.as_path(), source.as_bytes())),
@@ -274,6 +332,9 @@ pub(super) fn repository_sources(
         elixir,
         csharp,
         csharp_projects,
+        unity_prefabs,
+        unity_script_metas,
+        unity_prefab_metas,
         typescript,
         typescript_manifests,
         typescript_configs,

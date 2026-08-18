@@ -151,6 +151,7 @@ impl From<dto::EntityKind> for v1::EntityKind {
             dto::EntityKind::ProtoService => Self::ProtoService,
             dto::EntityKind::Rpc => Self::Rpc,
             dto::EntityKind::Service => Self::Service,
+            dto::EntityKind::UnityPrefab => Self::UnityPrefab,
             dto::EntityKind::Unknown => Self::Unknown,
         }
     }
@@ -188,6 +189,7 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
             v1::EntityKind::ProtoService => dto::EntityKind::ProtoService,
             v1::EntityKind::Rpc => dto::EntityKind::Rpc,
             v1::EntityKind::Service => dto::EntityKind::Service,
+            v1::EntityKind::UnityPrefab => dto::EntityKind::UnityPrefab,
             v1::EntityKind::Unknown => dto::EntityKind::Unknown,
         },
     )

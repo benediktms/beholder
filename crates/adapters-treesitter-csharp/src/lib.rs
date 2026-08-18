@@ -1,5 +1,5 @@
 pub const FRONTEND_VERSION: &str = "7";
-pub const RESOLVER_VERSION: &str = "12";
+pub const RESOLVER_VERSION: &str = "13";
 
 mod analysis;
 mod dotnet_di;
@@ -14,4 +14,7 @@ pub use analysis::{
 pub use model::CsharpAnalysis;
 pub use project::{CsharpProject, parse_project, source_assemblies};
 pub use resolution::{CsharpSource, resolve_repository_calls};
-pub use unity::{parse_unity_assemblies, unity_lifecycle};
+pub use unity::{
+    UnityPrefab, parse_unity_assemblies, parse_unity_meta, parse_unity_prefab, unity_lifecycle,
+    unity_prefab_dependencies,
+};

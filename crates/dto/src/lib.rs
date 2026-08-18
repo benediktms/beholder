@@ -62,6 +62,7 @@ pub enum EntityKind {
     ProtoService,
     Rpc,
     Service,
+    UnityPrefab,
     Unknown,
 }
 

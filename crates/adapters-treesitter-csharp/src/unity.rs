@@ -2,13 +2,115 @@ use crate::{
     CsharpProject, CsharpSource, analysis::source_stem, model::DefinitionKind,
     project::assembly_visibility,
 };
-use beholder_domain::{DependencyRelation, EntityFact, EntityKind, Observation};
+use beholder_domain::{
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
+    Observation,
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    io::{self, BufRead},
     path::{Component, Path, PathBuf},
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnityPrefab {
+    pub path: PathBuf,
+    pub scripts: Vec<UnityScriptReference>,
+    pub source_prefabs: Vec<UnityReference>,
+    pub fingerprint: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnityReference {
+    pub guid: String,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnityScriptReference {
+    pub guid: String,
+    pub class_identifier: Option<String>,
+    pub line: u32,
+}
+
+fn guid(line: &str) -> Option<&str> {
+    line.split_once("guid:")?
+        .1
+        .trim_start()
+        .split([',', '}', ' '])
+        .find(|part| !part.is_empty())
+}
+
+pub fn parse_unity_meta(reader: impl BufRead) -> io::Result<Option<(String, Vec<u8>)>> {
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(guid) = line
+            .trim_start_matches('\u{feff}')
+            .trim()
+            .strip_prefix("guid:")
+        {
+            let guid = guid.trim().to_owned();
+            return Ok(Some((guid.clone(), format!("guid:{guid}\n").into_bytes())));
+        }
+    }
+    Ok(None)
+}
+
+pub fn parse_unity_prefab(path: &Path, reader: impl BufRead) -> io::Result<UnityPrefab> {
+    let mut scripts = Vec::new();
+    let mut source_prefabs = Vec::new();
+    let mut pending_script = None;
+    let mut fingerprint = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        if trimmed.starts_with("---") {
+            if let Some(script) = pending_script.take() {
+                scripts.push(script);
+            }
+        } else if trimmed.starts_with("m_Script:") {
+            if let Some(script) = pending_script.take() {
+                scripts.push(script);
+            }
+            if let Some(guid) = guid(trimmed) {
+                fingerprint.extend_from_slice(format!("script:{line_number}:{guid}\n").as_bytes());
+                pending_script = Some(UnityScriptReference {
+                    guid: guid.into(),
+                    class_identifier: None,
+                    line: line_number,
+                });
+            }
+        } else if let Some(identifier) = trimmed.strip_prefix("m_EditorClassIdentifier:") {
+            let identifier = identifier.trim();
+            if let Some(script) = pending_script.as_mut()
+                && !identifier.is_empty()
+            {
+                script.class_identifier = Some(identifier.into());
+                fingerprint.extend_from_slice(format!("class:{identifier}\n").as_bytes());
+            }
+        } else if trimmed.starts_with("m_SourcePrefab:")
+            && let Some(guid) = guid(trimmed)
+        {
+            fingerprint.extend_from_slice(format!("prefab:{line_number}:{guid}\n").as_bytes());
+            source_prefabs.push(UnityReference {
+                guid: guid.into(),
+                line: line_number,
+            });
+        }
+    }
+    if let Some(script) = pending_script {
+        scripts.push(script);
+    }
+    Ok(UnityPrefab {
+        path: path.into(),
+        scripts,
+        source_prefabs,
+        fingerprint,
+    })
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +308,137 @@ pub fn unity_lifecycle(
     (entities, observations)
 }
 
+fn prefab_id(repository: &str, path: &Path) -> String {
+    format!("repo://{repository}/unity-prefab/{}", path.display())
+}
+
+fn type_id(repository: &str, source: &CsharpSource<'_>, qualified_name: &str) -> String {
+    format!(
+        "repo://{repository}/csharp/{}/{}/{}",
+        source.assembly,
+        source_stem(source.path),
+        qualified_name
+    )
+}
+
+pub fn unity_prefab_dependencies(
+    repository: &str,
+    prefabs: &[UnityPrefab],
+    script_paths: &BTreeMap<String, PathBuf>,
+    prefab_paths: &BTreeMap<String, PathBuf>,
+    sources: &[CsharpSource<'_>],
+) -> (Vec<EntityFact>, Vec<Observation>, Vec<AnalysisDiagnostic>) {
+    let mut entities: Vec<EntityFact> = prefabs
+        .iter()
+        .map(|prefab| {
+            EntityFact::new(
+                prefab_id(repository, &prefab.path),
+                EntityKind::UnityPrefab,
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut observations = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut reported_script_guids = BTreeSet::new();
+    for prefab in prefabs {
+        let from = prefab_id(repository, &prefab.path);
+        for script in &prefab.scripts {
+            let Some(path) = script_paths.get(&script.guid) else {
+                if let Some(identifier) = script.class_identifier.as_deref()
+                    && let Some((assembly, name)) = identifier.split_once("::")
+                {
+                    let target = format!("unity://{assembly}/{}", name.replace('.', "/"));
+                    entities.push(
+                        EntityFact::new(target.clone(), EntityKind::Namespace, None).unwrap(),
+                    );
+                    observations.push(Observation::dependency(
+                        from.clone(),
+                        DependencyRelation::Uses,
+                        target,
+                        format!("{}:{}", prefab.path.display(), script.line),
+                    ));
+                } else if reported_script_guids.insert(script.guid.clone()) {
+                    diagnostics.push(AnalysisDiagnostic {
+                        code: "unity.prefab_script_unresolved".into(),
+                        severity: AnalysisDiagnosticSeverity::Warning,
+                        path: prefab.path.clone(),
+                        line: Some(script.line),
+                        detail: Some(format!(
+                            "script GUID {} has no indexed metadata",
+                            script.guid
+                        )),
+                    });
+                }
+                continue;
+            };
+            let expected = script
+                .class_identifier
+                .as_deref()
+                .and_then(|identifier| identifier.split_once("::").map(|(_, name)| name))
+                .map(|name| name.replace('.', "/"));
+            let candidates = sources
+                .iter()
+                .filter(|source| source.path == path)
+                .flat_map(|source| {
+                    source
+                        .analysis
+                        .definitions
+                        .iter()
+                        .filter(|definition| definition.kind == DefinitionKind::Type)
+                        .filter(|definition| {
+                            expected.as_ref().map_or_else(
+                                || {
+                                    path.file_stem().and_then(|name| name.to_str()).is_some_and(
+                                        |name| simple_type_name(&definition.qualified_name) == name,
+                                    )
+                                },
+                                |expected| definition.qualified_name == *expected,
+                            )
+                        })
+                        .map(move |definition| {
+                            type_id(repository, source, &definition.qualified_name)
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            if candidates.len() == 1 {
+                observations.push(Observation::dependency(
+                    from.clone(),
+                    DependencyRelation::Uses,
+                    candidates.into_iter().next().unwrap(),
+                    format!("{}:{}", prefab.path.display(), script.line),
+                ));
+            } else if reported_script_guids.insert(script.guid.clone()) {
+                diagnostics.push(AnalysisDiagnostic {
+                    code: "unity.prefab_script_unresolved".into(),
+                    severity: AnalysisDiagnosticSeverity::Warning,
+                    path: prefab.path.clone(),
+                    line: Some(script.line),
+                    detail: Some(format!(
+                        "script GUID {} resolved to {} indexed C# types",
+                        script.guid,
+                        candidates.len()
+                    )),
+                });
+            }
+        }
+        for source_prefab in &prefab.source_prefabs {
+            if let Some(path) = prefab_paths.get(&source_prefab.guid) {
+                observations.push(Observation::dependency(
+                    from.clone(),
+                    DependencyRelation::Uses,
+                    prefab_id(repository, path),
+                    format!("{}:{}", prefab.path.display(), source_prefab.line),
+                ));
+            }
+        }
+    }
+    entities.sort_by(|left, right| left.id.cmp(&right.id));
+    entities.dedup();
+    (entities, observations, diagnostics)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +529,50 @@ mod tests {
                     .to
                     .as_str()
                     .ends_with("/InventoryView/OnDrawGizmosSelected()")
+        }));
+    }
+
+    #[test]
+    fn parses_and_links_prefab_scripts_and_source_prefabs() {
+        let prefab = parse_unity_prefab(
+            Path::new("Assets/Player.prefab"),
+            r#"﻿--- !u!114 &1
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: script-guid, type: 3}
+  m_EditorClassIdentifier: Assembly-CSharp::Game.Player
+  m_SourcePrefab: {fileID: 100100000, guid: prefab-guid, type: 3}
+--- !u!114 &2
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: missing-guid, type: 3}
+"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let analysis =
+            crate::analyze("namespace Game; class Player : UnityEngine.MonoBehaviour {}").unwrap();
+        let sources = [CsharpSource {
+            path: Path::new("Assets/Player.cs"),
+            assembly: "Assembly-CSharp",
+            analysis: &analysis,
+        }];
+        let (entities, observations, diagnostics) = unity_prefab_dependencies(
+            "example/game",
+            std::slice::from_ref(&prefab),
+            &BTreeMap::from([("script-guid".into(), PathBuf::from("Assets/Player.cs"))]),
+            &BTreeMap::from([("prefab-guid".into(), PathBuf::from("Assets/Base.prefab"))]),
+            &sources,
+        );
+
+        assert_eq!(entities[0].kind, EntityKind::UnityPrefab);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "unity.prefab_script_unresolved");
+        assert!(observations.iter().any(|observation| {
+            observation.to.as_str()
+                == "repo://example/game/csharp/Assembly-CSharp/Assets/Player/Game/Player"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.to.as_str() == "repo://example/game/unity-prefab/Assets/Base.prefab"
         }));
     }
 }

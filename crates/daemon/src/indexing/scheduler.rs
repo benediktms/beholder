@@ -5,11 +5,12 @@ use beholder_adapters_protobuf::{
 };
 use beholder_adapters_treesitter_csharp::{
     CsharpAnalysis, CsharpProject, CsharpSource, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
-    RESOLVER_VERSION as CSHARP_RESOLVER_VERSION, diagnostics_from_analysis as csharp_diagnostics,
-    entities_from_analysis as csharp_entities, observations_from_analysis as csharp_observations,
-    parse_project as parse_csharp_project, parse_unity_assemblies,
-    resolve_repository_calls as resolve_csharp_repository_calls,
+    RESOLVER_VERSION as CSHARP_RESOLVER_VERSION, UnityPrefab,
+    diagnostics_from_analysis as csharp_diagnostics, entities_from_analysis as csharp_entities,
+    observations_from_analysis as csharp_observations, parse_project as parse_csharp_project,
+    parse_unity_assemblies, resolve_repository_calls as resolve_csharp_repository_calls,
     source_assemblies as csharp_source_assemblies, unity_lifecycle as csharp_unity_lifecycle,
+    unity_prefab_dependencies as csharp_unity_prefab_dependencies,
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
@@ -194,6 +195,9 @@ struct RepositoryAnalysisSources<'a> {
     elixir: &'a [(PathBuf, String)],
     csharp: &'a [(PathBuf, Vec<u8>)],
     csharp_projects: &'a [(PathBuf, String)],
+    unity_prefabs: &'a [UnityPrefab],
+    unity_script_metas: &'a [(PathBuf, String, Vec<u8>)],
+    unity_prefab_metas: &'a [(PathBuf, String, Vec<u8>)],
     typescript: &'a [(PathBuf, String, SourceLanguage)],
     typescript_manifests: &'a [(PathBuf, String)],
     typescript_configs: &'a [(PathBuf, String)],
@@ -637,6 +641,9 @@ impl IndexScheduler {
             elixir: elixir_sources,
             csharp: csharp_sources,
             csharp_projects,
+            unity_prefabs,
+            unity_script_metas,
+            unity_prefab_metas,
             typescript: typescript_sources,
             typescript_manifests,
             typescript_configs,
@@ -646,7 +653,7 @@ impl IndexScheduler {
             state.fingerprint.clone(),
             !rust_sources.is_empty(),
             !elixir_sources.is_empty(),
-            !csharp_sources.is_empty() || !csharp_projects.is_empty(),
+            !csharp_sources.is_empty() || !csharp_projects.is_empty() || !unity_prefabs.is_empty(),
             !typescript_sources.is_empty(),
             !descriptors.is_empty(),
         );
@@ -689,14 +696,14 @@ impl IndexScheduler {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let is_unity = !unity_assemblies.is_empty();
-        let csharp_projects = if unity_assemblies.is_empty() {
+        let is_unity = !unity_assemblies.is_empty() || !unity_prefabs.is_empty();
+        let csharp_projects = if is_unity {
+            parse_unity_assemblies(&unity_assemblies)?
+        } else {
             csharp_projects
                 .iter()
                 .map(|(path, source)| parse_csharp_project(path, source))
                 .collect::<Result<Vec<CsharpProject>, _>>()?
-        } else {
-            parse_unity_assemblies(&unity_assemblies)?
         };
         let mut rust_analyses = Vec::new();
         let analyzed_rust = self.analysis_pool.install(|| {
@@ -884,6 +891,25 @@ impl IndexScheduler {
             );
             entities.extend(unity_entities);
             observations.extend(unity_observations);
+            let script_paths = unity_script_metas
+                .iter()
+                .map(|(path, guid, _)| (guid.clone(), path.clone()))
+                .collect();
+            let prefab_paths = unity_prefab_metas
+                .iter()
+                .map(|(path, guid, _)| (guid.clone(), path.clone()))
+                .collect();
+            let (prefab_entities, prefab_observations, prefab_diagnostics) =
+                csharp_unity_prefab_dependencies(
+                    &state.repository.identity,
+                    unity_prefabs,
+                    &script_paths,
+                    &prefab_paths,
+                    &csharp_repository_source_refs,
+                );
+            entities.extend(prefab_entities);
+            observations.extend(prefab_observations);
+            diagnostics.extend(prefab_diagnostics);
         }
         observations.extend(resolve_csharp_repository_calls(
             &state.repository.identity,
@@ -1110,6 +1136,9 @@ fn index_workspace_versioned(
             elixir,
             csharp,
             csharp_projects,
+            unity_prefabs,
+            unity_script_metas,
+            unity_prefab_metas,
             typescript,
             typescript_manifests,
             typescript_configs,
@@ -1126,6 +1155,9 @@ fn index_workspace_versioned(
                         + elixir.len()
                         + csharp.len()
                         + csharp_projects.len()
+                        + unity_prefabs.len()
+                        + unity_script_metas.len()
+                        + unity_prefab_metas.len()
                         + typescript.len()
                         + typescript_manifests.len()
                         + typescript_configs.len()
@@ -1140,6 +1172,9 @@ fn index_workspace_versioned(
                     elixir: &elixir,
                     csharp: &csharp,
                     csharp_projects: &csharp_projects,
+                    unity_prefabs: &unity_prefabs,
+                    unity_script_metas: &unity_script_metas,
+                    unity_prefab_metas: &unity_prefab_metas,
                     typescript: &typescript,
                     typescript_manifests: &typescript_manifests,
                     typescript_configs: &typescript_configs,

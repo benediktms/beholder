@@ -95,6 +95,7 @@ fn entity_kind(kind: EntityKind) -> &'static str {
         EntityKind::ProtoService => "proto_service",
         EntityKind::ProtoType => "proto_type",
         EntityKind::Service => "service",
+        EntityKind::UnityPrefab => "unity_prefab",
     }
 }
 
