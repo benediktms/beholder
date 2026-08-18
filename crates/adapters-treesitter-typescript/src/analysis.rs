@@ -154,6 +154,52 @@ fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mu
     }
 }
 
+fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
+    let mut bindings = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if matches!(child.kind(), "public_field_definition" | "field_definition")
+            && let Some(mut binding) = binding(child, source)
+        {
+            binding.receiver = format!("this.{}", binding.receiver);
+            bindings.push(binding);
+        }
+        if child.kind() != "method_definition"
+            || child
+                .child_by_field_name("name")
+                .and_then(|name| text(name, source))
+                != Some("constructor")
+        {
+            continue;
+        }
+        let Some(parameters) = child.child_by_field_name("parameters") else {
+            continue;
+        };
+        let mut parameter_cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut parameter_cursor) {
+            let mut modifier_cursor = parameter.walk();
+            let has_access_modifier = parameter
+                .named_children(&mut modifier_cursor)
+                .any(|child| child.kind() == "accessibility_modifier");
+            let has_readonly = parameter
+                .child_by_field_name("pattern")
+                .and_then(|pattern| source.get(parameter.start_byte()..pattern.start_byte()))
+                .is_some_and(|prefix| {
+                    std::str::from_utf8(prefix).is_ok_and(|prefix| {
+                        prefix.split_whitespace().any(|word| word == "readonly")
+                    })
+                });
+            if (has_access_modifier || has_readonly)
+                && let Some(mut binding) = binding(parameter, source)
+            {
+                binding.receiver = format!("this.{}", binding.receiver);
+                bindings.push(binding);
+            }
+        }
+    }
+    bindings
+}
+
 fn definition(
     node: Node<'_>,
     body: Option<Node<'_>>,
@@ -262,6 +308,7 @@ fn collect_definitions(
             else {
                 return;
             };
+            let class_name = qualified(scope, name);
             definitions.push(definition(
                 node,
                 None,
@@ -272,9 +319,20 @@ fn collect_definitions(
             ));
             scope.push(name.into());
             if let Some(body) = node.child_by_field_name("body") {
+                let bindings = class_bindings(body, source);
+                let first_definition = definitions.len();
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {
                     collect_definitions(child, source, scope, definitions);
+                }
+                for definition in &mut definitions[first_definition..] {
+                    if definition
+                        .qualified_name
+                        .strip_prefix(&format!("{class_name}/"))
+                        .is_some_and(|member| !member.contains('/'))
+                    {
+                        definition.bindings.extend(bindings.iter().cloned());
+                    }
                 }
             }
             scope.pop();

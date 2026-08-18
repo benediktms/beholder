@@ -412,6 +412,11 @@ mod tests {
                 "import { Service } from './service'; export function injected(service: Service) { service.execute(); } export function created() { const service = new Service(); service.execute(); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/class-consumer.ts"),
+                "import { Service } from './service'; export class InjectedConsumer { constructor(private readonly service: Service) {} run() { this.service.execute(); } } export class FieldConsumer { private service: Service; run() { this.service.execute(); } }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -476,6 +481,14 @@ mod tests {
             assert!(observations.iter().any(|observation| {
                 observation.from.as_str()
                     == format!("repo://example/typescript/packages/app/src/consumer/{caller}")
+                    && observation.to.as_str()
+                        == "repo://example/typescript/packages/app/src/service/Service/execute"
+            }));
+        }
+        for caller in ["InjectedConsumer/run", "FieldConsumer/run"] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == format!("repo://example/typescript/packages/app/src/class-consumer/{caller}")
                     && observation.to.as_str()
                         == "repo://example/typescript/packages/app/src/service/Service/execute"
             }));
