@@ -162,13 +162,11 @@ pub struct IndexScheduler {
     changed: Notify,
     shutdown: Notify,
     cache_dir: PathBuf,
-    // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
     csharp_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<CsharpAnalysis>>>,
     typescript_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<TypescriptAnalysis>>>,
     protobuf_compiler: SourceCompiler,
-    repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<RepositoryAnalysis>>>,
     analysis_pool: rayon::ThreadPool,
 }
 
@@ -234,7 +232,6 @@ impl IndexScheduler {
             csharp_cache: Mutex::new(BTreeMap::new()),
             typescript_cache: Mutex::new(BTreeMap::new()),
             protobuf_compiler,
-            repository_cache: Mutex::new(BTreeMap::new()),
             analysis_pool,
         }
     }
@@ -302,10 +299,6 @@ impl IndexScheduler {
             .map_err(|_| "TypeScript frontend cache lock poisoned")?
             .clear();
         self.protobuf_compiler.clear_memory()?;
-        self.repository_cache
-            .lock()
-            .map_err(|_| "repository cache lock poisoned")?
-            .clear();
         if self.cache_dir.exists() {
             fs::remove_dir_all(&self.cache_dir)?;
         }
@@ -618,16 +611,6 @@ impl IndexScheduler {
             !descriptors.is_empty(),
         );
         let analysis_identity = key.analysis_identity();
-        if let Some(analysis) = self
-            .repository_cache
-            .lock()
-            .map_err(|_| "repository cache lock poisoned")?
-            .get(&key)
-            .cloned()
-        {
-            tracing::debug!(repository = %state.repository.identity, cache_status = "memory", "repository cache lookup");
-            return Ok((analysis, CacheStatus::Memory, analysis_identity));
-        }
         let (rust_frontend, rust_resolver) = key.rust.unwrap_or(("_", "_"));
         let (elixir_frontend, elixir_resolver) = key.elixir.unwrap_or(("_", "_"));
         let (csharp_frontend, csharp_resolver) = key.csharp.unwrap_or(("_", "_"));
@@ -651,10 +634,6 @@ impl IndexScheduler {
                 serde_json::from_reader::<_, RepositoryAnalysis>(BufReader::new(file))
         {
             let analysis = Arc::new(analysis);
-            self.repository_cache
-                .lock()
-                .map_err(|_| "repository cache lock poisoned")?
-                .insert(key, analysis.clone());
             tracing::debug!(repository = %state.repository.identity, cache_status = "disk", "repository cache lookup");
             return Ok((analysis, CacheStatus::Disk, analysis_identity));
         }
@@ -907,10 +886,6 @@ impl IndexScheduler {
                 let _ = writer.flush();
             }
         }
-        self.repository_cache
-            .lock()
-            .map_err(|_| "repository cache lock poisoned")?
-            .insert(key, analysis.clone());
         tracing::debug!(repository = %state.repository.identity, cache_status = "miss", "repository cache lookup");
         Ok((analysis, CacheStatus::Miss, analysis_identity))
     }
@@ -988,6 +963,7 @@ fn index_workspace_versioned(
     let mut dirty_source_units = 0;
     let mut diagnostics = Vec::new();
     let mut typescript_repositories = Vec::new();
+    let mut needs_workspace_resolution = false;
     let repository_analysis_started = Instant::now();
     for sources in repositories {
         let RepositorySources {
@@ -1001,6 +977,8 @@ fn index_workspace_versioned(
             protobuf,
             protobuf_source,
         } = sources;
+        needs_workspace_resolution |=
+            !rust.is_empty() || !elixir.is_empty() || !typescript.is_empty();
         dirty_source_units +=
             match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
                 Some(DirtyRepository::Sources(sources)) => sources.len(),
@@ -1053,17 +1031,24 @@ fn index_workspace_versioned(
     }
     let repository_analysis = repository_analysis_started.elapsed();
     let workspace_resolution_started = Instant::now();
-    let mut all_observations = repository_facts
+    let observation_count = repository_facts
         .iter()
-        .flat_map(|facts| facts.observations.iter().cloned())
-        .collect::<Vec<_>>();
-    let mut overrides = resolve_rust_repository_calls(&mut all_observations);
-    overrides.extend(resolve_workspace_modules(&all_observations));
-    overrides.extend(resolve_typescript_workspace_calls(
-        &mut all_observations,
-        &typescript_repositories,
-    ));
-    diagnostics.extend(unresolved_typescript_call_diagnostics(&all_observations));
+        .map(|facts| facts.observations.len())
+        .sum();
+    let mut overrides = Vec::new();
+    if needs_workspace_resolution {
+        let mut all_observations = repository_facts
+            .iter()
+            .flat_map(|facts| facts.observations.iter().cloned())
+            .collect::<Vec<_>>();
+        overrides = resolve_rust_repository_calls(&mut all_observations);
+        overrides.extend(resolve_workspace_modules(&all_observations));
+        overrides.extend(resolve_typescript_workspace_calls(
+            &mut all_observations,
+            &typescript_repositories,
+        ));
+        diagnostics.extend(unresolved_typescript_call_diagnostics(&all_observations));
+    }
     let workspace_resolution = workspace_resolution_started.elapsed();
     let publication_started = Instant::now();
     let changes = store.publish(&view, &repository_facts, &overrides)?;
@@ -1076,7 +1061,7 @@ fn index_workspace_versioned(
     pipeline::report_analysis_diagnostics(&workspace.name, &diagnostics);
     tracing::info!(
         workspace = %workspace.name,
-        observation_count = all_observations.len(),
+        observation_count,
         facts_inserted = changes.inserted,
         facts_updated = changes.updated,
         facts_removed = changes.removed,
@@ -1093,7 +1078,7 @@ fn index_workspace_versioned(
         checkpoint_ms = checkpoint.as_secs_f64() * 1000.0,
         "workspace indexed"
     );
-    Ok((all_observations.len(), true))
+    Ok((observation_count, true))
 }
 
 #[cfg(test)]
@@ -1474,27 +1459,22 @@ mod tests {
             let scheduler = IndexScheduler::new(cache.clone());
             let store = SemanticStore::memory().unwrap();
             assert!(scheduler.index(&store, &workspace).unwrap().1);
-            let cached = scheduler.repository_cache.lock().unwrap();
-            let repositories = cached
-                .values()
-                .filter_map(|analysis| analysis.typescript.clone())
-                .collect::<Vec<_>>();
-            let mut observations = cached
-                .values()
-                .flat_map(|analysis| analysis.observations.iter().cloned())
-                .collect::<Vec<_>>();
-            let overrides = resolve_typescript_workspace_calls(&mut observations, &repositories);
-            assert_eq!(overrides.len(), 2, "{repositories:?} {observations:?}");
-            let caller = overrides[0].from.clone();
-            drop(cached);
-            let context = store.context("main", caller.as_str()).unwrap();
+            let stored = store.inspect_observations(Some("calls")).unwrap();
+            let caller = stored
+                .rows
+                .iter()
+                .filter_map(|row| row[1].as_str())
+                .find(|from| from.ends_with("/typescript/src/start/start"))
+                .unwrap()
+                .to_owned();
+            let context = store.context("main", &caller).unwrap();
             for target in [
                 "/typescript/src/impl/work",
                 "/typescript/src/impl/Service/execute",
             ] {
                 assert!(
                     context.edges.iter().any(|edge| {
-                        edge.from == caller.as_str()
+                        edge.from == caller
                             && edge.to.starts_with("repo://local://")
                             && edge.to.ends_with(target)
                     }),
@@ -1506,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_cache_ignores_versions_for_absent_languages() {
+    fn repository_disk_cache_ignores_versions_for_absent_languages() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -1552,17 +1532,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(first_status, CacheStatus::Miss);
-        assert_eq!(second_status, CacheStatus::Memory);
+        assert_eq!(second_status, CacheStatus::Disk);
         assert_eq!(first_identity, second_identity);
         assert_eq!(
             first_identity,
             format!("rust:{FRONTEND_VERSION}:{RESOLVER_VERSION}")
         );
-        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.observations, second.observations);
         assert!(first.observations.iter().any(|observation| {
             observation.from.as_str() == "repo://repo/rust/lib/caller"
                 && observation.to.as_str() == "repo://repo/rust/lib/helper"
         }));
+        let first_weak = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(first_weak.upgrade().is_none());
 
         drop(scheduler);
         let scheduler = IndexScheduler::new(cache.clone());
@@ -1602,7 +1586,6 @@ mod tests {
         assert!(scheduler.elixir_cache.lock().unwrap().is_empty());
         assert!(scheduler.csharp_cache.lock().unwrap().is_empty());
         assert!(scheduler.typescript_cache.lock().unwrap().is_empty());
-        assert!(scheduler.repository_cache.lock().unwrap().is_empty());
         assert!(!cache.exists());
     }
 
@@ -2008,7 +1991,6 @@ mod tests {
         );
         assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 1);
         assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 2);
-        assert_eq!(scheduler.repository_cache.lock().unwrap().len(), 2);
         let observations = format!("{:?}", store.inspect_observations(None).unwrap());
         assert!(observations.contains("/rust/lib/indexed"));
         assert!(observations.contains("/elixir/Sample/indexed/0"));
