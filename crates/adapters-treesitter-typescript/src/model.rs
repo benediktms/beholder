@@ -46,6 +46,8 @@ pub struct TypescriptAnalysis {
     pub(super) imports: Vec<Import>,
     pub(super) exports: Vec<Export>,
     pub(super) string_constants: Vec<StringConstant>,
+    pub(super) nest_modules: Vec<NestModule>,
+    pub(super) nest_providers: Vec<NestProvider>,
     pub(super) parse_error_lines: Vec<usize>,
 }
 
@@ -102,6 +104,24 @@ pub(super) struct Definition {
 pub(super) struct Binding {
     pub(super) receiver: String,
     pub(super) type_name: String,
+    pub(super) injection_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct NestModule {
+    pub(super) name: String,
+    pub(super) imports: Vec<String>,
+    pub(super) providers: Vec<String>,
+    pub(super) members: Vec<String>,
+    pub(super) exports: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct NestProvider {
+    pub(super) name: String,
+    pub(super) token: String,
+    pub(super) implementation: String,
+    pub(super) existing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

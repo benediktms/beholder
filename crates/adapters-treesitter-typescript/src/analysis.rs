@@ -1,4 +1,4 @@
-use super::{model::*, ts_proto};
+use super::{model::*, nestjs_di, ts_proto};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, Provenance, StructuralRelation,
@@ -229,7 +229,29 @@ fn binding(node: Node<'_>, source: &[u8]) -> Option<Binding> {
     Some(Binding {
         receiver,
         type_name,
+        injection_token: injection_token(node, source),
     })
+}
+
+fn injection_token(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .find_map(|decorator| {
+            let call = decorator.named_child(0)?;
+            if call.kind() != "call_expression"
+                || call
+                    .child_by_field_name("function")
+                    .and_then(|function| text(function, source))
+                    != Some("Inject")
+            {
+                return None;
+            }
+            call.child_by_field_name("arguments")?
+                .named_child(0)
+                .and_then(|argument| text(argument, source))
+                .map(str::to_owned)
+        })
 }
 
 fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mut Vec<Binding>) {
@@ -434,6 +456,7 @@ fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
                 alias.receiver.starts_with("this.").then(|| Binding {
                     receiver: alias.receiver,
                     type_name: parameter.type_name.clone(),
+                    injection_token: parameter.injection_token.clone(),
                 })
             }));
         }
@@ -884,6 +907,7 @@ pub fn analyze(
     collect_imports(tree.root_node(), source.as_bytes(), &mut imports);
     collect_exports(tree.root_node(), source.as_bytes(), &mut exports);
     collect_string_constants(tree.root_node(), source.as_bytes(), &mut string_constants);
+    let (nest_modules, nest_providers) = nestjs_di::extract(tree.root_node(), source.as_bytes());
     collect_parse_errors(tree.root_node(), &mut parse_error_lines);
     parse_error_lines.sort_unstable();
     parse_error_lines.dedup();
@@ -894,6 +918,8 @@ pub fn analyze(
         imports,
         exports,
         string_constants,
+        nest_modules,
+        nest_providers,
         parse_error_lines,
     })
 }

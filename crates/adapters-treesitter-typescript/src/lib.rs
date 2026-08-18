@@ -1,10 +1,11 @@
-pub const FRONTEND_VERSION: &str = "21";
-pub const RESOLVER_VERSION: &str = "14";
+pub const FRONTEND_VERSION: &str = "22";
+pub const RESOLVER_VERSION: &str = "15";
 
 mod analysis;
 mod grpc;
 mod model;
 mod nestjs;
+mod nestjs_di;
 mod resolution;
 mod ts_proto;
 
