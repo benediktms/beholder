@@ -545,6 +545,7 @@ fn entity_ref_with_origin(
                 || id.starts_with("elixir-call://")
                 || id.starts_with("elixir-module://")
                 || id.starts_with("erlang-module://")
+                || id.starts_with("unity://")
             {
                 EntityOrigin::ExternalDependency
             } else {
@@ -762,6 +763,18 @@ mod tests {
             EntityKind::Namespace
         );
         assert_eq!(graph.nodes.len(), 1);
+    }
+
+    #[test]
+    fn treats_unity_callbacks_as_external_dependencies() {
+        assert_eq!(
+            entity_ref(
+                "unity://UnityEngine.MonoBehaviour/Update()",
+                EntityKind::Callable
+            )
+            .origin,
+            EntityOrigin::ExternalDependency
+        );
     }
 
     #[test]

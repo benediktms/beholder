@@ -69,6 +69,7 @@ pub(super) fn is_index_input(path: &Path) -> bool {
         .is_some_and(|name| {
             matches!(name, "buf.yaml" | "buf.lock" | "package.json")
                 || name.ends_with(".csproj")
+                || name.ends_with(".asmdef")
                 || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
                     && name.ends_with(".json"))
         }))
@@ -190,7 +191,7 @@ pub(super) fn repository_sources(
         .collect::<Result<CsharpSources, Box<dyn Error>>>()?;
     let (csharp_project_files, sources): (Vec<_>, Vec<_>) = sources.into_iter().partition(|path| {
         path.extension()
-            .is_some_and(|extension| extension == "csproj")
+            .is_some_and(|extension| matches!(extension.to_str(), Some("csproj" | "asmdef")))
     });
     let csharp_projects = csharp_project_files
         .into_iter()
@@ -398,6 +399,11 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            repository.join("src/App.asmdef"),
+            r#"{"name":"Example.App"}"#,
+        )
+        .unwrap();
+        fs::write(
             repository.join("src/sjis.cs"),
             [b'c', b'l', b'a', b's', b's', b' ', 0x83, 0x65, 0x83, 0x58],
         )
@@ -407,7 +413,7 @@ mod tests {
 
         let sources = repository_sources(&repository, &[]).unwrap();
         assert_eq!(sources.csharp.len(), 2);
-        assert_eq!(sources.csharp_projects.len(), 1);
+        assert_eq!(sources.csharp_projects.len(), 2);
         assert_eq!(sources.csharp[0].0, Path::new("src/Program.cs"));
         let (_, lossy) = decode_csharp_source(&sources.csharp[1].1);
         assert!(lossy);

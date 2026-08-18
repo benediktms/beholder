@@ -7,9 +7,9 @@ use beholder_adapters_treesitter_csharp::{
     CsharpAnalysis, CsharpProject, CsharpSource, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
     RESOLVER_VERSION as CSHARP_RESOLVER_VERSION, diagnostics_from_analysis as csharp_diagnostics,
     entities_from_analysis as csharp_entities, observations_from_analysis as csharp_observations,
-    parse_project as parse_csharp_project,
+    parse_project as parse_csharp_project, parse_unity_assemblies,
     resolve_repository_calls as resolve_csharp_repository_calls,
-    source_assemblies as csharp_source_assemblies,
+    source_assemblies as csharp_source_assemblies, unity_lifecycle as csharp_unity_lifecycle,
 };
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
@@ -681,10 +681,23 @@ impl IndexScheduler {
         let mut entities = Vec::<EntityFact>::new();
         let mut grpc_bindings = Vec::new();
         let mut diagnostics = Vec::new();
-        let csharp_projects = csharp_projects
+        let unity_assemblies = csharp_projects
             .iter()
-            .map(|(path, source)| parse_csharp_project(path, source))
-            .collect::<Result<Vec<CsharpProject>, _>>()?;
+            .filter(|(path, _)| {
+                path.extension()
+                    .is_some_and(|extension| extension == "asmdef")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let is_unity = !unity_assemblies.is_empty();
+        let csharp_projects = if unity_assemblies.is_empty() {
+            csharp_projects
+                .iter()
+                .map(|(path, source)| parse_csharp_project(path, source))
+                .collect::<Result<Vec<CsharpProject>, _>>()?
+        } else {
+            parse_unity_assemblies(&unity_assemblies)?
+        };
         let mut rust_analyses = Vec::new();
         let analyzed_rust = self.analysis_pool.install(|| {
             rust_sources
@@ -863,6 +876,15 @@ impl IndexScheduler {
                 analysis,
             })
             .collect::<Vec<_>>();
+        if is_unity {
+            let (unity_entities, unity_observations) = csharp_unity_lifecycle(
+                &state.repository.identity,
+                &csharp_projects,
+                &csharp_repository_source_refs,
+            );
+            entities.extend(unity_entities);
+            observations.extend(unity_observations);
+        }
         observations.extend(resolve_csharp_repository_calls(
             &state.repository.identity,
             &csharp_projects,

@@ -19,6 +19,7 @@ pub(super) struct Definition {
     pub(super) kind: DefinitionKind,
     pub(super) return_type: Option<String>,
     pub(super) base_types: Vec<String>,
+    pub(super) is_static: bool,
     pub(super) line: usize,
     pub(super) parameters: Vec<Parameter>,
     pub(super) locals: Vec<Binding>,

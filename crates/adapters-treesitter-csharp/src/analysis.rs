@@ -303,6 +303,9 @@ fn collect_definitions(
         } else {
             Vec::new()
         },
+        is_static: node
+            .children(&mut node.walk())
+            .any(|child| child.kind() == "modifier" && text(child, source) == Some("static")),
         line: node.start_position().row + 1,
         parameters: if kind == DefinitionKind::Callable {
             parameters(node, source)

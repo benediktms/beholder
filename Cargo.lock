@@ -299,6 +299,7 @@ dependencies = [
  "beholder-domain",
  "quick-xml",
  "serde",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-c-sharp",
 ]
