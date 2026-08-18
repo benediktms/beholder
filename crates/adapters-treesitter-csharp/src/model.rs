@@ -19,7 +19,14 @@ pub(super) struct Definition {
     pub(super) kind: DefinitionKind,
     pub(super) line: usize,
     pub(super) parameters: Vec<Parameter>,
+    pub(super) locals: Vec<Binding>,
     pub(super) calls: Vec<Call>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Binding {
+    pub(super) name: String,
+    pub(super) type_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

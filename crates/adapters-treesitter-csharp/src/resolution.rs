@@ -55,10 +55,17 @@ fn inferred_argument_type<'a>(caller: &'a Definition, expression: &str) -> Optio
         .iter()
         .find(|parameter| parameter.name == expression)
         .map(|parameter| parameter.type_name.as_str())
+        .or_else(|| {
+            caller
+                .locals
+                .iter()
+                .find(|binding| binding.name == expression)
+                .map(|binding| binding.type_name.as_str())
+        })
         .or_else(|| expression.starts_with('"').then_some("string"))
 }
 
-fn call_is_applicable(caller: &Definition, target: &Definition, call: &Call) -> bool {
+fn call_is_applicable(target: &Definition, call: &Call) -> bool {
     let parameters = if call.kind == CallKind::Member
         && target
             .parameters
@@ -79,22 +86,52 @@ fn call_is_applicable(caller: &Definition, target: &Definition, call: &Call) -> 
         return false;
     }
     call.arguments.iter().enumerate().all(|(index, argument)| {
-        let Some(parameter) = argument
+        argument
             .name
             .as_deref()
             .and_then(|name| parameters.iter().find(|parameter| parameter.name == name))
             .or_else(|| parameters.get(index))
-        else {
-            return false;
-        };
-        inferred_argument_type(caller, &argument.expression).is_none_or(|argument_type| {
-            simple_type_name(argument_type) == simple_type_name(&parameter.type_name)
-        })
+            .is_some()
     })
 }
 
+fn argument_match_score(caller: &Definition, target: &Definition, call: &Call) -> usize {
+    let parameters = if call.kind == CallKind::Member
+        && target
+            .parameters
+            .first()
+            .is_some_and(|parameter| parameter.is_extension)
+    {
+        &target.parameters[1..]
+    } else {
+        target.parameters.as_slice()
+    };
+    call.arguments
+        .iter()
+        .enumerate()
+        .filter(|(index, argument)| {
+            let parameter = argument
+                .name
+                .as_deref()
+                .and_then(|name| parameters.iter().find(|parameter| parameter.name == name))
+                .or_else(|| parameters.get(*index));
+            parameter
+                .zip(inferred_argument_type(caller, &argument.expression))
+                .is_some_and(|(parameter, argument_type)| {
+                    simple_type_name(argument_type) == simple_type_name(&parameter.type_name)
+                })
+        })
+        .count()
+}
+
 fn target_matches(caller: &Definition, target: &Definition, call: &Call) -> bool {
-    if callable_name(target) != call.name {
+    if callable_name(target)
+        != if call.kind == CallKind::Constructor {
+            simple_type_name(&call.name)
+        } else {
+            &call.name
+        }
+    {
         return false;
     }
     let owner_matches = match call.kind {
@@ -102,7 +139,7 @@ fn target_matches(caller: &Definition, target: &Definition, call: &Call) -> bool
         CallKind::Constructor => parent(&target.qualified_name)
             .rsplit('/')
             .next()
-            .is_some_and(|type_name| type_name == call.name),
+            .is_some_and(|type_name| type_name == simple_type_name(&call.name)),
         CallKind::Member if call.receiver.as_deref() == Some("this") => {
             parent(&target.qualified_name) == parent(&caller.qualified_name)
         }
@@ -111,20 +148,36 @@ fn target_matches(caller: &Definition, target: &Definition, call: &Call) -> bool
             caller
                 .parameters
                 .iter()
-                .find(|parameter| parameter.name == receiver)
+                .map(|parameter| (&parameter.name, &parameter.type_name))
+                .chain(
+                    caller
+                        .locals
+                        .iter()
+                        .map(|binding| (&binding.name, &binding.type_name)),
+                )
+                .find(|(name, _)| name.as_str() == receiver)
                 .zip(target.parameters.first())
-                .is_some_and(|(receiver, first)| {
+                .is_some_and(|((_, receiver_type), first)| {
                     first.is_extension
-                        && simple_type_name(&first.type_name)
-                            == simple_type_name(&receiver.type_name)
+                        && simple_type_name(&first.type_name) == simple_type_name(receiver_type)
                 })
+                || caller
+                    .locals
+                    .iter()
+                    .find(|binding| binding.name == receiver)
+                    .is_some_and(|binding| {
+                        parent(&target.qualified_name)
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|owner| owner == simple_type_name(&binding.type_name))
+                    })
                 || parent(&target.qualified_name)
                     .rsplit('/')
                     .next()
                     .is_some_and(|owner| owner == simple_type_name(receiver))
         }
     };
-    owner_matches && call_is_applicable(caller, target, call)
+    owner_matches && call_is_applicable(target, call)
 }
 
 fn id(repository: &str, source: &CsharpSource<'_>, definition: &Definition) -> String {
@@ -172,8 +225,13 @@ pub fn resolve_repository_calls(
             .filter(|definition| definition.kind == DefinitionKind::Callable)
         {
             for call in &caller.calls {
-                let candidates = definitions
-                    .get(call.name.as_str())
+                let lookup_name = if call.kind == CallKind::Constructor {
+                    simple_type_name(&call.name)
+                } else {
+                    &call.name
+                };
+                let mut candidates = definitions
+                    .get(lookup_name)
                     .into_iter()
                     .flatten()
                     .filter(|(candidate, target)| {
@@ -193,6 +251,15 @@ pub fn resolve_repository_calls(
                     .collect::<BTreeMap<_, _>>()
                     .into_values()
                     .collect::<Vec<_>>();
+                if let Some(best_score) = candidates
+                    .iter()
+                    .map(|(_, target)| argument_match_score(caller, target, call))
+                    .max()
+                {
+                    candidates.retain(|(_, target)| {
+                        argument_match_score(caller, target, call) == best_score
+                    });
+                }
                 if let [(target_source, target)] = candidates.as_slice() {
                     observations.push(Observation::dependency(
                         id(repository, source, caller),
@@ -312,9 +379,9 @@ mod tests {
         )
         .unwrap();
         let core_project = parse_project(Path::new("Core/Core.csproj"), "<Project />").unwrap();
-        let app = analyze("static class Syntax { static void Start(string text) { Parse(text, flag: null); SourceText.From(text); } static void Parse(string text, object? flag) {} static void Parse(SourceText text, object? flag) {} }").unwrap();
+        let app = analyze("static class Syntax { static void Start(string text) { Parse(text, flag: null); SourceText.From(text); var source = new Core.SourceText(); source.Read(); var derived = new Core.Derived(); Accept(derived); } static void Parse(string text, object? flag) {} static void Parse(SourceText text, object? flag) {} static void Accept(Core.Base value) {} }").unwrap();
         let core = analyze(
-            "class SourceText { public static SourceText From(string text) { return new SourceText(); } public SourceText() {} }",
+            "namespace Core { class SourceText { public static SourceText From(string text) { return new SourceText(); } public SourceText() {} public void Read() {} } class Base {} class Derived : Base {} }",
         )
         .unwrap();
         let sources = [
@@ -350,6 +417,25 @@ mod tests {
                         .to
                         .as_str()
                         .ends_with("/SourceText/From(string)")
+            }),
+            "{observations:#?}"
+        );
+        for target in ["/Core/SourceText/SourceText()", "/Core/SourceText/Read()"] {
+            assert!(
+                observations.iter().any(|observation| {
+                    observation.from.as_str().ends_with("/Syntax/Start(string)")
+                        && observation.to.as_str().ends_with(target)
+                }),
+                "missing {target}: {observations:#?}"
+            );
+        }
+        assert!(
+            observations.iter().any(|observation| {
+                observation.from.as_str().ends_with("/Syntax/Start(string)")
+                    && observation
+                        .to
+                        .as_str()
+                        .ends_with("/Syntax/Accept(Core.Base)")
             }),
             "{observations:#?}"
         );

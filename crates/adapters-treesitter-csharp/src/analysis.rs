@@ -185,6 +185,52 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
     }
 }
 
+fn collect_locals(node: Node<'_>, source: &[u8], root: Node<'_>, locals: &mut Vec<Binding>) {
+    if node != root && declaration_kind(node) == Some(DefinitionKind::Callable) {
+        return;
+    }
+    if node.kind() == "variable_declaration"
+        && let Some(declared_type) = node
+            .child_by_field_name("type")
+            .and_then(|type_| text(type_, source))
+    {
+        let mut cursor = node.walk();
+        for declarator in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "variable_declarator")
+        {
+            let Some(name) = declarator
+                .child_by_field_name("name")
+                .and_then(|name| text(name, source))
+            else {
+                continue;
+            };
+            let inferred_type = declarator
+                .named_children(&mut declarator.walk())
+                .find(|child| {
+                    Some(*child) != declarator.child_by_field_name("name")
+                        && child.kind() != "bracketed_argument_list"
+                })
+                .and_then(|value| match value.kind() {
+                    "object_creation_expression" | "cast_expression" => value
+                        .child_by_field_name("type")
+                        .and_then(|type_| text(type_, source)),
+                    _ => None,
+                });
+            if declared_type != "var" || inferred_type.is_some() {
+                locals.push(Binding {
+                    name: name.into(),
+                    type_name: inferred_type.unwrap_or(declared_type).into(),
+                });
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_locals(child, source, root, locals);
+    }
+}
+
 fn collect_definitions(
     node: Node<'_>,
     source: &[u8],
@@ -223,10 +269,12 @@ fn collect_definitions(
         .collect::<Vec<_>>()
         .join("/");
     let mut calls = Vec::new();
+    let mut locals = Vec::new();
     if kind == DefinitionKind::Callable
         && let Some(body) = node.child_by_field_name("body")
     {
         collect_calls(body, source, body, &mut calls);
+        collect_locals(body, source, body, &mut locals);
     }
     definitions.push(Definition {
         qualified_name,
@@ -237,6 +285,7 @@ fn collect_definitions(
         } else {
             Vec::new()
         },
+        locals,
         calls,
     });
     let mut nested_scope = scope.to_vec();
