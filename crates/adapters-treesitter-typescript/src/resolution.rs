@@ -604,6 +604,11 @@ mod tests {
                 "import { Modal } from './modal-index'; export const FactoryConsumer = () => <Modal.Route />;",
                 SourceLanguage::Tsx,
             ),
+            (
+                Path::new("packages/app/src/async-consumer.ts"),
+                "import { Service } from './service'; export async function asyncConsumer(service: Service) { await Promise.resolve().then(() => service.execute()); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -706,5 +711,11 @@ mod tests {
                 .iter()
                 .all(|observation| observation.to.as_str() != "typescript-call://main")
         );
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/async-consumer/asyncConsumer"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/service/Service/execute"
+        }));
     }
 }

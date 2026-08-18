@@ -70,14 +70,16 @@ fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
 
 fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
     if node != root
-        && matches!(
+        && (matches!(
             node.kind(),
-            "arrow_function"
-                | "function_declaration"
+            "function_declaration"
                 | "function_expression"
                 | "generator_function_declaration"
                 | "method_definition"
-        )
+        ) || (node.kind() == "arrow_function"
+            && node
+                .parent()
+                .is_none_or(|parent| parent.kind() != "arguments")))
     {
         return;
     }
