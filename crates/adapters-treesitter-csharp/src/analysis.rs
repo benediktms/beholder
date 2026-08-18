@@ -1,0 +1,414 @@
+use super::model::*;
+use beholder_domain::{
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
+    Observation, Provenance, StructuralRelation,
+};
+use std::{collections::BTreeMap, error::Error, path::Path};
+use tree_sitter::{Node, Parser};
+
+fn text<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    node.utf8_text(source).ok()
+}
+
+fn declaration_kind(node: Node<'_>) -> Option<DefinitionKind> {
+    match node.kind() {
+        "namespace_declaration"
+        | "file_scoped_namespace_declaration"
+        | "class_declaration"
+        | "struct_declaration"
+        | "interface_declaration"
+        | "record_declaration"
+        | "enum_declaration"
+        | "delegate_declaration" => Some(DefinitionKind::Namespace),
+        "method_declaration"
+        | "constructor_declaration"
+        | "local_function_statement"
+        | "operator_declaration"
+        | "conversion_operator_declaration" => Some(DefinitionKind::Callable),
+        _ => None,
+    }
+}
+
+fn declaration_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let name = text(node.child_by_field_name("name")?, source)?;
+    if declaration_kind(node) != Some(DefinitionKind::Callable) {
+        return Some(name.replace('.', "/"));
+    }
+    let parameters = node
+        .child_by_field_name("parameters")
+        .map(|parameters| {
+            let mut cursor = parameters.walk();
+            parameters
+                .named_children(&mut cursor)
+                .filter(|parameter| parameter.kind() == "parameter")
+                .filter_map(|parameter| parameter.child_by_field_name("type"))
+                .filter_map(|kind| text(kind, source))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    Some(format!("{name}({parameters})"))
+}
+
+fn simple_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|name| text(name, source))
+        .or_else(|| text(node, source))?;
+    Some(name.split('<').next().unwrap_or(name).trim().to_owned())
+}
+
+fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
+    match node.kind() {
+        "invocation_expression" => {
+            let function = node.child_by_field_name("function")?;
+            if function.kind() == "member_access_expression" {
+                return Some(Call {
+                    kind: CallKind::Member,
+                    receiver: function
+                        .child_by_field_name("expression")
+                        .and_then(|receiver| text(receiver, source))
+                        .map(str::to_owned),
+                    name: simple_name(function, source)?,
+                    line: node.start_position().row + 1,
+                });
+            }
+            Some(Call {
+                kind: CallKind::Direct,
+                receiver: None,
+                name: simple_name(function, source)?,
+                line: node.start_position().row + 1,
+            })
+        }
+        "object_creation_expression" => Some(Call {
+            kind: CallKind::Constructor,
+            receiver: None,
+            name: node
+                .child_by_field_name("type")
+                .and_then(|kind| text(kind, source))?
+                .to_owned(),
+            line: node.start_position().row + 1,
+        }),
+        _ => None,
+    }
+}
+
+fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
+    if node != root && declaration_kind(node) == Some(DefinitionKind::Callable) {
+        return;
+    }
+    if let Some(call) = call(node, source) {
+        calls.push(call);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_calls(child, source, root, calls);
+    }
+}
+
+fn collect_definitions(
+    node: Node<'_>,
+    source: &[u8],
+    scope: &[String],
+    definitions: &mut Vec<Definition>,
+) {
+    if node.kind() == "compilation_unit" {
+        let mut file_scope = scope.to_vec();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "file_scoped_namespace_declaration" {
+                collect_definitions(child, source, scope, definitions);
+                if let Some(name) = declaration_name(child, source) {
+                    file_scope.extend(name.split('/').map(str::to_owned));
+                }
+            } else {
+                collect_definitions(child, source, &file_scope, definitions);
+            }
+        }
+        return;
+    }
+    let Some(kind) = declaration_kind(node) else {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_definitions(child, source, scope, definitions);
+        }
+        return;
+    };
+    let Some(name) = declaration_name(node, source) else {
+        return;
+    };
+    let qualified_name = scope
+        .iter()
+        .chain(std::iter::once(&name))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("/");
+    let mut calls = Vec::new();
+    if kind == DefinitionKind::Callable
+        && let Some(body) = node.child_by_field_name("body")
+    {
+        collect_calls(body, source, body, &mut calls);
+    }
+    definitions.push(Definition {
+        qualified_name,
+        kind,
+        line: node.start_position().row + 1,
+        calls,
+    });
+    let mut nested_scope = scope.to_vec();
+    nested_scope.extend(name.split('/').map(str::to_owned));
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child != node.child_by_field_name("name").unwrap_or(child) {
+            collect_definitions(child, source, &nested_scope, definitions);
+        }
+    }
+}
+
+fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>) {
+    if node.is_error() || node.is_missing() {
+        lines.push(node.start_position().row + 1);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_parse_errors(child, lines);
+    }
+}
+
+pub fn analyze(source: &str) -> Result<CsharpAnalysis, Box<dyn Error>> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("C# parser returned no tree")?;
+    let mut definitions = Vec::new();
+    let mut parse_error_lines = Vec::new();
+    collect_definitions(tree.root_node(), source.as_bytes(), &[], &mut definitions);
+    collect_parse_errors(tree.root_node(), &mut parse_error_lines);
+    parse_error_lines.sort_unstable();
+    parse_error_lines.dedup();
+    Ok(CsharpAnalysis {
+        definitions,
+        parse_error_lines,
+    })
+}
+
+pub fn diagnostics_from_analysis(
+    analysis: &CsharpAnalysis,
+    path: &Path,
+) -> Vec<AnalysisDiagnostic> {
+    analysis
+        .parse_error_lines
+        .iter()
+        .map(|line| AnalysisDiagnostic {
+            code: "csharp.parse_recovery".into(),
+            severity: AnalysisDiagnosticSeverity::Warning,
+            path: path.into(),
+            line: u32::try_from(*line).ok(),
+            detail: Some("tree-sitter recovered from invalid or unsupported C# syntax".into()),
+        })
+        .collect()
+}
+
+fn source_stem(path: &Path) -> String {
+    path.with_extension("")
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+fn is_generated_source(path: &Path, source: &str) -> bool {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".generated") || name.ends_with(".g"))
+        || source.lines().take(20).any(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("<auto-generated") || line.contains("generated by")
+        })
+}
+
+fn local_target(
+    analysis: &CsharpAnalysis,
+    ids: &BTreeMap<String, String>,
+    scope: &str,
+    call: &Call,
+) -> Option<String> {
+    let mut candidates = analysis
+        .definitions
+        .iter()
+        .filter(|definition| definition.kind == DefinitionKind::Callable)
+        .filter(|definition| {
+            let simple = definition
+                .qualified_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(&definition.qualified_name);
+            let callable = simple.split('(').next().unwrap_or(simple);
+            callable == call.name
+                && (call.kind != CallKind::Member || call.receiver.as_deref() == Some("this"))
+        })
+        .filter_map(|definition| {
+            ids.get(&definition.qualified_name)
+                .map(|id| (&definition.qualified_name, id))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(name, _)| !name.starts_with(scope));
+    (candidates.len() == 1).then(|| candidates[0].1.clone())
+}
+
+pub fn observations_from_analysis(
+    repository: &str,
+    analysis: &CsharpAnalysis,
+    source: &str,
+    path: &Path,
+) -> Vec<Observation> {
+    let module_id = format!("repo://{repository}/csharp/{}", source_stem(path));
+    let source_id = format!("repo://{repository}/csharp-source/{}", path.display());
+    let ids = analysis
+        .definitions
+        .iter()
+        .map(|definition| {
+            (
+                definition.qualified_name.clone(),
+                format!("{module_id}/{}", definition.qualified_name),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut observations = vec![Observation::structural(
+        source_id,
+        StructuralRelation::Defines,
+        module_id.clone(),
+        path.display().to_string(),
+    )];
+    for definition in &analysis.definitions {
+        let id = &ids[&definition.qualified_name];
+        let parent_name = definition
+            .qualified_name
+            .rsplit_once('/')
+            .map(|(parent, _)| parent);
+        let parent = parent_name
+            .and_then(|parent| ids.get(parent))
+            .unwrap_or(&module_id);
+        observations.push(Observation::structural(
+            parent.clone(),
+            StructuralRelation::Defines,
+            id.clone(),
+            format!("{}:{}", path.display(), definition.line),
+        ));
+        for call in &definition.calls {
+            let Some(target) = local_target(analysis, &ids, parent_name.unwrap_or_default(), call)
+            else {
+                continue;
+            };
+            observations.push(Observation::dependency(
+                id.clone(),
+                DependencyRelation::Calls,
+                target,
+                format!("{}:{}", path.display(), call.line),
+            ));
+        }
+    }
+    if is_generated_source(path, source) {
+        for observation in &mut observations {
+            observation.provenance = Provenance::Generated;
+        }
+    }
+    observations
+}
+
+pub fn entities_from_analysis(
+    repository: &str,
+    analysis: &CsharpAnalysis,
+    path: &Path,
+) -> Vec<EntityFact> {
+    let module_id = format!("repo://{repository}/csharp/{}", source_stem(path));
+    std::iter::once(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap())
+        .chain(analysis.definitions.iter().map(|definition| {
+            EntityFact::new(
+                format!("{module_id}/{}", definition.qualified_name),
+                match definition.kind {
+                    DefinitionKind::Namespace => EntityKind::Namespace,
+                    DefinitionKind::Callable => EntityKind::Callable,
+                },
+                None,
+            )
+            .unwrap()
+        }))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beholder_domain::{Confidence, SemanticRelation};
+
+    #[test]
+    fn indexes_file_scoped_namespaces_and_same_type_calls() {
+        let source = r#"
+namespace Game.Core;
+
+public sealed class Runner
+{
+    public void Run() { Helper(); var worker = new Worker(); }
+    private void Helper() {}
+}
+
+public sealed class Worker
+{
+    public Worker() {}
+}
+"#;
+        let analysis = analyze(source).unwrap();
+        let observations =
+            observations_from_analysis("example", &analysis, source, Path::new("src/Runner.cs"));
+
+        assert!(analysis.parse_error_lines.is_empty());
+        assert!(
+            observations.iter().any(|observation| {
+                observation
+                    .from
+                    .as_str()
+                    .ends_with("/Game/Core/Runner/Run()")
+                    && observation
+                        .to
+                        .as_str()
+                        .ends_with("/Game/Core/Runner/Helper()")
+                    && observation.relation
+                        == SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation.confidence == Confidence::Exact
+            }),
+            "{observations:#?}"
+        );
+        assert!(
+            observations.iter().any(|observation| {
+                observation
+                    .from
+                    .as_str()
+                    .ends_with("/Game/Core/Runner/Run()")
+                    && observation
+                        .to
+                        .as_str()
+                        .ends_with("/Game/Core/Worker/Worker()")
+            }),
+            "{observations:#?}"
+        );
+    }
+
+    #[test]
+    fn reports_parse_recovery() {
+        let analysis = analyze("class Broken { void Run( }").unwrap();
+        assert!(!diagnostics_from_analysis(&analysis, Path::new("Broken.cs")).is_empty());
+    }
+
+    #[test]
+    fn does_not_publish_unresolved_calls_as_exact_edges() {
+        let source = "class Runner { void Run() { External.Call(); } }";
+        let analysis = analyze(source).unwrap();
+        let observations =
+            observations_from_analysis("example", &analysis, source, Path::new("src/Runner.cs"));
+
+        assert!(!observations.iter().any(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+        }));
+    }
+}

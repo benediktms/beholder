@@ -3,6 +3,11 @@ use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_protobuf::{
     FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, SourceCompiler, facts as protobuf_facts,
 };
+use beholder_adapters_treesitter_csharp::{
+    CsharpAnalysis, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
+    RESOLVER_VERSION as CSHARP_RESOLVER_VERSION, diagnostics_from_analysis as csharp_diagnostics,
+    entities_from_analysis as csharp_entities, observations_from_analysis as csharp_observations,
+};
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
     RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
@@ -28,7 +33,10 @@ use beholder_adapters_treesitter_typescript::{
     resolve_workspace_calls as resolve_typescript_workspace_calls,
     unresolved_call_diagnostics as unresolved_typescript_call_diagnostics,
 };
-use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
+use beholder_domain::{
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, EntityFact, RepositoryFacts, RepositoryState,
+    Workspace, WorkspaceView,
+};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
 use rayon::prelude::*;
@@ -47,6 +55,8 @@ use tokio::{
 
 #[path = "cache.rs"]
 mod cache;
+#[path = "csharp_analysis.rs"]
+mod csharp_analysis;
 #[path = "elixir_analysis.rs"]
 mod elixir_analysis;
 #[path = "pipeline.rs"]
@@ -58,7 +68,7 @@ mod sources;
 #[path = "typescript_analysis.rs"]
 mod typescript_analysis;
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
-use sources::{RepositorySources, is_index_input, repository_sources};
+use sources::{RepositorySources, decode_csharp_source, is_index_input, repository_sources};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
@@ -71,6 +81,8 @@ struct AnalysisVersions {
     rust_resolver: &'static str,
     elixir_frontend: &'static str,
     elixir_resolver: &'static str,
+    csharp_frontend: &'static str,
+    csharp_resolver: &'static str,
     typescript_frontend: &'static str,
     typescript_resolver: &'static str,
     protobuf_frontend: &'static str,
@@ -82,6 +94,8 @@ const CURRENT_ANALYSIS_VERSIONS: AnalysisVersions = AnalysisVersions {
     rust_resolver: RESOLVER_VERSION,
     elixir_frontend: ELIXIR_FRONTEND_VERSION,
     elixir_resolver: ELIXIR_RESOLVER_VERSION,
+    csharp_frontend: CSHARP_FRONTEND_VERSION,
+    csharp_resolver: CSHARP_RESOLVER_VERSION,
     typescript_frontend: TYPESCRIPT_FRONTEND_VERSION,
     typescript_resolver: TYPESCRIPT_RESOLVER_VERSION,
     protobuf_frontend: PROTOBUF_FRONTEND_VERSION,
@@ -94,6 +108,7 @@ impl AnalysisVersions {
         fingerprint: String,
         has_rust: bool,
         has_elixir: bool,
+        has_csharp: bool,
         has_typescript: bool,
         has_protobuf: bool,
     ) -> RepositoryAnalysisKey {
@@ -101,6 +116,7 @@ impl AnalysisVersions {
             fingerprint,
             rust: has_rust.then_some((self.rust_frontend, self.rust_resolver)),
             elixir: has_elixir.then_some((self.elixir_frontend, self.elixir_resolver)),
+            csharp: has_csharp.then_some((self.csharp_frontend, self.csharp_resolver)),
             typescript: has_typescript
                 .then_some((self.typescript_frontend, self.typescript_resolver)),
             protobuf: has_protobuf.then_some(self.protobuf_frontend),
@@ -114,6 +130,9 @@ impl AnalysisVersions {
             repositories
                 .iter()
                 .any(|sources| !sources.elixir.is_empty()),
+            repositories
+                .iter()
+                .any(|sources| !sources.csharp.is_empty()),
             repositories
                 .iter()
                 .any(|sources| !sources.typescript.is_empty()),
@@ -145,6 +164,7 @@ pub struct IndexScheduler {
     // ponytail: memory and disk caches are unbounded; evict after measured daemon pressure.
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
+    csharp_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<CsharpAnalysis>>>,
     typescript_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<TypescriptAnalysis>>>,
     protobuf_compiler: SourceCompiler,
     repository_cache: Mutex<BTreeMap<RepositoryAnalysisKey, Arc<RepositoryAnalysis>>>,
@@ -166,6 +186,7 @@ struct ActiveIndex<'a> {
 struct RepositoryAnalysisSources<'a> {
     rust: &'a [(PathBuf, String)],
     elixir: &'a [(PathBuf, String)],
+    csharp: &'a [(PathBuf, Vec<u8>)],
     typescript: &'a [(PathBuf, String, SourceLanguage)],
     typescript_manifests: &'a [(PathBuf, String)],
     typescript_configs: &'a [(PathBuf, String)],
@@ -209,6 +230,7 @@ impl IndexScheduler {
             cache_dir,
             rust_cache: Mutex::new(BTreeMap::new()),
             elixir_cache: Mutex::new(BTreeMap::new()),
+            csharp_cache: Mutex::new(BTreeMap::new()),
             typescript_cache: Mutex::new(BTreeMap::new()),
             protobuf_compiler,
             repository_cache: Mutex::new(BTreeMap::new()),
@@ -269,6 +291,10 @@ impl IndexScheduler {
         self.elixir_cache
             .lock()
             .map_err(|_| "Elixir frontend cache lock poisoned")?
+            .clear();
+        self.csharp_cache
+            .lock()
+            .map_err(|_| "C# frontend cache lock poisoned")?
             .clear();
         self.typescript_cache
             .lock()
@@ -543,6 +569,10 @@ impl IndexScheduler {
         elixir_analysis::analysis_versioned(self, source, frontend_version)
     }
 
+    fn csharp_analysis_versioned(&self, source: &str) -> Cached<CsharpAnalysis> {
+        csharp_analysis::analysis_versioned(self, source)
+    }
+
     fn typescript_analysis_versioned(
         &self,
         source: &str,
@@ -572,6 +602,7 @@ impl IndexScheduler {
         let RepositoryAnalysisSources {
             rust: rust_sources,
             elixir: elixir_sources,
+            csharp: csharp_sources,
             typescript: typescript_sources,
             typescript_manifests,
             typescript_configs,
@@ -581,6 +612,7 @@ impl IndexScheduler {
             state.fingerprint.clone(),
             !rust_sources.is_empty(),
             !elixir_sources.is_empty(),
+            !csharp_sources.is_empty(),
             !typescript_sources.is_empty(),
             !descriptors.is_empty(),
         );
@@ -597,6 +629,7 @@ impl IndexScheduler {
         }
         let (rust_frontend, rust_resolver) = key.rust.unwrap_or(("_", "_"));
         let (elixir_frontend, elixir_resolver) = key.elixir.unwrap_or(("_", "_"));
+        let (csharp_frontend, csharp_resolver) = key.csharp.unwrap_or(("_", "_"));
         let (typescript_frontend, typescript_resolver) = key.typescript.unwrap_or(("_", "_"));
         let path = self
             .cache_dir
@@ -606,6 +639,8 @@ impl IndexScheduler {
             .join(rust_resolver)
             .join(elixir_frontend)
             .join(elixir_resolver)
+            .join(csharp_frontend)
+            .join(csharp_resolver)
             .join(typescript_frontend)
             .join(typescript_resolver)
             .join(key.protobuf.unwrap_or("_"))
@@ -718,6 +753,48 @@ impl IndexScheduler {
             elixir_grpc_bindings(&state.repository.identity, &elixir_sources);
         grpc_bindings.extend(source_bindings);
         diagnostics.extend(source_diagnostics);
+        let analyzed_csharp = self.analysis_pool.install(|| {
+            csharp_sources
+                .par_iter()
+                .map(|(path, bytes)| {
+                    let (source, lossy_encoding) = decode_csharp_source(bytes);
+                    let (analysis, cache_status) =
+                        self.csharp_analysis_versioned(&source).map_err(|error| {
+                            format!("failed to analyze {}: {error}", path.display())
+                        })?;
+                    tracing::debug!(
+                        repository = %state.repository.identity,
+                        path = %path.display(),
+                        ?cache_status,
+                        "frontend cache lookup"
+                    );
+                    let mut source_diagnostics = csharp_diagnostics(&analysis, path);
+                    if lossy_encoding {
+                        source_diagnostics.push(AnalysisDiagnostic {
+                            code: "csharp.lossy_encoding".into(),
+                            severity: AnalysisDiagnosticSeverity::Warning,
+                            path: path.into(),
+                            line: None,
+                            detail: Some(
+                                "source contained an unsupported text encoding and was decoded lossily"
+                                    .into(),
+                            ),
+                        });
+                    }
+                    Ok::<_, String>((
+                        csharp_observations(&state.repository.identity, &analysis, &source, path),
+                        csharp_entities(&state.repository.identity, &analysis, path),
+                        source_diagnostics,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+        for analysis in analyzed_csharp {
+            let (source_observations, source_entities, source_diagnostics) = analysis?;
+            observations.extend(source_observations);
+            entities.extend(source_entities);
+            diagnostics.extend(source_diagnostics);
+        }
         let mut typescript_analyses = Vec::new();
         let analyzed_typescript = self.analysis_pool.install(|| {
             typescript_sources
@@ -912,6 +989,7 @@ fn index_workspace_versioned(
             state,
             rust,
             elixir,
+            csharp,
             typescript,
             typescript_manifests,
             typescript_configs,
@@ -924,6 +1002,7 @@ fn index_workspace_versioned(
                 Some(DirtyRepository::All) | None => {
                     rust.len()
                         + elixir.len()
+                        + csharp.len()
                         + typescript.len()
                         + typescript_manifests.len()
                         + typescript_configs.len()
@@ -936,6 +1015,7 @@ fn index_workspace_versioned(
                 RepositoryAnalysisSources {
                     rust: &rust,
                     elixir: &elixir,
+                    csharp: &csharp,
                     typescript: &typescript,
                     typescript_manifests: &typescript_manifests,
                     typescript_configs: &typescript_configs,
@@ -1143,6 +1223,35 @@ mod tests {
     }
 
     #[test]
+    fn csharp_frontend_cache_reuses_memory_and_disk() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-csharp-cache-{unique}"));
+        let source = "class Shared {}";
+        let scheduler = IndexScheduler::new(cache.clone());
+
+        assert_eq!(
+            scheduler.csharp_analysis_versioned(source).unwrap().1,
+            CacheStatus::Miss
+        );
+        assert_eq!(
+            scheduler.csharp_analysis_versioned(source).unwrap().1,
+            CacheStatus::Memory
+        );
+        drop(scheduler);
+
+        let scheduler = IndexScheduler::new(cache.clone());
+        assert_eq!(
+            scheduler.csharp_analysis_versioned(source).unwrap().1,
+            CacheStatus::Disk
+        );
+        drop(scheduler);
+        fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
     fn indexes_javascript_and_typescript_through_the_workspace_pipeline() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1270,6 +1379,41 @@ mod tests {
         assert!(observations.contains("/typescript/src/component/Component"));
         assert!(observations.contains("/javascript/src/legacy/legacy"));
         assert!(observations.contains("/javascript/src/view/View"));
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn indexes_csharp_through_the_workspace_pipeline() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-csharp-index-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(
+            repository.join("src/Program.cs"),
+            "namespace Demo; class Program { void Run() { Helper(); } void Helper() {} }",
+        )
+        .unwrap();
+        let workspace = test_workspace("main", repository);
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::memory().unwrap();
+
+        assert!(scheduler.index(&store, &workspace).unwrap().1);
+        assert_eq!(scheduler.csharp_cache.lock().unwrap().len(), 1);
+        let stored = store.inspect_observations(Some("calls")).unwrap();
+        assert!(
+            stored.rows.iter().any(|row| {
+                row[1]
+                    .as_str()
+                    .is_some_and(|from| from.ends_with("/csharp/src/Program/Demo/Program/Run()"))
+                    && row[3]
+                        .as_str()
+                        .is_some_and(|to| to.ends_with("/csharp/src/Program/Demo/Program/Helper()"))
+            }),
+            "{stored:?}"
+        );
         fs::remove_dir_all(state).unwrap();
     }
 
@@ -1451,6 +1595,7 @@ mod tests {
         scheduler.clear_cache().unwrap();
         assert!(scheduler.rust_cache.lock().unwrap().is_empty());
         assert!(scheduler.elixir_cache.lock().unwrap().is_empty());
+        assert!(scheduler.csharp_cache.lock().unwrap().is_empty());
         assert!(scheduler.typescript_cache.lock().unwrap().is_empty());
         assert!(scheduler.repository_cache.lock().unwrap().is_empty());
         assert!(!cache.exists());
@@ -1582,6 +1727,8 @@ mod tests {
             rust_resolver: "rust-resolver-1",
             elixir_frontend: "elixir-1",
             elixir_resolver: "elixir-resolver-1",
+            csharp_frontend: "csharp-1",
+            csharp_resolver: "csharp-resolver-1",
             typescript_frontend: "typescript-1",
             typescript_resolver: "typescript-resolver-1",
             protobuf_frontend: "protobuf-1",
@@ -1592,6 +1739,8 @@ mod tests {
             rust_resolver: "rust-resolver-2",
             elixir_frontend: "elixir-2",
             elixir_resolver: "elixir-resolver-2",
+            csharp_frontend: "csharp-2",
+            csharp_resolver: "csharp-resolver-2",
             typescript_frontend: "typescript-2",
             typescript_resolver: "typescript-resolver-2",
             protobuf_frontend: "protobuf-2",
@@ -1599,32 +1748,79 @@ mod tests {
         };
 
         for (languages, expected) in [
-            ((true, false, false, false), "rust:rust-1:rust-resolver-1"),
             (
-                (false, true, false, false),
+                (true, false, false, false, false),
+                "rust:rust-1:rust-resolver-1",
+            ),
+            (
+                (false, true, false, false, false),
                 "elixir:elixir-1:elixir-resolver-1",
             ),
             (
-                (false, false, true, false),
+                (false, false, true, false, false),
+                "csharp:csharp-1:csharp-resolver-1",
+            ),
+            (
+                (false, false, false, true, false),
                 "typescript:typescript-1:typescript-resolver-1",
             ),
-            ((false, false, false, true), "protobuf:protobuf-1"),
-            ((false, false, false, false), "none"),
+            ((false, false, false, false, true), "protobuf:protobuf-1"),
+            ((false, false, false, false, false), "none"),
         ] {
-            let (rust, elixir, typescript, protobuf) = languages;
-            let key = versions.repository_key("state".into(), rust, elixir, typescript, protobuf);
+            let (rust, elixir, csharp, typescript, protobuf) = languages;
+            let key =
+                versions.repository_key("state".into(), rust, elixir, csharp, typescript, protobuf);
             assert_eq!(key.analysis_identity(), expected);
-            if rust || elixir || typescript || protobuf {
+            if rust || elixir || csharp || typescript || protobuf {
                 assert_ne!(
                     key,
-                    changed.repository_key("state".into(), rust, elixir, typescript, protobuf)
+                    changed.repository_key(
+                        "state".into(),
+                        rust,
+                        elixir,
+                        csharp,
+                        typescript,
+                        protobuf,
+                    )
                 );
             }
         }
 
         assert_eq!(
-            versions.repository_key("state".into(), true, false, false, false),
+            versions.repository_key("state".into(), true, false, false, false, false),
             AnalysisVersions {
+                elixir_frontend: "irrelevant",
+                elixir_resolver: "irrelevant",
+                csharp_frontend: "irrelevant",
+                csharp_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                typescript_frontend: "irrelevant",
+                typescript_resolver: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), true, false, false, false, false)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), false, true, false, false, false),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
+                csharp_frontend: "irrelevant",
+                csharp_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                typescript_frontend: "irrelevant",
+                typescript_resolver: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), false, true, false, false, false)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), false, false, true, false, false),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
                 protobuf_frontend: "irrelevant",
@@ -1633,47 +1829,38 @@ mod tests {
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), true, false, false, false)
+            .repository_key("state".into(), false, false, true, false, false)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, true, false, false),
-            AnalysisVersions {
-                rust_frontend: "irrelevant",
-                rust_resolver: "irrelevant",
-                protobuf_frontend: "irrelevant",
-                typescript_frontend: "irrelevant",
-                typescript_resolver: "irrelevant",
-                rule_pack: "irrelevant",
-                ..versions
-            }
-            .repository_key("state".into(), false, true, false, false)
-        );
-        assert_eq!(
-            versions.repository_key("state".into(), false, false, true, false),
+            versions.repository_key("state".into(), false, false, false, true, false),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
+                csharp_frontend: "irrelevant",
+                csharp_resolver: "irrelevant",
                 protobuf_frontend: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, true, false)
+            .repository_key("state".into(), false, false, false, true, false)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, false, false, true),
+            versions.repository_key("state".into(), false, false, false, false, true),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
+                csharp_frontend: "irrelevant",
+                csharp_resolver: "irrelevant",
                 typescript_frontend: "irrelevant",
                 typescript_resolver: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, false, true)
+            .repository_key("state".into(), false, false, false, false, true)
         );
     }
 
@@ -1695,6 +1882,8 @@ mod tests {
             rust_resolver: "1",
             elixir_frontend: "1",
             elixir_resolver: "1",
+            csharp_frontend: "1",
+            csharp_resolver: "1",
             typescript_frontend: "1",
             typescript_resolver: "1",
             protobuf_frontend: "1",
@@ -1782,6 +1971,8 @@ mod tests {
             rust_resolver: "1",
             elixir_frontend: "1",
             elixir_resolver: "1",
+            csharp_frontend: "1",
+            csharp_resolver: "1",
             typescript_frontend: "1",
             typescript_resolver: "1",
             protobuf_frontend: "1",
