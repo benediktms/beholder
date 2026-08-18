@@ -2842,17 +2842,19 @@ mod tests {
     }
 
     #[test]
-    fn typescript_grpc_workspace_resolves_client_contract_messages_and_server() {
+    fn graphql_workspace_resolves_operation_through_grpc_to_server() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let state = std::env::temp_dir().join(format!("beholder-typescript-grpc-{unique}"));
         let contracts = state.join("contracts");
+        let spa = state.join("spa");
         let client = state.join("client");
         let server = state.join("server");
         for directory in [
             contracts.as_path(),
+            spa.join("src").as_path(),
             client.join("src").as_path(),
             server.join("src").as_path(),
         ] {
@@ -2867,6 +2869,25 @@ mod tests {
             message InitializeOrderResponse {}
             service RPCService {
               rpc InitializeOrder(InitializeOrderRequest) returns (InitializeOrderResponse);
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            spa.join("src/Checkout.gql.tsx"),
+            r#"
+            export const InitializeOrder_Query = gql(`
+              query InitializeOrder_Query { initializeOrder { id } }
+            `);
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            spa.join("src/Checkout.tsx"),
+            r#"
+            import { InitializeOrder_Query } from "./Checkout.gql";
+            export function Checkout() {
+              return useQuery(InitializeOrder_Query);
             }
             "#,
         )
@@ -2897,9 +2918,12 @@ mod tests {
             client.join("src/caller.ts"),
             r#"
             import { RPCServiceClientImpl } from "./generated";
-            export function initializeOrder() {
-              const client = new RPCServiceClientImpl({} as Rpc);
-              return client.initializeOrder({});
+            export class InitializeOrderResolver {
+              /** @gqlQueryField initializeOrder */
+              static query() {
+                const client = new RPCServiceClientImpl({} as Rpc);
+                return client.initializeOrder({});
+              }
             }
             "#,
         )
@@ -2923,13 +2947,23 @@ mod tests {
         let workspace = registry
             .register(
                 "typescript-grpc".into(),
-                vec![contracts.clone(), client.clone(), server.clone()],
+                vec![
+                    contracts.clone(),
+                    spa.clone(),
+                    client.clone(),
+                    server.clone(),
+                ],
                 Vec::new(),
             )
             .unwrap();
         let client_identity = beholder_adapters_git::repository_identity(&client).unwrap();
+        let spa_identity = beholder_adapters_git::repository_identity(&spa).unwrap();
         let server_identity = beholder_adapters_git::repository_identity(&server).unwrap();
-        let caller = format!("repo://{client_identity}/typescript/src/caller/initializeOrder");
+        let caller = format!("repo://{spa_identity}/typescript/src/Checkout/Checkout");
+        let graphql_operation = "graphql-operation://InitializeOrder_Query";
+        let graphql_field = "graphql-field://Query/initializeOrder";
+        let resolver =
+            format!("repo://{client_identity}/typescript/src/caller/InitializeOrderResolver/query");
         let generated_client = format!(
             "repo://{client_identity}/typescript/src/generated/RPCServiceClientImpl/initializeOrder"
         );
@@ -2950,6 +2984,9 @@ mod tests {
             path.nodes
                 == [
                     caller.as_str(),
+                    graphql_operation,
+                    graphql_field,
+                    resolver.as_str(),
                     generated_client.as_str(),
                     operation,
                     implementation.as_str(),
