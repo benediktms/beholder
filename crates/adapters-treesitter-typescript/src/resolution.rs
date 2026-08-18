@@ -62,16 +62,112 @@ fn source_stem(path: &Path) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
-fn package_roots(manifests: &[(&Path, &str)]) -> BTreeMap<String, PathBuf> {
+#[derive(Clone)]
+struct Package {
+    root: PathBuf,
+    manifest: Value,
+}
+
+fn package_index(manifests: &[(&Path, &str)]) -> BTreeMap<String, Package> {
     manifests
         .iter()
         .filter_map(|(path, source)| {
-            let name = serde_json::from_str::<Value>(source)
-                .ok()?
-                .get("name")?
-                .as_str()?
-                .to_owned();
-            Some((name, path.parent().unwrap_or(Path::new("")).to_path_buf()))
+            let manifest = serde_json::from_str::<Value>(source).ok()?;
+            let name = manifest.get("name")?.as_str()?.to_owned();
+            Some((
+                name,
+                Package {
+                    root: path.parent().unwrap_or(Path::new("")).to_path_buf(),
+                    manifest,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn string_targets(value: &Value, targets: &mut Vec<PathBuf>) {
+    match value {
+        Value::String(target) => targets.push(target.into()),
+        Value::Object(conditions) => {
+            for condition in ["source", "types", "import", "default", "require"] {
+                if let Some(value) = conditions.get(condition) {
+                    string_targets(value, targets);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                string_targets(value, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn package_bases(source: &str, packages: &BTreeMap<String, Package>) -> Vec<PathBuf> {
+    let Some((name, package)) = packages
+        .iter()
+        .filter(|(name, _)| source == name.as_str() || source.starts_with(&format!("{name}/")))
+        .max_by_key(|(name, _)| name.len())
+    else {
+        return Vec::new();
+    };
+    package_targets(source, name, package)
+}
+
+fn package_targets(source: &str, name: &str, package: &Package) -> Vec<PathBuf> {
+    let rest = source
+        .strip_prefix(name)
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let key = if rest.is_empty() {
+        ".".to_owned()
+    } else {
+        format!("./{rest}")
+    };
+    let mut targets = Vec::new();
+    if let Some(exports) = package.manifest.get("exports") {
+        if let Some(value) = exports.get(&key) {
+            string_targets(value, &mut targets);
+        } else if key == "."
+            && !exports
+                .as_object()
+                .is_some_and(|map| map.keys().any(|key| key.starts_with('.')))
+        {
+            string_targets(exports, &mut targets);
+        } else if let Some(map) = exports.as_object() {
+            for (pattern, value) in map {
+                let Some((prefix, suffix)) = pattern.split_once('*') else {
+                    continue;
+                };
+                let Some(capture) = key
+                    .strip_prefix(prefix)
+                    .and_then(|value| value.strip_suffix(suffix))
+                else {
+                    continue;
+                };
+                let mut wildcard_targets = Vec::new();
+                string_targets(value, &mut wildcard_targets);
+                targets.extend(wildcard_targets.into_iter().map(|target| {
+                    PathBuf::from(target.to_string_lossy().replacen('*', capture, 1))
+                }));
+            }
+        }
+    }
+    if rest.is_empty() {
+        for field in ["source", "module", "main"] {
+            if let Some(target) = package.manifest.get(field).and_then(Value::as_str) {
+                targets.push(target.into());
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .map(|target| normalized(&package.root.join(target)))
+        .chain(if rest.is_empty() {
+            vec![package.root.join("src/index"), package.root.join("index")]
+        } else {
+            vec![package.root.join(rest)]
         })
         .collect()
 }
@@ -190,38 +286,25 @@ fn alias_targets(caller: &Path, source: &str, aliases: &[PathAliases]) -> Vec<Pa
         .collect()
 }
 
-fn import_base(
-    caller: &Path,
-    source: &str,
-    packages: &BTreeMap<String, PathBuf>,
-) -> Option<PathBuf> {
+fn import_bases(caller: &Path, source: &str, packages: &BTreeMap<String, Package>) -> Vec<PathBuf> {
     if source.starts_with('.') {
-        return Some(normalized(
+        return vec![normalized(
             &caller.parent().unwrap_or(Path::new("")).join(source),
-        ));
+        )];
     }
-    packages.iter().find_map(|(name, root)| {
-        if source == name {
-            Some(root.join("src/index"))
-        } else {
-            source
-                .strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .map(|rest| root.join(rest))
-        }
-    })
+    package_bases(source, packages)
 }
 
 fn imported_file(
     caller: &Path,
     source: &str,
-    packages: &BTreeMap<String, PathBuf>,
+    packages: &BTreeMap<String, Package>,
     aliases: &[PathAliases],
     files: &BTreeMap<PathBuf, &TypescriptAnalysis>,
 ) -> Option<PathBuf> {
     alias_targets(caller, source, aliases)
         .into_iter()
-        .chain(import_base(caller, source, packages))
+        .chain(import_bases(caller, source, packages))
         .flat_map(|base| {
             if SourceLanguage::from_path(&base).is_some() {
                 vec![base]
@@ -242,7 +325,7 @@ fn imported_file(
 
 struct RepositoryIndex<'a> {
     files: BTreeMap<PathBuf, &'a TypescriptAnalysis>,
-    packages: BTreeMap<String, PathBuf>,
+    packages: BTreeMap<String, Package>,
     aliases: Vec<PathAliases>,
     exports: BTreeMap<(PathBuf, String), EntityId>,
     origins: BTreeMap<(PathBuf, String), (PathBuf, String)>,
@@ -267,7 +350,7 @@ fn repository_index<'a>(
         .iter()
         .map(|(path, analysis)| ((*path).to_path_buf(), *analysis))
         .collect::<BTreeMap<_, _>>();
-    let packages = package_roots(manifests);
+    let packages = package_index(manifests);
     let aliases = path_aliases(configs);
     let mut symbols = BTreeMap::<(PathBuf, String), EntityId>::new();
     let mut origins = BTreeMap::<(PathBuf, String), (PathBuf, String)>::new();
@@ -765,35 +848,36 @@ pub fn resolve_repository_calls(
 
 fn workspace_imported_file(
     source: &str,
-    packages: &BTreeMap<String, Option<(usize, PathBuf)>>,
+    packages: &BTreeMap<String, Option<(usize, Package)>>,
     indexes: &[RepositoryIndex<'_>],
 ) -> Option<(usize, PathBuf)> {
-    let (index, base) = packages.iter().find_map(|(name, package)| {
-        let (index, root) = package.as_ref()?;
-        if source == name {
-            Some((*index, root.join("src/index")))
-        } else {
-            source
-                .strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .map(|rest| (*index, root.join(rest)))
-        }
-    })?;
-    let candidates = if SourceLanguage::from_path(&base).is_some() {
-        vec![base]
-    } else {
-        ["ts", "tsx", "js", "jsx"]
-            .into_iter()
-            .map(|extension| base.with_extension(extension))
-            .chain(
+    let (index, package) = packages
+        .iter()
+        .filter_map(|(name, package)| {
+            (source == name.as_str() || source.starts_with(&format!("{name}/")))
+                .then_some((name.len(), package.as_ref()?))
+        })
+        .max_by_key(|(length, _)| *length)?
+        .1;
+    let index = *index;
+    let name = package.manifest.get("name")?.as_str()?;
+    package_targets(source, name, package)
+        .into_iter()
+        .flat_map(|base| {
+            if SourceLanguage::from_path(&base).is_some() {
+                vec![base]
+            } else {
                 ["ts", "tsx", "js", "jsx"]
                     .into_iter()
-                    .map(|extension| base.join("index").with_extension(extension)),
-            )
-            .collect()
-    };
-    candidates
-        .into_iter()
+                    .map(|extension| base.with_extension(extension))
+                    .chain(
+                        ["ts", "tsx", "js", "jsx"]
+                            .into_iter()
+                            .map(|extension| base.join("index").with_extension(extension)),
+                    )
+                    .collect()
+            }
+        })
         .find(|candidate| indexes[index].files.contains_key(candidate))
         .map(|file| (index, file))
 }
@@ -823,9 +907,9 @@ pub fn resolve_workspace_calls(
             repository_index(&repository.repository, &sources, &manifests, &configs)
         })
         .collect::<Vec<_>>();
-    let mut packages = BTreeMap::<String, Option<(usize, PathBuf)>>::new();
+    let mut packages = BTreeMap::<String, Option<(usize, Package)>>::new();
     for (index, repository) in repositories.iter().enumerate() {
-        for (name, root) in package_roots(
+        for (name, package) in package_index(
             &repository
                 .manifests
                 .iter()
@@ -835,7 +919,7 @@ pub fn resolve_workspace_calls(
             packages
                 .entry(name)
                 .and_modify(|package| *package = None)
-                .or_insert(Some((index, root)));
+                .or_insert(Some((index, package)));
         }
     }
     let callers = indexes
@@ -1107,6 +1191,21 @@ mod tests {
                 "import { Service } from './service'; export function aliasedService(service: Service) { const first = service; let second; second = first; second.execute(); } export class AssignedConsumer { private service; constructor(service: Service) { this.service = service; } run() { this.service.execute(); } }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/exported/lib/root.ts"),
+                "export function packageRoot() {}",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/exported/lib/tool.ts"),
+                "export function packageTool() {}",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/export-map-consumer.ts"),
+                "import { packageRoot } from '@example/exported'; import { packageTool } from '@example/exported/tool'; export function useExportMap() { packageRoot(); packageTool(); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1128,10 +1227,16 @@ mod tests {
             "example",
             &mut observations,
             &sources,
-            &[(
-                Path::new("packages/shell/package.json"),
-                r#"{"name":"@example/shell"}"#,
-            )],
+            &[
+                (
+                    Path::new("packages/shell/package.json"),
+                    r#"{"name":"@example/shell"}"#,
+                ),
+                (
+                    Path::new("packages/exported/package.json"),
+                    r#"{"name":"@example/exported","exports":{".":{"source":"./lib/root.ts"},"./*":"./lib/*.ts"}}"#,
+                ),
+            ],
             &[
                 (
                     Path::new("tsconfig.json"),
@@ -1253,6 +1358,16 @@ mod tests {
                     == format!("repo://example/typescript/packages/app/src/alias-consumer/{caller}")
                     && observation.to.as_str()
                         == "repo://example/typescript/packages/app/src/service/Service/execute"
+            }));
+        }
+        for target in [
+            "repo://example/typescript/packages/exported/lib/root/packageRoot",
+            "repo://example/typescript/packages/exported/lib/tool/packageTool",
+        ] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == "repo://example/typescript/packages/app/src/export-map-consumer/useExportMap"
+                    && observation.to.as_str() == target
             }));
         }
     }
