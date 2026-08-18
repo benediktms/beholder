@@ -1,3 +1,4 @@
+use beholder_adapters_treesitter_typescript::TypescriptRepository;
 use beholder_domain::{AnalysisDiagnostic, EntityFact, GrpcBindingCandidate, Observation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +25,8 @@ pub(super) struct RepositoryAnalysis {
     pub(super) grpc_bindings: Vec<GrpcBindingCandidate>,
     pub(super) observations: Vec<Observation>,
     pub(super) diagnostics: Vec<AnalysisDiagnostic>,
+    #[serde(default)]
+    pub(super) typescript: Option<TypescriptRepository>,
 }
 
 impl SourceAnalysisKey {

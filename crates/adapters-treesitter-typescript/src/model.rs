@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +44,34 @@ pub struct TypescriptAnalysis {
     pub(super) definitions: Vec<Definition>,
     pub(super) imports: Vec<Import>,
     pub(super) exports: Vec<Export>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TypescriptRepository {
+    pub(super) repository: String,
+    pub(super) sources: Vec<(PathBuf, TypescriptAnalysis)>,
+    pub(super) manifests: Vec<(PathBuf, String)>,
+    pub(super) configs: Vec<(PathBuf, String)>,
+}
+
+impl TypescriptRepository {
+    pub fn new(
+        repository: impl Into<String>,
+        sources: Vec<(PathBuf, TypescriptAnalysis)>,
+        manifests: Vec<(PathBuf, String)>,
+        configs: Vec<(PathBuf, String)>,
+    ) -> Self {
+        Self {
+            repository: repository.into(),
+            sources,
+            manifests,
+            configs,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

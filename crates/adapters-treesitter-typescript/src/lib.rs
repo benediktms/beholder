@@ -6,5 +6,5 @@ mod model;
 mod resolution;
 
 pub use analysis::{analyze, entities_from_analysis, observations_from_analysis};
-pub use model::{SourceLanguage, TypescriptAnalysis};
-pub use resolution::resolve_repository_calls;
+pub use model::{SourceLanguage, TypescriptAnalysis, TypescriptRepository};
+pub use resolution::{resolve_repository_calls, resolve_workspace_calls};

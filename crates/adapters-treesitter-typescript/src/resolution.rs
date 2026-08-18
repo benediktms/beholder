@@ -1,5 +1,8 @@
 use super::model::*;
-use beholder_domain::{DependencyRelation, EntityId, Observation, SemanticRelation};
+use beholder_domain::{
+    Confidence, DependencyOverride, DependencyRelation, EntityId, Observation, Provenance,
+    SemanticRelation,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -237,13 +240,24 @@ fn imported_file(
         .find(|candidate| files.contains_key(candidate))
 }
 
-pub fn resolve_repository_calls(
+struct RepositoryIndex<'a> {
+    files: BTreeMap<PathBuf, &'a TypescriptAnalysis>,
+    packages: BTreeMap<String, PathBuf>,
+    aliases: Vec<PathAliases>,
+    exports: BTreeMap<(PathBuf, String), EntityId>,
+    origins: BTreeMap<(PathBuf, String), (PathBuf, String)>,
+    members: BTreeMap<(PathBuf, String, String), EntityId>,
+    caller_files: BTreeMap<String, PathBuf>,
+    caller_bindings: BTreeMap<String, &'a [Binding]>,
+    file_imports: BTreeMap<PathBuf, &'a [Import]>,
+}
+
+fn repository_index<'a>(
     repository: &str,
-    observations: &mut [Observation],
-    sources: &[(&Path, &TypescriptAnalysis)],
+    sources: &[(&Path, &'a TypescriptAnalysis)],
     manifests: &[(&Path, &str)],
     configs: &[(&Path, &str)],
-) {
+) -> RepositoryIndex<'a> {
     let files = sources
         .iter()
         .map(|(path, analysis)| ((*path).to_path_buf(), *analysis))
@@ -254,7 +268,7 @@ pub fn resolve_repository_calls(
     let mut origins = BTreeMap::<(PathBuf, String), (PathBuf, String)>::new();
     let mut members = BTreeMap::<(PathBuf, String, String), EntityId>::new();
     let mut factories = BTreeMap::<(PathBuf, String), String>::new();
-    let mut caller_files = BTreeMap::<String, &Path>::new();
+    let mut caller_files = BTreeMap::<String, PathBuf>::new();
     let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
     let mut file_imports = BTreeMap::<PathBuf, &[Import]>::new();
     let mut file_exports = BTreeMap::<PathBuf, &[Export]>::new();
@@ -301,7 +315,7 @@ pub fn resolve_repository_calls(
                 );
             }
             if definition.kind == DefinitionKind::Callable {
-                caller_files.insert(id.clone(), path);
+                caller_files.insert(id.clone(), (*path).to_path_buf());
                 caller_bindings.insert(id, &definition.bindings);
             }
         }
@@ -415,13 +429,257 @@ pub fn resolve_repository_calls(
         }
     }
 
+    RepositoryIndex {
+        files,
+        packages,
+        aliases,
+        exports,
+        origins,
+        members,
+        caller_files,
+        caller_bindings,
+        file_imports,
+    }
+}
+
+fn resolve_observations(observations: &mut [Observation], index: &RepositoryIndex<'_>) {
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
     }) {
-        let Some(caller_file) = caller_files.get(observation.from.as_str()) else {
+        let Some(caller_file) = index.caller_files.get(observation.from.as_str()) else {
             continue;
         };
-        let imports = file_imports.get(*caller_file).copied().unwrap_or_default();
+        let imports = index
+            .file_imports
+            .get(caller_file)
+            .copied()
+            .unwrap_or_default();
+        let direct = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-call://")
+            .or_else(|| observation.to.as_str().strip_prefix("javascript-call://"))
+            .map(|name| (name, None));
+        let member = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-method://")
+            .or_else(|| observation.to.as_str().strip_prefix("javascript-method://"))
+            .and_then(|target| target.split_once('/'))
+            .map(|(receiver, name)| (name, Some(receiver)));
+        let constructor = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-constructor://")
+            .or_else(|| {
+                observation
+                    .to
+                    .as_str()
+                    .strip_prefix("javascript-constructor://")
+            })
+            .map(|name| (name, None));
+        let Some((name, receiver)) = direct.or(member).or(constructor) else {
+            continue;
+        };
+        let candidate =
+            imports
+                .iter()
+                .find_map(|import| {
+                    let binding = import.bindings.iter().find(|binding| match receiver {
+                        Some(receiver) => binding.local == receiver && binding.imported == "*",
+                        None => binding.local == name && binding.imported != "*",
+                    })?;
+                    let imported = if binding.imported == "*" {
+                        name
+                    } else {
+                        &binding.imported
+                    };
+                    let file = imported_file(
+                        caller_file,
+                        &import.source,
+                        &index.packages,
+                        &index.aliases,
+                        &index.files,
+                    )?;
+                    index.exports.get(&(file, imported.to_owned()))
+                })
+                .or_else(|| {
+                    let receiver = receiver?;
+                    let type_name = index
+                        .caller_bindings
+                        .get(observation.from.as_str())?
+                        .iter()
+                        .find(|binding| binding.receiver == receiver)?
+                        .type_name
+                        .as_str();
+                    let imported_type = imports.iter().find_map(|import| {
+                        let binding = import.bindings.iter().find(|binding| {
+                            binding.local == type_name && binding.imported != "*"
+                        })?;
+                        let file = imported_file(
+                            caller_file,
+                            &import.source,
+                            &index.packages,
+                            &index.aliases,
+                            &index.files,
+                        )?;
+                        Some((file, binding.imported.as_str()))
+                    });
+                    let (mut file, mut type_name) =
+                        imported_type.unwrap_or_else(|| (caller_file.to_path_buf(), type_name));
+                    let origin = index.origins.get(&(file.clone(), type_name.to_owned()));
+                    if let Some((origin_file, origin_name)) = origin {
+                        file = origin_file.clone();
+                        type_name = origin_name;
+                    }
+                    index
+                        .members
+                        .get(&(file, type_name.to_owned(), name.to_owned()))
+                })
+                .or_else(|| {
+                    let receiver = receiver?;
+                    let (file, namespace) = imports
+                        .iter()
+                        .find_map(|import| {
+                            let binding = import.bindings.iter().find(|binding| {
+                                binding.local == receiver && binding.imported != "*"
+                            })?;
+                            let file = imported_file(
+                                caller_file,
+                                &import.source,
+                                &index.packages,
+                                &index.aliases,
+                                &index.files,
+                            )?;
+                            Some((file, binding.imported.clone()))
+                        })
+                        .unwrap_or_else(|| (caller_file.to_path_buf(), receiver.to_owned()));
+                    let (file, namespace) = index
+                        .origins
+                        .get(&(file.clone(), namespace.clone()))
+                        .cloned()
+                        .unwrap_or((file, namespace));
+                    index.members.get(&(file, namespace, name.to_owned()))
+                });
+        if let Some(target) = candidate {
+            observation.to = target.clone();
+        }
+    }
+}
+
+pub fn resolve_repository_calls(
+    repository: &str,
+    observations: &mut [Observation],
+    sources: &[(&Path, &TypescriptAnalysis)],
+    manifests: &[(&Path, &str)],
+    configs: &[(&Path, &str)],
+) {
+    resolve_observations(
+        observations,
+        &repository_index(repository, sources, manifests, configs),
+    );
+}
+
+fn workspace_imported_file(
+    source: &str,
+    packages: &BTreeMap<String, Option<(usize, PathBuf)>>,
+    indexes: &[RepositoryIndex<'_>],
+) -> Option<(usize, PathBuf)> {
+    let (index, base) = packages.iter().find_map(|(name, package)| {
+        let (index, root) = package.as_ref()?;
+        if source == name {
+            Some((*index, root.join("src/index")))
+        } else {
+            source
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|rest| (*index, root.join(rest)))
+        }
+    })?;
+    let candidates = if SourceLanguage::from_path(&base).is_some() {
+        vec![base]
+    } else {
+        ["ts", "tsx", "js", "jsx"]
+            .into_iter()
+            .map(|extension| base.with_extension(extension))
+            .chain(
+                ["ts", "tsx", "js", "jsx"]
+                    .into_iter()
+                    .map(|extension| base.join("index").with_extension(extension)),
+            )
+            .collect()
+    };
+    candidates
+        .into_iter()
+        .find(|candidate| indexes[index].files.contains_key(candidate))
+        .map(|file| (index, file))
+}
+
+pub fn resolve_workspace_calls(
+    observations: &mut [Observation],
+    repositories: &[TypescriptRepository],
+) -> Vec<DependencyOverride> {
+    let indexes = repositories
+        .iter()
+        .map(|repository| {
+            let sources = repository
+                .sources
+                .iter()
+                .map(|(path, analysis)| (path.as_path(), analysis))
+                .collect::<Vec<_>>();
+            let manifests = repository
+                .manifests
+                .iter()
+                .map(|(path, source)| (path.as_path(), source.as_str()))
+                .collect::<Vec<_>>();
+            let configs = repository
+                .configs
+                .iter()
+                .map(|(path, source)| (path.as_path(), source.as_str()))
+                .collect::<Vec<_>>();
+            repository_index(&repository.repository, &sources, &manifests, &configs)
+        })
+        .collect::<Vec<_>>();
+    let mut packages = BTreeMap::<String, Option<(usize, PathBuf)>>::new();
+    for (index, repository) in repositories.iter().enumerate() {
+        for (name, root) in package_roots(
+            &repository
+                .manifests
+                .iter()
+                .map(|(path, source)| (path.as_path(), source.as_str()))
+                .collect::<Vec<_>>(),
+        ) {
+            packages
+                .entry(name)
+                .and_modify(|package| *package = None)
+                .or_insert(Some((index, root)));
+        }
+    }
+    let callers = indexes
+        .iter()
+        .enumerate()
+        .flat_map(|(index, repository)| {
+            repository
+                .caller_files
+                .keys()
+                .map(move |caller| (caller.as_str(), index))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut overrides = Vec::new();
+    for observation in observations.iter_mut().filter(|observation| {
+        observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+    }) {
+        let Some(&caller_index) = callers.get(observation.from.as_str()) else {
+            continue;
+        };
+        let caller = &indexes[caller_index];
+        let caller_file = &caller.caller_files[observation.from.as_str()];
+        let imports = caller
+            .file_imports
+            .get(caller_file)
+            .copied()
+            .unwrap_or_default();
         let direct = observation
             .to
             .as_str()
@@ -461,64 +719,71 @@ pub fn resolve_repository_calls(
                 } else {
                     &binding.imported
                 };
-                let file = imported_file(caller_file, &import.source, &packages, &aliases, &files)?;
-                exports.get(&(file, imported.to_owned()))
+                let (target_index, file) =
+                    workspace_imported_file(&import.source, &packages, &indexes)?;
+                indexes[target_index]
+                    .exports
+                    .get(&(file, imported.to_owned()))
             })
             .or_else(|| {
                 let receiver = receiver?;
-                let type_name = caller_bindings
+                let type_name = caller
+                    .caller_bindings
                     .get(observation.from.as_str())?
                     .iter()
                     .find(|binding| binding.receiver == receiver)?
                     .type_name
                     .as_str();
-                let imported_type = imports.iter().find_map(|import| {
+                let (target_index, file, imported) = imports.iter().find_map(|import| {
                     let binding = import
                         .bindings
                         .iter()
                         .find(|binding| binding.local == type_name && binding.imported != "*")?;
-                    let file =
-                        imported_file(caller_file, &import.source, &packages, &aliases, &files)?;
-                    Some((file, binding.imported.as_str()))
-                });
-                let (mut file, mut type_name) =
-                    imported_type.unwrap_or_else(|| ((*caller_file).to_path_buf(), type_name));
-                let origin = origins.get(&(file.clone(), type_name.to_owned()));
-                if let Some((origin_file, origin_name)) = origin {
-                    file = origin_file.clone();
-                    type_name = origin_name;
-                }
-                members.get(&(file, type_name.to_owned(), name.to_owned()))
+                    let (target_index, file) =
+                        workspace_imported_file(&import.source, &packages, &indexes)?;
+                    Some((target_index, file, binding.imported.as_str()))
+                })?;
+                let target = &indexes[target_index];
+                let (file, owner) = target
+                    .origins
+                    .get(&(file.clone(), imported.to_owned()))
+                    .cloned()
+                    .unwrap_or((file, imported.to_owned()));
+                target.members.get(&(file, owner, name.to_owned()))
             })
             .or_else(|| {
                 let receiver = receiver?;
-                let (file, namespace) = imports
-                    .iter()
-                    .find_map(|import| {
-                        let binding = import
-                            .bindings
-                            .iter()
-                            .find(|binding| binding.local == receiver && binding.imported != "*")?;
-                        let file = imported_file(
-                            caller_file,
-                            &import.source,
-                            &packages,
-                            &aliases,
-                            &files,
-                        )?;
-                        Some((file, binding.imported.clone()))
-                    })
-                    .unwrap_or_else(|| ((*caller_file).to_path_buf(), receiver.to_owned()));
-                let (file, namespace) = origins
-                    .get(&(file.clone(), namespace.clone()))
+                let (target_index, file, imported) = imports.iter().find_map(|import| {
+                    let binding = import
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.local == receiver && binding.imported != "*")?;
+                    let (target_index, file) =
+                        workspace_imported_file(&import.source, &packages, &indexes)?;
+                    Some((target_index, file, binding.imported.clone()))
+                })?;
+                let target = &indexes[target_index];
+                let (file, owner) = target
+                    .origins
+                    .get(&(file.clone(), imported.clone()))
                     .cloned()
-                    .unwrap_or((file, namespace));
-                members.get(&(file, namespace, name.to_owned()))
+                    .unwrap_or((file, imported));
+                target.members.get(&(file, owner, name.to_owned()))
             });
         if let Some(target) = candidate {
+            overrides.push(DependencyOverride {
+                from: observation.from.clone(),
+                relation: DependencyRelation::Calls,
+                unresolved_to: observation.to.clone(),
+                resolved_to: target.clone(),
+                evidence: observation.evidence.clone(),
+                confidence: Confidence::Exact,
+                provenance: Provenance::Ast,
+            });
             observation.to = target.clone();
         }
     }
+    overrides
 }
 
 #[cfg(test)]
@@ -717,5 +982,71 @@ mod tests {
                 && observation.to.as_str()
                     == "repo://example/typescript/packages/app/src/service/Service/execute"
         }));
+    }
+
+    #[test]
+    fn resolves_workspace_package_imports_across_repositories() {
+        let consumer_source = "import { Service, work } from '@example/provider'; export function start(service: Service) { work(); service.execute(); }";
+        let provider_sources = [
+            (
+                PathBuf::from("src/index.ts"),
+                "export { Service, work } from './impl';",
+            ),
+            (
+                PathBuf::from("src/impl.ts"),
+                "export class Service { execute() {} } export function work() {}",
+            ),
+        ];
+        let consumer_analysis = analyze(consumer_source, SourceLanguage::TypeScript).unwrap();
+        let provider_analyses = provider_sources
+            .iter()
+            .map(|(path, source)| {
+                (
+                    path.clone(),
+                    analyze(source, SourceLanguage::TypeScript).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let repositories = vec![
+            TypescriptRepository::new(
+                "consumer",
+                vec![(PathBuf::from("src/start.ts"), consumer_analysis.clone())],
+                vec![],
+                vec![],
+            ),
+            TypescriptRepository::new(
+                "provider",
+                provider_analyses.clone(),
+                vec![(
+                    PathBuf::from("package.json"),
+                    r#"{"name":"@example/provider"}"#.into(),
+                )],
+                vec![],
+            ),
+        ];
+        let mut observations = observations_from_analysis(
+            "consumer",
+            &consumer_analysis,
+            consumer_source,
+            Path::new("src/start.ts"),
+        );
+        for ((path, source), (_, analysis)) in provider_sources.iter().zip(&provider_analyses) {
+            observations.extend(observations_from_analysis(
+                "provider", analysis, source, path,
+            ));
+        }
+
+        let overrides = resolve_workspace_calls(&mut observations, &repositories);
+
+        assert_eq!(overrides.len(), 2);
+        for target in [
+            "repo://provider/typescript/src/impl/work",
+            "repo://provider/typescript/src/impl/Service/execute",
+        ] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str() == "repo://consumer/typescript/src/start/start"
+                    && observation.to.as_str() == target
+            }));
+        }
     }
 }

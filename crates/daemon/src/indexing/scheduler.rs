@@ -20,9 +20,10 @@ use beholder_adapters_treesitter_rust::{
 use beholder_adapters_treesitter_typescript::{
     FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION,
     RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
-    entities_from_analysis as typescript_entities,
+    TypescriptRepository, entities_from_analysis as typescript_entities,
     observations_from_analysis as typescript_observations,
     resolve_repository_calls as resolve_typescript_repository_calls,
+    resolve_workspace_calls as resolve_typescript_workspace_calls,
 };
 use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
@@ -754,11 +755,11 @@ impl IndexScheduler {
             .iter()
             .map(|(path, analysis)| (*path, analysis.as_ref()))
             .collect::<Vec<_>>();
-        let typescript_manifests = typescript_manifests
+        let typescript_manifest_refs = typescript_manifests
             .iter()
             .map(|(path, source)| (path.as_path(), source.as_str()))
             .collect::<Vec<_>>();
-        let typescript_configs = typescript_configs
+        let typescript_config_refs = typescript_configs
             .iter()
             .map(|(path, source)| (path.as_path(), source.as_str()))
             .collect::<Vec<_>>();
@@ -766,9 +767,20 @@ impl IndexScheduler {
             &state.repository.identity,
             &mut observations,
             &typescript_sources,
-            &typescript_manifests,
-            &typescript_configs,
+            &typescript_manifest_refs,
+            &typescript_config_refs,
         );
+        let typescript = (!typescript_analyses.is_empty()).then(|| {
+            TypescriptRepository::new(
+                state.repository.identity.clone(),
+                typescript_analyses
+                    .iter()
+                    .map(|(path, analysis)| ((*path).to_path_buf(), analysis.as_ref().clone()))
+                    .collect(),
+                typescript_manifests.to_vec(),
+                typescript_configs.to_vec(),
+            )
+        });
         let descriptor_facts = self.analysis_pool.install(|| {
             descriptors
                 .par_iter()
@@ -791,6 +803,7 @@ impl IndexScheduler {
             grpc_bindings,
             observations,
             diagnostics,
+            typescript,
         });
         if let Some(parent) = path.parent()
             && fs::create_dir_all(parent).is_ok()
@@ -878,6 +891,7 @@ fn index_workspace_versioned(
     let mut misses = 0;
     let mut dirty_source_units = 0;
     let mut diagnostics = Vec::new();
+    let mut typescript_repositories = Vec::new();
     let repository_analysis_started = Instant::now();
     for sources in repositories {
         let RepositorySources {
@@ -927,6 +941,9 @@ fn index_workspace_versioned(
                 .cloned()
                 .map(|diagnostic| (state.repository.identity.clone(), diagnostic)),
         );
+        if let Some(typescript) = &analysis.typescript {
+            typescript_repositories.push(typescript.clone());
+        }
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity,
@@ -943,6 +960,10 @@ fn index_workspace_versioned(
         .collect::<Vec<_>>();
     let mut overrides = resolve_rust_repository_calls(&mut all_observations);
     overrides.extend(resolve_workspace_modules(&all_observations));
+    overrides.extend(resolve_typescript_workspace_calls(
+        &mut all_observations,
+        &typescript_repositories,
+    ));
     let workspace_resolution = workspace_resolution_started.elapsed();
     let publication_started = Instant::now();
     let changes = store.publish(&view, &repository_facts, &overrides)?;
@@ -1187,6 +1208,89 @@ mod tests {
         assert!(observations.contains("/typescript/src/component/Component"));
         assert!(observations.contains("/javascript/src/legacy/legacy"));
         assert!(observations.contains("/javascript/src/view/View"));
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn resolves_typescript_workspace_packages_across_repositories() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-typescript-workspace-{unique}"));
+        let consumer = state.join("consumer");
+        let provider = state.join("provider");
+        fs::create_dir_all(consumer.join("src")).unwrap();
+        fs::create_dir_all(provider.join("src")).unwrap();
+        fs::write(
+            consumer.join("src/start.ts"),
+            "import { Service, work } from '@example/provider'; export function start(service: Service) { work(); service.execute(); }",
+        )
+        .unwrap();
+        fs::write(
+            provider.join("package.json"),
+            r#"{"name":"@example/provider"}"#,
+        )
+        .unwrap();
+        fs::write(
+            provider.join("src/index.ts"),
+            "export { Service, work } from './impl';",
+        )
+        .unwrap();
+        fs::write(
+            provider.join("src/impl.ts"),
+            "export class Service { execute() {} } export function work() {}",
+        )
+        .unwrap();
+        let workspace = Workspace::new(
+            "main",
+            [("consumer", consumer), ("provider", provider)]
+                .into_iter()
+                .map(|(identity, base)| WorkspaceRepository {
+                    repository: LogicalRepository {
+                        identity: identity.into(),
+                    },
+                    display_name: identity.into(),
+                    base,
+                    alternatives: Vec::new(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let cache = state.join("cache");
+
+        for _ in 0..2 {
+            let scheduler = IndexScheduler::new(cache.clone());
+            let store = SemanticStore::memory().unwrap();
+            assert!(scheduler.index(&store, &workspace).unwrap().1);
+            let cached = scheduler.repository_cache.lock().unwrap();
+            let repositories = cached
+                .values()
+                .filter_map(|analysis| analysis.typescript.clone())
+                .collect::<Vec<_>>();
+            let mut observations = cached
+                .values()
+                .flat_map(|analysis| analysis.observations.iter().cloned())
+                .collect::<Vec<_>>();
+            let overrides = resolve_typescript_workspace_calls(&mut observations, &repositories);
+            assert_eq!(overrides.len(), 2, "{repositories:?} {observations:?}");
+            let caller = overrides[0].from.clone();
+            drop(cached);
+            let context = store.context("main", caller.as_str()).unwrap();
+            for target in [
+                "/typescript/src/impl/work",
+                "/typescript/src/impl/Service/execute",
+            ] {
+                assert!(
+                    context.edges.iter().any(|edge| {
+                        edge.from == caller.as_str()
+                            && edge.to.starts_with("repo://local://")
+                            && edge.to.ends_with(target)
+                    }),
+                    "{context:?}"
+                );
+            }
+        }
         fs::remove_dir_all(state).unwrap();
     }
 
