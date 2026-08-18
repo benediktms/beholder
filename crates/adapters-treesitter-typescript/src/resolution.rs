@@ -313,7 +313,12 @@ fn source_candidates(base: PathBuf) -> Vec<PathBuf> {
     }
     ["ts", "tsx", "d.ts", "js", "jsx"]
         .into_iter()
-        .map(|extension| base.with_extension(extension))
+        .map(|extension| {
+            let mut path = base.as_os_str().to_os_string();
+            path.push(".");
+            path.push(extension);
+            PathBuf::from(path)
+        })
         .chain(
             ["ts", "tsx", "d.ts", "js", "jsx"]
                 .into_iter()
@@ -1330,6 +1335,16 @@ mod tests {
                 SourceLanguage::TypeScript,
             ),
             (
+                Path::new("packages/app/src/dotted.service.tsx"),
+                "export class DottedService { execute() {} }",
+                SourceLanguage::Tsx,
+            ),
+            (
+                Path::new("packages/app/src/dotted.controller.ts"),
+                "import { DottedService } from './dotted.service'; export class DottedController { constructor(private readonly service: DottedService) {} run() { this.service.execute(); } }",
+                SourceLanguage::TypeScript,
+            ),
+            (
                 Path::new("packages/app/src/consumer.ts"),
                 "import { Service } from './service'; export function injected(service: Service) { service.execute(); } export function created() { const service = new Service(); service.execute(); }",
                 SourceLanguage::TypeScript,
@@ -1602,6 +1617,12 @@ mod tests {
                         == "repo://example/typescript/packages/app/src/service/Service/execute"
             }));
         }
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/dotted.controller/DottedController/run"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/dotted.service/DottedService/execute"
+        }));
         let barrel_caller = "repo://example/typescript/packages/app/src/barrel-consumer/useBarrel";
         for target in [
             "repo://example/typescript/packages/app/src/default-service/DefaultService/execute",
