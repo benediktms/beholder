@@ -30,10 +30,10 @@ impl SourceLanguage {
 
     pub fn cache_version(self) -> &'static str {
         match self {
-            Self::JavaScript => "9-javascript",
-            Self::Jsx => "9-jsx",
-            Self::TypeScript => "9-typescript",
-            Self::Tsx => "9-tsx",
+            Self::JavaScript => "10-javascript",
+            Self::Jsx => "10-jsx",
+            Self::TypeScript => "10-typescript",
+            Self::Tsx => "10-tsx",
         }
     }
 }
@@ -44,6 +44,7 @@ pub struct TypescriptAnalysis {
     pub(super) definitions: Vec<Definition>,
     pub(super) imports: Vec<Import>,
     pub(super) exports: Vec<Export>,
+    pub(super) parse_error_lines: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

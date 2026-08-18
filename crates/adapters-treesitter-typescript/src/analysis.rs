@@ -1,6 +1,7 @@
 use super::model::*;
 use beholder_domain::{
-    DependencyRelation, EntityFact, EntityKind, Observation, Provenance, StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
+    Observation, Provenance, StructuralRelation,
 };
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -666,6 +667,16 @@ fn collect_definitions(
     }
 }
 
+fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>) {
+    if node.is_error() || node.is_missing() {
+        lines.push(node.start_position().row + 1);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_parse_errors(child, lines);
+    }
+}
+
 pub fn analyze(
     source: &str,
     language: SourceLanguage,
@@ -680,12 +691,10 @@ pub fn analyze(
     let tree = parser
         .parse(source, None)
         .ok_or("JavaScript/TypeScript parser returned no tree")?;
-    if tree.root_node().has_error() {
-        return Err("failed to parse JavaScript/TypeScript source".into());
-    }
     let mut definitions = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
+    let mut parse_error_lines = Vec::new();
     collect_definitions(
         tree.root_node(),
         source.as_bytes(),
@@ -694,12 +703,33 @@ pub fn analyze(
     );
     collect_imports(tree.root_node(), source.as_bytes(), &mut imports);
     collect_exports(tree.root_node(), source.as_bytes(), &mut exports);
+    collect_parse_errors(tree.root_node(), &mut parse_error_lines);
+    parse_error_lines.sort_unstable();
+    parse_error_lines.dedup();
     Ok(TypescriptAnalysis {
         language,
         definitions,
         imports,
         exports,
+        parse_error_lines,
     })
+}
+
+pub fn diagnostics_from_analysis(
+    analysis: &TypescriptAnalysis,
+    path: &Path,
+) -> Vec<AnalysisDiagnostic> {
+    analysis
+        .parse_error_lines
+        .iter()
+        .map(|line| AnalysisDiagnostic {
+            code: "typescript.parse_recovery".into(),
+            severity: AnalysisDiagnosticSeverity::Warning,
+            path: path.into(),
+            line: u32::try_from(*line).ok(),
+            detail: Some("tree-sitter recovered from invalid or unsupported syntax".into()),
+        })
+        .collect()
 }
 
 fn source_stem(path: &Path) -> String {
@@ -911,6 +941,26 @@ mod tests {
             ordinary
                 .iter()
                 .all(|observation| observation.provenance == Provenance::Ast)
+        );
+    }
+
+    #[test]
+    fn recovers_valid_symbols_and_reports_parse_errors() {
+        let analysis = analyze(
+            "const = ; export function stillIndexed() {}",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .any(|definition| definition.qualified_name == "stillIndexed")
+        );
+        assert_eq!(
+            diagnostics_from_analysis(&analysis, Path::new("src/broken.ts"))[0].code,
+            "typescript.parse_recovery"
         );
     }
 }

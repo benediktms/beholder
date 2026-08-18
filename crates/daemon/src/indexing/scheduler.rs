@@ -20,7 +20,8 @@ use beholder_adapters_treesitter_rust::{
 use beholder_adapters_treesitter_typescript::{
     FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION,
     RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
-    TypescriptRepository, entities_from_analysis as typescript_entities,
+    TypescriptRepository, diagnostics_from_analysis as typescript_diagnostics,
+    entities_from_analysis as typescript_entities,
     observations_from_analysis as typescript_observations,
     resolve_repository_calls as resolve_typescript_repository_calls,
     resolve_workspace_calls as resolve_typescript_workspace_calls,
@@ -741,14 +742,17 @@ impl IndexScheduler {
                             path,
                         ),
                         typescript_entities(&state.repository.identity, &analysis, path),
+                        typescript_diagnostics(&analysis, path),
                     ))
                 })
                 .collect::<Vec<_>>()
         });
         for analysis in analyzed_typescript {
-            let (path, analysis, source_observations, source_entities) = analysis?;
+            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+                analysis?;
             observations.extend(source_observations);
             entities.extend(source_entities);
+            diagnostics.extend(source_diagnostics);
             typescript_analyses.push((path, analysis));
         }
         let typescript_sources = typescript_analyses
