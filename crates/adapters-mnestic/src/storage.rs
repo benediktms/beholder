@@ -335,11 +335,13 @@ pub(super) fn reusable_current_state(
         return Ok(None);
     };
     let fingerprint = &facts.state.fingerprint;
-    if !state.ends_with(fingerprint)
-        && !state
-            .strip_prefix(fingerprint)
-            .is_some_and(|suffix| suffix.starts_with(':'))
+    if state
+        .strip_prefix(fingerprint)
+        .is_some_and(|suffix| suffix.starts_with(':'))
     {
+        return Ok(None);
+    }
+    if !state.ends_with(fingerprint) {
         return Ok(None);
     }
     let stored = transaction.run_script(
