@@ -45,6 +45,7 @@ pub struct TypescriptAnalysis {
     pub(super) definitions: Vec<Definition>,
     pub(super) imports: Vec<Import>,
     pub(super) exports: Vec<Export>,
+    pub(super) string_constants: Vec<StringConstant>,
     pub(super) parse_error_lines: Vec<usize>,
 }
 
@@ -146,5 +147,13 @@ pub(super) struct Call {
     pub(super) kind: CallKind,
     pub(super) receiver: Option<String>,
     pub(super) name: String,
+    pub(super) arguments: Vec<String>,
+    pub(super) type_arguments: Vec<String>,
     pub(super) line: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct StringConstant {
+    pub(super) name: String,
+    pub(super) value: String,
 }
