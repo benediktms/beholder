@@ -32,11 +32,7 @@ fn is_exported(mut node: Node<'_>) -> bool {
     false
 }
 
-fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
-    let target = node.child_by_field_name(match kind {
-        CallKind::Constructor => "constructor",
-        CallKind::Direct | CallKind::Member => "function",
-    })?;
+fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     let (receiver, name, kind) = match target.kind() {
         "identifier" => (None, text(target, source)?.into(), kind),
         "member_expression" => (
@@ -64,6 +60,14 @@ fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     })
 }
 
+fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
+    let target = node.child_by_field_name(match kind {
+        CallKind::Constructor => "constructor",
+        CallKind::Direct | CallKind::Member => "function",
+    })?;
+    call_target(node, target, source, kind)
+}
+
 fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
     if node != root
         && matches!(
@@ -85,6 +89,20 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
         }
         "new_expression" => {
             if let Some(call) = call(node, source, CallKind::Constructor) {
+                calls.push(call);
+            }
+        }
+        "jsx_opening_element" | "jsx_self_closing_element" => {
+            if let Some(call) = node
+                .child_by_field_name("name")
+                .filter(|target| {
+                    target.kind() == "member_expression"
+                        || text(*target, source)
+                            .and_then(|name| name.chars().next())
+                            .is_some_and(char::is_uppercase)
+                })
+                .and_then(|target| call_target(node, target, source, CallKind::Direct))
+            {
                 calls.push(call);
             }
         }
@@ -220,6 +238,7 @@ fn definition(
         line: node.start_position().row + 1,
         calls,
         bindings,
+        factory: None,
         exported: is_exported(node),
     }
 }
@@ -424,6 +443,39 @@ fn collect_definitions(
             if value.is_some_and(callable_value)
                 && let Some(name) = node
                     .child_by_field_name("name")
+                    .and_then(|name| text(name, source))
+            {
+                definitions.push(definition(
+                    node,
+                    value.and_then(|value| value.child_by_field_name("body")),
+                    source,
+                    scope,
+                    name,
+                    DefinitionKind::Callable,
+                ));
+                return;
+            }
+            if let Some(factory) = value
+                .filter(|value| value.kind() == "call_expression")
+                .and_then(|value| value.child_by_field_name("function"))
+                .filter(|function| function.kind() == "identifier")
+                .and_then(|function| text(function, source))
+                && let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| text(name, source))
+            {
+                let mut factory_definition =
+                    definition(node, None, source, scope, name, DefinitionKind::Namespace);
+                factory_definition.factory = Some(factory.into());
+                definitions.push(factory_definition);
+                return;
+            }
+        }
+        "pair" => {
+            let value = node.child_by_field_name("value");
+            if value.is_some_and(callable_value)
+                && let Some(name) = node
+                    .child_by_field_name("key")
                     .and_then(|name| text(name, source))
             {
                 definitions.push(definition(

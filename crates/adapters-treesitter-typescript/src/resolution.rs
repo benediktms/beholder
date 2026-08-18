@@ -253,6 +253,7 @@ pub fn resolve_repository_calls(
     let mut symbols = BTreeMap::<(PathBuf, String), EntityId>::new();
     let mut origins = BTreeMap::<(PathBuf, String), (PathBuf, String)>::new();
     let mut members = BTreeMap::<(PathBuf, String, String), EntityId>::new();
+    let mut factories = BTreeMap::<(PathBuf, String), String>::new();
     let mut caller_files = BTreeMap::<String, &Path>::new();
     let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
     let mut file_imports = BTreeMap::<PathBuf, &[Import]>::new();
@@ -266,12 +267,10 @@ pub fn resolve_repository_calls(
         );
         file_imports.insert((*path).to_path_buf(), &analysis.imports);
         file_exports.insert((*path).to_path_buf(), &analysis.exports);
-        let exported_namespaces = analysis
+        let exported_owners = analysis
             .definitions
             .iter()
-            .filter(|definition| {
-                definition.kind == DefinitionKind::Namespace && definition.exported
-            })
+            .filter(|definition| definition.exported && !definition.qualified_name.contains('/'))
             .map(|definition| definition.qualified_name.as_str())
             .collect::<Vec<_>>();
         for definition in &analysis.definitions {
@@ -282,9 +281,15 @@ pub fn resolve_repository_calls(
                 if definition.exported {
                     origins.insert(key.clone(), key);
                 }
+                if let Some(factory) = &definition.factory {
+                    factories.insert(
+                        ((*path).to_path_buf(), definition.qualified_name.clone()),
+                        factory.clone(),
+                    );
+                }
             }
             if let Some((namespace, member)) = definition.qualified_name.rsplit_once('/')
-                && exported_namespaces.contains(&namespace)
+                && exported_owners.contains(&namespace)
             {
                 members.insert(
                     (
@@ -376,6 +381,39 @@ pub fn resolve_repository_calls(
                 .map(|entity| (export.clone(), entity.clone()))
         })
         .collect::<BTreeMap<_, _>>();
+    for ((file, namespace), factory) in factories {
+        let local_origin = origins
+            .get(&(file.clone(), factory.clone()))
+            .cloned()
+            .or_else(|| {
+                file_imports.get(&file).and_then(|imports| {
+                    imports.iter().find_map(|import| {
+                        let binding = import
+                            .bindings
+                            .iter()
+                            .find(|binding| binding.local == factory)?;
+                        let imported_file =
+                            imported_file(&file, &import.source, &packages, &aliases, &files)?;
+                        origins
+                            .get(&(imported_file, binding.imported.clone()))
+                            .cloned()
+                    })
+                })
+            });
+        let Some((factory_file, factory_name)) = local_origin else {
+            continue;
+        };
+        let returned_members = members
+            .iter()
+            .filter(|((member_file, owner, _), _)| {
+                member_file == &factory_file && owner == &factory_name
+            })
+            .map(|((_, _, name), entity)| (name.clone(), entity.clone()))
+            .collect::<Vec<_>>();
+        for (name, entity) in returned_members {
+            members.insert((file.clone(), namespace.clone(), name), entity);
+        }
+    }
 
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
@@ -451,6 +489,31 @@ pub fn resolve_repository_calls(
                     type_name = origin_name;
                 }
                 members.get(&(file, type_name.to_owned(), name.to_owned()))
+            })
+            .or_else(|| {
+                let receiver = receiver?;
+                let (file, namespace) = imports
+                    .iter()
+                    .find_map(|import| {
+                        let binding = import
+                            .bindings
+                            .iter()
+                            .find(|binding| binding.local == receiver && binding.imported != "*")?;
+                        let file = imported_file(
+                            caller_file,
+                            &import.source,
+                            &packages,
+                            &aliases,
+                            &files,
+                        )?;
+                        Some((file, binding.imported.clone()))
+                    })
+                    .unwrap_or_else(|| ((*caller_file).to_path_buf(), receiver.to_owned()));
+                let (file, namespace) = origins
+                    .get(&(file.clone(), namespace.clone()))
+                    .cloned()
+                    .unwrap_or((file, namespace));
+                members.get(&(file, namespace, name.to_owned()))
             });
         if let Some(target) = candidate {
             observation.to = target.clone();
@@ -520,6 +583,26 @@ mod tests {
                 Path::new("packages/app/src/barrel-consumer.ts"),
                 "import { BarrelService, ImportedBarrelService, ping } from './index'; export function useBarrel(service: BarrelService) { service.execute(); ping(); } export function useImportedBarrel(service: ImportedBarrelService) { service.execute(); }",
                 SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/factory.tsx"),
+                "export default function makeFactory() { return { Route: () => <main /> }; }",
+                SourceLanguage::Tsx,
+            ),
+            (
+                Path::new("packages/app/src/modal.ts"),
+                "import makeFactory from './factory'; export const Modal = makeFactory();",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/modal-index.ts"),
+                "export { Modal } from './modal';",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/factory-consumer.tsx"),
+                "import { Modal } from './modal-index'; export const FactoryConsumer = () => <Modal.Route />;",
+                SourceLanguage::Tsx,
             ),
         ];
         let analyses = fixtures
@@ -612,5 +695,16 @@ mod tests {
                 && observation.to.as_str()
                     == "repo://example/typescript/packages/app/src/default-service/DefaultService/execute"
         }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/factory-consumer/FactoryConsumer"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/factory/makeFactory/Route"
+        }));
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.to.as_str() != "typescript-call://main")
+        );
     }
 }
