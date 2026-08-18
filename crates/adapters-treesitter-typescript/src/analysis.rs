@@ -96,6 +96,64 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
     }
 }
 
+fn type_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() == "type_identifier" {
+        return text(node, source).map(str::to_owned);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| type_name(child, source))
+}
+
+fn binding(node: Node<'_>, source: &[u8]) -> Option<Binding> {
+    let receiver = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("pattern"))
+        .and_then(|name| text(name, source))?
+        .to_owned();
+    let type_name = node
+        .child_by_field_name("type")
+        .and_then(|annotation| type_name(annotation, source))
+        .or_else(|| {
+            let value = node.child_by_field_name("value")?;
+            (value.kind() == "new_expression")
+                .then(|| value.child_by_field_name("constructor"))
+                .flatten()
+                .and_then(|constructor| text(constructor, source))
+                .map(str::to_owned)
+        })?;
+    Some(Binding {
+        receiver,
+        type_name,
+    })
+}
+
+fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mut Vec<Binding>) {
+    if node != root
+        && matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function_declaration"
+                | "method_definition"
+        )
+    {
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "required_parameter" | "optional_parameter" | "variable_declarator"
+    ) && let Some(binding) = binding(node, source)
+    {
+        bindings.push(binding);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_bindings(child, source, root, bindings);
+    }
+}
+
 fn definition(
     node: Node<'_>,
     body: Option<Node<'_>>,
@@ -105,14 +163,17 @@ fn definition(
     kind: DefinitionKind,
 ) -> Definition {
     let mut calls = Vec::new();
+    let mut bindings = Vec::new();
     if let Some(body) = body {
         collect_calls(body, source, body, &mut calls);
     }
+    collect_bindings(node, source, node, &mut bindings);
     Definition {
         qualified_name: qualified(scope, name),
         kind,
         line: node.start_position().row + 1,
         calls,
+        bindings,
         exported: is_exported(node),
     }
 }

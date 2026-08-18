@@ -185,7 +185,9 @@ pub fn resolve_repository_calls(
     let packages = package_roots(manifests);
     let aliases = path_aliases(configs);
     let mut exports = BTreeMap::<(PathBuf, String), EntityId>::new();
+    let mut members = BTreeMap::<(PathBuf, String, String), EntityId>::new();
     let mut caller_files = BTreeMap::<String, &Path>::new();
+    let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
     let mut file_imports = BTreeMap::<PathBuf, &[Import]>::new();
     for (path, analysis) in sources {
         let module_id = format!(
@@ -195,6 +197,14 @@ pub fn resolve_repository_calls(
             source_stem(path)
         );
         file_imports.insert((*path).to_path_buf(), &analysis.imports);
+        let exported_namespaces = analysis
+            .definitions
+            .iter()
+            .filter(|definition| {
+                definition.kind == DefinitionKind::Namespace && definition.exported
+            })
+            .map(|definition| definition.qualified_name.as_str())
+            .collect::<Vec<_>>();
         for definition in &analysis.definitions {
             let id = format!("{module_id}/{}", definition.qualified_name);
             if definition.exported && !definition.qualified_name.contains('/') {
@@ -203,8 +213,21 @@ pub fn resolve_repository_calls(
                     EntityId::from(id.clone()),
                 );
             }
+            if let Some((namespace, member)) = definition.qualified_name.rsplit_once('/')
+                && exported_namespaces.contains(&namespace)
+            {
+                members.insert(
+                    (
+                        (*path).to_path_buf(),
+                        namespace.to_owned(),
+                        member.to_owned(),
+                    ),
+                    EntityId::from(id.clone()),
+                );
+            }
             if definition.kind == DefinitionKind::Callable {
-                caller_files.insert(id, path);
+                caller_files.insert(id.clone(), path);
+                caller_bindings.insert(id, &definition.bindings);
             }
         }
     }
@@ -215,9 +238,7 @@ pub fn resolve_repository_calls(
         let Some(caller_file) = caller_files.get(observation.from.as_str()) else {
             continue;
         };
-        let Some(imports) = file_imports.get(*caller_file) else {
-            continue;
-        };
+        let imports = file_imports.get(*caller_file).copied().unwrap_or_default();
         let direct = observation
             .to
             .as_str()
@@ -245,19 +266,42 @@ pub fn resolve_repository_calls(
         let Some((name, receiver)) = direct.or(member).or(constructor) else {
             continue;
         };
-        let candidate = imports.iter().find_map(|import| {
-            let binding = import.bindings.iter().find(|binding| match receiver {
-                Some(receiver) => binding.local == receiver && binding.imported == "*",
-                None => binding.local == name && binding.imported != "*",
-            })?;
-            let imported = if binding.imported == "*" {
-                name
-            } else {
-                &binding.imported
-            };
-            let file = imported_file(caller_file, &import.source, &packages, &aliases, &files)?;
-            exports.get(&(file, imported.to_owned()))
-        });
+        let candidate = imports
+            .iter()
+            .find_map(|import| {
+                let binding = import.bindings.iter().find(|binding| match receiver {
+                    Some(receiver) => binding.local == receiver && binding.imported == "*",
+                    None => binding.local == name && binding.imported != "*",
+                })?;
+                let imported = if binding.imported == "*" {
+                    name
+                } else {
+                    &binding.imported
+                };
+                let file = imported_file(caller_file, &import.source, &packages, &aliases, &files)?;
+                exports.get(&(file, imported.to_owned()))
+            })
+            .or_else(|| {
+                let receiver = receiver?;
+                let type_name = caller_bindings
+                    .get(observation.from.as_str())?
+                    .iter()
+                    .find(|binding| binding.receiver == receiver)?
+                    .type_name
+                    .as_str();
+                let imported_type = imports.iter().find_map(|import| {
+                    let binding = import
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.local == type_name && binding.imported != "*")?;
+                    let file =
+                        imported_file(caller_file, &import.source, &packages, &aliases, &files)?;
+                    Some((file, binding.imported.as_str()))
+                });
+                let (file, type_name) =
+                    imported_type.unwrap_or_else(|| ((*caller_file).to_path_buf(), type_name));
+                members.get(&(file, type_name.to_owned(), name.to_owned()))
+            });
         if let Some(target) = candidate {
             observation.to = target.clone();
         }
@@ -290,6 +334,16 @@ mod tests {
             (
                 Path::new("packages/app/src/aliased.ts"),
                 "import { setLocale } from '@shell/current'; export function aliased() { setLocale(); }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/service.ts"),
+                "export class Service { execute() {} }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/consumer.ts"),
+                "import { Service } from './service'; export function injected(service: Service) { service.execute(); } export function created() { const service = new Service(); service.execute(); }",
                 SourceLanguage::TypeScript,
             ),
         ];
@@ -346,5 +400,13 @@ mod tests {
                 && observation.to.as_str()
                     == "repo://example/typescript/packages/shell/src/current/setLocale"
         }));
+        for caller in ["injected", "created"] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == format!("repo://example/typescript/packages/app/src/consumer/{caller}")
+                    && observation.to.as_str()
+                        == "repo://example/typescript/packages/app/src/service/Service/execute"
+            }));
+        }
     }
 }

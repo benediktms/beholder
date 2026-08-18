@@ -30,10 +30,10 @@ impl SourceLanguage {
 
     pub fn cache_version(self) -> &'static str {
         match self {
-            Self::JavaScript => "1-javascript",
-            Self::Jsx => "1-jsx",
-            Self::TypeScript => "1-typescript",
-            Self::Tsx => "1-tsx",
+            Self::JavaScript => "2-javascript",
+            Self::Jsx => "2-jsx",
+            Self::TypeScript => "2-typescript",
+            Self::Tsx => "2-tsx",
         }
     }
 }
@@ -57,7 +57,14 @@ pub(super) struct Definition {
     pub(super) kind: DefinitionKind,
     pub(super) line: usize,
     pub(super) calls: Vec<Call>,
+    pub(super) bindings: Vec<Binding>,
     pub(super) exported: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Binding {
+    pub(super) receiver: String,
+    pub(super) type_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
