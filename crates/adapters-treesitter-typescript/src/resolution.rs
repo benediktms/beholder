@@ -362,6 +362,19 @@ struct RepositoryIndex<'a> {
 type Origin = (PathBuf, String);
 type Origins = BTreeMap<Origin, Origin>;
 
+#[derive(Clone, Eq, PartialEq)]
+enum NestTarget {
+    Concrete(Origin),
+    Alias(Origin),
+}
+
+struct ResolvedNestModule {
+    imports: Vec<Origin>,
+    providers: Vec<Origin>,
+    members: Vec<Origin>,
+    exports: Vec<Origin>,
+}
+
 fn insert_origin(
     origins: &mut Origins,
     origins_by_file: &mut BTreeMap<PathBuf, BTreeMap<String, Origin>>,
@@ -373,6 +386,293 @@ fn insert_origin(
         .or_default()
         .insert(export.1.clone(), origin.clone());
     origins.insert(export, origin.clone()).as_ref() != Some(&origin)
+}
+
+fn nest_reference_origin(
+    file: &Path,
+    name: &str,
+    files: &BTreeMap<PathBuf, &TypescriptAnalysis>,
+    packages: &BTreeMap<String, Package>,
+    aliases: &[PathAliases],
+    imports: &BTreeMap<PathBuf, &[Import]>,
+    origins: &Origins,
+) -> Option<Origin> {
+    if matches!(name.as_bytes().first(), Some(b'\'' | b'"' | b'`')) {
+        return Some((PathBuf::new(), name.trim_matches(['\'', '"', '`']).into()));
+    }
+    if let Some(imported) = imports.get(file).and_then(|imports| {
+        imports.iter().find_map(|import| {
+            let binding = import
+                .bindings
+                .iter()
+                .find(|binding| binding.local == name && binding.imported != "*")?;
+            let imported_file = imported_file(file, &import.source, packages, aliases, files)?;
+            let reference = (imported_file, binding.imported.clone());
+            Some(origins.get(&reference).cloned().unwrap_or(reference))
+        })
+    }) {
+        return Some(imported);
+    }
+    let local = (file.to_path_buf(), name.to_owned());
+    Some(origins.get(&local).cloned().unwrap_or(local))
+}
+
+fn merge_nest_provider(
+    providers: &mut BTreeMap<Origin, Option<NestTarget>>,
+    token: Origin,
+    target: NestTarget,
+) {
+    providers
+        .entry(token)
+        .and_modify(|current| {
+            if current.as_ref() != Some(&target) {
+                *current = None;
+            }
+        })
+        .or_insert(Some(target));
+}
+
+fn nest_own_providers(
+    module: &ResolvedNestModule,
+    custom: &BTreeMap<Origin, (Origin, NestTarget)>,
+    symbols: &BTreeMap<Origin, EntityId>,
+) -> BTreeMap<Origin, Option<NestTarget>> {
+    let mut providers = BTreeMap::new();
+    for provider in &module.providers {
+        if let Some((token, target)) = custom.get(provider) {
+            merge_nest_provider(&mut providers, token.clone(), target.clone());
+        } else if symbols.contains_key(provider) {
+            merge_nest_provider(
+                &mut providers,
+                provider.clone(),
+                NestTarget::Concrete(provider.clone()),
+            );
+        }
+    }
+    providers
+}
+
+fn nest_exported_providers(
+    module: &Origin,
+    modules: &BTreeMap<Origin, ResolvedNestModule>,
+    custom: &BTreeMap<Origin, (Origin, NestTarget)>,
+    symbols: &BTreeMap<Origin, EntityId>,
+    cache: &mut BTreeMap<Origin, BTreeMap<Origin, Option<NestTarget>>>,
+    visiting: &mut BTreeSet<Origin>,
+) -> BTreeMap<Origin, Option<NestTarget>> {
+    if let Some(cached) = cache.get(module) {
+        return cached.clone();
+    }
+    if !visiting.insert(module.clone()) {
+        return BTreeMap::new();
+    }
+    let Some(definition) = modules.get(module) else {
+        visiting.remove(module);
+        return BTreeMap::new();
+    };
+    let own = nest_own_providers(definition, custom, symbols);
+    let mut available = own.clone();
+    for imported in &definition.imports {
+        for (token, target) in
+            nest_exported_providers(imported, modules, custom, symbols, cache, visiting)
+        {
+            if let Some(target) = target {
+                merge_nest_provider(&mut available, token, target);
+            }
+        }
+    }
+    let mut exported = BTreeMap::new();
+    for reference in &definition.exports {
+        if modules.contains_key(reference) {
+            for (token, target) in
+                nest_exported_providers(reference, modules, custom, symbols, cache, visiting)
+            {
+                if let Some(target) = target {
+                    merge_nest_provider(&mut exported, token, target);
+                }
+            }
+        } else {
+            let token = custom
+                .get(reference)
+                .map(|(token, _)| token)
+                .unwrap_or(reference);
+            if let Some(target) = concrete_nest_target(token, &available, &mut BTreeSet::new()) {
+                merge_nest_provider(&mut exported, token.clone(), NestTarget::Concrete(target));
+            }
+        }
+    }
+    visiting.remove(module);
+    cache.insert(module.clone(), exported.clone());
+    exported
+}
+
+fn nest_visible_providers(
+    module: &Origin,
+    modules: &BTreeMap<Origin, ResolvedNestModule>,
+    custom: &BTreeMap<Origin, (Origin, NestTarget)>,
+    symbols: &BTreeMap<Origin, EntityId>,
+    exported_cache: &mut BTreeMap<Origin, BTreeMap<Origin, Option<NestTarget>>>,
+) -> BTreeMap<Origin, Option<NestTarget>> {
+    let Some(definition) = modules.get(module) else {
+        return BTreeMap::new();
+    };
+    let mut visible = nest_own_providers(definition, custom, symbols);
+    for imported in &definition.imports {
+        for (token, target) in nest_exported_providers(
+            imported,
+            modules,
+            custom,
+            symbols,
+            exported_cache,
+            &mut BTreeSet::new(),
+        ) {
+            if let Some(target) = target {
+                merge_nest_provider(&mut visible, token, target);
+            }
+        }
+    }
+    visible
+}
+
+fn concrete_nest_target(
+    token: &Origin,
+    providers: &BTreeMap<Origin, Option<NestTarget>>,
+    visiting: &mut BTreeSet<Origin>,
+) -> Option<Origin> {
+    if !visiting.insert(token.clone()) {
+        return None;
+    }
+    let target = match providers.get(token)?.as_ref()? {
+        NestTarget::Concrete(target) => Some(target.clone()),
+        NestTarget::Alias(target) => concrete_nest_target(target, providers, visiting),
+    };
+    visiting.remove(token);
+    target
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nest_injected_field_types(
+    sources: &[(&Path, &TypescriptAnalysis)],
+    files: &BTreeMap<PathBuf, &TypescriptAnalysis>,
+    packages: &BTreeMap<String, Package>,
+    aliases: &[PathAliases],
+    imports: &BTreeMap<PathBuf, &[Import]>,
+    origins: &Origins,
+    symbols: &BTreeMap<Origin, EntityId>,
+) -> BTreeMap<(PathBuf, String, String), Origin> {
+    let reference = |file: &Path, name: &str| {
+        nest_reference_origin(file, name, files, packages, aliases, imports, origins)
+    };
+    let mut custom = BTreeMap::new();
+    let mut modules = BTreeMap::new();
+    for (path, analysis) in sources {
+        for provider in &analysis.nest_providers {
+            let provider_origin = reference(path, &provider.name).unwrap();
+            let Some(token) = reference(path, &provider.token) else {
+                continue;
+            };
+            let Some(implementation) = reference(path, &provider.implementation) else {
+                continue;
+            };
+            let target = if provider.existing {
+                NestTarget::Alias(implementation)
+            } else {
+                NestTarget::Concrete(implementation)
+            };
+            custom.insert(provider_origin, (token, target));
+        }
+        for module in &analysis.nest_modules {
+            let Some(module_origin) = reference(path, &module.name) else {
+                continue;
+            };
+            let resolve = |names: &[String]| {
+                names
+                    .iter()
+                    .filter_map(|name| reference(path, name))
+                    .collect()
+            };
+            modules.insert(
+                module_origin,
+                ResolvedNestModule {
+                    imports: resolve(&module.imports),
+                    providers: resolve(&module.providers),
+                    members: resolve(&module.members),
+                    exports: resolve(&module.exports),
+                },
+            );
+        }
+    }
+    let mut member_modules = BTreeMap::<Origin, Vec<Origin>>::new();
+    for (module, definition) in &modules {
+        for member in &definition.members {
+            member_modules
+                .entry(member.clone())
+                .or_default()
+                .push(module.clone());
+        }
+        for provider in &definition.providers {
+            if let Some((_, NestTarget::Concrete(implementation))) = custom.get(provider) {
+                member_modules
+                    .entry(implementation.clone())
+                    .or_default()
+                    .push(module.clone());
+            }
+        }
+    }
+    let mut exported_cache = BTreeMap::new();
+    let mut field_types = BTreeMap::new();
+    for (path, analysis) in sources {
+        for definition in analysis
+            .definitions
+            .iter()
+            .filter(|definition| !definition.qualified_name.contains('/'))
+        {
+            let Some(owner) = reference(path, &definition.qualified_name) else {
+                continue;
+            };
+            let Some(owner_modules) = member_modules.get(&owner) else {
+                continue;
+            };
+            for binding in &definition.bindings {
+                let (Some(field), Some(token)) = (
+                    binding.receiver.strip_prefix("this."),
+                    binding.injection_token.as_deref(),
+                ) else {
+                    continue;
+                };
+                let Some(token) = reference(path, token) else {
+                    continue;
+                };
+                let targets = owner_modules
+                    .iter()
+                    .filter_map(|module| {
+                        concrete_nest_target(
+                            &token,
+                            &nest_visible_providers(
+                                module,
+                                &modules,
+                                &custom,
+                                symbols,
+                                &mut exported_cache,
+                            ),
+                            &mut BTreeSet::new(),
+                        )
+                    })
+                    .collect::<BTreeSet<_>>();
+                if targets.len() == 1 {
+                    field_types.insert(
+                        (
+                            path.to_path_buf(),
+                            definition.qualified_name.clone(),
+                            field.into(),
+                        ),
+                        targets.into_iter().next().unwrap(),
+                    );
+                }
+            }
+        }
+    }
+    field_types
 }
 
 fn repository_index<'a>(
@@ -598,7 +898,7 @@ fn repository_index<'a>(
             Some((callable, origin))
         })
         .collect::<BTreeMap<_, _>>();
-    let field_types = raw_field_types
+    let mut field_types = raw_field_types
         .into_iter()
         .filter_map(|((file, owner, field), type_name)| {
             let origin = file_imports
@@ -622,6 +922,15 @@ fn repository_index<'a>(
             Some(((file, owner, field), origin))
         })
         .collect::<BTreeMap<_, _>>();
+    field_types.extend(nest_injected_field_types(
+        sources,
+        &files,
+        &packages,
+        &aliases,
+        &file_imports,
+        &origins,
+        &symbols,
+    ));
     for ((file, namespace), factory) in &factories {
         let local_origin = origins
             .get(&(file.clone(), factory.clone()))
@@ -811,6 +1120,13 @@ fn receiver_type_uncached(
 ) -> Option<(PathBuf, String)> {
     let file = index.caller_files.get(caller)?;
     let receiver = aliased_receiver(index, caller, receiver);
+    if let Some(field) = receiver.strip_prefix("this.")
+        && !field.contains('.')
+        && let Some((owner_file, owner)) = index.caller_owners.get(caller)
+        && let Some(resolved) = field_type(index, owner_file.clone(), owner.clone(), field)
+    {
+        return Some(resolved);
+    }
     if let Some(type_name) = index
         .caller_bindings
         .get(caller)
@@ -1844,6 +2160,84 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn resolves_nest_injection_tokens_through_imported_module_providers() {
+        let fixtures = [
+            (
+                Path::new("src/tokens.ts"),
+                "export const WORKER = 'worker'; export const ALIAS = 'alias'; export const FACTORY = 'factory';",
+            ),
+            (
+                Path::new("src/workers.ts"),
+                "export class Worker { execute() {} } export class FactoryWorker { execute() {} } export class WrongWorker { execute() {} }",
+            ),
+            (
+                Path::new("src/providers.ts"),
+                "import { WORKER, ALIAS, FACTORY } from './tokens'; import { Worker, FactoryWorker } from './workers'; export const WorkerProvider = { provide: WORKER, useClass: Worker }; export const AliasProvider = { provide: ALIAS, useExisting: WORKER }; export const FactoryProvider = { provide: FACTORY, useFactory: () => new FactoryWorker() };",
+            ),
+            (
+                Path::new("src/providers.module.ts"),
+                "import { Module } from '@nestjs/common'; import { WORKER, ALIAS, FACTORY } from './tokens'; import { Worker } from './workers'; import { WorkerProvider, AliasProvider, FactoryProvider } from './providers'; @Module({ providers: [WorkerProvider, AliasProvider, FactoryProvider, { provide: 'literal', useClass: Worker }], exports: [WORKER, ALIAS, FACTORY, 'literal'] }) export class ProvidersModule {}",
+            ),
+            (
+                Path::new("src/consumer.ts"),
+                "import { Inject, Optional } from '@nestjs/common'; import { WORKER, ALIAS, FACTORY } from './tokens'; interface Port { execute(): void } export class Consumer { constructor(@Inject(WORKER) private worker: Port, @Inject(ALIAS) private alias: Port, @Inject(FACTORY) private factory: Port, @Optional() @Inject('literal') private literal: Port) {} run() { this.worker.execute(); this.alias.execute(); this.factory.execute(); this.literal.execute(); } }",
+            ),
+            (
+                Path::new("src/consumer.module.ts"),
+                "import { Module } from '@nestjs/common'; import { ProvidersModule } from './providers.module'; import { Consumer } from './consumer'; @Module({ imports: [ProvidersModule], controllers: [Consumer] }) export class ConsumerModule {}",
+            ),
+            (
+                Path::new("src/unrelated.module.ts"),
+                "import { Module } from '@nestjs/common'; import { WORKER } from './tokens'; import { WrongWorker } from './workers'; @Module({ providers: [{ provide: WORKER, useClass: WrongWorker }] }) export class UnrelatedModule {}",
+            ),
+        ];
+        let analyses = fixtures
+            .iter()
+            .map(|(_, source)| analyze(source, SourceLanguage::TypeScript).unwrap())
+            .collect::<Vec<_>>();
+        let sources = fixtures
+            .iter()
+            .zip(&analyses)
+            .map(|((path, _), analysis)| (*path, analysis))
+            .collect::<Vec<_>>();
+        let mut observations = fixtures
+            .iter()
+            .zip(&analyses)
+            .flat_map(|((path, source), analysis)| {
+                observations_from_analysis("example", analysis, source, path)
+            })
+            .collect::<Vec<_>>();
+
+        resolve_repository_calls("example", &mut observations, &sources, &[], &[]);
+
+        let caller = "repo://example/typescript/src/consumer/Consumer/run";
+        for target in [
+            "repo://example/typescript/src/workers/Worker/execute",
+            "repo://example/typescript/src/workers/FactoryWorker/execute",
+        ] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str() == caller && observation.to.as_str() == target
+            }));
+        }
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| {
+                    observation.from.as_str() == caller
+                        && observation.to.as_str()
+                            == "repo://example/typescript/src/workers/Worker/execute"
+                })
+                .count(),
+            3
+        );
+        assert!(!observations.iter().any(|observation| {
+            observation.from.as_str() == caller
+                && observation.to.as_str()
+                    == "repo://example/typescript/src/workers/WrongWorker/execute"
+        }));
     }
 
     #[test]
