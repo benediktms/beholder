@@ -1,0 +1,11 @@
+[package]
+name = "beholder-adapters-treesitter-typescript"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+beholder-domain.workspace = true
+serde.workspace = true
+tree-sitter = "0.26.12"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"

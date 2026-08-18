@@ -1,0 +1,433 @@
+use super::model::*;
+use beholder_domain::{
+    DependencyRelation, EntityFact, EntityKind, Observation, Provenance, StructuralRelation,
+};
+use std::{collections::BTreeMap, error::Error, path::Path};
+use tree_sitter::{Node, Parser};
+
+fn text<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    node.utf8_text(source).ok()
+}
+
+fn qualified(scope: &[String], name: &str) -> String {
+    scope
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(name))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn callable_value(node: Node<'_>) -> bool {
+    matches!(node.kind(), "arrow_function" | "function_expression")
+}
+
+fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
+    let target = node.child_by_field_name(match kind {
+        CallKind::Constructor => "constructor",
+        CallKind::Direct | CallKind::Member => "function",
+    })?;
+    let (receiver, name, kind) = match target.kind() {
+        "identifier" => (None, text(target, source)?.into(), kind),
+        "member_expression" => (
+            target
+                .child_by_field_name("object")
+                .and_then(|node| text(node, source))
+                .map(str::to_owned),
+            target
+                .child_by_field_name("property")
+                .and_then(|node| text(node, source))?
+                .into(),
+            if kind == CallKind::Constructor {
+                CallKind::Constructor
+            } else {
+                CallKind::Member
+            },
+        ),
+        _ => return None,
+    };
+    Some(Call {
+        kind,
+        receiver,
+        name,
+        line: node.start_position().row + 1,
+    })
+}
+
+fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
+    if node != root
+        && matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function_declaration"
+                | "method_definition"
+        )
+    {
+        return;
+    }
+    match node.kind() {
+        "call_expression" => {
+            if let Some(call) = call(node, source, CallKind::Direct) {
+                calls.push(call);
+            }
+        }
+        "new_expression" => {
+            if let Some(call) = call(node, source, CallKind::Constructor) {
+                calls.push(call);
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_calls(child, source, root, calls);
+    }
+}
+
+fn definition(
+    node: Node<'_>,
+    body: Option<Node<'_>>,
+    source: &[u8],
+    scope: &[String],
+    name: &str,
+    kind: DefinitionKind,
+) -> Definition {
+    let mut calls = Vec::new();
+    if let Some(body) = body {
+        collect_calls(body, source, body, &mut calls);
+    }
+    Definition {
+        qualified_name: qualified(scope, name),
+        kind,
+        line: node.start_position().row + 1,
+        calls,
+    }
+}
+
+fn collect_definitions(
+    node: Node<'_>,
+    source: &[u8],
+    scope: &mut Vec<String>,
+    definitions: &mut Vec<Definition>,
+) {
+    match node.kind() {
+        "class_declaration" => {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| text(name, source))
+            else {
+                return;
+            };
+            definitions.push(definition(
+                node,
+                None,
+                source,
+                scope,
+                name,
+                DefinitionKind::Namespace,
+            ));
+            scope.push(name.into());
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.named_children(&mut cursor) {
+                    collect_definitions(child, source, scope, definitions);
+                }
+            }
+            scope.pop();
+            return;
+        }
+        "function_declaration" | "generator_function_declaration" | "method_definition" => {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| text(name, source))
+            else {
+                return;
+            };
+            definitions.push(definition(
+                node,
+                node.child_by_field_name("body"),
+                source,
+                scope,
+                name,
+                DefinitionKind::Callable,
+            ));
+            scope.push(name.into());
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.named_children(&mut cursor) {
+                    collect_definitions(child, source, scope, definitions);
+                }
+            }
+            scope.pop();
+            return;
+        }
+        "variable_declarator" | "public_field_definition" | "field_definition" => {
+            let value = node.child_by_field_name("value");
+            if value.is_some_and(callable_value)
+                && let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| text(name, source))
+            {
+                definitions.push(definition(
+                    node,
+                    value.and_then(|value| value.child_by_field_name("body")),
+                    source,
+                    scope,
+                    name,
+                    DefinitionKind::Callable,
+                ));
+                return;
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_definitions(child, source, scope, definitions);
+    }
+}
+
+pub fn analyze(
+    source: &str,
+    language: SourceLanguage,
+) -> Result<TypescriptAnalysis, Box<dyn Error>> {
+    let mut parser = Parser::new();
+    let grammar = match language {
+        SourceLanguage::JavaScript | SourceLanguage::Jsx => tree_sitter_javascript::LANGUAGE,
+        SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
+    };
+    parser.set_language(&grammar.into())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("JavaScript/TypeScript parser returned no tree")?;
+    if tree.root_node().has_error() {
+        return Err("failed to parse JavaScript/TypeScript source".into());
+    }
+    let mut definitions = Vec::new();
+    collect_definitions(
+        tree.root_node(),
+        source.as_bytes(),
+        &mut Vec::new(),
+        &mut definitions,
+    );
+    Ok(TypescriptAnalysis {
+        language,
+        definitions,
+    })
+}
+
+fn source_stem(path: &Path) -> String {
+    path.with_extension("")
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+fn is_generated_source(path: &Path, source: &str) -> bool {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".generated") || name.ends_with(".gen"))
+        || source.lines().take(20).any(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("@generated")
+                || line.contains("generated by")
+                || line.contains("do not edit")
+        })
+}
+
+pub fn observations_from_analysis(
+    repository: &str,
+    analysis: &TypescriptAnalysis,
+    source: &str,
+    path: &Path,
+) -> Vec<Observation> {
+    let language = analysis.language.id_segment();
+    let module_id = format!("repo://{repository}/{language}/{}", source_stem(path));
+    let source_id = format!("repo://{repository}/{language}-source/{}", path.display());
+    let mut observations = vec![Observation::structural(
+        source_id,
+        StructuralRelation::Defines,
+        module_id.clone(),
+        path.display().to_string(),
+    )];
+    let ids = analysis
+        .definitions
+        .iter()
+        .map(|definition| {
+            (
+                definition.qualified_name.clone(),
+                format!("{module_id}/{}", definition.qualified_name),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for definition in &analysis.definitions {
+        let id = &ids[&definition.qualified_name];
+        let parent_name = definition
+            .qualified_name
+            .rsplit_once('/')
+            .map(|(parent, _)| parent);
+        let parent = parent_name
+            .and_then(|parent| ids.get(parent))
+            .unwrap_or(&module_id);
+        observations.push(Observation::structural(
+            parent.clone(),
+            StructuralRelation::Defines,
+            id.clone(),
+            format!("{}:{}", path.display(), definition.line),
+        ));
+        if definition.kind != DefinitionKind::Callable {
+            continue;
+        }
+        let scope = parent_name.unwrap_or_default();
+        for call in &definition.calls {
+            let target = match call.kind {
+                CallKind::Direct => ids
+                    .get(&qualified(
+                        &scope.split('/').map(str::to_owned).collect::<Vec<_>>(),
+                        &call.name,
+                    ))
+                    .or_else(|| ids.get(&call.name))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{language}-call://{}", call.name)),
+                CallKind::Member if call.receiver.as_deref() == Some("this") => ids
+                    .get(&format!("{scope}/{}", call.name))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{language}-method://this/{}", call.name)),
+                CallKind::Member => format!(
+                    "{language}-method://{}/{}",
+                    call.receiver.as_deref().unwrap_or("_"),
+                    call.name
+                ),
+                CallKind::Constructor => ids
+                    .get(&call.name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{language}-constructor://{}", call.name)),
+            };
+            observations.push(Observation::dependency(
+                id.clone(),
+                DependencyRelation::Calls,
+                target,
+                format!("{}:{}", path.display(), call.line),
+            ));
+        }
+    }
+    if is_generated_source(path, source) {
+        for observation in &mut observations {
+            observation.provenance = Provenance::Generated;
+        }
+    }
+    observations
+}
+
+pub fn entities_from_analysis(
+    repository: &str,
+    analysis: &TypescriptAnalysis,
+    path: &Path,
+) -> Vec<EntityFact> {
+    let module_id = format!(
+        "repo://{}/{}/{}",
+        repository,
+        analysis.language.id_segment(),
+        source_stem(path)
+    );
+    std::iter::once(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap())
+        .chain(analysis.definitions.iter().map(|definition| {
+            EntityFact::new(
+                format!("{module_id}/{}", definition.qualified_name),
+                match definition.kind {
+                    DefinitionKind::Namespace => EntityKind::Namespace,
+                    DefinitionKind::Callable => EntityKind::Callable,
+                },
+                None,
+            )
+            .unwrap()
+        }))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beholder_domain::{Confidence, SemanticRelation};
+
+    fn observations(source: &str, path: &str) -> Vec<Observation> {
+        let path = Path::new(path);
+        let language = SourceLanguage::from_path(path).unwrap();
+        let analysis = analyze(source, language).unwrap();
+        observations_from_analysis("example", &analysis, source, path)
+    }
+
+    #[test]
+    fn parses_all_four_source_forms_with_their_explicit_grammar() {
+        for (path, source, expected) in [
+            ("src/plain.js", "export function run() {}", "/javascript/"),
+            (
+                "src/view.jsx",
+                "export const View = () => <main />",
+                "/javascript/",
+            ),
+            (
+                "src/plain.ts",
+                "export function run(value: string): string { return value }",
+                "/typescript/",
+            ),
+            (
+                "src/view.tsx",
+                "export const View = (): JSX.Element => <main />",
+                "/typescript/",
+            ),
+        ] {
+            assert!(observations(source, path).iter().any(|observation| {
+                observation.to.as_str().contains(expected)
+                    && observation.to.as_str().ends_with(if path.contains("view") {
+                        "/View"
+                    } else {
+                        "/run"
+                    })
+            }));
+        }
+    }
+
+    #[test]
+    fn resolves_local_and_this_calls_but_preserves_external_receivers() {
+        let source = "function helper() {} class Worker { run() { helper(); this.stop(); api.send(); new Job(); } stop() {} }";
+        let observations = observations(source, "src/worker.ts");
+        let calls = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<Vec<_>>();
+        assert!(calls.contains(&"repo://example/typescript/src/worker/helper"));
+        assert!(calls.contains(&"repo://example/typescript/src/worker/Worker/stop"));
+        assert!(calls.contains(&"typescript-method://api/send"));
+        assert!(calls.contains(&"typescript-constructor://Job"));
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.confidence == Confidence::Exact)
+        );
+    }
+
+    #[test]
+    fn marks_only_explicit_generated_sources_as_generated() {
+        let generated = observations(
+            "// Generated by example. Do not edit.\nexport function run() {}",
+            "src/client.ts",
+        );
+        assert!(
+            generated
+                .iter()
+                .all(|observation| observation.provenance == Provenance::Generated)
+        );
+        let ordinary = observations("export function run() {}", "src/generated/client.ts");
+        assert!(
+            ordinary
+                .iter()
+                .all(|observation| observation.provenance == Provenance::Ast)
+        );
+    }
+}
