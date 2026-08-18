@@ -295,6 +295,21 @@ fn import_bases(caller: &Path, source: &str, packages: &BTreeMap<String, Package
     package_bases(source, packages)
 }
 
+fn source_candidates(base: PathBuf) -> Vec<PathBuf> {
+    if SourceLanguage::from_path(&base).is_some() {
+        return vec![base];
+    }
+    ["ts", "tsx", "d.ts", "js", "jsx"]
+        .into_iter()
+        .map(|extension| base.with_extension(extension))
+        .chain(
+            ["ts", "tsx", "d.ts", "js", "jsx"]
+                .into_iter()
+                .map(|extension| base.join("index").with_extension(extension)),
+        )
+        .collect()
+}
+
 fn imported_file(
     caller: &Path,
     source: &str,
@@ -305,21 +320,7 @@ fn imported_file(
     alias_targets(caller, source, aliases)
         .into_iter()
         .chain(import_bases(caller, source, packages))
-        .flat_map(|base| {
-            if SourceLanguage::from_path(&base).is_some() {
-                vec![base]
-            } else {
-                ["ts", "tsx", "js", "jsx"]
-                    .into_iter()
-                    .map(|extension| base.with_extension(extension))
-                    .chain(
-                        ["ts", "tsx", "js", "jsx"]
-                            .into_iter()
-                            .map(|extension| base.join("index").with_extension(extension)),
-                    )
-                    .collect()
-            }
-        })
+        .flat_map(source_candidates)
         .find(|candidate| files.contains_key(candidate))
 }
 
@@ -948,21 +949,7 @@ fn workspace_imported_file(
     let name = package.manifest.get("name")?.as_str()?;
     package_targets(source, name, package)
         .into_iter()
-        .flat_map(|base| {
-            if SourceLanguage::from_path(&base).is_some() {
-                vec![base]
-            } else {
-                ["ts", "tsx", "js", "jsx"]
-                    .into_iter()
-                    .map(|extension| base.with_extension(extension))
-                    .chain(
-                        ["ts", "tsx", "js", "jsx"]
-                            .into_iter()
-                            .map(|extension| base.join("index").with_extension(extension)),
-                    )
-                    .collect()
-            }
-        })
+        .flat_map(source_candidates)
         .find(|candidate| indexes[index].files.contains_key(candidate))
         .map(|file| (index, file))
 }
@@ -1417,6 +1404,16 @@ mod tests {
                 "import { Client } from './client'; import { Service } from './service'; function callWithCache<T>(load: () => Promise<T>) { return load(); } export function nested(client: Client) { client.service.execute(); } export function optional(service: Service) { service?.execute(); } export function callback(service: Service) { return callWithCache(async () => service.execute()); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/types.d.ts"),
+                "export declare class DeclaredService { execute(): void; } export declare function declaredWork(): void; export declare const declaredService: DeclaredService;",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/declaration-consumer.ts"),
+                "import { declaredService, declaredWork } from './types'; export function useDeclarations() { declaredWork(); declaredService.execute(); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1628,6 +1625,20 @@ mod tests {
                     && observation.to.as_str()
                         == "repo://example/typescript/packages/app/src/service/Service/execute"
             }));
+        }
+        let declaration_caller =
+            "repo://example/typescript/packages/app/src/declaration-consumer/useDeclarations";
+        for target in [
+            "repo://example/typescript/packages/app/src/types.d/declaredWork",
+            "repo://example/typescript/packages/app/src/types.d/DeclaredService/execute",
+        ] {
+            assert!(
+                observations.iter().any(|observation| {
+                    observation.from.as_str() == declaration_caller
+                        && observation.to.as_str() == target
+                }),
+                "missing {target}: {observations:?}"
+            );
         }
     }
 

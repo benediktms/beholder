@@ -641,6 +641,7 @@ fn collect_definitions(
         }
         "function_declaration"
         | "generator_function_declaration"
+        | "function_signature"
         | "method_definition"
         | "method_signature"
         | "abstract_method_signature" => {
@@ -730,6 +731,22 @@ fn collect_definitions(
                     definition(node, None, source, scope, name, DefinitionKind::Namespace);
                 factory_definition.factory = Some(factory.into());
                 definitions.push(factory_definition);
+                return;
+            }
+            if node.kind() == "variable_declarator"
+                && scope.is_empty()
+                && let Some(binding) = binding(node, source)
+            {
+                let mut instance = definition(
+                    node,
+                    None,
+                    source,
+                    scope,
+                    &binding.receiver,
+                    DefinitionKind::Namespace,
+                );
+                instance.base = Some(binding.type_name);
+                definitions.push(instance);
                 return;
             }
         }
