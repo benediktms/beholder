@@ -19,9 +19,10 @@ use beholder_adapters_treesitter_rust::{
 };
 use beholder_adapters_treesitter_typescript::{
     FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION,
+    GrpcBindingInput as TypescriptGrpcBindingInput,
     RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
     TypescriptRepository, diagnostics_from_analysis as typescript_diagnostics,
-    entities_from_analysis as typescript_entities,
+    entities_from_analysis as typescript_entities, grpc_bindings as typescript_grpc_bindings,
     observations_from_analysis as typescript_observations,
     resolve_repository_calls as resolve_typescript_repository_calls,
     resolve_workspace_calls as resolve_typescript_workspace_calls,
@@ -775,6 +776,14 @@ impl IndexScheduler {
             &typescript_manifest_refs,
             &typescript_config_refs,
         );
+        let (source_bindings, source_diagnostics) =
+            typescript_grpc_bindings(TypescriptGrpcBindingInput {
+                repository: &state.repository.identity,
+                sources: &typescript_sources,
+                observations: &observations,
+            });
+        grpc_bindings.extend(source_bindings);
+        diagnostics.extend(source_diagnostics);
         let typescript = (!typescript_analyses.is_empty()).then(|| {
             TypescriptRepository::new(
                 state.repository.identity.clone(),
@@ -2357,6 +2366,156 @@ mod tests {
                     .any(|edge| edge.kind == RelationKind::BindsContract)
             );
         }
+
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn typescript_grpc_workspace_resolves_client_contract_messages_and_server() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-typescript-grpc-{unique}"));
+        let contracts = state.join("contracts");
+        let client = state.join("client");
+        let server = state.join("server");
+        for directory in [
+            contracts.as_path(),
+            client.join("src").as_path(),
+            server.join("src").as_path(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            contracts.join("checkout.proto"),
+            r#"
+            syntax = "proto3";
+            package phase7.checkout.v1;
+            message InitializeOrderRequest {}
+            message InitializeOrderResponse {}
+            service RPCService {
+              rpc InitializeOrder(InitializeOrderRequest) returns (InitializeOrderResponse);
+            }
+            "#,
+        )
+        .unwrap();
+        let generated = r#"
+            export const RPCServiceServiceName = "phase7.checkout.v1.RPCService";
+            export class RPCServiceClientImpl {
+              constructor(private readonly rpc: Rpc) {}
+              initializeOrder(request: InitializeOrderRequest): Promise<InitializeOrderResponse> {
+                return this.rpc.request(this.service, "InitializeOrder", request);
+              }
+            }
+        "#;
+        fs::write(client.join("src/generated.ts"), generated).unwrap();
+        fs::write(
+            client.join("src/messages.generated.ts"),
+            r#"
+            export const protobufPackage = "phase7.checkout.v1";
+            export interface InitializeOrderRequest {}
+            export const InitializeOrderRequest = {
+              encode(message: InitializeOrderRequest) { return message; },
+              decode(input: Uint8Array) { return input; },
+            };
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            client.join("src/caller.ts"),
+            r#"
+            import { RPCServiceClientImpl } from "./generated";
+            export function initializeOrder() {
+              const client = new RPCServiceClientImpl({} as Rpc);
+              return client.initializeOrder({});
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(server.join("src/generated.ts"), generated).unwrap();
+        fs::write(
+            server.join("src/controller.ts"),
+            r#"
+            import { GrpcMethod } from "@nestjs/microservices";
+            export class CheckoutController {
+              @GrpcMethod("RPCService", "InitializeOrder")
+              initializeOrder(request: InitializeOrderRequest): InitializeOrderResponse {
+                return request;
+              }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register(
+                "typescript-grpc".into(),
+                vec![contracts.clone(), client.clone(), server.clone()],
+                Vec::new(),
+            )
+            .unwrap();
+        let client_identity = beholder_adapters_git::repository_identity(&client).unwrap();
+        let server_identity = beholder_adapters_git::repository_identity(&server).unwrap();
+        let caller = format!("repo://{client_identity}/typescript/src/caller/initializeOrder");
+        let generated_client = format!(
+            "repo://{client_identity}/typescript/src/generated/RPCServiceClientImpl/initializeOrder"
+        );
+        let implementation = format!(
+            "repo://{server_identity}/typescript/src/controller/CheckoutController/initializeOrder"
+        );
+        let operation = "grpc://phase7.checkout.v1.RPCService/InitializeOrder";
+        let contract = "proto-method://phase7.checkout.v1.RPCService/InitializeOrder";
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+
+        scheduler.index(&store, &workspace).unwrap();
+
+        let trace = store
+            .trace("typescript-grpc", &caller, &implementation, 32)
+            .unwrap();
+        assert!(trace.paths.iter().any(|path| {
+            path.nodes
+                == [
+                    caller.as_str(),
+                    generated_client.as_str(),
+                    operation,
+                    implementation.as_str(),
+                ]
+        }));
+        let context = store.context("typescript-grpc", contract).unwrap();
+        for (kind, message) in [
+            (
+                RelationKind::RequestType,
+                "proto-type://phase7.checkout.v1.InitializeOrderRequest",
+            ),
+            (
+                RelationKind::ResponseType,
+                "proto-type://phase7.checkout.v1.InitializeOrderResponse",
+            ),
+        ] {
+            assert!(
+                context.edges.iter().any(|edge| {
+                    edge.kind == kind && edge.from == contract && edge.to == message
+                })
+            );
+        }
+        let request = store
+            .context(
+                "typescript-grpc",
+                "proto-type://phase7.checkout.v1.InitializeOrderRequest",
+            )
+            .unwrap();
+        assert!(request.edges.iter().any(|edge| {
+            edge.kind == RelationKind::BindsContract
+                && edge.from
+                    == format!(
+                        "repo://{client_identity}/typescript/src/messages.generated/InitializeOrderRequest"
+                    )
+                && edge.to == "proto-type://phase7.checkout.v1.InitializeOrderRequest"
+        }));
 
         drop(store);
         fs::remove_dir_all(state).unwrap();
