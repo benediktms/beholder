@@ -1,7 +1,7 @@
 use super::model::*;
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, Provenance, StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, EntityFact, EntityKind, Observation,
+    Provenance, StructuralRelation,
 };
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -51,17 +51,56 @@ fn parameters(node: Node<'_>, source: &[u8]) -> Vec<Parameter> {
                 .named_children(&mut cursor)
                 .filter(|parameter| parameter.kind() == "parameter")
                 .filter_map(|parameter| {
+                    let name = parameter.child_by_field_name("name")?;
+                    let type_ = parameter.child_by_field_name("type")?;
+                    let is_optional =
+                        parameter
+                            .named_children(&mut parameter.walk())
+                            .any(|child| {
+                                child != name
+                                    && child != type_
+                                    && !matches!(
+                                        child.kind(),
+                                        "attribute_list"
+                                            | "modifier"
+                                            | "preproc_if_in_attribute_list"
+                                    )
+                            });
                     Some(Parameter {
-                        name: text(parameter.child_by_field_name("name")?, source)?.into(),
-                        type_name: text(parameter.child_by_field_name("type")?, source)?
-                            .trim()
-                            .into(),
+                        name: text(name, source)?.into(),
+                        type_name: text(type_, source)?.trim().into(),
                         is_extension: text(parameter, source)?.trim_start().starts_with("this "),
+                        is_optional,
                     })
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn arguments(node: Node<'_>, source: &[u8]) -> Vec<Argument> {
+    let Some(arguments) = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "argument_list")
+    else {
+        return Vec::new();
+    };
+    arguments
+        .named_children(&mut arguments.walk())
+        .filter(|argument| argument.kind() == "argument")
+        .filter_map(|argument| {
+            let name = argument
+                .child_by_field_name("name")
+                .and_then(|name| text(name, source).map(str::to_owned));
+            let expression = argument
+                .named_children(&mut argument.walk())
+                .find(|child| Some(*child) != argument.child_by_field_name("name"))?;
+            Some(Argument {
+                name,
+                expression: text(expression, source)?.into(),
+            })
+        })
+        .collect()
 }
 
 fn simple_name(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -105,6 +144,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                         .map(str::to_owned),
                     name: simple_name(function, source)?,
                     type_arguments: type_arguments(function, source),
+                    arguments: arguments(node, source),
                     line: node.start_position().row + 1,
                 });
             }
@@ -113,6 +153,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                 receiver: None,
                 name: simple_name(function, source)?,
                 type_arguments: type_arguments(function, source),
+                arguments: arguments(node, source),
                 line: node.start_position().row + 1,
             })
         }
@@ -124,6 +165,7 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                 .and_then(|kind| text(kind, source))?
                 .to_owned(),
             type_arguments: Vec::new(),
+            arguments: arguments(node, source),
             line: node.start_position().row + 1,
         }),
         _ => None,
@@ -268,35 +310,6 @@ fn is_generated_source(path: &Path, source: &str) -> bool {
         })
 }
 
-fn local_target(
-    analysis: &CsharpAnalysis,
-    ids: &BTreeMap<String, String>,
-    scope: &str,
-    call: &Call,
-) -> Option<String> {
-    let mut candidates = analysis
-        .definitions
-        .iter()
-        .filter(|definition| definition.kind == DefinitionKind::Callable)
-        .filter(|definition| {
-            let simple = definition
-                .qualified_name
-                .rsplit('/')
-                .next()
-                .unwrap_or(&definition.qualified_name);
-            let callable = simple.split('(').next().unwrap_or(simple);
-            callable == call.name
-                && (call.kind != CallKind::Member || call.receiver.as_deref() == Some("this"))
-        })
-        .filter_map(|definition| {
-            ids.get(&definition.qualified_name)
-                .map(|id| (&definition.qualified_name, id))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|(name, _)| !name.starts_with(scope));
-    (candidates.len() == 1).then(|| candidates[0].1.clone())
-}
-
 pub fn observations_from_analysis(
     repository: &str,
     assembly: &str,
@@ -340,18 +353,6 @@ pub fn observations_from_analysis(
             id.clone(),
             format!("{}:{}", path.display(), definition.line),
         ));
-        for call in &definition.calls {
-            let Some(target) = local_target(analysis, &ids, parent_name.unwrap_or_default(), call)
-            else {
-                continue;
-            };
-            observations.push(Observation::dependency(
-                id.clone(),
-                DependencyRelation::Calls,
-                target,
-                format!("{}:{}", path.display(), call.line),
-            ));
-        }
     }
     if is_generated_source(path, source) {
         for observation in &mut observations {
@@ -389,7 +390,7 @@ pub fn entities_from_analysis(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::{Confidence, SemanticRelation};
+    use beholder_domain::{Confidence, DependencyRelation, SemanticRelation};
 
     #[test]
     fn indexes_file_scoped_namespaces_and_same_type_calls() {
@@ -408,13 +409,22 @@ public sealed class Worker
 }
 "#;
         let analysis = analyze(source).unwrap();
-        let observations = observations_from_analysis(
+        let mut observations = observations_from_analysis(
             "example",
             "Example.App",
             &analysis,
             source,
             Path::new("src/Runner.cs"),
         );
+        observations.extend(crate::resolve_repository_calls(
+            "example",
+            &[],
+            &[crate::CsharpSource {
+                path: Path::new("src/Runner.cs"),
+                assembly: "Example.App",
+                analysis: &analysis,
+            }],
+        ));
 
         assert!(analysis.parse_error_lines.is_empty());
         assert!(

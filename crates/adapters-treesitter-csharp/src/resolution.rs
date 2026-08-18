@@ -49,11 +49,55 @@ fn simple_type_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+fn inferred_argument_type<'a>(caller: &'a Definition, expression: &str) -> Option<&'a str> {
+    caller
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == expression)
+        .map(|parameter| parameter.type_name.as_str())
+        .or_else(|| expression.starts_with('"').then_some("string"))
+}
+
+fn call_is_applicable(caller: &Definition, target: &Definition, call: &Call) -> bool {
+    let parameters = if call.kind == CallKind::Member
+        && target
+            .parameters
+            .first()
+            .is_some_and(|parameter| parameter.is_extension)
+    {
+        &target.parameters[1..]
+    } else {
+        target.parameters.as_slice()
+    };
+    if call.arguments.len() > parameters.len()
+        || call.arguments.len()
+            < parameters
+                .iter()
+                .filter(|parameter| !parameter.is_optional)
+                .count()
+    {
+        return false;
+    }
+    call.arguments.iter().enumerate().all(|(index, argument)| {
+        let Some(parameter) = argument
+            .name
+            .as_deref()
+            .and_then(|name| parameters.iter().find(|parameter| parameter.name == name))
+            .or_else(|| parameters.get(index))
+        else {
+            return false;
+        };
+        inferred_argument_type(caller, &argument.expression).is_none_or(|argument_type| {
+            simple_type_name(argument_type) == simple_type_name(&parameter.type_name)
+        })
+    })
+}
+
 fn target_matches(caller: &Definition, target: &Definition, call: &Call) -> bool {
     if callable_name(target) != call.name {
         return false;
     }
-    match call.kind {
+    let owner_matches = match call.kind {
         CallKind::Direct => parent(&target.qualified_name) == parent(&caller.qualified_name),
         CallKind::Constructor => parent(&target.qualified_name)
             .rsplit('/')
@@ -62,20 +106,25 @@ fn target_matches(caller: &Definition, target: &Definition, call: &Call) -> bool
         CallKind::Member if call.receiver.as_deref() == Some("this") => {
             parent(&target.qualified_name) == parent(&caller.qualified_name)
         }
-        CallKind::Member => call
-            .receiver
-            .as_deref()
-            .and_then(|receiver| {
-                caller
-                    .parameters
-                    .iter()
-                    .find(|parameter| parameter.name == receiver)
-            })
-            .zip(target.parameters.first())
-            .is_some_and(|(receiver, first)| {
-                first.is_extension && first.type_name == receiver.type_name
-            }),
-    }
+        CallKind::Member => {
+            let receiver = call.receiver.as_deref().unwrap_or_default();
+            caller
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == receiver)
+                .zip(target.parameters.first())
+                .is_some_and(|(receiver, first)| {
+                    first.is_extension
+                        && simple_type_name(&first.type_name)
+                            == simple_type_name(&receiver.type_name)
+                })
+                || parent(&target.qualified_name)
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|owner| owner == simple_type_name(receiver))
+        }
+    };
+    owner_matches && call_is_applicable(caller, target, call)
 }
 
 fn id(repository: &str, source: &CsharpSource<'_>, definition: &Definition) -> String {
@@ -145,13 +194,6 @@ pub fn resolve_repository_calls(
                     .into_values()
                     .collect::<Vec<_>>();
                 if let [(target_source, target)] = candidates.as_slice() {
-                    let already_resolved_locally = target_source.path == source.path
-                        && target_source.assembly == source.assembly
-                        && !(call.kind == CallKind::Member
-                            && call.receiver.as_deref() != Some("this"));
-                    if already_resolved_locally {
-                        continue;
-                    }
                     observations.push(Observation::dependency(
                         id(repository, source, caller),
                         DependencyRelation::Calls,
@@ -259,7 +301,58 @@ mod tests {
             }),
             "{observations:#?}"
         );
-        assert_eq!(observations.len(), 1, "{observations:#?}");
+        assert_eq!(observations.len(), 2, "{observations:#?}");
+    }
+
+    #[test]
+    fn resolves_overloads_and_static_calls_from_argument_types() {
+        let app_project = parse_project(
+            Path::new("App/App.csproj"),
+            r#"<Project><ItemGroup><ProjectReference Include="../Core/Core.csproj" /></ItemGroup></Project>"#,
+        )
+        .unwrap();
+        let core_project = parse_project(Path::new("Core/Core.csproj"), "<Project />").unwrap();
+        let app = analyze("static class Syntax { static void Start(string text) { Parse(text, flag: null); SourceText.From(text); } static void Parse(string text, object? flag) {} static void Parse(SourceText text, object? flag) {} }").unwrap();
+        let core = analyze(
+            "class SourceText { public static SourceText From(string text) { return new SourceText(); } public SourceText() {} }",
+        )
+        .unwrap();
+        let sources = [
+            CsharpSource {
+                path: Path::new("App/Syntax.cs"),
+                assembly: "App",
+                analysis: &app,
+            },
+            CsharpSource {
+                path: Path::new("Core/SourceText.cs"),
+                assembly: "Core",
+                analysis: &core,
+            },
+        ];
+
+        let observations =
+            resolve_repository_calls("example", &[app_project, core_project], &sources);
+
+        assert!(
+            observations.iter().any(|observation| {
+                observation.from.as_str().ends_with("/Syntax/Start(string)")
+                    && observation
+                        .to
+                        .as_str()
+                        .ends_with("/Syntax/Parse(string,object?)")
+            }),
+            "{observations:#?}"
+        );
+        assert!(
+            observations.iter().any(|observation| {
+                observation.from.as_str().ends_with("/Syntax/Start(string)")
+                    && observation
+                        .to
+                        .as_str()
+                        .ends_with("/SourceText/From(string)")
+            }),
+            "{observations:#?}"
+        );
     }
 
     #[test]

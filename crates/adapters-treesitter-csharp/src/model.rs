@@ -27,6 +27,13 @@ pub(super) struct Parameter {
     pub(super) name: String,
     pub(super) type_name: String,
     pub(super) is_extension: bool,
+    pub(super) is_optional: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Argument {
+    pub(super) name: Option<String>,
+    pub(super) expression: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,5 +49,6 @@ pub(super) struct Call {
     pub(super) receiver: Option<String>,
     pub(super) name: String,
     pub(super) type_arguments: Vec<String>,
+    pub(super) arguments: Vec<Argument>,
     pub(super) line: usize,
 }
