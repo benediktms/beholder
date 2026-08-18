@@ -1087,6 +1087,53 @@ mod tests {
     }
 
     #[test]
+    fn typescript_frontend_cache_reuses_disk_and_separates_grammars() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-typescript-cache-{unique}"));
+        let source = "export function shared() {}";
+        let scheduler = IndexScheduler::new(cache.clone());
+
+        assert_eq!(
+            scheduler
+                .typescript_analysis_versioned(source, SourceLanguage::TypeScript)
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+        assert_eq!(
+            scheduler
+                .typescript_analysis_versioned(source, SourceLanguage::TypeScript)
+                .unwrap()
+                .1,
+            CacheStatus::Memory
+        );
+        assert_eq!(
+            scheduler
+                .typescript_analysis_versioned(source, SourceLanguage::JavaScript)
+                .unwrap()
+                .1,
+            CacheStatus::Miss
+        );
+
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(cache.clone());
+        for language in [SourceLanguage::TypeScript, SourceLanguage::JavaScript] {
+            assert_eq!(
+                scheduler
+                    .typescript_analysis_versioned(source, language)
+                    .unwrap()
+                    .1,
+                CacheStatus::Disk
+            );
+        }
+        drop(scheduler);
+        fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
     fn indexes_javascript_and_typescript_through_the_workspace_pipeline() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
