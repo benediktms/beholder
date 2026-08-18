@@ -248,9 +248,11 @@ struct RepositoryIndex<'a> {
     origins: BTreeMap<(PathBuf, String), (PathBuf, String)>,
     members: BTreeMap<(PathBuf, String, String), EntityId>,
     bases: BTreeMap<(PathBuf, String), (PathBuf, String)>,
+    return_types: BTreeMap<(PathBuf, String), (PathBuf, String)>,
     caller_files: BTreeMap<String, PathBuf>,
     caller_owners: BTreeMap<String, (PathBuf, String)>,
     caller_bindings: BTreeMap<String, &'a [Binding]>,
+    caller_factory_bindings: BTreeMap<String, &'a [FactoryBinding]>,
     file_imports: BTreeMap<PathBuf, &'a [Import]>,
 }
 
@@ -270,10 +272,12 @@ fn repository_index<'a>(
     let mut origins = BTreeMap::<(PathBuf, String), (PathBuf, String)>::new();
     let mut members = BTreeMap::<(PathBuf, String, String), EntityId>::new();
     let mut raw_bases = BTreeMap::<(PathBuf, String), String>::new();
+    let mut raw_return_types = BTreeMap::<(PathBuf, String), String>::new();
     let mut factories = BTreeMap::<(PathBuf, String), String>::new();
     let mut caller_files = BTreeMap::<String, PathBuf>::new();
     let mut caller_owners = BTreeMap::<String, (PathBuf, String)>::new();
     let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
+    let mut caller_factory_bindings = BTreeMap::<String, &[FactoryBinding]>::new();
     let mut file_imports = BTreeMap::<PathBuf, &[Import]>::new();
     let mut file_exports = BTreeMap::<PathBuf, &[Export]>::new();
     for (path, analysis) in sources {
@@ -314,6 +318,12 @@ fn repository_index<'a>(
                         base.clone(),
                     );
                 }
+                if let Some(return_type) = &definition.return_type {
+                    raw_return_types.insert(
+                        ((*path).to_path_buf(), definition.qualified_name.clone()),
+                        return_type.clone(),
+                    );
+                }
             }
             if let Some((namespace, member)) = definition.qualified_name.rsplit_once('/')
                 && member_owners.contains(&namespace)
@@ -329,7 +339,8 @@ fn repository_index<'a>(
             }
             if definition.kind == DefinitionKind::Callable {
                 caller_files.insert(id.clone(), (*path).to_path_buf());
-                caller_bindings.insert(id, &definition.bindings);
+                caller_bindings.insert(id.clone(), &definition.bindings);
+                caller_factory_bindings.insert(id, &definition.factory_bindings);
                 if let Some((owner, member)) = definition.qualified_name.rsplit_once('/')
                     && !member.contains('/')
                     && member_owners.contains(&owner)
@@ -417,19 +428,44 @@ fn repository_index<'a>(
                 .map(|entity| (export.clone(), entity.clone()))
         })
         .collect::<BTreeMap<_, _>>();
-    for ((file, namespace), factory) in factories {
+    let return_types = raw_return_types
+        .into_iter()
+        .filter_map(|(callable, return_type)| {
+            let file = &callable.0;
+            let origin = file_imports
+                .get(file)
+                .and_then(|imports| {
+                    imports.iter().find_map(|import| {
+                        let binding = import.bindings.iter().find(|binding| {
+                            binding.local == return_type && binding.imported != "*"
+                        })?;
+                        let imported_file =
+                            imported_file(file, &import.source, &packages, &aliases, &files)?;
+                        origins
+                            .get(&(imported_file, binding.imported.clone()))
+                            .cloned()
+                    })
+                })
+                .or_else(|| {
+                    let key = (file.clone(), return_type);
+                    symbols.contains_key(&key).then_some(key)
+                })?;
+            Some((callable, origin))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for ((file, namespace), factory) in &factories {
         let local_origin = origins
             .get(&(file.clone(), factory.clone()))
             .cloned()
             .or_else(|| {
-                file_imports.get(&file).and_then(|imports| {
+                file_imports.get(file).and_then(|imports| {
                     imports.iter().find_map(|import| {
                         let binding = import
                             .bindings
                             .iter()
-                            .find(|binding| binding.local == factory)?;
+                            .find(|binding| binding.local == *factory)?;
                         let imported_file =
-                            imported_file(&file, &import.source, &packages, &aliases, &files)?;
+                            imported_file(file, &import.source, &packages, &aliases, &files)?;
                         origins
                             .get(&(imported_file, binding.imported.clone()))
                             .cloned()
@@ -450,7 +486,7 @@ fn repository_index<'a>(
             members.insert((file.clone(), namespace.clone(), name), entity);
         }
     }
-    let bases = raw_bases
+    let mut bases = raw_bases
         .into_iter()
         .filter_map(|((file, owner), base)| {
             let origin = file_imports
@@ -474,7 +510,30 @@ fn repository_index<'a>(
                 })?;
             Some(((file, owner), origin))
         })
-        .collect();
+        .collect::<BTreeMap<_, _>>();
+    for ((file, namespace), factory) in factories {
+        let factory_origin = origins
+            .get(&(file.clone(), factory.clone()))
+            .cloned()
+            .or_else(|| {
+                file_imports.get(&file).and_then(|imports| {
+                    imports.iter().find_map(|import| {
+                        let binding = import
+                            .bindings
+                            .iter()
+                            .find(|binding| binding.local == factory)?;
+                        let imported_file =
+                            imported_file(&file, &import.source, &packages, &aliases, &files)?;
+                        origins
+                            .get(&(imported_file, binding.imported.clone()))
+                            .cloned()
+                    })
+                })
+            });
+        if let Some(return_type) = factory_origin.and_then(|origin| return_types.get(&origin)) {
+            bases.insert((file, namespace), return_type.clone());
+        }
+    }
 
     RepositoryIndex {
         files,
@@ -484,9 +543,11 @@ fn repository_index<'a>(
         origins,
         members,
         bases,
+        return_types,
         caller_files,
         caller_owners,
         caller_bindings,
+        caller_factory_bindings,
         file_imports,
     }
 }
@@ -509,6 +570,59 @@ fn member_entity<'a>(
         owner = base.1.clone();
     }
     None
+}
+
+fn imported_origin(
+    index: &RepositoryIndex<'_>,
+    file: &Path,
+    name: &str,
+) -> Option<(PathBuf, String)> {
+    index.file_imports.get(file)?.iter().find_map(|import| {
+        let binding = import
+            .bindings
+            .iter()
+            .find(|binding| binding.local == name && binding.imported != "*")?;
+        let imported_file = imported_file(
+            file,
+            &import.source,
+            &index.packages,
+            &index.aliases,
+            &index.files,
+        )?;
+        index
+            .origins
+            .get(&(imported_file, binding.imported.clone()))
+            .cloned()
+    })
+}
+
+fn receiver_type(
+    index: &RepositoryIndex<'_>,
+    caller: &str,
+    receiver: &str,
+) -> Option<(PathBuf, String)> {
+    let file = index.caller_files.get(caller)?;
+    if let Some(type_name) = index
+        .caller_bindings
+        .get(caller)
+        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+        .map(|binding| binding.type_name.as_str())
+    {
+        return imported_origin(index, file, type_name)
+            .or_else(|| Some((file.clone(), type_name.to_owned())))
+            .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
+    }
+    let factory = index
+        .caller_factory_bindings
+        .get(caller)?
+        .iter()
+        .find(|binding| binding.receiver == receiver)?
+        .factory
+        .as_str();
+    let factory_origin = imported_origin(index, file, factory)
+        .or_else(|| Some((file.clone(), factory.to_owned())))
+        .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin))?;
+    index.return_types.get(&factory_origin).cloned()
 }
 
 fn resolve_observations(observations: &mut [Observation], index: &RepositoryIndex<'_>) {
@@ -550,49 +664,49 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
         let Some((name, receiver)) = direct.or(member).or(constructor) else {
             continue;
         };
-        let candidate =
-            imports
-                .iter()
-                .find_map(|import| {
-                    let binding = import.bindings.iter().find(|binding| match receiver {
-                        Some(receiver) => binding.local == receiver && binding.imported == "*",
-                        None => binding.local == name && binding.imported != "*",
-                    })?;
-                    let imported = if binding.imported == "*" {
-                        name
-                    } else {
-                        &binding.imported
-                    };
-                    let file = imported_file(
-                        caller_file,
-                        &import.source,
-                        &index.packages,
-                        &index.aliases,
-                        &index.files,
-                    )?;
-                    index.exports.get(&(file, imported.to_owned()))
-                })
-                .or_else(|| {
-                    (receiver == Some("this"))
-                        .then(|| index.caller_owners.get(observation.from.as_str()))
-                        .flatten()
-                        .and_then(|(file, owner)| {
-                            member_entity(index, file.clone(), owner.clone(), name)
-                        })
-                })
-                .or_else(|| {
-                    let receiver = receiver?;
-                    let type_name = index
-                        .caller_bindings
-                        .get(observation.from.as_str())?
-                        .iter()
-                        .find(|binding| binding.receiver == receiver)?
-                        .type_name
-                        .as_str();
-                    let imported_type = imports.iter().find_map(|import| {
-                        let binding = import.bindings.iter().find(|binding| {
-                            binding.local == type_name && binding.imported != "*"
-                        })?;
+        let candidate = imports
+            .iter()
+            .find_map(|import| {
+                let binding = import.bindings.iter().find(|binding| match receiver {
+                    Some(receiver) => binding.local == receiver && binding.imported == "*",
+                    None => binding.local == name && binding.imported != "*",
+                })?;
+                let imported = if binding.imported == "*" {
+                    name
+                } else {
+                    &binding.imported
+                };
+                let file = imported_file(
+                    caller_file,
+                    &import.source,
+                    &index.packages,
+                    &index.aliases,
+                    &index.files,
+                )?;
+                index.exports.get(&(file, imported.to_owned()))
+            })
+            .or_else(|| {
+                (receiver == Some("this"))
+                    .then(|| index.caller_owners.get(observation.from.as_str()))
+                    .flatten()
+                    .and_then(|(file, owner)| {
+                        member_entity(index, file.clone(), owner.clone(), name)
+                    })
+            })
+            .or_else(|| {
+                let receiver = receiver?;
+                let (file, type_name) = receiver_type(index, observation.from.as_str(), receiver)?;
+                member_entity(index, file, type_name, name)
+            })
+            .or_else(|| {
+                let receiver = receiver?;
+                let (file, namespace) = imports
+                    .iter()
+                    .find_map(|import| {
+                        let binding = import
+                            .bindings
+                            .iter()
+                            .find(|binding| binding.local == receiver && binding.imported != "*")?;
                         let file = imported_file(
                             caller_file,
                             &import.source,
@@ -600,42 +714,16 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
                             &index.aliases,
                             &index.files,
                         )?;
-                        Some((file, binding.imported.as_str()))
-                    });
-                    let (mut file, mut type_name) =
-                        imported_type.unwrap_or_else(|| (caller_file.to_path_buf(), type_name));
-                    let origin = index.origins.get(&(file.clone(), type_name.to_owned()));
-                    if let Some((origin_file, origin_name)) = origin {
-                        file = origin_file.clone();
-                        type_name = origin_name;
-                    }
-                    member_entity(index, file, type_name.to_owned(), name)
-                })
-                .or_else(|| {
-                    let receiver = receiver?;
-                    let (file, namespace) = imports
-                        .iter()
-                        .find_map(|import| {
-                            let binding = import.bindings.iter().find(|binding| {
-                                binding.local == receiver && binding.imported != "*"
-                            })?;
-                            let file = imported_file(
-                                caller_file,
-                                &import.source,
-                                &index.packages,
-                                &index.aliases,
-                                &index.files,
-                            )?;
-                            Some((file, binding.imported.clone()))
-                        })
-                        .unwrap_or_else(|| (caller_file.to_path_buf(), receiver.to_owned()));
-                    let (file, namespace) = index
-                        .origins
-                        .get(&(file.clone(), namespace.clone()))
-                        .cloned()
-                        .unwrap_or((file, namespace));
-                    member_entity(index, file, namespace, name)
-                });
+                        Some((file, binding.imported.clone()))
+                    })
+                    .unwrap_or_else(|| (caller_file.to_path_buf(), receiver.to_owned()));
+                let (file, namespace) = index
+                    .origins
+                    .get(&(file.clone(), namespace.clone()))
+                    .cloned()
+                    .unwrap_or((file, namespace));
+                member_entity(index, file, namespace, name)
+            });
         if let Some(target) = candidate {
             observation.to = target.clone();
         }
@@ -964,6 +1052,16 @@ mod tests {
                 "import { Child } from './child'; export function inherited(child: Child) { child.execute(); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/service-factory.ts"),
+                "import { Service } from './service'; export function makeService(): Service { return new Service(); } export function inferService() { return new Service(); }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/returned-service-consumer.ts"),
+                "import { makeService, inferService } from './service-factory'; export function explicitReturn() { const service = makeService(); service.execute(); } export function inferredReturn() { const service = inferService(); service.execute(); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1080,6 +1178,16 @@ mod tests {
                 observation.from.as_str() == caller
                     && observation.to.as_str()
                         == "repo://example/typescript/packages/app/src/base/Base/execute"
+            }));
+        }
+        for caller in ["explicitReturn", "inferredReturn"] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == format!(
+                        "repo://example/typescript/packages/app/src/returned-service-consumer/{caller}"
+                    )
+                    && observation.to.as_str()
+                        == "repo://example/typescript/packages/app/src/service/Service/execute"
             }));
         }
     }

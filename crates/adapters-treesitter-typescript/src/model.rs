@@ -30,10 +30,10 @@ impl SourceLanguage {
 
     pub fn cache_version(self) -> &'static str {
         match self {
-            Self::JavaScript => "7-javascript",
-            Self::Jsx => "7-jsx",
-            Self::TypeScript => "7-typescript",
-            Self::Tsx => "7-tsx",
+            Self::JavaScript => "8-javascript",
+            Self::Jsx => "8-jsx",
+            Self::TypeScript => "8-typescript",
+            Self::Tsx => "8-tsx",
         }
     }
 }
@@ -87,8 +87,10 @@ pub(super) struct Definition {
     pub(super) line: usize,
     pub(super) calls: Vec<Call>,
     pub(super) bindings: Vec<Binding>,
+    pub(super) factory_bindings: Vec<FactoryBinding>,
     pub(super) factory: Option<String>,
     pub(super) base: Option<String>,
+    pub(super) return_type: Option<String>,
     pub(super) exported: bool,
 }
 
@@ -96,6 +98,12 @@ pub(super) struct Definition {
 pub(super) struct Binding {
     pub(super) receiver: String,
     pub(super) type_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct FactoryBinding {
+    pub(super) receiver: String,
+    pub(super) factory: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

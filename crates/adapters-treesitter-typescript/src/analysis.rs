@@ -174,6 +174,74 @@ fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mu
     }
 }
 
+fn collect_factory_bindings(
+    node: Node<'_>,
+    source: &[u8],
+    root: Node<'_>,
+    bindings: &mut Vec<FactoryBinding>,
+) {
+    if node != root
+        && matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function_declaration"
+                | "method_definition"
+        )
+    {
+        return;
+    }
+    if node.kind() == "variable_declarator"
+        && let Some(receiver) = node
+            .child_by_field_name("name")
+            .filter(|name| name.kind() == "identifier")
+            .and_then(|name| text(name, source))
+        && let Some(factory) = node
+            .child_by_field_name("value")
+            .filter(|value| value.kind() == "call_expression")
+            .and_then(|value| value.child_by_field_name("function"))
+            .filter(|function| function.kind() == "identifier")
+            .and_then(|function| text(function, source))
+    {
+        bindings.push(FactoryBinding {
+            receiver: receiver.into(),
+            factory: factory.into(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_factory_bindings(child, source, root, bindings);
+    }
+}
+
+fn returned_constructor(node: Node<'_>, source: &[u8], root: Node<'_>) -> Option<String> {
+    if node != root
+        && matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function_declaration"
+                | "method_definition"
+        )
+    {
+        return None;
+    }
+    if node.kind() == "return_statement"
+        && let Some(value) = node.named_child(0)
+        && value.kind() == "new_expression"
+    {
+        return value
+            .child_by_field_name("constructor")
+            .and_then(|constructor| text(constructor, source))
+            .map(str::to_owned);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| returned_constructor(child, source, root))
+}
+
 fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
     let mut bindings = Vec::new();
     let mut cursor = body.walk();
@@ -230,18 +298,26 @@ fn definition(
 ) -> Definition {
     let mut calls = Vec::new();
     let mut bindings = Vec::new();
+    let mut factory_bindings = Vec::new();
     if let Some(body) = body {
         collect_calls(body, source, body, &mut calls);
     }
     collect_bindings(node, source, node, &mut bindings);
+    collect_factory_bindings(node, source, node, &mut factory_bindings);
+    let return_type = node
+        .child_by_field_name("return_type")
+        .and_then(|annotation| type_name(annotation, source))
+        .or_else(|| returned_constructor(node, source, node));
     Definition {
         qualified_name: qualified(scope, name),
         kind,
         line: node.start_position().row + 1,
         calls,
         bindings,
+        factory_bindings,
         factory: None,
         base: None,
+        return_type,
         exported: is_exported(node),
     }
 }
