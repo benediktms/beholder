@@ -25,6 +25,7 @@ use beholder_adapters_treesitter_typescript::{
     observations_from_analysis as typescript_observations,
     resolve_repository_calls as resolve_typescript_repository_calls,
     resolve_workspace_calls as resolve_typescript_workspace_calls,
+    unresolved_call_diagnostics as unresolved_typescript_call_diagnostics,
 };
 use beholder_domain::{EntityFact, RepositoryFacts, RepositoryState, Workspace, WorkspaceView};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
@@ -968,6 +969,7 @@ fn index_workspace_versioned(
         &mut all_observations,
         &typescript_repositories,
     ));
+    diagnostics.extend(unresolved_typescript_call_diagnostics(&all_observations));
     let workspace_resolution = workspace_resolution_started.elapsed();
     let publication_started = Instant::now();
     let changes = store.publish(&view, &repository_facts, &overrides)?;

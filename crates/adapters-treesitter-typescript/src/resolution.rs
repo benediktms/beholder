@@ -1,7 +1,7 @@
 use super::model::*;
 use beholder_domain::{
-    Confidence, DependencyOverride, DependencyRelation, EntityId, Observation, Provenance,
-    SemanticRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
+    DependencyRelation, EntityId, Observation, Provenance, SemanticRelation,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -1053,6 +1053,54 @@ pub fn resolve_workspace_calls(
     overrides
 }
 
+pub fn unresolved_call_diagnostics(
+    observations: &[Observation],
+) -> Vec<(String, AnalysisDiagnostic)> {
+    let mut unresolved = BTreeMap::<(String, PathBuf), (usize, Option<u32>)>::new();
+    for observation in observations.iter().filter(|observation| {
+        observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            && (observation.to.as_str().starts_with("typescript-method://")
+                || observation.to.as_str().starts_with("javascript-method://"))
+    }) {
+        let Some(caller) = observation.from.as_str().strip_prefix("repo://") else {
+            continue;
+        };
+        let Some((repository, _)) = caller
+            .split_once("/typescript/")
+            .or_else(|| caller.split_once("/javascript/"))
+        else {
+            continue;
+        };
+        let (path, line) = observation
+            .evidence
+            .as_str()
+            .rsplit_once(':')
+            .map(|(path, line)| (path, line.parse().ok()))
+            .unwrap_or((observation.evidence.as_str(), None));
+        unresolved
+            .entry((repository.into(), path.into()))
+            .and_modify(|(count, _)| *count += 1)
+            .or_insert((1, line));
+    }
+    unresolved
+        .into_iter()
+        .map(|((repository, path), (count, line))| {
+            (
+                repository,
+                AnalysisDiagnostic {
+                    code: "typescript.receiver_resolution_incomplete".into(),
+                    severity: AnalysisDiagnosticSeverity::KnownLimitation,
+                    path,
+                    line,
+                    detail: Some(format!(
+                        "{count} receiver method call(s) remain unresolved after workspace resolution"
+                    )),
+                },
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,5 +1484,38 @@ mod tests {
                     && observation.to.as_str() == target
             }));
         }
+    }
+
+    #[test]
+    fn reports_only_receiver_calls_left_unresolved_after_workspace_resolution() {
+        let observations = vec![
+            Observation::dependency(
+                "repo://example/typescript/src/client/run",
+                DependencyRelation::Calls,
+                "typescript-method://client/send",
+                "src/client.ts:4",
+            ),
+            Observation::dependency(
+                "repo://example/typescript/src/client/run",
+                DependencyRelation::Calls,
+                "typescript-method://client/close",
+                "src/client.ts:5",
+            ),
+            Observation::dependency(
+                "repo://example/typescript/src/client/run",
+                DependencyRelation::Calls,
+                "typescript-call://external",
+                "src/client.ts:6",
+            ),
+        ];
+
+        let diagnostics = unresolved_call_diagnostics(&observations);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].0, "example");
+        assert_eq!(
+            diagnostics[0].1.detail.as_deref(),
+            Some("2 receiver method call(s) remain unresolved after workspace resolution")
+        );
     }
 }
