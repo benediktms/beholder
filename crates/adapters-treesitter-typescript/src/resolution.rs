@@ -689,31 +689,16 @@ fn receiver_type(
     receiver: &str,
 ) -> Option<(PathBuf, String)> {
     let file = index.caller_files.get(caller)?;
-    let aliases = index
-        .caller_alias_bindings
+    let receiver = aliased_receiver(index, caller, receiver);
+    if let Some(type_name) = index
+        .caller_bindings
         .get(caller)
-        .copied()
-        .unwrap_or_default();
-    let mut receiver = receiver;
-    for _ in 0..=aliases.len() {
-        if let Some(type_name) = index
-            .caller_bindings
-            .get(caller)
-            .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
-            .map(|binding| binding.type_name.as_str())
-        {
-            return imported_origin(index, file, type_name)
-                .or_else(|| Some((file.clone(), type_name.to_owned())))
-                .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
-        }
-        let Some(source) = aliases
-            .iter()
-            .find(|binding| binding.receiver == receiver)
-            .map(|binding| binding.source.as_str())
-        else {
-            break;
-        };
-        receiver = source;
+        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+        .map(|binding| binding.type_name.as_str())
+    {
+        return imported_origin(index, file, type_name)
+            .or_else(|| Some((file.clone(), type_name.to_owned())))
+            .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
     }
     let factory = index
         .caller_factory_bindings
@@ -726,6 +711,26 @@ fn receiver_type(
         .or_else(|| Some((file.clone(), factory.to_owned())))
         .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin))?;
     index.return_types.get(&factory_origin).cloned()
+}
+
+fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -> String {
+    let aliases = index
+        .caller_alias_bindings
+        .get(caller)
+        .copied()
+        .unwrap_or_default();
+    let mut receiver = receiver.to_owned();
+    for _ in 0..=aliases.len() {
+        let Some(source) = aliases
+            .iter()
+            .find(|binding| binding.receiver == receiver)
+            .map(|binding| binding.source.clone())
+        else {
+            break;
+        };
+        receiver = source;
+    }
+    receiver
 }
 
 fn resolve_observations(observations: &mut [Observation], index: &RepositoryIndex<'_>) {
@@ -993,7 +998,7 @@ pub fn resolve_workspace_calls(
                     .get(&(file, imported.to_owned()))
             })
             .or_else(|| {
-                let receiver = receiver?;
+                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?);
                 let type_name = caller
                     .caller_bindings
                     .get(observation.from.as_str())?
@@ -1016,6 +1021,29 @@ pub fn resolve_workspace_calls(
                     .get(&(file.clone(), imported.to_owned()))
                     .cloned()
                     .unwrap_or((file, imported.to_owned()));
+                member_entity(target, file, owner, name)
+            })
+            .or_else(|| {
+                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?);
+                let factory = caller
+                    .caller_factory_bindings
+                    .get(observation.from.as_str())?
+                    .iter()
+                    .find(|binding| binding.receiver == receiver)?
+                    .factory
+                    .as_str();
+                let (target_index, file, imported) = imports.iter().find_map(|import| {
+                    let binding = import
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.local == factory && binding.imported != "*")?;
+                    let (target_index, file) =
+                        workspace_imported_file(&import.source, &packages, &indexes)?;
+                    Some((target_index, file, binding.imported.clone()))
+                })?;
+                let target = &indexes[target_index];
+                let factory_origin = target.origins.get(&(file, imported)).cloned()?;
+                let (file, owner) = target.return_types.get(&factory_origin)?.clone();
                 member_entity(target, file, owner, name)
             })
             .or_else(|| {
@@ -1438,15 +1466,15 @@ mod tests {
 
     #[test]
     fn resolves_workspace_package_imports_across_repositories() {
-        let consumer_source = "import { Service, work } from '@example/provider'; export function start(service: Service) { work(); service.execute(); }";
+        let consumer_source = "import { Service, makeService, work } from '@example/provider'; export function start(service: Service) { work(); service.execute(); const made = makeService(); const alias = made; alias.execute(); }";
         let provider_sources = [
             (
                 PathBuf::from("src/index.ts"),
-                "export { Service, work } from './impl';",
+                "export { Service, makeService, work } from './impl';",
             ),
             (
                 PathBuf::from("src/impl.ts"),
-                "export class Service { execute() {} } export function work() {}",
+                "export class Service { execute() {} } export function makeService(): Service { return new Service(); } export function work() {}",
             ),
         ];
         let consumer_analysis = analyze(consumer_source, SourceLanguage::TypeScript).unwrap();
@@ -1490,7 +1518,7 @@ mod tests {
 
         let overrides = resolve_workspace_calls(&mut observations, &repositories);
 
-        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides.len(), 4);
         for target in [
             "repo://provider/typescript/src/impl/work",
             "repo://provider/typescript/src/impl/Service/execute",
@@ -1500,6 +1528,17 @@ mod tests {
                     && observation.to.as_str() == target
             }));
         }
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| {
+                    observation.from.as_str() == "repo://consumer/typescript/src/start/start"
+                        && observation.to.as_str()
+                            == "repo://provider/typescript/src/impl/Service/execute"
+                })
+                .count(),
+            2
+        );
     }
 
     #[test]
