@@ -582,6 +582,20 @@ fn collect_definitions(
                     .and_then(|extends| extends.child_by_field_name("value"))
                     .and_then(|base| text(base, source))
                     .map(str::to_owned);
+            } else {
+                class.base = node
+                    .named_children(&mut node.walk())
+                    .find(|child| child.kind() == "extends_type_clause")
+                    .and_then(|extends| {
+                        let types = extends
+                            .named_children(&mut extends.walk())
+                            .filter(|child| child.kind() == "type_identifier")
+                            .collect::<Vec<_>>();
+                        (types.len() == 1)
+                            .then(|| text(types[0], source))
+                            .flatten()
+                            .map(str::to_owned)
+                    });
             }
             definitions.push(class);
             scope.push(name.into());
@@ -603,6 +617,22 @@ fn collect_definitions(
                 }
             }
             scope.pop();
+            return;
+        }
+        "type_alias_declaration" => {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| text(name, source))
+            else {
+                return;
+            };
+            let mut alias = definition(node, None, source, scope, name, DefinitionKind::Namespace);
+            alias.base = node
+                .child_by_field_name("value")
+                .filter(|value| value.kind() == "type_identifier")
+                .and_then(|value| text(value, source))
+                .map(str::to_owned);
+            definitions.push(alias);
             return;
         }
         "function_declaration"

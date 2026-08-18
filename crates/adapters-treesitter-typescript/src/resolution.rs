@@ -1307,6 +1307,26 @@ mod tests {
                 "function work() {} export function createWorker() { return () => work(); }",
                 SourceLanguage::TypeScript,
             ),
+            (
+                Path::new("packages/app/src/service-alias.ts"),
+                "import { Service } from './service'; export type ServiceAlias = Service;",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/type-alias-consumer.ts"),
+                "import { ServiceAlias } from './service-alias'; export function useAlias(service: ServiceAlias) { service.execute(); }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/child-sender.ts"),
+                "import { Sender } from './sender'; export interface ChildSender extends Sender { close(): void; }",
+                SourceLanguage::TypeScript,
+            ),
+            (
+                Path::new("packages/app/src/interface-inheritance-consumer.ts"),
+                "import { ChildSender } from './child-sender'; export function inheritedInterface(sender: ChildSender) { sender.send('hello'); sender.close(); }",
+                SourceLanguage::TypeScript,
+            ),
         ];
         let analyses = fixtures
             .iter()
@@ -1493,6 +1513,22 @@ mod tests {
                 && observation.to.as_str()
                     == "repo://example/typescript/packages/app/src/returned-closure/work"
         }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str()
+                == "repo://example/typescript/packages/app/src/type-alias-consumer/useAlias"
+                && observation.to.as_str()
+                    == "repo://example/typescript/packages/app/src/service/Service/execute"
+        }));
+        for target in [
+            "repo://example/typescript/packages/app/src/sender/Sender/send",
+            "repo://example/typescript/packages/app/src/child-sender/ChildSender/close",
+        ] {
+            assert!(observations.iter().any(|observation| {
+                observation.from.as_str()
+                    == "repo://example/typescript/packages/app/src/interface-inheritance-consumer/inheritedInterface"
+                    && observation.to.as_str() == target
+            }));
+        }
     }
 
     #[test]
