@@ -2,9 +2,9 @@ use crate::{InspectionResult, InspectionValue};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
     EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
-    IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, ProtoTypeKind, QueryMetadata,
-    RelationKind, RpcCardinality, SemanticEdge, SemanticPath, TRACE_SCHEMA_V2, TraceResult,
-    TraversalMetadata,
+    GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, ProtoTypeKind,
+    QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath, TRACE_SCHEMA_V2,
+    TraceResult, TraversalMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -440,6 +440,42 @@ fn entity_kinds(result: InspectionResult) -> Result<EntityFactMap, Box<dyn Error
                 ("callable", "") => (EntityKind::Callable, None),
                 ("graphql_field", "") => (EntityKind::GraphqlField, None),
                 ("graphql_operation", "") => (EntityKind::GraphqlOperation, None),
+                ("graphql_type", "graphql_type:enum") => (
+                    EntityKind::GraphqlType,
+                    Some(EntityMetadata::GraphqlType {
+                        type_kind: GraphqlTypeKind::Enum,
+                    }),
+                ),
+                ("graphql_type", "graphql_type:input") => (
+                    EntityKind::GraphqlType,
+                    Some(EntityMetadata::GraphqlType {
+                        type_kind: GraphqlTypeKind::Input,
+                    }),
+                ),
+                ("graphql_type", "graphql_type:interface") => (
+                    EntityKind::GraphqlType,
+                    Some(EntityMetadata::GraphqlType {
+                        type_kind: GraphqlTypeKind::Interface,
+                    }),
+                ),
+                ("graphql_type", "graphql_type:object") => (
+                    EntityKind::GraphqlType,
+                    Some(EntityMetadata::GraphqlType {
+                        type_kind: GraphqlTypeKind::Object,
+                    }),
+                ),
+                ("graphql_type", "graphql_type:scalar") => (
+                    EntityKind::GraphqlType,
+                    Some(EntityMetadata::GraphqlType {
+                        type_kind: GraphqlTypeKind::Scalar,
+                    }),
+                ),
+                ("graphql_type", "graphql_type:union") => (
+                    EntityKind::GraphqlType,
+                    Some(EntityMetadata::GraphqlType {
+                        type_kind: GraphqlTypeKind::Union,
+                    }),
+                ),
                 ("grpc_operation", "") => (EntityKind::Rpc, None),
                 ("kafka_topic", "") => (EntityKind::KafkaTopic, None),
                 ("namespace", "") => (EntityKind::Namespace, None),
@@ -501,6 +537,7 @@ fn kind_priority(kind: EntityKind) -> u8 {
         EntityKind::Callable => 2,
         EntityKind::GraphqlField
         | EntityKind::GraphqlOperation
+        | EntityKind::GraphqlType
         | EntityKind::KafkaTopic
         | EntityKind::Rpc
         | EntityKind::Service
@@ -596,6 +633,8 @@ fn infer_kind(id: &str) -> EntityKind {
         EntityKind::GraphqlField
     } else if id.starts_with("graphql-operation://") {
         EntityKind::GraphqlOperation
+    } else if id.starts_with("graphql-type://") {
+        EntityKind::GraphqlType
     } else if id.starts_with("kafka-topic://") {
         EntityKind::KafkaTopic
     } else if id.contains("/unity-prefab/") {

@@ -79,6 +79,17 @@ enum EntityKind {
   ENTITY_KIND_PROTO_SERVICE = 11;
   ENTITY_KIND_UNITY_PREFAB = 12;
   ENTITY_KIND_GRAPHQL_OPERATION = 13;
+  ENTITY_KIND_GRAPHQL_TYPE = 14;
+}
+
+enum GraphqlTypeKind {
+  GRAPHQL_TYPE_KIND_UNKNOWN = 0;
+  GRAPHQL_TYPE_KIND_ENUM = 1;
+  GRAPHQL_TYPE_KIND_INPUT = 2;
+  GRAPHQL_TYPE_KIND_INTERFACE = 3;
+  GRAPHQL_TYPE_KIND_OBJECT = 4;
+  GRAPHQL_TYPE_KIND_SCALAR = 5;
+  GRAPHQL_TYPE_KIND_UNION = 6;
 }
 
 enum EntityOrigin {
@@ -105,6 +116,7 @@ message EntityMetadata {
   oneof metadata {
     ProtoTypeKind proto_type_kind = 1;
     RpcCardinality rpc_cardinality = 2;
+    GraphqlTypeKind graphql_type_kind = 3;
   }
 }
 

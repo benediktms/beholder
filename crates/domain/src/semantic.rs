@@ -242,6 +242,7 @@ pub enum EntityKind {
     Callable,
     GraphqlField,
     GraphqlOperation,
+    GraphqlType,
     GrpcOperation,
     KafkaTopic,
     Namespace,
@@ -255,8 +256,19 @@ pub enum EntityKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum EntityMetadata {
+    GraphqlType { kind: GraphqlTypeKind },
     ProtoMethod { cardinality: RpcCardinality },
     ProtoType { kind: ProtoTypeKind },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GraphqlTypeKind {
+    Enum,
+    Input,
+    Interface,
+    Object,
+    Scalar,
+    Union,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -280,7 +292,8 @@ impl EntityFact {
         metadata: Option<EntityMetadata>,
     ) -> Result<Self, &'static str> {
         match (kind, metadata) {
-            (EntityKind::ProtoMethod, Some(EntityMetadata::ProtoMethod { .. }))
+            (EntityKind::GraphqlType, Some(EntityMetadata::GraphqlType { .. }))
+            | (EntityKind::ProtoMethod, Some(EntityMetadata::ProtoMethod { .. }))
             | (EntityKind::ProtoType, Some(EntityMetadata::ProtoType { .. }))
             | (
                 EntityKind::Callable

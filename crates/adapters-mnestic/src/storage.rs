@@ -1,8 +1,8 @@
 use super::schema::*;
 use beholder_domain::{
     DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
-    GrpcBindingCandidate, GrpcBindingRole, Observation, ProtoTypeKind, RepositoryFacts,
-    RpcCardinality, SemanticRelation, WorkspaceView,
+    GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, Observation, ProtoTypeKind,
+    RepositoryFacts, RpcCardinality, SemanticRelation, WorkspaceView,
 };
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
@@ -88,6 +88,7 @@ fn entity_kind(kind: EntityKind) -> &'static str {
         EntityKind::Callable => "callable",
         EntityKind::GraphqlField => "graphql_field",
         EntityKind::GraphqlOperation => "graphql_operation",
+        EntityKind::GraphqlType => "graphql_type",
         EntityKind::GrpcOperation => "grpc_operation",
         EntityKind::KafkaTopic => "kafka_topic",
         EntityKind::Namespace => "namespace",
@@ -112,6 +113,24 @@ fn rpc_cardinality(cardinality: RpcCardinality) -> &'static str {
 fn entity_metadata(metadata: Option<EntityMetadata>) -> &'static str {
     match metadata {
         None => "",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Enum,
+        }) => "graphql_type:enum",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Input,
+        }) => "graphql_type:input",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Interface,
+        }) => "graphql_type:interface",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Object,
+        }) => "graphql_type:object",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Scalar,
+        }) => "graphql_type:scalar",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Union,
+        }) => "graphql_type:union",
         Some(EntityMetadata::ProtoMethod {
             cardinality: RpcCardinality::BidirectionalStreaming,
         }) => "rpc_cardinality:bidirectional_streaming",

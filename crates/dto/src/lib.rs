@@ -54,6 +54,7 @@ pub enum EntityKind {
     Callable,
     GraphqlField,
     GraphqlOperation,
+    GraphqlType,
     KafkaTopic,
     Namespace,
     ProtoEnum,
@@ -94,8 +95,20 @@ pub enum RpcCardinality {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EntityMetadata {
+    GraphqlType { type_kind: GraphqlTypeKind },
     ProtoMethod { cardinality: RpcCardinality },
     ProtoType { type_kind: ProtoTypeKind },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphqlTypeKind {
+    Enum,
+    Input,
+    Interface,
+    Object,
+    Scalar,
+    Union,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

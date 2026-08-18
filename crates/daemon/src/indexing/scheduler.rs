@@ -1846,7 +1846,7 @@ mod tests {
         };
         let graphql = vec![(
             PathBuf::from("src/package.graphql"),
-            "type Mutation { initializeOrder: ID } query Package { packageTemplatePreview { id } }"
+            "type Mutation { initializeOrder: ID } input InitializeOrderInput { id: ID! } query Package { packageTemplatePreview { id } }"
                 .into(),
         )];
         let elixir = vec![(
@@ -1899,6 +1899,14 @@ mod tests {
                     )
                 && observation.to.as_str()
                     == "repo://repo/elixir/Checkout.Resolvers.InitializeOrder/run/3"
+        }));
+        assert!(analysis.entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-type://InitializeOrderInput"
+                && entity.kind == beholder_domain::EntityKind::GraphqlType
+                && entity.metadata
+                    == Some(beholder_domain::EntityMetadata::GraphqlType {
+                        kind: beholder_domain::GraphqlTypeKind::Input,
+                    })
         }));
         scheduler.clear_cache().unwrap();
     }

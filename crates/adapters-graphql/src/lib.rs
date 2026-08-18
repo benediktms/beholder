@@ -4,11 +4,11 @@ use apollo_parser::{
 };
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, StructuralRelation,
+    EntityMetadata, GraphqlTypeKind, Observation, StructuralRelation,
 };
 use std::{collections::BTreeMap, path::Path};
 
-pub const FRONTEND_VERSION: &str = "3";
+pub const FRONTEND_VERSION: &str = "4";
 
 #[derive(Clone, Copy)]
 pub struct GraphqlSource<'a> {
@@ -115,6 +115,25 @@ fn field_entities(
             ));
         }
     }
+}
+
+fn type_entity(
+    entities: &mut BTreeMap<String, EntityFact>,
+    name: Option<cst::Name>,
+    kind: GraphqlTypeKind,
+) {
+    let Some(name) = name else {
+        return;
+    };
+    let id = format!("graphql-type://{}", name.text());
+    entities.entry(id.clone()).or_insert_with(|| {
+        EntityFact::new(
+            id,
+            EntityKind::GraphqlType,
+            Some(EntityMetadata::GraphqlType { kind }),
+        )
+        .unwrap()
+    });
 }
 
 fn directive_argument(
@@ -234,6 +253,7 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
             match definition {
                 cst::Definition::ObjectTypeDefinition(object) => {
                     if let Some(name) = object.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Object);
                         field_entities(
                             &mut facts,
                             &mut entities,
@@ -247,6 +267,7 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                 }
                 cst::Definition::ObjectTypeExtension(object) => {
                     if let Some(name) = object.name() {
+                        type_entity(&mut entities, Some(name.clone()), GraphqlTypeKind::Object);
                         field_entities(
                             &mut facts,
                             &mut entities,
@@ -257,6 +278,36 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                             &roots,
                         );
                     }
+                }
+                cst::Definition::InputObjectTypeDefinition(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Input)
+                }
+                cst::Definition::InputObjectTypeExtension(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Input)
+                }
+                cst::Definition::InterfaceTypeDefinition(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Interface)
+                }
+                cst::Definition::InterfaceTypeExtension(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Interface)
+                }
+                cst::Definition::UnionTypeDefinition(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Union)
+                }
+                cst::Definition::UnionTypeExtension(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Union)
+                }
+                cst::Definition::EnumTypeDefinition(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Enum)
+                }
+                cst::Definition::EnumTypeExtension(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Enum)
+                }
+                cst::Definition::ScalarTypeDefinition(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Scalar)
+                }
+                cst::Definition::ScalarTypeExtension(definition) => {
+                    type_entity(&mut entities, definition.name(), GraphqlTypeKind::Scalar)
                 }
                 cst::Definition::OperationDefinition(operation) => {
                     operation_facts(&mut facts, &mut entities, source, operation);
@@ -289,7 +340,7 @@ mod tests {
     fn maps_schema_fields_and_operation_root_selections() {
         let schema = GraphqlSource {
             path: Path::new("schema.graphql"),
-            source: "schema { query: RootQuery } type RootQuery { packageTemplatePreview: Package location: Location }",
+            source: "schema { query: RootQuery } type RootQuery { packageTemplatePreview: Package location: Location } input Filter { query: String } interface Node { id: ID! } type Package implements Node { id: ID! } union Search = Package enum Sort { ASC } scalar Date",
             owner: Some("repo://gateway/graphql-source/schema.graphql"),
         };
         let operation = GraphqlSource {
@@ -304,6 +355,20 @@ mod tests {
             entity.id.as_str() == "graphql-operation://Packages_Detail_Query"
                 && entity.kind == EntityKind::GraphqlOperation
         }));
+        for (name, kind) in [
+            ("RootQuery", GraphqlTypeKind::Object),
+            ("Filter", GraphqlTypeKind::Input),
+            ("Node", GraphqlTypeKind::Interface),
+            ("Search", GraphqlTypeKind::Union),
+            ("Sort", GraphqlTypeKind::Enum),
+            ("Date", GraphqlTypeKind::Scalar),
+        ] {
+            assert!(facts.entities.iter().any(|entity| {
+                entity.id.as_str() == format!("graphql-type://{name}")
+                    && entity.kind == EntityKind::GraphqlType
+                    && entity.metadata == Some(EntityMetadata::GraphqlType { kind })
+            }));
+        }
         assert!(facts.observations.iter().any(|observation| {
             observation.from.as_str() == "graphql-operation://Packages_Detail_Query"
                 && observation.relation

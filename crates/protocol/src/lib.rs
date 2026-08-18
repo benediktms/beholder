@@ -143,6 +143,7 @@ impl From<dto::EntityKind> for v1::EntityKind {
             dto::EntityKind::Callable => Self::Callable,
             dto::EntityKind::GraphqlField => Self::GraphqlField,
             dto::EntityKind::GraphqlOperation => Self::GraphqlOperation,
+            dto::EntityKind::GraphqlType => Self::GraphqlType,
             dto::EntityKind::KafkaTopic => Self::KafkaTopic,
             dto::EntityKind::Namespace => Self::Namespace,
             dto::EntityKind::ProtoEnum => Self::ProtoEnum,
@@ -182,6 +183,7 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
             v1::EntityKind::Callable => dto::EntityKind::Callable,
             v1::EntityKind::GraphqlField => dto::EntityKind::GraphqlField,
             v1::EntityKind::GraphqlOperation => dto::EntityKind::GraphqlOperation,
+            v1::EntityKind::GraphqlType => dto::EntityKind::GraphqlType,
             v1::EntityKind::KafkaTopic => dto::EntityKind::KafkaTopic,
             v1::EntityKind::Namespace => dto::EntityKind::Namespace,
             v1::EntityKind::ProtoEnum => dto::EntityKind::ProtoEnum,
@@ -199,6 +201,21 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
 
 fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'static str> {
     match value.metadata.ok_or("entity metadata is missing")? {
+        v1::entity_metadata::Metadata::GraphqlTypeKind(value) => {
+            Ok(dto::EntityMetadata::GraphqlType {
+                type_kind: match v1::GraphqlTypeKind::try_from(value)
+                    .map_err(|_| "unknown GraphQL type kind")?
+                {
+                    v1::GraphqlTypeKind::Enum => dto::GraphqlTypeKind::Enum,
+                    v1::GraphqlTypeKind::Input => dto::GraphqlTypeKind::Input,
+                    v1::GraphqlTypeKind::Interface => dto::GraphqlTypeKind::Interface,
+                    v1::GraphqlTypeKind::Object => dto::GraphqlTypeKind::Object,
+                    v1::GraphqlTypeKind::Scalar => dto::GraphqlTypeKind::Scalar,
+                    v1::GraphqlTypeKind::Union => dto::GraphqlTypeKind::Union,
+                    v1::GraphqlTypeKind::Unknown => return Err("GraphQL type kind is missing"),
+                },
+            })
+        }
         v1::entity_metadata::Metadata::ProtoTypeKind(value) => Ok(dto::EntityMetadata::ProtoType {
             type_kind: match v1::ProtoTypeKind::try_from(value)
                 .map_err(|_| "unknown Protobuf type kind")?
@@ -228,6 +245,16 @@ fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'s
 
 fn protocol_entity_metadata(value: dto::EntityMetadata) -> v1::EntityMetadata {
     let metadata = match value {
+        dto::EntityMetadata::GraphqlType { type_kind } => {
+            v1::entity_metadata::Metadata::GraphqlTypeKind(match type_kind {
+                dto::GraphqlTypeKind::Enum => v1::GraphqlTypeKind::Enum as i32,
+                dto::GraphqlTypeKind::Input => v1::GraphqlTypeKind::Input as i32,
+                dto::GraphqlTypeKind::Interface => v1::GraphqlTypeKind::Interface as i32,
+                dto::GraphqlTypeKind::Object => v1::GraphqlTypeKind::Object as i32,
+                dto::GraphqlTypeKind::Scalar => v1::GraphqlTypeKind::Scalar as i32,
+                dto::GraphqlTypeKind::Union => v1::GraphqlTypeKind::Union as i32,
+            })
+        }
         dto::EntityMetadata::ProtoType { type_kind } => {
             v1::entity_metadata::Metadata::ProtoTypeKind(match type_kind {
                 dto::ProtoTypeKind::Enum => v1::ProtoTypeKind::Enum as i32,
@@ -728,17 +755,30 @@ mod tests {
                 max_hops: 7,
                 truncated: true,
             },
-            nodes: vec![dto::EntityRef {
-                id: "a".into(),
-                kind: dto::EntityKind::Callable,
-                name: "a".into(),
-                repository: None,
-                origin: dto::EntityOrigin::Source,
-                test: false,
-                metadata: Some(dto::EntityMetadata::ProtoMethod {
-                    cardinality: dto::RpcCardinality::Unary,
-                }),
-            }],
+            nodes: vec![
+                dto::EntityRef {
+                    id: "a".into(),
+                    kind: dto::EntityKind::Callable,
+                    name: "a".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: Some(dto::EntityMetadata::ProtoMethod {
+                        cardinality: dto::RpcCardinality::Unary,
+                    }),
+                },
+                dto::EntityRef {
+                    id: "graphql-type://OrderInput".into(),
+                    kind: dto::EntityKind::GraphqlType,
+                    name: "OrderInput".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: Some(dto::EntityMetadata::GraphqlType {
+                        type_kind: dto::GraphqlTypeKind::Input,
+                    }),
+                },
+            ],
             edges: vec![dto::SemanticEdge {
                 id: "e1".into(),
                 from: "a".into(),
