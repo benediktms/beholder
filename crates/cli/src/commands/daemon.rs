@@ -54,6 +54,11 @@ async fn start() -> Result<(), Box<dyn Error>> {
         stdout(format_args!("already running (pid {})", status.pid))?;
         return Ok(());
     }
+    wait_for_lock().await?;
+    if let Ok(status) = get_status().await {
+        stdout(format_args!("already running (pid {})", status.pid))?;
+        return Ok(());
+    }
     let state = state_dir()?;
     fs::create_dir_all(&state)?;
     let log_path = state.join("beholderd.log");
@@ -67,14 +72,16 @@ async fn start() -> Result<(), Box<dyn Error>> {
         .stderr(log)
         .spawn()?;
     for _ in 0..50 {
-        if let Ok(status) = get_status().await {
-            stdout(format_args!("started (pid {})", status.pid))?;
-            return Ok(());
-        }
         if let Some(status) = child.try_wait()? {
             return Err(
                 format!("beholderd exited with {status}; see {}", log_path.display()).into(),
             );
+        }
+        if let Ok(status) = get_status().await
+            && status.pid == child.id()
+        {
+            stdout(format_args!("started (pid {})", status.pid))?;
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

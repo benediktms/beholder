@@ -34,7 +34,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo 'Building beholder and beholderd...' >&2
-cargo build -p beholder-cli -p beholder-daemon
+bash "$root/scripts/test-daemon-handover.sh"
 echo 'Starting isolated beholderd...' >&2
 target/debug/beholderd >"$state/beholderd.log" 2>&1 &
 daemon_pid=$!
