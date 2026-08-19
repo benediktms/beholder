@@ -1,5 +1,4 @@
 use super::{model::*, nestjs_di, ts_proto};
-use beholder_adapters_graphql::{GraphqlSource, facts as graphql_facts};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, Provenance, StructuralRelation,
@@ -1052,17 +1051,6 @@ pub fn observations_from_analysis(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    for document in &analysis.graphql_documents {
-        let facts = graphql_facts(
-            repository,
-            &[GraphqlSource {
-                path,
-                source: &document.source,
-                owner: Some(&module_id),
-            }],
-        );
-        observations.extend(facts.observations);
-    }
     for call in &analysis.calls {
         observations.push(Observation::dependency(
             module_id.clone(),
@@ -1167,19 +1155,6 @@ pub fn entities_from_analysis(
                 .unwrap()
             }))
             .collect::<Vec<_>>();
-    for document in &analysis.graphql_documents {
-        entities.extend(
-            graphql_facts(
-                repository,
-                &[GraphqlSource {
-                    path,
-                    source: &document.source,
-                    owner: None,
-                }],
-            )
-            .entities,
-        );
-    }
     entities.sort_by(|left, right| left.id.cmp(&right.id));
     entities.dedup();
     entities
@@ -1364,6 +1339,14 @@ mod tests {
             (component_path, &component_analysis, component),
             (resolver_path, &resolver_analysis, resolver),
         ];
+        let graphql_sources = sources
+            .iter()
+            .map(|(path, analysis, source)| crate::GraphqlResolverSource {
+                path,
+                analysis,
+                source,
+            })
+            .collect::<Vec<_>>();
         let mut observations = sources
             .iter()
             .flat_map(|(path, analysis, source)| {
@@ -1382,22 +1365,25 @@ mod tests {
         );
         let grats = crate::collect_graphql_resolvers(crate::GraphqlResolverInput {
             repository: "example",
-            sources: &[crate::GraphqlResolverSource {
-                path: resolver_path,
-                analysis: &resolver_analysis,
-                source: resolver,
-            }],
+            sources: &graphql_sources,
             manifests: &[(
                 Path::new("package.json"),
                 r#"{"dependencies":{"grats":"0.0.34"}}"#,
             )],
         });
+        let graphql = crate::collect_graphql_facts(crate::GraphqlFactInput {
+            repository: "example",
+            sources: &graphql_sources,
+            schemas: &[],
+        });
         let entities = sources
             .iter()
             .flat_map(|(path, analysis, _)| entities_from_analysis("example", analysis, path))
             .chain(grats.entities)
+            .chain(graphql.entities)
             .collect::<Vec<_>>();
         observations.extend(grats.observations);
+        observations.extend(graphql.observations);
 
         assert!(entities.iter().any(|entity| {
             entity.id.as_str() == "graphql-operation://Packages_Detail_Query"

@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-pub const FRONTEND_VERSION: &str = "6";
+pub const FRONTEND_VERSION: &str = "9";
 
 #[derive(Clone, Copy)]
 pub struct GraphqlSource<'a> {
@@ -77,15 +77,28 @@ fn record_root_types(
     }
 }
 
-fn field_entities(
-    facts: &mut GraphqlFacts,
-    entities: &mut BTreeMap<String, EntityFact>,
-    stitched_fields: &mut Vec<(String, String, String)>,
-    source: GraphqlSource<'_>,
+struct FieldEntitiesInput<'a, 'source> {
+    facts: &'a mut GraphqlFacts,
+    entities: &'a mut BTreeMap<String, EntityFact>,
+    stitched_fields: &'a mut Vec<(String, String, String)>,
+    source: GraphqlSource<'source>,
     type_name: cst::Name,
     fields: Option<cst::FieldsDefinition>,
-    roots: &BTreeMap<String, &'static str>,
-) {
+    roots: &'a BTreeMap<String, &'static str>,
+    source_types: &'a BTreeMap<(String, String), String>,
+}
+
+fn field_entities(input: FieldEntitiesInput<'_, '_>) {
+    let FieldEntitiesInput {
+        facts,
+        entities,
+        stitched_fields,
+        source,
+        type_name,
+        fields,
+        roots,
+        source_types,
+    } = input;
     let declared_type_name = type_name.text().to_string();
     let owner_type_id = format!("graphql-type://{declared_type_name}");
     let type_name = roots
@@ -171,12 +184,9 @@ fn field_entities(
                 evidence(source, &field),
             ));
         }
-        if let Some(upstream) = stitched_field(&field) {
-            stitched_fields.push((
-                id,
-                format!("graphql-field://{type_name}/{upstream}"),
-                evidence(source, &field),
-            ));
+        if let Some(upstream) = stitched_field(&field, &declared_type_name, type_name, source_types)
+        {
+            stitched_fields.push((id, upstream, evidence(source, &field)));
         }
     }
 }
@@ -365,15 +375,19 @@ fn enum_values(
 }
 
 fn directive_argument(
-    field: &cst::FieldDefinition,
+    directives: Option<cst::Directives>,
     directive_name: &str,
     argument_name: &str,
 ) -> Option<String> {
-    let directive = field.directives()?.directives().find(|directive| {
+    let directive = directives?.directives().find(|directive| {
         directive
             .name()
             .is_some_and(|name| name.text() == directive_name)
     })?;
+    directive_value(&directive, argument_name)
+}
+
+fn directive_value(directive: &cst::Directive, argument_name: &str) -> Option<String> {
     let value = directive.arguments()?.arguments().find_map(|argument| {
         (argument
             .name()
@@ -384,10 +398,44 @@ fn directive_argument(
     Some(value.syntax().text().to_string().trim_matches('"').into())
 }
 
-fn stitched_field(field: &cst::FieldDefinition) -> Option<String> {
-    directive_argument(field, "source", "subgraph")?;
-    directive_argument(field, "join__field", "graph")?;
-    directive_argument(field, "source", "name")
+fn stitched_field(
+    field: &cst::FieldDefinition,
+    declared_parent: &str,
+    canonical_parent: &str,
+    source_types: &BTreeMap<(String, String), String>,
+) -> Option<String> {
+    let subgraph = directive_argument(field.directives(), "source", "subgraph")?;
+    let field = directive_argument(field.directives(), "source", "name")?;
+    let parent = source_types
+        .get(&(declared_parent.to_owned(), subgraph))
+        .map(String::as_str)
+        .unwrap_or(canonical_parent);
+    Some(format!("graphql-field://{parent}/{field}"))
+}
+
+fn record_source_type(
+    source_types: &mut BTreeMap<(String, String), String>,
+    name: Option<cst::Name>,
+    directives: Option<cst::Directives>,
+) {
+    let Some(name) = name else {
+        return;
+    };
+    for directive in directives
+        .into_iter()
+        .flat_map(|directives| directives.directives())
+        .filter(|directive| directive.name().is_some_and(|name| name.text() == "source"))
+    {
+        let Some(upstream) = directive_value(&directive, "name") else {
+            continue;
+        };
+        let Some(subgraph) = directive_value(&directive, "subgraph") else {
+            continue;
+        };
+        source_types
+            .entry((name.text().to_string(), subgraph))
+            .or_insert(upstream);
+    }
 }
 
 fn operation_facts(
@@ -396,6 +444,8 @@ fn operation_facts(
     source: GraphqlSource<'_>,
     operation: cst::OperationDefinition,
     fragments: &BTreeMap<String, cst::FragmentDefinition>,
+    field_types: &BTreeMap<(String, String), String>,
+    roots: &BTreeMap<String, &'static str>,
 ) {
     let name = operation
         .name()
@@ -467,48 +517,87 @@ fn operation_facts(
         }
     }
     if let Some(selections) = operation.selection_set() {
-        root_selection_facts(
-            &mut RootSelectionFacts {
+        selection_facts(
+            &mut SelectionFacts {
                 facts,
                 entities,
                 source,
-                operation_id: &operation_id,
-                root,
                 fragments,
+                field_types,
+                roots,
                 visited: BTreeSet::new(),
             },
             selections,
+            root,
+            &operation_id,
         );
     }
 }
 
-struct RootSelectionFacts<'a, 'source> {
+struct SelectionFacts<'a, 'source> {
     facts: &'a mut GraphqlFacts,
     entities: &'a mut BTreeMap<String, EntityFact>,
     source: GraphqlSource<'source>,
-    operation_id: &'a str,
-    root: &'a str,
     fragments: &'a BTreeMap<String, cst::FragmentDefinition>,
+    field_types: &'a BTreeMap<(String, String), String>,
+    roots: &'a BTreeMap<String, &'static str>,
     visited: BTreeSet<String>,
 }
 
-fn root_selection_facts(context: &mut RootSelectionFacts<'_, '_>, selections: cst::SelectionSet) {
+fn type_condition_name(condition: Option<cst::TypeCondition>) -> Option<String> {
+    condition?
+        .named_type()?
+        .name()
+        .map(|name| name.text().to_string())
+}
+
+fn selection_parent(
+    context: &SelectionFacts<'_, '_>,
+    condition: Option<cst::TypeCondition>,
+    fallback: &str,
+) -> String {
+    let Some(parent) = type_condition_name(condition) else {
+        return fallback.to_owned();
+    };
+    context
+        .roots
+        .get(&parent)
+        .copied()
+        .unwrap_or(&parent)
+        .to_owned()
+}
+
+fn selection_facts(
+    context: &mut SelectionFacts<'_, '_>,
+    selections: cst::SelectionSet,
+    parent_type: &str,
+    selector: &str,
+) {
     for selection in selections.selections() {
         match selection {
             cst::Selection::Field(field) => {
                 let Some(name) = field.name() else {
                     continue;
                 };
-                let field_id = format!("graphql-field://{}/{}", context.root, name.text());
+                let name = name.text().to_string();
+                let field_id = format!("graphql-field://{parent_type}/{name}");
                 context.entities.entry(field_id.clone()).or_insert_with(|| {
                     EntityFact::new(field_id.clone(), EntityKind::GraphqlField, None).unwrap()
                 });
                 context.facts.observations.push(Observation::dependency(
-                    context.operation_id,
+                    selector,
                     DependencyRelation::Selects,
-                    field_id,
+                    field_id.clone(),
                     evidence(context.source, &field),
                 ));
+                if let Some(nested) = field.selection_set()
+                    && let Some(response_type) = context
+                        .field_types
+                        .get(&(parent_type.to_owned(), name))
+                        .cloned()
+                {
+                    selection_facts(context, nested, &response_type, &field_id);
+                }
             }
             cst::Selection::FragmentSpread(spread) => {
                 let Some(name) = spread
@@ -521,20 +610,53 @@ fn root_selection_facts(context: &mut RootSelectionFacts<'_, '_>, selections: cs
                 if !context.visited.insert(name.clone()) {
                     continue;
                 }
-                if let Some(selections) = context
-                    .fragments
-                    .get(&name)
-                    .and_then(|fragment| fragment.selection_set())
+                if let Some(fragment) = context.fragments.get(&name)
+                    && let Some(selections) = fragment.selection_set()
                 {
-                    root_selection_facts(context, selections);
+                    let parent_type =
+                        selection_parent(context, fragment.type_condition(), parent_type);
+                    selection_facts(context, selections, &parent_type, selector);
                 }
             }
             cst::Selection::InlineFragment(fragment) => {
                 if let Some(selections) = fragment.selection_set() {
-                    root_selection_facts(context, selections);
+                    let parent_type =
+                        selection_parent(context, fragment.type_condition(), parent_type);
+                    selection_facts(context, selections, &parent_type, selector);
                 }
             }
         }
+    }
+}
+
+fn record_field_types(
+    fields: &mut BTreeMap<(String, String), String>,
+    roots: &BTreeMap<String, &'static str>,
+    type_name: Option<cst::Name>,
+    definitions: Option<cst::FieldsDefinition>,
+) {
+    let Some(type_name) = type_name else {
+        return;
+    };
+    let declared_type = type_name.text().to_string();
+    let parent = roots
+        .get(&declared_type)
+        .copied()
+        .unwrap_or(&declared_type)
+        .to_owned();
+    for field in definitions
+        .into_iter()
+        .flat_map(|definitions| definitions.field_definitions())
+    {
+        let Some(name) = field.name() else {
+            continue;
+        };
+        let Some(response_type) = field.ty().as_ref().and_then(named_type_name) else {
+            continue;
+        };
+        fields
+            .entry((parent.clone(), name.text().to_string()))
+            .or_insert(response_type);
     }
 }
 
@@ -548,6 +670,7 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
         .collect::<Vec<_>>();
     let mut roots = BTreeMap::new();
     let mut fragments = BTreeMap::new();
+    let mut source_types = BTreeMap::new();
     for (_, syntax) in &parsed {
         for definition in syntax.document().definitions() {
             match definition {
@@ -565,6 +688,58 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                         fragments.entry(name.text().to_string()).or_insert(fragment);
                     }
                 }
+                cst::Definition::ObjectTypeDefinition(definition) => record_source_type(
+                    &mut source_types,
+                    definition.name(),
+                    definition.directives(),
+                ),
+                cst::Definition::ObjectTypeExtension(definition) => record_source_type(
+                    &mut source_types,
+                    definition.name(),
+                    definition.directives(),
+                ),
+                cst::Definition::InterfaceTypeDefinition(definition) => record_source_type(
+                    &mut source_types,
+                    definition.name(),
+                    definition.directives(),
+                ),
+                cst::Definition::InterfaceTypeExtension(definition) => record_source_type(
+                    &mut source_types,
+                    definition.name(),
+                    definition.directives(),
+                ),
+                _ => {}
+            }
+        }
+    }
+    let mut field_types = BTreeMap::new();
+    for (_, syntax) in &parsed {
+        for definition in syntax.document().definitions() {
+            match definition {
+                cst::Definition::ObjectTypeDefinition(definition) => record_field_types(
+                    &mut field_types,
+                    &roots,
+                    definition.name(),
+                    definition.fields_definition(),
+                ),
+                cst::Definition::ObjectTypeExtension(definition) => record_field_types(
+                    &mut field_types,
+                    &roots,
+                    definition.name(),
+                    definition.fields_definition(),
+                ),
+                cst::Definition::InterfaceTypeDefinition(definition) => record_field_types(
+                    &mut field_types,
+                    &roots,
+                    definition.name(),
+                    definition.fields_definition(),
+                ),
+                cst::Definition::InterfaceTypeExtension(definition) => record_field_types(
+                    &mut field_types,
+                    &roots,
+                    definition.name(),
+                    definition.fields_definition(),
+                ),
                 _ => {}
             }
         }
@@ -598,15 +773,16 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                             &name.text(),
                             object.implements_interfaces(),
                         );
-                        field_entities(
-                            &mut facts,
-                            &mut entities,
-                            &mut stitched_fields,
+                        field_entities(FieldEntitiesInput {
+                            facts: &mut facts,
+                            entities: &mut entities,
+                            stitched_fields: &mut stitched_fields,
                             source,
-                            name,
-                            object.fields_definition(),
-                            &roots,
-                        );
+                            type_name: name,
+                            fields: object.fields_definition(),
+                            roots: &roots,
+                            source_types: &source_types,
+                        });
                     }
                 }
                 cst::Definition::ObjectTypeExtension(object) => {
@@ -618,15 +794,16 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                             &name.text(),
                             object.implements_interfaces(),
                         );
-                        field_entities(
-                            &mut facts,
-                            &mut entities,
-                            &mut stitched_fields,
+                        field_entities(FieldEntitiesInput {
+                            facts: &mut facts,
+                            entities: &mut entities,
+                            stitched_fields: &mut stitched_fields,
                             source,
-                            name,
-                            object.fields_definition(),
-                            &roots,
-                        );
+                            type_name: name,
+                            fields: object.fields_definition(),
+                            roots: &roots,
+                            source_types: &source_types,
+                        });
                     }
                 }
                 cst::Definition::InputObjectTypeDefinition(definition) => {
@@ -666,15 +843,16 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                             &name.text(),
                             definition.implements_interfaces(),
                         );
-                        field_entities(
-                            &mut facts,
-                            &mut entities,
-                            &mut stitched_fields,
+                        field_entities(FieldEntitiesInput {
+                            facts: &mut facts,
+                            entities: &mut entities,
+                            stitched_fields: &mut stitched_fields,
                             source,
-                            name,
-                            definition.fields_definition(),
-                            &roots,
-                        );
+                            type_name: name,
+                            fields: definition.fields_definition(),
+                            roots: &roots,
+                            source_types: &source_types,
+                        });
                     }
                 }
                 cst::Definition::InterfaceTypeExtension(definition) => {
@@ -690,15 +868,16 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                             &name.text(),
                             definition.implements_interfaces(),
                         );
-                        field_entities(
-                            &mut facts,
-                            &mut entities,
-                            &mut stitched_fields,
+                        field_entities(FieldEntitiesInput {
+                            facts: &mut facts,
+                            entities: &mut entities,
+                            stitched_fields: &mut stitched_fields,
                             source,
-                            name,
-                            definition.fields_definition(),
-                            &roots,
-                        );
+                            type_name: name,
+                            fields: definition.fields_definition(),
+                            roots: &roots,
+                            source_types: &source_types,
+                        });
                     }
                 }
                 cst::Definition::UnionTypeDefinition(definition) => {
@@ -754,7 +933,15 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                     type_entity(&mut entities, definition.name(), GraphqlTypeKind::Scalar)
                 }
                 cst::Definition::OperationDefinition(operation) => {
-                    operation_facts(&mut facts, &mut entities, source, operation, &fragments);
+                    operation_facts(
+                        &mut facts,
+                        &mut entities,
+                        source,
+                        operation,
+                        &fragments,
+                        &field_types,
+                        &roots,
+                    );
                 }
                 _ => {}
             }
@@ -781,7 +968,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_schema_fields_and_operation_root_selections() {
+    fn maps_schema_fields_and_nested_operation_selections() {
         let schema = GraphqlSource {
             path: Path::new("schema.graphql"),
             source: "schema { query: RootQuery subscription: RootSubscription } type RootQuery { packageTemplatePreview(filter: Filter, sort: Sort!): Package location: Location } type RootSubscription { typing(conversationId: ID!): String } input Filter { query: String } interface Node { id: ID! } type Package implements Node { id: ID! } union Search = Package enum Sort { ASC } scalar Date",
@@ -837,6 +1024,25 @@ mod tests {
                     == beholder_domain::SemanticRelation::Dependency(DependencyRelation::Selects)
                 && observation.to.as_str() == "graphql-field://Subscription/typing"
         }));
+        for (from, to) in [
+            (
+                "graphql-field://Query/packageTemplatePreview",
+                "graphql-field://Package/id",
+            ),
+            (
+                "graphql-field://Query/location",
+                "graphql-field://Location/id",
+            ),
+        ] {
+            assert!(facts.observations.iter().any(|observation| {
+                observation.from.as_str() == from
+                    && observation.relation
+                        == beholder_domain::SemanticRelation::Dependency(
+                            DependencyRelation::Selects,
+                        )
+                    && observation.to.as_str() == to
+            }));
+        }
         for (from, relation, to) in [
             (
                 "graphql-field://Query/packageTemplatePreview",
@@ -916,7 +1122,7 @@ mod tests {
     fn maps_composed_fields_to_their_source_field() {
         let upstream = GraphqlSource {
             path: Path::new("compose/schemas/Checkout.graphql"),
-            source: "schema { mutation: RootMutationType } type RootMutationType { initializeOrder: ID }",
+            source: "schema { mutation: RootMutationType } type RootMutationType { initializeOrder: ID } type Order { paymentMethods: [String!]! }",
             owner: None,
         };
         let composed = GraphqlSource {
@@ -926,6 +1132,10 @@ mod tests {
                   Checkout_initializeOrder: ID
                     @source(name: "initializeOrder", subgraph: "Checkout")
                     @join__field(graph: CHECKOUT)
+                }
+                type Checkout_Order @source(name: "Order", subgraph: "Checkout") {
+                  paymentMethods: [String!]!
+                    @source(name: "paymentMethods", subgraph: "Checkout")
                 }
             "#,
             owner: None,
@@ -938,6 +1148,12 @@ mod tests {
                 && observation.relation
                     == beholder_domain::SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
                 && observation.to.as_str() == "graphql-field://Mutation/initializeOrder"
+        }));
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Checkout_Order/paymentMethods"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
+                && observation.to.as_str() == "graphql-field://Order/paymentMethods"
         }));
     }
 }

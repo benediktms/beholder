@@ -1,5 +1,5 @@
-pub const FRONTEND_VERSION: &str = "13";
-pub const RESOLVER_VERSION: &str = "8";
+pub const FRONTEND_VERSION: &str = "17";
+pub const RESOLVER_VERSION: &str = "9";
 
 mod absinthe;
 mod analysis;

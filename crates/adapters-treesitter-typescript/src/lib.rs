@@ -1,5 +1,5 @@
 pub const FRONTEND_VERSION: &str = "27";
-pub const RESOLVER_VERSION: &str = "18";
+pub const RESOLVER_VERSION: &str = "20";
 
 mod analysis;
 mod graphql;
@@ -8,13 +8,17 @@ mod grpc;
 mod model;
 mod nestjs;
 mod nestjs_di;
+mod nestjs_graphql;
 mod resolution;
 mod ts_proto;
 
 pub use analysis::{
     analyze, diagnostics_from_analysis, entities_from_analysis, observations_from_analysis,
 };
-pub use graphql::{GraphqlResolverInput, GraphqlResolverSource, collect_graphql_resolvers};
+pub use graphql::{
+    GraphqlFactInput, GraphqlResolverInput, GraphqlResolverSource, collect_graphql_facts,
+    collect_graphql_resolvers,
+};
 pub use grpc::{GrpcBindingInput, bindings as grpc_bindings};
 pub use model::{SourceLanguage, TypescriptAnalysis, TypescriptRepository};
 pub use resolution::{

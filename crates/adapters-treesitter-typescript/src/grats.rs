@@ -1,38 +1,22 @@
 use super::{SourceLanguage, analysis::source_stem, graphql::GraphqlResolverSource};
 use beholder_adapters_graphql::GraphqlFacts;
 use beholder_domain::{DependencyRelation, EntityFact, EntityKind, Observation};
-use serde_json::Value;
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 use tree_sitter::{Node, Parser};
 
 struct Resolver {
-    root_type: &'static str,
+    parent_type: String,
     field: String,
     definition: String,
     line: usize,
 }
 
-pub(super) fn installed(manifests: &[(&Path, &str)]) -> bool {
-    manifests.iter().any(|(_, source)| {
-        let Ok(manifest) = serde_json::from_str::<Value>(source) else {
-            return false;
-        };
-        [
-            "dependencies",
-            "devDependencies",
-            "optionalDependencies",
-            "peerDependencies",
-        ]
-        .iter()
-        .any(|section| {
-            manifest
-                .get(section)
-                .is_some_and(|deps| deps.get("grats").is_some())
-        })
-    })
+enum Annotation {
+    Root(&'static str, Option<String>),
+    Field(Option<String>),
 }
 
-fn annotation(comment: &str) -> Option<(&'static str, String)> {
+fn annotation(comment: &str) -> Option<Annotation> {
     for line in comment.lines() {
         let line = line.trim().trim_start_matches('*').trim();
         for (tag, root_type) in [
@@ -40,42 +24,92 @@ fn annotation(comment: &str) -> Option<(&'static str, String)> {
             ("@gqlMutationField", "Mutation"),
             ("@gqlSubscriptionField", "Subscription"),
         ] {
-            if let Some(field) = line.strip_prefix(tag).map(str::trim)
-                && !field.is_empty()
-            {
-                return Some((root_type, field.into()));
+            if let Some(field) = line.strip_prefix(tag).map(str::trim) {
+                return Some(Annotation::Root(
+                    root_type,
+                    (!field.is_empty()).then(|| field.into()),
+                ));
             }
+        }
+        if let Some(field) = line.strip_prefix("@gqlField") {
+            let field = field.trim();
+            return Some(Annotation::Field((!field.is_empty()).then(|| field.into())));
         }
     }
     None
 }
 
-fn resolver(node: Node<'_>, source: &[u8], scope: &[String]) -> Option<Resolver> {
-    let name = node.child_by_field_name("name")?.utf8_text(source).ok()?;
-    let start = node
+fn leading_comment<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let mut declaration = node;
+    while let Some(parent) = declaration
         .parent()
-        .filter(|parent| parent.kind() == "export_statement")
-        .map_or(node.start_byte(), |parent| parent.start_byte());
+        .filter(|parent| matches!(parent.kind(), "lexical_declaration" | "export_statement"))
+    {
+        declaration = parent;
+    }
+    let start = declaration.start_byte();
     let prefix = std::str::from_utf8(source.get(..start)?).ok()?;
     let comment = prefix.rsplit_once("/**")?.1;
     let (comment, trailing) = comment.rsplit_once("*/")?;
-    (trailing.trim().is_empty() || trailing.trim_start().starts_with('@'))
-        .then_some(comment)
-        .and_then(annotation)
-        .map(|(root_type, field)| Resolver {
-            root_type,
-            field,
-            definition: scope
-                .iter()
-                .map(String::as_str)
-                .chain(std::iter::once(name))
-                .collect::<Vec<_>>()
-                .join("/"),
-            line: node.start_position().row + 1,
-        })
+    (trailing.trim().is_empty() || trailing.trim_start().starts_with('@')).then_some(comment)
 }
 
-fn collect(node: Node<'_>, source: &[u8], scope: &mut Vec<String>, resolvers: &mut Vec<Resolver>) {
+fn parameter_type<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let node = node
+        .child_by_field_name("value")
+        .filter(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+        .unwrap_or(node);
+    let parameter = node.child_by_field_name("parameters")?.named_child(0)?;
+    let annotation = parameter.child_by_field_name("type")?;
+    annotation
+        .utf8_text(source)
+        .ok()?
+        .trim()
+        .strip_prefix(':')
+        .map(str::trim)
+}
+
+fn resolver(
+    node: Node<'_>,
+    source: &[u8],
+    scope: &[String],
+    types: &BTreeMap<String, String>,
+) -> Option<Resolver> {
+    let name = node.child_by_field_name("name")?.utf8_text(source).ok()?;
+    let annotation = annotation(leading_comment(node, source)?)?;
+    let (parent_type, field) = match annotation {
+        Annotation::Root(parent, field) => (parent.into(), field.unwrap_or_else(|| name.into())),
+        Annotation::Field(field) => {
+            let owner = scope
+                .last()
+                .map(String::as_str)
+                .or_else(|| parameter_type(node, source))?;
+            (
+                types.get(owner)?.clone(),
+                field.unwrap_or_else(|| name.into()),
+            )
+        }
+    };
+    Some(Resolver {
+        parent_type,
+        field,
+        definition: scope
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(name))
+            .collect::<Vec<_>>()
+            .join("/"),
+        line: node.start_position().row + 1,
+    })
+}
+
+fn collect(
+    node: Node<'_>,
+    source: &[u8],
+    scope: &mut Vec<String>,
+    types: &BTreeMap<String, String>,
+    resolvers: &mut Vec<Resolver>,
+) {
     match node.kind() {
         "class_declaration" => {
             let Some(name) = node
@@ -88,14 +122,24 @@ fn collect(node: Node<'_>, source: &[u8], scope: &mut Vec<String>, resolvers: &m
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {
-                    collect(child, source, scope, resolvers);
+                    collect(child, source, scope, types, resolvers);
                 }
             }
             scope.pop();
             return;
         }
         "method_definition" | "function_declaration" | "generator_function_declaration" => {
-            if let Some(resolver) = resolver(node, source, scope) {
+            if let Some(resolver) = resolver(node, source, scope, types) {
+                resolvers.push(resolver);
+            }
+            return;
+        }
+        "variable_declarator"
+            if node.child_by_field_name("value").is_some_and(|value| {
+                matches!(value.kind(), "arrow_function" | "function_expression")
+            }) =>
+        {
+            if let Some(resolver) = resolver(node, source, scope, types) {
                 resolvers.push(resolver);
             }
             return;
@@ -104,23 +148,78 @@ fn collect(node: Node<'_>, source: &[u8], scope: &mut Vec<String>, resolvers: &m
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect(child, source, scope, resolvers);
+        collect(child, source, scope, types, resolvers);
     }
 }
 
-pub(super) fn facts(repository: &str, input: &GraphqlResolverSource<'_>) -> GraphqlFacts {
-    if !input.source.contains("@gql") {
-        return GraphqlFacts::default();
+fn type_annotation(comment: &str, code_name: &str) -> Option<String> {
+    comment.lines().find_map(|line| {
+        let line = line.trim().trim_start_matches('*').trim();
+        ["@gqlType", "@gqlInterface"].iter().find_map(|tag| {
+            line.strip_prefix(tag).map(|name| {
+                let name = name.trim();
+                if name.is_empty() { code_name } else { name }.into()
+            })
+        })
+    })
+}
+
+fn collect_types(node: Node<'_>, source: &[u8], types: &mut Vec<(String, String)>) {
+    if matches!(
+        node.kind(),
+        "class_declaration" | "interface_declaration" | "type_alias_declaration"
+    ) && let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|name| name.utf8_text(source).ok())
+        && let Some(comment) = leading_comment(node, source)
+        && let Some(graphql_name) = type_annotation(comment, name)
+    {
+        types.push((name.into(), graphql_name));
     }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_types(child, source, types);
+    }
+}
+
+pub(super) fn types(input: &GraphqlResolverSource<'_>) -> Vec<(String, String)> {
+    let Some(tree) = parser(input).and_then(|mut parser| parser.parse(input.source, None)) else {
+        return Vec::new();
+    };
+    let mut types = Vec::new();
+    collect_types(tree.root_node(), input.source.as_bytes(), &mut types);
+    types
+}
+
+fn parser(input: &GraphqlResolverSource<'_>) -> Option<Parser> {
     let mut parser = Parser::new();
     let grammar = match input.analysis.language {
         SourceLanguage::JavaScript | SourceLanguage::Jsx => tree_sitter_javascript::LANGUAGE,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
-    if parser.set_language(&grammar.into()).is_err() {
+    parser.set_language(&grammar.into()).ok()?;
+    Some(parser)
+}
+
+pub(super) struct FactsInput<'a> {
+    pub repository: &'a str,
+    pub source: &'a GraphqlResolverSource<'a>,
+    pub types: &'a BTreeMap<String, String>,
+}
+
+pub(super) fn facts(input: FactsInput<'_>) -> GraphqlFacts {
+    let FactsInput {
+        repository,
+        source: input,
+        types,
+    } = input;
+    if !input.source.contains("@gql") {
         return GraphqlFacts::default();
     }
+    let Some(mut parser) = parser(input) else {
+        return GraphqlFacts::default();
+    };
     let Some(tree) = parser.parse(input.source, None) else {
         return GraphqlFacts::default();
     };
@@ -129,6 +228,7 @@ pub(super) fn facts(repository: &str, input: &GraphqlResolverSource<'_>) -> Grap
         tree.root_node(),
         input.source.as_bytes(),
         &mut Vec::new(),
+        types,
         &mut resolvers,
     );
     let module_id = format!(
@@ -153,7 +253,10 @@ pub(super) fn facts(repository: &str, input: &GraphqlResolverSource<'_>) -> Grap
         let Some(definition) = definitions.get(resolver.definition.as_str()) else {
             continue;
         };
-        let field = format!("graphql-field://{}/{}", resolver.root_type, resolver.field);
+        let field = format!(
+            "graphql-field://{}/{}",
+            resolver.parent_type, resolver.field
+        );
         facts
             .entities
             .push(EntityFact::new(field.clone(), EntityKind::GraphqlField, None).unwrap());
@@ -172,12 +275,28 @@ mod tests {
     use super::*;
     use crate::analyze;
     use beholder_domain::SemanticRelation;
+    use std::path::Path;
 
     #[test]
     fn requires_package_and_maps_exported_subscription_generator() {
         let source = r#"
             /** @gqlSubscriptionField giftCardPaymentCompleted */
             export async function* subscriptionGiftCardPaymentCompleted() { yield null }
+
+            /** @gqlQueryField */
+            export function walletBalance() { return 10 }
+
+            /** @gqlType Customer */
+            export class CustomerModel {
+              /** @gqlField displayName */
+              name() { return "Ada" }
+            }
+
+            /** @gqlField emailAddress */
+            export function email(customer: CustomerModel) { return customer.email }
+
+            /** @gqlField loyaltyStatus */
+            export const loyalty = (customer: CustomerModel) => customer.loyalty
         "#;
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
         let source = GraphqlResolverSource {
@@ -213,6 +332,32 @@ mod tests {
                     == SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
                 && observation.to.as_str()
                     == "repo://example/typescript/src/subscription/subscriptionGiftCardPaymentCompleted"
+        }));
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Query/walletBalance"
+                && observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
+                && observation.to.as_str()
+                    == "repo://example/typescript/src/subscription/walletBalance"
+        }));
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Customer/displayName"
+                && observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
+                && observation.to.as_str()
+                    == "repo://example/typescript/src/subscription/CustomerModel/name"
+        }));
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Customer/emailAddress"
+                && observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
+                && observation.to.as_str() == "repo://example/typescript/src/subscription/email"
+        }));
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Customer/loyaltyStatus"
+                && observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
+                && observation.to.as_str() == "repo://example/typescript/src/subscription/loyalty"
         }));
     }
 }

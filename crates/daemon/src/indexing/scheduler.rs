@@ -1,7 +1,5 @@
 use crate::workspace_registry::WorkspaceRegistry;
-use beholder_adapters_graphql::{
-    FRONTEND_VERSION as GRAPHQL_FRONTEND_VERSION, GraphqlSource, facts as graphql_facts,
-};
+use beholder_adapters_graphql::{FRONTEND_VERSION as GRAPHQL_FRONTEND_VERSION, GraphqlSource};
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_protobuf::{
     FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, SourceCompiler, facts as protobuf_facts,
@@ -31,10 +29,11 @@ use beholder_adapters_treesitter_rust::{
     tonic_bindings,
 };
 use beholder_adapters_treesitter_typescript::{
-    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION, GraphqlResolverInput, GraphqlResolverSource,
-    GrpcBindingInput as TypescriptGrpcBindingInput,
+    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION, GraphqlFactInput, GraphqlResolverInput,
+    GraphqlResolverSource, GrpcBindingInput as TypescriptGrpcBindingInput,
     RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
-    TypescriptRepository, collect_graphql_resolvers as collect_typescript_graphql_resolvers,
+    TypescriptRepository, collect_graphql_facts as collect_typescript_graphql_facts,
+    collect_graphql_resolvers as collect_typescript_graphql_resolvers,
     diagnostics_from_analysis as typescript_diagnostics,
     entities_from_analysis as typescript_entities, grpc_bindings as typescript_grpc_bindings,
     observations_from_analysis as typescript_observations,
@@ -1036,7 +1035,11 @@ impl IndexScheduler {
                 owner: None,
             })
             .collect::<Vec<_>>();
-        let graphql = graphql_facts(&state.repository.identity, &graphql_sources);
+        let graphql = collect_typescript_graphql_facts(GraphqlFactInput {
+            repository: &state.repository.identity,
+            sources: &typescript_graphql_sources,
+            schemas: &graphql_sources,
+        });
         entities.extend(graphql.entities);
         observations.extend(graphql.observations);
         diagnostics.extend(graphql.diagnostics);
@@ -1046,25 +1049,28 @@ impl IndexScheduler {
             .filter_map(|entity| {
                 let path = entity.id.as_str().strip_prefix("graphql-field://")?;
                 let (parent, field) = path.split_once('/')?;
-                matches!(parent, "Query" | "Mutation" | "Subscription")
-                    .then_some((field, entity.id.as_str()))
+                Some(((parent, field), entity.id.as_str()))
             })
-            .fold(
-                BTreeMap::<_, BTreeSet<_>>::new(),
-                |mut fields, (name, id)| {
-                    fields.entry(name).or_default().insert(id);
-                    fields
-                },
-            );
+            .collect::<BTreeMap<_, _>>();
         observations.extend(graphql_resolver_bindings.into_iter().filter_map(|binding| {
-            let fields = graphql_fields.get(binding.field.as_str())?;
-            let mut fields = fields.iter();
-            let field = fields.next()?;
-            if fields.next().is_some() {
-                return None;
-            }
+            let field = binding
+                .parent
+                .as_deref()
+                .and_then(|parent| {
+                    graphql_fields
+                        .get(&(parent, binding.field.as_str()))
+                        .copied()
+                })
+                .or_else(|| {
+                    let mut fields = graphql_fields
+                        .iter()
+                        .filter(|((_, name), _)| *name == binding.field)
+                        .map(|(_, id)| *id);
+                    let field = fields.next()?;
+                    fields.next().is_none().then_some(field)
+                })?;
             Some(Observation::dependency(
-                *field,
+                field,
                 DependencyRelation::ResolvedBy,
                 binding.resolver,
                 binding.evidence,
@@ -1864,7 +1870,7 @@ mod tests {
         };
         let graphql = vec![(
             PathBuf::from("src/package.graphql"),
-            "type Mutation { initializeOrder(input: InitializeOrderInput!, mode: OrderMode): ID } input InitializeOrderInput { id: ID! } enum OrderMode { PREVIEW COMMIT } query Package { packageTemplatePreview { id } }"
+            "type Query { order: Order } type Order { status: String total: String } type Mutation { initializeOrder(input: InitializeOrderInput!, mode: OrderMode): ID } type Subscription { order: ID } input InitializeOrderInput { id: ID! } enum OrderMode { PREVIEW COMMIT } query OrderQuery { order { status total } } query Package { packageTemplatePreview { id } }"
                 .into(),
         )];
         let elixir = vec![(
@@ -1878,8 +1884,36 @@ mod tests {
             defmodule Checkout.Resolvers.InitializeOrder do
               def run(_, _, _), do: :ok
             end
+            defmodule Checkout.Schema do
+              object :order do
+                field :status, :string do
+                  resolve fn order, _ -> Checkout.Orders.status(order) end
+                end
+              end
+              subscription do
+                field :order, :id do
+                  resolve fn args, _ -> Checkout.Orders.load(args) end
+                end
+              end
+            end
             "#
             .into(),
+        )];
+        let typescript = vec![(
+            PathBuf::from("src/order.ts"),
+            r#"
+            /** @gqlType Order */
+            export class OrderModel {
+              /** @gqlField total */
+              total() { return "10.00" }
+            }
+            "#
+            .into(),
+            SourceLanguage::TypeScript,
+        )];
+        let manifests = vec![(
+            PathBuf::from("package.json"),
+            r#"{"dependencies":{"grats":"0.0.34"}}"#.into(),
         )];
         let scheduler = IndexScheduler::new(cache.clone());
         let (analysis, status, identity) = scheduler
@@ -1888,6 +1922,8 @@ mod tests {
                 RepositoryAnalysisSources {
                     graphql: &graphql,
                     elixir: &elixir,
+                    typescript: &typescript,
+                    typescript_manifests: &manifests,
                     ..Default::default()
                 },
                 CURRENT_ANALYSIS_VERSIONS,
@@ -1898,7 +1934,7 @@ mod tests {
         assert_eq!(
             identity,
             format!(
-                "elixir:{ELIXIR_FRONTEND_VERSION}:{ELIXIR_RESOLVER_VERSION}:graphql:{GRAPHQL_FRONTEND_VERSION}"
+                "elixir:{ELIXIR_FRONTEND_VERSION}:{ELIXIR_RESOLVER_VERSION}:typescript:{TYPESCRIPT_FRONTEND_VERSION}:{TYPESCRIPT_RESOLVER_VERSION}:graphql:{GRAPHQL_FRONTEND_VERSION}"
             )
         );
         assert!(analysis.observations.iter().any(|observation| {
@@ -1910,6 +1946,31 @@ mod tests {
                 && observation.to.as_str() == "graphql-field://Query/packageTemplatePreview"
         }));
         assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Query/order"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::Selects,
+                    )
+                && observation.to.as_str() == "graphql-field://Order/status"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Order/status"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str()
+                    == "repo://repo/elixir/Checkout.Schema/__absinthe_order_status_resolver/2"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Order/total"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str() == "repo://repo/typescript/src/order/OrderModel/total"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
             observation.from.as_str() == "graphql-field://Mutation/initializeOrder"
                 && observation.relation
                     == beholder_domain::SemanticRelation::Dependency(
@@ -1917,6 +1978,15 @@ mod tests {
                     )
                 && observation.to.as_str()
                     == "repo://repo/elixir/Checkout.Resolvers.InitializeOrder/run/3"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Subscription/order"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str()
+                    == "repo://repo/elixir/Checkout.Schema/__absinthe_subscription_order_resolver/2"
         }));
         assert!(analysis.entities.iter().any(|entity| {
             entity.id.as_str() == "graphql-type://InitializeOrderInput"
