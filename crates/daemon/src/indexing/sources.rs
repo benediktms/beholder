@@ -5,7 +5,7 @@ use beholder_adapters_treesitter_csharp::{UnityPrefab, parse_unity_meta, parse_u
 use beholder_adapters_treesitter_typescript::SourceLanguage;
 #[cfg(test)]
 use beholder_domain::RepositoryState;
-use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot, WorkspaceAnalyzer};
+use beholder_indexing::{Indexer, InputKind, RepositoryInput, RepositorySnapshot};
 #[cfg(test)]
 use std::{borrow::Cow, fs::File, io::BufReader};
 use std::{
@@ -400,7 +400,7 @@ pub(super) fn repository_sources(
 
 fn accepted_files(
     directory: &Path,
-    analyzers: &[Box<dyn WorkspaceAnalyzer>],
+    indexer: &Indexer,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     for entry in fs::read_dir(directory)? {
@@ -408,9 +408,9 @@ fn accepted_files(
         let path = entry.path();
         if entry.file_type()?.is_dir() {
             if !entry.file_name().to_str().is_some_and(is_ignored_directory) {
-                accepted_files(&path, analyzers, files)?;
+                accepted_files(&path, indexer, files)?;
             }
-        } else if analyzers.iter().any(|analyzer| analyzer.accepts(&path)) {
+        } else if indexer.accepts(&path) {
             files.push(path);
         }
     }
@@ -420,13 +420,13 @@ fn accepted_files(
 pub(super) fn repository_snapshot(
     root: &Path,
     descriptor_paths: &[PathBuf],
-    analyzers: &[Box<dyn WorkspaceAnalyzer>],
+    indexer: &Indexer,
 ) -> Result<RepositorySnapshot, Box<dyn Error>> {
     if !root.is_dir() {
         return Err(format!("repository does not exist: {}", root.display()).into());
     }
     let mut files = Vec::new();
-    accepted_files(root, analyzers, &mut files)?;
+    accepted_files(root, indexer, &mut files)?;
     files.sort();
     let mut inputs = files
         .into_iter()
@@ -500,12 +500,13 @@ mod tests {
         )
         .unwrap();
         fs::write(repository.join("README.md"), "ignored").unwrap();
-        let analyzers: Vec<Box<dyn WorkspaceAnalyzer>> = vec![
-            Box::new(RustAnalyzer::new(repository.join("cache"))),
-            Box::new(GraphqlAnalyzer),
-        ];
+        let indexer = beholder_indexing::IndexerBuilder::new(repository.join("cache"), 1)
+            .add_analyzer(RustAnalyzer::new(repository.join("cache")))
+            .add_analyzer(GraphqlAnalyzer)
+            .build()
+            .unwrap();
 
-        let snapshot = repository_snapshot(&repository, &[], &analyzers).unwrap();
+        let snapshot = repository_snapshot(&repository, &[], &indexer).unwrap();
         assert_eq!(
             snapshot
                 .inputs

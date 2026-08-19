@@ -41,17 +41,6 @@ pub(super) struct RepositoryAnalysis {
     pub(super) typescript: Option<TypescriptRepository>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(super) struct CanonicalRepositoryAnalysis {
-    #[serde(default)]
-    pub(super) incomplete: bool,
-    pub(super) entities: Vec<EntityFact>,
-    #[serde(default)]
-    pub(super) grpc_bindings: Vec<GrpcBindingCandidate>,
-    pub(super) observations: Vec<Observation>,
-    pub(super) diagnostics: Vec<AnalysisDiagnostic>,
-}
-
 #[cfg(test)]
 impl SourceAnalysisKey {
     pub(super) fn new(source: &str, frontend_version: &'static str) -> Self {
