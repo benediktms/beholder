@@ -1,9 +1,13 @@
+#[cfg(test)]
 use beholder_adapters_treesitter_csharp::CsharpProject;
+#[cfg(test)]
 use beholder_adapters_treesitter_typescript::TypescriptRepository;
 use beholder_domain::{AnalysisDiagnostic, EntityFact, GrpcBindingCandidate, Observation};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct SourceAnalysisKey {
     pub(super) content_hash: [u8; 32],
@@ -21,6 +25,7 @@ pub(super) struct RepositoryAnalysisKey {
     pub(super) protobuf: Option<&'static str>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RepositoryAnalysis {
     #[serde(default)]
@@ -36,6 +41,18 @@ pub(super) struct RepositoryAnalysis {
     pub(super) typescript: Option<TypescriptRepository>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(super) struct CanonicalRepositoryAnalysis {
+    #[serde(default)]
+    pub(super) incomplete: bool,
+    pub(super) entities: Vec<EntityFact>,
+    #[serde(default)]
+    pub(super) grpc_bindings: Vec<GrpcBindingCandidate>,
+    pub(super) observations: Vec<Observation>,
+    pub(super) diagnostics: Vec<AnalysisDiagnostic>,
+}
+
+#[cfg(test)]
 impl SourceAnalysisKey {
     pub(super) fn new(source: &str, frontend_version: &'static str) -> Self {
         Self {

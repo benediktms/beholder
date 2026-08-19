@@ -18,6 +18,7 @@ members = [
     "crates/adapters-treesitter-typescript",
     "crates/domain",
     "crates/dto",
+    "crates/indexing",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ beholder-adapters-treesitter-csharp = { path = "crates/adapters-treesitter-cshar
 beholder-adapters-treesitter-typescript = { path = "crates/adapters-treesitter-typescript" }
 beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }
+beholder-indexing = { path = "crates/indexing" }
 beholder-daemon-client = { path = "crates/daemon-client" }
 beholder-protocol = { path = "crates/protocol" }
 rayon = "1.10.0"

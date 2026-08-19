@@ -281,6 +281,7 @@ version = "0.1.0"
 dependencies = [
  "apollo-parser",
  "beholder-domain",
+ "beholder-indexing",
 ]
 
 [[package]]
@@ -301,6 +302,7 @@ dependencies = [
  "beholder-adapters-mnestic",
  "beholder-domain",
  "beholder-dto",
+ "beholder-indexing",
  "prost",
  "prost-types",
  "protox",
@@ -316,9 +318,12 @@ name = "beholder-adapters-treesitter-csharp"
 version = "0.1.0"
 dependencies = [
  "beholder-domain",
+ "beholder-indexing",
  "quick-xml",
+ "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "tree-sitter",
  "tree-sitter-c-sharp",
 ]
@@ -328,7 +333,11 @@ name = "beholder-adapters-treesitter-elixir"
 version = "0.1.0"
 dependencies = [
  "beholder-domain",
+ "beholder-indexing",
+ "rayon",
  "serde",
+ "serde_json",
+ "sha2",
  "tree-sitter",
  "tree-sitter-elixir",
 ]
@@ -338,7 +347,11 @@ name = "beholder-adapters-treesitter-rust"
 version = "0.1.0"
 dependencies = [
  "beholder-domain",
+ "beholder-indexing",
+ "rayon",
  "serde",
+ "serde_json",
+ "sha2",
  "tree-sitter",
  "tree-sitter-rust",
 ]
@@ -349,9 +362,12 @@ version = "0.1.0"
 dependencies = [
  "beholder-adapters-graphql",
  "beholder-domain",
+ "beholder-indexing",
  "jsonc-parser",
+ "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
@@ -387,6 +403,7 @@ dependencies = [
  "beholder-daemon-client",
  "beholder-domain",
  "beholder-dto",
+ "beholder-indexing",
  "beholder-protocol",
  "notify",
  "rayon",
@@ -423,6 +440,13 @@ name = "beholder-dto"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "beholder-indexing"
+version = "0.1.0"
+dependencies = [
+ "beholder-domain",
 ]
 
 [[package]]

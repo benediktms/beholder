@@ -19,6 +19,7 @@ beholder-adapters-treesitter-typescript.workspace = true
 beholder-daemon-client.workspace = true
 beholder-domain.workspace = true
 beholder-dto.workspace = true
+beholder-indexing.workspace = true
 beholder-protocol.workspace = true
 notify = "8.2.0"
 rayon.workspace = true

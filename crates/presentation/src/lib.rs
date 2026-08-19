@@ -29,6 +29,7 @@ pub enum OutputMode {
 pub struct RenderOptions {
     pub mode: OutputMode,
     pub include_tests: bool,
+    pub include_diagnostics: bool,
 }
 
 impl From<OutputMode> for RenderOptions {
@@ -36,6 +37,7 @@ impl From<OutputMode> for RenderOptions {
         Self {
             mode,
             include_tests: false,
+            include_diagnostics: false,
         }
     }
 }
@@ -55,7 +57,11 @@ pub fn context(
             &[],
             None,
         )),
-        OutputMode::Human => Ok(context_human(result, options.include_tests)),
+        OutputMode::Human => Ok(context_human(
+            result,
+            options.include_tests,
+            options.include_diagnostics,
+        )),
     }
 }
 
@@ -74,7 +80,11 @@ pub fn dependencies(
             &[],
             Some(&result.traversal),
         )),
-        OutputMode::Human => Ok(dependencies_human(result, options.include_tests)),
+        OutputMode::Human => Ok(dependencies_human(
+            result,
+            options.include_tests,
+            options.include_diagnostics,
+        )),
     }
 }
 
@@ -90,7 +100,11 @@ pub fn impact(result: &ImpactResult, options: RenderOptions) -> Result<String, s
             &[],
             Some(&result.traversal),
         )),
-        OutputMode::Human => Ok(impact_human(result, options.include_tests)),
+        OutputMode::Human => Ok(impact_human(
+            result,
+            options.include_tests,
+            options.include_diagnostics,
+        )),
     }
 }
 
@@ -106,7 +120,11 @@ pub fn trace(result: &TraceResult, options: RenderOptions) -> Result<String, ser
             &result.paths,
             Some(&result.traversal),
         )),
-        OutputMode::Human => Ok(trace_human(result, options.include_tests)),
+        OutputMode::Human => Ok(trace_human(
+            result,
+            options.include_tests,
+            options.include_diagnostics,
+        )),
     }
 }
 
@@ -122,7 +140,11 @@ pub fn why(result: &WhyResult, options: RenderOptions) -> Result<String, serde_j
             &result.paths,
             Some(&result.traversal),
         )),
-        OutputMode::Human => Ok(why_human(result, options.include_tests)),
+        OutputMode::Human => Ok(why_human(
+            result,
+            options.include_tests,
+            options.include_diagnostics,
+        )),
     }
 }
 
@@ -262,7 +284,17 @@ mod tests {
 
         let human = trace(&result, OutputMode::Human.into()).unwrap();
         assert!(human.contains("analysis incomplete · 2 diagnostics"));
-        assert!(human.contains("known_limitation repo src/a.ts:7 a-first recovered"));
+        assert!(!human.contains("known_limitation repo src/a.ts:7 a-first recovered"));
+        let verbose = trace(
+            &result,
+            RenderOptions {
+                mode: OutputMode::Human,
+                include_tests: false,
+                include_diagnostics: true,
+            },
+        )
+        .unwrap();
+        assert!(verbose.contains("known_limitation repo src/a.ts:7 a-first recovered"));
         let raw = trace(&result, OutputMode::Raw.into()).unwrap();
         assert!(raw.contains("incomplete=true"));
         assert!(raw.contains("\ndiagnostics\n"));
@@ -496,6 +528,7 @@ mod tests {
             RenderOptions {
                 mode: OutputMode::Human,
                 include_tests: true,
+                include_diagnostics: false,
             },
         )
         .unwrap();

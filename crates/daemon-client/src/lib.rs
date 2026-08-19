@@ -13,6 +13,8 @@ use beholder_protocol::{
 use std::path::{Path, PathBuf};
 use tonic::{Code, Status, transport::Channel};
 
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn socket_path() -> Result<PathBuf, String> {
     Ok(state_dir()?.join("beholder.sock"))
 }
@@ -25,7 +27,9 @@ fn endpoint() -> Result<String, String> {
 }
 
 async fn connect() -> Result<DaemonClient<Channel>, Box<dyn std::error::Error>> {
-    Ok(DaemonClient::connect(endpoint()?).await?)
+    Ok(DaemonClient::connect(endpoint()?)
+        .await?
+        .max_decoding_message_size(MAX_RESPONSE_BYTES))
 }
 
 pub fn state_dir() -> Result<PathBuf, String> {
@@ -184,14 +188,17 @@ async fn operation_client() -> Result<DaemonClient<Channel>, BeholderError> {
         )
         .with_source(std::io::Error::other(source))
     })?;
-    DaemonClient::connect(endpoint).await.map_err(|source| {
-        BeholderError::new(
-            BeholderErrorKind::Unavailable,
-            BeholderErrorCode::DaemonUnavailable,
-            "Beholder daemon is unavailable",
-        )
-        .with_source(source)
-    })
+    DaemonClient::connect(endpoint)
+        .await
+        .map(|client| client.max_decoding_message_size(MAX_RESPONSE_BYTES))
+        .map_err(|source| {
+            BeholderError::new(
+                BeholderErrorKind::Unavailable,
+                BeholderErrorCode::DaemonUnavailable,
+                "Beholder daemon is unavailable",
+            )
+            .with_source(source)
+        })
 }
 
 fn operation_error(status: Status) -> BeholderError {

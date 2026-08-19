@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 beholder-domain.workspace = true
+beholder-indexing.workspace = true
+rayon.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
 tree-sitter = "0.26.12"
 tree-sitter-rust = "0.24.2"

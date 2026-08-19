@@ -964,7 +964,7 @@ fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) 
 pub fn analyze(
     source: &str,
     language: SourceLanguage,
-) -> Result<TypescriptAnalysis, Box<dyn Error>> {
+) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     let grammar = match language {
         SourceLanguage::JavaScript | SourceLanguage::Jsx => tree_sitter_javascript::LANGUAGE,

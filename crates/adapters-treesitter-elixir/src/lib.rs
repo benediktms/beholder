@@ -3,12 +3,14 @@ pub const RESOLVER_VERSION: &str = "9";
 
 mod absinthe;
 mod analysis;
+mod analyzer;
 mod grpc;
 mod model;
 mod resolution;
 
 pub use absinthe::{GraphqlResolverBinding, bindings as graphql_resolver_bindings};
 pub use analysis::analyze;
+pub use analyzer::ElixirAnalyzer;
 pub use grpc::bindings as grpc_bindings;
 pub use model::ElixirAnalysis;
 pub use resolution::{

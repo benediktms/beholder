@@ -30,7 +30,7 @@ pub(super) fn analysis_versioned(
             .insert(key, analysis.clone());
         return Ok((analysis, CacheStatus::Disk));
     }
-    let analysis = Arc::new(analyze(source, language)?);
+    let analysis = Arc::new(analyze(source, language).map_err(super::erase_error)?);
     if let Some(parent) = path.parent()
         && fs::create_dir_all(parent).is_ok()
         && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())

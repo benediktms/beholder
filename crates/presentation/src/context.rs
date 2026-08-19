@@ -1,7 +1,11 @@
 use crate::projection::{entities, entity_names, is_primary, label, name, write_metadata};
 use beholder_dto::ContextResult;
 
-pub(super) fn context_human(result: &ContextResult, include_tests: bool) -> String {
+pub(super) fn context_human(
+    result: &ContextResult,
+    include_tests: bool,
+    include_diagnostics: bool,
+) -> String {
     let entities = entities(&result.nodes);
     let names = entity_names(&result.nodes);
     let mut incoming = Vec::new();
@@ -32,7 +36,7 @@ pub(super) fn context_human(result: &ContextResult, include_tests: bool) -> Stri
         output.push_str(&outgoing.join("\n"));
         output.push('\n');
     }
-    write_metadata(&mut output, &result.metadata);
+    write_metadata(&mut output, &result.metadata, include_diagnostics);
     output
 }
 

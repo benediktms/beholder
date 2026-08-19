@@ -1,37 +1,52 @@
 use crate::workspace_registry::WorkspaceRegistry;
-use beholder_adapters_graphql::{FRONTEND_VERSION as GRAPHQL_FRONTEND_VERSION, GraphqlSource};
+#[cfg(test)]
+use beholder_adapters_graphql::GraphqlSource;
+use beholder_adapters_graphql::{FRONTEND_VERSION as GRAPHQL_FRONTEND_VERSION, GraphqlAnalyzer};
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_adapters_protobuf::{
-    FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, SourceCompiler, facts as protobuf_facts,
-};
+use beholder_adapters_protobuf::{FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, ProtobufAnalyzer};
+#[cfg(test)]
+use beholder_adapters_protobuf::{SourceCompiler, facts as protobuf_facts};
+#[cfg(test)]
 use beholder_adapters_treesitter_csharp::{
-    CsharpAnalysis, CsharpProject, CsharpSource, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
-    RESOLVER_VERSION as CSHARP_RESOLVER_VERSION, UnityPrefab,
+    CsharpAnalysis, CsharpProject, CsharpSource, UnityPrefab,
     diagnostics_from_analysis as csharp_diagnostics, entities_from_analysis as csharp_entities,
     observations_from_analysis as csharp_observations, parse_project as parse_csharp_project,
     parse_unity_assemblies, resolve_repository_calls as resolve_csharp_repository_calls,
     source_assemblies as csharp_source_assemblies, unity_lifecycle as csharp_unity_lifecycle,
     unity_prefab_dependencies as csharp_unity_prefab_dependencies,
 };
+use beholder_adapters_treesitter_csharp::{
+    CsharpAnalyzer, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
+    RESOLVER_VERSION as CSHARP_RESOLVER_VERSION,
+};
+#[cfg(test)]
 use beholder_adapters_treesitter_elixir::{
-    ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
-    RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
+    ElixirAnalysis, diagnostics_from_analysis as elixir_diagnostics,
     entities_from_analysis as elixir_entities, generated_entities as elixir_generated_entities,
     generated_observations as elixir_generated_observations,
     graphql_resolver_bindings as elixir_graphql_resolver_bindings,
     grpc_bindings as elixir_grpc_bindings, observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
+use beholder_adapters_treesitter_elixir::{
+    ElixirAnalyzer, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
+    RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION,
+};
+use beholder_adapters_treesitter_rust::{FRONTEND_VERSION, RESOLVER_VERSION, RustAnalyzer};
+#[cfg(test)]
 use beholder_adapters_treesitter_rust::{
-    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis,
-    diagnostics_from_analysis as rust_diagnostics, entities_from_analysis as rust_entities,
-    observations_from_analysis, resolve_repository_calls as resolve_rust_repository_calls,
-    tonic_bindings,
+    RustAnalysis, diagnostics_from_analysis as rust_diagnostics,
+    entities_from_analysis as rust_entities, observations_from_analysis,
+    resolve_repository_calls as resolve_rust_repository_calls, tonic_bindings,
 };
 use beholder_adapters_treesitter_typescript::{
-    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION, GraphqlFactInput, GraphqlResolverInput,
-    GraphqlResolverSource, GrpcBindingInput as TypescriptGrpcBindingInput,
-    RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
+    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION,
+    RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, TypescriptAnalyzer,
+};
+#[cfg(test)]
+use beholder_adapters_treesitter_typescript::{
+    GraphqlFactInput, GraphqlResolverInput, GraphqlResolverSource,
+    GrpcBindingInput as TypescriptGrpcBindingInput, SourceLanguage, TypescriptAnalysis,
     TypescriptRepository, collect_graphql_facts as collect_typescript_graphql_facts,
     collect_graphql_resolvers as collect_typescript_graphql_resolvers,
     diagnostics_from_analysis as typescript_diagnostics,
@@ -42,11 +57,18 @@ use beholder_adapters_treesitter_typescript::{
     unresolved_call_diagnostics as unresolved_typescript_call_diagnostics,
 };
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, RepositoryFacts, RepositoryState, SourceAnalysisError, Workspace, WorkspaceView,
+    AnalysisDiagnostic, DependencyRelation, EntityKind, Observation, RepositoryFacts,
+    RepositoryState, Workspace, WorkspaceView,
 };
+#[cfg(test)]
+use beholder_domain::{AnalysisDiagnosticSeverity, EntityFact, SourceAnalysisError};
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
+use beholder_indexing::{
+    AnalysisCompleteness, CacheStatistics, GraphqlResolverCandidate, WorkspaceAnalyzer,
+    WorkspaceSnapshot,
+};
 use notify::{Event, EventKind};
+#[cfg(test)]
 use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -67,20 +89,28 @@ use tokio::{
 
 #[path = "cache.rs"]
 mod cache;
+#[cfg(test)]
 #[path = "csharp_analysis.rs"]
 mod csharp_analysis;
+#[cfg(test)]
 #[path = "elixir_analysis.rs"]
 mod elixir_analysis;
 #[path = "pipeline.rs"]
 mod pipeline;
+#[cfg(test)]
 #[path = "rust_analysis.rs"]
 mod rust_analysis;
 #[path = "sources.rs"]
 mod sources;
+#[cfg(test)]
 #[path = "typescript_analysis.rs"]
 mod typescript_analysis;
-use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
-use sources::{RepositorySources, decode_csharp_source, is_index_input, repository_sources};
+use cache::{CanonicalRepositoryAnalysis, RepositoryAnalysisKey};
+#[cfg(test)]
+use cache::{RepositoryAnalysis, SourceAnalysisKey};
+use sources::repository_snapshot;
+#[cfg(test)]
+use sources::{RepositorySources, decode_csharp_source, repository_sources};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
@@ -151,6 +181,7 @@ impl AnalysisVersions {
         }
     }
 
+    #[cfg(test)]
     fn workspace_identity(self, repositories: &[RepositorySources]) -> String {
         let key = self.repository_key(
             String::new(),
@@ -175,16 +206,82 @@ impl AnalysisVersions {
         );
         format!("{}:core-rules:{}", key.analysis_identity(), self.rule_pack)
     }
+
+    fn snapshot_languages(
+        analyzers: &[Box<dyn WorkspaceAnalyzer>],
+        repository: &beholder_indexing::RepositorySnapshot,
+    ) -> RepositoryLanguages {
+        let mut languages = RepositoryLanguages::default();
+        for analyzer in analyzers
+            .iter()
+            .filter(|analyzer| analyzer.is_active(repository))
+        {
+            match analyzer.metadata().id.as_str() {
+                "rust" => languages.rust = true,
+                "elixir" => languages.elixir = true,
+                "csharp" => languages.csharp = true,
+                "typescript" => languages.typescript = true,
+                "protobuf" => languages.protobuf = true,
+                "graphql" => languages.graphql = true,
+                _ => {}
+            }
+        }
+        languages
+    }
+
+    fn snapshot_workspace_identity(
+        self,
+        analyzers: &[Box<dyn WorkspaceAnalyzer>],
+        snapshot: &WorkspaceSnapshot,
+    ) -> String {
+        let languages = snapshot.repositories.iter().fold(
+            RepositoryLanguages::default(),
+            |mut languages, repository| {
+                let active = Self::snapshot_languages(analyzers, repository);
+                languages.rust |= active.rust;
+                languages.elixir |= active.elixir;
+                languages.csharp |= active.csharp;
+                languages.typescript |= active.typescript;
+                languages.protobuf |= active.protobuf;
+                languages.graphql |= active.graphql;
+                languages
+            },
+        );
+        format!(
+            "{}:core-rules:{}",
+            self.repository_key(String::new(), languages)
+                .analysis_identity(),
+            self.rule_pack
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CacheStatus {
+    #[cfg(test)]
     Memory,
     Disk,
     Miss,
 }
 
+#[cfg(test)]
 type Cached<T> = Result<(Arc<T>, CacheStatus), Box<dyn Error>>;
+
+fn erase_error(error: Box<dyn Error + Send + Sync>) -> Box<dyn Error> {
+    error
+}
+
+struct WorkspacePortAnalysis {
+    repositories: Vec<(
+        RepositoryState,
+        Arc<CanonicalRepositoryAnalysis>,
+        CacheStatus,
+        String,
+    )>,
+    overrides: Vec<beholder_domain::DependencyOverride>,
+    diagnostics: Vec<(String, AnalysisDiagnostic)>,
+    cache: CacheStatistics,
+}
 
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
@@ -195,11 +292,17 @@ pub struct IndexScheduler {
     shutdown: Notify,
     checkpointing: AtomicBool,
     cache_dir: PathBuf,
+    #[cfg(test)]
     rust_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<RustAnalysis>>>,
+    #[cfg(test)]
     elixir_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<ElixirAnalysis>>>,
+    #[cfg(test)]
     csharp_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<CsharpAnalysis>>>,
+    #[cfg(test)]
     typescript_cache: Mutex<BTreeMap<SourceAnalysisKey, Arc<TypescriptAnalysis>>>,
+    #[cfg(test)]
     protobuf_compiler: SourceCompiler,
+    analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
     analysis_pool: rayon::ThreadPool,
 }
 
@@ -215,6 +318,7 @@ struct ActiveIndex<'a> {
 }
 
 #[derive(Clone, Copy, Default)]
+#[cfg(test)]
 struct RepositoryAnalysisSources<'a> {
     rust: &'a [(PathBuf, String)],
     elixir: &'a [(PathBuf, String)],
@@ -256,7 +360,16 @@ impl IndexScheduler {
             .build()
             .expect("bounded indexing pool should start");
         tracing::info!(workers, "index analysis pool configured");
+        #[cfg(test)]
         let protobuf_compiler = SourceCompiler::new(cache_dir.clone());
+        let analyzers: Vec<Box<dyn WorkspaceAnalyzer>> = vec![
+            Box::new(RustAnalyzer::new(cache_dir.clone())),
+            Box::new(ElixirAnalyzer::new(cache_dir.clone())),
+            Box::new(CsharpAnalyzer::new(cache_dir.clone())),
+            Box::new(TypescriptAnalyzer::new(cache_dir.clone())),
+            Box::new(GraphqlAnalyzer),
+            Box::new(ProtobufAnalyzer::new(cache_dir.clone())),
+        ];
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
@@ -266,11 +379,17 @@ impl IndexScheduler {
             shutdown: Notify::new(),
             checkpointing: AtomicBool::new(false),
             cache_dir,
+            #[cfg(test)]
             rust_cache: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
             elixir_cache: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
             csharp_cache: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
             typescript_cache: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
             protobuf_compiler,
+            analyzers,
             analysis_pool,
         }
     }
@@ -327,23 +446,31 @@ impl IndexScheduler {
 
     pub fn clear_cache(&self) -> Result<(), Box<dyn Error>> {
         let _active = self.begin("cache clear")?;
+        #[cfg(test)]
         self.rust_cache
             .lock()
             .map_err(|_| "Rust frontend cache lock poisoned")?
             .clear();
+        #[cfg(test)]
         self.elixir_cache
             .lock()
             .map_err(|_| "Elixir frontend cache lock poisoned")?
             .clear();
+        #[cfg(test)]
         self.csharp_cache
             .lock()
             .map_err(|_| "C# frontend cache lock poisoned")?
             .clear();
+        #[cfg(test)]
         self.typescript_cache
             .lock()
             .map_err(|_| "TypeScript frontend cache lock poisoned")?
             .clear();
+        #[cfg(test)]
         self.protobuf_compiler.clear_memory()?;
+        for analyzer in &self.analyzers {
+            analyzer.clear_cache().map_err(erase_error)?;
+        }
         if self.cache_dir.exists() {
             fs::remove_dir_all(&self.cache_dir)?;
         }
@@ -458,7 +585,9 @@ impl IndexScheduler {
                             path.strip_prefix(&repository.base)
                                 .ok()
                                 .filter(|relative| {
-                                    is_index_input(relative)
+                                    self.analyzers
+                                        .iter()
+                                        .any(|analyzer| analyzer.accepts(relative))
                                         || workspace.protobuf_descriptors.iter().any(|descriptor| {
                                             descriptor.repository == repository.repository
                                                 && descriptor.path == *path
@@ -626,6 +755,7 @@ impl IndexScheduler {
         }
     }
 
+    #[cfg(test)]
     fn rust_analysis_versioned(
         &self,
         source: &str,
@@ -634,6 +764,7 @@ impl IndexScheduler {
         rust_analysis::analysis_versioned(self, source, frontend_version)
     }
 
+    #[cfg(test)]
     fn elixir_analysis_versioned(
         &self,
         source: &str,
@@ -642,10 +773,12 @@ impl IndexScheduler {
         elixir_analysis::analysis_versioned(self, source, frontend_version)
     }
 
+    #[cfg(test)]
     fn csharp_analysis_versioned(&self, source: &str) -> Cached<CsharpAnalysis> {
         csharp_analysis::analysis_versioned(self, source)
     }
 
+    #[cfg(test)]
     fn typescript_analysis_versioned(
         &self,
         source: &str,
@@ -654,6 +787,7 @@ impl IndexScheduler {
         typescript_analysis::analysis_versioned(self, source, language)
     }
 
+    #[cfg(test)]
     fn cache_path(&self, language: &str, key: &SourceAnalysisKey) -> PathBuf {
         let hash = key
             .content_hash
@@ -666,6 +800,7 @@ impl IndexScheduler {
             .join(format!("{hash}.json"))
     }
 
+    #[cfg(test)]
     fn repository_observations_versioned(
         &self,
         state: &RepositoryState,
@@ -741,12 +876,13 @@ impl IndexScheduler {
             .collect::<Vec<_>>();
         let is_unity = !unity_assemblies.is_empty() || !unity_prefabs.is_empty();
         let csharp_projects = if is_unity {
-            parse_unity_assemblies(&unity_assemblies)?
+            parse_unity_assemblies(&unity_assemblies).map_err(erase_error)?
         } else {
             csharp_projects
                 .iter()
                 .map(|(path, source)| parse_csharp_project(path, source))
-                .collect::<Result<Vec<CsharpProject>, _>>()?
+                .collect::<Result<Vec<CsharpProject>, _>>()
+                .map_err(erase_error)?
         };
         let mut rust_analyses = Vec::new();
         let analyzed_rust = self.analysis_pool.install(|| {
@@ -1138,6 +1274,190 @@ impl IndexScheduler {
         tracing::debug!(repository = %state.repository.identity, cache_status = "miss", "repository cache lookup");
         Ok((analysis, CacheStatus::Miss, analysis_identity))
     }
+
+    fn canonical_repository_versioned(
+        &self,
+        state: &RepositoryState,
+        analysis: CanonicalRepositoryAnalysis,
+        versions: AnalysisVersions,
+        languages: RepositoryLanguages,
+    ) -> Result<(Arc<CanonicalRepositoryAnalysis>, CacheStatus, String), Box<dyn Error>> {
+        let key = versions.repository_key(state.fingerprint.clone(), languages);
+        let analysis_identity = key.analysis_identity();
+        let (rust_frontend, rust_resolver) = key.rust.unwrap_or(("_", "_"));
+        let (elixir_frontend, elixir_resolver) = key.elixir.unwrap_or(("_", "_"));
+        let (csharp_frontend, csharp_resolver) = key.csharp.unwrap_or(("_", "_"));
+        let (typescript_frontend, typescript_resolver) = key.typescript.unwrap_or(("_", "_"));
+        let path = self
+            .cache_dir
+            .join("repository")
+            .join("semantic")
+            .join(rust_frontend)
+            .join(rust_resolver)
+            .join(elixir_frontend)
+            .join(elixir_resolver)
+            .join(csharp_frontend)
+            .join(csharp_resolver)
+            .join(typescript_frontend)
+            .join(typescript_resolver)
+            .join(key.protobuf.unwrap_or("_"))
+            .join(key.graphql.unwrap_or("_"))
+            .join(format!("{}.json", state.fingerprint));
+        if let Ok(file) = File::open(&path)
+            && let Ok(analysis) =
+                serde_json::from_reader::<_, CanonicalRepositoryAnalysis>(BufReader::new(file))
+        {
+            tracing::debug!(repository = %state.repository.identity, cache_status = "disk", "repository cache lookup");
+            return Ok((Arc::new(analysis), CacheStatus::Disk, analysis_identity));
+        }
+        let analysis = Arc::new(analysis);
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_ok()
+            && let Ok(file) = File::create(path)
+        {
+            let mut writer = BufWriter::new(file);
+            if serde_json::to_writer(&mut writer, analysis.as_ref()).is_ok() {
+                let _ = writer.flush();
+            }
+        }
+        tracing::debug!(repository = %state.repository.identity, cache_status = "miss", "repository cache lookup");
+        Ok((analysis, CacheStatus::Miss, analysis_identity))
+    }
+
+    fn analyze_snapshot_versioned(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        versions: AnalysisVersions,
+    ) -> Result<WorkspacePortAnalysis, Box<dyn Error>> {
+        let mut merged = snapshot
+            .repositories
+            .iter()
+            .map(|repository| {
+                (
+                    repository.state.repository.identity.clone(),
+                    CanonicalRepositoryAnalysis::default(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut overrides = Vec::new();
+        let mut graphql_resolvers = Vec::<GraphqlResolverCandidate>::new();
+        let mut diagnostics = Vec::new();
+        let mut cache = CacheStatistics::default();
+        for analyzer in &self.analyzers {
+            let contribution = self
+                .analysis_pool
+                .install(|| analyzer.analyze(snapshot))
+                .map_err(erase_error)?;
+            tracing::debug!(
+                analyzer = contribution.metadata.id,
+                version = contribution.metadata.version,
+                repositories = contribution.active_repositories.len(),
+                "workspace analyzer completed"
+            );
+            cache.memory_hits += contribution.cache.memory_hits;
+            cache.disk_hits += contribution.cache.disk_hits;
+            cache.misses += contribution.cache.misses;
+            overrides.extend(contribution.overrides);
+            graphql_resolvers.extend(contribution.graphql_resolvers);
+            diagnostics.extend(contribution.diagnostics);
+            for repository in contribution.repositories {
+                let analysis = merged.get_mut(&repository.repository).ok_or_else(|| {
+                    format!(
+                        "analyzer returned unknown repository {}",
+                        repository.repository
+                    )
+                })?;
+                analysis.incomplete |= repository.completeness == AnalysisCompleteness::Incomplete;
+                extend_unique(&mut analysis.entities, repository.entities);
+                extend_unique(&mut analysis.grpc_bindings, repository.grpc_bindings);
+                extend_unique(&mut analysis.observations, repository.observations);
+                extend_unique(&mut analysis.diagnostics, repository.diagnostics);
+            }
+        }
+        bind_graphql_resolvers(&mut merged, graphql_resolvers);
+        let mut repositories = Vec::new();
+        for repository in &snapshot.repositories {
+            let identity = &repository.state.repository.identity;
+            let analysis = merged
+                .remove(identity)
+                .ok_or_else(|| format!("missing analysis for repository {identity}"))?;
+            let languages = AnalysisVersions::snapshot_languages(&self.analyzers, repository);
+            let (analysis, status, analysis_identity) = self.canonical_repository_versioned(
+                &repository.state,
+                analysis,
+                versions,
+                languages,
+            )?;
+            diagnostics.extend(
+                analysis
+                    .diagnostics
+                    .iter()
+                    .cloned()
+                    .map(|diagnostic| (identity.clone(), diagnostic)),
+            );
+            repositories.push((
+                repository.state.clone(),
+                analysis,
+                status,
+                analysis_identity,
+            ));
+        }
+        Ok(WorkspacePortAnalysis {
+            repositories,
+            overrides,
+            diagnostics,
+            cache,
+        })
+    }
+}
+
+fn extend_unique<T: PartialEq>(target: &mut Vec<T>, source: Vec<T>) {
+    for value in source {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn bind_graphql_resolvers(
+    repositories: &mut BTreeMap<String, CanonicalRepositoryAnalysis>,
+    bindings: Vec<GraphqlResolverCandidate>,
+) {
+    for binding in bindings {
+        let Some(repository) = repositories.get_mut(&binding.repository) else {
+            continue;
+        };
+        let fields = repository
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::GraphqlField)
+            .filter_map(|entity| {
+                let path = entity.id.as_str().strip_prefix("graphql-field://")?;
+                let (parent, field) = path.split_once('/')?;
+                Some(((parent, field), entity.id.as_str()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let field = binding
+            .parent
+            .as_deref()
+            .and_then(|parent| fields.get(&(parent, binding.field.as_str())).copied())
+            .or_else(|| {
+                let mut matches = fields
+                    .iter()
+                    .filter(|((_, name), _)| *name == binding.field)
+                    .map(|(_, id)| *id);
+                let field = matches.next()?;
+                matches.next().is_none().then_some(field)
+            });
+        if let Some(field) = field {
+            repository.observations.push(Observation::dependency(
+                field,
+                DependencyRelation::ResolvedBy,
+                binding.resolver,
+                binding.evidence,
+            ));
+        }
+    }
 }
 
 fn index_workspace(
@@ -1146,7 +1466,7 @@ fn index_workspace(
     workspace: &Workspace,
     dirty: Option<&BTreeMap<String, DirtyRepository>>,
 ) -> Result<(usize, bool), Box<dyn Error>> {
-    index_workspace_versioned(
+    index_workspace_through_port(
         scheduler,
         store,
         workspace,
@@ -1155,6 +1475,122 @@ fn index_workspace(
     )
 }
 
+fn index_workspace_through_port(
+    scheduler: &IndexScheduler,
+    store: &SemanticStore,
+    workspace: &Workspace,
+    dirty: Option<&BTreeMap<String, DirtyRepository>>,
+    versions: AnalysisVersions,
+) -> Result<(usize, bool), Box<dyn Error>> {
+    let source_loading_started = Instant::now();
+    let repositories = workspace
+        .repositories
+        .iter()
+        .map(|repository| {
+            let descriptors = workspace
+                .protobuf_descriptors
+                .iter()
+                .filter(|descriptor| descriptor.repository == repository.repository)
+                .map(|descriptor| descriptor.path.clone())
+                .collect::<Vec<_>>();
+            repository_snapshot(&repository.base, &descriptors, &scheduler.analyzers)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_loading = source_loading_started.elapsed();
+    let snapshot = WorkspaceSnapshot {
+        name: workspace.name.clone(),
+        repositories,
+    };
+    let view = WorkspaceView::new(
+        &workspace.name,
+        versions.snapshot_workspace_identity(&scheduler.analyzers, &snapshot),
+        snapshot
+            .repositories
+            .iter()
+            .map(|repository| repository.state.clone())
+            .collect(),
+    )?;
+    if store.view_matches(&view)? {
+        tracing::info!(workspace = %workspace.name, "workspace unchanged");
+        return Ok((0, false));
+    }
+
+    let dirty_source_units = snapshot
+        .repositories
+        .iter()
+        .map(|repository| {
+            match dirty
+                .and_then(|repositories| repositories.get(&repository.state.repository.identity))
+            {
+                Some(DirtyRepository::Sources(sources)) => sources.len(),
+                Some(DirtyRepository::All) | None => repository
+                    .inputs
+                    .iter()
+                    .filter(|input| input.kind == beholder_indexing::InputKind::Source)
+                    .count(),
+            }
+        })
+        .sum::<usize>();
+    let repository_analysis_started = Instant::now();
+    let analysis = scheduler.analyze_snapshot_versioned(&snapshot, versions)?;
+    let repository_analysis = repository_analysis_started.elapsed();
+    let memory_hits = 0;
+    let mut disk_hits = 0;
+    let mut misses = 0;
+    let repository_facts = analysis
+        .repositories
+        .into_iter()
+        .map(|(state, analysis, status, analysis_identity)| {
+            match status {
+                #[cfg(test)]
+                CacheStatus::Memory => {}
+                CacheStatus::Disk => disk_hits += 1,
+                CacheStatus::Miss => misses += 1,
+            }
+            RepositoryFacts {
+                state,
+                analysis_identity,
+                incomplete: analysis.incomplete,
+                diagnostics: analysis.diagnostics.clone(),
+                entities: analysis.entities.clone(),
+                grpc_bindings: analysis.grpc_bindings.clone(),
+                observations: analysis.observations.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let observation_count = repository_facts
+        .iter()
+        .map(|facts| facts.observations.len())
+        .sum();
+    let publication_started = Instant::now();
+    let changes = store.publish(&view, &repository_facts, &analysis.overrides)?;
+    let publication = publication_started.elapsed();
+    pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
+    tracing::info!(
+        workspace = %workspace.name,
+        observation_count,
+        facts_inserted = changes.inserted,
+        facts_updated = changes.updated,
+        facts_removed = changes.removed,
+        facts_unchanged = changes.unchanged,
+        repository_cache_memory_hits = memory_hits,
+        repository_cache_disk_hits = disk_hits,
+        repository_cache_misses = misses,
+        analyzer_cache_memory_hits = analysis.cache.memory_hits,
+        analyzer_cache_disk_hits = analysis.cache.disk_hits,
+        analyzer_cache_misses = analysis.cache.misses,
+        dirty_source_units,
+        source_loading_ms = source_loading.as_secs_f64() * 1000.0,
+        protobuf_compilation_ms = 0.0,
+        repository_analysis_ms = repository_analysis.as_secs_f64() * 1000.0,
+        workspace_resolution_ms = 0.0,
+        publication_ms = publication.as_secs_f64() * 1000.0,
+        "workspace indexed"
+    );
+    Ok((observation_count, true))
+}
+
+#[cfg(test)]
 fn index_workspace_versioned(
     scheduler: &IndexScheduler,
     store: &SemanticStore,
@@ -1387,6 +1823,62 @@ mod tests {
     }
 
     #[test]
+    fn built_in_analyzers_declare_every_current_input() {
+        let scheduler = IndexScheduler::new(PathBuf::new());
+        for path in [
+            "src/lib.rs",
+            "lib/app.ex",
+            "test/app.exs",
+            "src/App.cs",
+            "src/app.js",
+            "src/app.jsx",
+            "src/app.ts",
+            "src/app.tsx",
+            "schema.graphql",
+            "operation.gql",
+            "contract.proto",
+            "buf.yaml",
+            "buf.lock",
+            "package.json",
+            "App.csproj",
+            "App.asmdef",
+            "Thing.prefab",
+            "Thing.cs.meta",
+            "Thing.prefab.meta",
+            "tsconfig.app.json",
+            "jsconfig.app.json",
+        ] {
+            assert!(
+                scheduler
+                    .analyzers
+                    .iter()
+                    .any(|analyzer| analyzer.accepts(Path::new(path))),
+                "no analyzer accepts {path}"
+            );
+        }
+        let protobuf = scheduler
+            .analyzers
+            .iter()
+            .find(|analyzer| analyzer.metadata().id == "protobuf")
+            .unwrap();
+        assert!(protobuf.is_active(&beholder_indexing::RepositorySnapshot {
+            base: PathBuf::new(),
+            state: RepositoryState {
+                repository: beholder_domain::LogicalRepository {
+                    identity: "descriptor-only".into(),
+                },
+                head: None,
+                fingerprint: "descriptor".into(),
+            },
+            inputs: vec![beholder_indexing::RepositoryInput {
+                path: PathBuf::from("descriptor.binpb"),
+                content: Arc::from(&b"descriptor"[..]),
+                kind: beholder_indexing::InputKind::ProtobufDescriptor,
+            }],
+        }));
+    }
+
+    #[test]
     fn frontend_cache_reuses_content_and_invalidates_versions() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1601,7 +2093,6 @@ mod tests {
         let store = SemanticStore::memory().unwrap();
 
         assert!(scheduler.index(&store, &workspace).unwrap().1);
-        assert_eq!(scheduler.typescript_cache.lock().unwrap().len(), 7);
         let stored = store.inspect_observations(Some("calls")).unwrap();
         let has_call = |target: &str| {
             stored.rows.iter().any(|row| {
@@ -1684,7 +2175,6 @@ mod tests {
         let store = SemanticStore::memory().unwrap();
 
         assert!(scheduler.index(&store, &workspace).unwrap().1);
-        assert_eq!(scheduler.csharp_cache.lock().unwrap().len(), 1);
         let stored = store.inspect_observations(Some("calls")).unwrap();
         assert!(
             stored.rows.iter().any(|row| {
@@ -2613,14 +3103,6 @@ mod tests {
                 .iter()
                 .all(|row| row[1].as_str() != Some("repo://repo/rust/lib/old"))
         );
-        assert_eq!(
-            scheduler
-                .rust_analysis_versioned("fn broken() { @ } fn current() {}", FRONTEND_VERSION,)
-                .unwrap()
-                .1,
-            CacheStatus::Memory
-        );
-
         fs::write(&source, "fn broken() { fn nested() {}").unwrap();
         scheduler.mark(&workspace);
         let error = scheduler.index(&store, &workspace).unwrap_err();
@@ -2699,7 +3181,6 @@ mod tests {
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
         scheduler.mark(&workspace);
         scheduler.index(&store, &workspace).unwrap();
-        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 2);
 
         fs::write(&changed, "fn after() {}").unwrap();
         scheduler.add_event(
@@ -2716,7 +3197,6 @@ mod tests {
         );
 
         scheduler.index(&store, &workspace).unwrap();
-        assert_eq!(scheduler.rust_cache.lock().unwrap().len(), 3);
         let context = format!(
             "{:?}",
             store
@@ -2805,7 +3285,6 @@ mod tests {
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
         scheduler.mark(&workspace);
         scheduler.index(&store, &workspace).unwrap();
-        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 2);
 
         let module = format!("repo://{identity}/elixir/MyApp.Sample");
         let context = store.context("main", &module).unwrap();
@@ -2903,7 +3382,6 @@ mod tests {
         );
 
         scheduler.index(&store, &workspace).unwrap();
-        assert_eq!(scheduler.elixir_cache.lock().unwrap().len(), 3);
         let context = store.context("main", &module).unwrap();
         assert!(
             context
