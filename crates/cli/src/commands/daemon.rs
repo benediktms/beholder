@@ -4,10 +4,12 @@ use beholder_daemon_client::{get_status, state_dir, stop};
 use std::{
     error::Error,
     fs::{self, OpenOptions},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
+
+const STOP_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) async fn run(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
     match command {
@@ -99,15 +101,34 @@ fn foreground() -> Result<(), Box<dyn Error>> {
 
 async fn wait_for_lock() -> Result<(), Box<dyn Error>> {
     let path = state_dir()?.join("beholderd.pid");
-    loop {
-        if !path.exists() {
-            return Ok(());
+    wait_for_lock_at(&path, STOP_TIMEOUT).await
+}
+
+async fn wait_for_lock_at(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    match tokio::time::timeout(timeout, async {
+        let mut reported = false;
+        loop {
+            if !path.exists() {
+                return Ok(());
+            }
+            let file = fs::File::options().read(true).write(true).open(path)?;
+            if file.try_lock().is_ok() {
+                return Ok(());
+            }
+            if !reported {
+                eprintln!("waiting for beholderd to finish active work...");
+                reported = true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let file = fs::File::options().read(true).write(true).open(&path)?;
-        if file.try_lock().is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "timed out waiting for beholderd to stop after {timeout:?}; retry once active work completes"
+        )
+        .into()),
     }
 }
 
@@ -181,4 +202,30 @@ async fn uninstall_service() -> Result<(), Box<dyn Error>> {
         outcome.manifest_path.display()
     ))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn waiting_for_daemon_lock_times_out() {
+        let path = std::env::temp_dir().join(format!(
+            "beholder-cli-daemon-lock-test-{}",
+            std::process::id()
+        ));
+        let file = fs::File::create(&path).unwrap();
+        file.try_lock().unwrap();
+
+        let error = wait_for_lock_at(&path, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for beholderd")
+        );
+        fs::remove_file(path).unwrap();
+    }
 }
