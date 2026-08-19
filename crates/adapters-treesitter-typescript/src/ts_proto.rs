@@ -213,13 +213,11 @@ mod tests {
             };
         "#;
         let path = Path::new("generated/initialize_order.generated.ts");
-        let analysis = analyze_with_plugins(
-            source,
-            SourceLanguage::TypeScript,
-            path,
-            &built_in_plugins().unwrap(),
-        )
-        .unwrap();
+        let plugins = built_in_plugins().unwrap();
+        let active = plugins.activate_direct(path);
+        let analysis =
+            analyze_with_plugins(source, SourceLanguage::TypeScript, path, &plugins, &active)
+                .unwrap();
 
         let observations = message_observations("example", &analysis, path);
 

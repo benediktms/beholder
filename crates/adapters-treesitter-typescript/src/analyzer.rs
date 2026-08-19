@@ -12,9 +12,9 @@ use crate::{
 use beholder_adapters_graphql::GraphqlSource;
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    LanguageAnalyzer, RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer,
-    WorkspaceSnapshot,
+    ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
+    CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
+    WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -55,12 +55,13 @@ impl TypescriptAnalyzer {
         path: &Path,
         source: &str,
         language: SourceLanguage,
+        active_plugins: &ActivePlugins,
     ) -> Result<(Arc<TypescriptAnalysis>, CacheStatus), AnalyzerError> {
         let mut digest = Sha256::new();
         digest.update(source.as_bytes());
         digest.update(path.to_string_lossy().as_bytes());
         digest.update(language.cache_version().as_bytes());
-        digest.update(self.plugins.identity().as_bytes());
+        digest.update(active_plugins.identity().as_bytes());
         let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
@@ -82,7 +83,13 @@ impl TypescriptAnalyzer {
                 .insert(key, analysis.clone());
             return Ok((analysis, CacheStatus::Disk));
         }
-        let analysis = Arc::new(analyze_with_plugins(source, language, path, &self.plugins)?);
+        let analysis = Arc::new(analyze_with_plugins(
+            source,
+            language,
+            path,
+            &self.plugins,
+            active_plugins,
+        )?);
         if let Some(parent) = cache_path.parent()
             && fs::create_dir_all(parent).is_ok()
             && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
@@ -164,6 +171,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     text(input).map(|source| (input.path.as_path(), source, language))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let active_plugins = self.plugins.activate(repository, !sources.is_empty());
             let manifests = inputs
                 .iter()
                 .filter(|input| {
@@ -200,7 +208,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 .par_iter()
                 .map(|(path, source, language)| {
                     let (analysis, status) = self
-                        .analysis(path, source, *language)
+                        .analysis(path, source, *language, &active_plugins)
                         .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     Ok::<_, SourceAnalysisError>((*path, *source, analysis, status))
                 })
@@ -277,6 +285,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     entities: &entities,
                     observations: &observations,
                 },
+                &active_plugins,
             )?;
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);

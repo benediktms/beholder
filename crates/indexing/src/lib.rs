@@ -152,6 +152,41 @@ pub struct PluginMetadata {
     pub version: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginActivation {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivePlugin {
+    pub metadata: PluginMetadata,
+    pub activation: PluginActivation,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ActivePlugins {
+    plugins: BTreeMap<String, ActivePlugin>,
+}
+
+impl ActivePlugins {
+    pub fn identity(&self) -> String {
+        self.plugins
+            .values()
+            .map(|plugin| format!("{}:{}", plugin.metadata.id, plugin.metadata.version))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    pub fn plugins(&self) -> impl Iterator<Item = &ActivePlugin> {
+        self.plugins.values()
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.plugins.contains_key(id)
+    }
+}
+
 pub struct SourceRecognitionInput<'a, L: AnalyzerLanguage> {
     pub path: &'a Path,
     pub text: &'a str,
@@ -189,7 +224,13 @@ pub trait RepositoryEnricher<L: AnalyzerLanguage>: Send + Sync {
 
 pub trait Plugin<L: AnalyzerLanguage>: Send + Sync + 'static {
     fn metadata(&self) -> PluginMetadata;
-    fn install(self, builder: &mut LanguageAnalyzerBuilder<L>);
+    fn activate(&self, repository: &RepositorySnapshot) -> Option<PluginActivation>;
+    fn install(&self, builder: &mut LanguageAnalyzerBuilder<L>);
+}
+
+struct InstalledPlugin<L: AnalyzerLanguage> {
+    metadata: PluginMetadata,
+    plugin: Box<dyn Plugin<L>>,
 }
 
 struct InstalledSourceRecognizer<L: AnalyzerLanguage> {
@@ -203,7 +244,7 @@ struct InstalledRepositoryEnricher<L: AnalyzerLanguage> {
 }
 
 pub struct LanguageAnalyzerBuilder<L: AnalyzerLanguage> {
-    plugins: Vec<PluginMetadata>,
+    plugins: Vec<InstalledPlugin<L>>,
     source_recognizers: Vec<InstalledSourceRecognizer<L>>,
     repository_enrichers: Vec<InstalledRepositoryEnricher<L>>,
     installing: Option<PluginMetadata>,
@@ -247,7 +288,8 @@ impl<L: AnalyzerLanguage> LanguageAnalyzerBuilder<L> {
     ///     fn metadata(&self) -> PluginMetadata {
     ///         PluginMetadata { id: "typescript.example".into(), version: "1".into() }
     ///     }
-    ///     fn install(self, _: &mut LanguageAnalyzerBuilder<TypeScript>) {}
+    ///     fn activate(&self, _: &beholder_indexing::RepositorySnapshot) -> Option<beholder_indexing::PluginActivation> { None }
+    ///     fn install(&self, _: &mut LanguageAnalyzerBuilder<TypeScript>) {}
     /// }
     ///
     /// let _ = LanguageAnalyzerBuilder::<Rust>::new().add_plugin(TypeScriptPlugin);
@@ -257,7 +299,10 @@ impl<L: AnalyzerLanguage> LanguageAnalyzerBuilder<L> {
         self.installing = Some(metadata.clone());
         plugin.install(&mut self);
         self.installing = None;
-        self.plugins.push(metadata);
+        self.plugins.push(InstalledPlugin {
+            metadata,
+            plugin: Box::new(plugin),
+        });
         self
     }
 
@@ -282,13 +327,14 @@ impl<L: AnalyzerLanguage> LanguageAnalyzerBuilder<L> {
     }
 
     pub fn build(mut self) -> Result<LanguageAnalyzer<L>, AnalyzerError> {
-        self.plugins.sort_by(|left, right| left.id.cmp(&right.id));
+        self.plugins
+            .sort_by(|left, right| left.metadata.id.cmp(&right.metadata.id));
         if let Some(duplicate) = self
             .plugins
             .windows(2)
-            .find(|pair| pair[0].id == pair[1].id)
+            .find(|pair| pair[0].metadata.id == pair[1].metadata.id)
         {
-            return Err(format!("duplicate plugin identity {}", duplicate[0].id).into());
+            return Err(format!("duplicate plugin identity {}", duplicate[0].metadata.id).into());
         }
         self.source_recognizers
             .sort_by(|left, right| left.plugin.id.cmp(&right.plugin.id));
@@ -304,7 +350,7 @@ impl<L: AnalyzerLanguage> LanguageAnalyzerBuilder<L> {
 }
 
 pub struct LanguageAnalyzer<L: AnalyzerLanguage> {
-    plugins: Vec<PluginMetadata>,
+    plugins: Vec<InstalledPlugin<L>>,
     source_recognizers: Vec<InstalledSourceRecognizer<L>>,
     repository_enrichers: Vec<InstalledRepositoryEnricher<L>>,
     language: PhantomData<fn() -> L>,
@@ -314,17 +360,69 @@ impl<L: AnalyzerLanguage> LanguageAnalyzer<L> {
     pub fn identity(&self) -> String {
         self.plugins
             .iter()
-            .map(|plugin| format!("{}:{}", plugin.id, plugin.version))
+            .map(|plugin| format!("{}:{}", plugin.metadata.id, plugin.metadata.version))
             .collect::<Vec<_>>()
             .join(":")
+    }
+
+    pub fn activate(
+        &self,
+        repository: &RepositorySnapshot,
+        has_language_inputs: bool,
+    ) -> ActivePlugins {
+        if !has_language_inputs {
+            return ActivePlugins::default();
+        }
+        ActivePlugins {
+            plugins: self
+                .plugins
+                .iter()
+                .filter_map(|installed| {
+                    installed.plugin.activate(repository).map(|activation| {
+                        (
+                            installed.metadata.id.clone(),
+                            ActivePlugin {
+                                metadata: installed.metadata.clone(),
+                                activation,
+                            },
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    pub fn activate_direct(&self, path: &Path) -> ActivePlugins {
+        ActivePlugins {
+            plugins: self
+                .plugins
+                .iter()
+                .map(|installed| {
+                    (
+                        installed.metadata.id.clone(),
+                        ActivePlugin {
+                            metadata: installed.metadata.clone(),
+                            activation: PluginActivation {
+                                path: path.to_path_buf(),
+                                reason: "direct source analysis".into(),
+                            },
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
     pub fn recognize(
         &self,
         input: SourceRecognitionInput<'_, L>,
         analysis: &mut L::Analysis,
+        active: &ActivePlugins,
     ) -> Result<(), AnalyzerError> {
         for installed in &self.source_recognizers {
+            if !active.contains(&installed.plugin.id) {
+                continue;
+            }
             installed.recognizer.recognize(
                 SourceRecognitionInput {
                     path: input.path,
@@ -341,9 +439,13 @@ impl<L: AnalyzerLanguage> LanguageAnalyzer<L> {
         &self,
         repository: &L::Repository,
         base: RepositoryFactsView<'_>,
+        active: &ActivePlugins,
     ) -> Result<RepositoryEnrichment, AnalyzerError> {
         let mut merged = RepositoryEnrichment::default();
         for installed in &self.repository_enrichers {
+            if !active.contains(&installed.plugin.id) {
+                continue;
+            }
             let contribution = installed.enricher.enrich(
                 repository,
                 RepositoryFactsView {
@@ -685,9 +787,16 @@ mod tests {
             }
         }
 
-        fn install(self, builder: &mut LanguageAnalyzerBuilder<FakeLanguage>) {
-            builder.install_source_recognizer(self);
-            builder.install_repository_enricher(self);
+        fn activate(&self, repository: &RepositorySnapshot) -> Option<PluginActivation> {
+            (self.id != "inactive").then(|| PluginActivation {
+                path: repository.inputs[0].path.clone(),
+                reason: "fake input".into(),
+            })
+        }
+
+        fn install(&self, builder: &mut LanguageAnalyzerBuilder<FakeLanguage>) {
+            builder.install_source_recognizer(*self);
+            builder.install_repository_enricher(*self);
         }
     }
 
@@ -854,6 +963,7 @@ mod tests {
             .add_plugin(FakePlugin { id: "fake" })
             .build()
             .unwrap();
+        let active = analyzer.activate(&snapshot().repositories[0], true);
         let mut analysis = Vec::new();
 
         analyzer
@@ -864,6 +974,7 @@ mod tests {
                     syntax: &(),
                 },
                 &mut analysis,
+                &active,
             )
             .unwrap();
         let enrichment = analyzer
@@ -873,6 +984,7 @@ mod tests {
                     entities: &[],
                     observations: &[],
                 },
+                &active,
             )
             .unwrap();
 
@@ -890,6 +1002,7 @@ mod tests {
                 })
                 .build()
                 .unwrap();
+            let active = analyzer.activate(&snapshot().repositories[0], true);
             analyzer
                 .enrich(
                     &(),
@@ -897,6 +1010,7 @@ mod tests {
                         entities: &[],
                         observations: &[],
                     },
+                    &active,
                 )
                 .unwrap()
                 .entities
@@ -918,5 +1032,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(error.to_string(), "duplicate plugin identity fake");
+    }
+
+    #[test]
+    fn repository_plugin_activation_excludes_inactive_output_and_identity() {
+        let analyzer = LanguageAnalyzerBuilder::<FakeLanguage>::new()
+            .add_plugin(FakePlugin { id: "active" })
+            .add_plugin(FakePlugin { id: "inactive" })
+            .build()
+            .unwrap();
+        let active = analyzer.activate(&snapshot().repositories[0], true);
+        let mut analysis = Vec::new();
+
+        analyzer
+            .recognize(
+                SourceRecognitionInput {
+                    path: Path::new("input.fake"),
+                    text: "input",
+                    syntax: &(),
+                },
+                &mut analysis,
+                &active,
+            )
+            .unwrap();
+
+        assert_eq!(active.identity(), "active:1");
+        assert_eq!(analysis, ["active"]);
+        assert_eq!(
+            active.plugins().next().unwrap().activation,
+            PluginActivation {
+                path: PathBuf::from("src/input.fake"),
+                reason: "fake input".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn repository_plugin_activation_skips_evaluation_without_language_inputs() {
+        struct PanicPlugin;
+
+        impl Plugin<FakeLanguage> for PanicPlugin {
+            fn metadata(&self) -> PluginMetadata {
+                PluginMetadata {
+                    id: "panic".into(),
+                    version: "1".into(),
+                }
+            }
+
+            fn activate(&self, _: &RepositorySnapshot) -> Option<PluginActivation> {
+                panic!("plugin activation should have been skipped")
+            }
+
+            fn install(&self, _: &mut LanguageAnalyzerBuilder<FakeLanguage>) {}
+        }
+
+        let analyzer = LanguageAnalyzerBuilder::<FakeLanguage>::new()
+            .add_plugin(PanicPlugin)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            analyzer
+                .activate(&snapshot().repositories[0], false)
+                .identity(),
+            ""
+        );
     }
 }

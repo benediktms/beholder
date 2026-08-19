@@ -969,12 +969,9 @@ pub fn analyze(
     source: &str,
     language: SourceLanguage,
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
-    analyze_with_plugins(
-        source,
-        language,
-        Path::new("input.ts"),
-        &built_in_plugins()?,
-    )
+    let plugins = built_in_plugins()?;
+    let active = plugins.activate_direct(Path::new("input.ts"));
+    analyze_with_plugins(source, language, Path::new("input.ts"), &plugins, &active)
 }
 
 pub(super) fn analyze_with_plugins(
@@ -982,6 +979,7 @@ pub(super) fn analyze_with_plugins(
     language: SourceLanguage,
     path: &Path,
     plugins: &LanguageAnalyzer<TypescriptLanguage>,
+    active_plugins: &beholder_indexing::ActivePlugins,
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     let grammar = match language {
@@ -1055,6 +1053,7 @@ pub(super) fn analyze_with_plugins(
             syntax: &tree,
         },
         &mut analysis,
+        active_plugins,
     )?;
     Ok(analysis)
 }
@@ -1221,8 +1220,9 @@ mod tests {
     fn observations(source: &str, path: &str) -> Vec<Observation> {
         let path = Path::new(path);
         let language = SourceLanguage::from_path(path).unwrap();
-        let analysis =
-            analyze_with_plugins(source, language, path, &built_in_plugins().unwrap()).unwrap();
+        let plugins = built_in_plugins().unwrap();
+        let active = plugins.activate_direct(path);
+        let analysis = analyze_with_plugins(source, language, path, &plugins, &active).unwrap();
         observations_from_analysis("example", &analysis, source, path)
     }
 
