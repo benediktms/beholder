@@ -3437,6 +3437,11 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            server.join("package.json"),
+            r#"{"dependencies":{"@nestjs/common":"11.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
             contracts.join("checkout.proto"),
             r#"
             syntax = "proto3";
