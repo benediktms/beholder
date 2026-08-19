@@ -9,6 +9,7 @@ use std::{
     error::Error,
     fs::{self, File},
     io::{BufReader, BufWriter, Write},
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -136,6 +137,226 @@ pub trait WorkspaceAnalyzer: Send + Sync {
     fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError>;
     fn clear_cache(&self) -> Result<(), AnalyzerError> {
         Ok(())
+    }
+}
+
+pub trait AnalyzerLanguage: 'static {
+    type Analysis;
+    type Syntax;
+    type Repository;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginMetadata {
+    pub id: String,
+    pub version: String,
+}
+
+pub struct SourceRecognitionInput<'a, L: AnalyzerLanguage> {
+    pub path: &'a Path,
+    pub text: &'a str,
+    pub syntax: &'a L::Syntax,
+}
+
+pub trait SourceRecognizer<L: AnalyzerLanguage>: Send + Sync {
+    fn recognize(
+        &self,
+        input: SourceRecognitionInput<'_, L>,
+        analysis: &mut L::Analysis,
+    ) -> Result<(), AnalyzerError>;
+}
+
+pub struct RepositoryFactsView<'a> {
+    pub entities: &'a [EntityFact],
+    pub observations: &'a [Observation],
+}
+
+#[derive(Default)]
+pub struct RepositoryEnrichment {
+    pub entities: Vec<EntityFact>,
+    pub grpc_bindings: Vec<GrpcBindingCandidate>,
+    pub observations: Vec<Observation>,
+    pub diagnostics: Vec<AnalysisDiagnostic>,
+}
+
+pub trait RepositoryEnricher<L: AnalyzerLanguage>: Send + Sync {
+    fn enrich(
+        &self,
+        repository: &L::Repository,
+        base: RepositoryFactsView<'_>,
+    ) -> Result<RepositoryEnrichment, AnalyzerError>;
+}
+
+pub trait Plugin<L: AnalyzerLanguage>: Send + Sync + 'static {
+    fn metadata(&self) -> PluginMetadata;
+    fn install(self, builder: &mut LanguageAnalyzerBuilder<L>);
+}
+
+struct InstalledSourceRecognizer<L: AnalyzerLanguage> {
+    plugin: PluginMetadata,
+    recognizer: Box<dyn SourceRecognizer<L>>,
+}
+
+struct InstalledRepositoryEnricher<L: AnalyzerLanguage> {
+    plugin: PluginMetadata,
+    enricher: Box<dyn RepositoryEnricher<L>>,
+}
+
+pub struct LanguageAnalyzerBuilder<L: AnalyzerLanguage> {
+    plugins: Vec<PluginMetadata>,
+    source_recognizers: Vec<InstalledSourceRecognizer<L>>,
+    repository_enrichers: Vec<InstalledRepositoryEnricher<L>>,
+    installing: Option<PluginMetadata>,
+}
+
+impl<L: AnalyzerLanguage> Default for LanguageAnalyzerBuilder<L> {
+    fn default() -> Self {
+        Self {
+            plugins: Vec::new(),
+            source_recognizers: Vec::new(),
+            repository_enrichers: Vec::new(),
+            installing: None,
+        }
+    }
+}
+
+impl<L: AnalyzerLanguage> LanguageAnalyzerBuilder<L> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Installs a plugin for this builder's language.
+    ///
+    /// ```compile_fail
+    /// use beholder_indexing::{AnalyzerLanguage, LanguageAnalyzerBuilder, Plugin, PluginMetadata};
+    ///
+    /// struct Rust;
+    /// impl AnalyzerLanguage for Rust {
+    ///     type Analysis = ();
+    ///     type Syntax = ();
+    ///     type Repository = ();
+    /// }
+    /// struct TypeScript;
+    /// impl AnalyzerLanguage for TypeScript {
+    ///     type Analysis = ();
+    ///     type Syntax = ();
+    ///     type Repository = ();
+    /// }
+    /// struct TypeScriptPlugin;
+    /// impl Plugin<TypeScript> for TypeScriptPlugin {
+    ///     fn metadata(&self) -> PluginMetadata {
+    ///         PluginMetadata { id: "typescript.example".into(), version: "1".into() }
+    ///     }
+    ///     fn install(self, _: &mut LanguageAnalyzerBuilder<TypeScript>) {}
+    /// }
+    ///
+    /// let _ = LanguageAnalyzerBuilder::<Rust>::new().add_plugin(TypeScriptPlugin);
+    /// ```
+    pub fn add_plugin<P: Plugin<L>>(mut self, plugin: P) -> Self {
+        let metadata = plugin.metadata();
+        self.installing = Some(metadata.clone());
+        plugin.install(&mut self);
+        self.installing = None;
+        self.plugins.push(metadata);
+        self
+    }
+
+    pub fn install_source_recognizer(&mut self, recognizer: impl SourceRecognizer<L> + 'static) {
+        self.source_recognizers.push(InstalledSourceRecognizer {
+            plugin: self
+                .installing
+                .clone()
+                .expect("source recognizers must be installed by a plugin"),
+            recognizer: Box::new(recognizer),
+        });
+    }
+
+    pub fn install_repository_enricher(&mut self, enricher: impl RepositoryEnricher<L> + 'static) {
+        self.repository_enrichers.push(InstalledRepositoryEnricher {
+            plugin: self
+                .installing
+                .clone()
+                .expect("repository enrichers must be installed by a plugin"),
+            enricher: Box::new(enricher),
+        });
+    }
+
+    pub fn build(mut self) -> Result<LanguageAnalyzer<L>, AnalyzerError> {
+        self.plugins.sort_by(|left, right| left.id.cmp(&right.id));
+        if let Some(duplicate) = self
+            .plugins
+            .windows(2)
+            .find(|pair| pair[0].id == pair[1].id)
+        {
+            return Err(format!("duplicate plugin identity {}", duplicate[0].id).into());
+        }
+        self.source_recognizers
+            .sort_by(|left, right| left.plugin.id.cmp(&right.plugin.id));
+        self.repository_enrichers
+            .sort_by(|left, right| left.plugin.id.cmp(&right.plugin.id));
+        Ok(LanguageAnalyzer {
+            plugins: self.plugins,
+            source_recognizers: self.source_recognizers,
+            repository_enrichers: self.repository_enrichers,
+            language: PhantomData,
+        })
+    }
+}
+
+pub struct LanguageAnalyzer<L: AnalyzerLanguage> {
+    plugins: Vec<PluginMetadata>,
+    source_recognizers: Vec<InstalledSourceRecognizer<L>>,
+    repository_enrichers: Vec<InstalledRepositoryEnricher<L>>,
+    language: PhantomData<fn() -> L>,
+}
+
+impl<L: AnalyzerLanguage> LanguageAnalyzer<L> {
+    pub fn identity(&self) -> String {
+        self.plugins
+            .iter()
+            .map(|plugin| format!("{}:{}", plugin.id, plugin.version))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    pub fn recognize(
+        &self,
+        input: SourceRecognitionInput<'_, L>,
+        analysis: &mut L::Analysis,
+    ) -> Result<(), AnalyzerError> {
+        for installed in &self.source_recognizers {
+            installed.recognizer.recognize(
+                SourceRecognitionInput {
+                    path: input.path,
+                    text: input.text,
+                    syntax: input.syntax,
+                },
+                analysis,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn enrich(
+        &self,
+        repository: &L::Repository,
+        base: RepositoryFactsView<'_>,
+    ) -> Result<RepositoryEnrichment, AnalyzerError> {
+        let mut merged = RepositoryEnrichment::default();
+        for installed in &self.repository_enrichers {
+            let contribution = installed.enricher.enrich(
+                repository,
+                RepositoryFactsView {
+                    entities: base.entities,
+                    observations: base.observations,
+                },
+            )?;
+            extend_unique(&mut merged.entities, contribution.entities);
+            extend_unique(&mut merged.grpc_bindings, contribution.grpc_bindings);
+            extend_unique(&mut merged.observations, contribution.observations);
+            extend_unique(&mut merged.diagnostics, contribution.diagnostics);
+        }
+        Ok(merged)
     }
 }
 
@@ -443,6 +664,61 @@ mod tests {
         id: &'static str,
     }
 
+    struct FakeLanguage;
+
+    impl AnalyzerLanguage for FakeLanguage {
+        type Analysis = Vec<String>;
+        type Syntax = ();
+        type Repository = ();
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakePlugin {
+        id: &'static str,
+    }
+
+    impl Plugin<FakeLanguage> for FakePlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: self.id.into(),
+                version: "1".into(),
+            }
+        }
+
+        fn install(self, builder: &mut LanguageAnalyzerBuilder<FakeLanguage>) {
+            builder.install_source_recognizer(self);
+            builder.install_repository_enricher(self);
+        }
+    }
+
+    impl SourceRecognizer<FakeLanguage> for FakePlugin {
+        fn recognize(
+            &self,
+            _: SourceRecognitionInput<'_, FakeLanguage>,
+            analysis: &mut Vec<String>,
+        ) -> Result<(), AnalyzerError> {
+            analysis.push(self.id.into());
+            Ok(())
+        }
+    }
+
+    impl RepositoryEnricher<FakeLanguage> for FakePlugin {
+        fn enrich(
+            &self,
+            _: &(),
+            _: RepositoryFactsView<'_>,
+        ) -> Result<RepositoryEnrichment, AnalyzerError> {
+            Ok(RepositoryEnrichment {
+                entities: vec![EntityFact {
+                    id: format!("rust-function://{}", self.id).into(),
+                    kind: EntityKind::Callable,
+                    metadata: None,
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
     impl WorkspaceAnalyzer for FakeAnalyzer {
         fn metadata(&self) -> AnalyzerMetadata {
             AnalyzerMetadata {
@@ -570,5 +846,77 @@ mod tests {
         assert_eq!(first.repositories[0].facts, second.repositories[0].facts);
         let _ = fs::remove_dir_all(first_dir);
         let _ = fs::remove_dir_all(second_dir);
+    }
+
+    #[test]
+    fn typed_plugins_install_both_supported_capabilities() {
+        let analyzer = LanguageAnalyzerBuilder::<FakeLanguage>::new()
+            .add_plugin(FakePlugin { id: "fake" })
+            .build()
+            .unwrap();
+        let mut analysis = Vec::new();
+
+        analyzer
+            .recognize(
+                SourceRecognitionInput {
+                    path: Path::new("input.fake"),
+                    text: "input",
+                    syntax: &(),
+                },
+                &mut analysis,
+            )
+            .unwrap();
+        let enrichment = analyzer
+            .enrich(
+                &(),
+                RepositoryFactsView {
+                    entities: &[],
+                    observations: &[],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(analysis, ["fake"]);
+        assert_eq!(enrichment.entities[0].id.as_str(), "rust-function://fake");
+    }
+
+    #[test]
+    fn plugin_registration_order_does_not_change_output() {
+        let analyze = |plugins: [FakePlugin; 2]| {
+            let analyzer = plugins
+                .into_iter()
+                .fold(LanguageAnalyzerBuilder::new(), |builder, plugin| {
+                    builder.add_plugin(plugin)
+                })
+                .build()
+                .unwrap();
+            analyzer
+                .enrich(
+                    &(),
+                    RepositoryFactsView {
+                        entities: &[],
+                        observations: &[],
+                    },
+                )
+                .unwrap()
+                .entities
+        };
+
+        assert_eq!(
+            analyze([FakePlugin { id: "b" }, FakePlugin { id: "a" }]),
+            analyze([FakePlugin { id: "a" }, FakePlugin { id: "b" }])
+        );
+    }
+
+    #[test]
+    fn duplicate_plugin_identities_fail_construction() {
+        let error = LanguageAnalyzerBuilder::<FakeLanguage>::new()
+            .add_plugin(FakePlugin { id: "fake" })
+            .add_plugin(FakePlugin { id: "fake" })
+            .build()
+            .err()
+            .unwrap();
+
+        assert_eq!(error.to_string(), "duplicate plugin identity fake");
     }
 }

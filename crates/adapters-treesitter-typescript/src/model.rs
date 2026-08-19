@@ -31,9 +31,9 @@ impl SourceLanguage {
     pub fn cache_version(self) -> &'static str {
         match self {
             Self::JavaScript => "21-javascript",
-            Self::Jsx => "21-jsx",
-            Self::TypeScript => "21-typescript",
-            Self::Tsx => "21-tsx",
+            Self::Jsx => "22-jsx",
+            Self::TypeScript => "22-typescript",
+            Self::Tsx => "22-tsx",
         }
     }
 }
@@ -49,6 +49,8 @@ pub struct TypescriptAnalysis {
     pub(super) graphql_documents: Vec<GraphqlDocument>,
     pub(super) nest_modules: Vec<NestModule>,
     pub(super) nest_providers: Vec<NestProvider>,
+    #[serde(default)]
+    pub(super) generated: bool,
     pub(super) parse_error_lines: Vec<usize>,
 }
 

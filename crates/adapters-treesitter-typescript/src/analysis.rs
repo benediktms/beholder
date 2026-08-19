@@ -1,8 +1,12 @@
-use super::{model::*, nestjs_di, ts_proto};
+use super::{
+    model::*,
+    plugin::{TypescriptLanguage, built_in_plugins},
+};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, Provenance, StructuralRelation, UnsafeTreeRecovery,
 };
+use beholder_indexing::{LanguageAnalyzer, SourceRecognitionInput};
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
@@ -965,11 +969,25 @@ pub fn analyze(
     source: &str,
     language: SourceLanguage,
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
+    analyze_with_plugins(
+        source,
+        language,
+        Path::new("input.ts"),
+        &built_in_plugins()?,
+    )
+}
+
+pub(super) fn analyze_with_plugins(
+    source: &str,
+    language: SourceLanguage,
+    path: &Path,
+    plugins: &LanguageAnalyzer<TypescriptLanguage>,
+) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     let grammar = match language {
-        SourceLanguage::JavaScript | SourceLanguage::Jsx => tree_sitter_javascript::LANGUAGE,
+        SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
+        SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
     parser.set_language(&grammar.into())?;
     let tree = parser
@@ -1002,8 +1020,6 @@ pub fn analyze(
             .filter(|child| !child.has_error())
             .collect()
     };
-    let mut nest_modules = Vec::new();
-    let mut nest_providers = Vec::new();
     for root in roots {
         collect_definitions(root, source.as_bytes(), &mut Vec::new(), &mut definitions);
         collect_top_level_call(root, source.as_bytes(), &mut calls);
@@ -1011,9 +1027,6 @@ pub fn analyze(
         collect_exports(root, source.as_bytes(), &mut exports);
         collect_string_constants(root, source.as_bytes(), &mut string_constants);
         collect_graphql_documents(root, source.as_bytes(), &mut graphql_documents);
-        let (modules, providers) = nestjs_di::extract(root, source.as_bytes());
-        nest_modules.extend(modules);
-        nest_providers.extend(providers);
     }
     if !parse_error_lines.is_empty() && definitions.is_empty() && calls.is_empty() {
         return Err(UnsafeTreeRecovery::new(
@@ -1022,7 +1035,7 @@ pub fn analyze(
         )
         .into());
     }
-    Ok(TypescriptAnalysis {
+    let mut analysis = TypescriptAnalysis {
         language,
         calls,
         definitions,
@@ -1030,10 +1043,20 @@ pub fn analyze(
         exports,
         string_constants,
         graphql_documents,
-        nest_modules,
-        nest_providers,
+        nest_modules: Vec::new(),
+        nest_providers: Vec::new(),
+        generated: false,
         parse_error_lines,
-    })
+    };
+    plugins.recognize(
+        SourceRecognitionInput {
+            path,
+            text: source,
+            syntax: &tree,
+        },
+        &mut analysis,
+    )?;
+    Ok(analysis)
 }
 
 pub fn diagnostics_from_analysis(
@@ -1062,7 +1085,7 @@ pub(super) fn source_stem(path: &Path) -> String {
 pub fn observations_from_analysis(
     repository: &str,
     analysis: &TypescriptAnalysis,
-    source: &str,
+    _source: &str,
     path: &Path,
 ) -> Vec<Observation> {
     let language = analysis.language.id_segment();
@@ -1121,10 +1144,7 @@ pub fn observations_from_analysis(
             ));
         }
     }
-    observations.extend(ts_proto::message_observations(
-        repository, analysis, source, path,
-    ));
-    if ts_proto::is_generated_source(path, source) {
+    if analysis.generated {
         for observation in &mut observations {
             observation.provenance = Provenance::Generated;
         }
@@ -1201,7 +1221,8 @@ mod tests {
     fn observations(source: &str, path: &str) -> Vec<Observation> {
         let path = Path::new(path);
         let language = SourceLanguage::from_path(path).unwrap();
-        let analysis = analyze(source, language).unwrap();
+        let analysis =
+            analyze_with_plugins(source, language, path, &built_in_plugins().unwrap()).unwrap();
         observations_from_analysis("example", &analysis, source, path)
     }
 
@@ -1306,6 +1327,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
+    }
+
+    #[test]
+    fn parses_keyword_jsx_attributes() {
+        let analysis = analyze(
+            "export default loader => <Loader if static fixedMobile />;",
+            SourceLanguage::Jsx,
+        )
+        .unwrap();
+
+        assert!(analysis.parse_error_lines.is_empty());
+    }
+
+    #[test]
+    fn parses_generic_import_types() {
+        let analysis = analyze(
+            "declare type Mock<T = any> = import('vitest').Mock<T>;",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert!(analysis.parse_error_lines.is_empty());
     }
 
     #[test]

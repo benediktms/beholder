@@ -1,15 +1,20 @@
 use crate::{
     FRONTEND_VERSION, GraphqlFactInput, GraphqlResolverInput, GraphqlResolverSource,
-    GrpcBindingInput, RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis, TypescriptRepository,
-    analyze, collect_graphql_facts, collect_graphql_resolvers, diagnostics_from_analysis,
-    entities_from_analysis, grpc_bindings, observations_from_analysis, resolve_repository_calls,
+    RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis, TypescriptRepository,
+    collect_graphql_facts, collect_graphql_resolvers, diagnostics_from_analysis,
+    entities_from_analysis, observations_from_analysis, resolve_repository_calls,
     resolve_workspace_calls, unresolved_call_diagnostics,
+};
+use crate::{
+    analysis::analyze_with_plugins,
+    plugin::{TypescriptLanguage, built_in_plugins},
 };
 use beholder_adapters_graphql::GraphqlSource;
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
     AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+    LanguageAnalyzer, RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer,
+    WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -33,6 +38,7 @@ enum CacheStatus {
 pub struct TypescriptAnalyzer {
     cache_dir: PathBuf,
     cache: Mutex<BTreeMap<CacheKey, Arc<TypescriptAnalysis>>>,
+    plugins: LanguageAnalyzer<TypescriptLanguage>,
 }
 
 impl TypescriptAnalyzer {
@@ -40,16 +46,22 @@ impl TypescriptAnalyzer {
         Self {
             cache_dir: cache_dir.join("typescript"),
             cache: Mutex::new(BTreeMap::new()),
+            plugins: built_in_plugins().expect("built-in TypeScript plugins should compose"),
         }
     }
 
     fn analysis(
         &self,
+        path: &Path,
         source: &str,
         language: SourceLanguage,
     ) -> Result<(Arc<TypescriptAnalysis>, CacheStatus), AnalyzerError> {
-        let version = language.cache_version();
-        let key = CacheKey(Sha256::digest(source.as_bytes()).into());
+        let mut digest = Sha256::new();
+        digest.update(source.as_bytes());
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update(language.cache_version().as_bytes());
+        digest.update(self.plugins.identity().as_bytes());
+        let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
             .lock()
@@ -59,11 +71,8 @@ impl TypescriptAnalyzer {
         {
             return Ok((analysis, CacheStatus::Memory));
         }
-        let path = self
-            .cache_dir
-            .join(version)
-            .join(format!("{}.json", hex(key.0)));
-        if let Ok(bytes) = fs::read(&path)
+        let cache_path = self.cache_dir.join(format!("{}.json", hex(key.0)));
+        if let Ok(bytes) = fs::read(&cache_path)
             && let Ok(analysis) = serde_json::from_slice::<TypescriptAnalysis>(&bytes)
         {
             let analysis = Arc::new(analysis);
@@ -73,12 +82,12 @@ impl TypescriptAnalyzer {
                 .insert(key, analysis.clone());
             return Ok((analysis, CacheStatus::Disk));
         }
-        let analysis = Arc::new(analyze(source, language)?);
-        if let Some(parent) = path.parent()
+        let analysis = Arc::new(analyze_with_plugins(source, language, path, &self.plugins)?);
+        if let Some(parent) = cache_path.parent()
             && fs::create_dir_all(parent).is_ok()
             && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
         {
-            let _ = fs::write(path, bytes);
+            let _ = fs::write(cache_path, bytes);
         }
         self.cache
             .lock()
@@ -92,7 +101,10 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
     fn metadata(&self) -> AnalyzerMetadata {
         AnalyzerMetadata {
             id: "typescript".into(),
-            version: format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}"),
+            version: format!(
+                "{FRONTEND_VERSION}:{RESOLVER_VERSION}:{}",
+                self.plugins.identity()
+            ),
         }
     }
 
@@ -188,7 +200,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 .par_iter()
                 .map(|(path, source, language)| {
                     let (analysis, status) = self
-                        .analysis(source, *language)
+                        .analysis(path, source, *language)
                         .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     Ok::<_, SourceAnalysisError>((*path, *source, analysis, status))
                 })
@@ -242,12 +254,33 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 &manifests,
                 &configs,
             );
-            let (grpc_candidates, grpc_diagnostics) = grpc_bindings(GrpcBindingInput {
-                repository: &repository.state.repository.identity,
-                sources: &source_refs,
-                observations: &observations,
-            });
-            diagnostics.extend(grpc_diagnostics);
+            let typed_repository = TypescriptRepository::new(
+                repository.state.repository.identity.clone(),
+                analyzed
+                    .iter()
+                    .map(|(path, _, analysis, _)| {
+                        ((*path).to_path_buf(), analysis.as_ref().clone())
+                    })
+                    .collect(),
+                manifests
+                    .iter()
+                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
+                    .collect(),
+                configs
+                    .iter()
+                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
+                    .collect(),
+            );
+            let enrichment = self.plugins.enrich(
+                &typed_repository,
+                RepositoryFactsView {
+                    entities: &entities,
+                    observations: &observations,
+                },
+            )?;
+            entities.extend(enrichment.entities);
+            observations.extend(enrichment.observations);
+            diagnostics.extend(enrichment.diagnostics);
             let graphql_sources = schemas
                 .iter()
                 .map(|(path, source)| GraphqlSource {
@@ -264,23 +297,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             observations.extend(graphql.observations);
             entities.extend(graphql.entities);
             diagnostics.extend(graphql.diagnostics);
-            typed_repositories.push(TypescriptRepository::new(
-                repository.state.repository.identity.clone(),
-                analyzed
-                    .iter()
-                    .map(|(path, _, analysis, _)| {
-                        ((*path).to_path_buf(), analysis.as_ref().clone())
-                    })
-                    .collect(),
-                manifests
-                    .iter()
-                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
-                    .collect(),
-                configs
-                    .iter()
-                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
-                    .collect(),
-            ));
+            typed_repositories.push(typed_repository);
             let completeness = if diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"))
@@ -293,7 +310,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 repository: repository.state.repository.identity.clone(),
                 completeness,
                 entities,
-                grpc_bindings: grpc_candidates,
+                grpc_bindings: enrichment.grpc_bindings,
                 observations,
                 diagnostics,
             });

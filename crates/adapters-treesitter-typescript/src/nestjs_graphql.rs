@@ -14,9 +14,9 @@ struct Resolver {
 fn parser(language: SourceLanguage) -> Option<Parser> {
     let mut parser = Parser::new();
     let grammar = match language {
-        SourceLanguage::JavaScript | SourceLanguage::Jsx => tree_sitter_javascript::LANGUAGE,
+        SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
+        SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
     parser.set_language(&grammar.into()).ok()?;
     Some(parser)
