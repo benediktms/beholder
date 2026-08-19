@@ -50,6 +50,10 @@ fn binary() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 async fn start() -> Result<(), Box<dyn Error>> {
+    if let Some(pid) = wait_to_start().await? {
+        stdout(format_args!("already running (pid {pid})"))?;
+        return Ok(());
+    }
     if let Ok(status) = get_status().await {
         stdout(format_args!("already running (pid {})", status.pid))?;
         return Ok(());
@@ -67,14 +71,16 @@ async fn start() -> Result<(), Box<dyn Error>> {
         .stderr(log)
         .spawn()?;
     for _ in 0..50 {
-        if let Ok(status) = get_status().await {
-            stdout(format_args!("started (pid {})", status.pid))?;
-            return Ok(());
-        }
         if let Some(status) = child.try_wait()? {
             return Err(
                 format!("beholderd exited with {status}; see {}", log_path.display()).into(),
             );
+        }
+        if let Ok(status) = get_status().await
+            && status.pid == child.id()
+        {
+            stdout(format_args!("started (pid {})", status.pid))?;
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -104,15 +110,47 @@ async fn wait_for_lock() -> Result<(), Box<dyn Error>> {
     wait_for_lock_at(&path, STOP_TIMEOUT).await
 }
 
+async fn wait_to_start() -> Result<Option<u32>, Box<dyn Error>> {
+    let path = state_dir()?.join("beholderd.pid");
+    match tokio::time::timeout(STOP_TIMEOUT, async {
+        let mut reported = false;
+        loop {
+            if let Ok(status) = get_status().await {
+                return Ok(Some(status.pid));
+            }
+            if lock_available(&path)? {
+                return Ok(None);
+            }
+            if !reported {
+                eprintln!("waiting for beholderd to finish active work...");
+                reported = true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "timed out waiting for beholderd to stop or become ready after {STOP_TIMEOUT:?}"
+        )
+        .into()),
+    }
+}
+
+fn lock_available(path: &Path) -> Result<bool, Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    let file = fs::File::options().read(true).write(true).open(path)?;
+    Ok(file.try_lock().is_ok())
+}
+
 async fn wait_for_lock_at(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
     match tokio::time::timeout(timeout, async {
         let mut reported = false;
         loop {
-            if !path.exists() {
-                return Ok(());
-            }
-            let file = fs::File::options().read(true).write(true).open(path)?;
-            if file.try_lock().is_ok() {
+            if lock_available(path)? {
                 return Ok(());
             }
             if !reported {
