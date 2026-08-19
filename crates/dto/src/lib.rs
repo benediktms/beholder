@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const CONTEXT_SCHEMA_V1: &str = "beholder.context.v1";
 pub const DEPENDENCIES_SCHEMA_V2: &str = "beholder.dependencies.v2";
@@ -21,11 +22,50 @@ pub struct Freshness {
     pub dirty_repositories: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisCompleteness {
+    #[default]
+    Complete,
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisDiagnosticSeverity {
+    KnownLimitation,
+    Warning,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct AnalysisDiagnostic {
+    pub code: String,
+    pub severity: AnalysisDiagnosticSeverity,
+    pub repository: String,
+    pub path: PathBuf,
+    pub line: Option<u32>,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnalysisMetadata {
+    pub completeness: AnalysisCompleteness,
+    pub diagnostics: Vec<AnalysisDiagnostic>,
+}
+
+impl AnalysisMetadata {
+    fn is_complete(&self) -> bool {
+        self.completeness == AnalysisCompleteness::Complete && self.diagnostics.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueryMetadata {
     pub revision: u64,
     pub view: String,
     pub freshness: Freshness,
+    #[serde(default, skip_serializing_if = "AnalysisMetadata::is_complete")]
+    pub analysis: AnalysisMetadata,
 }
 
 impl QueryMetadata {
@@ -38,6 +78,7 @@ impl QueryMetadata {
                 indexing: false,
                 dirty_repositories: Vec::new(),
             },
+            analysis: AnalysisMetadata::default(),
         }
     }
 }
@@ -375,4 +416,5 @@ semantic_result!(
 pub struct Revisioned<T> {
     pub result: T,
     pub analysis_revision: u64,
+    pub analysis: AnalysisMetadata,
 }

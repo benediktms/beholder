@@ -97,6 +97,29 @@ pub(super) const CREATE_GRPC_DIAGNOSTIC_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ANALYSIS_METADATA_SCHEMA: &str = r#"
+:create analysis_revision_metadata {
+    view: String,
+    revision: Int,
+    =>
+    incomplete: Bool,
+}
+"#;
+
+pub(super) const CREATE_ANALYSIS_DIAGNOSTIC_SCHEMA: &str = r#"
+:create analysis_revision_diagnostic {
+    view: String,
+    revision: Int,
+    repository: String,
+    code: String,
+    severity: String,
+    path: String,
+    line: Int,
+    =>
+    detail: String,
+}
+"#;
+
 pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \

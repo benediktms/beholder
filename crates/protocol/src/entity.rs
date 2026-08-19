@@ -21,12 +21,85 @@ impl From<v1::Freshness> for dto::Freshness {
     }
 }
 
+impl From<dto::AnalysisCompleteness> for v1::AnalysisCompleteness {
+    fn from(value: dto::AnalysisCompleteness) -> Self {
+        match value {
+            dto::AnalysisCompleteness::Complete => Self::Complete,
+            dto::AnalysisCompleteness::Incomplete => Self::Incomplete,
+        }
+    }
+}
+
+fn analysis_completeness(value: i32) -> Result<dto::AnalysisCompleteness, &'static str> {
+    match v1::AnalysisCompleteness::try_from(value).map_err(|_| "unknown analysis completeness")? {
+        v1::AnalysisCompleteness::Complete => Ok(dto::AnalysisCompleteness::Complete),
+        v1::AnalysisCompleteness::Incomplete => Ok(dto::AnalysisCompleteness::Incomplete),
+    }
+}
+
+impl From<dto::AnalysisDiagnosticSeverity> for v1::AnalysisDiagnosticSeverity {
+    fn from(value: dto::AnalysisDiagnosticSeverity) -> Self {
+        match value {
+            dto::AnalysisDiagnosticSeverity::KnownLimitation => Self::KnownLimitation,
+            dto::AnalysisDiagnosticSeverity::Warning => Self::Warning,
+        }
+    }
+}
+
+fn analysis_diagnostic_severity(
+    value: i32,
+) -> Result<dto::AnalysisDiagnosticSeverity, &'static str> {
+    match v1::AnalysisDiagnosticSeverity::try_from(value)
+        .map_err(|_| "unknown analysis diagnostic severity")?
+    {
+        v1::AnalysisDiagnosticSeverity::KnownLimitation => {
+            Ok(dto::AnalysisDiagnosticSeverity::KnownLimitation)
+        }
+        v1::AnalysisDiagnosticSeverity::Warning => Ok(dto::AnalysisDiagnosticSeverity::Warning),
+    }
+}
+
+impl From<dto::AnalysisDiagnostic> for v1::AnalysisDiagnostic {
+    fn from(value: dto::AnalysisDiagnostic) -> Self {
+        Self {
+            code: value.code,
+            severity: v1::AnalysisDiagnosticSeverity::from(value.severity) as i32,
+            repository: value.repository,
+            path: value.path.to_string_lossy().into_owned(),
+            line: value.line,
+            detail: value.detail,
+        }
+    }
+}
+
+impl TryFrom<v1::AnalysisDiagnostic> for dto::AnalysisDiagnostic {
+    type Error = &'static str;
+
+    fn try_from(value: v1::AnalysisDiagnostic) -> Result<Self, Self::Error> {
+        Ok(Self {
+            code: value.code,
+            severity: analysis_diagnostic_severity(value.severity)?,
+            repository: value.repository,
+            path: value.path.into(),
+            line: value.line,
+            detail: value.detail,
+        })
+    }
+}
+
 impl From<dto::QueryMetadata> for v1::QueryMetadata {
     fn from(value: dto::QueryMetadata) -> Self {
         Self {
             revision: value.revision,
             view: value.view,
             freshness: Some(value.freshness.into()),
+            completeness: v1::AnalysisCompleteness::from(value.analysis.completeness) as i32,
+            diagnostics: value
+                .analysis
+                .diagnostics
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -39,6 +112,14 @@ impl TryFrom<v1::QueryMetadata> for dto::QueryMetadata {
             revision: value.revision,
             view: value.view,
             freshness: value.freshness.ok_or("query freshness is missing")?.into(),
+            analysis: dto::AnalysisMetadata {
+                completeness: analysis_completeness(value.completeness)?,
+                diagnostics: value
+                    .diagnostics
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_, _>>()?,
+            },
         })
     }
 }

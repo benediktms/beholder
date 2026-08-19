@@ -16,6 +16,9 @@ pub(super) fn raw(
         "{schema} · view {} · revision {} · stale={} · indexing={}",
         metadata.view, metadata.revision, metadata.freshness.stale, metadata.freshness.indexing
     );
+    if metadata.analysis.completeness == beholder_dto::AnalysisCompleteness::Incomplete {
+        output.push_str(" · incomplete=true");
+    }
     if let Some(traversal) = traversal {
         let _ = write!(
             output,
@@ -58,6 +61,7 @@ pub(super) fn raw(
             );
         }
     }
+    write_diagnostics(&mut output, metadata, "\ndiagnostics\n", "  ");
     output
 }
 
@@ -286,6 +290,43 @@ pub(super) fn write_metadata(output: &mut String, metadata: &QueryMetadata) {
         "\nview {} · revision {} · stale={} · indexing={}",
         metadata.view, metadata.revision, metadata.freshness.stale, metadata.freshness.indexing
     );
+    if metadata.analysis.completeness == beholder_dto::AnalysisCompleteness::Incomplete {
+        let _ = write!(
+            output,
+            "\nanalysis incomplete · {} diagnostics",
+            metadata.analysis.diagnostics.len()
+        );
+        write_diagnostics(output, metadata, "\n", "  ");
+    }
+}
+
+fn write_diagnostics(output: &mut String, metadata: &QueryMetadata, heading: &str, indent: &str) {
+    if metadata.analysis.diagnostics.is_empty() {
+        return;
+    }
+    output.push_str(heading);
+    let mut diagnostics = metadata.analysis.diagnostics.iter().collect::<Vec<_>>();
+    diagnostics.sort();
+    for diagnostic in diagnostics {
+        let severity = match diagnostic.severity {
+            beholder_dto::AnalysisDiagnosticSeverity::KnownLimitation => "known_limitation",
+            beholder_dto::AnalysisDiagnosticSeverity::Warning => "warning",
+        };
+        let _ = write!(
+            output,
+            "{indent}{severity} {} {}",
+            diagnostic.repository,
+            diagnostic.path.display()
+        );
+        if let Some(line) = diagnostic.line {
+            let _ = write!(output, ":{line}");
+        }
+        let _ = write!(output, " {}", diagnostic.code);
+        if let Some(detail) = &diagnostic.detail {
+            let _ = write!(output, " {detail}");
+        }
+        output.push('\n');
+    }
 }
 
 pub(super) fn write_traversal(output: &mut String, traversal: &TraversalMetadata) {

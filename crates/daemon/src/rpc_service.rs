@@ -304,6 +304,7 @@ impl Daemon for BeholderDaemon {
             .map(|revisioned| Revisioned {
                 result: WhyResult::from(revisioned.result),
                 analysis_revision: revisioned.analysis_revision,
+                analysis: revisioned.analysis,
             });
         self.query_response(&request.workspace, revisioned)
     }

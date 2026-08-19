@@ -4,8 +4,8 @@ use super::{
     database::{benchmark_database, memory_database, persistent_database},
     inspection::{InspectionResult, inspection_result},
     query::{
-        analysis_revision, context, dependencies, entity_facts, impact, inspect_grpc_bindings,
-        inspect_observations, inspect_relations, inspect_revisions, trace,
+        analysis_metadata, analysis_revision, context, dependencies, entity_facts, impact,
+        inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions, trace,
     },
     storage::{garbage_collect, publish_observations, view_matches},
 };
@@ -315,10 +315,12 @@ impl SemanticStore {
         let transaction = self.read_db.multi_transaction(false);
         let result = read(&transaction)?;
         let analysis_revision = analysis_revision(&transaction, view)?;
+        let analysis = analysis_metadata(&transaction, view, analysis_revision)?;
         transaction.abort()?;
         Ok(Revisioned {
             result,
             analysis_revision,
+            analysis,
         })
     }
 
@@ -341,12 +343,14 @@ impl SemanticStore {
 mod tests {
     use crate::SemanticStore;
     use beholder_domain::{
-        DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
-        WorkspaceView,
+        AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, LogicalRepository,
+        Observation, RepositoryFacts, RepositoryState, WorkspaceView,
     };
+    use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity as DtoSeverity};
     use std::{
         collections::BTreeMap,
         fs,
+        path::PathBuf,
         sync::{Arc, mpsc},
         thread,
         time::{Duration, SystemTime},
@@ -355,10 +359,53 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: Vec::new(),
             grpc_bindings: Vec::new(),
             observations,
         }
+    }
+
+    #[test]
+    fn snapshot_preserves_incomplete_analysis_metadata() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let mut repository = facts(&view, Vec::new());
+        repository.incomplete = true;
+        repository.diagnostics.push(AnalysisDiagnostic {
+            code: "typescript.syntax_recovered".into(),
+            severity: AnalysisDiagnosticSeverity::Warning,
+            path: "src/broken.ts".into(),
+            line: Some(7),
+            detail: Some("unexpected token".into()),
+        });
+        store.publish(&view, &[repository], &[]).unwrap();
+
+        let snapshot = store.context_snapshot("main", "missing").unwrap();
+
+        assert_eq!(
+            snapshot.analysis.completeness,
+            AnalysisCompleteness::Incomplete
+        );
+        assert_eq!(snapshot.analysis.diagnostics.len(), 1);
+        let diagnostic = &snapshot.analysis.diagnostics[0];
+        assert_eq!(diagnostic.code, "typescript.syntax_recovered");
+        assert_eq!(diagnostic.severity, DtoSeverity::Warning);
+        assert_eq!(diagnostic.repository, "repo");
+        assert_eq!(diagnostic.path, PathBuf::from("src/broken.ts"));
+        assert_eq!(diagnostic.line, Some(7));
     }
     #[test]
     fn persistent_reads_serve_the_completed_revision_during_a_write() {

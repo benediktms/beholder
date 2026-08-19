@@ -266,6 +266,8 @@ pub async fn stop() -> Result<bool, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity, QueryMetadata};
+    use beholder_protocol::v1;
     use tonic::metadata::MetadataValue;
 
     #[test]
@@ -295,6 +297,35 @@ mod tests {
         assert_eq!(
             operation_error(Status::permission_denied("denied")).code(),
             BeholderErrorCode::TransportGrpc
+        );
+    }
+
+    #[test]
+    fn query_metadata_preserves_incomplete_diagnostics() {
+        let metadata = v1::QueryMetadata {
+            revision: 3,
+            view: "main".into(),
+            freshness: Some(v1::Freshness::default()),
+            completeness: v1::AnalysisCompleteness::Incomplete as i32,
+            diagnostics: vec![v1::AnalysisDiagnostic {
+                code: "typescript.syntax_recovered".into(),
+                severity: v1::AnalysisDiagnosticSeverity::Warning as i32,
+                repository: "repo".into(),
+                path: "src/broken.ts".into(),
+                line: Some(7),
+                detail: None,
+            }],
+        };
+
+        let metadata = QueryMetadata::try_from(metadata).unwrap();
+
+        assert_eq!(
+            metadata.analysis.completeness,
+            AnalysisCompleteness::Incomplete
+        );
+        assert_eq!(
+            metadata.analysis.diagnostics[0].severity,
+            AnalysisDiagnosticSeverity::Warning
         );
     }
 }

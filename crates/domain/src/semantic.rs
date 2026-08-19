@@ -199,6 +199,8 @@ pub struct Observation {
 pub struct RepositoryFacts {
     pub state: RepositoryState,
     pub analysis_identity: String,
+    pub incomplete: bool,
+    pub diagnostics: Vec<AnalysisDiagnostic>,
     pub entities: Vec<EntityFact>,
     pub grpc_bindings: Vec<GrpcBindingCandidate>,
     pub observations: Vec<Observation>,
@@ -357,6 +359,15 @@ mod entity_fact_tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn diagnostic_severity_has_a_stable_wire_name() {
+        assert_eq!(
+            AnalysisDiagnosticSeverity::KnownLimitation.as_str(),
+            "known_limitation"
+        );
+        assert_eq!(AnalysisDiagnosticSeverity::Warning.as_str(), "warning");
     }
 }
 

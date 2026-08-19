@@ -775,6 +775,7 @@ pub(super) fn publish_observations(
         params,
     )?;
     store_repository_states(&transaction, view, repositories, &analyzed_states)?;
+    store_analysis_metadata(&transaction, view, repositories)?;
     store_grpc_resolution(&transaction, &view.name, &resolution)?;
     for override_ in overrides {
         let params = BTreeMap::from([
@@ -814,6 +815,64 @@ pub(super) fn publish_observations(
     }
     transaction.commit()?;
     Ok(changes)
+}
+
+fn store_analysis_metadata(
+    transaction: &MultiTransaction,
+    view: &WorkspaceView,
+    repositories: &[RepositoryFacts],
+) -> Result<(), Box<dyn Error>> {
+    let revision = transaction
+        .run_script(
+            "?[revision] := *analysis_revision{view: $view, revision}",
+            BTreeMap::from([("view".into(), view.name.clone().into())]),
+        )?
+        .rows
+        .first()
+        .and_then(|row| row[0].get_int())
+        .ok_or("published analysis revision is missing")?;
+    let params = BTreeMap::from([
+        ("view".into(), view.name.clone().into()),
+        (
+            "incomplete".into(),
+            repositories.iter().any(|facts| facts.incomplete).into(),
+        ),
+    ]);
+    transaction.run_script(
+        "?[view, revision, incomplete] := \
+             *analysis_revision{view: $view, revision}, \
+             view = $view, incomplete = $incomplete\n\
+         :put analysis_revision_metadata {view, revision => incomplete}",
+        params,
+    )?;
+
+    let rows = repositories
+        .iter()
+        .flat_map(|facts| {
+            facts.diagnostics.iter().map(|diagnostic| {
+                DataValue::List(vec![
+                    view.name.as_str().into(),
+                    revision.into(),
+                    facts.state.repository.identity.as_str().into(),
+                    diagnostic.code.as_str().into(),
+                    diagnostic.severity.as_str().into(),
+                    diagnostic.path.to_string_lossy().into_owned().into(),
+                    i64::from(diagnostic.line.unwrap_or_default()).into(),
+                    diagnostic.detail.as_deref().unwrap_or_default().into(),
+                ])
+            })
+        })
+        .collect::<Vec<_>>();
+    if !rows.is_empty() {
+        transaction.run_script(
+            "?[view, revision, repository, code, severity, path, line, detail] <- $rows\n\
+             :put analysis_revision_diagnostic {\
+                 view, revision, repository, code, severity, path, line => detail\
+             }",
+            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn store_repository_states(
@@ -926,6 +985,11 @@ pub(super) fn garbage_collect(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
 
     for (relation, keys) in [
         ("analysis_revision_state", "view, revision, repository"),
+        ("analysis_revision_metadata", "view, revision"),
+        (
+            "analysis_revision_diagnostic",
+            "view, revision, repository, code, severity, path, line",
+        ),
         (
             "analysis_revision_dependency_override",
             "view, revision, from, relation, unresolved_to",
@@ -996,6 +1060,8 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: Vec::new(),
             grpc_bindings: Vec::new(),
             observations,
@@ -1216,6 +1282,8 @@ mod tests {
         let application = RepositoryFacts {
             state: application_state.clone(),
             analysis_identity: "rust".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: Vec::new(),
             grpc_bindings: vec![
                 candidate(
@@ -1236,6 +1304,8 @@ mod tests {
         let contracts = RepositoryFacts {
             state: contract_state,
             analysis_identity: "protobuf".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: vec![
                 EntityFact::new(
                     "proto-method://pricing.v1.Pricing/GetQuote",
@@ -1303,6 +1373,8 @@ mod tests {
                     RepositoryFacts {
                         state: replacement_contract_state,
                         analysis_identity: "protobuf".into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
                         entities: Vec::new(),
                         grpc_bindings: Vec::new(),
                         observations: Vec::new(),
@@ -1438,6 +1510,8 @@ mod tests {
                     &[RepositoryFacts {
                         state: state.clone(),
                         analysis_identity: analysis_identity.into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
                         entities: Vec::new(),
                         grpc_bindings: Vec::new(),
                         observations: vec![observation.clone()],
@@ -1513,6 +1587,8 @@ mod tests {
                 &[RepositoryFacts {
                     state,
                     analysis_identity: "analysis-v2".into(),
+                    incomplete: false,
+                    diagnostics: Vec::new(),
                     entities: Vec::new(),
                     grpc_bindings: Vec::new(),
                     observations: vec![observation],
@@ -1580,6 +1656,8 @@ mod tests {
                     &[RepositoryFacts {
                         state: state.clone(),
                         analysis_identity: analysis_identity.into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
                         entities: Vec::new(),
                         grpc_bindings: Vec::new(),
                         observations: observations.clone(),
@@ -1661,6 +1739,8 @@ mod tests {
                     RepositoryFacts {
                         state: source,
                         analysis_identity: "analysis".into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
                         entities: Vec::new(),
                         grpc_bindings: Vec::new(),
                         observations: vec![unresolved.clone()],
@@ -1668,6 +1748,8 @@ mod tests {
                     RepositoryFacts {
                         state: target,
                         analysis_identity: "analysis".into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
                         entities: Vec::new(),
                         grpc_bindings: Vec::new(),
                         observations: vec![Observation::structural(
