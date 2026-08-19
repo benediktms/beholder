@@ -4006,7 +4006,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-typescript"
 version = "0.23.2"
-source = "git+https://github.com/benediktms/tree-sitter-typescript?rev=c8e636524cd1e7b16a134a4694cae28def45de6a#c8e636524cd1e7b16a134a4694cae28def45de6a"
+source = "git+https://github.com/elecnix/tree-sitter-typescript?rev=92634edfbf75963f8b47c6740e9e89ee289ae3df#92634edfbf75963f8b47c6740e9e89ee289ae3df"
 dependencies = [
  "cc",
  "tree-sitter-language",
