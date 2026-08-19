@@ -1,0 +1,8 @@
+mod bridge_client {
+    pub struct BridgeClient<T>(T);
+
+    impl<T> BridgeClient<T> {
+        pub async fn rust_to_elixir(&mut self) {}
+        pub async fn elixir_to_rust(&mut self) {}
+    }
+}

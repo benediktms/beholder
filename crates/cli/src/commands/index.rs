@@ -1,3 +1,4 @@
+use crate::stdout;
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_treesitter_rust::{FRONTEND_VERSION, observations};
@@ -38,17 +39,18 @@ pub(super) fn rust(path: &Path, database_path: &Path) -> Result<(usize, bool), B
 }
 
 pub(super) async fn workspace(name: String) -> Result<(), Box<dyn Error>> {
-    print_result(reindex_workspace(name).await?);
+    print_result(reindex_workspace(name).await?)?;
     Ok(())
 }
 
-pub(super) fn print_result((count, published): (usize, bool)) {
-    println!(
+pub(super) fn print_result((count, published): (usize, bool)) -> Result<(), Box<dyn Error>> {
+    stdout(format_args!(
         "{}",
         if published {
             format!("indexed {count} observations")
         } else {
             "unchanged; kept current analysis revision".into()
         }
-    );
+    ))?;
+    Ok(())
 }

@@ -52,63 +52,8 @@ mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
 xxd -r -p "$root/scripts/fixtures/grpc-matrix.descriptor.hex" "$state/contracts/grpc-matrix.descriptor.bin"
 mkdir -p "$state/elixir/lib"
-printf '%s\n' \
-    'defmodule Beholder.Macro do' \
-    '  defmacro __using__(_) do' \
-    '    quote do' \
-    '      def generated(value), do: Beholder.Helper.work(value)' \
-    '    end' \
-    '  end' \
-    'end' \
-    'defmodule Beholder.Worker do' \
-    '  @callback work(term()) :: term()' \
-    'end' \
-    'defmodule Beholder.Payload do' \
-    '  defstruct [:value]' \
-    'end' \
-    'defmodule Beholder do' \
-    '  defmodule Smoke do' \
-    '    use Beholder.Macro, mode: :strict' \
-    '    @behaviour Beholder.Worker' \
-    '    alias Beholder.Payload' \
-    '    import External.Helpers, only: [help: 1]' \
-    '    require External.Macros, as: Macros' \
-    '    def indexed(value), do: helper(%Payload{value: value})' \
-    '    def classify(:none), do: :none' \
-    '    def classify(%Beholder.PatternPayload{}), do: :pattern' \
-    '    defp helper(value), do: value' \
-    '    def work(value), do: value' \
-    '  end' \
-    'end' \
-    'defprotocol Beholder.Renderable do' \
-    '  def render(value)' \
-    'end' \
-    'defmodule Beholder.Implementations do' \
-    '  defimpl Beholder.Renderable, for: Beholder.Payload do' \
-    '    def render(value), do: value.value' \
-    '  end' \
-    'end' \
-    'defmodule Beholder.Helper do' \
-    '  def work(value), do: value' \
-    'end' >"$state/elixir/lib/smoke.ex"
-printf '%s\n' \
-    'defmodule Phase5.V1.Bridge.Service do' \
-    '  use GRPC.Service, name: "phase5.v1.Bridge"' \
-    '  rpc :RustToElixir, Phase5.V1.Request, Phase5.V1.Response' \
-    '  rpc :ElixirToRust, Phase5.V1.Request, Phase5.V1.Response' \
-    'end' \
-    'defmodule Phase5.V1.Bridge.Stub do' \
-    '  use GRPC.Stub, service: Phase5.V1.Bridge.Service' \
-    'end' \
-    'defmodule Phase5.Client do' \
-    '  alias Phase5.V1.Bridge.Stub' \
-    '  def elixir_to_rust(channel, request), do: Stub.elixir_to_rust(channel, request)' \
-    'end' \
-    'defmodule Phase5.Server do' \
-    '  alias Phase5.V1.Bridge.Service' \
-    '  use GRPC.Server, service: Service' \
-    '  def rust_to_elixir(request, stream), do: {request, stream}' \
-    'end' >"$state/elixir/lib/grpc.pb.ex"
+cp "$root/scripts/fixtures/dogfood/elixir/smoke.ex.fixture" "$state/elixir/lib/smoke.ex"
+cp "$root/scripts/fixtures/dogfood/elixir/grpc.pb.ex.fixture" "$state/elixir/lib/grpc.pb.ex"
 git -C "$state/elixir" init -q
 git -C "$state/elixir" config user.name 'Beholder Smoke'
 git -C "$state/elixir" config user.email 'smoke@beholder.local'
@@ -121,27 +66,10 @@ git -C "$state/elixir" add lib
 git -C "$state/elixir" commit -qm 'Add Elixir smoke fixture'
 git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
 mkdir -p "$state/rust/src"
-printf '%s\n' 'tonic::include_proto!("phase5.v1");' >"$state/rust/src/protocol.rs"
-printf '%s\n' \
-    'mod bridge_client {' \
-    '  pub struct BridgeClient<T>(T);' \
-    '  impl<T> BridgeClient<T> {' \
-    '    pub async fn rust_to_elixir(&mut self) {}' \
-    '    pub async fn elixir_to_rust(&mut self) {}' \
-    '  }' \
-    '}' >"$state/rust/src/generated.rs"
-printf '%s\n' \
-    'use contract::bridge_client::BridgeClient;' \
-    'async fn rust_to_elixir() {' \
-    '  let mut client = BridgeClient::new();' \
-    '  client.rust_to_elixir().await;' \
-    '}' >"$state/rust/src/client.rs"
-printf '%s\n' \
-    'use contract::bridge_server::{Bridge, BridgeServer};' \
-    'struct RustHandler;' \
-    'impl Bridge for RustHandler {' \
-    '  async fn elixir_to_rust(&self) {}' \
-    '}' >"$state/rust/src/server.rs"
+cp "$root/scripts/fixtures/dogfood/rust/protocol.rs.fixture" "$state/rust/src/protocol.rs"
+cp "$root/scripts/fixtures/dogfood/rust/generated.rs.fixture" "$state/rust/src/generated.rs"
+cp "$root/scripts/fixtures/dogfood/rust/client.rs.fixture" "$state/rust/src/client.rs"
+cp "$root/scripts/fixtures/dogfood/rust/server.rs.fixture" "$state/rust/src/server.rs"
 git -C "$state/rust" init -q
 git -C "$state/rust" config user.name 'Beholder Smoke'
 git -C "$state/rust" config user.email 'smoke@beholder.local'
@@ -327,6 +255,12 @@ for expected in 'src/generated.rs' 'lib/grpc.pb.ex' 'confidence 1.00' 'revision 
     fi
 done
 
+echo 'Checking closed inspect output...' >&2
+if ! target/debug/beholder inspect grpc-bindings --database "$state/daemon/beholder.db" | head -n 1 >/dev/null; then
+    echo 'inspect grpc-bindings did not handle a closed output pipe cleanly' >&2
+    exit 1
+fi
+
 echo 'Checking contract removal and restoration...' >&2
 target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
     --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" >/dev/null
@@ -376,6 +310,56 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     printf 'expected main revision:\n%s\n' "$revision" >&2
     exit 1
 fi
+
+echo 'Checking safe and unsafe parser recovery...' >&2
+recovery_source="$state/rust/src/recovery.rs"
+recovery_module='repo://github.com/example/beholder-rust-smoke/rust/recovery'
+printf '%s\n' 'fn broken() { @ }' 'fn recovered() {}' >"$recovery_source"
+for _ in {1..100}; do
+    result="$(target/debug/beholder context --json --workspace main "$recovery_module" 2>/dev/null || true)"
+    grep -Fq '/recovered' <<<"$result" && grep -Fq '"completeness":"incomplete"' <<<"$result" && break
+    sleep 0.1
+done
+for expected in '/recovered' '"completeness":"incomplete"' '"code":"rust.parse_recovery"'; do
+    if ! grep -Fq "$expected" <<<"$result"; then
+        printf 'recoverable Rust source did not expose %s:\n%s\n' "$expected" "$result" >&2
+        exit 1
+    fi
+done
+
+revision_before_unsafe="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
+printf '%s\n' 'fn broken() {' 'fn nested() {}' >"$recovery_source"
+if unsafe_output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+    printf 'unsafe recovery unexpectedly succeeded:\n%s\n' "$unsafe_output" >&2
+    exit 1
+fi
+if ! grep -Fq '[beholder.source.recovery_unsafe]' <<<"$unsafe_output"; then
+    printf 'unsafe recovery did not expose its stable error code:\n%s\n' "$unsafe_output" >&2
+    exit 1
+fi
+revision_after_unsafe="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
+if [[ "$revision_before_unsafe" != "$revision_after_unsafe" ]]; then
+    printf 'unsafe recovery published a new revision:\n%s\n' "$revision_after_unsafe" >&2
+    exit 1
+fi
+
+printf '%s\n' 'fn repaired() {}' >"$recovery_source"
+target/debug/beholder reindex-workspace main >/dev/null
+for _ in {1..100}; do
+    result="$(target/debug/beholder context --json --workspace main "$recovery_module" 2>/dev/null || true)"
+    grep -Fq '/repaired' <<<"$result" \
+        && grep -Fq '"completeness":"complete"' <<<"$result" \
+        && ! grep -Fq '"code":"rust.parse_recovery"' <<<"$result" \
+        && break
+    sleep 0.1
+done
+if ! grep -Fq '/repaired' <<<"$result" \
+    || ! grep -Fq '"completeness":"complete"' <<<"$result" \
+    || grep -Fq '"code":"rust.parse_recovery"' <<<"$result"; then
+    printf 'repair did not publish a complete analysis:\n%s\n' "$result" >&2
+    exit 1
+fi
+
 echo 'Garbage collecting obsolete semantic states...' >&2
 gc_result="$(target/debug/beholder cache gc)"
 if ! grep -Eq '^removed [0-9]+ repository states' <<<"$gc_result"; then
@@ -392,9 +376,14 @@ if [[ -z "$trace_file" ]]; then
     echo 'daemon produced no structured trace file' >&2
     exit 1
 fi
-if grep -Eq '"level":"(WARN|ERROR)"' "$trace_file"; then
+unexpected_errors="$(grep -E '"level":"(WARN|ERROR)"' "$trace_file" \
+    | grep -Fv 'rust.parse_recovery' \
+    | grep -Fv 'source cannot be recovered safely' \
+    | grep -Fv 'source recovery was unsafe; the previous analysis remains active' \
+    | grep -Fv 'beholder.source.recovery_unsafe' || true)"
+if [[ -n "$unexpected_errors" ]]; then
     echo 'daemon trace contains warnings or errors:' >&2
-    cat "$trace_file" >&2
+    printf '%s\n' "$unexpected_errors" >&2
     exit 1
 fi
 for expected in \

@@ -1,0 +1,20 @@
+defmodule Phase5.V1.Bridge.Service do
+  use GRPC.Service, name: "phase5.v1.Bridge"
+  rpc :RustToElixir, Phase5.V1.Request, Phase5.V1.Response
+  rpc :ElixirToRust, Phase5.V1.Request, Phase5.V1.Response
+end
+
+defmodule Phase5.V1.Bridge.Stub do
+  use GRPC.Stub, service: Phase5.V1.Bridge.Service
+end
+
+defmodule Phase5.Client do
+  alias Phase5.V1.Bridge.Stub
+  def elixir_to_rust(channel, request), do: Stub.elixir_to_rust(channel, request)
+end
+
+defmodule Phase5.Server do
+  alias Phase5.V1.Bridge.Service
+  use GRPC.Server, service: Service
+  def rust_to_elixir(request, stream), do: {request, stream}
+end

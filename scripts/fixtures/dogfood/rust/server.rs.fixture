@@ -1,0 +1,7 @@
+use contract::bridge_server::{Bridge, BridgeServer};
+
+struct RustHandler;
+
+impl Bridge for RustHandler {
+    async fn elixir_to_rust(&self) {}
+}

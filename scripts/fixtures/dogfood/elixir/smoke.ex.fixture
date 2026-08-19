@@ -1,0 +1,44 @@
+defmodule Beholder.Macro do
+  defmacro __using__(_) do
+    quote do
+      def generated(value), do: Beholder.Helper.work(value)
+    end
+  end
+end
+
+defmodule Beholder.Worker do
+  @callback work(term()) :: term()
+end
+
+defmodule Beholder.Payload do
+  defstruct [:value]
+end
+
+defmodule Beholder do
+  defmodule Smoke do
+    use Beholder.Macro, mode: :strict
+    @behaviour Beholder.Worker
+    alias Beholder.Payload
+    import External.Helpers, only: [help: 1]
+    require External.Macros, as: Macros
+    def indexed(value), do: helper(%Payload{value: value})
+    def classify(:none), do: :none
+    def classify(%Beholder.PatternPayload{}), do: :pattern
+    defp helper(value), do: value
+    def work(value), do: value
+  end
+end
+
+defprotocol Beholder.Renderable do
+  def render(value)
+end
+
+defmodule Beholder.Implementations do
+  defimpl Beholder.Renderable, for: Beholder.Payload do
+    def render(value), do: value.value
+  end
+end
+
+defmodule Beholder.Helper do
+  def work(value), do: value
+end

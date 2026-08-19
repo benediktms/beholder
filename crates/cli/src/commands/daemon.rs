@@ -1,5 +1,5 @@
 use super::DaemonCommand;
-use crate::service;
+use crate::{service, stdout};
 use beholder_daemon_client::{get_status, state_dir, stop};
 use std::{
     error::Error,
@@ -17,19 +17,19 @@ pub(super) async fn run(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
         DaemonCommand::Run => foreground()?,
         DaemonCommand::Status => {
             let status = get_status().await?;
-            println!(
+            stdout(format_args!(
                 "{} (pid {}, protocol v{})",
                 status.status, status.pid, status.protocol_version
-            );
+            ))?;
         }
-        DaemonCommand::Stop => println!(
+        DaemonCommand::Stop => stdout(format_args!(
             "{}",
             if stop_daemon().await? {
                 "stopped"
             } else {
                 "not running"
             }
-        ),
+        ))?,
     }
     Ok(())
 }
@@ -49,7 +49,7 @@ fn binary() -> Result<PathBuf, Box<dyn Error>> {
 
 async fn start() -> Result<(), Box<dyn Error>> {
     if let Ok(status) = get_status().await {
-        println!("already running (pid {})", status.pid);
+        stdout(format_args!("already running (pid {})", status.pid))?;
         return Ok(());
     }
     let state = state_dir()?;
@@ -66,7 +66,7 @@ async fn start() -> Result<(), Box<dyn Error>> {
         .spawn()?;
     for _ in 0..50 {
         if let Ok(status) = get_status().await {
-            println!("started (pid {})", status.pid);
+            stdout(format_args!("started (pid {})", status.pid))?;
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
@@ -156,7 +156,7 @@ async fn install_service() -> Result<(), Box<dyn Error>> {
             )
         })?;
     }
-    println!(
+    stdout(format_args!(
         "installed {} ({})",
         outcome.manifest_path.display(),
         if outcome.manifest_changed {
@@ -164,14 +164,14 @@ async fn install_service() -> Result<(), Box<dyn Error>> {
         } else {
             "unchanged"
         }
-    );
+    ))?;
     Ok(())
 }
 
 async fn uninstall_service() -> Result<(), Box<dyn Error>> {
     stop_for_service_change().await?;
     let outcome = service::uninstall()?;
-    println!(
+    stdout(format_args!(
         "{} {}",
         if outcome.manifest_existed {
             "removed"
@@ -179,6 +179,6 @@ async fn uninstall_service() -> Result<(), Box<dyn Error>> {
             "already absent"
         },
         outcome.manifest_path.display()
-    );
+    ))?;
     Ok(())
 }
