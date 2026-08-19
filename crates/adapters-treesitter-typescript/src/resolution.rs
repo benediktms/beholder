@@ -551,16 +551,28 @@ fn concrete_nest_target(
     target
 }
 
-#[allow(clippy::too_many_arguments)]
+struct NestInjectionContext<'a> {
+    sources: &'a [(&'a Path, &'a TypescriptAnalysis)],
+    files: &'a BTreeMap<PathBuf, &'a TypescriptAnalysis>,
+    packages: &'a BTreeMap<String, Package>,
+    aliases: &'a [PathAliases],
+    imports: &'a BTreeMap<PathBuf, &'a [Import]>,
+    origins: &'a Origins,
+    symbols: &'a BTreeMap<Origin, EntityId>,
+}
+
 fn nest_injected_field_types(
-    sources: &[(&Path, &TypescriptAnalysis)],
-    files: &BTreeMap<PathBuf, &TypescriptAnalysis>,
-    packages: &BTreeMap<String, Package>,
-    aliases: &[PathAliases],
-    imports: &BTreeMap<PathBuf, &[Import]>,
-    origins: &Origins,
-    symbols: &BTreeMap<Origin, EntityId>,
+    context: NestInjectionContext<'_>,
 ) -> BTreeMap<(PathBuf, String, String), Origin> {
+    let NestInjectionContext {
+        sources,
+        files,
+        packages,
+        aliases,
+        imports,
+        origins,
+        symbols,
+    } = context;
     let reference = |file: &Path, name: &str| {
         nest_reference_origin(file, name, files, packages, aliases, imports, origins)
     };
@@ -923,15 +935,15 @@ fn repository_index<'a>(
             Some(((file, owner, field), origin))
         })
         .collect::<BTreeMap<_, _>>();
-    field_types.extend(nest_injected_field_types(
+    field_types.extend(nest_injected_field_types(NestInjectionContext {
         sources,
-        &files,
-        &packages,
-        &aliases,
-        &file_imports,
-        &origins,
-        &symbols,
-    ));
+        files: &files,
+        packages: &packages,
+        aliases: &aliases,
+        imports: &file_imports,
+        origins: &origins,
+        symbols: &symbols,
+    }));
     for ((file, namespace), factory) in &factories {
         let local_origin = origins
             .get(&(file.clone(), factory.clone()))
