@@ -930,15 +930,62 @@ fn collect_definitions(
     }
 }
 
-fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
-    if node.is_error() || node.is_missing() {
+fn collect_parse_errors(node: Node<'_>, source: &[u8], lines: &mut Vec<usize>, missing: &mut bool) {
+    // Remove this recovery once the grammar includes
+    // https://github.com/tree-sitter/tree-sitter-typescript/pull/358.
+    let type_only_star_export = node.is_error()
+        && text(node, source) == Some("type")
+        && node.parent().is_some_and(|parent| {
+            parent.kind() == "export_statement"
+                && text(parent, source)
+                    .is_some_and(|statement| statement.starts_with("export type * from"))
+        });
+    if (node.is_error() && !type_only_star_export) || node.is_missing() {
         lines.push(node.start_position().row + 1);
         *missing |= node.is_missing();
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_parse_errors(child, lines, missing);
+        collect_parse_errors(child, source, lines, missing);
     }
+}
+
+fn mask_jsx_attribute_ampersands(source: &str) -> Option<Vec<u8>> {
+    let mut masked = source.as_bytes().to_vec();
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < masked.len() {
+        if masked[index] != b'=' {
+            index += 1;
+            continue;
+        }
+
+        let mut value = index + 1;
+        while masked.get(value).is_some_and(u8::is_ascii_whitespace) {
+            value += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = masked.get(value) else {
+            index += 1;
+            continue;
+        };
+
+        value += 1;
+        while value < masked.len() && masked[value] != quote {
+            if masked[value] == b'\\' {
+                value += 2;
+                continue;
+            }
+            if masked[value] == b'&' && masked.get(value + 1).is_some_and(u8::is_ascii_alphabetic) {
+                masked[value] = b'_';
+                changed = true;
+            }
+            value += 1;
+        }
+        index = value.saturating_add(1);
+    }
+
+    changed.then_some(masked)
 }
 
 fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) {
@@ -969,12 +1016,9 @@ pub fn analyze(
     source: &str,
     language: SourceLanguage,
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
-    analyze_with_plugins(
-        source,
-        language,
-        Path::new("input.ts"),
-        &built_in_plugins()?,
-    )
+    let plugins = built_in_plugins()?;
+    let active = plugins.activate_direct(Path::new("input.ts"));
+    analyze_with_plugins(source, language, Path::new("input.ts"), &plugins, &active)
 }
 
 pub(super) fn analyze_with_plugins(
@@ -982,6 +1026,7 @@ pub(super) fn analyze_with_plugins(
     language: SourceLanguage,
     path: &Path,
     plugins: &LanguageAnalyzer<TypescriptLanguage>,
+    active_plugins: &beholder_indexing::ActivePlugins,
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     let grammar = match language {
@@ -990,9 +1035,20 @@ pub(super) fn analyze_with_plugins(
         SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
     parser.set_language(&grammar.into())?;
-    let tree = parser
+    let mut tree = parser
         .parse(source, None)
         .ok_or("JavaScript/TypeScript parser returned no tree")?;
+    if matches!(language, SourceLanguage::Jsx | SourceLanguage::Tsx)
+        && tree.root_node().has_error()
+        && let Some(parser_source) = mask_jsx_attribute_ampersands(source)
+    {
+        // https://github.com/tree-sitter/tree-sitter-javascript/pull/305 only fixed
+        // literal ampersands that are not followed by a letter. Remove this same-width
+        // recovery when the upstream JSX grammar accepts URLs such as `?a=1&b=2`.
+        tree = parser
+            .parse(&parser_source, None)
+            .ok_or("JavaScript/TypeScript parser returned no tree")?;
+    }
     let mut definitions = Vec::new();
     let mut calls = Vec::new();
     let mut imports = Vec::new();
@@ -1002,7 +1058,12 @@ pub(super) fn analyze_with_plugins(
     let mut parse_error_lines = Vec::new();
     let root = tree.root_node();
     let mut missing = false;
-    collect_parse_errors(root, &mut parse_error_lines, &mut missing);
+    collect_parse_errors(
+        root,
+        source.as_bytes(),
+        &mut parse_error_lines,
+        &mut missing,
+    );
     if missing {
         return Err(UnsafeTreeRecovery::new(
             "JavaScript/TypeScript",
@@ -1055,6 +1116,7 @@ pub(super) fn analyze_with_plugins(
             syntax: &tree,
         },
         &mut analysis,
+        active_plugins,
     )?;
     Ok(analysis)
 }
@@ -1221,8 +1283,9 @@ mod tests {
     fn observations(source: &str, path: &str) -> Vec<Observation> {
         let path = Path::new(path);
         let language = SourceLanguage::from_path(path).unwrap();
-        let analysis =
-            analyze_with_plugins(source, language, path, &built_in_plugins().unwrap()).unwrap();
+        let plugins = built_in_plugins().unwrap();
+        let active = plugins.activate_direct(path);
+        let analysis = analyze_with_plugins(source, language, path, &plugins, &active).unwrap();
         observations_from_analysis("example", &analysis, source, path)
     }
 
@@ -1296,6 +1359,26 @@ mod tests {
                 .iter()
                 .all(|observation| observation.provenance == Provenance::Ast)
         );
+    }
+
+    #[test]
+    fn accepts_type_only_star_re_exports() {
+        let analysis =
+            analyze("export type * from './items';", SourceLanguage::TypeScript).unwrap();
+
+        assert!(analysis.parse_error_lines.is_empty());
+        assert!(analysis.exports.is_empty());
+    }
+
+    #[test]
+    fn parses_ampersands_in_jsx_attribute_strings() {
+        let analysis = analyze(
+            r#"const view = <Filter initialUrl="/test?a=1&b=2" />;"#,
+            SourceLanguage::Tsx,
+        )
+        .unwrap();
+
+        assert!(analysis.parse_error_lines.is_empty());
     }
 
     #[test]

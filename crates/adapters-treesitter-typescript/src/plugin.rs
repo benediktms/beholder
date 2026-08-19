@@ -1,8 +1,11 @@
-use super::{TypescriptRepository, model::TypescriptAnalysis, nestjs, nestjs_di, ts_proto};
+use super::{
+    SourceLanguage, TypescriptRepository, graphql, model::TypescriptAnalysis, nestjs, nestjs_di,
+    ts_proto,
+};
 use beholder_indexing::{
     AnalyzerError, AnalyzerLanguage, LanguageAnalyzer, LanguageAnalyzerBuilder, Plugin,
-    PluginMetadata, RepositoryEnricher, RepositoryEnrichment, RepositoryFactsView,
-    SourceRecognitionInput, SourceRecognizer,
+    PluginActivation, PluginMetadata, RepositoryEnricher, RepositoryEnrichment,
+    RepositoryFactsView, RepositorySnapshot, SourceRecognitionInput, SourceRecognizer,
 };
 
 pub(super) struct TypescriptLanguage;
@@ -20,13 +23,29 @@ impl Plugin<TypescriptLanguage> for TsProtoPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "typescript.ts-proto".into(),
-            version: "1".into(),
+            version: "2".into(),
         }
     }
 
-    fn install(self, builder: &mut LanguageAnalyzerBuilder<TypescriptLanguage>) {
-        builder.install_source_recognizer(self);
-        builder.install_repository_enricher(self);
+    fn activate(&self, repository: &RepositorySnapshot) -> Option<PluginActivation> {
+        repository
+            .inputs
+            .iter()
+            .filter(|input| SourceLanguage::from_path(&input.path).is_some())
+            .filter_map(|input| {
+                let source = std::str::from_utf8(&input.content).ok()?;
+                ts_proto::is_generated_source(&input.path, source).then_some(input)
+            })
+            .min_by_key(|input| &input.path)
+            .map(|input| PluginActivation {
+                path: input.path.clone(),
+                reason: "generated TypeScript source".into(),
+            })
+    }
+
+    fn install(&self, builder: &mut LanguageAnalyzerBuilder<TypescriptLanguage>) {
+        builder.install_source_recognizer(*self);
+        builder.install_repository_enricher(*self);
     }
 }
 
@@ -73,13 +92,31 @@ impl Plugin<TypescriptLanguage> for NestjsPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "typescript.nestjs".into(),
-            version: "1".into(),
+            version: "2".into(),
         }
     }
 
-    fn install(self, builder: &mut LanguageAnalyzerBuilder<TypescriptLanguage>) {
-        builder.install_source_recognizer(self);
-        builder.install_repository_enricher(self);
+    fn activate(&self, repository: &RepositorySnapshot) -> Option<PluginActivation> {
+        repository
+            .inputs
+            .iter()
+            .filter(|input| {
+                input.path.file_name().and_then(|name| name.to_str()) == Some("package.json")
+            })
+            .filter_map(|input| {
+                let source = std::str::from_utf8(&input.content).ok()?;
+                graphql::has_package(&[(&input.path, source)], "@nestjs/common").then_some(input)
+            })
+            .min_by_key(|input| &input.path)
+            .map(|input| PluginActivation {
+                path: input.path.clone(),
+                reason: "package.json declares @nestjs/common".into(),
+            })
+    }
+
+    fn install(&self, builder: &mut LanguageAnalyzerBuilder<TypescriptLanguage>) {
+        builder.install_source_recognizer(*self);
+        builder.install_repository_enricher(*self);
     }
 }
 
@@ -138,4 +175,80 @@ pub(super) fn built_in_plugins() -> Result<LanguageAnalyzer<TypescriptLanguage>,
         .add_plugin(TsProtoPlugin)
         .add_plugin(NestjsPlugin)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beholder_domain::{LogicalRepository, RepositoryState};
+    use beholder_indexing::{InputKind, RepositoryInput};
+    use std::{path::PathBuf, sync::Arc};
+
+    fn snapshot(inputs: &[(&str, &str)]) -> RepositorySnapshot {
+        RepositorySnapshot {
+            base: PathBuf::from("repo"),
+            state: RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repo".into(),
+                },
+                head: None,
+                fingerprint: "state".into(),
+            },
+            inputs: inputs
+                .iter()
+                .map(|(path, content)| RepositoryInput {
+                    path: PathBuf::from(path),
+                    content: Arc::from(content.as_bytes()),
+                    kind: InputKind::Source,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn repository_plugin_activation_uses_nested_manifest_and_generated_source_evidence() {
+        let repository = snapshot(&[
+            ("src/main.ts", "export const main = true"),
+            (
+                "packages/api/package.json",
+                r#"{"dependencies":{"@nestjs/common":"11.0.0"}}"#,
+            ),
+            (
+                "packages/contracts/client.generated.ts",
+                "// generated by ts-proto\nexport const client = true",
+            ),
+        ]);
+
+        let active = built_in_plugins().unwrap().activate(&repository, true);
+        assert_eq!(
+            active.identity(),
+            "typescript.nestjs:2:typescript.ts-proto:2"
+        );
+        let evidence = active
+            .plugins()
+            .map(|plugin| {
+                (
+                    plugin.metadata.id.as_str(),
+                    plugin.activation.path.as_path(),
+                    plugin.activation.reason.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            evidence,
+            [
+                (
+                    "typescript.nestjs",
+                    std::path::Path::new("packages/api/package.json"),
+                    "package.json declares @nestjs/common",
+                ),
+                (
+                    "typescript.ts-proto",
+                    std::path::Path::new("packages/contracts/client.generated.ts"),
+                    "generated TypeScript source",
+                ),
+            ]
+        );
+    }
 }

@@ -12,9 +12,9 @@ use crate::{
 use beholder_adapters_graphql::GraphqlSource;
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    LanguageAnalyzer, RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer,
-    WorkspaceSnapshot,
+    ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
+    CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
+    WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -55,12 +55,13 @@ impl TypescriptAnalyzer {
         path: &Path,
         source: &str,
         language: SourceLanguage,
+        active_plugins: &ActivePlugins,
     ) -> Result<(Arc<TypescriptAnalysis>, CacheStatus), AnalyzerError> {
         let mut digest = Sha256::new();
         digest.update(source.as_bytes());
         digest.update(path.to_string_lossy().as_bytes());
         digest.update(language.cache_version().as_bytes());
-        digest.update(self.plugins.identity().as_bytes());
+        digest.update(active_plugins.identity().as_bytes());
         let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
@@ -82,7 +83,13 @@ impl TypescriptAnalyzer {
                 .insert(key, analysis.clone());
             return Ok((analysis, CacheStatus::Disk));
         }
-        let analysis = Arc::new(analyze_with_plugins(source, language, path, &self.plugins)?);
+        let analysis = Arc::new(analyze_with_plugins(
+            source,
+            language,
+            path,
+            &self.plugins,
+            active_plugins,
+        )?);
         if let Some(parent) = cache_path.parent()
             && fs::create_dir_all(parent).is_ok()
             && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
@@ -164,6 +171,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     text(input).map(|source| (input.path.as_path(), source, language))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let active_plugins = self.plugins.activate(repository, !sources.is_empty());
             let manifests = inputs
                 .iter()
                 .filter(|input| {
@@ -196,18 +204,37 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 })
                 .map(|input| text(input).map(|source| (input.path.as_path(), source)))
                 .collect::<Result<Vec<_>, _>>()?;
-            let analyzed = sources
+            let analyzed_results = sources
                 .par_iter()
                 .map(|(path, source, language)| {
-                    let (analysis, status) = self
-                        .analysis(path, source, *language)
-                        .map_err(|error| SourceAnalysisError::from_source(path, error))?;
-                    Ok::<_, SourceAnalysisError>((*path, *source, analysis, status))
+                    let analysis = self
+                        .analysis(path, source, *language, &active_plugins)
+                        .map_err(|error| SourceAnalysisError::from_source(path, error));
+                    (*path, *source, analysis)
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Vec<_>>();
             let mut observations = Vec::new();
             let mut entities = Vec::new();
             let mut diagnostics = Vec::new();
+            let mut analyzed = Vec::new();
+            for (path, source, result) in analyzed_results {
+                match result {
+                    Ok((analysis, status)) => analyzed.push((path, source, analysis, status)),
+                    Err(error) if error.is_unsafe_recovery() => {
+                        diagnostics.push(beholder_domain::AnalysisDiagnostic {
+                            code: "typescript.parse_recovery".into(),
+                            severity: beholder_domain::AnalysisDiagnosticSeverity::Warning,
+                            path: path.into(),
+                            line: None,
+                            detail: Some(
+                                "tree-sitter could not recover this source safely; the file was skipped"
+                                    .into(),
+                            ),
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             for (path, source, analysis, status) in &analyzed {
                 match status {
                     CacheStatus::Memory => cache.memory_hits += 1,
@@ -277,6 +304,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     entities: &entities,
                     observations: &observations,
                 },
+                &active_plugins,
             )?;
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);
@@ -348,4 +376,59 @@ fn hex(key: [u8; 32]) -> String {
 fn text(input: &beholder_indexing::RepositoryInput) -> Result<&str, SourceAnalysisError> {
     std::str::from_utf8(&input.content)
         .map_err(|error| SourceAnalysisError::from_source(&input.path, Box::new(error)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beholder_domain::{LogicalRepository, RepositoryState};
+    use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot};
+
+    #[test]
+    fn skips_unsafe_source_without_aborting_repository() {
+        let cache_dir =
+            std::env::temp_dir().join(format!("beholder-typescript-skip-{}", std::process::id()));
+        let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
+        let snapshot = WorkspaceSnapshot {
+            name: "test".into(),
+            repositories: vec![RepositorySnapshot {
+                base: PathBuf::from("repo"),
+                state: RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: "state".into(),
+                },
+                inputs: vec![
+                    RepositoryInput {
+                        path: PathBuf::from("src/valid.ts"),
+                        content: Arc::from(&b"export function valid() {}"[..]),
+                        kind: InputKind::Source,
+                    },
+                    RepositoryInput {
+                        path: PathBuf::from("src/broken.ts"),
+                        content: Arc::from(&b"const broken = {"[..]),
+                        kind: InputKind::Source,
+                    },
+                ],
+            }],
+        };
+
+        let contribution = analyzer.analyze(&snapshot).unwrap();
+
+        assert_eq!(contribution.repositories.len(), 1);
+        assert_eq!(
+            contribution.repositories[0].completeness,
+            AnalysisCompleteness::Incomplete
+        );
+        assert!(
+            contribution.repositories[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == Path::new("src/broken.ts"))
+        );
+        assert!(!contribution.repositories[0].entities.is_empty());
+        let _ = fs::remove_dir_all(cache_dir);
+    }
 }
