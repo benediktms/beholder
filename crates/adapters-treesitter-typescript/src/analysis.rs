@@ -33,6 +33,19 @@ fn is_exported(mut node: Node<'_>) -> bool {
     false
 }
 
+fn collect_identifiers(node: Node<'_>, source: &[u8], identifiers: &mut Vec<String>) {
+    if node.kind() == "identifier" {
+        if let Some(identifier) = text(node, source) {
+            identifiers.push(identifier.into());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_identifiers(child, source, identifiers);
+    }
+}
+
 fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     let (receiver, name, kind): (Option<String>, String, CallKind) = match target.kind() {
         "identifier" => (None, text(target, source)?.into(), kind),
@@ -53,27 +66,38 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
         ),
         _ => return None,
     };
-    let preserve_arguments = matches!(
+    let preserve_all_arguments = matches!(
         name.as_str(),
         "GrpcMethod" | "GrpcStreamMethod" | "GrpcStreamCall" | "getService"
-    ) || (name == "request" && receiver.as_deref() == Some("this.rpc"));
+    ) || (name == "request"
+        && receiver.as_deref() == Some("this.rpc"));
     let preserve_type_arguments = name == "getService";
     Some(Call {
         kind,
         receiver,
         name,
-        arguments: preserve_arguments
-            .then(|| {
-                let arguments = node.child_by_field_name("arguments")?;
-                Some(
-                    arguments
-                        .named_children(&mut arguments.walk())
-                        .filter_map(|argument| text(argument, source).map(str::to_owned))
-                        .collect(),
-                )
+        arguments: node
+            .child_by_field_name("arguments")
+            .map(|arguments| {
+                arguments
+                    .named_children(&mut arguments.walk())
+                    .filter_map(|argument| {
+                        (argument.kind() == "identifier" || preserve_all_arguments)
+                            .then(|| text(argument, source).map(str::to_owned))
+                            .flatten()
+                    })
+                    .collect()
             })
-            .flatten()
-            .unwrap_or_default(),
+            .unwrap_or_else(|| {
+                let mut identifiers = Vec::new();
+                if matches!(
+                    node.kind(),
+                    "jsx_opening_element" | "jsx_self_closing_element"
+                ) {
+                    collect_identifiers(node, source, &mut identifiers);
+                }
+                identifiers
+            }),
         type_arguments: preserve_type_arguments
             .then(|| {
                 let arguments = node.child_by_field_name("type_arguments")?;
@@ -88,6 +112,58 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
             .unwrap_or_default(),
         line: node.start_position().row + 1,
     })
+}
+
+fn collect_graphql_documents(node: Node<'_>, source: &[u8], documents: &mut Vec<GraphqlDocument>) {
+    if node.kind() == "variable_declarator"
+        && let (Some(name), Some(value)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("value"),
+        )
+        && name.kind() == "identifier"
+        && value.kind() == "call_expression"
+        && value
+            .child_by_field_name("function")
+            .and_then(|function| text(function, source))
+            .is_some_and(|function| matches!(function, "gql" | "graphql"))
+        && let Some(arguments) = value.child_by_field_name("arguments")
+    {
+        let arguments = arguments
+            .named_children(&mut arguments.walk())
+            .filter(|argument| argument.kind() != "comment")
+            .collect::<Vec<_>>();
+        if let [document] = arguments.as_slice()
+            && matches!(document.kind(), "template_string" | "string")
+            && (document.kind() != "template_string"
+                || document
+                    .named_children(&mut document.walk())
+                    .all(|child| child.kind() != "template_substitution"))
+            && let (Some(binding), Some(document)) = (text(name, source), text(*document, source))
+            && let Some(document) = document
+                .strip_prefix('`')
+                .and_then(|text| text.strip_suffix('`'))
+                .or_else(|| {
+                    document
+                        .strip_prefix('"')
+                        .and_then(|text| text.strip_suffix('"'))
+                })
+                .or_else(|| {
+                    document
+                        .strip_prefix('\'')
+                        .and_then(|text| text.strip_suffix('\''))
+                })
+        {
+            documents.push(GraphqlDocument {
+                binding: binding.into(),
+                source: document.into(),
+                line: node.start_position().row + 1,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_graphql_documents(child, source, documents);
+    }
 }
 
 fn collect_string_constants(node: Node<'_>, source: &[u8], constants: &mut Vec<StringConstant>) {
@@ -879,6 +955,7 @@ pub fn analyze(
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut string_constants = Vec::new();
+    let mut graphql_documents = Vec::new();
     let mut parse_error_lines = Vec::new();
     collect_definitions(
         tree.root_node(),
@@ -907,6 +984,7 @@ pub fn analyze(
     collect_imports(tree.root_node(), source.as_bytes(), &mut imports);
     collect_exports(tree.root_node(), source.as_bytes(), &mut exports);
     collect_string_constants(tree.root_node(), source.as_bytes(), &mut string_constants);
+    collect_graphql_documents(tree.root_node(), source.as_bytes(), &mut graphql_documents);
     let (nest_modules, nest_providers) = nestjs_di::extract(tree.root_node(), source.as_bytes());
     collect_parse_errors(tree.root_node(), &mut parse_error_lines);
     parse_error_lines.sort_unstable();
@@ -918,6 +996,7 @@ pub fn analyze(
         imports,
         exports,
         string_constants,
+        graphql_documents,
         nest_modules,
         nest_providers,
         parse_error_lines,
@@ -941,7 +1020,7 @@ pub fn diagnostics_from_analysis(
         .collect()
 }
 
-fn source_stem(path: &Path) -> String {
+pub(super) fn source_stem(path: &Path) -> String {
     path.with_extension("")
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
@@ -1062,19 +1141,23 @@ pub fn entities_from_analysis(
         analysis.language.id_segment(),
         source_stem(path)
     );
-    std::iter::once(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap())
-        .chain(analysis.definitions.iter().map(|definition| {
-            EntityFact::new(
-                format!("{module_id}/{}", definition.qualified_name),
-                match definition.kind {
-                    DefinitionKind::Namespace => EntityKind::Namespace,
-                    DefinitionKind::Callable => EntityKind::Callable,
-                },
-                None,
-            )
-            .unwrap()
-        }))
-        .collect()
+    let mut entities =
+        std::iter::once(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap())
+            .chain(analysis.definitions.iter().map(|definition| {
+                EntityFact::new(
+                    format!("{module_id}/{}", definition.qualified_name),
+                    match definition.kind {
+                        DefinitionKind::Namespace => EntityKind::Namespace,
+                        DefinitionKind::Callable => EntityKind::Callable,
+                    },
+                    None,
+                )
+                .unwrap()
+            }))
+            .collect::<Vec<_>>();
+    entities.sort_by(|left, right| left.id.cmp(&right.id));
+    entities.dedup();
+    entities
 }
 
 #[cfg(test)]
@@ -1216,6 +1299,130 @@ mod tests {
                     .iter()
                     .any(|call| call.0 == expected.0 && call.1 == expected.1),
                 "missing {expected:?}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_embedded_operations_and_grats_resolvers() {
+        let documents = r#"
+            export const Packages_Detail_Query = gql(`
+              query Packages_Detail_Query { packageTemplatePreview { id } }
+            `);
+            export const PaymentCompleted = gql(`
+              subscription PaymentCompleted { paymentCompleted { id } }
+            `);
+            export const Tada_Query = graphql(/* GraphQL */ "query Tada_Query { location { id } }");
+        "#;
+        let component = r#"
+            import { Packages_Detail_Query, PaymentCompleted } from './PackageDetail.gql';
+            export function PackageDetail() {
+              useSWRGQL(Packages_Detail_Query, variables);
+              return <Checkout subscription={enabled ? PaymentCompleted : null} />;
+            }
+        "#;
+        let resolver = r#"
+            class GetPackageTemplatePreview {
+              /** @gqlQueryField packageTemplatePreview */
+              @validateInput(schema)
+              static async query(args: Args) {}
+            }
+        "#;
+        let document_path = Path::new("src/PackageDetail.gql.tsx");
+        let component_path = Path::new("src/PackageDetail.tsx");
+        let resolver_path = Path::new("src/package-details.ts");
+        let document_analysis = analyze(documents, SourceLanguage::Tsx).unwrap();
+        let component_analysis = analyze(component, SourceLanguage::Tsx).unwrap();
+        let resolver_analysis = analyze(resolver, SourceLanguage::TypeScript).unwrap();
+        let sources = [
+            (document_path, &document_analysis, documents),
+            (component_path, &component_analysis, component),
+            (resolver_path, &resolver_analysis, resolver),
+        ];
+        let graphql_sources = sources
+            .iter()
+            .map(|(path, analysis, source)| crate::GraphqlResolverSource {
+                path,
+                analysis,
+                source,
+            })
+            .collect::<Vec<_>>();
+        let mut observations = sources
+            .iter()
+            .flat_map(|(path, analysis, source)| {
+                observations_from_analysis("example", analysis, source, path)
+            })
+            .collect::<Vec<_>>();
+        crate::resolve_repository_calls(
+            "example",
+            &mut observations,
+            &sources
+                .iter()
+                .map(|(path, analysis, _)| (*path, *analysis))
+                .collect::<Vec<_>>(),
+            &[],
+            &[],
+        );
+        let grats = crate::collect_graphql_resolvers(crate::GraphqlResolverInput {
+            repository: "example",
+            sources: &graphql_sources,
+            manifests: &[(
+                Path::new("package.json"),
+                r#"{"dependencies":{"grats":"0.0.34"}}"#,
+            )],
+        });
+        let graphql = crate::collect_graphql_facts(crate::GraphqlFactInput {
+            repository: "example",
+            sources: &graphql_sources,
+            schemas: &[],
+        });
+        let entities = sources
+            .iter()
+            .flat_map(|(path, analysis, _)| entities_from_analysis("example", analysis, path))
+            .chain(grats.entities)
+            .chain(graphql.entities)
+            .collect::<Vec<_>>();
+        observations.extend(grats.observations);
+        observations.extend(graphql.observations);
+
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-operation://Packages_Detail_Query"
+                && entity.kind == EntityKind::GraphqlOperation
+        }));
+        assert!(entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-operation://Tada_Query"
+                && entity.kind == EntityKind::GraphqlOperation
+        }));
+        for (from, relation, to) in [
+            (
+                "repo://example/typescript/src/PackageDetail/PackageDetail",
+                DependencyRelation::CallsGraphql,
+                "graphql-operation://Packages_Detail_Query",
+            ),
+            (
+                "graphql-operation://Packages_Detail_Query",
+                DependencyRelation::Selects,
+                "graphql-field://Query/packageTemplatePreview",
+            ),
+            (
+                "repo://example/typescript/src/PackageDetail/PackageDetail",
+                DependencyRelation::CallsGraphql,
+                "graphql-operation://PaymentCompleted",
+            ),
+            (
+                "graphql-field://Query/packageTemplatePreview",
+                DependencyRelation::ResolvedBy,
+                "repo://example/typescript/src/package-details/GetPackageTemplatePreview/query",
+            ),
+        ] {
+            assert!(
+                observations.iter().any(|observation| {
+                    observation.from.as_str() == from
+                        && observation.relation == SemanticRelation::Dependency(relation)
+                        && observation.to.as_str() == to
+                }),
+                "missing {from} {} {to}: {observations:#?}",
+                relation.as_str()
             );
         }
     }

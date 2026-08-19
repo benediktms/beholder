@@ -141,7 +141,11 @@ impl From<dto::EntityKind> for v1::EntityKind {
     fn from(value: dto::EntityKind) -> Self {
         match value {
             dto::EntityKind::Callable => Self::Callable,
+            dto::EntityKind::GraphqlArgument => Self::GraphqlArgument,
+            dto::EntityKind::GraphqlEnumValue => Self::GraphqlEnumValue,
             dto::EntityKind::GraphqlField => Self::GraphqlField,
+            dto::EntityKind::GraphqlOperation => Self::GraphqlOperation,
+            dto::EntityKind::GraphqlType => Self::GraphqlType,
             dto::EntityKind::KafkaTopic => Self::KafkaTopic,
             dto::EntityKind::Namespace => Self::Namespace,
             dto::EntityKind::ProtoEnum => Self::ProtoEnum,
@@ -179,7 +183,11 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
     Ok(
         match v1::EntityKind::try_from(value).map_err(|_| "unknown entity kind")? {
             v1::EntityKind::Callable => dto::EntityKind::Callable,
+            v1::EntityKind::GraphqlArgument => dto::EntityKind::GraphqlArgument,
+            v1::EntityKind::GraphqlEnumValue => dto::EntityKind::GraphqlEnumValue,
             v1::EntityKind::GraphqlField => dto::EntityKind::GraphqlField,
+            v1::EntityKind::GraphqlOperation => dto::EntityKind::GraphqlOperation,
+            v1::EntityKind::GraphqlType => dto::EntityKind::GraphqlType,
             v1::EntityKind::KafkaTopic => dto::EntityKind::KafkaTopic,
             v1::EntityKind::Namespace => dto::EntityKind::Namespace,
             v1::EntityKind::ProtoEnum => dto::EntityKind::ProtoEnum,
@@ -197,6 +205,37 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
 
 fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'static str> {
     match value.metadata.ok_or("entity metadata is missing")? {
+        v1::entity_metadata::Metadata::GraphqlOperationKind(value) => {
+            Ok(dto::EntityMetadata::GraphqlOperation {
+                operation_kind: match v1::GraphqlOperationKind::try_from(value)
+                    .map_err(|_| "unknown GraphQL operation kind")?
+                {
+                    v1::GraphqlOperationKind::Mutation => dto::GraphqlOperationKind::Mutation,
+                    v1::GraphqlOperationKind::Query => dto::GraphqlOperationKind::Query,
+                    v1::GraphqlOperationKind::Subscription => {
+                        dto::GraphqlOperationKind::Subscription
+                    }
+                    v1::GraphqlOperationKind::Unknown => {
+                        return Err("GraphQL operation kind is missing");
+                    }
+                },
+            })
+        }
+        v1::entity_metadata::Metadata::GraphqlTypeKind(value) => {
+            Ok(dto::EntityMetadata::GraphqlType {
+                type_kind: match v1::GraphqlTypeKind::try_from(value)
+                    .map_err(|_| "unknown GraphQL type kind")?
+                {
+                    v1::GraphqlTypeKind::Enum => dto::GraphqlTypeKind::Enum,
+                    v1::GraphqlTypeKind::Input => dto::GraphqlTypeKind::Input,
+                    v1::GraphqlTypeKind::Interface => dto::GraphqlTypeKind::Interface,
+                    v1::GraphqlTypeKind::Object => dto::GraphqlTypeKind::Object,
+                    v1::GraphqlTypeKind::Scalar => dto::GraphqlTypeKind::Scalar,
+                    v1::GraphqlTypeKind::Union => dto::GraphqlTypeKind::Union,
+                    v1::GraphqlTypeKind::Unknown => return Err("GraphQL type kind is missing"),
+                },
+            })
+        }
         v1::entity_metadata::Metadata::ProtoTypeKind(value) => Ok(dto::EntityMetadata::ProtoType {
             type_kind: match v1::ProtoTypeKind::try_from(value)
                 .map_err(|_| "unknown Protobuf type kind")?
@@ -226,6 +265,25 @@ fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'s
 
 fn protocol_entity_metadata(value: dto::EntityMetadata) -> v1::EntityMetadata {
     let metadata = match value {
+        dto::EntityMetadata::GraphqlOperation { operation_kind } => {
+            v1::entity_metadata::Metadata::GraphqlOperationKind(match operation_kind {
+                dto::GraphqlOperationKind::Mutation => v1::GraphqlOperationKind::Mutation as i32,
+                dto::GraphqlOperationKind::Query => v1::GraphqlOperationKind::Query as i32,
+                dto::GraphqlOperationKind::Subscription => {
+                    v1::GraphqlOperationKind::Subscription as i32
+                }
+            })
+        }
+        dto::EntityMetadata::GraphqlType { type_kind } => {
+            v1::entity_metadata::Metadata::GraphqlTypeKind(match type_kind {
+                dto::GraphqlTypeKind::Enum => v1::GraphqlTypeKind::Enum as i32,
+                dto::GraphqlTypeKind::Input => v1::GraphqlTypeKind::Input as i32,
+                dto::GraphqlTypeKind::Interface => v1::GraphqlTypeKind::Interface as i32,
+                dto::GraphqlTypeKind::Object => v1::GraphqlTypeKind::Object as i32,
+                dto::GraphqlTypeKind::Scalar => v1::GraphqlTypeKind::Scalar as i32,
+                dto::GraphqlTypeKind::Union => v1::GraphqlTypeKind::Union as i32,
+            })
+        }
         dto::EntityMetadata::ProtoType { type_kind } => {
             v1::entity_metadata::Metadata::ProtoTypeKind(match type_kind {
                 dto::ProtoTypeKind::Enum => v1::ProtoTypeKind::Enum as i32,
@@ -335,6 +393,7 @@ impl From<dto::RelationKind> for v1::RelationKind {
         match value {
             dto::RelationKind::BindsContract => Self::BindsContract,
             dto::RelationKind::Calls => Self::Calls,
+            dto::RelationKind::CallsGraphql => Self::CallsGraphql,
             dto::RelationKind::CallsRpc => Self::CallsRpc,
             dto::RelationKind::ConsumedBy => Self::ConsumedBy,
             dto::RelationKind::Defines => Self::Defines,
@@ -357,6 +416,7 @@ fn relation_kind(value: i32) -> Result<dto::RelationKind, &'static str> {
     match v1::RelationKind::try_from(value).map_err(|_| "unknown relation kind")? {
         v1::RelationKind::BindsContract => Ok(dto::RelationKind::BindsContract),
         v1::RelationKind::Calls => Ok(dto::RelationKind::Calls),
+        v1::RelationKind::CallsGraphql => Ok(dto::RelationKind::CallsGraphql),
         v1::RelationKind::CallsRpc => Ok(dto::RelationKind::CallsRpc),
         v1::RelationKind::ConsumedBy => Ok(dto::RelationKind::ConsumedBy),
         v1::RelationKind::Defines => Ok(dto::RelationKind::Defines),
@@ -726,37 +786,93 @@ mod tests {
                 max_hops: 7,
                 truncated: true,
             },
-            nodes: vec![dto::EntityRef {
-                id: "a".into(),
-                kind: dto::EntityKind::Callable,
-                name: "a".into(),
-                repository: None,
-                origin: dto::EntityOrigin::Source,
-                test: false,
-                metadata: Some(dto::EntityMetadata::ProtoMethod {
-                    cardinality: dto::RpcCardinality::Unary,
-                }),
-            }],
-            edges: vec![dto::SemanticEdge {
-                id: "e1".into(),
-                from: "a".into(),
-                to: "b".into(),
-                kind: dto::RelationKind::BindsContract,
-                confidence: 0.6,
-                evidence: vec![dto::EvidenceRef {
-                    source_kind: dto::EvidenceKind::Inference,
+            nodes: vec![
+                dto::EntityRef {
+                    id: "a".into(),
+                    kind: dto::EntityKind::Callable,
+                    name: "a".into(),
                     repository: None,
-                    path: Some("src/lib.rs".into()),
-                    line: Some(1),
-                    detail: Some("unique_name_heuristic".into()),
-                }],
-            }],
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: Some(dto::EntityMetadata::ProtoMethod {
+                        cardinality: dto::RpcCardinality::Unary,
+                    }),
+                },
+                dto::EntityRef {
+                    id: "graphql-type://OrderInput".into(),
+                    kind: dto::EntityKind::GraphqlType,
+                    name: "OrderInput".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: Some(dto::EntityMetadata::GraphqlType {
+                        type_kind: dto::GraphqlTypeKind::Input,
+                    }),
+                },
+                dto::EntityRef {
+                    id: "graphql-operation://CreateOrder".into(),
+                    kind: dto::EntityKind::GraphqlOperation,
+                    name: "CreateOrder".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: Some(dto::EntityMetadata::GraphqlOperation {
+                        operation_kind: dto::GraphqlOperationKind::Mutation,
+                    }),
+                },
+                dto::EntityRef {
+                    id: "graphql-argument://Mutation/createOrder/input".into(),
+                    kind: dto::EntityKind::GraphqlArgument,
+                    name: "input".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: None,
+                },
+                dto::EntityRef {
+                    id: "graphql-enum-value://OrderMode/PREVIEW".into(),
+                    kind: dto::EntityKind::GraphqlEnumValue,
+                    name: "PREVIEW".into(),
+                    repository: None,
+                    origin: dto::EntityOrigin::Source,
+                    test: false,
+                    metadata: None,
+                },
+            ],
+            edges: vec![
+                dto::SemanticEdge {
+                    id: "e1".into(),
+                    from: "a".into(),
+                    to: "b".into(),
+                    kind: dto::RelationKind::BindsContract,
+                    confidence: 0.6,
+                    evidence: vec![dto::EvidenceRef {
+                        source_kind: dto::EvidenceKind::Inference,
+                        repository: None,
+                        path: Some("src/lib.rs".into()),
+                        line: Some(1),
+                        detail: Some("unique_name_heuristic".into()),
+                    }],
+                },
+                dto::SemanticEdge {
+                    id: "e2".into(),
+                    from: "a".into(),
+                    to: "graphql-operation://CreateOrder".into(),
+                    kind: dto::RelationKind::CallsGraphql,
+                    confidence: 1.0,
+                    evidence: Vec::new(),
+                },
+            ],
             paths: Vec::new(),
         };
         let response = v1::TraceResponse::from(trace.clone());
         assert_eq!(
             response.edges[0].kind,
             v1::RelationKind::BindsContract as i32
+        );
+        assert_eq!(
+            response.edges[1].kind,
+            v1::RelationKind::CallsGraphql as i32
         );
         assert_eq!(
             response.edges[0].evidence[0].source,

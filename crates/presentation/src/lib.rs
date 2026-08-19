@@ -607,7 +607,11 @@ fn evidence_label(evidence: &EvidenceRef) -> String {
 fn kind_label(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Callable => "callables",
+        EntityKind::GraphqlArgument => "GraphQL arguments",
+        EntityKind::GraphqlEnumValue => "GraphQL enum values",
         EntityKind::GraphqlField => "GraphQL",
+        EntityKind::GraphqlOperation => "GraphQL operations",
+        EntityKind::GraphqlType => "GraphQL types",
         EntityKind::KafkaTopic => "Kafka",
         EntityKind::Namespace => "namespaces",
         EntityKind::ProtoEnum => "Protobuf enums",

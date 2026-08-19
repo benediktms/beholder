@@ -1,8 +1,8 @@
 use super::schema::*;
 use beholder_domain::{
     DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
-    GrpcBindingCandidate, GrpcBindingRole, Observation, ProtoTypeKind, RepositoryFacts,
-    RpcCardinality, SemanticRelation, WorkspaceView,
+    GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, Observation,
+    ProtoTypeKind, RepositoryFacts, RpcCardinality, SemanticRelation, WorkspaceView,
 };
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
@@ -86,7 +86,11 @@ pub(super) fn store_observations(
 fn entity_kind(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::Callable => "callable",
+        EntityKind::GraphqlArgument => "graphql_argument",
+        EntityKind::GraphqlEnumValue => "graphql_enum_value",
         EntityKind::GraphqlField => "graphql_field",
+        EntityKind::GraphqlOperation => "graphql_operation",
+        EntityKind::GraphqlType => "graphql_type",
         EntityKind::GrpcOperation => "grpc_operation",
         EntityKind::KafkaTopic => "kafka_topic",
         EntityKind::Namespace => "namespace",
@@ -111,6 +115,33 @@ fn rpc_cardinality(cardinality: RpcCardinality) -> &'static str {
 fn entity_metadata(metadata: Option<EntityMetadata>) -> &'static str {
     match metadata {
         None => "",
+        Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Mutation,
+        }) => "graphql_operation:mutation",
+        Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Query,
+        }) => "graphql_operation:query",
+        Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Subscription,
+        }) => "graphql_operation:subscription",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Enum,
+        }) => "graphql_type:enum",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Input,
+        }) => "graphql_type:input",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Interface,
+        }) => "graphql_type:interface",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Object,
+        }) => "graphql_type:object",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Scalar,
+        }) => "graphql_type:scalar",
+        Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Union,
+        }) => "graphql_type:union",
         Some(EntityMetadata::ProtoMethod {
             cardinality: RpcCardinality::BidirectionalStreaming,
         }) => "rpc_cardinality:bidirectional_streaming",
@@ -1000,6 +1031,32 @@ mod tests {
         facts.entities.push(
             EntityFact::new("repo://example/rust/unrelated", EntityKind::Callable, None).unwrap(),
         );
+        facts.entities.push(
+            EntityFact::new(
+                "graphql-argument://Mutation/createOrder/input",
+                EntityKind::GraphqlArgument,
+                None,
+            )
+            .unwrap(),
+        );
+        facts.entities.push(
+            EntityFact::new(
+                "graphql-enum-value://OrderMode/PREVIEW",
+                EntityKind::GraphqlEnumValue,
+                None,
+            )
+            .unwrap(),
+        );
+        facts.entities.push(
+            EntityFact::new(
+                "graphql-operation://CreateOrder",
+                EntityKind::GraphqlOperation,
+                Some(EntityMetadata::GraphqlOperation {
+                    kind: GraphqlOperationKind::Mutation,
+                }),
+            )
+            .unwrap(),
+        );
         let state = analyzed_state(&facts);
         store.publish(&view, &[facts], &[]).unwrap();
 
@@ -1027,6 +1084,32 @@ mod tests {
             })
         );
         assert_eq!(context.nodes.len(), 1);
+        assert_eq!(
+            store
+                .context("main", "graphql-argument://Mutation/createOrder/input")
+                .unwrap()
+                .root
+                .kind,
+            beholder_dto::EntityKind::GraphqlArgument
+        );
+        assert_eq!(
+            store
+                .context("main", "graphql-enum-value://OrderMode/PREVIEW")
+                .unwrap()
+                .root
+                .kind,
+            beholder_dto::EntityKind::GraphqlEnumValue
+        );
+        assert_eq!(
+            store
+                .context("main", "graphql-operation://CreateOrder")
+                .unwrap()
+                .root
+                .metadata,
+            Some(beholder_dto::EntityMetadata::GraphqlOperation {
+                operation_kind: beholder_dto::GraphqlOperationKind::Mutation,
+            })
+        );
     }
 
     #[test]

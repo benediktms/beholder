@@ -30,10 +30,10 @@ impl SourceLanguage {
 
     pub fn cache_version(self) -> &'static str {
         match self {
-            Self::JavaScript => "18-javascript",
-            Self::Jsx => "18-jsx",
-            Self::TypeScript => "18-typescript",
-            Self::Tsx => "18-tsx",
+            Self::JavaScript => "20-javascript",
+            Self::Jsx => "20-jsx",
+            Self::TypeScript => "20-typescript",
+            Self::Tsx => "20-tsx",
         }
     }
 }
@@ -46,9 +46,17 @@ pub struct TypescriptAnalysis {
     pub(super) imports: Vec<Import>,
     pub(super) exports: Vec<Export>,
     pub(super) string_constants: Vec<StringConstant>,
+    pub(super) graphql_documents: Vec<GraphqlDocument>,
     pub(super) nest_modules: Vec<NestModule>,
     pub(super) nest_providers: Vec<NestProvider>,
     pub(super) parse_error_lines: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct GraphqlDocument {
+    pub(super) binding: String,
+    pub(super) source: String,
+    pub(super) line: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

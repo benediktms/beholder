@@ -18,6 +18,7 @@ pub(super) type UnityMetas = Vec<(PathBuf, String, Vec<u8>)>;
 pub(super) type TypescriptSources = Vec<(PathBuf, String, SourceLanguage)>;
 pub(super) type TypescriptManifests = Vec<(PathBuf, String)>;
 pub(super) type TypescriptConfigs = Vec<(PathBuf, String)>;
+pub(super) type GraphqlSources = Vec<(PathBuf, String)>;
 pub(super) type ProtobufSources = Vec<(PathBuf, Vec<u8>)>;
 pub(super) type ProtobufSourceFiles = Vec<(PathBuf, Vec<u8>)>;
 
@@ -34,6 +35,7 @@ pub(super) struct RepositorySources {
     pub(super) typescript: TypescriptSources,
     pub(super) typescript_manifests: TypescriptManifests,
     pub(super) typescript_configs: TypescriptConfigs,
+    pub(super) graphql: GraphqlSources,
     pub(super) protobuf: ProtobufSources,
     pub(super) protobuf_source: ProtobufSourceFiles,
 }
@@ -67,7 +69,18 @@ pub(super) fn is_index_input(path: &Path) -> bool {
     }) && (path.extension().is_some_and(|extension| {
         matches!(
             extension.to_str(),
-            Some("rs" | "ex" | "exs" | "cs" | "js" | "jsx" | "ts" | "tsx" | "proto")
+            Some(
+                "rs" | "ex"
+                    | "exs"
+                    | "cs"
+                    | "js"
+                    | "jsx"
+                    | "ts"
+                    | "tsx"
+                    | "graphql"
+                    | "gql"
+                    | "proto"
+            )
         )
     }) || path
         .file_name()
@@ -245,6 +258,20 @@ pub(super) fn repository_sources(
             }
         }
     }
+    let (graphql_files, sources): (Vec<_>, Vec<_>) = sources.into_iter().partition(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "graphql" | "gql"))
+    });
+    let graphql = graphql_files
+        .into_iter()
+        .map(|path| {
+            Ok((
+                path.strip_prefix(root)?.to_path_buf(),
+                fs::read_to_string(path)?,
+            ))
+        })
+        .collect::<Result<GraphqlSources, Box<dyn Error>>>()?;
     let sources = sources
         .into_iter()
         .map(|path| {
@@ -306,6 +333,11 @@ pub(super) fn repository_sources(
                     .map(|(path, source, _)| (path.as_path(), source.as_bytes())),
             )
             .chain(
+                graphql
+                    .iter()
+                    .map(|(path, source)| (path.as_path(), source.as_bytes())),
+            )
+            .chain(
                 typescript_manifests
                     .iter()
                     .map(|(path, source)| (path.as_path(), source.as_bytes())),
@@ -338,6 +370,7 @@ pub(super) fn repository_sources(
         typescript,
         typescript_manifests,
         typescript_configs,
+        graphql,
         protobuf: descriptors,
         protobuf_source,
     })
@@ -384,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_javascript_and_typescript_but_skips_build_and_dependency_outputs() {
+    fn discovers_typescript_and_graphql_but_skips_build_and_dependency_outputs() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -403,6 +436,16 @@ mod tests {
         for path in ["src/a.js", "src/b.jsx", "src/c.ts", "src/d.tsx"] {
             fs::write(repository.join(path), "export function indexed() {}").unwrap();
         }
+        fs::write(
+            repository.join("src/schema.graphql"),
+            "type Query { indexed: Boolean! }",
+        )
+        .unwrap();
+        fs::write(
+            repository.join("src/operation.gql"),
+            "query Indexed { indexed }",
+        )
+        .unwrap();
         fs::write(
             repository.join("package.json"),
             r#"{"name":"@example/app"}"#,
@@ -427,6 +470,7 @@ mod tests {
         assert_eq!(sources.typescript.len(), 4);
         assert_eq!(sources.typescript_manifests.len(), 1);
         assert_eq!(sources.typescript_configs.len(), 1);
+        assert_eq!(sources.graphql.len(), 2);
         assert!(
             sources
                 .typescript

@@ -1,4 +1,5 @@
 use crate::workspace_registry::WorkspaceRegistry;
+use beholder_adapters_graphql::{FRONTEND_VERSION as GRAPHQL_FRONTEND_VERSION, GraphqlSource};
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_adapters_protobuf::{
     FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, SourceCompiler, facts as protobuf_facts,
@@ -16,8 +17,9 @@ use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, FRONTEND_VERSION as ELIXIR_FRONTEND_VERSION,
     RESOLVER_VERSION as ELIXIR_RESOLVER_VERSION, diagnostics_from_analysis as elixir_diagnostics,
     entities_from_analysis as elixir_entities, generated_entities as elixir_generated_entities,
-    generated_observations as elixir_generated_observations, grpc_bindings as elixir_grpc_bindings,
-    observations_from_analysis as elixir_observations,
+    generated_observations as elixir_generated_observations,
+    graphql_resolver_bindings as elixir_graphql_resolver_bindings,
+    grpc_bindings as elixir_grpc_bindings, observations_from_analysis as elixir_observations,
     resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
 use beholder_adapters_treesitter_rust::{
@@ -27,10 +29,12 @@ use beholder_adapters_treesitter_rust::{
     tonic_bindings,
 };
 use beholder_adapters_treesitter_typescript::{
-    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION,
-    GrpcBindingInput as TypescriptGrpcBindingInput,
+    FRONTEND_VERSION as TYPESCRIPT_FRONTEND_VERSION, GraphqlFactInput, GraphqlResolverInput,
+    GraphqlResolverSource, GrpcBindingInput as TypescriptGrpcBindingInput,
     RESOLVER_VERSION as TYPESCRIPT_RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis,
-    TypescriptRepository, diagnostics_from_analysis as typescript_diagnostics,
+    TypescriptRepository, collect_graphql_facts as collect_typescript_graphql_facts,
+    collect_graphql_resolvers as collect_typescript_graphql_resolvers,
+    diagnostics_from_analysis as typescript_diagnostics,
     entities_from_analysis as typescript_entities, grpc_bindings as typescript_grpc_bindings,
     observations_from_analysis as typescript_observations,
     resolve_repository_calls as resolve_typescript_repository_calls,
@@ -38,8 +42,8 @@ use beholder_adapters_treesitter_typescript::{
     unresolved_call_diagnostics as unresolved_typescript_call_diagnostics,
 };
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, EntityFact, RepositoryFacts, RepositoryState,
-    Workspace, WorkspaceView,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
+    Observation, RepositoryFacts, RepositoryState, Workspace, WorkspaceView,
 };
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
@@ -94,6 +98,7 @@ struct AnalysisVersions {
     typescript_frontend: &'static str,
     typescript_resolver: &'static str,
     protobuf_frontend: &'static str,
+    graphql_frontend: &'static str,
     rule_pack: &'static str,
 }
 
@@ -107,46 +112,66 @@ const CURRENT_ANALYSIS_VERSIONS: AnalysisVersions = AnalysisVersions {
     typescript_frontend: TYPESCRIPT_FRONTEND_VERSION,
     typescript_resolver: TYPESCRIPT_RESOLVER_VERSION,
     protobuf_frontend: PROTOBUF_FRONTEND_VERSION,
+    graphql_frontend: GRAPHQL_FRONTEND_VERSION,
     rule_pack: CORE_RULE_PACK_VERSION,
 };
+
+#[derive(Clone, Copy, Default)]
+struct RepositoryLanguages {
+    rust: bool,
+    elixir: bool,
+    csharp: bool,
+    typescript: bool,
+    protobuf: bool,
+    graphql: bool,
+}
 
 impl AnalysisVersions {
     fn repository_key(
         self,
         fingerprint: String,
-        has_rust: bool,
-        has_elixir: bool,
-        has_csharp: bool,
-        has_typescript: bool,
-        has_protobuf: bool,
+        languages: RepositoryLanguages,
     ) -> RepositoryAnalysisKey {
         RepositoryAnalysisKey {
             fingerprint,
-            rust: has_rust.then_some((self.rust_frontend, self.rust_resolver)),
-            elixir: has_elixir.then_some((self.elixir_frontend, self.elixir_resolver)),
-            csharp: has_csharp.then_some((self.csharp_frontend, self.csharp_resolver)),
-            typescript: has_typescript
+            rust: languages
+                .rust
+                .then_some((self.rust_frontend, self.rust_resolver)),
+            elixir: languages
+                .elixir
+                .then_some((self.elixir_frontend, self.elixir_resolver)),
+            csharp: languages
+                .csharp
+                .then_some((self.csharp_frontend, self.csharp_resolver)),
+            typescript: languages
+                .typescript
                 .then_some((self.typescript_frontend, self.typescript_resolver)),
-            protobuf: has_protobuf.then_some(self.protobuf_frontend),
+            protobuf: languages.protobuf.then_some(self.protobuf_frontend),
+            graphql: languages.graphql.then_some(self.graphql_frontend),
         }
     }
 
     fn workspace_identity(self, repositories: &[RepositorySources]) -> String {
         let key = self.repository_key(
             String::new(),
-            repositories.iter().any(|sources| !sources.rust.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.elixir.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.csharp.is_empty() || !sources.csharp_projects.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.typescript.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.protobuf.is_empty() || !sources.protobuf_source.is_empty()),
+            RepositoryLanguages {
+                rust: repositories.iter().any(|sources| !sources.rust.is_empty()),
+                elixir: repositories
+                    .iter()
+                    .any(|sources| !sources.elixir.is_empty()),
+                csharp: repositories.iter().any(|sources| {
+                    !sources.csharp.is_empty() || !sources.csharp_projects.is_empty()
+                }),
+                typescript: repositories
+                    .iter()
+                    .any(|sources| !sources.typescript.is_empty()),
+                protobuf: repositories.iter().any(|sources| {
+                    !sources.protobuf.is_empty() || !sources.protobuf_source.is_empty()
+                }),
+                graphql: repositories
+                    .iter()
+                    .any(|sources| !sources.graphql.is_empty()),
+            },
         );
         format!("{}:core-rules:{}", key.analysis_identity(), self.rule_pack)
     }
@@ -201,6 +226,7 @@ struct RepositoryAnalysisSources<'a> {
     typescript: &'a [(PathBuf, String, SourceLanguage)],
     typescript_manifests: &'a [(PathBuf, String)],
     typescript_configs: &'a [(PathBuf, String)],
+    graphql: &'a [(PathBuf, String)],
     descriptors: &'a [(PathBuf, Vec<u8>)],
 }
 
@@ -487,6 +513,7 @@ impl IndexScheduler {
                 let result = scheduler
                     .begin("checkpoint")
                     .and_then(|_active| store.checkpoint());
+                drop(store);
                 scheduler.checkpointing.store(false, Ordering::Release);
                 match result {
                     Ok(()) => tracing::info!(
@@ -518,11 +545,11 @@ impl IndexScheduler {
             reconciliation_period,
         );
         reconciliation.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
+        'run: loop {
             let dirty = tokio::select! {
                 _ = self.changed.notified() => true,
                 _ = reconciliation.tick() => self.mark_registered(&workspaces),
-                _ = self.shutdown.notified() => return,
+                _ = self.shutdown.notified() => break 'run,
             };
             if !dirty {
                 continue;
@@ -537,7 +564,7 @@ impl IndexScheduler {
                     _ = self.changed.notified() => last_change = Instant::now(),
                     _ = &mut quiet => break,
                     _ = &mut maximum => break,
-                    _ = self.shutdown.notified() => return,
+                    _ = self.shutdown.notified() => break 'run,
                 }
             }
             let scheduler = self.clone();
@@ -552,6 +579,9 @@ impl IndexScheduler {
             } else {
                 self.schedule_checkpoint(checkpoint_store);
             }
+        }
+        while self.checkpointing.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -647,15 +677,21 @@ impl IndexScheduler {
             typescript: typescript_sources,
             typescript_manifests,
             typescript_configs,
+            graphql,
             descriptors,
         } = sources;
         let key = versions.repository_key(
             state.fingerprint.clone(),
-            !rust_sources.is_empty(),
-            !elixir_sources.is_empty(),
-            !csharp_sources.is_empty() || !csharp_projects.is_empty() || !unity_prefabs.is_empty(),
-            !typescript_sources.is_empty(),
-            !descriptors.is_empty(),
+            RepositoryLanguages {
+                rust: !rust_sources.is_empty(),
+                elixir: !elixir_sources.is_empty(),
+                csharp: !csharp_sources.is_empty()
+                    || !csharp_projects.is_empty()
+                    || !unity_prefabs.is_empty(),
+                typescript: !typescript_sources.is_empty(),
+                protobuf: !descriptors.is_empty(),
+                graphql: !graphql.is_empty(),
+            },
         );
         let analysis_identity = key.analysis_identity();
         let (rust_frontend, rust_resolver) = key.rust.unwrap_or(("_", "_"));
@@ -675,6 +711,7 @@ impl IndexScheduler {
             .join(typescript_frontend)
             .join(typescript_resolver)
             .join(key.protobuf.unwrap_or("_"))
+            .join(key.graphql.unwrap_or("_"))
             .join(format!("{}.json", state.fingerprint));
         if let Ok(file) = File::open(&path)
             && let Ok(analysis) =
@@ -916,6 +953,8 @@ impl IndexScheduler {
             &csharp_projects,
             &csharp_repository_source_refs,
         ));
+        let graphql_resolver_bindings =
+            elixir_graphql_resolver_bindings(&state.repository.identity, &elixir_sources);
         let mut typescript_analyses = Vec::new();
         let analyzed_typescript = self.analysis_pool.install(|| {
             typescript_sources
@@ -935,6 +974,7 @@ impl IndexScheduler {
                     Ok::<_, String>((
                         path.as_path(),
                         analysis.clone(),
+                        source.as_str(),
                         typescript_observations(
                             &state.repository.identity,
                             &analysis,
@@ -948,16 +988,16 @@ impl IndexScheduler {
                 .collect::<Vec<_>>()
         });
         for analysis in analyzed_typescript {
-            let (path, analysis, source_observations, source_entities, source_diagnostics) =
+            let (path, analysis, source, source_observations, source_entities, source_diagnostics) =
                 analysis?;
             observations.extend(source_observations);
             entities.extend(source_entities);
             diagnostics.extend(source_diagnostics);
-            typescript_analyses.push((path, analysis));
+            typescript_analyses.push((path, analysis, source));
         }
         let typescript_sources = typescript_analyses
             .iter()
-            .map(|(path, analysis)| (*path, analysis.as_ref()))
+            .map(|(path, analysis, _)| (*path, analysis.as_ref()))
             .collect::<Vec<_>>();
         let typescript_manifest_refs = typescript_manifests
             .iter()
@@ -967,6 +1007,22 @@ impl IndexScheduler {
             .iter()
             .map(|(path, source)| (path.as_path(), source.as_str()))
             .collect::<Vec<_>>();
+        let typescript_graphql_sources = typescript_analyses
+            .iter()
+            .map(|(path, analysis, source)| GraphqlResolverSource {
+                path,
+                analysis,
+                source,
+            })
+            .collect::<Vec<_>>();
+        let graphql_resolvers = collect_typescript_graphql_resolvers(GraphqlResolverInput {
+            repository: &state.repository.identity,
+            sources: &typescript_graphql_sources,
+            manifests: &typescript_manifest_refs,
+        });
+        observations.extend(graphql_resolvers.observations);
+        entities.extend(graphql_resolvers.entities);
+        diagnostics.extend(graphql_resolvers.diagnostics);
         resolve_typescript_repository_calls(
             &state.repository.identity,
             &mut observations,
@@ -987,12 +1043,61 @@ impl IndexScheduler {
                 state.repository.identity.clone(),
                 typescript_analyses
                     .iter()
-                    .map(|(path, analysis)| ((*path).to_path_buf(), analysis.as_ref().clone()))
+                    .map(|(path, analysis, _)| ((*path).to_path_buf(), analysis.as_ref().clone()))
                     .collect(),
                 typescript_manifests.to_vec(),
                 typescript_configs.to_vec(),
             )
         });
+        let graphql_sources = graphql
+            .iter()
+            .map(|(path, source)| GraphqlSource {
+                path,
+                source,
+                owner: None,
+            })
+            .collect::<Vec<_>>();
+        let graphql = collect_typescript_graphql_facts(GraphqlFactInput {
+            repository: &state.repository.identity,
+            sources: &typescript_graphql_sources,
+            schemas: &graphql_sources,
+        });
+        entities.extend(graphql.entities);
+        observations.extend(graphql.observations);
+        diagnostics.extend(graphql.diagnostics);
+        let graphql_fields = entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::GraphqlField)
+            .filter_map(|entity| {
+                let path = entity.id.as_str().strip_prefix("graphql-field://")?;
+                let (parent, field) = path.split_once('/')?;
+                Some(((parent, field), entity.id.as_str()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        observations.extend(graphql_resolver_bindings.into_iter().filter_map(|binding| {
+            let field = binding
+                .parent
+                .as_deref()
+                .and_then(|parent| {
+                    graphql_fields
+                        .get(&(parent, binding.field.as_str()))
+                        .copied()
+                })
+                .or_else(|| {
+                    let mut fields = graphql_fields
+                        .iter()
+                        .filter(|((_, name), _)| *name == binding.field)
+                        .map(|(_, id)| *id);
+                    let field = fields.next()?;
+                    fields.next().is_none().then_some(field)
+                })?;
+            Some(Observation::dependency(
+                field,
+                DependencyRelation::ResolvedBy,
+                binding.resolver,
+                binding.evidence,
+            ))
+        }));
         let descriptor_facts = self.analysis_pool.install(|| {
             descriptors
                 .par_iter()
@@ -1142,6 +1247,7 @@ fn index_workspace_versioned(
             typescript,
             typescript_manifests,
             typescript_configs,
+            graphql,
             protobuf,
             protobuf_source,
         } = sources;
@@ -1161,6 +1267,7 @@ fn index_workspace_versioned(
                         + typescript.len()
                         + typescript_manifests.len()
                         + typescript_configs.len()
+                        + graphql.len()
                         + protobuf_source.len()
                 }
             };
@@ -1178,6 +1285,7 @@ fn index_workspace_versioned(
                     typescript: &typescript,
                     typescript_manifests: &typescript_manifests,
                     typescript_configs: &typescript_configs,
+                    graphql: &graphql,
                     descriptors: &protobuf,
                 },
                 versions,
@@ -1769,6 +1877,167 @@ mod tests {
     }
 
     #[test]
+    fn repository_analysis_indexes_graphql_sources() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-graphql-cache-{unique}"));
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "graphql-state".into(),
+        };
+        let graphql = vec![(
+            PathBuf::from("src/package.graphql"),
+            "type Query { order: Order } type Order { status: String total: String } type Mutation { initializeOrder(input: InitializeOrderInput!, mode: OrderMode): ID } type Subscription { order: ID } input InitializeOrderInput { id: ID! } enum OrderMode { PREVIEW COMMIT } query OrderQuery { order { status total } } query Package { packageTemplatePreview { id } }"
+                .into(),
+        )];
+        let elixir = vec![(
+            PathBuf::from("lib/schema/mutations.ex"),
+            r#"
+            defmodule Checkout.Schema.Mutations do
+              field :initialize_order, :initialize_order_payload do
+                resolve(&Checkout.Resolvers.InitializeOrder.run/3)
+              end
+            end
+            defmodule Checkout.Resolvers.InitializeOrder do
+              def run(_, _, _), do: :ok
+            end
+            defmodule Checkout.Schema do
+              object :order do
+                field :status, :string do
+                  resolve fn order, _ -> Checkout.Orders.status(order) end
+                end
+              end
+              subscription do
+                field :order, :id do
+                  resolve fn args, _ -> Checkout.Orders.load(args) end
+                end
+              end
+            end
+            "#
+            .into(),
+        )];
+        let typescript = vec![(
+            PathBuf::from("src/order.ts"),
+            r#"
+            /** @gqlType Order */
+            export class OrderModel {
+              /** @gqlField total */
+              total() { return "10.00" }
+            }
+            "#
+            .into(),
+            SourceLanguage::TypeScript,
+        )];
+        let manifests = vec![(
+            PathBuf::from("package.json"),
+            r#"{"dependencies":{"grats":"0.0.34"}}"#.into(),
+        )];
+        let scheduler = IndexScheduler::new(cache.clone());
+        let (analysis, status, identity) = scheduler
+            .repository_observations_versioned(
+                &state,
+                RepositoryAnalysisSources {
+                    graphql: &graphql,
+                    elixir: &elixir,
+                    typescript: &typescript,
+                    typescript_manifests: &manifests,
+                    ..Default::default()
+                },
+                CURRENT_ANALYSIS_VERSIONS,
+            )
+            .unwrap();
+
+        assert_eq!(status, CacheStatus::Miss);
+        assert_eq!(
+            identity,
+            format!(
+                "elixir:{ELIXIR_FRONTEND_VERSION}:{ELIXIR_RESOLVER_VERSION}:typescript:{TYPESCRIPT_FRONTEND_VERSION}:{TYPESCRIPT_RESOLVER_VERSION}:graphql:{GRAPHQL_FRONTEND_VERSION}"
+            )
+        );
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-operation://Package"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::Selects,
+                    )
+                && observation.to.as_str() == "graphql-field://Query/packageTemplatePreview"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Query/order"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::Selects,
+                    )
+                && observation.to.as_str() == "graphql-field://Order/status"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Order/status"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str()
+                    == "repo://repo/elixir/Checkout.Schema/__absinthe_order_status_resolver/2"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Order/total"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str() == "repo://repo/typescript/src/order/OrderModel/total"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Mutation/initializeOrder"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str()
+                    == "repo://repo/elixir/Checkout.Resolvers.InitializeOrder/run/3"
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Subscription/order"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(
+                        beholder_domain::DependencyRelation::ResolvedBy,
+                    )
+                && observation.to.as_str()
+                    == "repo://repo/elixir/Checkout.Schema/__absinthe_subscription_order_resolver/2"
+        }));
+        assert!(analysis.entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-type://InitializeOrderInput"
+                && entity.kind == beholder_domain::EntityKind::GraphqlType
+                && entity.metadata
+                    == Some(beholder_domain::EntityMetadata::GraphqlType {
+                        kind: beholder_domain::GraphqlTypeKind::Input,
+                    })
+        }));
+        assert!(analysis.entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-argument://Mutation/initializeOrder/input"
+                && entity.kind == beholder_domain::EntityKind::GraphqlArgument
+        }));
+        assert!(analysis.entities.iter().any(|entity| {
+            entity.id.as_str() == "graphql-enum-value://OrderMode/PREVIEW"
+                && entity.kind == beholder_domain::EntityKind::GraphqlEnumValue
+        }));
+        assert!(analysis.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Mutation/initializeOrder"
+                && observation.relation
+                    == beholder_domain::SemanticRelation::Structural(
+                        beholder_domain::StructuralRelation::RequestType,
+                    )
+                && observation.to.as_str() == "graphql-type://InitializeOrderInput"
+        }));
+        scheduler.clear_cache().unwrap();
+    }
+
+    #[test]
     fn parallel_source_analysis_is_deterministic() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1899,6 +2168,7 @@ mod tests {
             typescript_frontend: "typescript-1",
             typescript_resolver: "typescript-resolver-1",
             protobuf_frontend: "protobuf-1",
+            graphql_frontend: "graphql-1",
             rule_pack: "rules-1",
         };
         let changed = AnalysisVersions {
@@ -1911,110 +2181,128 @@ mod tests {
             typescript_frontend: "typescript-2",
             typescript_resolver: "typescript-resolver-2",
             protobuf_frontend: "protobuf-2",
+            graphql_frontend: "graphql-2",
             ..versions
         };
 
         for (languages, expected) in [
             (
-                (true, false, false, false, false),
+                (true, false, false, false, false, false),
                 "rust:rust-1:rust-resolver-1",
             ),
             (
-                (false, true, false, false, false),
+                (false, true, false, false, false, false),
                 "elixir:elixir-1:elixir-resolver-1",
             ),
             (
-                (false, false, true, false, false),
+                (false, false, true, false, false, false),
                 "csharp:csharp-1:csharp-resolver-1",
             ),
             (
-                (false, false, false, true, false),
+                (false, false, false, true, false, false),
                 "typescript:typescript-1:typescript-resolver-1",
             ),
-            ((false, false, false, false, true), "protobuf:protobuf-1"),
-            ((false, false, false, false, false), "none"),
+            (
+                (false, false, false, false, true, false),
+                "protobuf:protobuf-1",
+            ),
+            (
+                (false, false, false, false, false, true),
+                "graphql:graphql-1",
+            ),
+            ((false, false, false, false, false, false), "none"),
         ] {
-            let (rust, elixir, csharp, typescript, protobuf) = languages;
-            let key =
-                versions.repository_key("state".into(), rust, elixir, csharp, typescript, protobuf);
+            let (rust, elixir, csharp, typescript, protobuf, graphql) = languages;
+            let languages = RepositoryLanguages {
+                rust,
+                elixir,
+                csharp,
+                typescript,
+                protobuf,
+                graphql,
+            };
+            let key = versions.repository_key("state".into(), languages);
             assert_eq!(key.analysis_identity(), expected);
-            if rust || elixir || csharp || typescript || protobuf {
-                assert_ne!(
-                    key,
-                    changed.repository_key(
-                        "state".into(),
-                        rust,
-                        elixir,
-                        csharp,
-                        typescript,
-                        protobuf,
-                    )
-                );
+            if rust || elixir || csharp || typescript || protobuf || graphql {
+                assert_ne!(key, changed.repository_key("state".into(), languages));
             }
         }
 
+        let rust = RepositoryLanguages {
+            rust: true,
+            ..Default::default()
+        };
+        let elixir = RepositoryLanguages {
+            elixir: true,
+            ..Default::default()
+        };
+        let csharp = RepositoryLanguages {
+            csharp: true,
+            ..Default::default()
+        };
+        let typescript = RepositoryLanguages {
+            typescript: true,
+            ..Default::default()
+        };
+        let protobuf = RepositoryLanguages {
+            protobuf: true,
+            ..Default::default()
+        };
+        let graphql = RepositoryLanguages {
+            graphql: true,
+            ..Default::default()
+        };
+
         assert_eq!(
-            versions.repository_key("state".into(), true, false, false, false, false),
+            versions.repository_key("state".into(), rust),
             AnalysisVersions {
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
                 csharp_frontend: "irrelevant",
                 csharp_resolver: "irrelevant",
                 protobuf_frontend: "irrelevant",
+                graphql_frontend: "irrelevant",
                 typescript_frontend: "irrelevant",
                 typescript_resolver: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), true, false, false, false, false)
+            .repository_key("state".into(), rust)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, true, false, false, false),
+            versions.repository_key("state".into(), elixir),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
                 csharp_frontend: "irrelevant",
                 csharp_resolver: "irrelevant",
                 protobuf_frontend: "irrelevant",
+                graphql_frontend: "irrelevant",
                 typescript_frontend: "irrelevant",
                 typescript_resolver: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, true, false, false, false)
+            .repository_key("state".into(), elixir)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, false, true, false, false),
+            versions.repository_key("state".into(), csharp),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
                 protobuf_frontend: "irrelevant",
+                graphql_frontend: "irrelevant",
                 typescript_frontend: "irrelevant",
                 typescript_resolver: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, true, false, false)
+            .repository_key("state".into(), csharp)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, false, false, true, false),
-            AnalysisVersions {
-                rust_frontend: "irrelevant",
-                rust_resolver: "irrelevant",
-                elixir_frontend: "irrelevant",
-                elixir_resolver: "irrelevant",
-                csharp_frontend: "irrelevant",
-                csharp_resolver: "irrelevant",
-                protobuf_frontend: "irrelevant",
-                rule_pack: "irrelevant",
-                ..versions
-            }
-            .repository_key("state".into(), false, false, false, true, false)
-        );
-        assert_eq!(
-            versions.repository_key("state".into(), false, false, false, false, true),
+            versions.repository_key("state".into(), typescript),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
@@ -2022,12 +2310,46 @@ mod tests {
                 elixir_resolver: "irrelevant",
                 csharp_frontend: "irrelevant",
                 csharp_resolver: "irrelevant",
-                typescript_frontend: "irrelevant",
-                typescript_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                graphql_frontend: "irrelevant",
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, false, false, true)
+            .repository_key("state".into(), typescript)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), protobuf),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
+                elixir_frontend: "irrelevant",
+                elixir_resolver: "irrelevant",
+                csharp_frontend: "irrelevant",
+                csharp_resolver: "irrelevant",
+                typescript_frontend: "irrelevant",
+                typescript_resolver: "irrelevant",
+                graphql_frontend: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), protobuf)
+        );
+        assert_eq!(
+            versions.repository_key("state".into(), graphql),
+            AnalysisVersions {
+                rust_frontend: "irrelevant",
+                rust_resolver: "irrelevant",
+                elixir_frontend: "irrelevant",
+                elixir_resolver: "irrelevant",
+                csharp_frontend: "irrelevant",
+                csharp_resolver: "irrelevant",
+                typescript_frontend: "irrelevant",
+                typescript_resolver: "irrelevant",
+                protobuf_frontend: "irrelevant",
+                rule_pack: "irrelevant",
+                ..versions
+            }
+            .repository_key("state".into(), graphql)
         );
     }
 
@@ -2054,6 +2376,7 @@ mod tests {
             typescript_frontend: "1",
             typescript_resolver: "1",
             protobuf_frontend: "1",
+            graphql_frontend: "1",
             rule_pack: "1",
         };
 
@@ -2143,6 +2466,7 @@ mod tests {
             typescript_frontend: "1",
             typescript_resolver: "1",
             protobuf_frontend: "1",
+            graphql_frontend: "1",
             rule_pack: "1",
         };
 
@@ -2729,22 +3053,29 @@ mod tests {
     }
 
     #[test]
-    fn typescript_grpc_workspace_resolves_client_contract_messages_and_server() {
+    fn graphql_workspace_resolves_operation_through_grpc_to_server() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let state = std::env::temp_dir().join(format!("beholder-typescript-grpc-{unique}"));
         let contracts = state.join("contracts");
+        let spa = state.join("spa");
         let client = state.join("client");
         let server = state.join("server");
         for directory in [
             contracts.as_path(),
+            spa.join("src").as_path(),
             client.join("src").as_path(),
             server.join("src").as_path(),
         ] {
             fs::create_dir_all(directory).unwrap();
         }
+        fs::write(
+            client.join("package.json"),
+            r#"{"dependencies":{"grats":"1.0.0"}}"#,
+        )
+        .unwrap();
         fs::write(
             contracts.join("checkout.proto"),
             r#"
@@ -2754,6 +3085,25 @@ mod tests {
             message InitializeOrderResponse {}
             service RPCService {
               rpc InitializeOrder(InitializeOrderRequest) returns (InitializeOrderResponse);
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            spa.join("src/Checkout.gql.tsx"),
+            r#"
+            export const InitializeOrder_Query = gql(`
+              query InitializeOrder_Query { initializeOrder { id } }
+            `);
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            spa.join("src/Checkout.tsx"),
+            r#"
+            import { InitializeOrder_Query } from "./Checkout.gql";
+            export function Checkout() {
+              return useQuery(InitializeOrder_Query);
             }
             "#,
         )
@@ -2784,9 +3134,12 @@ mod tests {
             client.join("src/caller.ts"),
             r#"
             import { RPCServiceClientImpl } from "./generated";
-            export function initializeOrder() {
-              const client = new RPCServiceClientImpl({} as Rpc);
-              return client.initializeOrder({});
+            export class InitializeOrderResolver {
+              /** @gqlQueryField initializeOrder */
+              static query() {
+                const client = new RPCServiceClientImpl({} as Rpc);
+                return client.initializeOrder({});
+              }
             }
             "#,
         )
@@ -2810,13 +3163,23 @@ mod tests {
         let workspace = registry
             .register(
                 "typescript-grpc".into(),
-                vec![contracts.clone(), client.clone(), server.clone()],
+                vec![
+                    contracts.clone(),
+                    spa.clone(),
+                    client.clone(),
+                    server.clone(),
+                ],
                 Vec::new(),
             )
             .unwrap();
         let client_identity = beholder_adapters_git::repository_identity(&client).unwrap();
+        let spa_identity = beholder_adapters_git::repository_identity(&spa).unwrap();
         let server_identity = beholder_adapters_git::repository_identity(&server).unwrap();
-        let caller = format!("repo://{client_identity}/typescript/src/caller/initializeOrder");
+        let caller = format!("repo://{spa_identity}/typescript/src/Checkout/Checkout");
+        let graphql_operation = "graphql-operation://InitializeOrder_Query";
+        let graphql_field = "graphql-field://Query/initializeOrder";
+        let resolver =
+            format!("repo://{client_identity}/typescript/src/caller/InitializeOrderResolver/query");
         let generated_client = format!(
             "repo://{client_identity}/typescript/src/generated/RPCServiceClientImpl/initializeOrder"
         );
@@ -2837,6 +3200,9 @@ mod tests {
             path.nodes
                 == [
                     caller.as_str(),
+                    graphql_operation,
+                    graphql_field,
+                    resolver.as_str(),
                     generated_client.as_str(),
                     operation,
                     implementation.as_str(),

@@ -127,6 +127,7 @@ pub enum StructuralRelation {
 pub enum DependencyRelation {
     BindsContract,
     Calls,
+    CallsGraphql,
     CallsRpc,
     ConsumedBy,
     Implements,
@@ -144,6 +145,7 @@ impl DependencyRelation {
         match self {
             Self::BindsContract => "binds_contract",
             Self::Calls => "calls",
+            Self::CallsGraphql => "calls_graphql",
             Self::CallsRpc => "calls_rpc",
             Self::ConsumedBy => "consumed_by",
             Self::Implements => "implements",
@@ -240,7 +242,11 @@ pub struct EntityFact {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum EntityKind {
     Callable,
+    GraphqlArgument,
+    GraphqlEnumValue,
     GraphqlField,
+    GraphqlOperation,
+    GraphqlType,
     GrpcOperation,
     KafkaTopic,
     Namespace,
@@ -254,8 +260,27 @@ pub enum EntityKind {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum EntityMetadata {
+    GraphqlOperation { kind: GraphqlOperationKind },
+    GraphqlType { kind: GraphqlTypeKind },
     ProtoMethod { cardinality: RpcCardinality },
     ProtoType { kind: ProtoTypeKind },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GraphqlOperationKind {
+    Mutation,
+    Query,
+    Subscription,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GraphqlTypeKind {
+    Enum,
+    Input,
+    Interface,
+    Object,
+    Scalar,
+    Union,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -279,10 +304,14 @@ impl EntityFact {
         metadata: Option<EntityMetadata>,
     ) -> Result<Self, &'static str> {
         match (kind, metadata) {
-            (EntityKind::ProtoMethod, Some(EntityMetadata::ProtoMethod { .. }))
+            (EntityKind::GraphqlOperation, Some(EntityMetadata::GraphqlOperation { .. }))
+            | (EntityKind::GraphqlType, Some(EntityMetadata::GraphqlType { .. }))
+            | (EntityKind::ProtoMethod, Some(EntityMetadata::ProtoMethod { .. }))
             | (EntityKind::ProtoType, Some(EntityMetadata::ProtoType { .. }))
             | (
                 EntityKind::Callable
+                | EntityKind::GraphqlArgument
+                | EntityKind::GraphqlEnumValue
                 | EntityKind::GraphqlField
                 | EntityKind::GrpcOperation
                 | EntityKind::KafkaTopic

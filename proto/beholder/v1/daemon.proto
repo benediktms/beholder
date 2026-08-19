@@ -78,6 +78,27 @@ enum EntityKind {
   ENTITY_KIND_PROTO_MESSAGE = 10;
   ENTITY_KIND_PROTO_SERVICE = 11;
   ENTITY_KIND_UNITY_PREFAB = 12;
+  ENTITY_KIND_GRAPHQL_OPERATION = 13;
+  ENTITY_KIND_GRAPHQL_TYPE = 14;
+  ENTITY_KIND_GRAPHQL_ARGUMENT = 15;
+  ENTITY_KIND_GRAPHQL_ENUM_VALUE = 16;
+}
+
+enum GraphqlTypeKind {
+  GRAPHQL_TYPE_KIND_UNKNOWN = 0;
+  GRAPHQL_TYPE_KIND_ENUM = 1;
+  GRAPHQL_TYPE_KIND_INPUT = 2;
+  GRAPHQL_TYPE_KIND_INTERFACE = 3;
+  GRAPHQL_TYPE_KIND_OBJECT = 4;
+  GRAPHQL_TYPE_KIND_SCALAR = 5;
+  GRAPHQL_TYPE_KIND_UNION = 6;
+}
+
+enum GraphqlOperationKind {
+  GRAPHQL_OPERATION_KIND_UNKNOWN = 0;
+  GRAPHQL_OPERATION_KIND_MUTATION = 1;
+  GRAPHQL_OPERATION_KIND_QUERY = 2;
+  GRAPHQL_OPERATION_KIND_SUBSCRIPTION = 3;
 }
 
 enum EntityOrigin {
@@ -104,6 +125,8 @@ message EntityMetadata {
   oneof metadata {
     ProtoTypeKind proto_type_kind = 1;
     RpcCardinality rpc_cardinality = 2;
+    GraphqlTypeKind graphql_type_kind = 3;
+    GraphqlOperationKind graphql_operation_kind = 4;
   }
 }
 
@@ -134,6 +157,7 @@ enum RelationKind {
   RELATION_KIND_IMPORTS = 13;
   RELATION_KIND_REQUIRES = 14;
   RELATION_KIND_IMPLEMENTS = 15;
+  RELATION_KIND_CALLS_GRAPHQL = 17;
 }
 
 message Entity {

@@ -22,6 +22,26 @@ pub(super) struct ElixirModule {
     pub(super) aliases: Vec<ElixirAlias>,
     pub(super) references: Vec<ElixirModuleReference>,
     pub(super) grpc: GrpcModule,
+    pub(super) absinthe_resolvers: Vec<AbsintheResolver>,
+    pub(super) absinthe_field_imports: Vec<AbsintheFieldImport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct AbsintheResolver {
+    pub(super) field: String,
+    pub(super) public_field: Option<String>,
+    pub(super) owner: String,
+    pub(super) parent: Option<String>,
+    pub(super) module: String,
+    pub(super) function: String,
+    pub(super) arity: usize,
+    pub(super) line: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct AbsintheFieldImport {
+    pub(super) imported: String,
+    pub(super) parent: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

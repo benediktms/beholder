@@ -674,6 +674,8 @@ fn push_module(
         aliases: inherited_aliases,
         references: Vec::new(),
         grpc: Default::default(),
+        absinthe_resolvers: Vec::new(),
+        absinthe_field_imports: Vec::new(),
     });
     module
 }
@@ -703,6 +705,21 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
             let aliases = modules[module].aliases.clone();
             let name = modules[module].name.clone();
             super::grpc::observe_call(&mut modules[module].grpc, node, source, &aliases, &name);
+            if let Some((resolver, inline_function)) = absinthe_resolver(AbsintheResolverInput {
+                node,
+                source,
+                aliases: &aliases,
+                references: &modules[module].references,
+                current_module: &name,
+            }) {
+                modules[module].absinthe_resolvers.push(resolver);
+                if let Some(function) = inline_function {
+                    modules[module].functions.push(function);
+                }
+            }
+            if let Some(import) = absinthe_field_import(node, source) {
+                modules[module].absinthe_field_imports.push(import);
+            }
         }
         match call_target(node, source) {
             Some("defmodule" | "defprotocol") => {
@@ -903,6 +920,236 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
     for child in node.named_children(&mut cursor) {
         collect(child, source, module, modules);
     }
+}
+
+fn find_resolve_argument<'tree>(node: Node<'tree>, source: &[u8]) -> Option<(Node<'tree>, usize)> {
+    if node.kind() == "pair"
+        && node
+            .child_by_field_name("key")
+            .and_then(|key| text(key, source))
+            .is_some_and(|key| key.trim().trim_end_matches(':') == "resolve")
+        && let Some(argument) = node.child_by_field_name("value")
+    {
+        return Some((argument, node.start_position().row + 1));
+    }
+    if node.kind() == "call"
+        && call_target(node, source) == Some("resolve")
+        && let Some(argument) = arguments(node).and_then(|arguments| arguments.named_child(0))
+    {
+        return Some((argument, node.start_position().row + 1));
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| find_resolve_argument(child, source))
+}
+
+struct AbsintheOwner {
+    identity: String,
+    parent: Option<String>,
+}
+
+fn pascal_case(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(characters).collect()
+            })
+        })
+        .collect()
+}
+
+fn string_keyword(node: Node<'_>, source: &[u8], key: &str) -> Option<String> {
+    keyword_value(node, source, key)
+        .and_then(|value| text(value, source))
+        .and_then(|value| value.strip_prefix('"')?.strip_suffix('"'))
+        .map(str::to_owned)
+}
+
+fn absinthe_owner(mut node: Node<'_>, source: &[u8]) -> AbsintheOwner {
+    while let Some(parent) = node.parent() {
+        node = parent;
+        if node.kind() != "call" {
+            continue;
+        }
+        match call_target(node, source) {
+            Some(owner @ ("query" | "mutation" | "subscription")) => {
+                return AbsintheOwner {
+                    identity: owner.into(),
+                    parent: Some(
+                        match owner {
+                            "query" => "Query",
+                            "mutation" => "Mutation",
+                            _ => "Subscription",
+                        }
+                        .into(),
+                    ),
+                };
+            }
+            Some("object" | "interface") => {
+                if let Some(owner) = arguments(node)
+                    .and_then(|arguments| arguments.named_child(0))
+                    .filter(|owner| owner.kind() == "atom")
+                    .and_then(|owner| text(owner, source))
+                {
+                    return AbsintheOwner {
+                        identity: owner.trim_start_matches(':').into(),
+                        parent: Some(
+                            string_keyword(node, source, "name")
+                                .unwrap_or_else(|| pascal_case(owner.trim_start_matches(':'))),
+                        ),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    AbsintheOwner {
+        identity: "schema".into(),
+        parent: None,
+    }
+}
+
+fn absinthe_field_import(node: Node<'_>, source: &[u8]) -> Option<AbsintheFieldImport> {
+    if call_target(node, source) != Some("import_fields") {
+        return None;
+    }
+    let imported = arguments(node)
+        .and_then(|arguments| arguments.named_child(0))
+        .filter(|imported| imported.kind() == "atom")
+        .and_then(|imported| text(imported, source))?
+        .trim_start_matches(':')
+        .to_owned();
+    Some(AbsintheFieldImport {
+        imported,
+        parent: absinthe_owner(node, source).parent?,
+    })
+}
+
+struct AbsintheResolverInput<'a, 'tree> {
+    node: Node<'tree>,
+    source: &'a [u8],
+    aliases: &'a [ElixirAlias],
+    references: &'a [ElixirModuleReference],
+    current_module: &'a str,
+}
+
+fn absinthe_resolver(
+    input: AbsintheResolverInput<'_, '_>,
+) -> Option<(AbsintheResolver, Option<ElixirFunction>)> {
+    let AbsintheResolverInput {
+        node,
+        source,
+        aliases,
+        references,
+        current_module,
+    } = input;
+    if call_target(node, source) != Some("field") {
+        return None;
+    }
+    let field = arguments(node)
+        .and_then(|arguments| arguments.named_child(0))
+        .filter(|field| field.kind() == "atom")
+        .and_then(|field| text(field, source))?
+        .trim_start_matches(':')
+        .to_owned();
+    let public_field = string_keyword(node, source, "name");
+    let owner = absinthe_owner(node, source);
+    let (argument, line) = find_resolve_argument(node, source)?;
+    if let Some(capture) = text(argument, source).and_then(|capture| capture.strip_prefix('&')) {
+        let (target, arity) = capture.rsplit_once('/')?;
+        let (module, function) = target.rsplit_once('.').unwrap_or((current_module, target));
+        return Some((
+            AbsintheResolver {
+                field,
+                public_field,
+                owner: owner.identity,
+                parent: owner.parent,
+                module: module.into(),
+                function: function.into(),
+                arity: arity.parse().ok()?,
+                line,
+            },
+            None,
+        ));
+    }
+    if argument.kind() == "call"
+        && let Some(factory) = parsed_call(argument, source)
+    {
+        return Some((
+            AbsintheResolver {
+                field,
+                public_field,
+                owner: owner.identity,
+                parent: owner.parent,
+                module: factory.module.unwrap_or_else(|| current_module.into()),
+                function: factory.name,
+                arity: factory.arity,
+                line,
+            },
+            None,
+        ));
+    }
+    if argument.kind() != "anonymous_function" {
+        return None;
+    }
+    let mut cursor = argument.walk();
+    let clauses = argument
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "stab_clause")
+        .collect::<Vec<_>>();
+    let arity = clauses
+        .first()?
+        .child_by_field_name("left")
+        .map_or(0, |arguments| arguments.named_child_count());
+    if clauses.iter().any(|clause| {
+        clause
+            .child_by_field_name("left")
+            .map_or(0, |arguments| arguments.named_child_count())
+            != arity
+    }) {
+        return None;
+    }
+    let function = format!("__absinthe_{}_{field}_resolver", owner.identity);
+    let mut calls = Vec::new();
+    for clause in clauses {
+        collect_calls(clause.child_by_field_name("right")?, source, &mut calls);
+    }
+    for call in &mut calls {
+        if let Some(module) = &mut call.module {
+            *module = expand_alias(module, aliases, current_module);
+        }
+    }
+    let imports = references
+        .iter()
+        .filter(|reference| reference.kind == ElixirModuleReferenceKind::Import)
+        .cloned()
+        .collect();
+    let mut struct_uses = function_struct_uses(argument, source);
+    for r#use in &mut struct_uses {
+        r#use.module = expand_alias(&r#use.module, aliases, current_module);
+    }
+    Some((
+        AbsintheResolver {
+            field,
+            public_field,
+            owner: owner.identity,
+            parent: owner.parent,
+            module: current_module.into(),
+            function: function.clone(),
+            arity,
+            line,
+        },
+        Some(ElixirFunction {
+            name: function,
+            arity,
+            line,
+            calls,
+            struct_uses,
+            imports,
+        }),
+    ))
 }
 
 pub fn analyze(source: &str) -> Result<ElixirAnalysis, Box<dyn Error>> {
