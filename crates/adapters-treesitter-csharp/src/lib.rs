@@ -1,4 +1,4 @@
-pub const FRONTEND_VERSION: &str = "7";
+pub const FRONTEND_VERSION: &str = "8";
 pub const RESOLVER_VERSION: &str = "13";
 
 mod analysis;

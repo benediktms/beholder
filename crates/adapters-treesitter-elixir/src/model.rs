@@ -6,6 +6,7 @@ use super::grpc::GrpcModule;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ElixirAnalysis {
     pub(super) modules: Vec<ElixirModule>,
+    pub(super) parse_error_lines: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

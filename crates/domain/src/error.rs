@@ -3,6 +3,7 @@ use std::{error::Error, fmt};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeholderErrorCode {
     DaemonUnavailable,
+    SourceRecoveryUnsafe,
     TransportGrpc,
     WorkspaceIndexFailed,
     WorkspaceIndexWorkerFailed,
@@ -15,6 +16,7 @@ impl BeholderErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DaemonUnavailable => "beholder.daemon.unavailable",
+            Self::SourceRecoveryUnsafe => "beholder.source.recovery_unsafe",
             Self::TransportGrpc => "beholder.transport.grpc",
             Self::WorkspaceIndexFailed => "beholder.workspace.index_failed",
             Self::WorkspaceIndexWorkerFailed => "beholder.workspace.index_worker_failed",
@@ -33,6 +35,7 @@ impl std::str::FromStr for BeholderErrorCode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "beholder.daemon.unavailable" => Ok(Self::DaemonUnavailable),
+            "beholder.source.recovery_unsafe" => Ok(Self::SourceRecoveryUnsafe),
             "beholder.transport.grpc" => Ok(Self::TransportGrpc),
             "beholder.workspace.index_failed" => Ok(Self::WorkspaceIndexFailed),
             "beholder.workspace.index_worker_failed" => Ok(Self::WorkspaceIndexWorkerFailed),
@@ -61,6 +64,63 @@ pub struct BeholderError {
     message: String,
     source: Option<Box<dyn Error + Send + Sync>>,
 }
+
+/// A source cannot satisfy Beholder's conservative tree-recovery policy.
+///
+/// Adapters discard a complete top-level unit containing an `ERROR` node and
+/// may publish unaffected sibling units. Any `MISSING` node aborts the source
+/// because a missing delimiter can change the apparent nesting of later code.
+#[derive(Debug)]
+pub struct UnsafeTreeRecovery {
+    language: &'static str,
+    reason: &'static str,
+}
+
+impl UnsafeTreeRecovery {
+    pub fn new(language: &'static str, reason: &'static str) -> Self {
+        Self { language, reason }
+    }
+}
+
+impl fmt::Display for UnsafeTreeRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} source cannot be recovered safely: {}",
+            self.language, self.reason
+        )
+    }
+}
+
+impl Error for UnsafeTreeRecovery {}
+
+#[derive(Debug)]
+pub struct SourceAnalysisError {
+    unsafe_recovery: bool,
+    message: String,
+}
+
+impl SourceAnalysisError {
+    pub fn from_source(path: &std::path::Path, error: Box<dyn Error>) -> Self {
+        let message = format!("failed to analyze {}: {error}", path.display());
+        Self {
+            unsafe_recovery: error.downcast_ref::<UnsafeTreeRecovery>().is_some(),
+            message,
+        }
+    }
+
+    pub fn is_unsafe_recovery(&self) -> bool {
+        self.unsafe_recovery
+    }
+}
+
+impl fmt::Display for SourceAnalysisError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for SourceAnalysisError {}
 
 impl BeholderError {
     pub fn new(
@@ -120,6 +180,7 @@ mod tests {
     fn exposes_stable_public_diagnostics_without_printing_internal_causes() {
         for code in [
             BeholderErrorCode::DaemonUnavailable,
+            BeholderErrorCode::SourceRecoveryUnsafe,
             BeholderErrorCode::TransportGrpc,
             BeholderErrorCode::WorkspaceIndexFailed,
             BeholderErrorCode::WorkspaceIndexWorkerFailed,
@@ -146,5 +207,19 @@ mod tests {
         );
         assert!(!format!("{error:?}").contains("password"));
         assert!(error.source().unwrap().to_string().contains("password"));
+    }
+
+    #[test]
+    fn classifies_unsafe_tree_recovery_without_matching_error_text() {
+        let error = SourceAnalysisError::from_source(
+            std::path::Path::new("src/broken.rs"),
+            Box::new(UnsafeTreeRecovery::new(
+                "Rust",
+                "missing syntax may change nesting",
+            )),
+        );
+
+        assert!(error.is_unsafe_recovery());
+        assert!(error.to_string().contains("src/broken.rs"));
     }
 }

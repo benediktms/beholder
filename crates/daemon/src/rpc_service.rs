@@ -1,5 +1,5 @@
 use crate::daemon::BeholderDaemon;
-use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind};
+use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, SourceAnalysisError};
 use beholder_dto::{DEFAULT_MAX_HOPS, Revisioned, WhyResult};
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
@@ -156,9 +156,14 @@ impl Daemon for BeholderDaemon {
         let scheduler = self.scheduler.clone();
         let store = self.store.clone();
         let (observation_count, published) = tokio::task::spawn_blocking(move || {
-            scheduler
-                .index(&store, &workspace)
-                .map_err(|error| error.to_string())
+            scheduler.index(&store, &workspace).map_err(|error| {
+                (
+                    error
+                        .downcast_ref::<SourceAnalysisError>()
+                        .is_some_and(SourceAnalysisError::is_unsafe_recovery),
+                    error.to_string(),
+                )
+            })
         })
         .await
         .map_err(|source| {
@@ -171,14 +176,21 @@ impl Daemon for BeholderDaemon {
                 .with_source(source),
             )
         })?
-        .map_err(|source| {
-            operation_status(
-                BeholderError::new(
-                    BeholderErrorKind::FailedPrecondition,
+        .map_err(|(unsafe_recovery, source)| {
+            let (code, message) = if unsafe_recovery {
+                (
+                    BeholderErrorCode::SourceRecoveryUnsafe,
+                    "source recovery was unsafe; the previous analysis remains active",
+                )
+            } else {
+                (
                     BeholderErrorCode::WorkspaceIndexFailed,
                     "workspace indexing failed",
                 )
-                .with_source(std::io::Error::other(source)),
+            };
+            operation_status(
+                BeholderError::new(BeholderErrorKind::FailedPrecondition, code, message)
+                    .with_source(std::io::Error::other(source)),
             )
         })?;
         if published {

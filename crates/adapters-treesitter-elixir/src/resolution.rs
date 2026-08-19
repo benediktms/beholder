@@ -178,9 +178,16 @@ pub fn diagnostics_from_analysis(
     path: &Path,
 ) -> Vec<AnalysisDiagnostic> {
     analysis
-        .modules
+        .parse_error_lines
         .iter()
-        .flat_map(|module| {
+        .map(|line| AnalysisDiagnostic {
+            code: "elixir.parse_recovery".into(),
+            severity: AnalysisDiagnosticSeverity::Warning,
+            path: path.into(),
+            line: u32::try_from(*line).ok(),
+            detail: Some("tree-sitter discarded an invalid Elixir syntax unit".into()),
+        })
+        .chain(analysis.modules.iter().flat_map(|module| {
             module
                 .references
                 .iter()
@@ -195,7 +202,7 @@ pub fn diagnostics_from_analysis(
                         reference.name
                     )),
                 })
-        })
+        }))
         .collect()
 }
 

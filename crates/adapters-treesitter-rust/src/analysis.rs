@@ -1,7 +1,7 @@
 use super::model::*;
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, StructuralRelation,
+    Observation, StructuralRelation, UnsafeTreeRecovery,
 };
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -77,25 +77,53 @@ fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<RustCall>) {
     }
 }
 
+fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
+    if node.is_error() || node.is_missing() {
+        lines.push(node.start_position().row + 1);
+        *missing |= node.is_missing();
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_parse_errors(child, lines, missing);
+    }
+}
+
 pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let tree = parser
         .parse(source, None)
         .ok_or("Rust parser returned no tree")?;
-    if tree.root_node().has_error() {
-        return Err("failed to parse Rust source".into());
-    }
-
     let source_bytes = source.as_bytes();
+    let root = tree.root_node();
+    let mut parse_error_lines = Vec::new();
+    let mut missing = false;
+    collect_parse_errors(root, &mut parse_error_lines, &mut missing);
+    if missing {
+        return Err(UnsafeTreeRecovery::new("Rust", "missing syntax may change nesting").into());
+    }
+    parse_error_lines.sort_unstable();
+    parse_error_lines.dedup();
     let mut functions = Vec::new();
-    collect_functions(
-        tree.root_node(),
-        source_bytes,
-        &mut Vec::new(),
-        &mut functions,
-    );
-    let tonic = super::tonic::analyze(tree.root_node(), source_bytes, &functions);
+    if parse_error_lines.is_empty() {
+        collect_functions(root, source_bytes, &mut Vec::new(), &mut functions);
+    } else {
+        let mut cursor = root.walk();
+        for child in root
+            .named_children(&mut cursor)
+            .filter(|child| !child.has_error())
+        {
+            collect_functions(child, source_bytes, &mut Vec::new(), &mut functions);
+        }
+        if functions.is_empty() {
+            return Err(UnsafeTreeRecovery::new("Rust", "no unaffected definitions remain").into());
+        }
+    }
+    let tonic = if parse_error_lines.is_empty() {
+        super::tonic::analyze(root, source_bytes, &functions)
+    } else {
+        Default::default()
+    };
     Ok(RustAnalysis {
         functions: functions
             .into_iter()
@@ -111,6 +139,7 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
             })
             .collect(),
         tonic,
+        parse_error_lines,
     })
 }
 
@@ -198,6 +227,17 @@ pub fn entities_from_analysis(
 }
 
 pub fn diagnostics_from_analysis(analysis: &RustAnalysis, path: &Path) -> Vec<AnalysisDiagnostic> {
+    let mut diagnostics = analysis
+        .parse_error_lines
+        .iter()
+        .map(|line| AnalysisDiagnostic {
+            code: "rust.parse_recovery".into(),
+            severity: AnalysisDiagnosticSeverity::Warning,
+            path: path.into(),
+            line: u32::try_from(*line).ok(),
+            detail: Some("tree-sitter discarded an invalid Rust syntax unit".into()),
+        })
+        .collect::<Vec<_>>();
     let mut calls = analysis
         .functions
         .iter()
@@ -211,9 +251,9 @@ pub fn diagnostics_from_analysis(analysis: &RustAnalysis, path: &Path) -> Vec<An
                     .any(|(line, name)| *line == call.line && name == &call.name)
         });
     let Some(first) = calls.next() else {
-        return Vec::new();
+        return diagnostics;
     };
-    vec![AnalysisDiagnostic {
+    diagnostics.push(AnalysisDiagnostic {
         code: "rust.receiver_method_resolution_unavailable".into(),
         severity: AnalysisDiagnosticSeverity::KnownLimitation,
         path: path.into(),
@@ -222,7 +262,8 @@ pub fn diagnostics_from_analysis(analysis: &RustAnalysis, path: &Path) -> Vec<An
             "{} receiver method calls are indexed without type resolution",
             1 + calls.count()
         )),
-    }]
+    });
+    diagnostics
 }
 
 pub fn observations(
@@ -235,4 +276,23 @@ pub fn observations(
         &analyze(source)?,
         path,
     ))
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovers_only_unaffected_top_level_functions() {
+        let analysis = analyze("fn broken() { @ }\nfn safe() {}").unwrap();
+        assert_eq!(analysis.functions.len(), 1);
+        assert_eq!(analysis.functions[0].name, "safe");
+        assert!(!analysis.parse_error_lines.is_empty());
+    }
+
+    #[test]
+    fn rejects_missing_delimiters_that_can_change_nesting() {
+        let error = analyze("fn broken() {\nfn nested() {}\n").unwrap_err();
+        assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
+    }
 }
