@@ -32,8 +32,8 @@ impl SourceLanguage {
         match self {
             Self::JavaScript => "21-javascript",
             Self::Jsx => "22-jsx",
-            Self::TypeScript => "21-typescript",
-            Self::Tsx => "21-tsx",
+            Self::TypeScript => "22-typescript",
+            Self::Tsx => "22-tsx",
         }
     }
 }

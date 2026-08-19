@@ -1341,6 +1341,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_generic_import_types() {
+        let analysis = analyze(
+            "declare type Mock<T = any> = import('vitest').Mock<T>;",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert!(analysis.parse_error_lines.is_empty());
+    }
+
+    #[test]
     fn preserves_decorator_invocations_as_calls() {
         let source = "function controller() {} function traced() {} function helper() {} @controller() class Api { @traced() run() { helper(); } }";
         let calls = observations(source, "src/decorated.ts")
