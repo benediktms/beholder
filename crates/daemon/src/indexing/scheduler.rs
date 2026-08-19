@@ -513,6 +513,7 @@ impl IndexScheduler {
                 let result = scheduler
                     .begin("checkpoint")
                     .and_then(|_active| store.checkpoint());
+                drop(store);
                 scheduler.checkpointing.store(false, Ordering::Release);
                 match result {
                     Ok(()) => tracing::info!(
@@ -544,11 +545,11 @@ impl IndexScheduler {
             reconciliation_period,
         );
         reconciliation.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
+        'run: loop {
             let dirty = tokio::select! {
                 _ = self.changed.notified() => true,
                 _ = reconciliation.tick() => self.mark_registered(&workspaces),
-                _ = self.shutdown.notified() => return,
+                _ = self.shutdown.notified() => break 'run,
             };
             if !dirty {
                 continue;
@@ -563,7 +564,7 @@ impl IndexScheduler {
                     _ = self.changed.notified() => last_change = Instant::now(),
                     _ = &mut quiet => break,
                     _ = &mut maximum => break,
-                    _ = self.shutdown.notified() => return,
+                    _ = self.shutdown.notified() => break 'run,
                 }
             }
             let scheduler = self.clone();
@@ -578,6 +579,9 @@ impl IndexScheduler {
             } else {
                 self.schedule_checkpoint(checkpoint_store);
             }
+        }
+        while self.checkpointing.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
