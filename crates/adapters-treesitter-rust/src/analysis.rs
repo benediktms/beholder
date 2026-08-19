@@ -3,10 +3,14 @@ use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, StructuralRelation, UnsafeTreeRecovery,
 };
+use ra_ap_syntax::{
+    AstNode, Edition, SourceFile,
+    ast::{self, HasName},
+};
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-fn collect_functions<'tree>(
+fn collect_tree_sitter_functions<'tree>(
     node: Node<'tree>,
     source: &[u8],
     scope: &mut Vec<String>,
@@ -52,28 +56,39 @@ fn collect_functions<'tree>(
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_functions(child, source, scope, functions);
+        collect_tree_sitter_functions(child, source, scope, functions);
     }
     if pushed_scope {
         scope.pop();
     }
 }
 
-fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<RustCall>) {
+fn collect_tree_sitter_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<RustCall>) {
     if node.kind() == "call_expression"
         && let Some(function) = node.child_by_field_name("function")
-        && let Ok(text) = function.utf8_text(source)
-        && let Some(name) = text.rsplit([':', '.']).find(|part| !part.is_empty())
     {
-        calls.push(RustCall {
-            name: name.to_owned(),
-            line: node.start_position().row + 1,
-            receiver_method: function.kind() == "field_expression",
-        });
+        let callee = if function.kind() == "generic_function" {
+            function.child_by_field_name("function").unwrap_or(function)
+        } else {
+            function
+        };
+        let receiver_method = callee.kind() == "field_expression";
+        let name = if receiver_method {
+            callee.child_by_field_name("field")
+        } else {
+            Some(callee)
+        };
+        if let Some(name) = name.and_then(|name| name.utf8_text(source).ok()) {
+            calls.push(RustCall {
+                name: name.to_owned(),
+                line: node.start_position().row + 1,
+                receiver_method,
+            });
+        }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_calls(child, source, calls);
+        collect_tree_sitter_calls(child, source, calls);
     }
 }
 
@@ -88,12 +103,10 @@ fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bo
     }
 }
 
-pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or("Rust parser returned no tree")?;
+fn analyze_tree_sitter(
+    source: &str,
+    tree: &tree_sitter::Tree,
+) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
     let source_bytes = source.as_bytes();
     let root = tree.root_node();
     let mut parse_error_lines = Vec::new();
@@ -106,14 +119,14 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync
     parse_error_lines.dedup();
     let mut functions = Vec::new();
     if parse_error_lines.is_empty() {
-        collect_functions(root, source_bytes, &mut Vec::new(), &mut functions);
+        collect_tree_sitter_functions(root, source_bytes, &mut Vec::new(), &mut functions);
     } else {
         let mut cursor = root.walk();
         for child in root
             .named_children(&mut cursor)
             .filter(|child| !child.has_error())
         {
-            collect_functions(child, source_bytes, &mut Vec::new(), &mut functions);
+            collect_tree_sitter_functions(child, source_bytes, &mut Vec::new(), &mut functions);
         }
         if functions.is_empty() {
             return Err(UnsafeTreeRecovery::new("Rust", "no unaffected definitions remain").into());
@@ -129,7 +142,7 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync
             .into_iter()
             .map(|(name, qualified_name, function)| {
                 let mut calls = Vec::new();
-                collect_calls(function, source_bytes, &mut calls);
+                collect_tree_sitter_calls(function, source_bytes, &mut calls);
                 RustFunction {
                     name,
                     qualified_name,
@@ -140,6 +153,117 @@ pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync
             .collect(),
         tonic,
         parse_error_lines,
+    })
+}
+
+fn line_starts(source: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(source.match_indices('\n').map(|(index, _)| index + 1))
+        .collect()
+}
+
+fn line_at(lines: &[usize], offset: ra_ap_syntax::TextSize) -> usize {
+    lines.partition_point(|start| *start <= usize::from(offset))
+}
+
+fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction> {
+    let lines = line_starts(source);
+    file.syntax()
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .filter(|function| {
+            function
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .all(|ancestor| ast::Fn::cast(ancestor).is_none())
+        })
+        .filter_map(|function| {
+            let name = function.name()?.text().to_string();
+            let mut scope = function
+                .syntax()
+                .ancestors()
+                .skip(1)
+                .filter_map(|ancestor| {
+                    if let Some(module) = ast::Module::cast(ancestor.clone()) {
+                        return module.name().map(|name| name.text().to_string());
+                    }
+                    ast::Impl::cast(ancestor).and_then(|impl_| {
+                        let target = impl_.self_ty()?.syntax().text().to_string();
+                        let owner = impl_.trait_().map_or_else(
+                            || target.clone(),
+                            |trait_| format!("{}-for-{target}", trait_.syntax().text()),
+                        );
+                        Some(format!("impl/{owner}"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            scope.reverse();
+            let qualified_name = scope
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(name.as_str()))
+                .collect::<Vec<_>>()
+                .join("/");
+            let calls = function
+                .syntax()
+                .descendants()
+                .filter(|node| {
+                    node.ancestors()
+                        .find_map(ast::Fn::cast)
+                        .is_some_and(|owner| owner.syntax() == function.syntax())
+                })
+                .filter_map(|node| {
+                    if let Some(call) = ast::CallExpr::cast(node.clone()) {
+                        let callee = call.expr()?;
+                        return Some(RustCall {
+                            name: callee.syntax().text().to_string(),
+                            line: line_at(&lines, node.text_range().start()),
+                            receiver_method: false,
+                        });
+                    }
+                    ast::MethodCallExpr::cast(node).and_then(|call| {
+                        Some(RustCall {
+                            name: call.name_ref()?.text().to_string(),
+                            line: line_at(&lines, call.syntax().text_range().start()),
+                            receiver_method: true,
+                        })
+                    })
+                })
+                .collect();
+            Some(RustFunction {
+                name,
+                qualified_name,
+                line: line_at(&lines, function.syntax().text_range().start()),
+                calls,
+            })
+        })
+        .collect()
+}
+
+pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("Rust parser returned no tree")?;
+    if !tree.root_node().has_error() {
+        return analyze_tree_sitter(source, &tree);
+    }
+    // ponytail: rust-analyzer recursively drops its syntax tree; keep the recovery path bounded
+    // until its green-tree drop is iterative.
+    if source.len() > 200_000 {
+        return analyze_tree_sitter(source, &tree);
+    }
+    let parsed = SourceFile::parse(source, Edition::CURRENT);
+    if !parsed.errors().is_empty() {
+        return analyze_tree_sitter(source, &tree);
+    }
+    let functions = rust_analyzer_functions(source, &parsed.tree());
+    Ok(RustAnalysis {
+        functions,
+        tonic: Default::default(),
+        parse_error_lines: Vec::new(),
     })
 }
 
@@ -291,5 +415,25 @@ mod recovery_tests {
     fn rejects_missing_delimiters_that_can_change_nesting() {
         let error = analyze("fn broken() {\nfn nested() {}\n").unwrap_err();
         assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
+    }
+
+    #[test]
+    fn parses_current_rust_default_field_values() {
+        let analysis =
+            analyze("struct Options { retries: usize = 3 } fn after_default() { run(); }").unwrap();
+        assert_eq!(analysis.functions[0].name, "after_default");
+        assert_eq!(analysis.functions[0].calls[0].name, "run");
+    }
+
+    #[test]
+    fn preserves_qualified_call_paths() {
+        let analysis =
+            analyze("fn analyze() { super::tonic::analyze(); Default::default(); value.run(); }")
+                .unwrap();
+        let calls = &analysis.functions[0].calls;
+        assert_eq!(calls[0].name, "super::tonic::analyze");
+        assert_eq!(calls[1].name, "Default::default");
+        assert_eq!(calls[2].name, "run");
+        assert!(calls[2].receiver_method);
     }
 }
