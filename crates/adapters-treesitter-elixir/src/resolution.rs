@@ -448,7 +448,7 @@ pub fn observations(
     source: &str,
     path: &Path,
 ) -> Result<Vec<Observation>, Box<dyn Error>> {
-    let analysis = analyze(source)?;
+    let analysis = analyze(source).map_err(|error| -> Box<dyn Error> { error })?;
     let mut observations = observations_from_analysis(repository, &analysis, source, path);
     observations.extend(generated_observations(
         repository,

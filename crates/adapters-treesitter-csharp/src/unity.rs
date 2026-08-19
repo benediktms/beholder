@@ -141,14 +141,14 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
 
 pub fn parse_unity_assemblies(
     sources: &[(PathBuf, String)],
-) -> Result<Vec<CsharpProject>, Box<dyn Error>> {
+) -> Result<Vec<CsharpProject>, Box<dyn Error + Send + Sync>> {
     let definitions = sources
         .iter()
         .map(|(path, source)| {
             let source = source.strip_prefix('\u{feff}').unwrap_or(source);
             Ok((path, serde_json::from_str::<AssemblyDefinition>(source)?))
         })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
     let paths = definitions
         .iter()
         .map(|(path, definition)| (definition.name.as_str(), path.as_path()))

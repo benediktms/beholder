@@ -28,7 +28,10 @@ fn attribute(event: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<P
         .map(|value| normalized_path(&value))
 }
 
-pub fn parse_project(path: &Path, source: &str) -> Result<CsharpProject, Box<dyn Error>> {
+pub fn parse_project(
+    path: &Path,
+    source: &str,
+) -> Result<CsharpProject, Box<dyn Error + Send + Sync>> {
     let mut reader = Reader::from_str(source);
     reader.config_mut().trim_text(true);
     let mut assembly = None;

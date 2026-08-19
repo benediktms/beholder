@@ -1,27 +1,44 @@
 use beholder_adapters_git::repository_state_bytes;
+#[cfg(test)]
 use beholder_adapters_treesitter_csharp::{UnityPrefab, parse_unity_meta, parse_unity_prefab};
+#[cfg(test)]
 use beholder_adapters_treesitter_typescript::SourceLanguage;
+#[cfg(test)]
 use beholder_domain::RepositoryState;
+use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot, WorkspaceAnalyzer};
+#[cfg(test)]
+use std::{borrow::Cow, fs::File, io::BufReader};
 use std::{
-    borrow::Cow,
     error::Error,
-    fs::{self, File},
-    io::BufReader,
+    fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+#[cfg(test)]
 pub(super) type RustSources = Vec<(PathBuf, String)>;
+#[cfg(test)]
 pub(super) type ElixirSources = Vec<(PathBuf, String)>;
+#[cfg(test)]
 pub(super) type CsharpSources = Vec<(PathBuf, Vec<u8>)>;
+#[cfg(test)]
 pub(super) type CsharpProjects = Vec<(PathBuf, String)>;
+#[cfg(test)]
 pub(super) type UnityMetas = Vec<(PathBuf, String, Vec<u8>)>;
+#[cfg(test)]
 pub(super) type TypescriptSources = Vec<(PathBuf, String, SourceLanguage)>;
+#[cfg(test)]
 pub(super) type TypescriptManifests = Vec<(PathBuf, String)>;
+#[cfg(test)]
 pub(super) type TypescriptConfigs = Vec<(PathBuf, String)>;
+#[cfg(test)]
 pub(super) type GraphqlSources = Vec<(PathBuf, String)>;
+#[cfg(test)]
 pub(super) type ProtobufSources = Vec<(PathBuf, Vec<u8>)>;
+#[cfg(test)]
 pub(super) type ProtobufSourceFiles = Vec<(PathBuf, Vec<u8>)>;
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct RepositorySources {
     pub(super) state: RepositoryState,
@@ -46,6 +63,7 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
         ".git"
             | ".next"
             | ".next-server"
+            | ".terraform"
             | ".turbo"
             | "_build"
             | "bin"
@@ -60,6 +78,7 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(super) fn is_index_input(path: &Path) -> bool {
     !path.components().any(|component| {
         component
@@ -97,6 +116,7 @@ pub(super) fn is_index_input(path: &Path) -> bool {
         }))
 }
 
+#[cfg(test)]
 pub(super) fn decode_csharp_source(bytes: &[u8]) -> (Cow<'_, str>, bool) {
     if let Some(bytes) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
         return match std::str::from_utf8(bytes) {
@@ -130,6 +150,7 @@ pub(super) fn decode_csharp_source(bytes: &[u8]) -> (Cow<'_, str>, bool) {
     }
 }
 
+#[cfg(test)]
 fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -145,6 +166,7 @@ fn source_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dy
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn repository_sources(
     root: &Path,
     descriptor_paths: &[PathBuf],
@@ -376,15 +398,123 @@ pub(super) fn repository_sources(
     })
 }
 
+fn accepted_files(
+    directory: &Path,
+    analyzers: &[Box<dyn WorkspaceAnalyzer>],
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if !entry.file_name().to_str().is_some_and(is_ignored_directory) {
+                accepted_files(&path, analyzers, files)?;
+            }
+        } else if analyzers.iter().any(|analyzer| analyzer.accepts(&path)) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn repository_snapshot(
+    root: &Path,
+    descriptor_paths: &[PathBuf],
+    analyzers: &[Box<dyn WorkspaceAnalyzer>],
+) -> Result<RepositorySnapshot, Box<dyn Error>> {
+    if !root.is_dir() {
+        return Err(format!("repository does not exist: {}", root.display()).into());
+    }
+    let mut files = Vec::new();
+    accepted_files(root, analyzers, &mut files)?;
+    files.sort();
+    let mut inputs = files
+        .into_iter()
+        .map(|path| {
+            Ok(RepositoryInput {
+                path: path.strip_prefix(root)?.to_path_buf(),
+                content: Arc::from(fs::read(path)?),
+                kind: InputKind::Source,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    inputs.extend(
+        descriptor_paths
+            .iter()
+            .map(|path| {
+                Ok(RepositoryInput {
+                    path: path.strip_prefix(root)?.to_path_buf(),
+                    content: Arc::from(fs::read(path)?),
+                    kind: InputKind::ProtobufDescriptor,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+    );
+    inputs.sort_by(|left, right| (&left.path, left.kind).cmp(&(&right.path, right.kind)));
+    let state = repository_state_bytes(
+        root,
+        inputs
+            .iter()
+            .map(|input| (input.path.as_path(), input.content.as_ref())),
+    )?;
+    Ok(RepositorySnapshot {
+        base: root.to_path_buf(),
+        state,
+        inputs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beholder_adapters_graphql::GraphqlAnalyzer;
+    use beholder_adapters_treesitter_rust::RustAnalyzer;
     use std::time::SystemTime;
 
     #[test]
     fn rejects_missing_repository() {
         let error = repository_sources(Path::new("/definitely/missing"), &[]).unwrap_err();
         assert!(error.to_string().contains("repository does not exist"));
+    }
+
+    #[test]
+    fn discovers_the_union_of_analyzer_inputs_and_preserves_ignored_directories() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repository = std::env::temp_dir().join(format!("beholder-analyzer-inputs-{unique}"));
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join("target")).unwrap();
+        fs::create_dir_all(repository.join("infra/.terraform/modules/dependency")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        fs::write(
+            repository.join("src/schema.graphql"),
+            "type Query { ok: Boolean! }",
+        )
+        .unwrap();
+        fs::write(repository.join("target/generated.rs"), "fn ignored() {}").unwrap();
+        fs::write(
+            repository.join("infra/.terraform/modules/dependency/generated.rs"),
+            "fn ignored() {}",
+        )
+        .unwrap();
+        fs::write(repository.join("README.md"), "ignored").unwrap();
+        let analyzers: Vec<Box<dyn WorkspaceAnalyzer>> = vec![
+            Box::new(RustAnalyzer::new(repository.join("cache"))),
+            Box::new(GraphqlAnalyzer),
+        ];
+
+        let snapshot = repository_snapshot(&repository, &[], &analyzers).unwrap();
+        assert_eq!(
+            snapshot
+                .inputs
+                .iter()
+                .map(|input| input.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("src/lib.rs"), Path::new("src/schema.graphql")]
+        );
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]

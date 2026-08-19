@@ -6,6 +6,10 @@ use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact,
     GraphqlTypeKind, Observation,
 };
+use beholder_indexing::{
+    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
+    RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+};
 use std::{collections::BTreeMap, path::Path};
 
 mod operations;
@@ -24,6 +28,80 @@ pub struct GraphqlSource<'a> {
     pub path: &'a Path,
     pub source: &'a str,
     pub owner: Option<&'a str>,
+}
+
+pub struct GraphqlAnalyzer;
+
+impl WorkspaceAnalyzer for GraphqlAnalyzer {
+    fn metadata(&self) -> AnalyzerMetadata {
+        AnalyzerMetadata {
+            id: "graphql".into(),
+            version: FRONTEND_VERSION.into(),
+        }
+    }
+
+    fn accepts(&self, path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "graphql" | "gql"))
+    }
+
+    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+        let mut active_repositories = Vec::new();
+        let mut repositories = Vec::new();
+        for repository in &snapshot.repositories {
+            let schemas = repository
+                .inputs
+                .iter()
+                .filter(|input| self.accepts(&input.path))
+                .map(|input| {
+                    std::str::from_utf8(&input.content)
+                        .map(|source| GraphqlSource {
+                            path: &input.path,
+                            source,
+                            owner: None,
+                        })
+                        .map_err(|error| {
+                            beholder_domain::SourceAnalysisError::from_source(
+                                &input.path,
+                                Box::new(error),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if schemas.is_empty() {
+                continue;
+            }
+            active_repositories.push(repository.state.repository.identity.clone());
+            let analysis = facts(&repository.state.repository.identity, &schemas);
+            let completeness = if analysis
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"))
+            {
+                AnalysisCompleteness::Incomplete
+            } else {
+                AnalysisCompleteness::Complete
+            };
+            repositories.push(RepositoryContribution {
+                repository: repository.state.repository.identity.clone(),
+                completeness,
+                entities: analysis.entities,
+                grpc_bindings: Vec::new(),
+                observations: analysis.observations,
+                diagnostics: analysis.diagnostics,
+            });
+        }
+        Ok(AnalyzerContribution {
+            metadata: self.metadata(),
+            active_repositories,
+            repositories,
+            overrides: Vec::new(),
+            graphql_resolvers: Vec::new(),
+            diagnostics: Vec::new(),
+            cache: CacheStatistics::default(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

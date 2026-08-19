@@ -1163,7 +1163,7 @@ fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bo
     }
 }
 
-pub fn analyze(source: &str) -> Result<ElixirAnalysis, Box<dyn Error>> {
+pub fn analyze(source: &str) -> Result<ElixirAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_elixir::LANGUAGE.into())?;
     let tree = parser

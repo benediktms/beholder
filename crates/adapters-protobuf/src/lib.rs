@@ -2,6 +2,10 @@ use beholder_domain::{
     EntityFact, EntityKind, EntityMetadata, Observation, ProtoTypeKind, RpcCardinality,
     StructuralRelation,
 };
+use beholder_indexing::{
+    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
+    InputKind, RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+};
 use prost::Message;
 use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
 
@@ -10,6 +14,129 @@ mod compiler;
 pub use compiler::SourceCompiler;
 
 pub const FRONTEND_VERSION: &str = "2";
+
+pub struct ProtobufAnalyzer {
+    compiler: SourceCompiler,
+}
+
+impl ProtobufAnalyzer {
+    pub fn new(cache_dir: std::path::PathBuf) -> Self {
+        Self {
+            compiler: SourceCompiler::new(cache_dir),
+        }
+    }
+}
+
+impl WorkspaceAnalyzer for ProtobufAnalyzer {
+    fn metadata(&self) -> AnalyzerMetadata {
+        AnalyzerMetadata {
+            id: "protobuf".into(),
+            version: FRONTEND_VERSION.into(),
+        }
+    }
+
+    fn accepts(&self, path: &std::path::Path) -> bool {
+        path.extension()
+            .is_some_and(|extension| extension == "proto")
+            || matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("buf.yaml" | "buf.lock")
+            )
+    }
+
+    fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
+        repository
+            .inputs
+            .iter()
+            .any(|input| input.kind == InputKind::ProtobufDescriptor || self.accepts(&input.path))
+    }
+
+    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+        let mut active_repositories = Vec::new();
+        let mut repositories = Vec::new();
+        for repository in &snapshot.repositories {
+            let source_inputs = repository
+                .inputs
+                .iter()
+                .filter(|input| input.kind == InputKind::Source && self.accepts(&input.path))
+                .map(|input| (input.path.clone(), input.content.to_vec()))
+                .collect::<Vec<_>>();
+            let mut descriptors = repository
+                .inputs
+                .iter()
+                .filter(|input| input.kind == InputKind::ProtobufDescriptor)
+                .map(|input| input.content.to_vec())
+                .collect::<Vec<_>>();
+            if source_inputs.is_empty() && descriptors.is_empty() {
+                continue;
+            }
+            active_repositories.push(repository.state.repository.identity.clone());
+            let mut diagnostics = Vec::new();
+            match self
+                .compiler
+                .compile_repository(&repository.base, &source_inputs)
+            {
+                Ok(compiled) => {
+                    descriptors.extend(
+                        compiled
+                            .into_iter()
+                            .map(|descriptor| descriptor.as_ref().clone()),
+                    );
+                }
+                Err(error)
+                    if !descriptors.is_empty()
+                        || repository
+                            .inputs
+                            .iter()
+                            .any(|input| !self.accepts(&input.path)) =>
+                {
+                    diagnostics.push(beholder_domain::AnalysisDiagnostic {
+                        code: "protobuf.compile_failed".into(),
+                        severity: beholder_domain::AnalysisDiagnosticSeverity::Warning,
+                        path: std::path::PathBuf::from("."),
+                        line: None,
+                        detail: Some(error),
+                    });
+                }
+                Err(error) => return Err(std::io::Error::other(error).into()),
+            }
+            let mut entities = Vec::new();
+            let mut observations = Vec::new();
+            for descriptor in descriptors {
+                let descriptor = facts(&descriptor)?;
+                observations.extend(descriptor.observations);
+                for entity in descriptor.entities {
+                    if !entities.contains(&entity) {
+                        entities.push(entity);
+                    }
+                }
+            }
+            repositories.push(RepositoryContribution {
+                repository: repository.state.repository.identity.clone(),
+                completeness: AnalysisCompleteness::Complete,
+                entities,
+                grpc_bindings: Vec::new(),
+                observations,
+                diagnostics,
+            });
+        }
+        Ok(AnalyzerContribution {
+            metadata: self.metadata(),
+            active_repositories,
+            repositories,
+            overrides: Vec::new(),
+            graphql_resolvers: Vec::new(),
+            diagnostics: Vec::new(),
+            cache: CacheStatistics::default(),
+        })
+    }
+
+    fn clear_cache(&self) -> Result<(), AnalyzerError> {
+        self.compiler
+            .clear_memory()
+            .map_err(|error| std::io::Error::other(error).into())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtobufFacts {

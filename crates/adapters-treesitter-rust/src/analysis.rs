@@ -88,7 +88,7 @@ fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bo
     }
 }
 
-pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error>> {
+pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let tree = parser
@@ -271,11 +271,8 @@ pub fn observations(
     source: &str,
     path: &Path,
 ) -> Result<Vec<Observation>, Box<dyn Error>> {
-    Ok(observations_from_analysis(
-        repository,
-        &analyze(source)?,
-        path,
-    ))
+    let analysis = analyze(source).map_err(|error| -> Box<dyn Error> { error })?;
+    Ok(observations_from_analysis(repository, &analysis, path))
 }
 
 #[cfg(test)]

@@ -1,9 +1,7 @@
 [package]
-name = "beholder-adapters-graphql"
+name = "beholder-indexing"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-apollo-parser.workspace = true
 beholder-domain.workspace = true
-beholder-indexing.workspace = true
