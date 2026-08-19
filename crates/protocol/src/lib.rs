@@ -2,6 +2,8 @@ pub mod v1 {
     tonic::include_proto!("beholder.v1");
 }
 
+pub const ERROR_CODE_METADATA_KEY: &str = "beholder-error-code";
+
 mod entity;
 mod query;
 mod workspace;

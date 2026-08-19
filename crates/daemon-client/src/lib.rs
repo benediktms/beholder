@@ -1,14 +1,17 @@
-use beholder_domain::Workspace;
+use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, ImpactResult, TraceResult, WhyResult,
 };
-use beholder_protocol::v1::{
-    ClearCacheRequest, EntityRequest, GarbageCollectRequest, GetStatusRequest, GetStatusResponse,
-    ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-    StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+use beholder_protocol::{
+    ERROR_CODE_METADATA_KEY,
+    v1::{
+        ClearCacheRequest, EntityRequest, GarbageCollectRequest, GetStatusRequest,
+        GetStatusResponse, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
+        ReindexWorkspaceRequest, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+    },
 };
 use std::path::{Path, PathBuf};
-use tonic::transport::Channel;
+use tonic::{Code, Status, transport::Channel};
 
 pub fn socket_path() -> Result<PathBuf, String> {
     Ok(state_dir()?.join("beholder.sock"))
@@ -154,15 +157,59 @@ pub async fn why(
         .try_into()?)
 }
 
-pub async fn reindex_workspace(
-    workspace: String,
-) -> Result<(usize, bool), Box<dyn std::error::Error>> {
-    let response = connect()
+pub async fn reindex_workspace(workspace: String) -> Result<(usize, bool), BeholderError> {
+    let response = operation_client()
         .await?
         .reindex_workspace(ReindexWorkspaceRequest { workspace })
-        .await?
+        .await
+        .map_err(operation_error)?
         .into_inner();
-    Ok((response.observation_count.try_into()?, response.published))
+    let observation_count = response.observation_count.try_into().map_err(|source| {
+        BeholderError::new(
+            BeholderErrorKind::Internal,
+            BeholderErrorCode::WorkspaceObservationCountOverflow,
+            "workspace observation count exceeds client capacity",
+        )
+        .with_source(source)
+    })?;
+    Ok((observation_count, response.published))
+}
+
+async fn operation_client() -> Result<DaemonClient<Channel>, BeholderError> {
+    let endpoint = endpoint().map_err(|source| {
+        BeholderError::new(
+            BeholderErrorKind::Unavailable,
+            BeholderErrorCode::DaemonUnavailable,
+            "Beholder daemon is unavailable",
+        )
+        .with_source(std::io::Error::other(source))
+    })?;
+    DaemonClient::connect(endpoint).await.map_err(|source| {
+        BeholderError::new(
+            BeholderErrorKind::Unavailable,
+            BeholderErrorCode::DaemonUnavailable,
+            "Beholder daemon is unavailable",
+        )
+        .with_source(source)
+    })
+}
+
+fn operation_error(status: Status) -> BeholderError {
+    let kind = match status.code() {
+        Code::InvalidArgument => BeholderErrorKind::InvalidInput,
+        Code::NotFound => BeholderErrorKind::NotFound,
+        Code::FailedPrecondition => BeholderErrorKind::FailedPrecondition,
+        Code::Unavailable => BeholderErrorKind::Unavailable,
+        _ => BeholderErrorKind::Internal,
+    };
+    let code = status
+        .metadata()
+        .get(ERROR_CODE_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(BeholderErrorCode::TransportGrpc);
+    let message = status.message().to_owned();
+    BeholderError::new(kind, code, message).with_source(status)
 }
 
 pub async fn register_workspace(
@@ -214,4 +261,40 @@ pub async fn stop() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(false);
     };
     Ok(client.stop(StopRequest {}).await?.into_inner().accepted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn operation_errors_preserve_codes_independently_from_messages() {
+        for (grpc, expected) in [
+            (Code::InvalidArgument, BeholderErrorKind::InvalidInput),
+            (Code::NotFound, BeholderErrorKind::NotFound),
+            (
+                Code::FailedPrecondition,
+                BeholderErrorKind::FailedPrecondition,
+            ),
+            (Code::Unavailable, BeholderErrorKind::Unavailable),
+            (Code::Internal, BeholderErrorKind::Internal),
+        ] {
+            let mut status = Status::new(grpc, "wording can change");
+            status.metadata_mut().insert(
+                ERROR_CODE_METADATA_KEY,
+                MetadataValue::from_static("beholder.workspace.index_failed"),
+            );
+            let error = operation_error(status);
+            assert_eq!(error.kind(), expected);
+            assert_eq!(error.code(), BeholderErrorCode::WorkspaceIndexFailed);
+            assert_eq!(error.message(), "wording can change");
+            assert!(std::error::Error::source(&error).is_some());
+        }
+
+        assert_eq!(
+            operation_error(Status::permission_denied("denied")).code(),
+            BeholderErrorCode::TransportGrpc
+        );
+    }
 }

@@ -60,11 +60,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_protocol::v1::{
-        ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectRequest,
-        GetStatusRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
-        ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
-        daemon_client::DaemonClient,
+    use beholder_domain::BeholderErrorCode;
+    use beholder_protocol::{
+        ERROR_CODE_METADATA_KEY,
+        v1::{
+            ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectRequest,
+            GetStatusRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
+            ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
+            daemon_client::DaemonClient,
+        },
     };
     use std::{env, fs, path::Path, time::Duration};
 
@@ -134,6 +138,23 @@ mod tests {
         assert_eq!(status.status, "ready");
         assert_eq!(status.protocol_version, 11);
         assert_eq!(status.pid, std::process::id());
+
+        let missing = client
+            .reindex_workspace(ReindexWorkspaceRequest {
+                workspace: "missing".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        assert_eq!(
+            missing
+                .metadata()
+                .get(ERROR_CODE_METADATA_KEY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            BeholderErrorCode::WorkspaceNotRegistered.as_str()
+        );
 
         let first = state.join("repo-a");
         let second = state.join("repo-b");
