@@ -3068,6 +3068,11 @@ mod tests {
             fs::create_dir_all(directory).unwrap();
         }
         fs::write(
+            client.join("package.json"),
+            r#"{"dependencies":{"grats":"1.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
             contracts.join("checkout.proto"),
             r#"
             syntax = "proto3";
