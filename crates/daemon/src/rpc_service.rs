@@ -1,5 +1,7 @@
 use crate::daemon::BeholderDaemon;
+use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind};
 use beholder_dto::{DEFAULT_MAX_HOPS, Revisioned, WhyResult};
+use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
     GarbageCollectRequest, GarbageCollectResponse, GetStatusRequest, GetStatusResponse,
@@ -8,8 +10,8 @@ use beholder_protocol::v1::{
     ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse, TraversalEntityRequest,
     WhyResponse, daemon_server::Daemon,
 };
-use std::path::PathBuf;
-use tonic::{Request, Response, Status};
+use std::{error::Error, path::PathBuf};
+use tonic::{Code, Request, Response, Status, metadata::MetadataValue};
 
 #[tonic::async_trait]
 impl Daemon for BeholderDaemon {
@@ -135,11 +137,21 @@ impl Daemon for BeholderDaemon {
         let workspace = self
             .workspaces
             .lock()
-            .map_err(|_| Status::internal("workspace registry lock poisoned"))?
+            .map_err(|_| {
+                operation_status(BeholderError::new(
+                    BeholderErrorKind::Internal,
+                    BeholderErrorCode::WorkspaceRegistryFailed,
+                    "workspace registry is unavailable",
+                ))
+            })?
             .get(&workspace_name)
             .cloned()
             .ok_or_else(|| {
-                Status::not_found(format!("workspace not registered: {workspace_name}"))
+                operation_status(BeholderError::new(
+                    BeholderErrorKind::NotFound,
+                    BeholderErrorCode::WorkspaceNotRegistered,
+                    format!("workspace not registered: {workspace_name}"),
+                ))
             })?;
         let scheduler = self.scheduler.clone();
         let store = self.store.clone();
@@ -149,15 +161,37 @@ impl Daemon for BeholderDaemon {
                 .map_err(|error| error.to_string())
         })
         .await
-        .map_err(|error| Status::internal(format!("index worker failed: {error}")))?
-        .map_err(Status::failed_precondition)?;
+        .map_err(|source| {
+            operation_status(
+                BeholderError::new(
+                    BeholderErrorKind::Internal,
+                    BeholderErrorCode::WorkspaceIndexWorkerFailed,
+                    "workspace index worker failed",
+                )
+                .with_source(source),
+            )
+        })?
+        .map_err(|source| {
+            operation_status(
+                BeholderError::new(
+                    BeholderErrorKind::FailedPrecondition,
+                    BeholderErrorCode::WorkspaceIndexFailed,
+                    "workspace indexing failed",
+                )
+                .with_source(std::io::Error::other(source)),
+            )
+        })?;
         if published {
             self.scheduler.schedule_checkpoint(self.store.clone());
         }
         Ok(Response::new(ReindexWorkspaceResponse {
-            observation_count: observation_count
-                .try_into()
-                .map_err(|_| Status::internal("observation count exceeds protocol capacity"))?,
+            observation_count: observation_count.try_into().map_err(|_| {
+                operation_status(BeholderError::new(
+                    BeholderErrorKind::Internal,
+                    BeholderErrorCode::WorkspaceObservationCountOverflow,
+                    "workspace observation count exceeds protocol capacity",
+                ))
+            })?,
             published,
         }))
     }
@@ -281,5 +315,64 @@ fn max_hops(value: Option<u32>) -> Result<u32, Status> {
             "max_hops must be greater than zero",
         )),
         value => Ok(value),
+    }
+}
+
+fn operation_status(error: BeholderError) -> Status {
+    let code = match error.kind() {
+        BeholderErrorKind::InvalidInput => Code::InvalidArgument,
+        BeholderErrorKind::NotFound => Code::NotFound,
+        BeholderErrorKind::FailedPrecondition => Code::FailedPrecondition,
+        BeholderErrorKind::Unavailable => Code::Unavailable,
+        BeholderErrorKind::Internal => Code::Internal,
+    };
+    if let Some(source) = error.source() {
+        tracing::error!(
+            error.code = error.code().as_str(),
+            error.kind = ?error.kind(),
+            source = %source,
+            "operation failed"
+        );
+    }
+    let mut status = Status::new(code, error.message().to_owned());
+    if let Ok(value) = MetadataValue::try_from(error.code().as_str()) {
+        status.metadata_mut().insert(ERROR_CODE_METADATA_KEY, value);
+    }
+    status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_errors_map_to_grpc_codes_and_preserve_stable_codes() {
+        for (kind, expected) in [
+            (BeholderErrorKind::InvalidInput, Code::InvalidArgument),
+            (BeholderErrorKind::NotFound, Code::NotFound),
+            (
+                BeholderErrorKind::FailedPrecondition,
+                Code::FailedPrecondition,
+            ),
+            (BeholderErrorKind::Unavailable, Code::Unavailable),
+            (BeholderErrorKind::Internal, Code::Internal),
+        ] {
+            let status = operation_status(BeholderError::new(
+                kind,
+                BeholderErrorCode::TransportGrpc,
+                "safe public message",
+            ));
+            assert_eq!(status.code(), expected);
+            assert_eq!(status.message(), "safe public message");
+            assert_eq!(
+                status
+                    .metadata()
+                    .get(ERROR_CODE_METADATA_KEY)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "beholder.transport.grpc"
+            );
+        }
     }
 }
