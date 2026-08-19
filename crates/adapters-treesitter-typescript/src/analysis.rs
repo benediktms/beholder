@@ -985,9 +985,9 @@ pub(super) fn analyze_with_plugins(
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     let grammar = match language {
-        SourceLanguage::JavaScript | SourceLanguage::Jsx => tree_sitter_javascript::LANGUAGE,
+        SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
+        SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
     parser.set_language(&grammar.into())?;
     let tree = parser
@@ -1327,6 +1327,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
+    }
+
+    #[test]
+    fn parses_keyword_jsx_attributes() {
+        let analysis = analyze(
+            "export default loader => <Loader if static fixedMobile />;",
+            SourceLanguage::Jsx,
+        )
+        .unwrap();
+
+        assert!(analysis.parse_error_lines.is_empty());
     }
 
     #[test]
