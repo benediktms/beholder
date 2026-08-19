@@ -1,0 +1,6 @@
+use contract::bridge_client::BridgeClient;
+
+async fn rust_to_elixir() {
+    let mut client = BridgeClient::new();
+    client.rust_to_elixir().await;
+}

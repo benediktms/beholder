@@ -1,4 +1,5 @@
 use super::{BenchmarkArgs, BenchmarkQueryArgs, CacheCommand, InspectSubject, WorkspaceCommand};
+use crate::stdout;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{clear_cache, garbage_collect, list_workspaces, register_workspace};
 use std::{error::Error, path::Path};
@@ -9,13 +10,17 @@ pub(super) async fn workspace(command: WorkspaceCommand) -> Result<(), Box<dyn E
             name,
             repositories,
             protobuf_descriptors,
-        } => println!(
+        } => stdout(format_args!(
             "{:#?}",
             register_workspace(name, &repositories, &protobuf_descriptors).await?
-        ),
+        ))?,
         WorkspaceCommand::List => {
             for workspace in list_workspaces().await? {
-                println!("{}\t{}", workspace.name, workspace.repositories.len());
+                stdout(format_args!(
+                    "{}\t{}",
+                    workspace.name,
+                    workspace.repositories.len()
+                ))?;
             }
         }
     }
@@ -26,14 +31,14 @@ pub(super) async fn cache(command: CacheCommand) -> Result<(), Box<dyn Error>> {
     match command {
         CacheCommand::Clear => {
             clear_cache().await?;
-            println!("cleared analysis cache");
+            stdout(format_args!("cleared analysis cache"))?;
         }
         CacheCommand::Gc => {
             let collected = garbage_collect().await?;
-            println!(
+            stdout(format_args!(
                 "removed {} repository states · {} -> {} bytes",
                 collected.repository_states_removed, collected.bytes_before, collected.bytes_after
-            );
+            ))?;
         }
     }
     Ok(())
@@ -54,7 +59,7 @@ pub(super) fn inspect(
         InspectSubject::Revisions => store.inspect_revisions()?,
         InspectSubject::Observations => store.inspect_observations(relation)?,
     };
-    println!("{result:#?}");
+    stdout(format_args!("{result:#?}"))?;
     Ok(())
 }
 
@@ -63,20 +68,20 @@ pub(super) fn benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn Error>> {
         &args.storage,
         database_argument(args.database.as_deref())?,
     )?;
-    println!(
+    stdout(format_args!(
         "{}",
         store.benchmark(&args.topology, args.entities, args.fanout, args.depth)?
-    );
+    ))?;
     Ok(())
 }
 
 pub(super) fn benchmark_query(args: BenchmarkQueryArgs) -> Result<(), Box<dyn Error>> {
     let store =
         SemanticStore::benchmark_store(&args.storage, database_argument(Some(&args.database))?)?;
-    println!(
+    stdout(format_args!(
         "{}",
         store.benchmark_queries(&args.topology, args.entities, args.depth)
-    );
+    ))?;
     Ok(())
 }
 

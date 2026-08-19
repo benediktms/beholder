@@ -251,7 +251,7 @@ pub(super) async fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Some(Command::Daemon { command }) => daemon::run(command).await?,
         Some(Command::IndexRust { source, database }) => {
-            index::print_result(index::rust(&source, &database)?);
+            index::print_result(index::rust(&source, &database)?)?;
         }
         Some(Command::ReindexWorkspace { workspace }) => index::workspace(workspace).await?,
         Some(Command::Workspace { command }) => admin::workspace(command).await?,
