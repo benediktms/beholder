@@ -2,12 +2,16 @@ use crate::projection::{evidence_label, plural, projected_paths, write_metadata,
 use beholder_dto::{TraceResult, WhyResult};
 use std::{collections::BTreeSet, fmt::Write};
 
-pub(super) fn trace_human(result: &TraceResult, include_tests: bool) -> String {
+pub(super) fn trace_human(
+    result: &TraceResult,
+    include_tests: bool,
+    include_diagnostics: bool,
+) -> String {
     let projected = projected_paths(&result.nodes, &result.edges, &result.paths, include_tests);
     if projected.is_empty() {
         let mut output = format!("No path from {} to {}", result.query.from, result.query.to);
         write_traversal(&mut output, &result.traversal);
-        write_metadata(&mut output, &result.metadata);
+        write_metadata(&mut output, &result.metadata, include_diagnostics);
         return output;
     }
     let mut output = String::new();
@@ -48,16 +52,20 @@ pub(super) fn trace_human(result: &TraceResult, include_tests: bool) -> String {
         plural(hops as u32, "hop", "hops")
     );
     write_traversal(&mut output, &result.traversal);
-    write_metadata(&mut output, &result.metadata);
+    write_metadata(&mut output, &result.metadata, include_diagnostics);
     output
 }
 
-pub(super) fn why_human(result: &WhyResult, include_tests: bool) -> String {
+pub(super) fn why_human(
+    result: &WhyResult,
+    include_tests: bool,
+    include_diagnostics: bool,
+) -> String {
     let projected = projected_paths(&result.nodes, &result.edges, &result.paths, include_tests);
     if projected.is_empty() {
         let mut output = format!("No path from {} to {}", result.query.from, result.query.to);
         write_traversal(&mut output, &result.traversal);
-        write_metadata(&mut output, &result.metadata);
+        write_metadata(&mut output, &result.metadata, include_diagnostics);
         return output;
     }
     let mut output = String::new();
@@ -77,6 +85,6 @@ pub(super) fn why_human(result: &WhyResult, include_tests: bool) -> String {
         }
     }
     write_traversal(&mut output, &result.traversal);
-    write_metadata(&mut output, &result.metadata);
+    write_metadata(&mut output, &result.metadata, include_diagnostics);
     output
 }

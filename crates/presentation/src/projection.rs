@@ -284,7 +284,11 @@ pub(super) fn plural<'a>(count: u32, singular: &'a str, plural: &'a str) -> &'a 
     if count == 1 { singular } else { plural }
 }
 
-pub(super) fn write_metadata(output: &mut String, metadata: &QueryMetadata) {
+pub(super) fn write_metadata(
+    output: &mut String,
+    metadata: &QueryMetadata,
+    include_diagnostics: bool,
+) {
     let _ = write!(
         output,
         "\nview {} · revision {} · stale={} · indexing={}",
@@ -296,7 +300,9 @@ pub(super) fn write_metadata(output: &mut String, metadata: &QueryMetadata) {
             "\nanalysis incomplete · {} diagnostics",
             metadata.analysis.diagnostics.len()
         );
-        write_diagnostics(output, metadata, "\n", "  ");
+        if include_diagnostics {
+            write_diagnostics(output, metadata, "\n", "  ");
+        }
     }
 }
 

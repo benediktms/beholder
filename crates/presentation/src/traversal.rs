@@ -8,7 +8,11 @@ use std::{
     fmt::Write,
 };
 
-pub(super) fn dependencies_human(result: &DependenciesResult, include_tests: bool) -> String {
+pub(super) fn dependencies_human(
+    result: &DependenciesResult,
+    include_tests: bool,
+    include_diagnostics: bool,
+) -> String {
     let entities = entities(&result.nodes);
     let names = entity_names(&result.nodes);
     let mut output = format!("{}\n", label(&names, &result.root));
@@ -35,11 +39,15 @@ pub(super) fn dependencies_human(result: &DependenciesResult, include_tests: boo
     }
     let _ = writeln!(output, "\n{} dependencies", dependencies.len());
     write_traversal(&mut output, &result.traversal);
-    write_metadata(&mut output, &result.metadata);
+    write_metadata(&mut output, &result.metadata, include_diagnostics);
     output
 }
 
-pub(super) fn impact_human(result: &ImpactResult, include_tests: bool) -> String {
+pub(super) fn impact_human(
+    result: &ImpactResult,
+    include_tests: bool,
+    include_diagnostics: bool,
+) -> String {
     let entities = entities(&result.nodes);
     let names = entity_names(&result.nodes);
     let mut groups: BTreeMap<String, Vec<&EntityRef>> = BTreeMap::new();
@@ -111,7 +119,7 @@ pub(super) fn impact_human(result: &ImpactResult, include_tests: bool) -> String
         );
     }
     write_traversal(&mut output, &result.traversal);
-    write_metadata(&mut output, &result.metadata);
+    write_metadata(&mut output, &result.metadata, include_diagnostics);
     output
 }
 

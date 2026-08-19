@@ -224,6 +224,9 @@ struct OutputArgs {
     /// Include test and spec symbols in compact human output.
     #[arg(long)]
     include_tests: bool,
+    /// Show individual analysis diagnostics in human-readable output.
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 impl OutputArgs {
@@ -243,6 +246,7 @@ impl OutputArgs {
         RenderOptions {
             mode: self.mode(),
             include_tests: self.include_tests,
+            include_diagnostics: self.verbose,
         }
     }
 }
