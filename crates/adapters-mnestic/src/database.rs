@@ -41,6 +41,16 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_ANALYSIS_METADATA_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_ANALYSIS_DIAGNOSTIC_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_OBSERVATION_TO_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -170,6 +180,14 @@ pub(super) fn persistent_database(
         (
             "analysis_revision_grpc_diagnostic",
             CREATE_GRPC_DIAGNOSTIC_SCHEMA,
+        ),
+        (
+            "analysis_revision_metadata",
+            CREATE_ANALYSIS_METADATA_SCHEMA,
+        ),
+        (
+            "analysis_revision_diagnostic",
+            CREATE_ANALYSIS_DIAGNOSTIC_SCHEMA,
         ),
     ] {
         if initialize
@@ -309,6 +327,8 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: Vec::new(),
             grpc_bindings: Vec::new(),
             observations,

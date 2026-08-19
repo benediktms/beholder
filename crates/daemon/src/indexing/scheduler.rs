@@ -289,7 +289,12 @@ impl IndexScheduler {
         }
     }
 
-    pub fn query_metadata(&self, workspace: &str, analysis_revision: u64) -> QueryMetadata {
+    pub fn query_metadata(
+        &self,
+        workspace: &str,
+        analysis_revision: u64,
+        analysis: beholder_dto::AnalysisMetadata,
+    ) -> QueryMetadata {
         let stale = self
             .generations
             .lock()
@@ -316,6 +321,7 @@ impl IndexScheduler {
                 indexing,
                 dirty_repositories,
             },
+            analysis,
         }
     }
 
@@ -1308,6 +1314,8 @@ fn index_workspace_versioned(
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity,
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: analysis.entities.clone(),
             grpc_bindings: analysis.grpc_bindings.clone(),
             observations: analysis.observations.clone(),
@@ -2082,6 +2090,8 @@ mod tests {
                     &[RepositoryFacts {
                         state: state.clone(),
                         analysis_identity: "analysis".into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
                         entities: Vec::new(),
                         grpc_bindings: Vec::new(),
                         observations: analysis.observations.clone(),
@@ -2522,28 +2532,48 @@ mod tests {
 
         scheduler.mark(&workspace);
         scheduler.mark(&other);
-        let pending = scheduler.query_metadata("main", 4);
+        let pending = scheduler.query_metadata("main", 4, Default::default());
         assert_eq!(pending.revision, 4);
         assert!(pending.freshness.stale);
         assert!(!pending.freshness.indexing);
         assert_eq!(pending.freshness.dirty_repositories, ["repo"]);
 
         *scheduler.active_workspace.lock().unwrap() = Some("main".into());
-        assert!(scheduler.query_metadata("main", 4).freshness.indexing);
-        assert!(!scheduler.query_metadata("other", 4).freshness.indexing);
+        assert!(
+            scheduler
+                .query_metadata("main", 4, Default::default())
+                .freshness
+                .indexing
+        );
+        assert!(
+            !scheduler
+                .query_metadata("other", 4, Default::default())
+                .freshness
+                .indexing
+        );
         *scheduler.active_workspace.lock().unwrap() = None;
 
         let indexed_generation = scheduler.generations.lock().unwrap()["main"];
         scheduler.mark(&workspace);
         scheduler.complete_generation("main", Some(indexed_generation));
-        assert!(scheduler.query_metadata("main", 4).freshness.stale);
+        assert!(
+            scheduler
+                .query_metadata("main", 4, Default::default())
+                .freshness
+                .stale
+        );
 
         scheduler.index(&store, &workspace).unwrap();
-        let current = scheduler.query_metadata("main", 5);
+        let current = scheduler.query_metadata("main", 5, Default::default());
         assert!(!current.freshness.stale);
         assert!(!current.freshness.indexing);
         assert!(current.freshness.dirty_repositories.is_empty());
-        assert!(scheduler.query_metadata("other", 4).freshness.stale);
+        assert!(
+            scheduler
+                .query_metadata("other", 4, Default::default())
+                .freshness
+                .stale
+        );
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }
@@ -2623,7 +2653,7 @@ mod tests {
         );
         assert!(
             scheduler
-                .query_metadata("main", 2)
+                .query_metadata("main", 2, Default::default())
                 .freshness
                 .dirty_repositories
                 .is_empty()
@@ -2921,7 +2951,7 @@ mod tests {
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
         let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
         scheduler.index(&store, &workspace).unwrap();
-        let metadata = scheduler.query_metadata("grpc-matrix", 1);
+        let metadata = scheduler.query_metadata("grpc-matrix", 1, Default::default());
         assert_eq!(metadata.revision, 1);
         assert_eq!(metadata.view, "grpc-matrix");
         assert!(!metadata.freshness.stale);

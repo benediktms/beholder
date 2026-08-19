@@ -15,9 +15,11 @@ impl BeholderDaemon {
     {
         let revisioned = result.map_err(|error| Status::internal(error.to_string()))?;
         let mut result = revisioned.result;
-        *result.metadata_mut() = self
-            .scheduler
-            .query_metadata(workspace, revisioned.analysis_revision);
+        *result.metadata_mut() = self.scheduler.query_metadata(
+            workspace,
+            revisioned.analysis_revision,
+            revisioned.analysis,
+        );
         Ok(Response::new(result.into()))
     }
 }

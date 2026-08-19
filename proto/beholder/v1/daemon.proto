@@ -56,12 +56,33 @@ message QueryMetadata {
   uint64 revision = 1;
   string view = 2;
   Freshness freshness = 3;
+  AnalysisCompleteness completeness = 4;
+  repeated AnalysisDiagnostic diagnostics = 5;
 }
 
 message Freshness {
   bool stale = 1;
   bool indexing = 2;
   repeated string dirty_repositories = 3;
+}
+
+enum AnalysisCompleteness {
+  ANALYSIS_COMPLETENESS_COMPLETE = 0;
+  ANALYSIS_COMPLETENESS_INCOMPLETE = 1;
+}
+
+enum AnalysisDiagnosticSeverity {
+  ANALYSIS_DIAGNOSTIC_SEVERITY_KNOWN_LIMITATION = 0;
+  ANALYSIS_DIAGNOSTIC_SEVERITY_WARNING = 1;
+}
+
+message AnalysisDiagnostic {
+  string code = 1;
+  AnalysisDiagnosticSeverity severity = 2;
+  string repository = 3;
+  string path = 4;
+  optional uint32 line = 5;
+  optional string detail = 6;
 }
 
 enum EntityKind {

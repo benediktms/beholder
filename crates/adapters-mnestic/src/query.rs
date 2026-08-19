@@ -1,7 +1,11 @@
 use super::schema::*;
+use beholder_dto::{
+    AnalysisCompleteness, AnalysisDiagnostic, AnalysisDiagnosticSeverity, AnalysisMetadata,
+};
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::path::PathBuf;
 
 pub(super) trait QueryRunner {
     fn run_query(
@@ -76,6 +80,68 @@ pub(super) fn analysis_revision(db: &impl QueryRunner, view: &str) -> Result<u64
         .and_then(|row| row[0].get_int())
         .unwrap_or_default()
         .try_into()?)
+}
+
+pub(super) fn analysis_metadata(
+    db: &impl QueryRunner,
+    view: &str,
+    revision: u64,
+) -> Result<AnalysisMetadata, Box<dyn Error>> {
+    let rows = query(
+        db,
+        view,
+        "?[incomplete] := *analysis_revision_metadata{\
+             view: $view, revision: $revision, incomplete\
+         }",
+        [("revision", i64::try_from(revision)?.into())],
+    )?;
+    let incomplete = rows
+        .rows
+        .first()
+        .and_then(|row| match row.first() {
+            Some(DataValue::Bool(value)) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let rows = query(
+        db,
+        view,
+        "?[repository, code, severity, path, line, detail] := \
+             *analysis_revision_diagnostic{\
+                 view: $view, revision: $revision, repository, code, severity, path, line, detail\
+             }\n\
+         :order severity, repository, path, line, code",
+        [("revision", i64::try_from(revision)?.into())],
+    )?;
+    let diagnostics = rows
+        .rows
+        .into_iter()
+        .map(|row| {
+            let severity = match row[2].get_str() {
+                Some("known_limitation") => AnalysisDiagnosticSeverity::KnownLimitation,
+                Some("warning") => AnalysisDiagnosticSeverity::Warning,
+                _ => return Err("unknown stored analysis diagnostic severity".into()),
+            };
+            let line = u32::try_from(row[4].get_int().unwrap_or_default())?;
+            let detail = row[5].get_str().unwrap_or_default();
+            Ok(AnalysisDiagnostic {
+                repository: row[0].get_str().unwrap_or_default().into(),
+                code: row[1].get_str().unwrap_or_default().into(),
+                severity,
+                path: PathBuf::from(row[3].get_str().unwrap_or_default()),
+                line: (line != 0).then_some(line),
+                detail: (!detail.is_empty()).then(|| detail.into()),
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(AnalysisMetadata {
+        completeness: if incomplete {
+            AnalysisCompleteness::Incomplete
+        } else {
+            AnalysisCompleteness::Complete
+        },
+        diagnostics,
+    })
 }
 
 pub(super) fn entity_facts(
@@ -227,6 +293,8 @@ mod tests {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: Vec::new(),
             grpc_bindings: Vec::new(),
             observations,

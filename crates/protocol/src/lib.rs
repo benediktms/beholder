@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn typed_trace_round_trips_without_generic_rows() {
-        let trace = dto::TraceResult {
+        let mut trace = dto::TraceResult {
             schema: dto::TRACE_SCHEMA_V2.into(),
             metadata: dto::QueryMetadata::completed("main", 3),
             query: dto::PathQuery {
@@ -143,7 +143,22 @@ mod tests {
             ],
             paths: Vec::new(),
         };
+        trace.metadata.analysis = dto::AnalysisMetadata {
+            completeness: dto::AnalysisCompleteness::Incomplete,
+            diagnostics: vec![dto::AnalysisDiagnostic {
+                code: "typescript.syntax_recovered".into(),
+                severity: dto::AnalysisDiagnosticSeverity::Warning,
+                repository: "repo".into(),
+                path: "src/broken.ts".into(),
+                line: Some(7),
+                detail: Some("unexpected token".into()),
+            }],
+        };
         let response = v1::TraceResponse::from(trace.clone());
+        assert_eq!(
+            response.metadata.as_ref().unwrap().completeness,
+            v1::AnalysisCompleteness::Incomplete as i32
+        );
         assert_eq!(
             response.edges[0].kind,
             v1::RelationKind::BindsContract as i32

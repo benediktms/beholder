@@ -142,6 +142,7 @@ mod tests {
         traversal::display_names,
     };
     use beholder_dto::{
+        AnalysisCompleteness, AnalysisDiagnostic, AnalysisDiagnosticSeverity, AnalysisMetadata,
         CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, EntityQuery,
         EvidenceKind, Freshness, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery,
         QueryMetadata, RelationKind, TRACE_SCHEMA_V2,
@@ -165,6 +166,7 @@ mod tests {
                     indexing: false,
                     dirty_repositories: Vec::new(),
                 },
+                analysis: Default::default(),
             },
             query: PathQuery {
                 from: "a".into(),
@@ -226,10 +228,48 @@ mod tests {
         let json = trace(&result, OutputMode::Json.into()).unwrap();
         assert!(json.starts_with(r#"{"schema":"beholder.trace.v2","revision":42,"view":"main""#));
         assert!(json.contains(r#""traversal":{"max_hops":32,"truncated":false}"#));
+        assert!(!json.contains(r#""analysis""#));
         assert_eq!(
             trace(&result, OutputMode::Human.into()).unwrap(),
             "repo · CheckoutPage\n  → repo · Pricing.GetPrice [calls_rpc]\n\n1 hop · 1 repositories · confidence 1.00\ntraversal complete · max depth 32\nview main · revision 42 · stale=false · indexing=false"
         );
+    }
+
+    #[test]
+    fn incomplete_analysis_is_visible_and_deterministic() {
+        let mut result = trace_result();
+        result.metadata.analysis = AnalysisMetadata {
+            completeness: AnalysisCompleteness::Incomplete,
+            diagnostics: vec![
+                AnalysisDiagnostic {
+                    code: "z-last".into(),
+                    severity: AnalysisDiagnosticSeverity::Warning,
+                    repository: "repo".into(),
+                    path: "src/z.ts".into(),
+                    line: None,
+                    detail: None,
+                },
+                AnalysisDiagnostic {
+                    code: "a-first".into(),
+                    severity: AnalysisDiagnosticSeverity::KnownLimitation,
+                    repository: "repo".into(),
+                    path: "src/a.ts".into(),
+                    line: Some(7),
+                    detail: Some("recovered".into()),
+                },
+            ],
+        };
+
+        let human = trace(&result, OutputMode::Human.into()).unwrap();
+        assert!(human.contains("analysis incomplete · 2 diagnostics"));
+        assert!(human.contains("known_limitation repo src/a.ts:7 a-first recovered"));
+        let raw = trace(&result, OutputMode::Raw.into()).unwrap();
+        assert!(raw.contains("incomplete=true"));
+        assert!(raw.contains("\ndiagnostics\n"));
+        assert!(raw.find("a-first").unwrap() < raw.find("z-last").unwrap());
+        let json = trace(&result, OutputMode::Json.into()).unwrap();
+        assert!(json.contains(r#""completeness":"incomplete""#));
+        assert!(json.contains(r#""code":"a-first""#));
     }
 
     #[test]

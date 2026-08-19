@@ -25,6 +25,8 @@ pub(super) fn rust(path: &Path, database_path: &Path) -> Result<(usize, bool), B
         &[RepositoryFacts {
             state,
             analysis_identity: format!("rust:{FRONTEND_VERSION}:single-file:1"),
+            incomplete: false,
+            diagnostics: Vec::new(),
             entities: Vec::new(),
             grpc_bindings: Vec::new(),
             observations: observations.clone(),
