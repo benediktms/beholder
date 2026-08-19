@@ -1,11 +1,11 @@
 use super::indexing::IndexScheduler;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_domain::Workspace;
+use beholder_indexing::Indexer;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
     collections::BTreeSet,
     error::Error,
-    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tokio::sync::oneshot;
@@ -23,11 +23,11 @@ pub(super) type DaemonParts = (BeholderDaemon, oneshot::Receiver<()>, Arc<IndexS
 pub(super) fn build(
     store: SemanticStore,
     workspaces: super::workspace_registry::WorkspaceRegistry,
-    cache_dir: PathBuf,
+    indexer: Indexer,
 ) -> Result<DaemonParts, Box<dyn Error>> {
     let (shutdown, stopped) = oneshot::channel();
     let workspaces = Arc::new(Mutex::new(workspaces));
-    let scheduler = Arc::new(IndexScheduler::new(cache_dir));
+    let scheduler = Arc::new(IndexScheduler::with_indexer(indexer));
     let callback_workspaces = workspaces.clone();
     let callback_scheduler = scheduler.clone();
     let mut watcher = notify::recommended_watcher(move |event| {

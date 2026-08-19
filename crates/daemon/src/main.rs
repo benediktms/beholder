@@ -1,5 +1,12 @@
+use beholder_adapters_graphql::GraphqlAnalyzer;
 use beholder_adapters_mnestic::SemanticStore;
+use beholder_adapters_protobuf::ProtobufAnalyzer;
+use beholder_adapters_treesitter_csharp::CsharpAnalyzer;
+use beholder_adapters_treesitter_elixir::ElixirAnalyzer;
+use beholder_adapters_treesitter_rust::RustAnalyzer;
+use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
+use beholder_indexing::{Indexer, IndexerBuilder};
 use beholder_protocol::v1::daemon_server::DaemonServer;
 use std::error::Error;
 #[cfg(unix)]
@@ -33,10 +40,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let (listener, _socket_file) = ipc::bind_socket(&socket_path)?;
         let _log_guard = logging::init(&state_dir);
         tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "daemon started");
+        let cache_dir = state_dir.join("frontend-cache");
         let (service, stopped, index_scheduler) = daemon::build(
             SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
             WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
-            state_dir.join("frontend-cache"),
+            built_in_indexer(cache_dir)?,
         )?;
         let watcher_task = tokio::spawn(
             index_scheduler
@@ -55,6 +63,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!("daemon stopped");
         Ok(())
     }
+}
+
+fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Error>> {
+    let workers = std::env::var("BEHOLDER_INDEX_WORKERS")
+        .ok()
+        .and_then(|workers| workers.parse().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    tracing::info!(workers, "index analysis pool configured");
+    IndexerBuilder::new(cache_dir.clone(), workers)
+        .add_analyzer(RustAnalyzer::new(cache_dir.clone()))
+        .add_analyzer(ElixirAnalyzer::new(cache_dir.clone()))
+        .add_analyzer(CsharpAnalyzer::new(cache_dir.clone()))
+        .add_analyzer(TypescriptAnalyzer::new(cache_dir.clone()))
+        .add_analyzer(GraphqlAnalyzer)
+        .add_analyzer(ProtobufAnalyzer::new(cache_dir))
+        .build()
+        .map_err(|error| error.to_string().into())
 }
 
 #[cfg(test)]
@@ -104,7 +130,7 @@ mod tests {
         let (service, stopped, index_scheduler) = daemon::build(
             SemanticStore::persistent(&database, true).unwrap(),
             WorkspaceRegistry::open(registry_path.clone()).unwrap(),
-            state.join("frontend-cache"),
+            built_in_indexer(state.join("frontend-cache")).unwrap(),
         )
         .unwrap();
         let test_workspaces = service.workspaces.clone();

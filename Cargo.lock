@@ -447,6 +447,9 @@ name = "beholder-indexing"
 version = "0.1.0"
 dependencies = [
  "beholder-domain",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
