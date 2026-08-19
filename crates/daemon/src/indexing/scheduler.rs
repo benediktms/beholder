@@ -116,48 +116,62 @@ const CURRENT_ANALYSIS_VERSIONS: AnalysisVersions = AnalysisVersions {
     rule_pack: CORE_RULE_PACK_VERSION,
 };
 
+#[derive(Clone, Copy, Default)]
+struct RepositoryLanguages {
+    rust: bool,
+    elixir: bool,
+    csharp: bool,
+    typescript: bool,
+    protobuf: bool,
+    graphql: bool,
+}
+
 impl AnalysisVersions {
     fn repository_key(
         self,
         fingerprint: String,
-        has_rust: bool,
-        has_elixir: bool,
-        has_csharp: bool,
-        has_typescript: bool,
-        has_protobuf: bool,
-        has_graphql: bool,
+        languages: RepositoryLanguages,
     ) -> RepositoryAnalysisKey {
         RepositoryAnalysisKey {
             fingerprint,
-            rust: has_rust.then_some((self.rust_frontend, self.rust_resolver)),
-            elixir: has_elixir.then_some((self.elixir_frontend, self.elixir_resolver)),
-            csharp: has_csharp.then_some((self.csharp_frontend, self.csharp_resolver)),
-            typescript: has_typescript
+            rust: languages
+                .rust
+                .then_some((self.rust_frontend, self.rust_resolver)),
+            elixir: languages
+                .elixir
+                .then_some((self.elixir_frontend, self.elixir_resolver)),
+            csharp: languages
+                .csharp
+                .then_some((self.csharp_frontend, self.csharp_resolver)),
+            typescript: languages
+                .typescript
                 .then_some((self.typescript_frontend, self.typescript_resolver)),
-            protobuf: has_protobuf.then_some(self.protobuf_frontend),
-            graphql: has_graphql.then_some(self.graphql_frontend),
+            protobuf: languages.protobuf.then_some(self.protobuf_frontend),
+            graphql: languages.graphql.then_some(self.graphql_frontend),
         }
     }
 
     fn workspace_identity(self, repositories: &[RepositorySources]) -> String {
         let key = self.repository_key(
             String::new(),
-            repositories.iter().any(|sources| !sources.rust.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.elixir.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.csharp.is_empty() || !sources.csharp_projects.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.typescript.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.protobuf.is_empty() || !sources.protobuf_source.is_empty()),
-            repositories
-                .iter()
-                .any(|sources| !sources.graphql.is_empty()),
+            RepositoryLanguages {
+                rust: repositories.iter().any(|sources| !sources.rust.is_empty()),
+                elixir: repositories
+                    .iter()
+                    .any(|sources| !sources.elixir.is_empty()),
+                csharp: repositories.iter().any(|sources| {
+                    !sources.csharp.is_empty() || !sources.csharp_projects.is_empty()
+                }),
+                typescript: repositories
+                    .iter()
+                    .any(|sources| !sources.typescript.is_empty()),
+                protobuf: repositories.iter().any(|sources| {
+                    !sources.protobuf.is_empty() || !sources.protobuf_source.is_empty()
+                }),
+                graphql: repositories
+                    .iter()
+                    .any(|sources| !sources.graphql.is_empty()),
+            },
         );
         format!("{}:core-rules:{}", key.analysis_identity(), self.rule_pack)
     }
@@ -664,12 +678,16 @@ impl IndexScheduler {
         } = sources;
         let key = versions.repository_key(
             state.fingerprint.clone(),
-            !rust_sources.is_empty(),
-            !elixir_sources.is_empty(),
-            !csharp_sources.is_empty() || !csharp_projects.is_empty() || !unity_prefabs.is_empty(),
-            !typescript_sources.is_empty(),
-            !descriptors.is_empty(),
-            !graphql.is_empty(),
+            RepositoryLanguages {
+                rust: !rust_sources.is_empty(),
+                elixir: !elixir_sources.is_empty(),
+                csharp: !csharp_sources.is_empty()
+                    || !csharp_projects.is_empty()
+                    || !unity_prefabs.is_empty(),
+                typescript: !typescript_sources.is_empty(),
+                protobuf: !descriptors.is_empty(),
+                graphql: !graphql.is_empty(),
+            },
         );
         let analysis_identity = key.analysis_identity();
         let (rust_frontend, rust_resolver) = key.rust.unwrap_or(("_", "_"));
@@ -2191,34 +2209,48 @@ mod tests {
             ((false, false, false, false, false, false), "none"),
         ] {
             let (rust, elixir, csharp, typescript, protobuf, graphql) = languages;
-            let key = versions.repository_key(
-                "state".into(),
+            let languages = RepositoryLanguages {
                 rust,
                 elixir,
                 csharp,
                 typescript,
                 protobuf,
                 graphql,
-            );
+            };
+            let key = versions.repository_key("state".into(), languages);
             assert_eq!(key.analysis_identity(), expected);
             if rust || elixir || csharp || typescript || protobuf || graphql {
-                assert_ne!(
-                    key,
-                    changed.repository_key(
-                        "state".into(),
-                        rust,
-                        elixir,
-                        csharp,
-                        typescript,
-                        protobuf,
-                        graphql,
-                    )
-                );
+                assert_ne!(key, changed.repository_key("state".into(), languages));
             }
         }
 
+        let rust = RepositoryLanguages {
+            rust: true,
+            ..Default::default()
+        };
+        let elixir = RepositoryLanguages {
+            elixir: true,
+            ..Default::default()
+        };
+        let csharp = RepositoryLanguages {
+            csharp: true,
+            ..Default::default()
+        };
+        let typescript = RepositoryLanguages {
+            typescript: true,
+            ..Default::default()
+        };
+        let protobuf = RepositoryLanguages {
+            protobuf: true,
+            ..Default::default()
+        };
+        let graphql = RepositoryLanguages {
+            graphql: true,
+            ..Default::default()
+        };
+
         assert_eq!(
-            versions.repository_key("state".into(), true, false, false, false, false, false),
+            versions.repository_key("state".into(), rust),
             AnalysisVersions {
                 elixir_frontend: "irrelevant",
                 elixir_resolver: "irrelevant",
@@ -2231,10 +2263,10 @@ mod tests {
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), true, false, false, false, false, false)
+            .repository_key("state".into(), rust)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, true, false, false, false, false),
+            versions.repository_key("state".into(), elixir),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
@@ -2247,10 +2279,10 @@ mod tests {
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, true, false, false, false, false)
+            .repository_key("state".into(), elixir)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, false, true, false, false, false),
+            versions.repository_key("state".into(), csharp),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
@@ -2263,10 +2295,10 @@ mod tests {
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, true, false, false, false)
+            .repository_key("state".into(), csharp)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, false, false, true, false, false),
+            versions.repository_key("state".into(), typescript),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
@@ -2279,10 +2311,10 @@ mod tests {
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, false, true, false, false)
+            .repository_key("state".into(), typescript)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, false, false, false, true, false),
+            versions.repository_key("state".into(), protobuf),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
@@ -2296,10 +2328,10 @@ mod tests {
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, false, false, true, false)
+            .repository_key("state".into(), protobuf)
         );
         assert_eq!(
-            versions.repository_key("state".into(), false, false, false, false, false, true),
+            versions.repository_key("state".into(), graphql),
             AnalysisVersions {
                 rust_frontend: "irrelevant",
                 rust_resolver: "irrelevant",
@@ -2313,7 +2345,7 @@ mod tests {
                 rule_pack: "irrelevant",
                 ..versions
             }
-            .repository_key("state".into(), false, false, false, false, false, true)
+            .repository_key("state".into(), graphql)
         );
     }
 
