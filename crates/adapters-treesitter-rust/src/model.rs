@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct RustAnalysis {
     pub(super) functions: Vec<RustFunction>,
     pub(super) tonic: TonicAnalysis,
+    pub(super) parse_error_lines: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,7 +1,7 @@
 use super::{model::*, nestjs_di, ts_proto};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, Provenance, StructuralRelation,
+    Observation, Provenance, StructuralRelation, UnsafeTreeRecovery,
 };
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -926,13 +926,38 @@ fn collect_definitions(
     }
 }
 
-fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>) {
+fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
     if node.is_error() || node.is_missing() {
         lines.push(node.start_position().row + 1);
+        *missing |= node.is_missing();
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_parse_errors(child, lines);
+        collect_parse_errors(child, lines, missing);
+    }
+}
+
+fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) {
+    if node.kind() == "program" {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_top_level_call(child, source, calls);
+        }
+        return;
+    }
+    if node.kind() != "expression_statement" {
+        return;
+    }
+    let Some(expression) = node.named_child(0) else {
+        return;
+    };
+    let kind = match expression.kind() {
+        "call_expression" => CallKind::Direct,
+        "new_expression" => CallKind::Constructor,
+        _ => return,
+    };
+    if let Some(call) = call(expression, source, kind) {
+        calls.push(call);
     }
 }
 
@@ -957,38 +982,46 @@ pub fn analyze(
     let mut string_constants = Vec::new();
     let mut graphql_documents = Vec::new();
     let mut parse_error_lines = Vec::new();
-    collect_definitions(
-        tree.root_node(),
-        source.as_bytes(),
-        &mut Vec::new(),
-        &mut definitions,
-    );
     let root = tree.root_node();
-    let mut cursor = root.walk();
-    for statement in root
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "expression_statement")
-    {
-        let Some(expression) = statement.named_child(0) else {
-            continue;
-        };
-        let kind = match expression.kind() {
-            "call_expression" => CallKind::Direct,
-            "new_expression" => CallKind::Constructor,
-            _ => continue,
-        };
-        if let Some(call) = call(expression, source.as_bytes(), kind) {
-            calls.push(call);
-        }
+    let mut missing = false;
+    collect_parse_errors(root, &mut parse_error_lines, &mut missing);
+    if missing {
+        return Err(UnsafeTreeRecovery::new(
+            "JavaScript/TypeScript",
+            "missing syntax may change nesting",
+        )
+        .into());
     }
-    collect_imports(tree.root_node(), source.as_bytes(), &mut imports);
-    collect_exports(tree.root_node(), source.as_bytes(), &mut exports);
-    collect_string_constants(tree.root_node(), source.as_bytes(), &mut string_constants);
-    collect_graphql_documents(tree.root_node(), source.as_bytes(), &mut graphql_documents);
-    let (nest_modules, nest_providers) = nestjs_di::extract(tree.root_node(), source.as_bytes());
-    collect_parse_errors(tree.root_node(), &mut parse_error_lines);
     parse_error_lines.sort_unstable();
     parse_error_lines.dedup();
+    let roots = if parse_error_lines.is_empty() {
+        vec![root]
+    } else {
+        let mut cursor = root.walk();
+        root.named_children(&mut cursor)
+            .filter(|child| !child.has_error())
+            .collect()
+    };
+    let mut nest_modules = Vec::new();
+    let mut nest_providers = Vec::new();
+    for root in roots {
+        collect_definitions(root, source.as_bytes(), &mut Vec::new(), &mut definitions);
+        collect_top_level_call(root, source.as_bytes(), &mut calls);
+        collect_imports(root, source.as_bytes(), &mut imports);
+        collect_exports(root, source.as_bytes(), &mut exports);
+        collect_string_constants(root, source.as_bytes(), &mut string_constants);
+        collect_graphql_documents(root, source.as_bytes(), &mut graphql_documents);
+        let (modules, providers) = nestjs_di::extract(root, source.as_bytes());
+        nest_modules.extend(modules);
+        nest_providers.extend(providers);
+    }
+    if !parse_error_lines.is_empty() && definitions.is_empty() && calls.is_empty() {
+        return Err(UnsafeTreeRecovery::new(
+            "JavaScript/TypeScript",
+            "no unaffected definitions remain",
+        )
+        .into());
+    }
     Ok(TypescriptAnalysis {
         language,
         calls,
@@ -1015,7 +1048,7 @@ pub fn diagnostics_from_analysis(
             severity: AnalysisDiagnosticSeverity::Warning,
             path: path.into(),
             line: u32::try_from(*line).ok(),
-            detail: Some("tree-sitter recovered from invalid or unsupported syntax".into()),
+            detail: Some("tree-sitter discarded an invalid syntax unit".into()),
         })
         .collect()
 }
@@ -1252,6 +1285,7 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(analysis.definitions.len(), 1);
         assert!(
             analysis
                 .definitions
@@ -1262,6 +1296,16 @@ mod tests {
             diagnostics_from_analysis(&analysis, Path::new("src/broken.ts"))[0].code,
             "typescript.parse_recovery"
         );
+    }
+
+    #[test]
+    fn rejects_missing_delimiters_that_can_change_nesting() {
+        let error = analyze(
+            "function broken() {\nfunction nested() {}",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
     }
 
     #[test]

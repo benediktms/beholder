@@ -1,7 +1,7 @@
 use super::model::*;
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, EntityFact, EntityKind, Observation,
-    Provenance, StructuralRelation,
+    Provenance, StructuralRelation, UnsafeTreeRecovery,
 };
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -325,13 +325,14 @@ fn collect_definitions(
     }
 }
 
-fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>) {
+fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
     if node.is_error() || node.is_missing() {
         lines.push(node.start_position().row + 1);
+        *missing |= node.is_missing();
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_parse_errors(child, lines);
+        collect_parse_errors(child, lines, missing);
     }
 }
 
@@ -343,10 +344,28 @@ pub fn analyze(source: &str) -> Result<CsharpAnalysis, Box<dyn Error>> {
         .ok_or("C# parser returned no tree")?;
     let mut definitions = Vec::new();
     let mut parse_error_lines = Vec::new();
-    collect_definitions(tree.root_node(), source.as_bytes(), &[], &mut definitions);
-    collect_parse_errors(tree.root_node(), &mut parse_error_lines);
+    let root = tree.root_node();
+    let mut missing = false;
+    collect_parse_errors(root, &mut parse_error_lines, &mut missing);
+    if missing {
+        return Err(UnsafeTreeRecovery::new("C#", "missing syntax may change nesting").into());
+    }
     parse_error_lines.sort_unstable();
     parse_error_lines.dedup();
+    if parse_error_lines.is_empty() {
+        collect_definitions(root, source.as_bytes(), &[], &mut definitions);
+    } else {
+        let mut cursor = root.walk();
+        for child in root
+            .named_children(&mut cursor)
+            .filter(|child| !child.has_error())
+        {
+            collect_definitions(child, source.as_bytes(), &[], &mut definitions);
+        }
+        if definitions.is_empty() {
+            return Err(UnsafeTreeRecovery::new("C#", "no unaffected definitions remain").into());
+        }
+    }
     Ok(CsharpAnalysis {
         definitions,
         parse_error_lines,
@@ -365,7 +384,7 @@ pub fn diagnostics_from_analysis(
             severity: AnalysisDiagnosticSeverity::Warning,
             path: path.into(),
             line: u32::try_from(*line).ok(),
-            detail: Some("tree-sitter recovered from invalid or unsupported C# syntax".into()),
+            detail: Some("tree-sitter discarded an invalid C# syntax unit".into()),
         })
         .collect()
 }
@@ -536,8 +555,27 @@ public sealed class Worker
 
     #[test]
     fn reports_parse_recovery() {
-        let analysis = analyze("class Broken { void Run( }").unwrap();
+        let analysis =
+            analyze("class Broken { void Bad() { @ } } class Safe { void Run() {} }").unwrap();
         assert!(!diagnostics_from_analysis(&analysis, Path::new("Broken.cs")).is_empty());
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .any(|definition| definition.qualified_name == "Safe")
+        );
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .all(|definition| !definition.qualified_name.starts_with("Broken"))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_delimiters_that_can_change_nesting() {
+        let error = analyze("class Broken { void Run() { }").unwrap_err();
+        assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
     }
 
     #[test]

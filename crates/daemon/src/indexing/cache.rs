@@ -24,6 +24,8 @@ pub(super) struct RepositoryAnalysisKey {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RepositoryAnalysis {
     #[serde(default)]
+    pub(super) incomplete: bool,
+    #[serde(default)]
     pub(super) csharp_projects: Vec<CsharpProject>,
     pub(super) entities: Vec<EntityFact>,
     #[serde(default)]

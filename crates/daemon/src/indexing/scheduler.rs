@@ -43,7 +43,7 @@ use beholder_adapters_treesitter_typescript::{
 };
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, RepositoryFacts, RepositoryState, Workspace, WorkspaceView,
+    Observation, RepositoryFacts, RepositoryState, SourceAnalysisError, Workspace, WorkspaceView,
 };
 use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
 use notify::{Event, EventKind};
@@ -755,16 +755,14 @@ impl IndexScheduler {
                 .map(|(path, source)| {
                     let (analysis, cache_status) = self
                         .rust_analysis_versioned(source, versions.rust_frontend)
-                        .map_err(|error| {
-                            format!("failed to analyze {}: {error}", path.display())
-                        })?;
+                        .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     tracing::debug!(
                         repository = %state.repository.identity,
                         path = %path.display(),
                         ?cache_status,
                         "frontend cache lookup"
                     );
-                    Ok::<_, String>((
+                    Ok::<_, SourceAnalysisError>((
                         path.as_path(),
                         analysis.clone(),
                         observations_from_analysis(&state.repository.identity, &analysis, path),
@@ -798,16 +796,14 @@ impl IndexScheduler {
                 .map(|(path, source)| {
                     let (analysis, cache_status) = self
                         .elixir_analysis_versioned(source, versions.elixir_frontend)
-                        .map_err(|error| {
-                            format!("failed to analyze {}: {error}", path.display())
-                        })?;
+                        .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     tracing::debug!(
                         repository = %state.repository.identity,
                         path = %path.display(),
                         ?cache_status,
                         "frontend cache lookup"
                     );
-                    Ok::<_, String>((
+                    Ok::<_, SourceAnalysisError>((
                         path.as_path(),
                         analysis.clone(),
                         elixir_observations(&state.repository.identity, &analysis, source, path),
@@ -846,10 +842,9 @@ impl IndexScheduler {
                 .par_iter()
                 .map(|(path, bytes)| {
                     let (source, lossy_encoding) = decode_csharp_source(bytes);
-                    let (analysis, cache_status) =
-                        self.csharp_analysis_versioned(&source).map_err(|error| {
-                            format!("failed to analyze {}: {error}", path.display())
-                        })?;
+                    let (analysis, cache_status) = self
+                        .csharp_analysis_versioned(&source)
+                        .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     tracing::debug!(
                         repository = %state.repository.identity,
                         path = %path.display(),
@@ -888,7 +883,7 @@ impl IndexScheduler {
                             csharp_entities(&state.repository.identity, assembly, &analysis, path)
                         })
                         .collect::<Vec<_>>();
-                    Ok::<_, String>((
+                    Ok::<_, SourceAnalysisError>((
                         path.clone(),
                         analysis,
                         assemblies,
@@ -968,16 +963,14 @@ impl IndexScheduler {
                 .map(|(path, source, language)| {
                     let (analysis, cache_status) = self
                         .typescript_analysis_versioned(source, *language)
-                        .map_err(|error| {
-                            format!("failed to analyze {}: {error}", path.display())
-                        })?;
+                        .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     tracing::debug!(
                         repository = %state.repository.identity,
                         path = %path.display(),
                         ?cache_status,
                         "frontend cache lookup"
                     );
-                    Ok::<_, String>((
+                    Ok::<_, SourceAnalysisError>((
                         path.as_path(),
                         analysis.clone(),
                         source.as_str(),
@@ -1121,7 +1114,11 @@ impl IndexScheduler {
                 }
             }
         }
+        let incomplete = diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"));
         let analysis = Arc::new(RepositoryAnalysis {
+            incomplete,
             csharp_projects,
             entities,
             grpc_bindings,
@@ -1314,8 +1311,8 @@ fn index_workspace_versioned(
         repository_facts.push(RepositoryFacts {
             state,
             analysis_identity,
-            incomplete: false,
-            diagnostics: Vec::new(),
+            incomplete: analysis.incomplete,
+            diagnostics: analysis.diagnostics.clone(),
             entities: analysis.entities.clone(),
             grpc_bindings: analysis.grpc_bindings.clone(),
             observations: analysis.observations.clone(),
@@ -1371,7 +1368,7 @@ fn index_workspace_versioned(
 mod tests {
     use super::*;
     use beholder_domain::{LogicalRepository, WorkspaceRepository};
-    use beholder_dto::{EvidenceKind, RelationKind};
+    use beholder_dto::{AnalysisCompleteness, EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
     fn test_workspace(name: &str, base: PathBuf) -> Workspace {
@@ -2574,6 +2571,87 @@ mod tests {
                 .freshness
                 .stale
         );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn recovery_publication_is_incomplete_and_repair_clears_it() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-recovery-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        let source = repository.join("src/lib.rs");
+        fs::write(&source, "fn old() { removed(); } fn removed() {}").unwrap();
+        let workspace = test_workspace("main", repository);
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+
+        scheduler.index(&store, &workspace).unwrap();
+        fs::write(&source, "fn broken() { @ } fn current() {}").unwrap();
+        scheduler.index(&store, &workspace).unwrap();
+
+        let recovered = store
+            .context_snapshot("main", "repo://repo/rust/lib/current")
+            .unwrap();
+        assert_eq!(
+            recovered.analysis.completeness,
+            AnalysisCompleteness::Incomplete
+        );
+        assert_eq!(
+            recovered.analysis.diagnostics[0].code,
+            "rust.parse_recovery"
+        );
+        assert!(
+            store
+                .inspect_observations(Some("calls"))
+                .unwrap()
+                .rows
+                .iter()
+                .all(|row| row[1].as_str() != Some("repo://repo/rust/lib/old"))
+        );
+        assert_eq!(
+            scheduler
+                .rust_analysis_versioned("fn broken() { @ } fn current() {}", FRONTEND_VERSION,)
+                .unwrap()
+                .1,
+            CacheStatus::Memory
+        );
+
+        fs::write(&source, "fn broken() { fn nested() {}").unwrap();
+        scheduler.mark(&workspace);
+        let error = scheduler.index(&store, &workspace).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<SourceAnalysisError>()
+                .is_some_and(SourceAnalysisError::is_unsafe_recovery)
+        );
+        assert_eq!(
+            store.inspect_revisions().unwrap().rows[0][1].as_i64(),
+            Some(2)
+        );
+        assert!(
+            scheduler
+                .query_metadata("main", 2, recovered.analysis)
+                .freshness
+                .stale
+        );
+
+        fs::write(&source, "fn repaired() {}").unwrap();
+        scheduler.index(&store, &workspace).unwrap();
+        let repaired = store
+            .context_snapshot("main", "repo://repo/rust/lib/repaired")
+            .unwrap();
+        assert_eq!(
+            repaired.analysis.completeness,
+            AnalysisCompleteness::Complete
+        );
+        assert!(repaired.analysis.diagnostics.is_empty());
+        assert_eq!(repaired.analysis_revision, 3);
+
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

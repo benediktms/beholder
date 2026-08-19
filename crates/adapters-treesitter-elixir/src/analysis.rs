@@ -1,5 +1,5 @@
 use super::model::*;
-use beholder_domain::{DependencyRelation, Observation, Provenance};
+use beholder_domain::{DependencyRelation, Observation, Provenance, UnsafeTreeRecovery};
 use std::collections::BTreeSet;
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -1152,17 +1152,72 @@ fn absinthe_resolver(
     ))
 }
 
+fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
+    if node.is_error() || node.is_missing() {
+        lines.push(node.start_position().row + 1);
+        *missing |= node.is_missing();
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_parse_errors(child, lines, missing);
+    }
+}
+
 pub fn analyze(source: &str) -> Result<ElixirAnalysis, Box<dyn Error>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_elixir::LANGUAGE.into())?;
     let tree = parser
         .parse(source, None)
         .ok_or("Elixir parser returned no tree")?;
-    if tree.root_node().has_error() {
-        return Err("failed to parse Elixir source".into());
+    let root = tree.root_node();
+    let mut parse_error_lines = Vec::new();
+    let mut missing = false;
+    collect_parse_errors(root, &mut parse_error_lines, &mut missing);
+    if missing {
+        return Err(UnsafeTreeRecovery::new("Elixir", "missing syntax may change nesting").into());
+    }
+    parse_error_lines.sort_unstable();
+    parse_error_lines.dedup();
+    let mut modules = Vec::new();
+    if parse_error_lines.is_empty() {
+        collect(root, source.as_bytes(), None, &mut modules);
+    } else {
+        let mut cursor = root.walk();
+        for child in root
+            .named_children(&mut cursor)
+            .filter(|child| !child.has_error())
+        {
+            collect(child, source.as_bytes(), None, &mut modules);
+        }
+        if modules.is_empty() {
+            return Err(
+                UnsafeTreeRecovery::new("Elixir", "no unaffected definitions remain").into(),
+            );
+        }
+    }
+    Ok(ElixirAnalysis {
+        modules,
+        parse_error_lines,
+    })
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovers_only_unaffected_top_level_modules() {
+        let analysis =
+            analyze("defmodule Broken do\n  def run(, do: :bad\nend\ndefmodule Safe do\nend")
+                .unwrap();
+        assert_eq!(analysis.modules.len(), 1);
+        assert_eq!(analysis.modules[0].name, "Safe");
+        assert!(!analysis.parse_error_lines.is_empty());
     }
 
-    let mut modules = Vec::new();
-    collect(tree.root_node(), source.as_bytes(), None, &mut modules);
-    Ok(ElixirAnalysis { modules })
+    #[test]
+    fn rejects_missing_delimiters_that_can_change_nesting() {
+        let error = analyze("defmodule Broken do\n  def run do\n    :ok\nend").unwrap_err();
+        assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
+    }
 }
