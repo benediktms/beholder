@@ -10,6 +10,7 @@ mod model;
 mod nestjs;
 mod nestjs_di;
 mod nestjs_graphql;
+mod plugin;
 mod resolution;
 mod ts_proto;
 

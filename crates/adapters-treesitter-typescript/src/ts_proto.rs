@@ -122,10 +122,9 @@ pub(super) fn client_bindings(
 pub(super) fn message_observations(
     repository: &str,
     analysis: &TypescriptAnalysis,
-    source: &str,
     path: &Path,
 ) -> Vec<Observation> {
-    if !is_generated_source(path, source) {
+    if !analysis.generated {
         return Vec::new();
     }
     let Some(package) = analysis
@@ -163,7 +162,9 @@ pub(super) fn message_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SourceLanguage, analyze};
+    use crate::{
+        SourceLanguage, analysis::analyze_with_plugins, analyze, plugin::built_in_plugins,
+    };
 
     #[test]
     fn binds_only_used_ts_proto_clients() {
@@ -211,14 +212,16 @@ mod tests {
               decode(input: Uint8Array) { return input; },
             };
         "#;
-        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
-
-        let observations = message_observations(
-            "example",
-            &analysis,
+        let path = Path::new("generated/initialize_order.generated.ts");
+        let analysis = analyze_with_plugins(
             source,
-            Path::new("generated/initialize_order.generated.ts"),
-        );
+            SourceLanguage::TypeScript,
+            path,
+            &built_in_plugins().unwrap(),
+        )
+        .unwrap();
+
+        let observations = message_observations("example", &analysis, path);
 
         assert!(observations.iter().any(|observation| {
             observation.from.as_str()

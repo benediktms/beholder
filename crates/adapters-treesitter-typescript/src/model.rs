@@ -49,6 +49,8 @@ pub struct TypescriptAnalysis {
     pub(super) graphql_documents: Vec<GraphqlDocument>,
     pub(super) nest_modules: Vec<NestModule>,
     pub(super) nest_providers: Vec<NestProvider>,
+    #[serde(default)]
+    pub(super) generated: bool,
     pub(super) parse_error_lines: Vec<usize>,
 }
 
