@@ -1316,19 +1316,26 @@ fn index_workspace_through_port(
     dirty: Option<&BTreeMap<String, DirtyRepository>>,
 ) -> Result<(usize, bool), Box<dyn Error>> {
     let source_loading_started = Instant::now();
-    let inventories = workspace
-        .repositories
-        .iter()
-        .map(|repository| {
-            let descriptors = workspace
-                .protobuf_descriptors
-                .iter()
-                .filter(|descriptor| descriptor.repository == repository.repository)
-                .map(|descriptor| descriptor.path.clone())
-                .collect::<Vec<_>>();
-            repository_inventory(&repository.base, &descriptors, &scheduler.indexer)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let inventories = tracing::info_span!(
+        "index.inventory",
+        workspace = %workspace.name,
+        repositories = workspace.repositories.len()
+    )
+    .in_scope(|| {
+        workspace
+            .repositories
+            .iter()
+            .map(|repository| {
+                let descriptors = workspace
+                    .protobuf_descriptors
+                    .iter()
+                    .filter(|descriptor| descriptor.repository == repository.repository)
+                    .map(|descriptor| descriptor.path.clone())
+                    .collect::<Vec<_>>();
+                repository_inventory(&repository.base, &descriptors, &scheduler.indexer)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let verification_fingerprint =
         workspace_verification_fingerprint(&scheduler.indexer, &inventories);
     if store.verification_matches(&workspace.name, &verification_fingerprint)?
@@ -1337,10 +1344,17 @@ fn index_workspace_through_port(
         tracing::info!(workspace = %workspace.name, "workspace inputs unchanged");
         return Ok((0, false));
     }
-    let repositories = inventories
-        .into_iter()
-        .map(RepositoryInventory::load)
-        .collect::<Result<Vec<_>, _>>()?;
+    let repositories = tracing::info_span!(
+        "index.load_sources",
+        workspace = %workspace.name,
+        repositories = inventories.len()
+    )
+    .in_scope(|| {
+        inventories
+            .into_iter()
+            .map(RepositoryInventory::load)
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let source_loading = source_loading_started.elapsed();
     let snapshot = WorkspaceSnapshot {
         name: workspace.name.clone(),
@@ -1379,7 +1393,12 @@ fn index_workspace_through_port(
         })
         .sum::<usize>();
     let repository_analysis_started = Instant::now();
-    let analysis = scheduler.indexer.analyze(&snapshot).map_err(erase_error)?;
+    let analysis = tracing::info_span!(
+        "index.analyze",
+        workspace = %workspace.name,
+        dirty_source_units
+    )
+    .in_scope(|| scheduler.indexer.analyze(&snapshot).map_err(erase_error))?;
     let repository_analysis = repository_analysis_started.elapsed();
     let mut memory_hits = 0;
     let mut disk_hits = 0;
@@ -1401,12 +1420,19 @@ fn index_workspace_through_port(
         .map(|facts| facts.observations.len())
         .sum();
     let publication_started = Instant::now();
-    let changes = store.publish_verified(
-        &view,
-        &repository_facts,
-        &analysis.overrides,
-        &verification_fingerprint,
-    )?;
+    let changes = tracing::info_span!(
+        "index.publish",
+        workspace = %workspace.name,
+        observation_count
+    )
+    .in_scope(|| {
+        store.publish_verified(
+            &view,
+            &repository_facts,
+            &analysis.overrides,
+            &verification_fingerprint,
+        )
+    })?;
     scheduler.queue_enrichments(store, &snapshot, &view)?;
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
