@@ -13,4 +13,4 @@ if [[ -x "$cli" ]]; then
 else
     echo 'beholder is not built or installed; skipping daemon uninstall' >&2
 fi
-rm -f "$install_dir/beholder" "$install_dir/beholderd"
+rm -f "$install_dir/beholder" "$install_dir/beholderd" "$install_dir/beholder-worker-rust"

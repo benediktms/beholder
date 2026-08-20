@@ -49,7 +49,7 @@ tasks:
       runInCI: false
 
   release:
-    command: 'cargo build --release -p beholder-cli -p beholder-daemon'
+    command: 'cargo build --release -p beholder-cli -p beholder-daemon -p beholder-worker-rust'
     inputs:
       - '@group(sources)'
     options:

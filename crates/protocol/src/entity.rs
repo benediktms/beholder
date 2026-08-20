@@ -32,6 +32,7 @@ impl From<dto::AnalysisCompleteness> for v1::AnalysisCompleteness {
 
 fn analysis_completeness(value: i32) -> Result<dto::AnalysisCompleteness, &'static str> {
     match v1::AnalysisCompleteness::try_from(value).map_err(|_| "unknown analysis completeness")? {
+        v1::AnalysisCompleteness::Unspecified => Err("analysis completeness is missing"),
         v1::AnalysisCompleteness::Complete => Ok(dto::AnalysisCompleteness::Complete),
         v1::AnalysisCompleteness::Incomplete => Ok(dto::AnalysisCompleteness::Incomplete),
     }
@@ -52,6 +53,9 @@ fn analysis_diagnostic_severity(
     match v1::AnalysisDiagnosticSeverity::try_from(value)
         .map_err(|_| "unknown analysis diagnostic severity")?
     {
+        v1::AnalysisDiagnosticSeverity::Unspecified => {
+            Err("analysis diagnostic severity is missing")
+        }
         v1::AnalysisDiagnosticSeverity::KnownLimitation => {
             Ok(dto::AnalysisDiagnosticSeverity::KnownLimitation)
         }
@@ -161,7 +165,7 @@ impl From<dto::EntityKind> for v1::EntityKind {
             dto::EntityKind::Rpc => Self::Rpc,
             dto::EntityKind::Service => Self::Service,
             dto::EntityKind::UnityPrefab => Self::UnityPrefab,
-            dto::EntityKind::Unknown => Self::Unknown,
+            dto::EntityKind::Unknown => Self::Unspecified,
         }
     }
 }
@@ -178,6 +182,7 @@ impl From<dto::EntityOrigin> for v1::EntityOrigin {
 
 fn entity_origin(value: i32) -> Result<dto::EntityOrigin, &'static str> {
     match v1::EntityOrigin::try_from(value).map_err(|_| "unknown entity origin")? {
+        v1::EntityOrigin::Unspecified => Err("entity origin is missing"),
         v1::EntityOrigin::Source => Ok(dto::EntityOrigin::Source),
         v1::EntityOrigin::Generated => Ok(dto::EntityOrigin::Generated),
         v1::EntityOrigin::ExternalDependency => Ok(dto::EntityOrigin::ExternalDependency),
@@ -203,7 +208,7 @@ fn entity_kind(value: i32) -> Result<dto::EntityKind, &'static str> {
             v1::EntityKind::Rpc => dto::EntityKind::Rpc,
             v1::EntityKind::Service => dto::EntityKind::Service,
             v1::EntityKind::UnityPrefab => dto::EntityKind::UnityPrefab,
-            v1::EntityKind::Unknown => dto::EntityKind::Unknown,
+            v1::EntityKind::Unspecified => dto::EntityKind::Unknown,
         },
     )
 }
@@ -220,7 +225,7 @@ fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'s
                     v1::GraphqlOperationKind::Subscription => {
                         dto::GraphqlOperationKind::Subscription
                     }
-                    v1::GraphqlOperationKind::Unknown => {
+                    v1::GraphqlOperationKind::Unspecified => {
                         return Err("GraphQL operation kind is missing");
                     }
                 },
@@ -237,7 +242,9 @@ fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'s
                     v1::GraphqlTypeKind::Object => dto::GraphqlTypeKind::Object,
                     v1::GraphqlTypeKind::Scalar => dto::GraphqlTypeKind::Scalar,
                     v1::GraphqlTypeKind::Union => dto::GraphqlTypeKind::Union,
-                    v1::GraphqlTypeKind::Unknown => return Err("GraphQL type kind is missing"),
+                    v1::GraphqlTypeKind::Unspecified => {
+                        return Err("GraphQL type kind is missing");
+                    }
                 },
             })
         }
@@ -247,7 +254,7 @@ fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'s
             {
                 v1::ProtoTypeKind::Enum => dto::ProtoTypeKind::Enum,
                 v1::ProtoTypeKind::Message => dto::ProtoTypeKind::Message,
-                v1::ProtoTypeKind::Unknown => return Err("Protobuf type kind is missing"),
+                v1::ProtoTypeKind::Unspecified => return Err("Protobuf type kind is missing"),
             },
         }),
         v1::entity_metadata::Metadata::RpcCardinality(value) => {
@@ -261,7 +268,7 @@ fn entity_metadata(value: v1::EntityMetadata) -> Result<dto::EntityMetadata, &'s
                     v1::RpcCardinality::ClientStreaming => dto::RpcCardinality::ClientStreaming,
                     v1::RpcCardinality::ServerStreaming => dto::RpcCardinality::ServerStreaming,
                     v1::RpcCardinality::Unary => dto::RpcCardinality::Unary,
-                    v1::RpcCardinality::Unknown => return Err("RPC cardinality is missing"),
+                    v1::RpcCardinality::Unspecified => return Err("RPC cardinality is missing"),
                 },
             })
         }
@@ -345,11 +352,12 @@ impl From<dto::EvidenceKind> for v1::EvidenceKind {
     fn from(value: dto::EvidenceKind) -> Self {
         match value {
             dto::EvidenceKind::Ast => Self::Ast,
+            dto::EvidenceKind::Compiler => Self::Compiler,
             dto::EvidenceKind::Configuration => Self::Configuration,
             dto::EvidenceKind::Descriptor => Self::Descriptor,
             dto::EvidenceKind::Generated => Self::Generated,
             dto::EvidenceKind::Inference => Self::Inference,
-            dto::EvidenceKind::Unknown => Self::Unknown,
+            dto::EvidenceKind::Unknown => Self::Unspecified,
         }
     }
 }
@@ -358,11 +366,12 @@ fn evidence_kind(value: i32) -> Result<dto::EvidenceKind, &'static str> {
     Ok(
         match v1::EvidenceKind::try_from(value).map_err(|_| "unknown evidence kind")? {
             v1::EvidenceKind::Ast => dto::EvidenceKind::Ast,
+            v1::EvidenceKind::Compiler => dto::EvidenceKind::Compiler,
             v1::EvidenceKind::Configuration => dto::EvidenceKind::Configuration,
             v1::EvidenceKind::Descriptor => dto::EvidenceKind::Descriptor,
             v1::EvidenceKind::Generated => dto::EvidenceKind::Generated,
             v1::EvidenceKind::Inference => dto::EvidenceKind::Inference,
-            v1::EvidenceKind::Unknown => dto::EvidenceKind::Unknown,
+            v1::EvidenceKind::Unspecified => dto::EvidenceKind::Unknown,
         },
     )
 }
@@ -436,7 +445,7 @@ pub(super) fn relation_kind(value: i32) -> Result<dto::RelationKind, &'static st
         v1::RelationKind::Selects => Ok(dto::RelationKind::Selects),
         v1::RelationKind::ResponseType => Ok(dto::RelationKind::ResponseType),
         v1::RelationKind::Uses => Ok(dto::RelationKind::Uses),
-        v1::RelationKind::Unknown => Err("relation kind is missing"),
+        v1::RelationKind::Unspecified => Err("relation kind is missing"),
     }
 }
 

@@ -183,8 +183,9 @@ pub(super) fn inspect_observations(
     };
     Ok(db.run_script(
         &format!(
-            "?[state, from, relation, to, evidence] := \
-                 *state_observation{{state, from, relation, to, evidence}}{filter}\n\
+            "?[state, from, relation, to, evidence, confidence, provenance] := \
+                 *state_observation{{state, from, relation, to, evidence}}, \
+                 *state_observation_metadata{{state, from, relation, to, confidence, provenance}}{filter}\n\
              :order relation, from, to"
         ),
         params,

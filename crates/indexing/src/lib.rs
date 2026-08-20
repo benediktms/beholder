@@ -8,10 +8,12 @@ use std::{
     collections::{BTreeMap, HashSet},
     error::Error,
     fs::{self, File},
+    future::Future,
     hash::Hash,
     io::{BufReader, BufWriter, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -136,6 +138,24 @@ pub trait WorkspaceAnalyzer: Send + Sync {
             .any(|input| self.accepts(&input.path))
     }
     fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError>;
+    fn clear_cache(&self) -> Result<(), AnalyzerError> {
+        Ok(())
+    }
+}
+
+pub type EnrichmentFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AnalyzerContribution, AnalyzerError>> + Send + 'a>>;
+
+pub trait WorkspaceEnricher: Send + Sync {
+    fn metadata(&self) -> AnalyzerMetadata;
+    fn accepts(&self, path: &Path) -> bool;
+    fn is_active(&self, repository: &RepositorySnapshot) -> bool {
+        repository
+            .inputs
+            .iter()
+            .any(|input| self.accepts(&input.path))
+    }
+    fn enrich<'a>(&'a self, snapshot: WorkspaceSnapshot) -> EnrichmentFuture<'a>;
     fn clear_cache(&self) -> Result<(), AnalyzerError> {
         Ok(())
     }
@@ -465,6 +485,7 @@ impl<L: AnalyzerLanguage> LanguageAnalyzer<L> {
 
 pub struct IndexerBuilder {
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
+    enrichers: Vec<Box<dyn WorkspaceEnricher>>,
     cache_dir: PathBuf,
     workers: usize,
 }
@@ -473,6 +494,7 @@ impl IndexerBuilder {
     pub fn new(cache_dir: PathBuf, workers: usize) -> Self {
         Self {
             analyzers: Vec::new(),
+            enrichers: Vec::new(),
             cache_dir,
             workers,
         }
@@ -483,8 +505,15 @@ impl IndexerBuilder {
         self
     }
 
+    pub fn add_enricher(mut self, analyzer: impl WorkspaceEnricher + 'static) -> Self {
+        self.enrichers.push(Box::new(analyzer));
+        self
+    }
+
     pub fn build(mut self) -> Result<Indexer, AnalyzerError> {
         self.analyzers
+            .sort_by_key(|analyzer| analyzer.metadata().id);
+        self.enrichers
             .sort_by_key(|analyzer| analyzer.metadata().id);
         if let Some(duplicate) = self
             .analyzers
@@ -495,12 +524,22 @@ impl IndexerBuilder {
                 format!("duplicate analyzer identity {}", duplicate[0].metadata().id).into(),
             );
         }
+        if let Some(duplicate) = self
+            .enrichers
+            .windows(2)
+            .find(|pair| pair[0].metadata().id == pair[1].metadata().id)
+        {
+            return Err(
+                format!("duplicate enricher identity {}", duplicate[0].metadata().id).into(),
+            );
+        }
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.workers)
             .thread_name(|index| format!("beholder-index-{index}"))
             .build()?;
         Ok(Indexer {
             analyzers: self.analyzers,
+            enrichers: self.enrichers,
             cache_dir: self.cache_dir,
             pool,
             repository_cache: Mutex::new(BTreeMap::new()),
@@ -510,6 +549,7 @@ impl IndexerBuilder {
 
 pub struct Indexer {
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
+    enrichers: Vec<Box<dyn WorkspaceEnricher>>,
     cache_dir: PathBuf,
     pool: ThreadPool,
     repository_cache: Mutex<BTreeMap<(String, String), Arc<CanonicalRepositoryAnalysis>>>,
@@ -518,6 +558,7 @@ pub struct Indexer {
 impl Indexer {
     pub fn accepts(&self, path: &Path) -> bool {
         self.analyzers.iter().any(|analyzer| analyzer.accepts(path))
+            || self.enrichers.iter().any(|enricher| enricher.accepts(path))
     }
 
     pub fn analysis_identity(&self, snapshot: &WorkspaceSnapshot) -> String {
@@ -543,6 +584,39 @@ impl Indexer {
                 .map(|analyzer| analyzer.metadata())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    pub fn active_enrichers(&self, snapshot: &WorkspaceSnapshot) -> Vec<AnalyzerMetadata> {
+        self.enrichers
+            .iter()
+            .filter(|analyzer| {
+                snapshot
+                    .repositories
+                    .iter()
+                    .any(|repository| analyzer.is_active(repository))
+            })
+            .map(|analyzer| analyzer.metadata())
+            .collect()
+    }
+
+    pub fn enrichment_catalog(&self) -> Vec<AnalyzerMetadata> {
+        self.enrichers
+            .iter()
+            .map(|analyzer| analyzer.metadata())
+            .collect()
+    }
+
+    pub async fn enrich(
+        &self,
+        snapshot: WorkspaceSnapshot,
+        id: &str,
+    ) -> Result<AnalyzerContribution, AnalyzerError> {
+        let analyzer = self
+            .enrichers
+            .iter()
+            .find(|analyzer| analyzer.metadata().id == id)
+            .ok_or_else(|| format!("unknown enricher identity {id}"))?;
+        analyzer.enrich(snapshot).await
     }
 
     pub fn analyze(
@@ -637,6 +711,9 @@ impl Indexer {
     pub fn clear_cache(&self) -> Result<(), AnalyzerError> {
         for analyzer in &self.analyzers {
             analyzer.clear_cache()?;
+        }
+        for enricher in &self.enrichers {
+            enricher.clear_cache()?;
         }
         if self.cache_dir.exists() {
             fs::remove_dir_all(&self.cache_dir)?;
@@ -858,7 +935,7 @@ mod tests {
             snapshot: &WorkspaceSnapshot,
         ) -> Result<AnalyzerContribution, AnalyzerError> {
             Ok(AnalyzerContribution {
-                metadata: self.metadata(),
+                metadata: WorkspaceAnalyzer::metadata(self),
                 active_repositories: snapshot
                     .repositories
                     .iter()
@@ -884,6 +961,20 @@ mod tests {
                     ..Default::default()
                 },
             })
+        }
+    }
+
+    impl WorkspaceEnricher for FakeAnalyzer {
+        fn metadata(&self) -> AnalyzerMetadata {
+            WorkspaceAnalyzer::metadata(self)
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            WorkspaceAnalyzer::accepts(self, path)
+        }
+
+        fn enrich<'a>(&'a self, snapshot: WorkspaceSnapshot) -> EnrichmentFuture<'a> {
+            Box::pin(async move { self.analyze(&snapshot) })
         }
     }
 
@@ -929,6 +1020,28 @@ mod tests {
             indexer.analyze(&snapshot()).unwrap().repositories[0].cache,
             CacheStatus::Memory
         );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[tokio::test]
+    async fn enrichment_is_separate_from_baseline_analysis() {
+        let cache_dir = cache_dir("enrichment");
+        let indexer = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "syntax" })
+            .add_enricher(FakeAnalyzer { id: "semantic" })
+            .build()
+            .unwrap();
+
+        let baseline = indexer.analyze(&snapshot()).unwrap();
+        let enrichment = indexer.enrich(snapshot(), "semantic").await.unwrap();
+
+        assert!(baseline.analysis_identity.contains("syntax:1"));
+        assert!(!baseline.analysis_identity.contains("semantic:1"));
+        assert_eq!(
+            baseline.repositories[0].facts.entities[0].id.as_str(),
+            "rust-function://syntax"
+        );
+        assert_eq!(enrichment.metadata.id, "semantic");
         let _ = fs::remove_dir_all(cache_dir);
     }
 

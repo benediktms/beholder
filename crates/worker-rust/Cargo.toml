@@ -1,0 +1,24 @@
+[package]
+name = "beholder-worker-rust"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "beholder-worker-rust"
+path = "src/main.rs"
+
+[dependencies]
+beholder-adapters-treesitter-rust.workspace = true
+beholder-domain.workspace = true
+beholder-indexing.workspace = true
+beholder-protocol.workspace = true
+ra_ap_ide = "0.0.348"
+ra_ap_ide_db = "0.0.348"
+ra_ap_load-cargo = "0.0.348"
+ra_ap_project_model = "0.0.348"
+ra_ap_syntax = "0.0.348"
+ra_ap_vfs = "0.0.348"
+rayon.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic.workspace = true

@@ -8,12 +8,15 @@ use super::{
         inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions, trace,
     },
     storage::{
-        claim_garbage_collection, garbage_collection_pending, garbage_collection_queued,
-        publish_observations, store_verification_fingerprint, sweep_garbage_collection,
-        verification_matches, view_matches,
+        claim_garbage_collection, enrichment_matches, garbage_collection_pending,
+        garbage_collection_queued, publish_enrichment, publish_observations,
+        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
+        view_matches,
     },
 };
-use beholder_domain::{DependencyOverride, FactChanges, RepositoryFacts, WorkspaceView};
+use beholder_domain::{
+    AnalysisDiagnostic, DependencyOverride, FactChanges, RepositoryFacts, WorkspaceView,
+};
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
     Revisioned, TraceResult,
@@ -128,6 +131,26 @@ impl SemanticStore {
             overrides,
             Some(verification_fingerprint),
         )
+    }
+
+    pub fn enrichment_matches(
+        &self,
+        view: &str,
+        analyzer: &str,
+        version: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        enrichment_matches(&self.read_db, view, analyzer, version)
+    }
+
+    pub fn publish_enrichment(
+        &self,
+        view: &WorkspaceView,
+        analyzer: &str,
+        version: &str,
+        overrides: &[DependencyOverride],
+        diagnostics: &[(String, AnalysisDiagnostic)],
+    ) -> Result<bool, Box<dyn Error>> {
+        publish_enrichment(&self.db, view, analyzer, version, overrides, diagnostics)
     }
 
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {

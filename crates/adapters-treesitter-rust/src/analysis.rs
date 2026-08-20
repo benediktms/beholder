@@ -20,90 +20,104 @@ pub(super) fn collect_tree_sitter_functions<'tree>(
     scope: &mut Vec<String>,
     functions: &mut Vec<(String, String, Node<'tree>)>,
 ) {
-    if node.kind() == "function_item"
-        && let Some(name) = node.child_by_field_name("name")
-        && let Ok(name) = name.utf8_text(source)
-    {
-        let qualified_name = scope
-            .iter()
-            .map(String::as_str)
-            .chain(std::iter::once(name))
-            .collect::<Vec<_>>()
-            .join("/");
-        functions.push((name.to_owned(), qualified_name, node));
-        return;
+    enum Frame<'tree> {
+        Visit(Node<'tree>),
+        ExitScope,
     }
-
-    let nested_scope = match node.kind() {
-        "mod_item" => node
-            .child_by_field_name("name")
-            .and_then(|name| name.utf8_text(source).ok())
-            .map(str::to_owned),
-        "impl_item" => node
-            .child_by_field_name("type")
-            .and_then(|target| target.utf8_text(source).ok())
-            .map(|target| {
-                let owner = node
-                    .child_by_field_name("trait")
-                    .and_then(|trait_| trait_.utf8_text(source).ok())
-                    .map_or_else(
-                        || target.to_owned(),
-                        |trait_| format!("{trait_}-for-{target}"),
-                    );
-                format!("impl/{owner}")
-            }),
-        _ => None,
-    };
-    let pushed_scope = nested_scope.is_some();
-    if let Some(nested_scope) = nested_scope {
-        scope.push(nested_scope);
+    let initial_scope = scope.len();
+    let mut stack = vec![Frame::Visit(node)];
+    while let Some(frame) = stack.pop() {
+        let Frame::Visit(node) = frame else {
+            scope.pop();
+            continue;
+        };
+        if matches!(node.kind(), "function_item" | "function_signature_item")
+            && let Some(name) = node.child_by_field_name("name")
+            && let Ok(name) = name.utf8_text(source)
+        {
+            let qualified_name = scope
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(name))
+                .collect::<Vec<_>>()
+                .join("/");
+            functions.push((name.to_owned(), qualified_name, node));
+            continue;
+        }
+        let nested_scope = match node.kind() {
+            "mod_item" => node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+                .map(str::to_owned),
+            "impl_item" => node
+                .child_by_field_name("type")
+                .and_then(|target| target.utf8_text(source).ok())
+                .map(|target| {
+                    let owner = node
+                        .child_by_field_name("trait")
+                        .and_then(|trait_| trait_.utf8_text(source).ok())
+                        .map_or_else(
+                            || target.to_owned(),
+                            |trait_| format!("{trait_}-for-{target}"),
+                        );
+                    format!("impl/{owner}")
+                }),
+            _ => None,
+        };
+        if let Some(nested_scope) = nested_scope {
+            scope.push(nested_scope);
+            stack.push(Frame::ExitScope);
+        }
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev().map(Frame::Visit));
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_tree_sitter_functions(child, source, scope, functions);
-    }
-    if pushed_scope {
-        scope.pop();
-    }
+    debug_assert_eq!(scope.len(), initial_scope);
 }
 
 fn collect_tree_sitter_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<RustCall>) {
-    if node.kind() == "call_expression"
-        && let Some(function) = node.child_by_field_name("function")
-    {
-        let callee = if function.kind() == "generic_function" {
-            function.child_by_field_name("function").unwrap_or(function)
-        } else {
-            function
-        };
-        let receiver_method = callee.kind() == "field_expression";
-        let name = if receiver_method {
-            callee.child_by_field_name("field")
-        } else {
-            Some(callee)
-        };
-        if let Some(name) = name.and_then(|name| name.utf8_text(source).ok()) {
-            calls.push(RustCall {
-                name: name.to_owned(),
-                line: node.start_position().row + 1,
-                receiver_method,
-            });
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression"
+            && let Some(function) = node.child_by_field_name("function")
+        {
+            let callee = if function.kind() == "generic_function" {
+                function.child_by_field_name("function").unwrap_or(function)
+            } else {
+                function
+            };
+            let receiver_method = callee.kind() == "field_expression";
+            let name = if receiver_method {
+                callee.child_by_field_name("field")
+            } else {
+                Some(callee)
+            };
+            if let Some(name) = name
+                && let Ok(text) = name.utf8_text(source)
+            {
+                calls.push(RustCall {
+                    name: text.to_owned(),
+                    line: node.start_position().row + 1,
+                    offset: name.start_byte(),
+                    receiver_method,
+                });
+            }
         }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_tree_sitter_calls(child, source, calls);
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
 }
 
 fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
-    if node.is_error() || node.is_missing() {
-        lines.push(node.start_position().row + 1);
-        *missing |= node.is_missing();
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_parse_errors(child, lines, missing);
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            lines.push(node.start_position().row + 1);
+            *missing |= node.is_missing();
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
     }
 }
 
@@ -146,6 +160,9 @@ fn analyze_tree_sitter(
                     name,
                     qualified_name,
                     line: function.start_position().row + 1,
+                    name_offset: function
+                        .child_by_field_name("name")
+                        .map_or(function.start_byte(), |name| name.start_byte()),
                     calls,
                 }
             })
@@ -218,6 +235,7 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
                         return Some(RustCall {
                             name: callee.syntax().text().to_string(),
                             line: line_at(&lines, node.text_range().start()),
+                            offset: usize::from(callee.syntax().text_range().start()),
                             receiver_method: false,
                         });
                     }
@@ -225,6 +243,7 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
                         Some(RustCall {
                             name: call.name_ref()?.text().to_string(),
                             line: line_at(&lines, call.syntax().text_range().start()),
+                            offset: usize::from(call.name_ref()?.syntax().text_range().start()),
                             receiver_method: true,
                         })
                     })
@@ -234,6 +253,7 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
                 name,
                 qualified_name,
                 line: line_at(&lines, function.syntax().text_range().start()),
+                name_offset: usize::from(function.name()?.syntax().text_range().start()),
                 calls,
             })
         })
@@ -292,13 +312,7 @@ pub fn observations_from_analysis(
     analysis: &RustAnalysis,
     path: &Path,
 ) -> Vec<Observation> {
-    let module = path
-        .strip_prefix("src")
-        .unwrap_or(path)
-        .with_extension("")
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    let source_id = format!("repo://{repository}/rust/{module}");
+    let source_id = source_entity_id(repository, path);
     let mut definitions = BTreeMap::<(String, String), Option<String>>::new();
     for function in &analysis.functions {
         let id = format!("{source_id}/{}", function.qualified_name);
@@ -346,18 +360,22 @@ pub fn observations_from_analysis(
     observations
 }
 
-pub fn entities_from_analysis(
-    repository: &str,
-    analysis: &RustAnalysis,
-    path: &Path,
-) -> Vec<EntityFact> {
+pub fn source_entity_id(repository: &str, path: &Path) -> String {
     let module = path
         .strip_prefix("src")
         .unwrap_or(path)
         .with_extension("")
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
-    let source_id = format!("repo://{repository}/rust/{module}");
+    format!("repo://{repository}/rust/{module}")
+}
+
+pub fn entities_from_analysis(
+    repository: &str,
+    analysis: &RustAnalysis,
+    path: &Path,
+) -> Vec<EntityFact> {
+    let source_id = source_entity_id(repository, path);
     std::iter::once(EntityFact::new(source_id.clone(), EntityKind::Namespace, None).unwrap())
         .chain(analysis.functions.iter().map(|function| {
             EntityFact::new(

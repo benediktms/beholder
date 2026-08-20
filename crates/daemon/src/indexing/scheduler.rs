@@ -71,9 +71,11 @@ use beholder_domain::{
     BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace, WorkspaceView,
 };
 use beholder_dto::{Freshness, QueryMetadata};
-use beholder_indexing::{CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot};
 #[cfg(test)]
-use beholder_indexing::{IndexerBuilder, WorkspaceAnalyzer};
+use beholder_indexing::{
+    AnalyzerMetadata, EnrichmentFuture, IndexerBuilder, WorkspaceAnalyzer, WorkspaceEnricher,
+};
+use beholder_indexing::{CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot};
 use notify::{Event, EventKind};
 #[cfg(test)]
 use rayon::prelude::*;
@@ -107,6 +109,8 @@ mod csharp_analysis;
 #[cfg(test)]
 #[path = "elixir_analysis.rs"]
 mod elixir_analysis;
+#[path = "enrichment.rs"]
+mod enrichment;
 #[path = "pipeline.rs"]
 mod pipeline;
 #[cfg(test)]
@@ -119,6 +123,7 @@ mod sources;
 mod typescript_analysis;
 #[cfg(test)]
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
+use enrichment::{EnrichmentJob, EnrichmentRun};
 use sources::{RepositoryInventory, repository_inventory};
 #[cfg(test)]
 use sources::{RepositorySources, decode_csharp_source, repository_sources};
@@ -251,9 +256,13 @@ pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
     active_operation: Mutex<Option<String>>,
+    enrichment_jobs: Mutex<BTreeMap<(String, String), EnrichmentJob>>,
+    enriching: Mutex<BTreeMap<(String, String), EnrichmentRun>>,
     idle: Condvar,
     changed: Notify,
+    enrichment_changed: Notify,
     shutdown: Notify,
+    enrichment_shutdown: Notify,
     checkpointing: AtomicBool,
     indexer: Indexer,
     #[cfg(test)]
@@ -322,9 +331,13 @@ impl IndexScheduler {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
+            enrichment_jobs: Mutex::new(BTreeMap::new()),
+            enriching: Mutex::new(BTreeMap::new()),
             idle: Condvar::new(),
             changed: Notify::new(),
+            enrichment_changed: Notify::new(),
             shutdown: Notify::new(),
+            enrichment_shutdown: Notify::new(),
             checkpointing: AtomicBool::new(false),
             indexer,
             #[cfg(test)]
@@ -380,9 +393,13 @@ impl IndexScheduler {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
+            enrichment_jobs: Mutex::new(BTreeMap::new()),
+            enriching: Mutex::new(BTreeMap::new()),
             idle: Condvar::new(),
             changed: Notify::new(),
+            enrichment_changed: Notify::new(),
             shutdown: Notify::new(),
+            enrichment_shutdown: Notify::new(),
             checkpointing: AtomicBool::new(false),
             indexer,
             cache_dir,
@@ -437,7 +454,15 @@ impl IndexScheduler {
         let indexing = self
             .active_operation
             .lock()
-            .is_ok_and(|active| active.as_deref() == Some(workspace));
+            .is_ok_and(|active| active.as_deref() == Some(workspace))
+            || self
+                .enriching
+                .lock()
+                .is_ok_and(|active| active.keys().any(|(active, _)| active == workspace))
+            || self.enrichment_jobs.lock().is_ok_and(|jobs| {
+                jobs.keys()
+                    .any(|(queued_workspace, _)| queued_workspace == workspace)
+            });
         QueryMetadata {
             revision: analysis_revision,
             view: workspace.into(),
@@ -623,12 +648,15 @@ impl IndexScheduler {
         store: Arc<SemanticStore>,
         workspaces: Arc<Mutex<WorkspaceRegistry>>,
     ) {
+        let enrichment = tokio::spawn(self.clone().run_enrichments(store.clone()));
         self.run_with_reconciliation_period(store, workspaces, RECONCILIATION_PERIOD)
             .await;
+        let _ = enrichment.await;
     }
 
     pub fn stop(&self) {
         self.shutdown.notify_one();
+        self.enrichment_shutdown.notify_one();
     }
 
     pub fn schedule_checkpoint(self: &Arc<Self>, store: Arc<SemanticStore>) {
@@ -1303,7 +1331,9 @@ fn index_workspace_through_port(
         .collect::<Result<Vec<_>, _>>()?;
     let verification_fingerprint =
         workspace_verification_fingerprint(&scheduler.indexer, &inventories);
-    if store.verification_matches(&workspace.name, &verification_fingerprint)? {
+    if store.verification_matches(&workspace.name, &verification_fingerprint)?
+        && scheduler.enrichments_current(store, &workspace.name)?
+    {
         tracing::info!(workspace = %workspace.name, "workspace inputs unchanged");
         return Ok((0, false));
     }
@@ -1327,6 +1357,7 @@ fn index_workspace_through_port(
     )?;
     if store.view_matches(&view)? {
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
+        scheduler.queue_enrichments(store, &snapshot, &view)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
@@ -1376,6 +1407,7 @@ fn index_workspace_through_port(
         &analysis.overrides,
         &verification_fingerprint,
     )?;
+    scheduler.queue_enrichments(store, &snapshot, &view)?;
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
     tracing::info!(
@@ -1634,6 +1666,25 @@ mod tests {
     use beholder_dto::{AnalysisCompleteness, EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
+    struct FakeEnricher;
+
+    impl WorkspaceEnricher for FakeEnricher {
+        fn metadata(&self) -> AnalyzerMetadata {
+            AnalyzerMetadata {
+                id: "semantic".into(),
+                version: "1".into(),
+            }
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            path.extension().is_some_and(|extension| extension == "rs")
+        }
+
+        fn enrich<'a>(&'a self, _: WorkspaceSnapshot) -> EnrichmentFuture<'a> {
+            Box::pin(async { unreachable!("an identical active job must not be queued") })
+        }
+    }
+
     fn test_workspace(name: &str, base: PathBuf) -> Workspace {
         Workspace::new(
             name,
@@ -1696,6 +1747,49 @@ mod tests {
                 kind: beholder_indexing::InputKind::ProtobufDescriptor,
             }],
         }));
+    }
+
+    #[test]
+    fn does_not_queue_an_identical_active_enrichment() {
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "repo".into(),
+            },
+            head: None,
+            fingerprint: "source".into(),
+        };
+        let snapshot = WorkspaceSnapshot {
+            name: "main".into(),
+            repositories: vec![beholder_indexing::RepositorySnapshot {
+                base: PathBuf::from("repo"),
+                state: state.clone(),
+                inputs: vec![beholder_indexing::RepositoryInput {
+                    path: PathBuf::from("src/lib.rs"),
+                    content: Arc::from(&b"fn main() {}"[..]),
+                    kind: beholder_indexing::InputKind::Source,
+                }],
+            }],
+        };
+        let view = WorkspaceView::new("main", "syntax", vec![state]).unwrap();
+        let scheduler = IndexScheduler::with_indexer(
+            IndexerBuilder::new(PathBuf::new(), 1)
+                .add_enricher(FakeEnricher)
+                .build()
+                .unwrap(),
+        );
+        scheduler.enriching.lock().unwrap().insert(
+            ("main".into(), "semantic".into()),
+            EnrichmentRun {
+                fingerprint: view.fingerprint(),
+                version: "1".into(),
+            },
+        );
+
+        scheduler
+            .queue_enrichments(&SemanticStore::memory().unwrap(), &snapshot, &view)
+            .unwrap();
+
+        assert!(scheduler.enrichment_jobs.lock().unwrap().is_empty());
     }
 
     #[test]

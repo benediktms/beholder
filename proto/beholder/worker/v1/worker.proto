@@ -1,0 +1,186 @@
+syntax = "proto3";
+
+package beholder.worker.v1;
+
+import "beholder/v1/daemon.proto";
+
+service AnalyzerWorker {
+  rpc Analyze(stream AnalyzeRequest) returns (stream AnalyzeEvent);
+}
+
+message AnalyzeRequest {
+  oneof request {
+    AnalysisStart start = 1;
+    RepositoryStart repository = 2;
+    RepositoryInput input = 3;
+    AnalysisFinish finish = 4;
+  }
+}
+
+message AnalysisStart {
+  string workspace = 1;
+}
+
+message RepositoryStart {
+  string identity = 1;
+  string base = 2;
+  optional string head = 3;
+  string fingerprint = 4;
+}
+
+message RepositoryInput {
+  string repository = 1;
+  string path = 2;
+  bytes content = 3;
+  InputKind kind = 4;
+}
+
+message AnalysisFinish {}
+
+enum InputKind {
+  INPUT_KIND_UNSPECIFIED = 0;
+  INPUT_KIND_SOURCE = 1;
+  INPUT_KIND_PROTOBUF_DESCRIPTOR = 2;
+}
+
+message AnalyzeEvent {
+  oneof event {
+    AnalysisProgress progress = 1;
+    RepositoryContribution repository = 2;
+    AnalysisCompleted completed = 3;
+    AnalysisFailure failure = 4;
+    AnalysisContribution contribution = 5;
+  }
+}
+
+message AnalysisProgress {
+  AnalysisPhase phase = 1;
+  optional string detail = 2;
+}
+
+enum AnalysisPhase {
+  ANALYSIS_PHASE_UNSPECIFIED = 0;
+  ANALYSIS_PHASE_RECEIVING_SNAPSHOT = 1;
+  ANALYSIS_PHASE_ANALYZING = 2;
+}
+
+message AnalysisCompleted {
+  AnalyzerMetadata metadata = 1;
+  repeated string active_repositories = 2;
+  CacheStatistics cache = 6;
+}
+
+message AnalysisContribution {
+  repeated DependencyOverride overrides = 1;
+  repeated GraphqlResolverCandidate graphql_resolvers = 2;
+  repeated RepositoryDiagnostic diagnostics = 3;
+}
+
+message AnalysisFailure {
+  string code = 1;
+  string message = 2;
+}
+
+message AnalyzerMetadata {
+  string id = 1;
+  string version = 2;
+}
+
+message CacheStatistics {
+  uint64 memory_hits = 1;
+  uint64 disk_hits = 2;
+  uint64 misses = 3;
+}
+
+message RepositoryContribution {
+  string repository = 1;
+  AnalysisCompleteness completeness = 2;
+  repeated EntityFact entities = 3;
+  repeated GrpcBindingCandidate grpc_bindings = 4;
+  repeated Observation observations = 5;
+  repeated AnalysisDiagnostic diagnostics = 6;
+}
+
+enum AnalysisCompleteness {
+  ANALYSIS_COMPLETENESS_UNSPECIFIED = 0;
+  ANALYSIS_COMPLETENESS_COMPLETE = 1;
+  ANALYSIS_COMPLETENESS_INCOMPLETE = 2;
+}
+
+message EntityFact {
+  string id = 1;
+  beholder.v1.EntityKind kind = 2;
+  optional beholder.v1.EntityMetadata metadata = 3;
+}
+
+message Observation {
+  string from = 1;
+  beholder.v1.RelationKind relation = 2;
+  string to = 3;
+  string evidence = 4;
+  Confidence confidence = 5;
+  Provenance provenance = 6;
+}
+
+message GrpcBindingCandidate {
+  string local_symbol = 1;
+  GrpcBindingRole role = 2;
+  string service = 3;
+  string method = 4;
+  beholder.v1.RpcCardinality cardinality = 5;
+  string evidence = 6;
+  Confidence confidence = 7;
+  Provenance provenance = 8;
+}
+
+enum GrpcBindingRole {
+  GRPC_BINDING_ROLE_UNSPECIFIED = 0;
+  GRPC_BINDING_ROLE_CLIENT = 1;
+  GRPC_BINDING_ROLE_SERVER = 2;
+}
+
+message AnalysisDiagnostic {
+  string code = 1;
+  beholder.v1.AnalysisDiagnosticSeverity severity = 2;
+  string path = 3;
+  optional uint32 line = 4;
+  optional string detail = 5;
+}
+
+message DependencyOverride {
+  string from = 1;
+  beholder.v1.RelationKind relation = 2;
+  string unresolved_to = 3;
+  string resolved_to = 4;
+  string evidence = 5;
+  Confidence confidence = 6;
+  Provenance provenance = 7;
+}
+
+message GraphqlResolverCandidate {
+  string repository = 1;
+  string field = 2;
+  optional string parent = 3;
+  string resolver = 4;
+  string evidence = 5;
+}
+
+message RepositoryDiagnostic {
+  string repository = 1;
+  AnalysisDiagnostic diagnostic = 2;
+}
+
+enum Confidence {
+  CONFIDENCE_UNSPECIFIED = 0;
+  CONFIDENCE_EXACT = 1;
+  CONFIDENCE_INFERRED = 2;
+}
+
+enum Provenance {
+  PROVENANCE_UNSPECIFIED = 0;
+  PROVENANCE_AST = 1;
+  PROVENANCE_COMPILER = 2;
+  PROVENANCE_DESCRIPTOR = 3;
+  PROVENANCE_GENERATED = 4;
+  PROVENANCE_UNIQUE_NAME_HEURISTIC = 5;
+}

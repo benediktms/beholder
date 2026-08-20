@@ -211,7 +211,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 13,
+            protocol_version: 14,
             pid: std::process::id(),
         }))
     }

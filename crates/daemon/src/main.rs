@@ -8,6 +8,8 @@ use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
 use beholder_indexing::{Indexer, IndexerBuilder};
 use beholder_protocol::v1::daemon_server::DaemonServer;
+#[cfg(not(test))]
+use beholder_worker_client::WorkerAnalyzerBuilder;
 use std::error::Error;
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
@@ -72,8 +74,24 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .filter(|workers| *workers > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
     tracing::info!(workers, "index analysis pool configured");
-    IndexerBuilder::new(cache_dir.clone(), workers)
-        .add_analyzer(RustAnalyzer::new(cache_dir.clone()))
+    let builder = IndexerBuilder::new(cache_dir.clone(), workers)
+        .add_analyzer(RustAnalyzer::new(cache_dir.clone()));
+    #[cfg(not(test))]
+    let builder = builder.add_enricher(
+        WorkerAnalyzerBuilder::new(
+            rust_worker_executable()?,
+            cache_dir
+                .parent()
+                .unwrap_or(cache_dir.as_path())
+                .join("workers"),
+        )
+        .identity("rust", "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-5")
+        .accept_extension("rs")
+        .accept_file_name("Cargo.toml")
+        .build()
+        .map_err(|error| error.to_string())?,
+    );
+    builder
         .add_analyzer(ElixirAnalyzer::new(cache_dir.clone()))
         .add_analyzer(CsharpAnalyzer::new(cache_dir.clone()))
         .add_analyzer(TypescriptAnalyzer::new(cache_dir.clone()))
@@ -81,6 +99,17 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .add_analyzer(ProtobufAnalyzer::new(cache_dir))
         .build()
         .map_err(|error| error.to_string().into())
+}
+
+#[cfg(not(test))]
+fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let executable = std::env::var_os("BEHOLDER_RUST_WORKER_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_exe()?.with_file_name("beholder-worker-rust"));
+    if !executable.is_file() {
+        return Err(format!("Rust analyzer worker not found at {}", executable.display()).into());
+    }
+    Ok(executable)
 }
 
 #[cfg(test)]
@@ -163,7 +192,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 13);
+        assert_eq!(status.protocol_version, 14);
         assert_eq!(status.pid, std::process::id());
 
         let missing = client

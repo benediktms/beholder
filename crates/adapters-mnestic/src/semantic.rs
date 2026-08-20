@@ -781,6 +781,7 @@ fn evidence_ref(from: &str, to: &str, evidence: &str, provenance: &str) -> Evide
     EvidenceRef {
         source_kind: match provenance {
             "ast" => EvidenceKind::Ast,
+            "compiler" => EvidenceKind::Compiler,
             "unique_name_heuristic" => EvidenceKind::Inference,
             "descriptor" => EvidenceKind::Descriptor,
             "generated" => EvidenceKind::Generated,
