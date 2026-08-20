@@ -33,7 +33,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo 'Building beholder and beholderd...' >&2
+echo 'Building Beholder binaries...' >&2
 bash "$root/scripts/test-daemon-handover.sh"
 echo 'Starting isolated beholderd...' >&2
 target/debug/beholderd >"$state/beholderd.log" 2>&1 &
@@ -312,7 +312,7 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     exit 1
 fi
 
-echo 'Checking safe and unsafe parser recovery...' >&2
+echo 'Checking recoverable and skipped parser failures...' >&2
 recovery_source="$state/rust/src/recovery.rs"
 recovery_module='repo://github.com/example/beholder-rust-smoke/rust/recovery'
 printf '%s\n' 'fn broken() { @ }' 'fn recovered() {}' >"$recovery_source"
@@ -328,19 +328,20 @@ for expected in '/recovered' '"completeness":"incomplete"' '"code":"rust.parse_r
     fi
 done
 
-revision_before_unsafe="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
+revision_before_skip="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
 printf '%s\n' 'fn broken() {' 'fn nested() {}' >"$recovery_source"
-if unsafe_output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
-    printf 'unsafe recovery unexpectedly succeeded:\n%s\n' "$unsafe_output" >&2
+if ! unsafe_output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+    printf 'unrecoverable Rust source aborted workspace indexing:\n%s\n' "$unsafe_output" >&2
     exit 1
 fi
-if ! grep -Fq '[beholder.source.recovery_unsafe]' <<<"$unsafe_output"; then
-    printf 'unsafe recovery did not expose its stable error code:\n%s\n' "$unsafe_output" >&2
+result="$(target/debug/beholder context --json --workspace main "$recovery_module" 2>/dev/null || true)"
+if grep -Fq '/recovered' <<<"$result"; then
+    printf 'skipped Rust source retained stale observations:\n%s\n' "$result" >&2
     exit 1
 fi
-revision_after_unsafe="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
-if [[ "$revision_before_unsafe" != "$revision_after_unsafe" ]]; then
-    printf 'unsafe recovery published a new revision:\n%s\n' "$revision_after_unsafe" >&2
+revision_after_skip="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
+if [[ "$revision_before_skip" == "$revision_after_skip" ]]; then
+    printf 'skipped Rust source did not publish the remaining workspace:\n%s\n' "$revision_after_skip" >&2
     exit 1
 fi
 

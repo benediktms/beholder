@@ -280,7 +280,7 @@ mod tests {
             "beholder-rust-analyzer-test-{}",
             std::process::id()
         ));
-        let analyzer = RustAnalyzer::new(&cache);
+        let analyzer = RustAnalyzer::new(cache.clone());
         let contribution = analyzer
             .analyze(&WorkspaceSnapshot {
                 name: "test".into(),
