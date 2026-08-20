@@ -464,6 +464,40 @@ pub(super) fn view_matches(db: &DbInstance, view: &WorkspaceView) -> Result<bool
     Ok(rows.rows.first().is_some_and(|row| row[0] == true.into()))
 }
 
+pub(super) fn verification_matches(
+    db: &DbInstance,
+    view: &str,
+    fingerprint: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[matches] := *analysis_verification_fingerprint{view: $view, fingerprint: stored}, \
+             matches = stored == $fingerprint",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("fingerprint".into(), fingerprint.into()),
+        ]),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(rows.rows.first().is_some_and(|row| row[0] == true.into()))
+}
+
+pub(super) fn store_verification_fingerprint(
+    db: &DbInstance,
+    view: &str,
+    fingerprint: &str,
+) -> Result<(), Box<dyn Error>> {
+    db.run_script(
+        "?[view, fingerprint] <- [[$view, $fingerprint]] \
+         :put analysis_verification_fingerprint {view => fingerprint}",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("fingerprint".into(), fingerprint.into()),
+        ]),
+        ScriptMutability::Mutable,
+    )?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct GrpcResolution {
     entities: BTreeMap<String, EntityFact>,
@@ -655,6 +689,7 @@ pub(super) fn publish_observations(
     view: &WorkspaceView,
     repositories: &[RepositoryFacts],
     overrides: &[DependencyOverride],
+    verification_fingerprint: Option<&str>,
 ) -> Result<FactChanges, Box<dyn Error>> {
     if repositories
         .iter()
@@ -774,6 +809,21 @@ pub(super) fn publish_observations(
          :put analysis_fingerprint {view => fingerprint}",
         params,
     )?;
+    if let Some(fingerprint) = verification_fingerprint {
+        transaction.run_script(
+            "?[view, fingerprint] <- [[$view, $fingerprint]] \
+             :put analysis_verification_fingerprint {view => fingerprint}",
+            BTreeMap::from([
+                ("view".into(), view.name.clone().into()),
+                ("fingerprint".into(), fingerprint.into()),
+            ]),
+        )?;
+    } else {
+        transaction.run_script(
+            "?[view] <- [[$view]] :rm analysis_verification_fingerprint {view}",
+            BTreeMap::from([("view".into(), view.name.clone().into())]),
+        )?;
+    }
     store_repository_states(&transaction, view, repositories, &analyzed_states)?;
     store_analysis_metadata(&transaction, view, repositories)?;
     store_grpc_resolution(&transaction, &view.name, &resolution)?;

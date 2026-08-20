@@ -535,6 +535,16 @@ impl Indexer {
         analysis_identity(&active)
     }
 
+    pub fn catalog_identity(&self) -> String {
+        analysis_identity(
+            &self
+                .analyzers
+                .iter()
+                .map(|analyzer| analyzer.metadata())
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub fn analyze(
         &self,
         snapshot: &WorkspaceSnapshot,

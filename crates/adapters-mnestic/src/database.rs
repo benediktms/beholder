@@ -86,6 +86,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_VERIFICATION_FINGERPRINT_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_REPOSITORY_STATE_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -154,6 +159,18 @@ pub(super) fn persistent_database(
     {
         db.run_script(
             CREATE_METADATA_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("analysis_verification_fingerprint"))
+    {
+        db.run_script(
+            CREATE_VERIFICATION_FINGERPRINT_SCHEMA,
             BTreeMap::new(),
             ScriptMutability::Mutable,
         )?;
