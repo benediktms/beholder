@@ -2,7 +2,7 @@ use crate::RepositoryState;
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf};
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct EntityId(String);
 
@@ -30,7 +30,7 @@ impl fmt::Display for EntityId {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct Evidence(String);
 
@@ -40,7 +40,7 @@ impl Evidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Exact,
@@ -56,7 +56,7 @@ impl Confidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     Ast,
@@ -65,7 +65,7 @@ pub enum Provenance {
     UniqueNameHeuristic,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalysisDiagnosticSeverity {
     KnownLimitation,
@@ -81,7 +81,7 @@ impl AnalysisDiagnosticSeverity {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct AnalysisDiagnostic {
     pub code: String,
     pub severity: AnalysisDiagnosticSeverity,
@@ -113,7 +113,7 @@ impl From<&str> for Evidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuralRelation {
     Defines,
@@ -122,7 +122,7 @@ pub enum StructuralRelation {
     ResponseType,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyRelation {
     BindsContract,
@@ -160,7 +160,7 @@ impl DependencyRelation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum SemanticRelation {
     Structural(StructuralRelation),
     Dependency(DependencyRelation),
@@ -185,7 +185,7 @@ impl SemanticRelation {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Observation {
     pub from: EntityId,
     pub relation: SemanticRelation,
@@ -206,7 +206,7 @@ pub struct RepositoryFacts {
     pub observations: Vec<Observation>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct GrpcBindingCandidate {
     pub local_symbol: EntityId,
     pub role: GrpcBindingRole,
@@ -218,7 +218,7 @@ pub struct GrpcBindingCandidate {
     pub provenance: Provenance,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrpcBindingRole {
     Client,
@@ -234,14 +234,14 @@ impl GrpcBindingRole {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct EntityFact {
     pub id: EntityId,
     pub kind: EntityKind,
     pub metadata: Option<EntityMetadata>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum EntityKind {
     Callable,
     GraphqlArgument,
@@ -260,7 +260,7 @@ pub enum EntityKind {
     UnityPrefab,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum EntityMetadata {
     GraphqlOperation { kind: GraphqlOperationKind },
     GraphqlType { kind: GraphqlTypeKind },
@@ -268,14 +268,14 @@ pub enum EntityMetadata {
     ProtoType { kind: ProtoTypeKind },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum GraphqlOperationKind {
     Mutation,
     Query,
     Subscription,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum GraphqlTypeKind {
     Enum,
     Input,
@@ -285,13 +285,13 @@ pub enum GraphqlTypeKind {
     Union,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum ProtoTypeKind {
     Enum,
     Message,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum RpcCardinality {
     BidirectionalStreaming,
     ClientStreaming,
