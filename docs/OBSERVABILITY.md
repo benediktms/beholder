@@ -21,6 +21,11 @@ beholder daemon stop
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 beholder daemon start
 ```
 
+`just install` enables the installed release daemon with
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` by default and persists the
+supported observability variables in its launchd or systemd user service. Set a
+shared or signal-specific endpoint before installing to override that default.
+
 Open <http://localhost:4318>. RPC operations and background workspace indexing
 appear as traces; structured `tracing` events appear in the Logs view and carry
 trace/span correlation when emitted inside a span.
