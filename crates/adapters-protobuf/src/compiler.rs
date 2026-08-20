@@ -16,7 +16,6 @@ const COMPILER_ID: &str = "protox-0.9.1-v1";
 
 pub struct SourceCompiler {
     cache_dir: PathBuf,
-    http: reqwest::blocking::Client,
     memory: Mutex<BTreeMap<[u8; 32], Arc<Vec<u8>>>>,
 }
 
@@ -62,7 +61,6 @@ impl SourceCompiler {
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             cache_dir: cache_dir.join("protobuf"),
-            http: reqwest::blocking::Client::new(),
             memory: Mutex::new(BTreeMap::new()),
         }
     }
@@ -155,8 +153,7 @@ impl SourceCompiler {
             ],
         );
         self.cached("dependencies", key, || {
-            let response = self
-                .http
+            let response = reqwest::blocking::Client::new()
                 .get(&url)
                 .header("Accept", "application/proto")
                 .send()
