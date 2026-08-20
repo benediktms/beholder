@@ -120,6 +120,42 @@ pub(super) const CREATE_ANALYSIS_DIAGNOSTIC_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ENRICHMENT_SCHEMA: &str = r#"
+:create analysis_revision_enrichment {
+    view: String,
+    revision: Int,
+    analyzer: String,
+    =>
+    version: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_OVERRIDE_OWNER_SCHEMA: &str = r#"
+:create analysis_revision_enrichment_override_owner {
+    view: String,
+    revision: Int,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    =>
+    analyzer: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_DIAGNOSTIC_OWNER_SCHEMA: &str = r#"
+:create analysis_revision_enrichment_diagnostic_owner {
+    view: String,
+    revision: Int,
+    repository: String,
+    code: String,
+    severity: String,
+    path: String,
+    line: Int,
+    =>
+    analyzer: String,
+}
+"#;
+
 pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \

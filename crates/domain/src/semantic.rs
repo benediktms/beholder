@@ -60,6 +60,7 @@ impl Confidence {
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
     Ast,
+    Compiler,
     Descriptor,
     Generated,
     UniqueNameHeuristic,
@@ -94,6 +95,7 @@ impl Provenance {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ast => "ast",
+            Self::Compiler => "compiler",
             Self::Descriptor => "descriptor",
             Self::Generated => "generated",
             Self::UniqueNameHeuristic => "unique_name_heuristic",

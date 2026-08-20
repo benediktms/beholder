@@ -7,4 +7,4 @@ edition.workspace = true
 beholder-dto.workspace = true
 beholder-domain.workspace = true
 beholder-protocol.workspace = true
-tonic = "0.14.6"
+tonic.workspace = true

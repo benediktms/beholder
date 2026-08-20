@@ -7,7 +7,9 @@ use crate::{
     model::RustRepository,
     plugin::{RustLanguage, built_in_plugins},
 };
-use beholder_domain::SourceAnalysisError;
+use beholder_domain::{
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, SourceAnalysisError, UnsafeTreeRecovery,
+};
 use beholder_indexing::{
     ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
     CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
@@ -142,18 +144,42 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             }
             active_repositories.push(repository.state.repository.identity.clone());
             let active_plugins = self.plugins.activate(repository, true);
-            let analyzed = sources
+            enum SourceResult<'a> {
+                Analyzed(&'a Path, Arc<RustAnalysis>, CacheStatus),
+                Skipped(&'a Path, String),
+            }
+            let results = sources
                 .par_iter()
-                .map(|(path, source)| {
-                    let (analysis, status) = self
-                        .analysis(path, source, &active_plugins)
-                        .map_err(|error| SourceAnalysisError::from_source(path, error))?;
-                    Ok::<_, SourceAnalysisError>((*path, analysis, status))
-                })
+                .map(
+                    |(path, source)| match self.analysis(path, source, &active_plugins) {
+                        Ok((analysis, status)) => {
+                            Ok(SourceResult::Analyzed(path, analysis, status))
+                        }
+                        Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => {
+                            Ok(SourceResult::Skipped(path, error.to_string()))
+                        }
+                        Err(error) => Err(SourceAnalysisError::from_source(path, error)),
+                    },
+                )
                 .collect::<Result<Vec<_>, _>>()?;
             let mut observations = Vec::new();
             let mut entities = Vec::new();
             let mut diagnostics = Vec::new();
+            let mut analyzed = Vec::new();
+            for result in results {
+                match result {
+                    SourceResult::Analyzed(path, analysis, status) => {
+                        analyzed.push((path, analysis, status));
+                    }
+                    SourceResult::Skipped(path, detail) => diagnostics.push(AnalysisDiagnostic {
+                        code: "rust.parse_recovery".into(),
+                        severity: AnalysisDiagnosticSeverity::Warning,
+                        path: path.to_path_buf(),
+                        line: None,
+                        detail: Some(detail),
+                    }),
+                }
+            }
             for (path, analysis, status) in &analyzed {
                 match status {
                     CacheStatus::Memory => cache.memory_hits += 1,
@@ -240,4 +266,57 @@ fn hex(key: [u8; 32]) -> String {
 
 fn is_rust_source(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "rs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beholder_domain::{EntityKind, LogicalRepository, RepositoryState};
+    use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot};
+
+    #[test]
+    fn skips_unsafe_source_and_keeps_valid_siblings() {
+        let cache = std::env::temp_dir().join(format!(
+            "beholder-rust-analyzer-test-{}",
+            std::process::id()
+        ));
+        let analyzer = RustAnalyzer::new(cache.clone());
+        let contribution = analyzer
+            .analyze(&WorkspaceSnapshot {
+                name: "test".into(),
+                repositories: vec![RepositorySnapshot {
+                    base: PathBuf::from("repo"),
+                    state: RepositoryState {
+                        repository: LogicalRepository {
+                            identity: "example/repo".into(),
+                        },
+                        head: None,
+                        fingerprint: "state".into(),
+                    },
+                    inputs: [
+                        ("src/valid.rs", "fn valid() {}"),
+                        ("tests/ui/invalid.rs", "fn invalid("),
+                    ]
+                    .into_iter()
+                    .map(|(path, source)| RepositoryInput {
+                        path: path.into(),
+                        content: Arc::from(source.as_bytes()),
+                        kind: InputKind::Source,
+                    })
+                    .collect(),
+                }],
+            })
+            .unwrap();
+
+        let repository = &contribution.repositories[0];
+        assert_eq!(repository.completeness, AnalysisCompleteness::Incomplete);
+        assert!(repository.entities.iter().any(|entity| {
+            entity.kind == EntityKind::Callable && entity.id.as_str().ends_with("/valid")
+        }));
+        assert!(repository.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "rust.parse_recovery"
+                && diagnostic.path == Path::new("tests/ui/invalid.rs")
+        }));
+        fs::remove_dir_all(cache).unwrap();
+    }
 }

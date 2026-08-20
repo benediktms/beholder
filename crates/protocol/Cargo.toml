@@ -6,8 +6,9 @@ edition.workspace = true
 [dependencies]
 beholder-domain.workspace = true
 beholder-dto.workspace = true
+beholder-indexing.workspace = true
 prost = "0.14.4"
-tonic = "0.14.6"
+tonic.workspace = true
 tonic-prost = "0.14.6"
 
 [build-dependencies]

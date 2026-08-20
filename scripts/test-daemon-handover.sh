@@ -19,7 +19,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --quiet -p beholder-cli -p beholder-daemon
+cargo build --quiet -p beholder-cli -p beholder-daemon -p beholder-worker-rust
 mkdir -p "$state/daemon"
 
 # Model the old daemon's socket-to-lock shutdown window without timing the race.

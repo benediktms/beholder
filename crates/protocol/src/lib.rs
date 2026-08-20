@@ -1,12 +1,29 @@
-pub mod v1 {
-    tonic::include_proto!("beholder.v1");
+pub mod beholder {
+    pub mod v1 {
+        tonic::include_proto!("beholder.v1");
+    }
+
+    pub mod worker {
+        pub mod v1 {
+            tonic::include_proto!("beholder.worker.v1");
+        }
+    }
 }
+
+pub use beholder::v1;
+pub use beholder::worker::v1 as worker_v1;
 
 pub const ERROR_CODE_METADATA_KEY: &str = "beholder-error-code";
 
 mod entity;
 mod query;
+mod worker;
 mod workspace;
+
+pub use worker::{
+    WorkspaceSnapshotBuilder, analyze_events, analyze_requests, contribution_from_events,
+    workspace_snapshot,
+};
 
 #[cfg(test)]
 mod tests {
@@ -172,7 +189,7 @@ mod tests {
             v1::EvidenceKind::Inference as i32
         );
         assert_eq!(dto::TraceResult::try_from(response).unwrap(), trace);
-        assert!(relation_kind(v1::RelationKind::Unknown as i32).is_err());
+        assert!(relation_kind(v1::RelationKind::Unspecified as i32).is_err());
         let protocol = include_str!("../../../proto/beholder/v1/daemon.proto");
         assert!(!protocol.contains("message QueryResult"));
         assert!(!protocol.contains("repeated string headers"));

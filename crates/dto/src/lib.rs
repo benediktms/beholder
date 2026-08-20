@@ -305,6 +305,7 @@ impl TryFrom<&str> for RelationKind {
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     Ast,
+    Compiler,
     Configuration,
     Descriptor,
     Generated,
