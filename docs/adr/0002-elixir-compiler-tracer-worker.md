@@ -34,18 +34,32 @@ but process separation alone is not a security boundary.
 The CLI exposes one analyzer-neutral command:
 
 ```text
-beholder enrich <analyzer>
+beholder enrich <analyzer> [--repository <repository>]
 ```
 
-The command runs the named worker against the latest completed syntax baseline.
-It is available for every registered worker, including workers that also run
-automatically, so users can explicitly request or retry an enrichment without a
-language-specific CLI surface.
+The command runs the named worker for exactly one logical repository state in
+the latest completed workspace view. It is available for every registered
+worker, including workers that also run automatically, so users can explicitly
+request or retry an enrichment without a language-specific CLI surface.
+
+When `--repository` is omitted, the daemon resolves the repository from the
+caller's working directory. If the directory is outside a registered working
+tree or maps ambiguously, the command fails and requires an explicit repository
+selector. Omission never means the whole workspace, and the initial command has
+no `--all` mode.
+
+The enrichment target and compiler context are distinct. The target repository
+owns the analyzer contribution that may be replaced. Other repositories or
+dependencies may be made available as read-only compiler context when they are
+required to understand the target, but their facts are not enriched by that
+job. The completed contribution is still published as a coherent new workspace
+graph revision.
 
 Worker registration declares its default activation policy. The Rust worker
 remains automatic and may also be invoked manually. The Elixir worker is manual
 only. A newer syntax baseline marks its previous contribution stale but does not
-automatically queue another Elixir compilation.
+automatically queue another Elixir compilation. Automatic workers are also
+scheduled as repository-scoped jobs rather than one whole-workspace process.
 
 CI integration, non-interactive trust flags, persistent watch mode, and
 repository-configured automatic execution are outside this decision.
@@ -54,7 +68,9 @@ repository-configured automatic execution are outside this decision.
 
 The Elixir analyzer is a language-specific worker using the typed bidirectional
 gRPC protocol defined by ADR 0001. It runs compilation in a dedicated BEAM VM
-using the workspace's selected Elixir and Erlang/OTP toolchain.
+using the target repository's selected Elixir and Erlang/OTP toolchain. The
+worker request identifies the target logical repository and immutable repository
+state separately from any compiler context supplied with the snapshot.
 
 Beholder ships the tracer. The indexed repository does not implement `trace/2`
 and does not need to change its Mix configuration. Before compiling, the worker
@@ -92,11 +108,16 @@ Dynamic dispatch remains explicit. Calls through dynamic module values,
 are not rewritten to exact targets unless separate evidence justifies that
 relationship.
 
+An Elixir umbrella contained in one Git repository is one enrichment target in
+the initial implementation. Selecting individual umbrella applications may be
+added later if measurements justify a finer execution boundary.
+
 ### Trust and failure handling
 
 `beholder enrich elixir` warns that compilation executes trusted repository and
-dependency code and requires interactive confirmation before the worker starts.
-The initial implementation does not persist automatic trust.
+dependency code, identifies the selected target repository, and requires
+interactive confirmation before the worker starts. The initial implementation
+does not persist automatic trust.
 
 Repository-controlled configuration may tune analysis but cannot grant
 permission to execute the repository. A repository therefore cannot opt itself
@@ -113,23 +134,29 @@ fingerprint.
 The Elixir contribution fingerprint includes at least:
 
 - the immutable syntax baseline fingerprint;
+- the target logical repository and repository-state fingerprint;
 - analyzer and worker versions;
 - Elixir and Erlang/OTP versions;
 - the selected Mix environment;
 - relevant Mix project, lock, and configuration inputs;
-- analysis-relevant dependency and compiler identity.
+- analysis-relevant dependency and compiler-context identity.
 
 A matching completed contribution may be reused without recompiling. A worker
 result publishes as a new graph revision only if its input still matches the
-current baseline. A later run atomically replaces only the Elixir analyzer's
-previous contribution.
+current target and relevant compiler context. Changes to unrelated repositories
+do not invalidate the contribution. A later run atomically replaces only the
+Elixir analyzer's previous contribution for the target repository.
 
 ## Consequences
 
 - Beholder gains compiler-resolved Elixir aliases, imports, macros, and direct
   calls without requiring repositories to install a plugin.
 - The generic manual command provides a consistent way to trigger, retry, and
-  eventually inspect all native analyzer workers.
+  eventually inspect all native analyzer workers for one repository.
+- Repository-scoped scheduling bounds worker memory and prevents a manual
+  command from unintentionally enriching an entire workspace.
+- Compiler context may cross repository boundaries without granting the worker
+  ownership of those repositories' semantic contributions.
 - Elixir enrichment is deliberately less automatic than Rust enrichment
   because it crosses an arbitrary-code-execution boundary.
 - A dedicated BEAM VM isolates compiler options, loaded modules, crashes, and
