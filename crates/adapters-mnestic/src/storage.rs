@@ -17,8 +17,8 @@ use std::{
 
 const FACT_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_BATCH_SIZE: usize = 10_000;
-const GARBAGE_COLLECTION_CLAIM_RETRIES: usize = 50;
-const GARBAGE_COLLECTION_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(10);
+const GARBAGE_COLLECTION_TRANSACTION_RETRIES: usize = 50;
+const GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub(super) fn store_observations(
     transaction: &MultiTransaction,
@@ -1162,11 +1162,11 @@ pub(super) fn store_repository_states(
 }
 
 pub(super) fn claim_garbage_collection(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
-    for attempt in 0..=GARBAGE_COLLECTION_CLAIM_RETRIES {
+    for attempt in 0..=GARBAGE_COLLECTION_TRANSACTION_RETRIES {
         match claim_garbage_collection_once(db) {
             Ok(claimed) => return Ok(claimed),
-            Err(_) if attempt < GARBAGE_COLLECTION_CLAIM_RETRIES => {
-                thread::sleep(GARBAGE_COLLECTION_CLAIM_RETRY_DELAY);
+            Err(_) if attempt < GARBAGE_COLLECTION_TRANSACTION_RETRIES => {
+                thread::sleep(GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
@@ -1286,33 +1286,10 @@ fn sweep_relation(
         if batch.is_empty() {
             return Ok(());
         }
-        let transaction = db.multi_transaction(true);
-        if cleanup.guard_repository_state
-            && !transaction
-                .run_script(
-                    "?[fingerprint] := \
-                         *repository_state{fingerprint: $state}, fingerprint = $state\n\
-                     :limit 1",
-                    cleanup.parameters.clone(),
-                )?
-                .rows
-                .is_empty()
-        {
-            transaction.abort()?;
+        if !remove_garbage_collection_batch(db, &cleanup, &batch)? {
             return Ok(());
         }
         let batch_size: u64 = batch.len().try_into()?;
-        transaction.run_script(
-            &format!(
-                "?[{}] <- $rows\n:rm {} {{{}}}",
-                cleanup.keys, cleanup.relation, cleanup.keys
-            ),
-            BTreeMap::from([(
-                "rows".into(),
-                DataValue::List(batch.into_iter().map(DataValue::List).collect()),
-            )]),
-        )?;
-        transaction.commit()?;
         completed_rows += batch_size;
         progress(GarbageCollectionProgress {
             phase: GarbageCollectionPhase::SweepingObsoleteStates,
@@ -1325,6 +1302,57 @@ fn sweep_relation(
             total_steps: cleanup.total_steps,
         });
     }
+}
+
+fn remove_garbage_collection_batch(
+    db: &DbInstance,
+    cleanup: &RelationCleanup<'_>,
+    batch: &[Vec<DataValue>],
+) -> Result<bool, Box<dyn Error>> {
+    for attempt in 0..=GARBAGE_COLLECTION_TRANSACTION_RETRIES {
+        match remove_garbage_collection_batch_once(db, cleanup, batch) {
+            Ok(removed) => return Ok(removed),
+            Err(_) if attempt < GARBAGE_COLLECTION_TRANSACTION_RETRIES => {
+                thread::sleep(GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+fn remove_garbage_collection_batch_once(
+    db: &DbInstance,
+    cleanup: &RelationCleanup<'_>,
+    batch: &[Vec<DataValue>],
+) -> Result<bool, Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    if cleanup.guard_repository_state
+        && !transaction
+            .run_script(
+                "?[fingerprint] := \
+                     *repository_state{fingerprint: $state}, fingerprint = $state\n\
+                 :limit 1",
+                cleanup.parameters.clone(),
+            )?
+            .rows
+            .is_empty()
+    {
+        transaction.abort()?;
+        return Ok(false);
+    }
+    transaction.run_script(
+        &format!(
+            "?[{}] <- $rows\n:rm {} {{{}}}",
+            cleanup.keys, cleanup.relation, cleanup.keys
+        ),
+        BTreeMap::from([(
+            "rows".into(),
+            DataValue::List(batch.iter().cloned().map(DataValue::List).collect()),
+        )]),
+    )?;
+    transaction.commit()?;
+    Ok(true)
 }
 
 pub(super) fn sweep_garbage_collection(
