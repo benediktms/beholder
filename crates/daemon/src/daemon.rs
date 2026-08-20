@@ -109,11 +109,15 @@ pub(super) fn start_garbage_collector(
                     "semantic store garbage collection progress"
                 );
             });
-            let succeeded = result.is_ok();
+            let pending = restart_store.garbage_collection_pending().unwrap_or(false);
             match result {
                 Ok(states_resolved) => tracing::info!(
                     states_resolved,
                     "semantic store garbage collection sweep completed"
+                ),
+                Err(error) if pending => tracing::info!(
+                    %error,
+                    "semantic store garbage collection interrupted; retrying"
                 ),
                 Err(error) => tracing::error!(%error, "semantic store garbage collection failed"),
             }
@@ -121,7 +125,7 @@ pub(super) fn start_garbage_collector(
             if let Ok(mut current) = progress.lock() {
                 *current = None;
             }
-            if succeeded && restart_store.garbage_collection_pending().unwrap_or(false) {
+            if pending {
                 let _ = start_garbage_collector(restart_store, restart_running, restart_progress);
             }
         });
