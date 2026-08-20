@@ -3278,6 +3278,11 @@ mod tests {
             "#;
         fs::write(&contract_path, contract_source).unwrap();
         fs::write(
+            rust.join("Cargo.toml"),
+            "[dependencies]\ntonic = \"0.14\"\n",
+        )
+        .unwrap();
+        fs::write(
             rust.join("src/protocol.rs"),
             "tonic::include_proto!(\"phase5.v1\");",
         )

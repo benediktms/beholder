@@ -1,8 +1,12 @@
-use super::model::*;
+use super::{
+    model::*,
+    plugin::{RustLanguage, built_in_plugins},
+};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, StructuralRelation, UnsafeTreeRecovery,
 };
+use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
 use ra_ap_syntax::{
     AstNode, Edition, SourceFile,
     ast::{self, HasName},
@@ -10,7 +14,7 @@ use ra_ap_syntax::{
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
-fn collect_tree_sitter_functions<'tree>(
+pub(super) fn collect_tree_sitter_functions<'tree>(
     node: Node<'tree>,
     source: &[u8],
     scope: &mut Vec<String>,
@@ -132,11 +136,6 @@ fn analyze_tree_sitter(
             return Err(UnsafeTreeRecovery::new("Rust", "no unaffected definitions remain").into());
         }
     }
-    let tonic = if parse_error_lines.is_empty() {
-        super::tonic::analyze(root, source_bytes, &functions)
-    } else {
-        Default::default()
-    };
     Ok(RustAnalysis {
         functions: functions
             .into_iter()
@@ -151,7 +150,7 @@ fn analyze_tree_sitter(
                 }
             })
             .collect(),
-        tonic,
+        tonic: Default::default(),
         parse_error_lines,
     })
 }
@@ -242,29 +241,50 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
 }
 
 pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
+    let plugins = built_in_plugins()?;
+    let active = plugins.activate_direct(Path::new("input.rs"));
+    analyze_with_plugins(source, Path::new("input.rs"), &plugins, &active)
+}
+
+pub(super) fn analyze_with_plugins(
+    source: &str,
+    path: &Path,
+    plugins: &LanguageAnalyzer<RustLanguage>,
+    active_plugins: &ActivePlugins,
+) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())?;
     let tree = parser
         .parse(source, None)
         .ok_or("Rust parser returned no tree")?;
-    if !tree.root_node().has_error() {
-        return analyze_tree_sitter(source, &tree);
-    }
-    // ponytail: rust-analyzer recursively drops its syntax tree; keep the recovery path bounded
-    // until its green-tree drop is iterative.
-    if source.len() > 200_000 {
-        return analyze_tree_sitter(source, &tree);
-    }
-    let parsed = SourceFile::parse(source, Edition::CURRENT);
-    if !parsed.errors().is_empty() {
-        return analyze_tree_sitter(source, &tree);
-    }
-    let functions = rust_analyzer_functions(source, &parsed.tree());
-    Ok(RustAnalysis {
-        functions,
-        tonic: Default::default(),
-        parse_error_lines: Vec::new(),
-    })
+    let mut analysis = if !tree.root_node().has_error() {
+        analyze_tree_sitter(source, &tree)?
+    } else if source.len() > 200_000 {
+        // ponytail: rust-analyzer recursively drops its syntax tree; keep the recovery path bounded
+        // until its green-tree drop is iterative.
+        analyze_tree_sitter(source, &tree)?
+    } else {
+        let parsed = SourceFile::parse(source, Edition::CURRENT);
+        if parsed.errors().is_empty() {
+            RustAnalysis {
+                functions: rust_analyzer_functions(source, &parsed.tree()),
+                tonic: Default::default(),
+                parse_error_lines: Vec::new(),
+            }
+        } else {
+            analyze_tree_sitter(source, &tree)?
+        }
+    };
+    plugins.recognize(
+        SourceRecognitionInput {
+            path,
+            text: source,
+            syntax: &tree,
+        },
+        &mut analysis,
+        active_plugins,
+    )?;
+    Ok(analysis)
 }
 
 pub fn observations_from_analysis(
@@ -405,10 +425,13 @@ mod recovery_tests {
 
     #[test]
     fn recovers_only_unaffected_top_level_functions() {
-        let analysis = analyze("fn broken() { @ }\nfn safe() {}").unwrap();
+        let analysis =
+            analyze("tonic::include_proto!(\"example.v1\");\nfn broken() { @ }\nfn safe() {}")
+                .unwrap();
         assert_eq!(analysis.functions.len(), 1);
         assert_eq!(analysis.functions[0].name, "safe");
         assert!(!analysis.parse_error_lines.is_empty());
+        assert!(analysis.tonic.packages.is_empty());
     }
 
     #[test]

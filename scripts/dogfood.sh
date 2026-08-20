@@ -66,6 +66,7 @@ git -C "$state/elixir" add lib
 git -C "$state/elixir" commit -qm 'Add Elixir smoke fixture'
 git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
 mkdir -p "$state/rust/src"
+printf '[dependencies]\ntonic = "0.14"\n' >"$state/rust/Cargo.toml"
 cp "$root/scripts/fixtures/dogfood/rust/protocol.rs.fixture" "$state/rust/src/protocol.rs"
 cp "$root/scripts/fixtures/dogfood/rust/generated.rs.fixture" "$state/rust/src/generated.rs"
 cp "$root/scripts/fixtures/dogfood/rust/client.rs.fixture" "$state/rust/src/client.rs"
@@ -77,7 +78,7 @@ git -C "$state/rust" config gpg.format ssh
 git -C "$state/rust" config gpg.ssh.program "$(command -v ssh-keygen)"
 git -C "$state/rust" config user.signingkey "$state/signing-key"
 git -C "$state/rust" config commit.gpgsign true
-git -C "$state/rust" add src
+git -C "$state/rust" add Cargo.toml src
 git -C "$state/rust" commit -qm 'Add Rust smoke fixture'
 git -C "$state/rust" remote add origin https://github.com/example/beholder-rust-smoke.git
 target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \

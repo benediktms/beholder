@@ -1,11 +1,17 @@
 use crate::{
-    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, analyze, diagnostics_from_analysis,
-    entities_from_analysis, observations_from_analysis, resolve_repository_calls, tonic_bindings,
+    FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, diagnostics_from_analysis,
+    entities_from_analysis, observations_from_analysis, resolve_repository_calls,
+};
+use crate::{
+    analysis::analyze_with_plugins,
+    model::RustRepository,
+    plugin::{RustLanguage, built_in_plugins},
 };
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+    ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
+    CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
+    WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -29,6 +35,7 @@ enum CacheStatus {
 pub struct RustAnalyzer {
     cache_dir: PathBuf,
     cache: Mutex<BTreeMap<CacheKey, Arc<RustAnalysis>>>,
+    plugins: LanguageAnalyzer<RustLanguage>,
 }
 
 impl RustAnalyzer {
@@ -36,11 +43,20 @@ impl RustAnalyzer {
         Self {
             cache_dir: cache_dir.join("rust").join(FRONTEND_VERSION),
             cache: Mutex::new(BTreeMap::new()),
+            plugins: built_in_plugins().expect("built-in Rust plugins should compose"),
         }
     }
 
-    fn analysis(&self, source: &str) -> Result<(Arc<RustAnalysis>, CacheStatus), AnalyzerError> {
-        let key = CacheKey(Sha256::digest(source.as_bytes()).into());
+    fn analysis(
+        &self,
+        path: &Path,
+        source: &str,
+        active_plugins: &ActivePlugins,
+    ) -> Result<(Arc<RustAnalysis>, CacheStatus), AnalyzerError> {
+        let mut digest = Sha256::new();
+        digest.update(source.as_bytes());
+        digest.update(active_plugins.identity().as_bytes());
+        let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
             .lock()
@@ -50,8 +66,8 @@ impl RustAnalyzer {
         {
             return Ok((analysis, CacheStatus::Memory));
         }
-        let path = self.cache_dir.join(format!("{}.json", hex(key.0)));
-        if let Ok(bytes) = fs::read(&path)
+        let cache_path = self.cache_dir.join(format!("{}.json", hex(key.0)));
+        if let Ok(bytes) = fs::read(&cache_path)
             && let Ok(analysis) = serde_json::from_slice::<RustAnalysis>(&bytes)
         {
             let analysis = Arc::new(analysis);
@@ -61,12 +77,17 @@ impl RustAnalyzer {
                 .insert(key, analysis.clone());
             return Ok((analysis, CacheStatus::Disk));
         }
-        let analysis = Arc::new(analyze(source)?);
-        if let Some(parent) = path.parent()
+        let analysis = Arc::new(analyze_with_plugins(
+            source,
+            path,
+            &self.plugins,
+            active_plugins,
+        )?);
+        if let Some(parent) = cache_path.parent()
             && fs::create_dir_all(parent).is_ok()
             && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
         {
-            let _ = fs::write(path, bytes);
+            let _ = fs::write(cache_path, bytes);
         }
         self.cache
             .lock()
@@ -80,12 +101,22 @@ impl WorkspaceAnalyzer for RustAnalyzer {
     fn metadata(&self) -> AnalyzerMetadata {
         AnalyzerMetadata {
             id: "rust".into(),
-            version: format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}"),
+            version: format!(
+                "{FRONTEND_VERSION}:{RESOLVER_VERSION}:{}",
+                self.plugins.identity()
+            ),
         }
     }
 
     fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|extension| extension == "rs")
+        is_rust_source(path) || path.file_name().is_some_and(|name| name == "Cargo.toml")
+    }
+
+    fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
+        repository
+            .inputs
+            .iter()
+            .any(|input| is_rust_source(&input.path))
     }
 
     fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
@@ -97,7 +128,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             let sources = repository
                 .inputs
                 .iter()
-                .filter(|input| self.accepts(&input.path))
+                .filter(|input| is_rust_source(&input.path))
                 .map(|input| {
                     std::str::from_utf8(&input.content)
                         .map(|source| (input.path.as_path(), source))
@@ -110,11 +141,12 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 continue;
             }
             active_repositories.push(repository.state.repository.identity.clone());
+            let active_plugins = self.plugins.activate(repository, true);
             let analyzed = sources
                 .par_iter()
                 .map(|(path, source)| {
                     let (analysis, status) = self
-                        .analysis(source)
+                        .analysis(path, source, &active_plugins)
                         .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     Ok::<_, SourceAnalysisError>((*path, analysis, status))
                 })
@@ -140,13 +172,24 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 ));
                 diagnostics.extend(diagnostics_from_analysis(analysis, path));
             }
-            let source_refs = analyzed
-                .iter()
-                .map(|(path, analysis, _)| (*path, analysis.as_ref()))
-                .collect::<Vec<_>>();
-            let (grpc_bindings, grpc_diagnostics) =
-                tonic_bindings(&repository.state.repository.identity, &source_refs);
-            diagnostics.extend(grpc_diagnostics);
+            let typed_repository = RustRepository {
+                repository: repository.state.repository.identity.clone(),
+                sources: analyzed
+                    .iter()
+                    .map(|(path, analysis, _)| ((*path).to_path_buf(), analysis.as_ref().clone()))
+                    .collect(),
+            };
+            let enrichment = self.plugins.enrich(
+                &typed_repository,
+                RepositoryFactsView {
+                    entities: &entities,
+                    observations: &observations,
+                },
+                &active_plugins,
+            )?;
+            entities.extend(enrichment.entities);
+            observations.extend(enrichment.observations);
+            diagnostics.extend(enrichment.diagnostics);
             resolve_repository_calls(&mut observations);
             let completeness = if diagnostics
                 .iter()
@@ -160,7 +203,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 repository: repository.state.repository.identity.clone(),
                 completeness,
                 entities,
-                grpc_bindings,
+                grpc_bindings: enrichment.grpc_bindings,
                 observations,
                 diagnostics,
             });
@@ -193,4 +236,8 @@ impl WorkspaceAnalyzer for RustAnalyzer {
 
 fn hex(key: [u8; 32]) -> String {
     key.into_iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn is_rust_source(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rs")
 }
