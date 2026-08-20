@@ -19,6 +19,7 @@ members = [
     "crates/domain",
     "crates/dto",
     "crates/indexing",
+    "crates/observability",
     "crates/worker-client",
     "crates/worker-rust",
 ]
@@ -40,6 +41,7 @@ beholder-adapters-treesitter-typescript = { path = "crates/adapters-treesitter-t
 beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }
 beholder-indexing = { path = "crates/indexing" }
+beholder-observability = { path = "crates/observability" }
 beholder-worker-client = { path = "crates/worker-client" }
 beholder-worker-rust = { path = "crates/worker-rust" }
 beholder-daemon-client = { path = "crates/daemon-client" }
@@ -58,4 +60,6 @@ tokio = "1.53.1"
 tokio-stream = "0.1.17"
 tonic = "0.14.6"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 jsonc-parser = { version = "0.33.1", features = ["serde"] }

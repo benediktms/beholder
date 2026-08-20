@@ -7,6 +7,7 @@ use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
 use beholder_indexing::{Indexer, IndexerBuilder};
+use beholder_observability::{ExportMode, LogOutput};
 use beholder_protocol::v1::daemon_server::DaemonServer;
 #[cfg(not(test))]
 use beholder_worker_client::WorkerAnalyzerBuilder;
@@ -18,7 +19,6 @@ use tonic::transport::Server;
 mod daemon;
 mod indexing;
 mod ipc;
-mod logging;
 mod rpc;
 mod rpc_service;
 mod single_instance;
@@ -40,7 +40,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _lock = single_instance::acquire(&state_dir)?;
         let socket_path = socket_path()?;
         let (listener, _socket_file) = ipc::bind_socket(&socket_path)?;
-        let _log_guard = logging::init(&state_dir);
+        let _observability_guard = beholder_observability::init(
+            "beholderd",
+            LogOutput::Rolling {
+                directory: state_dir.clone(),
+                prefix: "beholderd".into(),
+            },
+            ExportMode::Batch,
+        );
         tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "daemon started");
         let cache_dir = state_dir.join("frontend-cache");
         let (service, stopped, index_scheduler) = daemon::build(

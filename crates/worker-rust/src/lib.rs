@@ -28,6 +28,7 @@ use std::{
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 const ANALYZER_VERSION: &str = "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-5";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -46,73 +47,92 @@ impl AnalyzerWorker for RustWorker {
         &self,
         request: Request<Streaming<AnalyzeRequest>>,
     ) -> Result<Response<Self::AnalyzeStream>, Status> {
+        let span = tracing::info_span!(
+            "worker.analyze",
+            workspace = tracing::field::Empty,
+            rpc.system = "grpc",
+            rpc.service = "beholder.worker.v1.AnalyzerWorker",
+            rpc.method = "Analyze"
+        );
+        beholder_observability::set_parent_from_metadata(&span, request.metadata());
         let mut stream = request.into_inner();
         let analyzer = self.analyzer.clone();
         let analysis_pool = self.analysis_pool.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move {
-            if send_progress(&sender, AnalysisPhase::ReceivingSnapshot).await {
-                return;
-            }
-            let mut snapshot = WorkspaceSnapshotBuilder::default();
-            loop {
-                match stream.message().await {
-                    Ok(Some(request)) => {
-                        if let Err(error) = snapshot.push(request) {
-                            let _ = sender.send(Err(Status::invalid_argument(error))).await;
+        tokio::spawn(
+            async move {
+                if send_progress(&sender, AnalysisPhase::ReceivingSnapshot).await {
+                    return;
+                }
+                let mut snapshot = WorkspaceSnapshotBuilder::default();
+                loop {
+                    match stream.message().await {
+                        Ok(Some(request)) => {
+                            if let Err(error) = snapshot.push(request) {
+                                let _ = sender.send(Err(Status::invalid_argument(error))).await;
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = sender.send(Err(error)).await;
                             return;
                         }
                     }
-                    Ok(None) => break,
+                }
+                let snapshot = match snapshot.finish() {
+                    Ok(snapshot) => snapshot,
                     Err(error) => {
-                        let _ = sender.send(Err(error)).await;
+                        let _ = sender.send(Err(Status::invalid_argument(error))).await;
+                        return;
+                    }
+                };
+                tracing::Span::current().record("workspace", &snapshot.name);
+                if send_progress(&sender, AnalysisPhase::Analyzing).await {
+                    return;
+                }
+                let analysis_span = tracing::info_span!(
+                    "worker.rust.semantic_analysis",
+                    workspace = snapshot.name,
+                    repositories = snapshot.repositories.len()
+                );
+                let result = tokio::task::spawn_blocking(
+                    move || -> Result<Vec<AnalyzeEvent>, Box<dyn Error + Send + Sync>> {
+                        analysis_span.in_scope(|| {
+                            analysis_pool.install(|| {
+                                let mut contribution = analyzer.analyze(&snapshot)?;
+                                enrich_semantics(&snapshot, &mut contribution);
+                                retain_semantic_enrichment(&mut contribution);
+                                contribution.metadata.version = ANALYZER_VERSION.into();
+                                analyze_events(contribution).map_err(Into::into)
+                            })
+                        })
+                    },
+                )
+                .await;
+                let events = match result {
+                    Ok(Ok(events)) => events,
+                    Ok(Err(error)) => {
+                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender
+                            .send(Err(Status::internal(format!(
+                                "Rust worker task failed: {error}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                for event in events {
+                    if sender.send(Ok(event)).await.is_err() {
                         return;
                     }
                 }
             }
-            let snapshot = match snapshot.finish() {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    let _ = sender.send(Err(Status::invalid_argument(error))).await;
-                    return;
-                }
-            };
-            if send_progress(&sender, AnalysisPhase::Analyzing).await {
-                return;
-            }
-            let result = tokio::task::spawn_blocking(
-                move || -> Result<Vec<AnalyzeEvent>, Box<dyn Error + Send + Sync>> {
-                    analysis_pool.install(|| {
-                        let mut contribution = analyzer.analyze(&snapshot)?;
-                        enrich_semantics(&snapshot, &mut contribution);
-                        retain_semantic_enrichment(&mut contribution);
-                        contribution.metadata.version = ANALYZER_VERSION.into();
-                        analyze_events(contribution).map_err(Into::into)
-                    })
-                },
-            )
-            .await;
-            let events = match result {
-                Ok(Ok(events)) => events,
-                Ok(Err(error)) => {
-                    let _ = sender.send(Err(Status::internal(error.to_string()))).await;
-                    return;
-                }
-                Err(error) => {
-                    let _ = sender
-                        .send(Err(Status::internal(format!(
-                            "Rust worker task failed: {error}"
-                        ))))
-                        .await;
-                    return;
-                }
-            };
-            for event in events {
-                if sender.send(Ok(event)).await.is_err() {
-                    return;
-                }
-            }
-        });
+            .instrument(span),
+        );
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
 }

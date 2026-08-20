@@ -30,6 +30,10 @@ Open <http://localhost:4318>. RPC operations and background workspace indexing
 appear as traces; structured `tracing` events appear in the Logs view and carry
 trace/span correlation when emitted inside a span.
 
+The Rust analyzer worker exports as the separate `beholder-worker-rust`
+service. Its analysis spans are linked to the daemon trace through W3C trace
+context propagated over the local worker gRPC request.
+
 Use `beholder daemon run` instead of `start` when foreground output is useful.
 
 ## Configuration
