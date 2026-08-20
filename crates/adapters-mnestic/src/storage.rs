@@ -10,10 +10,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    thread,
+    time::Duration,
 };
 
 const FACT_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_BATCH_SIZE: usize = 10_000;
+const GARBAGE_COLLECTION_CLAIM_RETRIES: usize = 50;
+const GARBAGE_COLLECTION_CLAIM_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub(super) fn store_observations(
     transaction: &MultiTransaction,
@@ -964,6 +968,19 @@ pub(super) fn store_repository_states(
 }
 
 pub(super) fn claim_garbage_collection(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
+    for attempt in 0..=GARBAGE_COLLECTION_CLAIM_RETRIES {
+        match claim_garbage_collection_once(db) {
+            Ok(claimed) => return Ok(claimed),
+            Err(_) if attempt < GARBAGE_COLLECTION_CLAIM_RETRIES => {
+                thread::sleep(GARBAGE_COLLECTION_CLAIM_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+fn claim_garbage_collection_once(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
     let transaction = db.multi_transaction(true);
     let stale = transaction.run_script(
         "live_state[state] := \
