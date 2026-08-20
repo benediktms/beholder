@@ -101,7 +101,15 @@ impl SourceCompiler {
     fn compile(&self, module: Module) -> Result<Arc<Vec<u8>>, String> {
         let key = content_key(
             "compiled",
-            std::iter::once((Path::new("compiler"), COMPILER_ID.as_bytes())).chain(
+            [
+                (Path::new("compiler"), COMPILER_ID.as_bytes()),
+                (
+                    Path::new("module"),
+                    module.name.as_os_str().as_encoded_bytes(),
+                ),
+            ]
+            .into_iter()
+            .chain(
                 module
                     .inputs
                     .iter()
