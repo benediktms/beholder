@@ -1,16 +1,22 @@
-use crate::daemon::BeholderDaemon;
+use crate::daemon::{BeholderDaemon, start_garbage_collector};
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, SourceAnalysisError};
-use beholder_dto::{DEFAULT_MAX_HOPS, Revisioned, WhyResult};
+use beholder_dto::{
+    DEFAULT_MAX_HOPS, GarbageCollectionPhase,
+    GarbageCollectionProgress as DtoGarbageCollectProgress, Revisioned, WhyResult,
+};
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
-    GarbageCollectRequest, GarbageCollectResponse, GetStatusRequest, GetStatusResponse,
-    ImpactResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
-    RegisterWorkspaceRequest, RegisterWorkspaceResponse, ReindexWorkspaceRequest,
-    ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse, TraversalEntityRequest,
-    WhyResponse, daemon_server::Daemon,
+    GarbageCollectEvent, GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest,
+    GarbageCollectResponse, GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse,
+    GetStatusRequest, GetStatusResponse, ImpactResponse, ListWorkspacesRequest,
+    ListWorkspacesResponse, PathRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
+    ReindexWorkspaceRequest, ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
+    TraversalEntityRequest, WhyResponse, daemon_server::Daemon, garbage_collect_event,
 };
-use std::{error::Error, path::PathBuf};
+use std::{error::Error, path::PathBuf, sync::atomic::Ordering};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Code, Request, Response, Status, metadata::MetadataValue};
 
 #[tonic::async_trait]
@@ -27,31 +33,137 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(ClearCacheResponse {}))
     }
 
+    type GarbageCollectStream = UnboundedReceiverStream<Result<GarbageCollectEvent, Status>>;
+
     #[tracing::instrument(name = "rpc.garbage_collect", skip_all, err)]
     async fn garbage_collect(
         &self,
         _request: Request<GarbageCollectRequest>,
-    ) -> Result<Response<GarbageCollectResponse>, Status> {
-        let scheduler = self.scheduler.clone();
+    ) -> Result<Response<Self::GarbageCollectStream>, Status> {
         let store = self.store.clone();
-        let collected = tokio::task::spawn_blocking(move || {
-            scheduler
-                .garbage_collect(&store)
-                .map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|error| Status::internal(format!("garbage collection worker failed: {error}")))?
-        .map_err(Status::internal)?;
-        tracing::info!(
-            repository_states_removed = collected.repository_states_removed,
-            bytes_before = collected.bytes_before,
-            bytes_after = collected.bytes_after,
-            "semantic store garbage collected"
-        );
-        Ok(Response::new(GarbageCollectResponse {
-            repository_states_removed: collected.repository_states_removed,
-            bytes_before: collected.bytes_before,
-            bytes_after: collected.bytes_after,
+        let garbage_collector_running = self.garbage_collector_running.clone();
+        let garbage_collection_progress = self.garbage_collection_progress.clone();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            if garbage_collector_running.load(Ordering::Acquire) {
+                let event = store
+                    .garbage_collection_queued()
+                    .map(|repository_states_queued| GarbageCollectEvent {
+                        event: Some(garbage_collect_event::Event::Completed(
+                            GarbageCollectResponse {
+                                repository_states_queued,
+                            },
+                        )),
+                    })
+                    .map_err(|source| {
+                        operation_status(
+                            BeholderError::new(
+                                BeholderErrorKind::Internal,
+                                BeholderErrorCode::GarbageCollectionFailed,
+                                "garbage collection status failed",
+                            )
+                            .with_source(std::io::Error::other(source.to_string())),
+                        )
+                    });
+                let _ = sender.send(event);
+                return;
+            }
+            let _ = sender.send(Ok(progress_event(DtoGarbageCollectProgress::phase(
+                GarbageCollectionPhase::ClaimingObsoleteStates,
+            ))));
+            let claim_store = store.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                claim_store.garbage_collect().map_err(|source| {
+                    BeholderError::new(
+                        BeholderErrorKind::Internal,
+                        BeholderErrorCode::GarbageCollectionFailed,
+                        "semantic store garbage collection claim failed",
+                    )
+                    .with_source(std::io::Error::other(source.to_string()))
+                })
+            })
+            .await;
+            let event = match result {
+                Ok(Ok(collected)) => {
+                    if let Err(source) = start_garbage_collector(
+                        store,
+                        garbage_collector_running,
+                        garbage_collection_progress,
+                    ) {
+                        let _ = sender.send(Err(operation_status(
+                            BeholderError::new(
+                                BeholderErrorKind::Internal,
+                                BeholderErrorCode::GarbageCollectionWorkerFailed,
+                                "garbage collection worker failed to start",
+                            )
+                            .with_source(std::io::Error::other(source.to_string())),
+                        )));
+                        return;
+                    }
+                    tracing::info!(
+                        repository_states_queued = collected.repository_states_queued,
+                        "semantic store garbage collection queued"
+                    );
+                    Ok(GarbageCollectEvent {
+                        event: Some(garbage_collect_event::Event::Completed(
+                            GarbageCollectResponse {
+                                repository_states_queued: collected.repository_states_queued,
+                            },
+                        )),
+                    })
+                }
+                Ok(Err(error)) => Err(operation_status(error)),
+                Err(source) => Err(operation_status(
+                    BeholderError::new(
+                        BeholderErrorKind::Internal,
+                        BeholderErrorCode::GarbageCollectionWorkerFailed,
+                        "garbage collection worker failed",
+                    )
+                    .with_source(source),
+                )),
+            };
+            let _ = sender.send(event);
+        });
+        Ok(Response::new(UnboundedReceiverStream::new(receiver)))
+    }
+
+    #[tracing::instrument(name = "rpc.get_garbage_collection_status", skip_all, err)]
+    async fn get_garbage_collection_status(
+        &self,
+        _request: Request<GetGarbageCollectionStatusRequest>,
+    ) -> Result<Response<GetGarbageCollectionStatusResponse>, Status> {
+        let repository_states_queued =
+            self.store.garbage_collection_queued().map_err(|source| {
+                operation_status(
+                    BeholderError::new(
+                        BeholderErrorKind::Internal,
+                        BeholderErrorCode::GarbageCollectionFailed,
+                        "garbage collection status failed",
+                    )
+                    .with_source(std::io::Error::other(source.to_string())),
+                )
+            })?;
+        let progress = self
+            .garbage_collection_progress
+            .lock()
+            .map_err(|_| {
+                operation_status(
+                    BeholderError::new(
+                        BeholderErrorKind::Internal,
+                        BeholderErrorCode::GarbageCollectionFailed,
+                        "garbage collection status failed",
+                    )
+                    .with_source(std::io::Error::other(
+                        "garbage collection progress lock poisoned",
+                    )),
+                )
+            })?
+            .clone()
+            .map(protocol_progress);
+        Ok(Response::new(GetGarbageCollectionStatusResponse {
+            running: self.garbage_collector_running.load(Ordering::Acquire),
+            repository_states_queued,
+            progress,
         }))
     }
 
@@ -99,7 +211,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 11,
+            protocol_version: 13,
             pid: std::process::id(),
         }))
     }
@@ -319,6 +431,35 @@ impl Daemon for BeholderDaemon {
                 analysis: revisioned.analysis,
             });
         self.query_response(&request.workspace, revisioned)
+    }
+}
+
+fn progress_event(progress: DtoGarbageCollectProgress) -> GarbageCollectEvent {
+    GarbageCollectEvent {
+        event: Some(garbage_collect_event::Event::Progress(protocol_progress(
+            progress,
+        ))),
+    }
+}
+
+fn protocol_progress(progress: DtoGarbageCollectProgress) -> GarbageCollectProgress {
+    let phase = match progress.phase {
+        GarbageCollectionPhase::ClaimingObsoleteStates => {
+            GarbageCollectPhase::ClaimingObsoleteStates
+        }
+        GarbageCollectionPhase::SweepingObsoleteStates => {
+            GarbageCollectPhase::SweepingObsoleteStates
+        }
+    };
+    GarbageCollectProgress {
+        phase: phase.into(),
+        step: progress.step.unwrap_or_default(),
+        completed_steps: progress.completed_steps,
+        total_steps: progress.total_steps,
+        rows: progress.rows,
+        completed_rows: progress.completed_rows,
+        stale_states: progress.stale_states,
+        repositories: progress.repositories,
     }
 }
 

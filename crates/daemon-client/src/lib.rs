@@ -1,13 +1,18 @@
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
-    ContextResult, DependenciesResult, GarbageCollection, ImpactResult, TraceResult, WhyResult,
+    ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionEvent,
+    GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus, ImpactResult,
+    TraceResult, WhyResult,
 };
 use beholder_protocol::{
     ERROR_CODE_METADATA_KEY,
     v1::{
-        ClearCacheRequest, EntityRequest, GarbageCollectRequest, GetStatusRequest,
+        ClearCacheRequest, EntityRequest, GarbageCollectEvent as ProtocolGarbageCollectEvent,
+        GarbageCollectPhase, GarbageCollectProgress as ProtocolGarbageCollectProgress,
+        GarbageCollectRequest, GetGarbageCollectionStatusRequest, GetStatusRequest,
         GetStatusResponse, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
         ReindexWorkspaceRequest, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+        garbage_collect_event,
     },
 };
 use std::path::{Path, PathBuf};
@@ -64,17 +69,96 @@ pub async fn clear_cache() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub async fn garbage_collect() -> Result<GarbageCollection, Box<dyn std::error::Error>> {
-    let response = connect()
+pub struct GarbageCollectionStream {
+    inner: tonic::Streaming<ProtocolGarbageCollectEvent>,
+    completed: bool,
+}
+
+impl GarbageCollectionStream {
+    pub async fn message(&mut self) -> Result<Option<GarbageCollectionEvent>, BeholderError> {
+        let Some(event) = self.inner.message().await.map_err(operation_error)? else {
+            return if self.completed {
+                Ok(None)
+            } else {
+                Err(invalid_garbage_collection_event())
+            };
+        };
+        let event = match event.event {
+            Some(garbage_collect_event::Event::Progress(progress)) => {
+                GarbageCollectionEvent::Progress(garbage_collection_progress(progress)?)
+            }
+            Some(garbage_collect_event::Event::Completed(completed)) => {
+                self.completed = true;
+                GarbageCollectionEvent::Completed(GarbageCollection {
+                    repository_states_queued: completed.repository_states_queued,
+                })
+            }
+            None => return Err(invalid_garbage_collection_event()),
+        };
+        Ok(Some(event))
+    }
+}
+
+pub async fn garbage_collect() -> Result<GarbageCollectionStream, BeholderError> {
+    let response = operation_client()
         .await?
         .garbage_collect(GarbageCollectRequest {})
-        .await?
+        .await
+        .map_err(operation_error)?
         .into_inner();
-    Ok(GarbageCollection {
-        repository_states_removed: response.repository_states_removed,
-        bytes_before: response.bytes_before,
-        bytes_after: response.bytes_after,
+    Ok(GarbageCollectionStream {
+        inner: response,
+        completed: false,
     })
+}
+
+pub async fn get_garbage_collection_status() -> Result<GarbageCollectionStatus, BeholderError> {
+    let status = operation_client()
+        .await?
+        .get_garbage_collection_status(GetGarbageCollectionStatusRequest {})
+        .await
+        .map_err(operation_error)?
+        .into_inner();
+    Ok(GarbageCollectionStatus {
+        running: status.running,
+        repository_states_queued: status.repository_states_queued,
+        progress: status
+            .progress
+            .map(garbage_collection_progress)
+            .transpose()?,
+    })
+}
+
+fn garbage_collection_progress(
+    progress: ProtocolGarbageCollectProgress,
+) -> Result<GarbageCollectionProgress, BeholderError> {
+    let phase = match GarbageCollectPhase::try_from(progress.phase) {
+        Ok(GarbageCollectPhase::ClaimingObsoleteStates) => {
+            GarbageCollectionPhase::ClaimingObsoleteStates
+        }
+        Ok(GarbageCollectPhase::SweepingObsoleteStates) => {
+            GarbageCollectionPhase::SweepingObsoleteStates
+        }
+        _ => return Err(invalid_garbage_collection_event()),
+    };
+    Ok(GarbageCollectionProgress {
+        phase,
+        step: (!progress.step.is_empty()).then_some(progress.step),
+        rows: progress.rows,
+        completed_rows: progress.completed_rows,
+        stale_states: progress.stale_states,
+        repositories: progress.repositories,
+        completed_steps: progress.completed_steps,
+        total_steps: progress.total_steps,
+    })
+}
+
+fn invalid_garbage_collection_event() -> BeholderError {
+    BeholderError::new(
+        BeholderErrorKind::Internal,
+        BeholderErrorCode::TransportGrpc,
+        "Beholder daemon returned an invalid garbage collection event",
+    )
 }
 
 pub async fn context(

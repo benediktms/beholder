@@ -90,10 +90,11 @@ mod tests {
     use beholder_protocol::{
         ERROR_CODE_METADATA_KEY,
         v1::{
-            ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectRequest,
-            GetStatusRequest, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
-            ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
-            daemon_client::DaemonClient,
+            ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectPhase,
+            GarbageCollectRequest, GetGarbageCollectionStatusRequest, GetStatusRequest,
+            ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
+            RelationKind, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+            garbage_collect_event,
         },
     };
     use std::{env, fs, path::Path, time::Duration};
@@ -162,7 +163,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 11);
+        assert_eq!(status.protocol_version, 13);
         assert_eq!(status.pid, std::process::id());
 
         let missing = client
@@ -343,12 +344,36 @@ mod tests {
 
         client.clear_cache(ClearCacheRequest {}).await.unwrap();
         assert!(!state.join("frontend-cache").exists());
-        let collected = client
+        let mut events = client
             .garbage_collect(GarbageCollectRequest {})
             .await
             .unwrap()
             .into_inner();
-        assert!(collected.bytes_after <= collected.bytes_before);
+        let mut phases = Vec::new();
+        let mut collected = None;
+        while let Some(event) = events.message().await.unwrap() {
+            match event.event {
+                Some(garbage_collect_event::Event::Progress(progress)) => {
+                    phases.push(GarbageCollectPhase::try_from(progress.phase).unwrap());
+                }
+                Some(garbage_collect_event::Event::Completed(result)) => {
+                    collected = Some(result);
+                }
+                None => panic!("garbage collection event should have a value"),
+            }
+        }
+        assert_eq!(phases, [GarbageCollectPhase::ClaimingObsoleteStates]);
+        let collected = collected.unwrap();
+        assert!(collected.repository_states_queued > 0);
+        let garbage_collection_status = client
+            .get_garbage_collection_status(GetGarbageCollectionStatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            garbage_collection_status.repository_states_queued
+                <= collected.repository_states_queued
+        );
 
         let third = state.join("repo-c");
         fs::create_dir_all(third.join("src")).unwrap();

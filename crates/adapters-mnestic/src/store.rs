@@ -8,13 +8,15 @@ use super::{
         inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions, trace,
     },
     storage::{
-        garbage_collect, publish_observations, store_verification_fingerprint,
+        claim_garbage_collection, garbage_collection_pending, garbage_collection_queued,
+        publish_observations, store_verification_fingerprint, sweep_garbage_collection,
         verification_matches, view_matches,
     },
 };
 use beholder_domain::{DependencyOverride, FactChanges, RepositoryFacts, WorkspaceView};
 use beholder_dto::{
-    ContextResult, DependenciesResult, GarbageCollection, ImpactResult, Revisioned, TraceResult,
+    ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
+    Revisioned, TraceResult,
 };
 use mnestic_engine::{DbInstance, MultiTransaction, NamedRows};
 use std::{
@@ -142,45 +144,24 @@ impl SemanticStore {
     }
 
     pub fn garbage_collect(&self) -> Result<GarbageCollection, Box<dyn Error>> {
-        let bytes_before = self
-            .database_path
-            .as_deref()
-            .map(std::fs::metadata)
-            .transpose()?
-            .map_or(0, |metadata| metadata.len());
-        let repository_states_removed = garbage_collect(&self.db)?;
-        self.checkpoint()?;
-
-        #[cfg(feature = "sqlite")]
-        if let Some(path) = &self.database_path {
-            let connection = sqlite::open(path)?;
-            connection.execute("PRAGMA busy_timeout = 5000")?;
-            let mut mode = connection.prepare("PRAGMA auto_vacuum")?;
-            if mode.next()? != sqlite::State::Row {
-                return Err("SQLite did not report its auto-vacuum mode".into());
-            }
-            if mode.read::<i64, _>(0)? == 0 {
-                drop(mode);
-                connection.execute("PRAGMA auto_vacuum = INCREMENTAL")?;
-                connection.execute("VACUUM")?;
-            } else {
-                drop(mode);
-                connection.execute("PRAGMA incremental_vacuum")?;
-            }
-        }
-        self.checkpoint()?;
-
-        let bytes_after = self
-            .database_path
-            .as_deref()
-            .map(std::fs::metadata)
-            .transpose()?
-            .map_or(0, |metadata| metadata.len());
         Ok(GarbageCollection {
-            repository_states_removed,
-            bytes_before,
-            bytes_after,
+            repository_states_queued: claim_garbage_collection(&self.db)?,
         })
+    }
+
+    pub fn sweep_garbage_collection(
+        &self,
+        mut progress: impl FnMut(GarbageCollectionProgress),
+    ) -> Result<u64, Box<dyn Error>> {
+        sweep_garbage_collection(&self.db, &mut progress)
+    }
+
+    pub fn garbage_collection_pending(&self) -> Result<bool, Box<dyn Error>> {
+        garbage_collection_pending(&self.read_db)
+    }
+
+    pub fn garbage_collection_queued(&self) -> Result<u64, Box<dyn Error>> {
+        garbage_collection_queued(&self.read_db)
     }
 
     pub fn inspect_relations(&self) -> Result<InspectionResult, Box<dyn Error>> {
@@ -510,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_collection_keeps_only_current_states_and_enables_incremental_vacuum() {
+    fn garbage_collection_queues_stale_states_and_sweeps_them_in_restart_safe_batches() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -518,7 +499,6 @@ mod tests {
         let state_dir = std::env::temp_dir().join(format!("beholder-gc-{unique}"));
         fs::create_dir_all(&state_dir).unwrap();
         let database = state_dir.join("beholder.db");
-        sqlite::open(&database).unwrap();
         let store = SemanticStore::persistent(&database, true).unwrap();
         let state = |fingerprint: &str| RepositoryState {
             repository: LogicalRepository {
@@ -528,29 +508,102 @@ mod tests {
             fingerprint: fingerprint.into(),
         };
 
-        for fingerprint in ["old", "current"] {
+        for fingerprint in ["old", "resurrected", "current"] {
             let view = WorkspaceView::new("main", "analysis", vec![state(fingerprint)]).unwrap();
-            store
-                .publish(
-                    &view,
-                    &[facts(
-                        &view,
-                        vec![Observation::dependency(
-                            "repo/source",
+            let observations = if fingerprint == "old" {
+                (0..10_001)
+                    .map(|index| {
+                        Observation::dependency(
+                            format!("repo/old/{index}"),
                             DependencyRelation::Calls,
                             "repo/target",
-                            format!("src/lib.rs:{fingerprint}"),
-                        )],
-                    )],
-                    &[],
-                )
+                            format!("src/lib.rs:{index}"),
+                        )
+                    })
+                    .collect()
+            } else if fingerprint == "current" {
+                vec![Observation::dependency(
+                    "repo/source",
+                    DependencyRelation::Calls,
+                    "repo/target",
+                    "src/lib.rs:current",
+                )]
+            } else {
+                vec![Observation::dependency(
+                    "repo/resurrected",
+                    DependencyRelation::Calls,
+                    "repo/target",
+                    "src/lib.rs:resurrected",
+                )]
+            };
+            store
+                .publish(&view, &[facts(&view, observations)], &[])
                 .unwrap();
         }
 
-        let before = store.context("main", "repo/source").unwrap();
         let collected = store.garbage_collect().unwrap();
-        assert_eq!(collected.repository_states_removed, 1);
-        assert_eq!(store.context("main", "repo/source").unwrap(), before);
+        assert_eq!(collected.repository_states_queued, 2);
+        assert!(store.garbage_collection_pending().unwrap());
+        assert_eq!(store.garbage_collection_queued().unwrap(), 2);
+        drop(store);
+        let store = SemanticStore::persistent(&database, true).unwrap();
+        assert!(store.garbage_collection_pending().unwrap());
+
+        let resurrected =
+            WorkspaceView::new("main", "analysis", vec![state("resurrected")]).unwrap();
+        store
+            .publish(
+                &resurrected,
+                &[facts(
+                    &resurrected,
+                    vec![Observation::dependency(
+                        "repo/resurrected",
+                        DependencyRelation::Calls,
+                        "repo/target",
+                        "src/lib.rs:resurrected",
+                    )],
+                )],
+                &[],
+            )
+            .unwrap();
+
+        let mut progress = Vec::new();
+        assert_eq!(
+            store
+                .sweep_garbage_collection(|event| progress.push(event))
+                .unwrap(),
+            2
+        );
+        let observation_updates = progress
+            .iter()
+            .filter(|event| {
+                event
+                    .step
+                    .as_deref()
+                    .is_some_and(|step| step.starts_with("stale observations "))
+            })
+            .collect::<Vec<_>>();
+        let observations = observation_updates
+            .iter()
+            .find(|event| event.completed_rows == Some(10_001))
+            .unwrap();
+        assert_eq!(observations.rows, None);
+        assert_eq!(observations.stale_states, Some(2));
+        assert_eq!(observations.repositories, Some(1));
+        assert!(observations.completed_steps < 2);
+        assert_eq!(
+            observation_updates
+                .iter()
+                .filter_map(|event| event.completed_rows.filter(|rows| *rows > 0))
+                .collect::<Vec<_>>(),
+            [10_000, 10_001]
+        );
+        assert!(!store.garbage_collection_pending().unwrap());
+        assert_eq!(store.garbage_collection_queued().unwrap(), 0);
+        assert_eq!(
+            store.context("main", "repo/resurrected").unwrap().root.id,
+            "repo/resurrected"
+        );
         let states = store
             .db
             .run_script(
@@ -559,21 +612,17 @@ mod tests {
                 mnestic_engine::ScriptMutability::Immutable,
             )
             .unwrap();
-        assert_eq!(states.rows.len(), 1);
-
-        let connection = sqlite::open(&database).unwrap();
-        let mut mode = connection.prepare("PRAGMA auto_vacuum").unwrap();
-        assert_eq!(mode.next().unwrap(), sqlite::State::Row);
-        assert_eq!(mode.read::<i64, _>(0).unwrap(), 2);
+        assert_eq!(states.rows.len(), 2);
+        let old_observations = store
+            .db
+            .run_script(
+                "?[state] := *state_observation{state, from: 'repo/old/0'}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert!(old_observations.rows.is_empty());
         drop(store);
-
-        let new_database = state_dir.join("new.db");
-        let new_store = SemanticStore::persistent(&new_database, true).unwrap();
-        let connection = sqlite::open(new_database).unwrap();
-        let mut mode = connection.prepare("PRAGMA auto_vacuum").unwrap();
-        assert_eq!(mode.next().unwrap(), sqlite::State::Row);
-        assert_eq!(mode.read::<i64, _>(0).unwrap(), 2);
-        drop(new_store);
         fs::remove_dir_all(state_dir).unwrap();
     }
 

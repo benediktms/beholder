@@ -10,9 +10,55 @@ pub const DEFAULT_MAX_HOPS: u32 = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GarbageCollection {
-    pub repository_states_removed: u64,
-    pub bytes_before: u64,
-    pub bytes_after: u64,
+    pub repository_states_queued: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GarbageCollectionStatus {
+    pub running: bool,
+    pub repository_states_queued: u64,
+    pub progress: Option<GarbageCollectionProgress>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GarbageCollectionEvent {
+    Progress(GarbageCollectionProgress),
+    Completed(GarbageCollection),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GarbageCollectionProgress {
+    pub phase: GarbageCollectionPhase,
+    pub step: Option<String>,
+    pub rows: Option<u64>,
+    pub completed_rows: Option<u64>,
+    pub stale_states: Option<u32>,
+    pub repositories: Option<u32>,
+    pub completed_steps: u32,
+    pub total_steps: u32,
+}
+
+impl GarbageCollectionProgress {
+    pub fn phase(phase: GarbageCollectionPhase) -> Self {
+        Self {
+            phase,
+            step: None,
+            rows: None,
+            completed_rows: None,
+            stale_states: None,
+            repositories: None,
+            completed_steps: 0,
+            total_steps: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GarbageCollectionPhase {
+    ClaimingObsoleteStates,
+    SweepingObsoleteStates,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

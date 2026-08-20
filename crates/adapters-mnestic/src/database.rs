@@ -95,6 +95,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
+    db.run_script(
+        CREATE_GARBAGE_COLLECTION_STATE_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
     db.run_script(SEED, BTreeMap::new(), ScriptMutability::Mutable)?;
     db.run_script(
         SEED_DEPENDENCIES,
@@ -159,6 +164,18 @@ pub(super) fn persistent_database(
     {
         db.run_script(
             CREATE_METADATA_SCHEMA,
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )?;
+    }
+    if initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("garbage_collection_state"))
+    {
+        db.run_script(
+            CREATE_GARBAGE_COLLECTION_STATE_SCHEMA,
             BTreeMap::new(),
             ScriptMutability::Mutable,
         )?;
@@ -372,6 +389,7 @@ mod tests {
         drop(db);
 
         let store = SemanticStore::persistent(&path, true).unwrap();
+        assert!(!store.garbage_collection_pending().unwrap());
         let view = WorkspaceView::new(
             "legacy",
             "analysis",

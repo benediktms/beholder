@@ -184,6 +184,15 @@ pub(super) const CREATE_REPOSITORY_STATE_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_GARBAGE_COLLECTION_STATE_SCHEMA: &str = r#"
+:create garbage_collection_state {
+    state: String,
+    =>
+    repository: String,
+    head: String,
+}
+"#;
+
 pub(super) const CREATE_REVISION_STATE_SCHEMA: &str = r#"
 :create analysis_revision_state {
     view: String,
