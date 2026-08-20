@@ -5,9 +5,10 @@ use beholder_domain::{
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     error::Error,
     fs::{self, File},
+    hash::Hash,
     io::{BufReader, BufWriter, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -534,6 +535,16 @@ impl Indexer {
         analysis_identity(&active)
     }
 
+    pub fn catalog_identity(&self) -> String {
+        analysis_identity(
+            &self
+                .analyzers
+                .iter()
+                .map(|analyzer| analyzer.metadata())
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub fn analyze(
         &self,
         snapshot: &WorkspaceSnapshot,
@@ -697,9 +708,10 @@ fn analysis_identity(metadata: &[AnalyzerMetadata]) -> String {
     )
 }
 
-fn extend_unique<T: PartialEq>(target: &mut Vec<T>, source: Vec<T>) {
+fn extend_unique<T: Clone + Eq + Hash>(target: &mut Vec<T>, source: Vec<T>) {
+    let mut seen = target.iter().cloned().collect::<HashSet<_>>();
     for value in source {
-        if !target.contains(&value) {
+        if seen.insert(value.clone()) {
             target.push(value);
         }
     }
@@ -955,6 +967,15 @@ mod tests {
         assert_eq!(first.repositories[0].facts, second.repositories[0].facts);
         let _ = fs::remove_dir_all(first_dir);
         let _ = fs::remove_dir_all(second_dir);
+    }
+
+    #[test]
+    fn extend_unique_preserves_first_seen_order() {
+        let mut target = vec![1, 2];
+
+        extend_unique(&mut target, vec![2, 3, 3, 1, 4]);
+
+        assert_eq!(target, vec![1, 2, 3, 4]);
     }
 
     #[test]

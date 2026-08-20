@@ -75,6 +75,7 @@ use beholder_indexing::{IndexerBuilder, WorkspaceAnalyzer};
 use notify::{Event, EventKind};
 #[cfg(test)]
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -116,7 +117,7 @@ mod sources;
 mod typescript_analysis;
 #[cfg(test)]
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
-use sources::repository_snapshot;
+use sources::{RepositoryInventory, repository_inventory};
 #[cfg(test)]
 use sources::{RepositorySources, decode_csharp_source, repository_sources};
 
@@ -1273,7 +1274,7 @@ fn index_workspace_through_port(
     dirty: Option<&BTreeMap<String, DirtyRepository>>,
 ) -> Result<(usize, bool), Box<dyn Error>> {
     let source_loading_started = Instant::now();
-    let repositories = workspace
+    let inventories = workspace
         .repositories
         .iter()
         .map(|repository| {
@@ -1283,8 +1284,18 @@ fn index_workspace_through_port(
                 .filter(|descriptor| descriptor.repository == repository.repository)
                 .map(|descriptor| descriptor.path.clone())
                 .collect::<Vec<_>>();
-            repository_snapshot(&repository.base, &descriptors, &scheduler.indexer)
+            repository_inventory(&repository.base, &descriptors, &scheduler.indexer)
         })
+        .collect::<Result<Vec<_>, _>>()?;
+    let verification_fingerprint =
+        workspace_verification_fingerprint(&scheduler.indexer, &inventories);
+    if store.verification_matches(&workspace.name, &verification_fingerprint)? {
+        tracing::info!(workspace = %workspace.name, "workspace inputs unchanged");
+        return Ok((0, false));
+    }
+    let repositories = inventories
+        .into_iter()
+        .map(RepositoryInventory::load)
         .collect::<Result<Vec<_>, _>>()?;
     let source_loading = source_loading_started.elapsed();
     let snapshot = WorkspaceSnapshot {
@@ -1301,6 +1312,7 @@ fn index_workspace_through_port(
             .collect(),
     )?;
     if store.view_matches(&view)? {
+        store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
@@ -1344,7 +1356,12 @@ fn index_workspace_through_port(
         .map(|facts| facts.observations.len())
         .sum();
     let publication_started = Instant::now();
-    let changes = store.publish(&view, &repository_facts, &analysis.overrides)?;
+    let changes = store.publish_verified(
+        &view,
+        &repository_facts,
+        &analysis.overrides,
+        &verification_fingerprint,
+    )?;
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
     tracing::info!(
@@ -1369,6 +1386,21 @@ fn index_workspace_through_port(
         "workspace indexed"
     );
     Ok((observation_count, true))
+}
+
+fn workspace_verification_fingerprint(
+    indexer: &Indexer,
+    inventories: &[RepositoryInventory],
+) -> String {
+    let mut digest = Sha256::new();
+    let identity = indexer.catalog_identity();
+    digest.update((identity.len() as u64).to_le_bytes());
+    digest.update(identity.as_bytes());
+    for inventory in inventories {
+        digest.update((inventory.fingerprint.len() as u64).to_le_bytes());
+        digest.update(inventory.fingerprint.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 #[cfg(test)]
@@ -2703,6 +2735,49 @@ mod tests {
         assert_eq!(
             store.inspect_revisions().unwrap().rows[0][1].as_i64(),
             Some(3)
+        );
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn unchanged_inventory_skips_source_loading_after_restart() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-warm-restart-{unique}"));
+        let repository = state.join("repo");
+        let source = repository.join("src/lib.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fn indexed() {}").unwrap();
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let workspace = test_workspace("main", repository.clone());
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+
+        assert!(scheduler.index(&store, &workspace).unwrap().1);
+        drop(scheduler);
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let fingerprint = workspace_verification_fingerprint(
+            &scheduler.indexer,
+            &[repository_inventory(&repository, &[], &scheduler.indexer).unwrap()],
+        );
+        assert!(store.verification_matches("main", &fingerprint).unwrap());
+        assert!(!scheduler.index(&store, &workspace).unwrap().1);
+
+        fs::write(&source, "fn indexed() {}").unwrap();
+        assert!(!scheduler.index(&store, &workspace).unwrap().1);
+        let refreshed = workspace_verification_fingerprint(
+            &scheduler.indexer,
+            &[repository_inventory(&repository, &[], &scheduler.indexer).unwrap()],
+        );
+        assert!(store.verification_matches("main", &refreshed).unwrap());
+
+        fs::write(&source, "fn changed() {}").unwrap();
+        assert!(scheduler.index(&store, &workspace).unwrap().1);
+        assert_eq!(
+            store.inspect_revisions().unwrap().rows[0][1].as_i64(),
+            Some(2)
         );
         drop(store);
         fs::remove_dir_all(state).unwrap();

@@ -7,7 +7,10 @@ use super::{
         analysis_metadata, analysis_revision, context, dependencies, entity_facts, impact,
         inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions, trace,
     },
-    storage::{garbage_collect, publish_observations, view_matches},
+    storage::{
+        garbage_collect, publish_observations, store_verification_fingerprint,
+        verification_matches, view_matches,
+    },
 };
 use beholder_domain::{DependencyOverride, FactChanges, RepositoryFacts, WorkspaceView};
 use beholder_dto::{
@@ -84,13 +87,45 @@ impl SemanticStore {
         view_matches(&self.read_db, view)
     }
 
+    pub fn verification_matches(
+        &self,
+        view: &str,
+        fingerprint: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        verification_matches(&self.read_db, view, fingerprint)
+    }
+
+    pub fn store_verification_fingerprint(
+        &self,
+        view: &str,
+        fingerprint: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        store_verification_fingerprint(&self.db, view, fingerprint)
+    }
+
     pub fn publish(
         &self,
         view: &WorkspaceView,
         repositories: &[RepositoryFacts],
         overrides: &[DependencyOverride],
     ) -> Result<FactChanges, Box<dyn Error>> {
-        publish_observations(&self.db, view, repositories, overrides)
+        publish_observations(&self.db, view, repositories, overrides, None)
+    }
+
+    pub fn publish_verified(
+        &self,
+        view: &WorkspaceView,
+        repositories: &[RepositoryFacts],
+        overrides: &[DependencyOverride],
+        verification_fingerprint: &str,
+    ) -> Result<FactChanges, Box<dyn Error>> {
+        publish_observations(
+            &self.db,
+            view,
+            repositories,
+            overrides,
+            Some(verification_fingerprint),
+        )
     }
 
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {
