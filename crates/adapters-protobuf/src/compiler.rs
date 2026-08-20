@@ -16,6 +16,7 @@ const COMPILER_ID: &str = "protox-0.9.1-v1";
 
 pub struct SourceCompiler {
     cache_dir: PathBuf,
+    http: reqwest::blocking::Client,
     memory: Mutex<BTreeMap<[u8; 32], Arc<Vec<u8>>>>,
 }
 
@@ -61,6 +62,7 @@ impl SourceCompiler {
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             cache_dir: cache_dir.join("protobuf"),
+            http: reqwest::blocking::Client::new(),
             memory: Mutex::new(BTreeMap::new()),
         }
     }
@@ -153,14 +155,17 @@ impl SourceCompiler {
             ],
         );
         self.cached("dependencies", key, || {
-            let response = ureq::get(&url)
+            let response = self
+                .http
+                .get(&url)
                 .header("Accept", "application/proto")
-                .call()
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
                 .map_err(|error| format!("failed to download {}: {error}", dependency.name))?;
             let bytes = response
-                .into_body()
-                .read_to_vec()
+                .bytes()
                 .map_err(|error| format!("failed to read {}: {error}", dependency.name))?;
+            let bytes = bytes.to_vec();
             DescriptorSetFileResolver::decode(bytes.as_slice()).map_err(|error| {
                 format!("invalid descriptor set for {}: {error}", dependency.name)
             })?;
