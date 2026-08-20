@@ -30,6 +30,11 @@ Open <http://localhost:4318>. RPC operations and background workspace indexing
 appear as traces; structured `tracing` events appear in the Logs view and carry
 trace/span correlation when emitted inside a span.
 
+The rolling JSON logs use the same correlation context. Events emitted inside
+an instrumented span include top-level `trace_id` and `span_id` fields, allowing
+local tooling to find the corresponding trace without querying the OTLP log
+store. Events outside a span omit both fields.
+
 The Rust analyzer worker exports as the separate `beholder-worker-rust`
 service. Its analysis spans are linked to the daemon trace through W3C trace
 context propagated over the local worker gRPC request.

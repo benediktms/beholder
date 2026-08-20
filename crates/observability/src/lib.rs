@@ -1,7 +1,7 @@
 use opentelemetry::{
     KeyValue, global,
     propagation::{Extractor, Injector},
-    trace::TracerProvider as _,
+    trace::{TraceContextExt as _, TracerProvider as _},
 };
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, Protocol, SpanExporter, WithExportConfig};
@@ -9,14 +9,25 @@ use opentelemetry_sdk::{
     Resource, logs::SdkLoggerProvider, propagation::TraceContextPropagator,
     trace::SdkTracerProvider,
 };
-use std::{error::Error, ffi::OsStr, path::PathBuf};
+use std::{
+    error::Error,
+    ffi::OsStr,
+    fmt,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 use tonic::metadata::{Ascii, MetadataKey, MetadataMap, MetadataValue};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     EnvFilter,
-    fmt::{format::FmtSpan, writer::BoxMakeWriter},
+    fmt::{
+        FmtContext, FormatEvent, FormatFields,
+        format::{FmtSpan, Json, Writer},
+        writer::BoxMakeWriter,
+    },
     prelude::*,
+    registry::LookupSpan,
 };
 
 const OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
@@ -63,10 +74,12 @@ pub fn init(
     global::set_text_map_propagator(TraceContextPropagator::new());
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let (writer, writer_guard) = log_writer(output);
+    let dispatch = Arc::new(OnceLock::new());
     let fmt_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_ansi(false)
         .with_span_events(FmtSpan::CLOSE)
+        .event_format(CorrelatedJson::new(dispatch.clone()))
         .with_writer(writer)
         .with_filter(filter);
 
@@ -89,11 +102,16 @@ pub fn init(
         .as_ref()
         .map(|provider| OpenTelemetryTracingBridge::new(provider).with_filter(telemetry_filter()));
 
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(fmt_layer)
         .with(trace_layer)
-        .with(log_layer)
-        .init();
+        .with(log_layer);
+    let subscriber = tracing::Dispatch::new(subscriber);
+    dispatch
+        .set(subscriber.downgrade())
+        .expect("subscriber dispatch is only initialized once");
+    tracing::dispatcher::set_global_default(subscriber)
+        .expect("a global tracing subscriber has already been set");
 
     if tracer_provider.is_some() || logger_provider.is_some() {
         tracing::info!(
@@ -108,6 +126,61 @@ pub fn init(
         _writer: writer_guard,
         tracer_provider,
         logger_provider,
+    }
+}
+
+struct CorrelatedJson {
+    inner: tracing_subscriber::fmt::format::Format<Json>,
+    dispatch: Arc<OnceLock<tracing::dispatcher::WeakDispatch>>,
+}
+
+impl CorrelatedJson {
+    fn new(dispatch: Arc<OnceLock<tracing::dispatcher::WeakDispatch>>) -> Self {
+        Self {
+            inner: tracing_subscriber::fmt::format::json(),
+            dispatch,
+        }
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for CorrelatedJson
+where
+    S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        let mut rendered = String::new();
+        self.inner
+            .format_event(ctx, Writer::new(&mut rendered), event)?;
+
+        let correlation = event
+            .parent()
+            .and_then(|id| ctx.span(id))
+            .or_else(|| ctx.lookup_current())
+            .and_then(|span| {
+                let dispatch = self.dispatch.get()?.upgrade()?;
+                tracing_opentelemetry::get_otel_context(&span.id(), &dispatch)
+            })
+            .and_then(|context| {
+                let span = context.span();
+                let context = span.span_context();
+                context
+                    .is_valid()
+                    .then(|| (context.trace_id(), context.span_id()))
+            });
+
+        match (rendered.strip_suffix("}\n"), correlation) {
+            (Some(json), Some((trace_id, span_id))) => writeln!(
+                writer,
+                "{json},\"trace_id\":\"{trace_id}\",\"span_id\":\"{span_id}\"}}"
+            ),
+            _ => writer.write_str(&rendered),
+        }
     }
 }
 
@@ -271,6 +344,14 @@ mod tests {
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SpanData, SpanExporter},
+    };
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
 
     #[test]
     fn tonic_metadata_round_trips_w3c_trace_context() {
@@ -289,5 +370,82 @@ mod tests {
         let extracted = propagator.extract(&MetadataExtractor(&metadata));
 
         assert_eq!(extracted.span().span_context(), &expected);
+    }
+
+    #[test]
+    fn json_logs_include_active_otel_trace_context() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = {
+            let output = output.clone();
+            move || SharedWriter(output.clone())
+        };
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(NoopExporter)
+            .build();
+        let trace_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("test"));
+        let dispatch = Arc::new(OnceLock::new());
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .event_format(CorrelatedJson::new(dispatch.clone()))
+            .with_writer(writer);
+        let subscriber = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(trace_layer);
+        let subscriber = tracing::Dispatch::new(subscriber);
+        dispatch.set(subscriber.downgrade()).unwrap();
+
+        let (trace_id, span_id) = tracing::dispatcher::with_default(&subscriber, || {
+            tracing::info!("outside span");
+            let span = tracing::info_span!("correlated");
+            let context = span.context();
+            let span_context = context.span();
+            let span_context = span_context.span_context();
+            assert!(span_context.is_valid());
+            let ids = (span_context.trace_id(), span_context.span_id());
+            let _entered = span.enter();
+            tracing::info!("inside span");
+            ids
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let outside = output
+            .lines()
+            .find(|line| line.contains("outside span"))
+            .unwrap();
+        let inside = output
+            .lines()
+            .find(|line| line.contains("inside span"))
+            .unwrap();
+        assert!(!outside.contains("trace_id"));
+        assert!(!outside.contains("span_id"));
+        assert!(
+            inside.contains(&format!(r#""trace_id":"{trace_id}""#)),
+            "missing trace correlation in {inside}"
+        );
+        assert!(
+            inside.contains(&format!(r#""span_id":"{span_id}""#)),
+            "missing span correlation in {inside}"
+        );
+    }
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    #[derive(Debug)]
+    struct NoopExporter;
+
+    impl SpanExporter for NoopExporter {
+        async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
