@@ -4,6 +4,7 @@ pub const RESOLVER_VERSION: &str = "6";
 mod analysis;
 mod analyzer;
 mod model;
+mod plugin;
 mod resolution;
 mod sources;
 mod tonic;

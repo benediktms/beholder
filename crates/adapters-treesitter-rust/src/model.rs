@@ -1,10 +1,16 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
     pub(super) functions: Vec<RustFunction>,
     pub(super) tonic: TonicAnalysis,
     pub(super) parse_error_lines: Vec<usize>,
+}
+
+pub(super) struct RustRepository {
+    pub(super) repository: String,
+    pub(super) sources: Vec<(PathBuf, RustAnalysis)>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
