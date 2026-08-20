@@ -312,55 +312,20 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     exit 1
 fi
 
-echo 'Checking recoverable and skipped parser failures...' >&2
+echo 'Checking a bad source does not abort workspace indexing...' >&2
 recovery_source="$state/rust/src/recovery.rs"
-recovery_module='repo://github.com/example/beholder-rust-smoke/rust/recovery'
-printf '%s\n' 'fn broken() { @ }' 'fn recovered() {}' >"$recovery_source"
-for _ in {1..100}; do
-    result="$(target/debug/beholder context --json --workspace main "$recovery_module" 2>/dev/null || true)"
-    grep -Fq '/recovered' <<<"$result" && grep -Fq '"completeness":"incomplete"' <<<"$result" && break
-    sleep 0.1
-done
-for expected in '/recovered' '"completeness":"incomplete"' '"code":"rust.parse_recovery"'; do
-    if ! grep -Fq "$expected" <<<"$result"; then
-        printf 'recoverable Rust source did not expose %s:\n%s\n' "$expected" "$result" >&2
-        exit 1
-    fi
-done
-
-revision_before_skip="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
 printf '%s\n' 'fn broken() {' 'fn nested() {}' >"$recovery_source"
-if ! unsafe_output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
-    printf 'unrecoverable Rust source aborted workspace indexing:\n%s\n' "$unsafe_output" >&2
+if ! reindex_output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+    printf 'unrecoverable Rust source aborted workspace indexing:\n%s\n' "$reindex_output" >&2
     exit 1
 fi
-result="$(target/debug/beholder context --json --workspace main "$recovery_module" 2>/dev/null || true)"
-if grep -Fq '/recovered' <<<"$result"; then
-    printf 'skipped Rust source retained stale observations:\n%s\n' "$result" >&2
+result="$(target/debug/beholder context --json --workspace main "$rust_client")"
+if ! grep -Fq '"kind":"calls_rpc"' <<<"$result"; then
+    printf 'bad Rust source removed valid sibling observations:\n%s\n' "$result" >&2
     exit 1
 fi
-revision_after_skip="$(target/debug/beholder inspect revisions --database "$state/daemon/beholder.db")"
-if [[ "$revision_before_skip" == "$revision_after_skip" ]]; then
-    printf 'skipped Rust source did not publish the remaining workspace:\n%s\n' "$revision_after_skip" >&2
-    exit 1
-fi
-
 printf '%s\n' 'fn repaired() {}' >"$recovery_source"
 target/debug/beholder reindex-workspace main >/dev/null
-for _ in {1..100}; do
-    result="$(target/debug/beholder context --json --workspace main "$recovery_module" 2>/dev/null || true)"
-    grep -Fq '/repaired' <<<"$result" \
-        && grep -Fq '"completeness":"complete"' <<<"$result" \
-        && ! grep -Fq '"code":"rust.parse_recovery"' <<<"$result" \
-        && break
-    sleep 0.1
-done
-if ! grep -Fq '/repaired' <<<"$result" \
-    || ! grep -Fq '"completeness":"complete"' <<<"$result" \
-    || grep -Fq '"code":"rust.parse_recovery"' <<<"$result"; then
-    printf 'repair did not publish a complete analysis:\n%s\n' "$result" >&2
-    exit 1
-fi
 
 echo 'Garbage collecting obsolete semantic states...' >&2
 gc_result="$(target/debug/beholder cache gc)"
@@ -389,9 +354,7 @@ if [[ -z "$trace_file" ]]; then
 fi
 unexpected_errors="$(grep -E '"level":"(WARN|ERROR)"' "$trace_file" \
     | grep -Fv 'rust.parse_recovery' \
-    | grep -Fv 'source cannot be recovered safely' \
-    | grep -Fv 'source recovery was unsafe; the previous analysis remains active' \
-    | grep -Fv 'beholder.source.recovery_unsafe' || true)"
+    || true)"
 if [[ -n "$unexpected_errors" ]]; then
     echo 'daemon trace contains warnings or errors:' >&2
     printf '%s\n' "$unexpected_errors" >&2

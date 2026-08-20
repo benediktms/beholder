@@ -3062,19 +3062,25 @@ mod tests {
         );
         fs::write(&source, "fn broken() { fn nested() {}").unwrap();
         scheduler.mark(&workspace);
-        let error = scheduler.index(&store, &workspace).unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<SourceAnalysisError>()
-                .is_some_and(SourceAnalysisError::is_unsafe_recovery)
+        let (observation_count, published) = scheduler.index(&store, &workspace).unwrap();
+        assert_eq!(observation_count, 0);
+        assert!(published);
+        let skipped = store
+            .context_snapshot("main", "repo://repo/rust/lib/current")
+            .unwrap();
+        assert_eq!(
+            skipped.analysis.completeness,
+            AnalysisCompleteness::Incomplete
         );
+        assert_eq!(skipped.analysis.diagnostics[0].code, "rust.parse_recovery");
+        assert!(skipped.result.edges.is_empty());
         assert_eq!(
             store.inspect_revisions().unwrap().rows[0][1].as_i64(),
-            Some(2)
+            Some(3)
         );
         assert!(
-            scheduler
-                .query_metadata("main", 2, recovered.analysis)
+            !scheduler
+                .query_metadata("main", 3, skipped.analysis)
                 .freshness
                 .stale
         );
@@ -3089,7 +3095,7 @@ mod tests {
             AnalysisCompleteness::Complete
         );
         assert!(repaired.analysis.diagnostics.is_empty());
-        assert_eq!(repaired.analysis_revision, 3);
+        assert_eq!(repaired.analysis_revision, 4);
 
         drop(store);
         fs::remove_dir_all(state).unwrap();

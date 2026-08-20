@@ -346,31 +346,6 @@ mod tests {
         assert!(!freshness.indexing);
         assert!(freshness.dirty_repositories.is_empty());
 
-        fs::write(first.join("src/lib.rs"), "fn caller() {").unwrap();
-        let unsafe_recovery = client
-            .reindex_workspace(ReindexWorkspaceRequest {
-                workspace: "main".into(),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(unsafe_recovery.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            unsafe_recovery
-                .metadata()
-                .get(ERROR_CODE_METADATA_KEY)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            BeholderErrorCode::SourceRecoveryUnsafe.as_str()
-        );
-        fs::write(first.join("src/lib.rs"), "fn caller() { helper(); }").unwrap();
-        client
-            .reindex_workspace(ReindexWorkspaceRequest {
-                workspace: "main".into(),
-            })
-            .await
-            .unwrap();
-
         client.clear_cache(ClearCacheRequest {}).await.unwrap();
         assert!(!state.join("frontend-cache").exists());
         let mut events = client
