@@ -363,8 +363,17 @@ fi
 
 echo 'Garbage collecting obsolete semantic states...' >&2
 gc_result="$(target/debug/beholder cache gc)"
-if ! grep -Eq '^removed [0-9]+ repository states' <<<"$gc_result"; then
+if ! grep -Eq '^queued [1-9][0-9]* obsolete repository states for background cleanup$' <<<"$gc_result"; then
     printf 'unexpected garbage collection result:\n%s\n' "$gc_result" >&2
+    exit 1
+fi
+for _ in {1..100}; do
+    gc_status="$(target/debug/beholder cache gc --status)"
+    grep -Fq 'idle · 0 repository states queued' <<<"$gc_status" && break
+    sleep 0.1
+done
+if ! grep -Fq 'idle · 0 repository states queued' <<<"$gc_status"; then
+    printf 'garbage collection did not finish:\n%s\n' "$gc_status" >&2
     exit 1
 fi
 echo 'Stopping daemon and inspecting traces...' >&2
@@ -392,7 +401,7 @@ for expected in \
     'workspace indexed' \
     'facts_inserted' \
     'rpc.context' \
-    'semantic store garbage collected' \
+    'semantic store garbage collection sweep completed' \
     'elixir.macro_expansion_incomplete' \
     'rust.receiver_method_resolution_unavailable' \
     'frontend analysis limitations' \
