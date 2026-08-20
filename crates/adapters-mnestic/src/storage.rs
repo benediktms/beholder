@@ -4,11 +4,16 @@ use beholder_domain::{
     GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, Observation,
     ProtoTypeKind, RepositoryFacts, RpcCardinality, SemanticRelation, WorkspaceView,
 };
+use beholder_dto::{GarbageCollectionPhase, GarbageCollectionProgress};
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, error::Error};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+};
 
 const FACT_BATCH_SIZE: usize = 10_000;
+const GARBAGE_COLLECTION_BATCH_SIZE: usize = 10_000;
 
 pub(super) fn store_observations(
     transaction: &MultiTransaction,
@@ -958,135 +963,344 @@ pub(super) fn store_repository_states(
     Ok(())
 }
 
-pub(super) fn garbage_collect(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
-    let stale = db.run_script(
+pub(super) fn claim_garbage_collection(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    let stale = transaction.run_script(
         "live_state[state] := \
              *analysis_revision{view, revision}, \
              *analysis_revision_state{view, revision, state}\n\
-         ?[state] := *repository_state{fingerprint: state}, not live_state[state]",
+         ?[state, repository, head] := \
+             *repository_state{fingerprint: state, repository, head}, not live_state[state]",
+        BTreeMap::new(),
+    )?;
+    if stale.rows.is_empty() {
+        transaction.abort()?;
+        return Ok(0);
+    }
+    let states = DataValue::List(
+        stale
+            .rows
+            .iter()
+            .map(|row| DataValue::List(vec![row[0].clone()]))
+            .collect(),
+    );
+    transaction.run_script(
+        "?[state, repository, head] <- $rows \
+         :put garbage_collection_state {state => repository, head}",
+        BTreeMap::from([(
+            "rows".into(),
+            DataValue::List(
+                stale
+                    .rows
+                    .clone()
+                    .into_iter()
+                    .map(DataValue::List)
+                    .collect(),
+            ),
+        )]),
+    )?;
+    transaction.run_script(
+        "?[fingerprint] <- $states :rm repository_state {fingerprint}",
+        BTreeMap::from([("states".into(), states)]),
+    )?;
+    transaction.commit()?;
+    Ok(stale.rows.len().try_into()?)
+}
+
+pub(super) fn garbage_collection_pending(db: &DbInstance) -> Result<bool, Box<dyn Error>> {
+    Ok(!db
+        .run_script(
+            "?[state] := *garbage_collection_state{state}\n:limit 1",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?
+        .rows
+        .is_empty())
+}
+
+pub(super) fn garbage_collection_queued(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
+    db.run_script(
+        "?[count(state)] := *garbage_collection_state{state}",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?
+    .rows
+    .first()
+    .and_then(|row| row[0].get_int())
+    .unwrap_or_default()
+    .try_into()
+    .map_err(Into::into)
+}
+
+struct RelationCleanup<'a> {
+    step: String,
+    select_script: String,
+    relation: &'a str,
+    keys: &'a str,
+    parameters: BTreeMap<String, DataValue>,
+    guard_repository_state: bool,
+    stale_states: u32,
+    repositories: u32,
+    completed_steps: u32,
+    total_steps: u32,
+}
+
+fn sweep_relation(
+    db: &DbInstance,
+    progress: &mut impl FnMut(GarbageCollectionProgress),
+    cleanup: RelationCleanup<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let mut completed_rows = 0;
+    progress(GarbageCollectionProgress {
+        phase: GarbageCollectionPhase::SweepingObsoleteStates,
+        step: Some(cleanup.step.clone()),
+        rows: None,
+        completed_rows: Some(completed_rows),
+        stale_states: Some(cleanup.stale_states),
+        repositories: Some(cleanup.repositories),
+        completed_steps: cleanup.completed_steps,
+        total_steps: cleanup.total_steps,
+    });
+    loop {
+        let batch = db
+            .run_script(
+                &format!(
+                    "{}\n:limit {GARBAGE_COLLECTION_BATCH_SIZE}",
+                    cleanup.select_script
+                ),
+                cleanup.parameters.clone(),
+                ScriptMutability::Immutable,
+            )?
+            .rows;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let transaction = db.multi_transaction(true);
+        if cleanup.guard_repository_state
+            && !transaction
+                .run_script(
+                    "?[fingerprint] := \
+                         *repository_state{fingerprint: $state}, fingerprint = $state\n\
+                     :limit 1",
+                    cleanup.parameters.clone(),
+                )?
+                .rows
+                .is_empty()
+        {
+            transaction.abort()?;
+            return Ok(());
+        }
+        let batch_size: u64 = batch.len().try_into()?;
+        transaction.run_script(
+            &format!(
+                "?[{}] <- $rows\n:rm {} {{{}}}",
+                cleanup.keys, cleanup.relation, cleanup.keys
+            ),
+            BTreeMap::from([(
+                "rows".into(),
+                DataValue::List(batch.into_iter().map(DataValue::List).collect()),
+            )]),
+        )?;
+        transaction.commit()?;
+        completed_rows += batch_size;
+        progress(GarbageCollectionProgress {
+            phase: GarbageCollectionPhase::SweepingObsoleteStates,
+            step: Some(cleanup.step.clone()),
+            rows: None,
+            completed_rows: Some(completed_rows),
+            stale_states: Some(cleanup.stale_states),
+            repositories: Some(cleanup.repositories),
+            completed_steps: cleanup.completed_steps,
+            total_steps: cleanup.total_steps,
+        });
+    }
+}
+
+pub(super) fn sweep_garbage_collection(
+    db: &DbInstance,
+    progress: &mut impl FnMut(GarbageCollectionProgress),
+) -> Result<u64, Box<dyn Error>> {
+    let queued = db.run_script(
+        "?[state, repository] := *garbage_collection_state{state, repository}",
         BTreeMap::new(),
         ScriptMutability::Immutable,
     )?;
-
-    db.run_script(
-        "{ \
-             live_state[state] := \
-                 *analysis_revision{view, revision}, \
-                 *analysis_revision_state{view, revision, state} \
-             stale_state[state] := \
-                 *repository_state{fingerprint: state}, not live_state[state] \
-             ?[state, from, relation, to] := \
-                 *state_observation{state, from, relation, to}, stale_state[state] \
-                 :rm state_observation {state, from, relation, to} \
-             } \
-             { \
-                 live_state[state] := \
-                     *analysis_revision{view, revision}, \
-                     *analysis_revision_state{view, revision, state} \
-                 stale_state[state] := \
-                     *repository_state{fingerprint: state}, not live_state[state] \
-                 ?[state, id] := *state_entity{state, id}, stale_state[state] \
-                 :rm state_entity {state, id} \
-             } \
-             { \
-                 live_state[state] := \
-                     *analysis_revision{view, revision}, \
-                     *analysis_revision_state{view, revision, state} \
-                 stale_state[state] := \
-                     *repository_state{fingerprint: state}, not live_state[state] \
-                 ?[state, local_symbol, role, service, method, evidence] := \
-                     *state_grpc_binding_candidate{\
-                         state, local_symbol, role, service, method, evidence\
-                     }, stale_state[state] \
-                 :rm state_grpc_binding_candidate {\
-                     state, local_symbol, role, service, method, evidence\
-                 } \
-             } \
-             { \
-                 live_state[state] := \
-                     *analysis_revision{view, revision}, \
-                     *analysis_revision_state{view, revision, state} \
-                 stale_state[state] := \
-                     *repository_state{fingerprint: state}, not live_state[state] \
-                 ?[state, from, relation, to] := \
-                     *state_dependency_observation{state, from, relation, to}, stale_state[state] \
-                 :rm state_dependency_observation {state, from, relation, to} \
-             } \
-             { \
-                 live_state[state] := \
-                     *analysis_revision{view, revision}, \
-                     *analysis_revision_state{view, revision, state} \
-                 stale_state[state] := \
-                     *repository_state{fingerprint: state}, not live_state[state] \
-                 ?[state, from, relation, to] := \
-                     *state_observation_metadata{state, from, relation, to}, stale_state[state] \
-                 :rm state_observation_metadata {state, from, relation, to} \
-             } \
-             { \
-                 live_state[state] := \
-                     *analysis_revision{view, revision}, \
-                     *analysis_revision_state{view, revision, state} \
-                 ?[fingerprint] := *repository_state{fingerprint}, not live_state[fingerprint] \
-                 :rm repository_state {fingerprint} \
-             }",
-        BTreeMap::new(),
-        ScriptMutability::Mutable,
-    )?;
-
-    for (relation, keys) in [
-        ("analysis_revision_state", "view, revision, repository"),
-        ("analysis_revision_metadata", "view, revision"),
+    let stale_states = queued.rows.len().try_into()?;
+    let repositories = queued
+        .rows
+        .iter()
+        .map(|row| {
+            row[1]
+                .get_str()
+                .ok_or("stale repository state has a non-string repository")
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .len()
+        .try_into()?;
+    let state_steps = [
         (
+            "stale observations",
+            "?[state, from, relation, to] := \
+                 *state_observation{state: $state, from, relation, to}, state = $state",
+            "state_observation",
+            "state, from, relation, to",
+        ),
+        (
+            "stale entities",
+            "?[state, id] := *state_entity{state: $state, id}, state = $state",
+            "state_entity",
+            "state, id",
+        ),
+        (
+            "stale gRPC binding candidates",
+            "?[state, local_symbol, role, service, method, evidence] := \
+                 *state_grpc_binding_candidate{\
+                     state: $state, local_symbol, role, service, method, evidence\
+                 }, state = $state",
+            "state_grpc_binding_candidate",
+            "state, local_symbol, role, service, method, evidence",
+        ),
+        (
+            "stale dependency observations",
+            "?[state, from, relation, to] := \
+                 *state_dependency_observation{\
+                     state: $state, from, relation, to\
+                 }, state = $state",
+            "state_dependency_observation",
+            "state, from, relation, to",
+        ),
+        (
+            "stale observation metadata",
+            "?[state, from, relation, to] := \
+                 *state_observation_metadata{\
+                     state: $state, from, relation, to\
+                 }, state = $state",
+            "state_observation_metadata",
+            "state, from, relation, to",
+        ),
+    ];
+
+    let revision_steps = [
+        (
+            "superseded revision repository states",
+            "analysis_revision_state",
+            "view, revision, repository",
+        ),
+        (
+            "superseded revision metadata",
+            "analysis_revision_metadata",
+            "view, revision",
+        ),
+        (
+            "superseded revision diagnostics",
             "analysis_revision_diagnostic",
             "view, revision, repository, code, severity, path, line",
         ),
         (
+            "superseded revision dependency overrides",
             "analysis_revision_dependency_override",
             "view, revision, from, relation, unresolved_to",
         ),
         (
+            "superseded revision dependency override metadata",
             "analysis_revision_dependency_override_metadata",
             "view, revision, from, relation, unresolved_to",
         ),
         (
+            "superseded revision observations",
             "analysis_revision_observation",
             "view, revision, from, relation, to, evidence",
         ),
-        ("analysis_revision_entity", "view, revision, id"),
         (
+            "superseded revision entities",
+            "analysis_revision_entity",
+            "view, revision, id",
+        ),
+        (
+            "superseded revision gRPC diagnostics",
             "analysis_revision_grpc_diagnostic",
             "view, revision, local_symbol, role, service, method, evidence",
         ),
-    ] {
+    ];
+    let total_states = stale_states;
+    let mut states_resolved = 0;
+    for row in queued.rows {
+        let state = row[0]
+            .get_str()
+            .ok_or("garbage collection state has a non-string fingerprint")?;
+        let repository = row[1]
+            .get_str()
+            .ok_or("garbage collection state has a non-string repository")?;
+        for (step, select_script, relation, keys) in state_steps {
+            sweep_relation(
+                db,
+                progress,
+                RelationCleanup {
+                    step: format!("{step} from {repository} state {state}"),
+                    select_script: select_script.into(),
+                    relation,
+                    keys,
+                    parameters: BTreeMap::from([("state".into(), state.into())]),
+                    guard_repository_state: true,
+                    stale_states,
+                    repositories,
+                    completed_steps: states_resolved,
+                    total_steps: total_states,
+                },
+            )?;
+        }
         db.run_script(
-            &format!(
-                "?[{keys}] := \
-                     *{relation}{{{keys}}}, \
-                     *analysis_revision{{view, revision: current}}, \
-                     revision != current \
-                 :rm {relation} {{{keys}}}"
-            ),
-            BTreeMap::new(),
+            "?[state] := state = $state\n:rm garbage_collection_state {state}",
+            BTreeMap::from([("state".into(), state.into())]),
             ScriptMutability::Mutable,
         )?;
+        states_resolved += 1;
     }
-
-    let relations = db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
-    for legacy in ["observation", "dependency_observation"] {
-        if relations
-            .rows
-            .iter()
-            .any(|row| row[0].get_str() == Some(legacy))
-        {
-            db.run_script(
-                &format!("::remove {legacy}"),
-                BTreeMap::new(),
-                ScriptMutability::Mutable,
+    let current_revisions = db.run_script(
+        "?[view, revision] := *analysis_revision{view, revision}",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?;
+    let revision_steps_per_view: u32 = revision_steps.len().try_into()?;
+    let total_revision_steps = u32::try_from(current_revisions.rows.len())?
+        .checked_mul(revision_steps_per_view)
+        .ok_or("garbage collection revision step count overflow")?;
+    for (view_index, row) in current_revisions.rows.into_iter().enumerate() {
+        let view = row[0]
+            .get_str()
+            .ok_or("analysis revision has a non-string view")?;
+        let current = row[1].clone();
+        for (relation_index, (step, relation, keys)) in revision_steps.into_iter().enumerate() {
+            let completed_steps = u32::try_from(view_index)?
+                .checked_mul(revision_steps_per_view)
+                .and_then(|steps| steps.checked_add(u32::try_from(relation_index).ok()?))
+                .ok_or("garbage collection revision step count overflow")?;
+            sweep_relation(
+                db,
+                progress,
+                RelationCleanup {
+                    step: format!("{step} from {view}"),
+                    select_script: format!(
+                        "?[{keys}] := \
+                             *{relation}{{{keys}}}, \
+                             view = $view, revision < $current"
+                    ),
+                    relation,
+                    keys,
+                    parameters: BTreeMap::from([
+                        ("view".into(), view.into()),
+                        ("current".into(), current.clone()),
+                    ]),
+                    guard_repository_state: false,
+                    stale_states,
+                    repositories,
+                    completed_steps,
+                    total_steps: total_revision_steps,
+                },
             )?;
         }
     }
-
-    Ok(stale.rows.len().try_into()?)
+    Ok(states_resolved.into())
 }
 
 #[cfg(test)]

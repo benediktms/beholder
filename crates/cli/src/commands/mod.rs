@@ -124,7 +124,11 @@ enum CacheCommand {
     /// Clear in-memory and persistent analysis caches.
     Clear,
     /// Remove obsolete indexed states and reclaim database space.
-    Gc,
+    Gc {
+        /// Report the current background garbage-collection status.
+        #[arg(long)]
+        status: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -300,7 +304,15 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Cache {
-                command: CacheCommand::Gc
+                command: CacheCommand::Gc { status: false }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "cache", "gc", "--status"])
+                .unwrap()
+                .command,
+            Some(Command::Cache {
+                command: CacheCommand::Gc { status: true }
             })
         ));
         assert!(matches!(

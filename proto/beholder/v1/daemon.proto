@@ -4,7 +4,8 @@ package beholder.v1;
 
 service Daemon {
   rpc ClearCache(ClearCacheRequest) returns (ClearCacheResponse);
-  rpc GarbageCollect(GarbageCollectRequest) returns (GarbageCollectResponse);
+  rpc GarbageCollect(GarbageCollectRequest) returns (stream GarbageCollectEvent);
+  rpc GetGarbageCollectionStatus(GetGarbageCollectionStatusRequest) returns (GetGarbageCollectionStatusResponse);
   rpc Context(EntityRequest) returns (ContextResponse);
   rpc Dependencies(TraversalEntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
@@ -23,10 +24,40 @@ message ClearCacheResponse {}
 
 message GarbageCollectRequest {}
 
+message GarbageCollectEvent {
+  oneof event {
+    GarbageCollectProgress progress = 1;
+    GarbageCollectResponse completed = 2;
+  }
+}
+
+message GarbageCollectProgress {
+  GarbageCollectPhase phase = 1;
+  string step = 2;
+  uint32 completed_steps = 3;
+  uint32 total_steps = 4;
+  optional uint64 rows = 5;
+  optional uint64 completed_rows = 6;
+  optional uint32 stale_states = 7;
+  optional uint32 repositories = 8;
+}
+
+enum GarbageCollectPhase {
+  GARBAGE_COLLECT_PHASE_UNSPECIFIED = 0;
+  GARBAGE_COLLECT_PHASE_CLAIMING_OBSOLETE_STATES = 1;
+  GARBAGE_COLLECT_PHASE_SWEEPING_OBSOLETE_STATES = 2;
+}
+
 message GarbageCollectResponse {
-  uint64 repository_states_removed = 1;
-  uint64 bytes_before = 2;
-  uint64 bytes_after = 3;
+  uint64 repository_states_queued = 1;
+}
+
+message GetGarbageCollectionStatusRequest {}
+
+message GetGarbageCollectionStatusResponse {
+  bool running = 1;
+  uint64 repository_states_queued = 2;
+  optional GarbageCollectProgress progress = 3;
 }
 
 message EntityRequest {

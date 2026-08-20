@@ -3,6 +3,9 @@ use std::{error::Error, fmt};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeholderErrorCode {
     DaemonUnavailable,
+    GarbageCollectionFailed,
+    GarbageCollectionWorkerFailed,
+    SchedulerUnavailable,
     SourceRecoveryUnsafe,
     TransportGrpc,
     WorkspaceIndexFailed,
@@ -16,6 +19,9 @@ impl BeholderErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DaemonUnavailable => "beholder.daemon.unavailable",
+            Self::GarbageCollectionFailed => "beholder.garbage_collection.failed",
+            Self::GarbageCollectionWorkerFailed => "beholder.garbage_collection.worker_failed",
+            Self::SchedulerUnavailable => "beholder.scheduler.unavailable",
             Self::SourceRecoveryUnsafe => "beholder.source.recovery_unsafe",
             Self::TransportGrpc => "beholder.transport.grpc",
             Self::WorkspaceIndexFailed => "beholder.workspace.index_failed",
@@ -35,6 +41,9 @@ impl std::str::FromStr for BeholderErrorCode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "beholder.daemon.unavailable" => Ok(Self::DaemonUnavailable),
+            "beholder.garbage_collection.failed" => Ok(Self::GarbageCollectionFailed),
+            "beholder.garbage_collection.worker_failed" => Ok(Self::GarbageCollectionWorkerFailed),
+            "beholder.scheduler.unavailable" => Ok(Self::SchedulerUnavailable),
             "beholder.source.recovery_unsafe" => Ok(Self::SourceRecoveryUnsafe),
             "beholder.transport.grpc" => Ok(Self::TransportGrpc),
             "beholder.workspace.index_failed" => Ok(Self::WorkspaceIndexFailed),
@@ -180,6 +189,9 @@ mod tests {
     fn exposes_stable_public_diagnostics_without_printing_internal_causes() {
         for code in [
             BeholderErrorCode::DaemonUnavailable,
+            BeholderErrorCode::GarbageCollectionFailed,
+            BeholderErrorCode::GarbageCollectionWorkerFailed,
+            BeholderErrorCode::SchedulerUnavailable,
             BeholderErrorCode::SourceRecoveryUnsafe,
             BeholderErrorCode::TransportGrpc,
             BeholderErrorCode::WorkspaceIndexFailed,

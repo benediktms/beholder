@@ -67,8 +67,10 @@ use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, RepositoryFacts, RepositoryState, SourceAnalysisError,
 };
-use beholder_domain::{Workspace, WorkspaceView};
-use beholder_dto::{Freshness, GarbageCollection, QueryMetadata};
+use beholder_domain::{
+    BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace, WorkspaceView,
+};
+use beholder_dto::{Freshness, QueryMetadata};
 use beholder_indexing::{CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot};
 #[cfg(test)]
 use beholder_indexing::{IndexerBuilder, WorkspaceAnalyzer};
@@ -237,10 +239,18 @@ fn erase_error(error: Box<dyn Error + Send + Sync>) -> Box<dyn Error> {
     error
 }
 
+fn scheduler_unavailable() -> BeholderError {
+    BeholderError::new(
+        BeholderErrorKind::Internal,
+        BeholderErrorCode::SchedulerUnavailable,
+        "index scheduler is unavailable",
+    )
+}
+
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
-    active_workspace: Mutex<Option<String>>,
+    active_operation: Mutex<Option<String>>,
     idle: Condvar,
     changed: Notify,
     shutdown: Notify,
@@ -268,8 +278,10 @@ enum DirtyRepository {
     Sources(BTreeSet<PathBuf>),
 }
 
-struct ActiveIndex<'a> {
-    active_workspace: &'a Mutex<Option<String>>,
+struct ActiveOperation<'a> {
+    operation: String,
+    started: Instant,
+    active_operation: &'a Mutex<Option<String>>,
     idle: &'a Condvar,
 }
 
@@ -290,12 +302,17 @@ struct RepositoryAnalysisSources<'a> {
     descriptors: &'a [(PathBuf, Vec<u8>)],
 }
 
-impl Drop for ActiveIndex<'_> {
+impl Drop for ActiveOperation<'_> {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.active_workspace.lock() {
+        if let Ok(mut active) = self.active_operation.lock() {
             *active = None;
             self.idle.notify_all();
         }
+        tracing::info!(
+            operation = self.operation,
+            elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            "scheduler operation finished"
+        );
     }
 }
 
@@ -304,7 +321,7 @@ impl IndexScheduler {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
-            active_workspace: Mutex::new(None),
+            active_operation: Mutex::new(None),
             idle: Condvar::new(),
             changed: Notify::new(),
             shutdown: Notify::new(),
@@ -362,7 +379,7 @@ impl IndexScheduler {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
-            active_workspace: Mutex::new(None),
+            active_operation: Mutex::new(None),
             idle: Condvar::new(),
             changed: Notify::new(),
             shutdown: Notify::new(),
@@ -418,7 +435,7 @@ impl IndexScheduler {
             })
             .unwrap_or_default();
         let indexing = self
-            .active_workspace
+            .active_operation
             .lock()
             .is_ok_and(|active| active.as_deref() == Some(workspace));
         QueryMetadata {
@@ -461,14 +478,6 @@ impl IndexScheduler {
         Ok(())
     }
 
-    pub fn garbage_collect(
-        &self,
-        store: &SemanticStore,
-    ) -> Result<GarbageCollection, Box<dyn Error>> {
-        let _active = self.begin("garbage collection")?;
-        store.garbage_collect()
-    }
-
     #[tracing::instrument(name = "index.workspace", skip(self, store), err, fields(workspace = %workspace.name))]
     pub fn index(
         &self,
@@ -503,20 +512,24 @@ impl IndexScheduler {
         index_workspace(self, store, workspace, dirty.as_ref())
     }
 
-    fn begin(&self, workspace: &str) -> Result<ActiveIndex<'_>, Box<dyn Error>> {
+    fn begin(&self, operation: &str) -> Result<ActiveOperation<'_>, BeholderError> {
         let mut active = self
-            .active_workspace
+            .active_operation
             .lock()
-            .map_err(|_| "active workspace lock poisoned")?;
-        while active.is_some() {
+            .map_err(|_| scheduler_unavailable())?;
+        while let Some(active_operation) = active.as_deref() {
+            tracing::info!(operation, active_operation, "scheduler operation waiting");
             active = self
                 .idle
                 .wait(active)
-                .map_err(|_| "active workspace lock poisoned")?;
+                .map_err(|_| scheduler_unavailable())?;
         }
-        *active = Some(workspace.into());
-        Ok(ActiveIndex {
-            active_workspace: &self.active_workspace,
+        *active = Some(operation.into());
+        tracing::info!(operation, "scheduler operation started");
+        Ok(ActiveOperation {
+            operation: operation.into(),
+            started: Instant::now(),
+            active_operation: &self.active_operation,
             idle: &self.idle,
         })
     }
@@ -627,9 +640,10 @@ impl IndexScheduler {
             .name("beholder-checkpoint".into())
             .spawn(move || {
                 let started = std::time::Instant::now();
-                let result = scheduler
-                    .begin("checkpoint")
-                    .and_then(|_active| store.checkpoint());
+                let result = match scheduler.begin("checkpoint") {
+                    Ok(_active) => store.checkpoint(),
+                    Err(error) => Err(Box::new(error) as Box<dyn Error>),
+                };
                 drop(store);
                 scheduler.checkpointing.store(false, Ordering::Release);
                 match result {
@@ -2874,7 +2888,7 @@ mod tests {
         assert!(!pending.freshness.indexing);
         assert_eq!(pending.freshness.dirty_repositories, ["repo"]);
 
-        *scheduler.active_workspace.lock().unwrap() = Some("main".into());
+        *scheduler.active_operation.lock().unwrap() = Some("main".into());
         assert!(
             scheduler
                 .query_metadata("main", 4, Default::default())
@@ -2887,7 +2901,7 @@ mod tests {
                 .freshness
                 .indexing
         );
-        *scheduler.active_workspace.lock().unwrap() = None;
+        *scheduler.active_operation.lock().unwrap() = None;
 
         let indexed_generation = scheduler.generations.lock().unwrap()["main"];
         scheduler.mark(&workspace);
@@ -2991,20 +3005,38 @@ mod tests {
     fn concurrent_index_claims_wait_for_the_active_job() {
         let scheduler = Arc::new(IndexScheduler::new(PathBuf::new()));
         let active = scheduler.begin("first").unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
         let waiting = scheduler.clone();
         let thread = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
             let _active = waiting.begin("second").unwrap();
             claimed_tx.send(()).unwrap();
         });
 
-        ready_rx.recv().unwrap();
         assert!(claimed_rx.recv_timeout(Duration::from_millis(25)).is_err());
         drop(active);
         claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn scheduler_lock_failure_returns_a_typed_error() {
+        let scheduler = Arc::new(IndexScheduler::new(PathBuf::new()));
+        let poisoned = scheduler.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _active = poisoned.active_operation.lock().unwrap();
+                panic!("poison scheduler lock");
+            })
+            .join()
+            .is_err()
+        );
+
+        let error = match scheduler.begin("garbage collection") {
+            Ok(_) => panic!("poisoned scheduler lock should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), BeholderErrorKind::Internal);
+        assert_eq!(error.code(), BeholderErrorCode::SchedulerUnavailable);
     }
 
     #[test]
