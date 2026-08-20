@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/beholder-logo.jpg" alt="Beholder — architecture intelligence for code" width="320" />
+  <img src="docs/assets/beholder-logo.png" alt="Beholder — architecture intelligence for code" width="320" />
 </p>
 
 <h1 align="center">Beholder</h1>
