@@ -48,14 +48,8 @@ alias f := format
 [group('install')]
 [unix]
 install:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ -z "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
-        && -z "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}" \
-        && -z "${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:-}" ]]; then
-        export OTEL_EXPORTER_OTLP_ENDPOINT='http://localhost:4318'
-    fi
-    export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-beholderd}"
+    OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}" \
+    OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-beholderd}" \
     moon run beholder:install
 
 # Unload the user daemon and remove both ~/.local/bin links.
