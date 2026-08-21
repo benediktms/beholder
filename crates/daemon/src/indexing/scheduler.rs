@@ -559,6 +559,15 @@ impl IndexScheduler {
         })
     }
 
+    pub(super) fn run_exclusive<T>(
+        &self,
+        operation: &str,
+        task: impl FnOnce() -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        let _active = self.begin(operation)?;
+        task()
+    }
+
     fn complete_generation(&self, workspace: &str, indexed: Option<u64>) {
         let Ok(mut generations) = self.generations.lock() else {
             return;

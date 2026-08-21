@@ -1,10 +1,9 @@
 use super::schema::*;
 use super::store::EnrichmentPayload;
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, DependencyRelation, EntityFact, EntityKind,
-    EntityMetadata, FactChanges, GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate,
-    GrpcBindingRole, Observation, ProtoTypeKind, RepositoryFacts, RpcCardinality, SemanticRelation,
-    WorkspaceView,
+    DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
+    GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, Observation,
+    ProtoTypeKind, RepositoryFacts, RpcCardinality, SemanticRelation, WorkspaceView,
 };
 use beholder_dto::{GarbageCollectionPhase, GarbageCollectionProgress};
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
@@ -2656,7 +2655,7 @@ mod tests {
             .db
             .run_script(
                 "?[id] := *analysis_revision{view: $view, revision}, \
-                     *analysis_revision_entity{view: $view, revision, id: $id}",
+                     *analysis_revision_entity{view: $view, revision, id}, id = $id",
                 BTreeMap::from([
                     ("view".into(), "elixir-enriched".into()),
                     ("id".into(), generated.into()),

@@ -7,6 +7,8 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @default_timeout_ms 300_000
   @default_max_output_bytes 1_048_576
   @termination_grace_ms 1_000
+  @process_group_pid_retries 100
+  @process_group_pid_retry_ms 10
 
   @type result :: %{
           status: :ok | :error,
@@ -140,7 +142,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   end
 
   defp run_command(mix, arguments, directory, env, timeout_ms, max_output_bytes) do
-    {executable, arguments, process_group?} = isolated_command(mix, arguments)
+    {executable, arguments, group_file} = isolated_command(mix, arguments)
 
     port =
       Port.open(
@@ -159,20 +161,47 @@ defmodule Beholder.Worker.Elixir.Compiler do
       )
 
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    collect_output(port, deadline, timeout_ms, max_output_bytes, {<<>>, false}, process_group?)
+    target = process_target(port, group_file)
+    collect_output(port, deadline, timeout_ms, max_output_bytes, {<<>>, false}, target)
   rescue
     error in [ArgumentError, ErlangError] ->
       {:error, "failed to start Mix compiler process: #{Exception.message(error)}"}
   end
 
   defp isolated_command(mix, arguments) do
-    case System.find_executable("setsid") do
-      nil -> {mix, arguments, false}
-      setsid -> {setsid, [mix | arguments], true}
+    with setsid when not is_nil(setsid) <- System.find_executable("setsid"),
+         shell when not is_nil(shell) <- System.find_executable("sh") do
+      group_file =
+        Path.join(
+          System.tmp_dir!(),
+          "beholder-elixir-process-group-#{System.pid()}-#{System.unique_integer([:positive])}.pid"
+        )
+
+      # setsid may fork when its caller is already a process-group leader, so
+      # the Port PID is not always the group that owns Mix and its children.
+      script = ~S(group_file=$1; shift; printf '%s' "$$" > "$group_file"; exec "$@")
+
+      {setsid,
+       ["--wait", shell, "-c", script, "beholder-process-group", group_file, mix | arguments],
+       group_file}
+    else
+      _missing_executable -> {mix, arguments, nil}
     end
   end
 
-  defp collect_output(port, deadline, timeout_ms, max_output_bytes, output, process_group?) do
+  defp process_target(port, nil) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} -> {:process, pid}
+      nil -> nil
+    end
+  end
+
+  defp process_target(port, group_file) do
+    fallback = process_target(port, nil)
+    {:group_file, group_file, fallback}
+  end
+
+  defp collect_output(port, deadline, timeout_ms, max_output_bytes, output, target) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
@@ -183,24 +212,28 @@ defmodule Beholder.Worker.Elixir.Compiler do
           timeout_ms,
           max_output_bytes,
           append_output(output, data, max_output_bytes),
-          process_group?
+          target
         )
 
       {^port, {:exit_status, status}} ->
+        cleanup_target(target)
         {:ok, render_output(output), status}
     after
       remaining ->
-        terminate(port, process_group?)
+        terminate(port, target)
         {:error, :timeout, render_output(output), timeout_ms}
     end
   end
 
-  defp terminate(port, process_group?) do
-    os_pid = Port.info(port, :os_pid)
+  defp terminate(port, unresolved_target) do
+    target = resolve_target(unresolved_target)
 
-    case os_pid do
-      {:os_pid, pid} ->
-        signal(pid, "TERM", process_group?)
+    case target do
+      nil ->
+        :ok
+
+      target ->
+        signal(target, "TERM")
 
         receive do
           {^port, {:exit_status, _status}} -> :ok
@@ -211,30 +244,61 @@ defmodule Beholder.Worker.Elixir.Compiler do
         # The direct process can exit before all of its descendants. Signal the
         # group again after it exits or the grace period expires so no compiler
         # children survive a timed-out enrichment.
-        signal(pid, "KILL", process_group?)
+        signal(target, "KILL")
 
         receive do
           {^port, {:exit_status, _status}} -> :ok
         after
           @termination_grace_ms -> :ok
         end
-
-      nil ->
-        :ok
     end
 
+    cleanup_target(unresolved_target)
     if Port.info(port), do: Port.close(port)
   rescue
     ArgumentError -> :ok
   end
 
-  defp signal(pid, signal, process_group?) do
+  defp resolve_target({:group_file, group_file, fallback}) do
+    case read_process_group_pid(group_file, @process_group_pid_retries) do
+      {:ok, pid} -> {:group, pid}
+      :error -> fallback
+    end
+  end
+
+  defp resolve_target(target), do: target
+
+  defp read_process_group_pid(_group_file, 0), do: :error
+
+  defp read_process_group_pid(group_file, retries) do
+    result =
+      with {:ok, contents} <- File.read(group_file),
+           {pid, ""} when pid > 0 <- Integer.parse(String.trim(contents)) do
+        {:ok, pid}
+      else
+        _unavailable_or_invalid -> :error
+      end
+
+    case result do
+      {:ok, _pid} = result ->
+        result
+
+      :error ->
+        Process.sleep(@process_group_pid_retry_ms)
+        read_process_group_pid(group_file, retries - 1)
+    end
+  end
+
+  defp cleanup_target({:group_file, group_file, _fallback}), do: File.rm(group_file)
+  defp cleanup_target(_target), do: :ok
+
+  defp signal({kind, pid}, signal) do
     case System.find_executable("kill") do
       nil ->
         :ok
 
       kill ->
-        target = if process_group?, do: "-#{pid}", else: Integer.to_string(pid)
+        target = if kind == :group, do: "-#{pid}", else: Integer.to_string(pid)
         System.cmd(kill, ["-#{signal}", "--", target], stderr_to_stdout: true)
         :ok
     end

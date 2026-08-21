@@ -41,6 +41,7 @@ impl Daemon for BeholderDaemon {
         _request: Request<GarbageCollectRequest>,
     ) -> Result<Response<Self::GarbageCollectStream>, Status> {
         let store = self.store.clone();
+        let scheduler = self.scheduler.clone();
         let garbage_collector_running = self.garbage_collector_running.clone();
         let garbage_collection_progress = self.garbage_collection_progress.clone();
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -87,6 +88,7 @@ impl Daemon for BeholderDaemon {
                 Ok(Ok(collected)) => {
                     if let Err(source) = start_garbage_collector(
                         store,
+                        scheduler,
                         garbage_collector_running,
                         garbage_collection_progress,
                     ) {

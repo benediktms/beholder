@@ -54,6 +54,7 @@ pub(super) fn build(
     let garbage_collection_progress = Arc::new(Mutex::new(None));
     start_garbage_collector(
         store.clone(),
+        scheduler.clone(),
         garbage_collector_running.clone(),
         garbage_collection_progress.clone(),
     )?;
@@ -74,6 +75,7 @@ pub(super) fn build(
 
 pub(super) fn start_garbage_collector(
     store: Arc<SemanticStore>,
+    scheduler: Arc<IndexScheduler>,
     running: Arc<AtomicBool>,
     progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
 ) -> Result<(), Box<dyn Error>> {
@@ -87,6 +89,7 @@ pub(super) fn start_garbage_collector(
         return Ok(());
     }
     let restart_store = store.clone();
+    let restart_scheduler = scheduler.clone();
     let restart_running = running.clone();
     let restart_progress = progress.clone();
     let worker_running = running.clone();
@@ -98,16 +101,18 @@ pub(super) fn start_garbage_collector(
                     GarbageCollectionPhase::SweepingObsoleteStates,
                 ));
             }
-            let result = store.sweep_garbage_collection(|update| {
-                if let Ok(mut current) = progress.lock() {
-                    *current = Some(update.clone());
-                }
-                tracing::info!(
-                    step = update.step,
-                    completed_rows = update.completed_rows,
-                    rows = update.rows,
-                    "semantic store garbage collection progress"
-                );
+            let result = scheduler.run_exclusive("garbage collection", || {
+                store.sweep_garbage_collection(|update| {
+                    if let Ok(mut current) = progress.lock() {
+                        *current = Some(update.clone());
+                    }
+                    tracing::info!(
+                        step = update.step,
+                        completed_rows = update.completed_rows,
+                        rows = update.rows,
+                        "semantic store garbage collection progress"
+                    );
+                })
             });
             let pending = restart_store.garbage_collection_pending().unwrap_or(false);
             match result {
@@ -126,7 +131,12 @@ pub(super) fn start_garbage_collector(
                 *current = None;
             }
             if pending {
-                let _ = start_garbage_collector(restart_store, restart_running, restart_progress);
+                let _ = start_garbage_collector(
+                    restart_store,
+                    restart_scheduler,
+                    restart_running,
+                    restart_progress,
+                );
             }
         });
     if let Err(error) = spawn {
