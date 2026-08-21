@@ -1,13 +1,19 @@
 use crate::{
     CsharpAnalysis, CsharpProject, CsharpSource, FRONTEND_VERSION, RESOLVER_VERSION, UnityPrefab,
     analyze, diagnostics_from_analysis, entities_from_analysis, observations_from_analysis,
-    parse_project, parse_unity_assemblies, parse_unity_meta, parse_unity_prefab,
-    resolve_repository_calls, source_assemblies, unity_lifecycle, unity_prefab_dependencies,
+    parse_project, parse_unity_assemblies, parse_unity_meta, parse_unity_prefab, source_assemblies,
+    unity_lifecycle, unity_prefab_dependencies,
+};
+use crate::{
+    model::{CsharpRepository, CsharpRepositorySource},
+    plugin::{CsharpLanguage, built_in_plugins},
+    resolution::resolve_language_calls,
 };
 use beholder_domain::{AnalysisDiagnostic, AnalysisDiagnosticSeverity, SourceAnalysisError};
 use beholder_indexing::{
     AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+    LanguageAnalyzer, RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer,
+    WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -33,6 +39,7 @@ enum CacheStatus {
 pub struct CsharpAnalyzer {
     cache_dir: PathBuf,
     cache: Mutex<BTreeMap<CacheKey, Arc<CsharpAnalysis>>>,
+    plugins: LanguageAnalyzer<CsharpLanguage>,
 }
 
 impl CsharpAnalyzer {
@@ -40,6 +47,7 @@ impl CsharpAnalyzer {
         Self {
             cache_dir: cache_dir.join("csharp").join(FRONTEND_VERSION),
             cache: Mutex::new(BTreeMap::new()),
+            plugins: built_in_plugins().expect("built-in C# plugins should compose"),
         }
     }
 
@@ -84,7 +92,10 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
     fn metadata(&self) -> AnalyzerMetadata {
         AnalyzerMetadata {
             id: "csharp".into(),
-            version: format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}"),
+            version: format!(
+                "{FRONTEND_VERSION}:{RESOLVER_VERSION}:{}",
+                self.plugins.identity()
+            ),
         }
     }
 
@@ -184,6 +195,7 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                         .is_some_and(|extension| extension == "cs")
                 })
                 .collect::<Vec<_>>();
+            let active_plugins = self.plugins.activate(repository, !sources.is_empty());
             let analyzed = sources
                 .par_iter()
                 .map(|input| {
@@ -276,11 +288,34 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                 observations.extend(prefab_observations);
                 diagnostics.extend(prefab_diagnostics);
             }
-            observations.extend(resolve_repository_calls(
+            observations.extend(resolve_language_calls(
                 &repository.state.repository.identity,
                 &projects,
                 &source_refs,
             ));
+            let typed_repository = CsharpRepository {
+                repository: repository.state.repository.identity.clone(),
+                projects: projects.clone(),
+                sources: analyzed_assemblies
+                    .iter()
+                    .map(|(path, assembly, analysis)| CsharpRepositorySource {
+                        path: path.clone(),
+                        assembly: assembly.clone(),
+                        analysis: analysis.as_ref().clone(),
+                    })
+                    .collect(),
+            };
+            let enrichment = self.plugins.enrich(
+                &typed_repository,
+                RepositoryFactsView {
+                    entities: &entities,
+                    observations: &observations,
+                },
+                &active_plugins,
+            )?;
+            entities.extend(enrichment.entities);
+            observations.extend(enrichment.observations);
+            diagnostics.extend(enrichment.diagnostics);
             let completeness = if diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"))
@@ -293,7 +328,7 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                 repository: repository.state.repository.identity.clone(),
                 completeness,
                 entities,
-                grpc_bindings: Vec::new(),
+                grpc_bindings: enrichment.grpc_bindings,
                 observations,
                 diagnostics,
             });

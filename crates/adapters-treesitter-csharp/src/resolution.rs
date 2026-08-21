@@ -1,10 +1,14 @@
 use super::{
     analysis::source_stem,
-    dotnet_di,
-    model::{Call, CallKind, CsharpAnalysis, Definition, DefinitionKind},
+    model::{
+        Call, CallKind, CsharpAnalysis, CsharpRepository, CsharpRepositorySource, Definition,
+        DefinitionKind,
+    },
+    plugin::built_in_plugins,
     project::{CsharpProject, assembly_visibility},
 };
 use beholder_domain::{DependencyRelation, Observation};
+use beholder_indexing::RepositoryFactsView;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -31,7 +35,7 @@ fn callable_name(definition: &Definition) -> &str {
         .unwrap_or_default()
 }
 
-fn type_name(definition: &Definition) -> &str {
+pub(super) fn type_name(definition: &Definition) -> &str {
     definition
         .qualified_name
         .rsplit('/')
@@ -39,7 +43,7 @@ fn type_name(definition: &Definition) -> &str {
         .unwrap_or(&definition.qualified_name)
 }
 
-fn simple_type_name(name: &str) -> &str {
+pub(super) fn simple_type_name(name: &str) -> &str {
     name.trim_end_matches('?')
         .rsplit('.')
         .next()
@@ -213,7 +217,7 @@ fn target_matches(
     owner_matches && call_is_applicable(target, call)
 }
 
-fn id(repository: &str, source: &CsharpSource<'_>, definition: &Definition) -> String {
+pub(super) fn id(repository: &str, source: &CsharpSource<'_>, definition: &Definition) -> String {
     format!(
         "repo://{repository}/csharp/{}/{}/{}",
         source.assembly,
@@ -222,7 +226,7 @@ fn id(repository: &str, source: &CsharpSource<'_>, definition: &Definition) -> S
     )
 }
 
-pub fn resolve_repository_calls(
+pub(super) fn resolve_language_calls(
     repository: &str,
     projects: &[CsharpProject],
     sources: &[CsharpSource<'_>],
@@ -337,55 +341,43 @@ pub fn resolve_repository_calls(
                         returned_types.insert(&call.expression, return_type);
                     }
                 }
-                let Some(registration) = dotnet_di::registration(caller, call) else {
-                    continue;
-                };
-                let resolve_type = |name: &str| {
-                    types
-                        .get(simple_type_name(name))
-                        .into_iter()
-                        .flatten()
-                        .filter(|(candidate, _)| visible.contains(candidate.assembly))
-                        .copied()
-                        .map(|candidate| {
-                            (
-                                (
-                                    candidate.0.assembly,
-                                    candidate.0.path,
-                                    candidate.1.qualified_name.as_str(),
-                                ),
-                                candidate,
-                            )
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                        .into_values()
-                        .collect::<Vec<_>>()
-                };
-                let (service, implementation) = (
-                    resolve_type(registration.service),
-                    resolve_type(registration.implementation),
-                );
-                let ([(service_source, service)], [(implementation_source, implementation)]) =
-                    (service.as_slice(), implementation.as_slice())
-                else {
-                    continue;
-                };
-                let evidence = format!("{}:{}", source.path.display(), call.line);
-                observations.push(Observation::dependency(
-                    id(repository, service_source, service),
-                    DependencyRelation::ResolvedBy,
-                    id(repository, implementation_source, implementation),
-                    evidence.clone(),
-                ));
-                observations.push(Observation::dependency(
-                    id(repository, source, caller),
-                    DependencyRelation::Selects,
-                    id(repository, implementation_source, implementation),
-                    evidence,
-                ));
             }
         }
     }
+    observations
+}
+
+pub fn resolve_repository_calls(
+    repository: &str,
+    projects: &[CsharpProject],
+    sources: &[CsharpSource<'_>],
+) -> Vec<Observation> {
+    let mut observations = resolve_language_calls(repository, projects, sources);
+    let typed_repository = CsharpRepository {
+        repository: repository.to_owned(),
+        projects: projects.to_vec(),
+        sources: sources
+            .iter()
+            .map(|source| CsharpRepositorySource {
+                path: source.path.to_path_buf(),
+                assembly: source.assembly.to_owned(),
+                analysis: source.analysis.clone(),
+            })
+            .collect(),
+    };
+    let plugins = built_in_plugins().expect("built-in C# plugins should compose");
+    let active = plugins.activate_direct(Path::new("input.csproj"));
+    let enrichment = plugins
+        .enrich(
+            &typed_repository,
+            RepositoryFactsView {
+                entities: &[],
+                observations: &observations,
+            },
+            &active,
+        )
+        .expect("built-in C# plugins should enrich direct repository analysis");
+    observations.extend(enrichment.observations);
     observations
 }
 
