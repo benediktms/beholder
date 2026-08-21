@@ -559,7 +559,7 @@ impl IndexScheduler {
         })
     }
 
-    pub(super) fn run_exclusive<T>(
+    pub(crate) fn run_exclusive<T>(
         &self,
         operation: &str,
         task: impl FnOnce() -> Result<T, Box<dyn Error>>,
