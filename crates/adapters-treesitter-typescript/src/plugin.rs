@@ -1,6 +1,6 @@
 use super::{
-    SourceLanguage, TypescriptRepository, graphql, model::TypescriptAnalysis, nestjs, nestjs_di,
-    ts_proto,
+    SourceLanguage, TypescriptRepository, analysis::recover_syntax, graphql,
+    model::TypescriptAnalysis, nestjs, nestjs_di, ts_proto,
 };
 use beholder_indexing::{
     AnalyzerError, AnalyzerLanguage, LanguageAnalyzer, LanguageAnalyzerBuilder, Plugin,
@@ -126,16 +126,8 @@ impl SourceRecognizer<TypescriptLanguage> for NestjsPlugin {
         input: SourceRecognitionInput<'_, TypescriptLanguage>,
         analysis: &mut TypescriptAnalysis,
     ) -> Result<(), AnalyzerError> {
-        let root = input.syntax.root_node();
-        let roots = if analysis.parse_error_lines.is_empty() {
-            vec![root]
-        } else {
-            let mut cursor = root.walk();
-            root.named_children(&mut cursor)
-                .filter(|child| !child.has_error())
-                .collect()
-        };
-        for root in roots {
+        let recovery = recover_syntax(input.syntax.root_node(), input.text.as_bytes())?;
+        for root in recovery.roots {
             let (modules, providers) = nestjs_di::extract(root, input.text.as_bytes());
             analysis.nest_modules.extend(modules);
             analysis.nest_providers.extend(providers);

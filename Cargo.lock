@@ -337,9 +337,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "beholder-adapters-treesitter"
+version = "0.1.0"
+dependencies = [
+ "tree-sitter",
+]
+
+[[package]]
 name = "beholder-adapters-treesitter-csharp"
 version = "0.1.0"
 dependencies = [
+ "beholder-adapters-treesitter",
  "beholder-domain",
  "beholder-indexing",
  "quick-xml",
@@ -355,6 +363,7 @@ dependencies = [
 name = "beholder-adapters-treesitter-elixir"
 version = "0.1.0"
 dependencies = [
+ "beholder-adapters-treesitter",
  "beholder-domain",
  "beholder-indexing",
  "rayon",
@@ -369,6 +378,7 @@ dependencies = [
 name = "beholder-adapters-treesitter-rust"
 version = "0.1.0"
 dependencies = [
+ "beholder-adapters-treesitter",
  "beholder-domain",
  "beholder-indexing",
  "ra_ap_syntax",
@@ -386,6 +396,7 @@ name = "beholder-adapters-treesitter-typescript"
 version = "0.1.0"
 dependencies = [
  "beholder-adapters-graphql",
+ "beholder-adapters-treesitter",
  "beholder-domain",
  "beholder-indexing",
  "jsonc-parser",

@@ -12,6 +12,7 @@ members = [
     "crates/adapters-graphql",
     "crates/adapters-protobuf",
     "crates/adapters-git",
+    "crates/adapters-treesitter",
     "crates/adapters-treesitter-elixir",
     "crates/adapters-treesitter-rust",
     "crates/adapters-treesitter-csharp",
@@ -34,6 +35,7 @@ beholder-adapters-graphql = { path = "crates/adapters-graphql" }
 beholder-adapters-mnestic = { path = "crates/adapters-mnestic", default-features = false }
 beholder-adapters-git = { path = "crates/adapters-git" }
 beholder-adapters-protobuf = { path = "crates/adapters-protobuf" }
+beholder-adapters-treesitter = { path = "crates/adapters-treesitter" }
 beholder-adapters-treesitter-elixir = { path = "crates/adapters-treesitter-elixir" }
 beholder-adapters-treesitter-rust = { path = "crates/adapters-treesitter-rust" }
 beholder-adapters-treesitter-csharp = { path = "crates/adapters-treesitter-csharp" }

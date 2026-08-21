@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 beholder-adapters-graphql.workspace = true
+beholder-adapters-treesitter.workspace = true
 beholder-domain.workspace = true
 beholder-indexing.workspace = true
 jsonc-parser.workspace = true

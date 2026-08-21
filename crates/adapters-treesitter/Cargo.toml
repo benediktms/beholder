@@ -1,0 +1,7 @@
+[package]
+name = "beholder-adapters-treesitter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tree-sitter = "0.26.12"
