@@ -184,8 +184,10 @@ mod tests {
             ("apps/api/mix.exs", "defp deps, do: [{ :grpc, \"~> 1.0\" }]"),
         ]);
 
-        let active = built_in_plugins().unwrap().activate(&repository, true);
-        assert_eq!(active.identity(), "elixir.grpc-elixir:1");
+        let plugins = built_in_plugins().unwrap();
+        let active = plugins.activate(&repository, true);
+        assert_eq!(active.identity(), "18:elixir.grpc-elixir1:1");
+        assert_eq!(plugins.source_identity(&active), "18:elixir.grpc-elixir1:1");
         let plugin = active.plugins().next().unwrap();
         assert_eq!(plugin.activation.path, Path::new("apps/api/mix.exs"));
         assert_eq!(
@@ -202,7 +204,7 @@ mod tests {
         )]);
 
         let active = built_in_plugins().unwrap().activate(&repository, true);
-        assert_eq!(active.identity(), "elixir.grpc-elixir:1");
+        assert_eq!(active.identity(), "18:elixir.grpc-elixir1:1");
         assert_eq!(
             active.plugins().next().unwrap().activation.reason,
             "Elixir source uses grpc-elixir"

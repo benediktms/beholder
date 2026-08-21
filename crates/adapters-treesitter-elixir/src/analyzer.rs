@@ -11,8 +11,8 @@ use crate::{
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
     ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
-    CacheStatistics, GraphqlResolverCandidate, LanguageAnalyzer, RepositoryContribution,
-    RepositoryFactsView, WorkspaceAnalyzer, WorkspaceSnapshot,
+    AnalyzerPlan, CacheStatistics, GraphqlResolverCandidate, LanguageAnalyzer,
+    RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -53,10 +53,18 @@ impl ElixirAnalyzer {
         path: &Path,
         source: &str,
         active_plugins: &ActivePlugins,
+        source_plugins: &str,
     ) -> Result<(Arc<ElixirAnalysis>, CacheStatus), AnalyzerError> {
         let mut digest = Sha256::new();
-        digest.update(source.as_bytes());
-        digest.update(active_plugins.identity().as_bytes());
+        for part in [
+            FRONTEND_VERSION.as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
+            source.as_bytes(),
+            source_plugins.as_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
         let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
@@ -100,12 +108,11 @@ impl ElixirAnalyzer {
 
 impl WorkspaceAnalyzer for ElixirAnalyzer {
     fn metadata(&self) -> AnalyzerMetadata {
+        let base = format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}");
+        let plugins = self.plugins.identity();
         AnalyzerMetadata {
             id: "elixir".into(),
-            version: format!(
-                "{FRONTEND_VERSION}:{RESOLVER_VERSION}:{}",
-                self.plugins.identity()
-            ),
+            version: format!("{}:{base}{}:{plugins}", base.len(), plugins.len()),
         }
     }
 
@@ -114,10 +121,37 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
             .is_some_and(|extension| matches!(extension.to_str(), Some("ex" | "exs")))
     }
 
-    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+    fn prepare(&self, snapshot: &WorkspaceSnapshot) -> AnalyzerPlan {
+        let analyzer = AnalyzerMetadata {
+            id: "elixir".into(),
+            version: format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}"),
+        };
+        AnalyzerPlan::from_repositories(
+            self.metadata(),
+            snapshot.repositories.iter().filter_map(|repository| {
+                let has_sources = repository
+                    .inputs
+                    .iter()
+                    .any(|input| self.accepts(&input.path));
+                self.plugins.prepare_repository(
+                    analyzer.clone(),
+                    repository,
+                    has_sources,
+                    has_sources,
+                )
+            }),
+        )
+    }
+
+    fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &AnalyzerPlan,
+    ) -> Result<AnalyzerContribution, AnalyzerError> {
         let mut active_repositories = Vec::new();
         let mut repositories = Vec::new();
         let mut graphql_resolvers = Vec::new();
+        let mut cached_observations = Vec::new();
         let mut cache = CacheStatistics::default();
 
         for repository in &snapshot.repositories {
@@ -137,25 +171,54 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
                 continue;
             }
             active_repositories.push(repository.state.repository.identity.clone());
-            let active_plugins = self.plugins.activate(repository, true);
+            let repository_plan = plan
+                .repository(&repository.state.repository.identity)
+                .ok_or("missing prepared Elixir repository")?;
+            let active_plugins = &repository_plan.active_plugins;
             let analyzed = sources
                 .par_iter()
                 .map(|(path, source)| {
                     let (analysis, status) = self
-                        .analysis(path, source, &active_plugins)
+                        .analysis(
+                            path,
+                            source,
+                            active_plugins,
+                            &repository_plan.source_plugins,
+                        )
                         .map_err(|error| SourceAnalysisError::from_source(path, error))?;
                     Ok::<_, SourceAnalysisError>((*path, *source, analysis, status))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut observations = Vec::new();
-            let mut entities = Vec::new();
-            let mut diagnostics = Vec::new();
-            for (path, source, analysis, status) in &analyzed {
+            for (_, _, _, status) in &analyzed {
                 match status {
                     CacheStatus::Memory => cache.memory_hits += 1,
                     CacheStatus::Disk => cache.disk_hits += 1,
                     CacheStatus::Miss => cache.misses += 1,
                 }
+            }
+            let source_refs = analyzed
+                .iter()
+                .map(|(path, _, analysis, _)| (*path, analysis.as_ref()))
+                .collect::<Vec<_>>();
+            graphql_resolvers.extend(
+                graphql_resolver_bindings(&repository.state.repository.identity, &source_refs)
+                    .into_iter()
+                    .map(|binding| GraphqlResolverCandidate {
+                        repository: repository.state.repository.identity.clone(),
+                        field: binding.field,
+                        parent: binding.parent,
+                        resolver: binding.resolver.into(),
+                        evidence: binding.evidence.into(),
+                    }),
+            );
+            if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
+                cached_observations.extend_from_slice(cached.observations);
+                continue;
+            }
+            let mut observations = Vec::new();
+            let mut entities = Vec::new();
+            let mut diagnostics = Vec::new();
+            for (path, source, analysis, _) in &analyzed {
                 observations.extend(observations_from_analysis(
                     &repository.state.repository.identity,
                     analysis,
@@ -169,10 +232,6 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
                 ));
                 diagnostics.extend(diagnostics_from_analysis(analysis, path));
             }
-            let source_refs = analyzed
-                .iter()
-                .map(|(path, _, analysis, _)| (*path, analysis.as_ref()))
-                .collect::<Vec<_>>();
             let generated = generated_observations(
                 &repository.state.repository.identity,
                 &source_refs,
@@ -196,22 +255,11 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
                     entities: &entities,
                     observations: &observations,
                 },
-                &active_plugins,
+                active_plugins,
             )?;
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);
             diagnostics.extend(enrichment.diagnostics);
-            graphql_resolvers.extend(
-                graphql_resolver_bindings(&repository.state.repository.identity, &source_refs)
-                    .into_iter()
-                    .map(|binding| GraphqlResolverCandidate {
-                        repository: repository.state.repository.identity.clone(),
-                        field: binding.field,
-                        parent: binding.parent,
-                        resolver: binding.resolver.into(),
-                        evidence: binding.evidence.into(),
-                    }),
-            );
             let completeness = if diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"))
@@ -230,10 +278,12 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
             });
         }
 
-        let all_observations = repositories
-            .iter()
-            .flat_map(|repository| repository.observations.iter().cloned())
-            .collect::<Vec<_>>();
+        let mut all_observations = cached_observations;
+        all_observations.extend(
+            repositories
+                .iter()
+                .flat_map(|repository| repository.observations.iter().cloned()),
+        );
         Ok(AnalyzerContribution {
             metadata: self.metadata(),
             active_repositories,
@@ -316,7 +366,12 @@ mod tests {
             ]))
             .unwrap();
 
-        assert!(analyzer.metadata().version.contains("elixir.grpc-elixir:1"));
+        assert!(
+            analyzer
+                .metadata()
+                .version
+                .contains("18:elixir.grpc-elixir1:1")
+        );
         assert_eq!(contribution.repositories.len(), 1);
         assert!(
             contribution.repositories[0]

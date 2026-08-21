@@ -13,7 +13,7 @@ use beholder_adapters_graphql::GraphqlSource;
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
     ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
-    CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
+    AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
     WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
@@ -56,12 +56,19 @@ impl TypescriptAnalyzer {
         source: &str,
         language: SourceLanguage,
         active_plugins: &ActivePlugins,
+        source_plugins: &str,
     ) -> Result<(Arc<TypescriptAnalysis>, CacheStatus), AnalyzerError> {
         let mut digest = Sha256::new();
-        digest.update(source.as_bytes());
-        digest.update(path.to_string_lossy().as_bytes());
-        digest.update(language.cache_version().as_bytes());
-        digest.update(active_plugins.identity().as_bytes());
+        for part in [
+            FRONTEND_VERSION.as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
+            language.cache_version().as_bytes(),
+            source.as_bytes(),
+            source_plugins.as_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
         let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
@@ -106,12 +113,11 @@ impl TypescriptAnalyzer {
 
 impl WorkspaceAnalyzer for TypescriptAnalyzer {
     fn metadata(&self) -> AnalyzerMetadata {
+        let base = format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}");
+        let plugins = self.plugins.identity();
         AnalyzerMetadata {
             id: "typescript".into(),
-            version: format!(
-                "{FRONTEND_VERSION}:{RESOLVER_VERSION}:{}",
-                self.plugins.identity()
-            ),
+            version: format!("{}:{base}{}:{plugins}", base.len(), plugins.len()),
         }
     }
 
@@ -132,24 +138,43 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
     }
 
     fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
-        repository.inputs.iter().any(|input| {
-            SourceLanguage::from_path(&input.path).is_some()
-                || input
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name == "package.json"
-                            || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
-                                && name.ends_with(".json"))
-                    })
-        })
+        repository
+            .inputs
+            .iter()
+            .any(|input| SourceLanguage::from_path(&input.path).is_some())
     }
 
-    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+    fn prepare(&self, snapshot: &WorkspaceSnapshot) -> AnalyzerPlan {
+        let analyzer = AnalyzerMetadata {
+            id: "typescript".into(),
+            version: format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}"),
+        };
+        AnalyzerPlan::from_repositories(
+            self.metadata(),
+            snapshot.repositories.iter().filter_map(|repository| {
+                let has_sources = repository
+                    .inputs
+                    .iter()
+                    .any(|input| SourceLanguage::from_path(&input.path).is_some());
+                self.plugins.prepare_repository(
+                    analyzer.clone(),
+                    repository,
+                    has_sources,
+                    has_sources,
+                )
+            }),
+        )
+    }
+
+    fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &AnalyzerPlan,
+    ) -> Result<AnalyzerContribution, AnalyzerError> {
         let mut active_repositories = Vec::new();
         let mut repositories = Vec::new();
         let mut typed_repositories = Vec::new();
+        let mut cached_observations = Vec::new();
         let mut cache = CacheStatistics::default();
 
         for repository in &snapshot.repositories {
@@ -158,10 +183,6 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 .iter()
                 .filter(|input| self.accepts(&input.path))
                 .collect::<Vec<_>>();
-            if !self.is_active(repository) {
-                continue;
-            }
-            active_repositories.push(repository.state.repository.identity.clone());
             let sources = inputs
                 .iter()
                 .filter_map(|input| {
@@ -171,7 +192,14 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     text(input).map(|source| (input.path.as_path(), source, language))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let active_plugins = self.plugins.activate(repository, !sources.is_empty());
+            if sources.is_empty() {
+                continue;
+            }
+            active_repositories.push(repository.state.repository.identity.clone());
+            let repository_plan = plan
+                .repository(&repository.state.repository.identity)
+                .ok_or("missing prepared TypeScript repository")?;
+            let active_plugins = &repository_plan.active_plugins;
             let manifests = inputs
                 .iter()
                 .filter(|input| {
@@ -208,7 +236,13 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 .par_iter()
                 .map(|(path, source, language)| {
                     let analysis = self
-                        .analysis(path, source, *language, &active_plugins)
+                        .analysis(
+                            path,
+                            source,
+                            *language,
+                            active_plugins,
+                            &repository_plan.source_plugins,
+                        )
                         .map_err(|error| SourceAnalysisError::from_source(path, error));
                     (*path, *source, analysis)
                 })
@@ -235,12 +269,36 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     Err(error) => return Err(error.into()),
                 }
             }
-            for (path, source, analysis, status) in &analyzed {
+            for (_, _, _, status) in &analyzed {
                 match status {
                     CacheStatus::Memory => cache.memory_hits += 1,
                     CacheStatus::Disk => cache.disk_hits += 1,
                     CacheStatus::Miss => cache.misses += 1,
                 }
+            }
+            let typed_repository = TypescriptRepository::new(
+                repository.state.repository.identity.clone(),
+                analyzed
+                    .iter()
+                    .map(|(path, _, analysis, _)| {
+                        ((*path).to_path_buf(), analysis.as_ref().clone())
+                    })
+                    .collect(),
+                manifests
+                    .iter()
+                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
+                    .collect(),
+                configs
+                    .iter()
+                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
+                    .collect(),
+            );
+            if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
+                cached_observations.extend_from_slice(cached.observations);
+                typed_repositories.push(typed_repository);
+                continue;
+            }
+            for (path, source, analysis, _) in &analyzed {
                 observations.extend(observations_from_analysis(
                     &repository.state.repository.identity,
                     analysis,
@@ -281,30 +339,13 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 &manifests,
                 &configs,
             );
-            let typed_repository = TypescriptRepository::new(
-                repository.state.repository.identity.clone(),
-                analyzed
-                    .iter()
-                    .map(|(path, _, analysis, _)| {
-                        ((*path).to_path_buf(), analysis.as_ref().clone())
-                    })
-                    .collect(),
-                manifests
-                    .iter()
-                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
-                    .collect(),
-                configs
-                    .iter()
-                    .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
-                    .collect(),
-            );
             let enrichment = self.plugins.enrich(
                 &typed_repository,
                 RepositoryFactsView {
                     entities: &entities,
                     observations: &observations,
                 },
-                &active_plugins,
+                active_plugins,
             )?;
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);
@@ -344,10 +385,12 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             });
         }
 
-        let mut all_observations = repositories
-            .iter()
-            .flat_map(|repository| repository.observations.iter().cloned())
-            .collect::<Vec<_>>();
+        let mut all_observations = cached_observations;
+        all_observations.extend(
+            repositories
+                .iter()
+                .flat_map(|repository| repository.observations.iter().cloned()),
+        );
         let overrides = resolve_workspace_calls(&mut all_observations, &typed_repositories);
         Ok(AnalyzerContribution {
             metadata: self.metadata(),

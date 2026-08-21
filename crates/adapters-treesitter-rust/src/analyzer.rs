@@ -12,7 +12,7 @@ use beholder_domain::{
 };
 use beholder_indexing::{
     ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
-    CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
+    AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
     WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
@@ -54,10 +54,18 @@ impl RustAnalyzer {
         path: &Path,
         source: &str,
         active_plugins: &ActivePlugins,
+        source_plugins: &str,
     ) -> Result<(Arc<RustAnalysis>, CacheStatus), AnalyzerError> {
         let mut digest = Sha256::new();
-        digest.update(source.as_bytes());
-        digest.update(active_plugins.identity().as_bytes());
+        for part in [
+            FRONTEND_VERSION.as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
+            source.as_bytes(),
+            source_plugins.as_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
         let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
@@ -101,12 +109,11 @@ impl RustAnalyzer {
 
 impl WorkspaceAnalyzer for RustAnalyzer {
     fn metadata(&self) -> AnalyzerMetadata {
+        let base = format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}");
+        let plugins = self.plugins.identity();
         AnalyzerMetadata {
             id: "rust".into(),
-            version: format!(
-                "{FRONTEND_VERSION}:{RESOLVER_VERSION}:{}",
-                self.plugins.identity()
-            ),
+            version: format!("{}:{base}{}:{plugins}", base.len(), plugins.len()),
         }
     }
 
@@ -121,9 +128,29 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             .any(|input| is_rust_source(&input.path))
     }
 
-    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+    fn prepare(&self, snapshot: &WorkspaceSnapshot) -> AnalyzerPlan {
+        let analyzer = AnalyzerMetadata {
+            id: "rust".into(),
+            version: format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}"),
+        };
+        AnalyzerPlan::from_repositories(
+            self.metadata(),
+            snapshot.repositories.iter().filter_map(|repository| {
+                let active = self.is_active(repository);
+                self.plugins
+                    .prepare_repository(analyzer.clone(), repository, active, active)
+            }),
+        )
+    }
+
+    fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &AnalyzerPlan,
+    ) -> Result<AnalyzerContribution, AnalyzerError> {
         let mut active_repositories = Vec::new();
         let mut repositories = Vec::new();
+        let mut cached_observations = Vec::new();
         let mut cache = CacheStatistics::default();
 
         for repository in &snapshot.repositories {
@@ -143,15 +170,27 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 continue;
             }
             active_repositories.push(repository.state.repository.identity.clone());
-            let active_plugins = self.plugins.activate(repository, true);
+            let repository_plan = plan
+                .repository(&repository.state.repository.identity)
+                .ok_or("missing prepared Rust repository")?;
+            if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
+                cached_observations.extend_from_slice(cached.observations);
+                continue;
+            }
+            let active_plugins = &repository_plan.active_plugins;
             enum SourceResult<'a> {
                 Analyzed(&'a Path, Arc<RustAnalysis>, CacheStatus),
                 Skipped(&'a Path, String),
             }
             let results = sources
                 .par_iter()
-                .map(
-                    |(path, source)| match self.analysis(path, source, &active_plugins) {
+                .map(|(path, source)| {
+                    match self.analysis(
+                        path,
+                        source,
+                        active_plugins,
+                        &repository_plan.source_plugins,
+                    ) {
                         Ok((analysis, status)) => {
                             Ok(SourceResult::Analyzed(path, analysis, status))
                         }
@@ -159,8 +198,8 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                             Ok(SourceResult::Skipped(path, error.to_string()))
                         }
                         Err(error) => Err(SourceAnalysisError::from_source(path, error)),
-                    },
-                )
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut observations = Vec::new();
             let mut entities = Vec::new();
@@ -211,7 +250,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                     entities: &entities,
                     observations: &observations,
                 },
-                &active_plugins,
+                active_plugins,
             )?;
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);
@@ -235,10 +274,12 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             });
         }
 
-        let mut all_observations = repositories
-            .iter()
-            .flat_map(|repository| repository.observations.iter().cloned())
-            .collect::<Vec<_>>();
+        let mut all_observations = cached_observations;
+        all_observations.extend(
+            repositories
+                .iter()
+                .flat_map(|repository| repository.observations.iter().cloned()),
+        );
         let overrides = resolve_repository_calls(&mut all_observations);
         Ok(AnalyzerContribution {
             metadata: self.metadata(),

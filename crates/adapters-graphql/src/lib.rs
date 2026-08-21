@@ -7,8 +7,8 @@ use beholder_domain::{
     GraphqlTypeKind, Observation,
 };
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, AnalyzerPlan,
+    CacheStatistics, RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use std::{collections::BTreeMap, path::Path};
 
@@ -46,7 +46,11 @@ impl WorkspaceAnalyzer for GraphqlAnalyzer {
             .is_some_and(|extension| matches!(extension, "graphql" | "gql"))
     }
 
-    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+    fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &AnalyzerPlan,
+    ) -> Result<AnalyzerContribution, AnalyzerError> {
         let mut active_repositories = Vec::new();
         let mut repositories = Vec::new();
         for repository in &snapshot.repositories {
@@ -73,6 +77,12 @@ impl WorkspaceAnalyzer for GraphqlAnalyzer {
                 continue;
             }
             active_repositories.push(repository.state.repository.identity.clone());
+            if plan
+                .cached_repository(&repository.state.repository.identity)
+                .is_some()
+            {
+                continue;
+            }
             let analysis = facts(&repository.state.repository.identity, &schemas);
             let completeness = if analysis
                 .diagnostics

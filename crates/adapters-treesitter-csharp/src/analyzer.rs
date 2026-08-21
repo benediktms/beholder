@@ -11,9 +11,9 @@ use crate::{
 };
 use beholder_domain::{AnalysisDiagnostic, AnalysisDiagnosticSeverity, SourceAnalysisError};
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    LanguageAnalyzer, RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer,
-    WorkspaceSnapshot,
+    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, AnalyzerPlan,
+    CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
+    WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -51,8 +51,23 @@ impl CsharpAnalyzer {
         }
     }
 
-    fn analysis(&self, source: &str) -> Result<(Arc<CsharpAnalysis>, CacheStatus), AnalyzerError> {
-        let key = CacheKey(Sha256::digest(source.as_bytes()).into());
+    fn analysis(
+        &self,
+        path: &Path,
+        source: &str,
+        source_plugins: &str,
+    ) -> Result<(Arc<CsharpAnalysis>, CacheStatus), AnalyzerError> {
+        let mut digest = Sha256::new();
+        for part in [
+            FRONTEND_VERSION.as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
+            source.as_bytes(),
+            source_plugins.as_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+        let key = CacheKey(digest.finalize().into());
         if let Some(analysis) = self
             .cache
             .lock()
@@ -90,12 +105,11 @@ impl CsharpAnalyzer {
 
 impl WorkspaceAnalyzer for CsharpAnalyzer {
     fn metadata(&self) -> AnalyzerMetadata {
+        let base = format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}");
+        let plugins = self.plugins.identity();
         AnalyzerMetadata {
             id: "csharp".into(),
-            version: format!(
-                "{FRONTEND_VERSION}:{RESOLVER_VERSION}:{}",
-                self.plugins.identity()
-            ),
+            version: format!("{}:{base}{}:{plugins}", base.len(), plugins.len()),
         }
     }
 
@@ -113,7 +127,35 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                 })
     }
 
-    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+    fn prepare(&self, snapshot: &WorkspaceSnapshot) -> AnalyzerPlan {
+        let analyzer = AnalyzerMetadata {
+            id: "csharp".into(),
+            version: format!("{FRONTEND_VERSION}:{RESOLVER_VERSION}"),
+        };
+        AnalyzerPlan::from_repositories(
+            self.metadata(),
+            snapshot.repositories.iter().filter_map(|repository| {
+                let has_sources = repository.inputs.iter().any(|input| {
+                    input
+                        .path
+                        .extension()
+                        .is_some_and(|extension| extension == "cs")
+                });
+                self.plugins.prepare_repository(
+                    analyzer.clone(),
+                    repository,
+                    self.is_active(repository),
+                    has_sources,
+                )
+            }),
+        )
+    }
+
+    fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &AnalyzerPlan,
+    ) -> Result<AnalyzerContribution, AnalyzerError> {
         let mut active_repositories = Vec::new();
         let mut repositories = Vec::new();
         let mut cache = CacheStatistics::default();
@@ -128,6 +170,15 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                 continue;
             }
             active_repositories.push(repository.state.repository.identity.clone());
+            let repository_plan = plan
+                .repository(&repository.state.repository.identity)
+                .ok_or("missing prepared C# repository")?;
+            if plan
+                .cached_repository(&repository.state.repository.identity)
+                .is_some()
+            {
+                continue;
+            }
             let project_inputs = inputs
                 .iter()
                 .filter(|input| {
@@ -195,13 +246,13 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                         .is_some_and(|extension| extension == "cs")
                 })
                 .collect::<Vec<_>>();
-            let active_plugins = self.plugins.activate(repository, !sources.is_empty());
+            let active_plugins = &repository_plan.active_plugins;
             let analyzed = sources
                 .par_iter()
                 .map(|input| {
                     let (source, lossy) = decode_source(&input.content);
                     let (analysis, status) = self
-                        .analysis(&source)
+                        .analysis(&input.path, &source, &repository_plan.source_plugins)
                         .map_err(|error| SourceAnalysisError::from_source(&input.path, error))?;
                     Ok::<_, SourceAnalysisError>((
                         input.path.clone(),
@@ -311,7 +362,7 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                     entities: &entities,
                     observations: &observations,
                 },
-                &active_plugins,
+                active_plugins,
             )?;
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);
