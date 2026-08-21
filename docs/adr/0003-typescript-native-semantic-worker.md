@@ -201,6 +201,38 @@ workers, a result publishes as a new revision only if its immutable input is
 still current, and a later run atomically replaces only this analyzer's
 contribution.
 
+### Incremental refresh and cache boundary
+
+TypeScript enrichment must remain useful in workspaces where repositories
+change frequently. A worker contribution is therefore owned and identified by
+the workspace, target repository, and analyzer rather than by one indivisible
+workspace revision. Publishing a new baseline carries forward contributions
+whose target input identities remain valid and queues only target repositories
+whose semantic inputs changed.
+
+The contribution input identity covers the target repository's baseline facts
+and semantic candidates, the worker and schema versions, compiler inputs, and
+only the read-only repository context capable of changing the target result.
+An unrelated repository update does not invalidate the contribution. A change
+to a project reference, relevant cross-repository declaration, compiler
+configuration, manifest, lockfile, or dependency does.
+
+Jobs are keyed by `(workspace, target repository, analyzer)`. A newer input
+coalesces a queued job and cooperatively cancels a running superseded job. The
+daemon validates the returned target input identity before publication and
+atomically replaces only that target repository's analyzer contribution.
+Completed contributions are persisted so an unchanged daemon restart does not
+require compiler analysis.
+
+This lifecycle is tracked by
+[issue 82](https://github.com/benediktms/beholder/issues/82) and is required
+before automatic TypeScript worker activation. It is distinct from
+[issue 54](https://github.com/benediktms/beholder/issues/54), which scopes
+analyzer-plugin cache identity for baseline source, repository, and workspace
+analysis. Keeping a TypeScript worker or LSP process warm across jobs remains a
+measured follow-up; repository-scoped reuse and scheduling do not depend on a
+persistent compiler process.
+
 ### Project input and execution safety
 
 TypeScript enrichment is repository-scoped. The target repository owns the
@@ -230,7 +262,7 @@ analysis does not intentionally execute repository application or build code.
 
 The TypeScript contribution identity includes at least:
 
-- the immutable baseline and target repository fingerprints;
+- the target repository baseline and semantic-candidate identities;
 - worker and contribution-schema versions;
 - semantic engine kind and compiler version;
 - relevant `tsconfig`, extended configuration, and project-reference inputs;
@@ -253,6 +285,9 @@ worker telemetry path.
   editor-oriented protocol to rediscover the entire graph.
 - A common semantic-candidate input removes language-specific duplication and
   makes every compiler override traceable to one baseline observation.
+- Repository-scoped contribution reuse keeps unrelated repository updates from
+  triggering whole-workspace compiler reruns, while relevant context changes
+  still invalidate affected targets.
 - The feasibility gate may defer the worker until TypeScript 7.1 if LSP results
   are too ambiguous or expensive.
 - Go becomes an additional Beholder worker toolchain and requires generated
