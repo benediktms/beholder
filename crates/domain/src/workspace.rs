@@ -161,6 +161,15 @@ impl WorkspaceView {
         )
         .collect()
     }
+
+    pub fn repository_input_fingerprint(&self, state: &RepositoryState) -> String {
+        format!(
+            "{}:{}{}",
+            self.analysis_identity.len(),
+            self.analysis_identity,
+            state.fingerprint
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

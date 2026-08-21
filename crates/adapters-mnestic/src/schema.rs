@@ -130,6 +130,29 @@ pub(super) const CREATE_ENRICHMENT_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_REVISION_INPUT_SCHEMA: &str = r#"
+:create analysis_revision_input {
+    view: String,
+    revision: Int,
+    repository: String,
+    =>
+    fingerprint: String,
+}
+"#;
+
+pub(super) const CREATE_REPOSITORY_ENRICHMENT_SCHEMA: &str = r#"
+:create analysis_revision_repository_enrichment {
+    view: String,
+    revision: Int,
+    owner: String,
+    =>
+    repository: String,
+    analyzer: String,
+    version: String,
+    input_fingerprint: String,
+}
+"#;
+
 pub(super) const CREATE_ENRICHMENT_OVERRIDE_OWNER_SCHEMA: &str = r#"
 :create analysis_revision_enrichment_override_owner {
     view: String,
