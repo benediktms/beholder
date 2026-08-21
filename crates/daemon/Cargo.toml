@@ -32,3 +32,6 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sig
 tokio-stream = { workspace = true, features = ["net"] }
 tonic.workspace = true
 tracing = "0.1.44"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
