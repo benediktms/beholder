@@ -211,6 +211,7 @@ mod tests {
         );
         let plugin = active.plugins().next().unwrap();
         assert_eq!(plugin.metadata.id, "csharp.dotnet-di");
+        assert_eq!(plugins.source_identity(&active), "");
         assert_eq!(plugin.activation.path, PathBuf::from("src/App.csproj"));
         assert_eq!(
             plugin.activation.reason,

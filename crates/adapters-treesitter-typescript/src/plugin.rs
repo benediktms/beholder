@@ -211,10 +211,15 @@ mod tests {
             ),
         ]);
 
-        let active = built_in_plugins().unwrap().activate(&repository, true);
+        let plugins = built_in_plugins().unwrap();
+        let active = plugins.activate(&repository, true);
         assert_eq!(
             active.identity(),
-            "typescript.nestjs:2:typescript.ts-proto:2"
+            "17:typescript.nestjs1:219:typescript.ts-proto1:2"
+        );
+        assert_eq!(
+            plugins.source_identity(&active),
+            "17:typescript.nestjs1:219:typescript.ts-proto1:2"
         );
         let evidence = active
             .plugins()

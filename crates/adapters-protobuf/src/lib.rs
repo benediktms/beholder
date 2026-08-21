@@ -3,8 +3,8 @@ use beholder_domain::{
     StructuralRelation,
 };
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, CacheStatistics,
-    InputKind, RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, AnalyzerPlan,
+    CacheStatistics, InputKind, RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use prost::Message;
 use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
@@ -51,7 +51,11 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
             .any(|input| input.kind == InputKind::ProtobufDescriptor || self.accepts(&input.path))
     }
 
-    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+    fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &AnalyzerPlan,
+    ) -> Result<AnalyzerContribution, AnalyzerError> {
         let mut active_repositories = Vec::new();
         let mut repositories = Vec::new();
         for repository in &snapshot.repositories {
@@ -71,6 +75,12 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
                 continue;
             }
             active_repositories.push(repository.state.repository.identity.clone());
+            if plan
+                .cached_repository(&repository.state.repository.identity)
+                .is_some()
+            {
+                continue;
+            }
             let mut diagnostics = Vec::new();
             match self
                 .compiler

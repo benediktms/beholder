@@ -221,6 +221,7 @@ mod tests {
 
         let plugin = active.plugins().next().unwrap();
         assert_eq!(plugin.metadata.id, "rust.tonic");
+        assert_eq!(plugins.source_identity(&active), "10:rust.tonic1:1");
         assert_eq!(
             plugin.activation.path,
             PathBuf::from("crates/api/Cargo.toml")

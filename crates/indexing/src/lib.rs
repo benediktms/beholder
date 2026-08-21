@@ -104,7 +104,7 @@ pub enum CacheStatus {
     Miss,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct CanonicalRepositoryAnalysis {
     #[serde(default)]
     incomplete: bool,
@@ -113,6 +113,14 @@ struct CanonicalRepositoryAnalysis {
     grpc_bindings: Vec<GrpcBindingCandidate>,
     observations: Vec<Observation>,
     diagnostics: Vec<AnalysisDiagnostic>,
+    #[serde(default)]
+    analyzers: BTreeMap<String, CanonicalAnalyzerAnalysis>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct CanonicalAnalyzerAnalysis {
+    entities: Vec<EntityFact>,
+    observations: Vec<Observation>,
 }
 
 pub struct AnalyzedRepository {
@@ -137,7 +145,20 @@ pub trait WorkspaceAnalyzer: Send + Sync {
             .iter()
             .any(|input| self.accepts(&input.path))
     }
-    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError>;
+    fn prepare(&self, snapshot: &WorkspaceSnapshot) -> AnalyzerPlan {
+        AnalyzerPlan::without_plugins(self.metadata(), snapshot, |repository| {
+            self.is_active(repository)
+        })
+    }
+    fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &AnalyzerPlan,
+    ) -> Result<AnalyzerContribution, AnalyzerError>;
+    fn analyze(&self, snapshot: &WorkspaceSnapshot) -> Result<AnalyzerContribution, AnalyzerError> {
+        let plan = self.prepare(snapshot);
+        self.analyze_prepared(snapshot, &plan)
+    }
     fn clear_cache(&self) -> Result<(), AnalyzerError> {
         Ok(())
     }
@@ -192,11 +213,11 @@ pub struct ActivePlugins {
 
 impl ActivePlugins {
     pub fn identity(&self) -> String {
-        self.plugins
-            .values()
-            .map(|plugin| format!("{}:{}", plugin.metadata.id, plugin.metadata.version))
-            .collect::<Vec<_>>()
-            .join(":")
+        encode_identity(
+            self.plugins
+                .values()
+                .map(|plugin| (&plugin.metadata.id, &plugin.metadata.version)),
+        )
     }
 
     pub fn plugins(&self) -> impl Iterator<Item = &ActivePlugin> {
@@ -205,6 +226,134 @@ impl ActivePlugins {
 
     fn contains(&self, id: &str) -> bool {
         self.plugins.contains_key(id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyzerRepositoryPlan {
+    pub repository: String,
+    pub analysis: AnalyzerMetadata,
+    pub source_plugins: String,
+    pub active_plugins: ActivePlugins,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyzerPlan {
+    pub analyzer: AnalyzerMetadata,
+    repositories: BTreeMap<String, AnalyzerRepositoryPlan>,
+    cached_repositories: BTreeMap<String, Arc<CanonicalAnalyzerAnalysis>>,
+}
+
+impl AnalyzerPlan {
+    pub fn without_plugins(
+        analyzer: AnalyzerMetadata,
+        snapshot: &WorkspaceSnapshot,
+        is_active: impl Fn(&RepositorySnapshot) -> bool,
+    ) -> Self {
+        let repositories = snapshot
+            .repositories
+            .iter()
+            .filter(|repository| is_active(repository))
+            .map(|repository| {
+                let identity = repository.state.repository.identity.clone();
+                (
+                    identity.clone(),
+                    AnalyzerRepositoryPlan {
+                        repository: identity,
+                        analysis: analyzer.clone(),
+                        source_plugins: String::new(),
+                        active_plugins: ActivePlugins::default(),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            analyzer,
+            repositories,
+            cached_repositories: BTreeMap::new(),
+        }
+    }
+
+    pub fn from_repositories(
+        analyzer: AnalyzerMetadata,
+        repositories: impl IntoIterator<Item = AnalyzerRepositoryPlan>,
+    ) -> Self {
+        Self {
+            analyzer,
+            repositories: repositories
+                .into_iter()
+                .map(|repository| (repository.repository.clone(), repository))
+                .collect(),
+            cached_repositories: BTreeMap::new(),
+        }
+    }
+
+    pub fn repository(&self, identity: &str) -> Option<&AnalyzerRepositoryPlan> {
+        self.repositories.get(identity)
+    }
+
+    pub fn repositories(&self) -> impl Iterator<Item = &AnalyzerRepositoryPlan> {
+        self.repositories.values()
+    }
+
+    pub fn cached_repository(&self, identity: &str) -> Option<RepositoryFactsView<'_>> {
+        self.cached_repositories
+            .get(identity)
+            .map(|analysis| RepositoryFactsView {
+                entities: &analysis.entities,
+                observations: &analysis.observations,
+            })
+    }
+
+    fn cache_repository(&mut self, identity: String, analysis: Arc<CanonicalAnalyzerAnalysis>) {
+        self.cached_repositories.insert(identity, analysis);
+    }
+}
+
+pub struct WorkspaceAnalysisPlan {
+    analyzers: Vec<AnalyzerPlan>,
+    analysis_identity: String,
+    repository_identities: BTreeMap<String, String>,
+    repository_fingerprints: BTreeMap<String, String>,
+    cached_repositories: BTreeMap<String, (Arc<CanonicalRepositoryAnalysis>, CacheStatus)>,
+}
+
+impl WorkspaceAnalysisPlan {
+    pub fn analysis_identity(&self) -> &str {
+        &self.analysis_identity
+    }
+
+    fn analyzer(&self, index: usize) -> &AnalyzerPlan {
+        &self.analyzers[index]
+    }
+
+    fn repository_identity(&self, repository: &str) -> Option<&str> {
+        self.repository_identities
+            .get(repository)
+            .map(String::as_str)
+    }
+
+    fn validate(&self, snapshot: &WorkspaceSnapshot) -> Result<(), AnalyzerError> {
+        let snapshots = snapshot
+            .repositories
+            .iter()
+            .map(|repository| {
+                (
+                    repository.state.repository.identity.clone(),
+                    repository.state.fingerprint.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if snapshots.len() != snapshot.repositories.len() {
+            return Err("workspace snapshot contains duplicate repository identities".into());
+        }
+        if snapshots != self.repository_fingerprints {
+            return Err("prepared analysis plan does not match workspace repositories".into());
+        }
+        if self.analysis_identity != workspace_analysis_identity(&self.repository_identities) {
+            return Err("prepared workspace analysis identity is inconsistent".into());
+        }
+        Ok(())
     }
 }
 
@@ -379,11 +528,11 @@ pub struct LanguageAnalyzer<L: AnalyzerLanguage> {
 
 impl<L: AnalyzerLanguage> LanguageAnalyzer<L> {
     pub fn identity(&self) -> String {
-        self.plugins
-            .iter()
-            .map(|plugin| format!("{}:{}", plugin.metadata.id, plugin.metadata.version))
-            .collect::<Vec<_>>()
-            .join(":")
+        encode_identity(
+            self.plugins
+                .iter()
+                .map(|plugin| (&plugin.metadata.id, &plugin.metadata.version)),
+        )
     }
 
     pub fn activate(
@@ -432,6 +581,50 @@ impl<L: AnalyzerLanguage> LanguageAnalyzer<L> {
                 })
                 .collect(),
         }
+    }
+
+    pub fn source_identity(&self, active: &ActivePlugins) -> String {
+        let plugins = self
+            .source_recognizers
+            .iter()
+            .filter(|installed| active.contains(&installed.plugin.id))
+            .map(|installed| (&installed.plugin.id, &installed.plugin.version));
+        encode_identity(plugins)
+    }
+
+    pub fn prepare_repository(
+        &self,
+        analyzer: AnalyzerMetadata,
+        repository: &RepositorySnapshot,
+        analyzer_active: bool,
+        has_language_inputs: bool,
+    ) -> Option<AnalyzerRepositoryPlan> {
+        if !analyzer_active {
+            return None;
+        }
+        let active_plugins = self.activate(repository, has_language_inputs);
+        let source_plugins = self.source_identity(&active_plugins);
+        let plugin_identity = active_plugins.identity();
+        let analysis = AnalyzerMetadata {
+            id: analyzer.id,
+            version: if plugin_identity.is_empty() {
+                analyzer.version
+            } else {
+                format!(
+                    "{}:{}{}:{}",
+                    analyzer.version.len(),
+                    analyzer.version,
+                    plugin_identity.len(),
+                    plugin_identity
+                )
+            },
+        };
+        Some(AnalyzerRepositoryPlan {
+            repository: repository.state.repository.identity.clone(),
+            analysis,
+            source_plugins,
+            active_plugins,
+        })
     }
 
     pub fn recognize(
@@ -561,28 +754,85 @@ impl Indexer {
             || self.enrichers.iter().any(|enricher| enricher.accepts(path))
     }
 
-    pub fn analysis_identity(&self, snapshot: &WorkspaceSnapshot) -> String {
-        let active = self
+    pub fn prepare(&self, snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysisPlan {
+        let mut analyzers = self
             .analyzers
             .iter()
-            .filter(|analyzer| {
-                snapshot
-                    .repositories
-                    .iter()
-                    .any(|repository| analyzer.is_active(repository))
-            })
-            .map(|analyzer| analyzer.metadata())
+            .map(|analyzer| analyzer.prepare(snapshot))
             .collect::<Vec<_>>();
-        analysis_identity(&active)
+        let repository_identities = snapshot
+            .repositories
+            .iter()
+            .map(|repository| {
+                let repository_id = repository.state.repository.identity.clone();
+                let metadata = analyzers
+                    .iter()
+                    .filter_map(|analyzer| {
+                        analyzer
+                            .repository(&repository_id)
+                            .map(|repository| repository.analysis.clone())
+                    })
+                    .collect::<Vec<_>>();
+                (repository_id, repository_analysis_identity(&metadata))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let analysis_identity = workspace_analysis_identity(&repository_identities);
+        let repository_fingerprints = snapshot
+            .repositories
+            .iter()
+            .map(|repository| {
+                (
+                    repository.state.repository.identity.clone(),
+                    repository.state.fingerprint.clone(),
+                )
+            })
+            .collect();
+        let cached_repositories = snapshot
+            .repositories
+            .iter()
+            .filter_map(|repository| {
+                let identity = &repository.state.repository.identity;
+                let analysis_identity = repository_identities.get(identity)?;
+                self.lookup_repository(&repository.state.fingerprint, analysis_identity)
+                    .map(|cached| (identity.clone(), cached))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for analyzer in &mut analyzers {
+            let identities = analyzer.repositories.keys().cloned().collect::<Vec<_>>();
+            for identity in identities {
+                if let Some((analysis, _)) = cached_repositories.get(&identity) {
+                    let contribution = analysis
+                        .analyzers
+                        .get(&analyzer.analyzer.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    analyzer.cache_repository(identity, Arc::new(contribution));
+                }
+            }
+        }
+        WorkspaceAnalysisPlan {
+            analyzers,
+            analysis_identity,
+            repository_identities,
+            repository_fingerprints,
+            cached_repositories,
+        }
+    }
+
+    pub fn analysis_identity(&self, snapshot: &WorkspaceSnapshot) -> String {
+        self.prepare(snapshot).analysis_identity
     }
 
     pub fn catalog_identity(&self) -> String {
-        analysis_identity(
-            &self
-                .analyzers
-                .iter()
-                .map(|analyzer| analyzer.metadata())
-                .collect::<Vec<_>>(),
+        format!(
+            "{}:core-rules:{CORE_RULE_PACK_VERSION}",
+            repository_analysis_identity(
+                &self
+                    .analyzers
+                    .iter()
+                    .map(|analyzer| analyzer.metadata())
+                    .collect::<Vec<_>>(),
+            )
         )
     }
 
@@ -623,13 +873,30 @@ impl Indexer {
         &self,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<WorkspaceAnalysis, AnalyzerError> {
+        let plan = self.prepare(snapshot);
+        self.analyze_prepared(snapshot, &plan)
+    }
+
+    pub fn analyze_prepared(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        plan: &WorkspaceAnalysisPlan,
+    ) -> Result<WorkspaceAnalysis, AnalyzerError> {
+        plan.validate(snapshot)?;
+        if self.analyzers.len() != plan.analyzers.len() {
+            return Err("prepared analysis plan does not match analyzer catalog".into());
+        }
         let mut merged = snapshot
             .repositories
             .iter()
             .map(|repository| {
+                let identity = repository.state.repository.identity.clone();
                 (
-                    repository.state.repository.identity.clone(),
-                    CanonicalRepositoryAnalysis::default(),
+                    identity.clone(),
+                    plan.cached_repositories
+                        .get(&identity)
+                        .map(|(analysis, _)| analysis.as_ref().clone())
+                        .unwrap_or_default(),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -637,14 +904,25 @@ impl Indexer {
         let mut graphql_resolvers = Vec::new();
         let mut diagnostics = Vec::new();
         let mut cache = CacheStatistics::default();
-        for analyzer in &self.analyzers {
-            let contribution = self.pool.install(|| analyzer.analyze(snapshot))?;
+        for (index, analyzer) in self.analyzers.iter().enumerate() {
+            let analyzer_plan = plan.analyzer(index);
+            if analyzer_plan.analyzer != analyzer.metadata() {
+                return Err(format!(
+                    "prepared analysis plan does not match analyzer {}",
+                    analyzer.metadata().id
+                )
+                .into());
+            }
+            let contribution = self
+                .pool
+                .install(|| analyzer.analyze_prepared(snapshot, analyzer_plan))?;
             cache.memory_hits += contribution.cache.memory_hits;
             cache.disk_hits += contribution.cache.disk_hits;
             cache.misses += contribution.cache.misses;
             overrides.extend(contribution.overrides);
             graphql_resolvers.extend(contribution.graphql_resolvers);
             diagnostics.extend(contribution.diagnostics);
+            let analyzer_id = contribution.metadata.id.clone();
             for repository in contribution.repositories {
                 let analysis = merged.get_mut(&repository.repository).ok_or_else(|| {
                     format!(
@@ -653,32 +931,38 @@ impl Indexer {
                     )
                 })?;
                 analysis.incomplete |= repository.completeness == AnalysisCompleteness::Incomplete;
+                let analyzer = analysis.analyzers.entry(analyzer_id.clone()).or_default();
+                extend_unique(&mut analyzer.entities, repository.entities.clone());
+                extend_unique(&mut analyzer.observations, repository.observations.clone());
                 extend_unique(&mut analysis.entities, repository.entities);
                 extend_unique(&mut analysis.grpc_bindings, repository.grpc_bindings);
                 extend_unique(&mut analysis.observations, repository.observations);
                 extend_unique(&mut analysis.diagnostics, repository.diagnostics);
             }
         }
-        bind_graphql_resolvers(&mut merged, graphql_resolvers);
-
         let mut repositories = Vec::new();
         for repository in &snapshot.repositories {
             let identity = &repository.state.repository.identity;
             let analysis = merged
                 .remove(identity)
                 .ok_or_else(|| format!("missing analysis for repository {identity}"))?;
-            let metadata = self
-                .analyzers
-                .iter()
-                .filter(|analyzer| analyzer.is_active(repository))
-                .map(|analyzer| analyzer.metadata())
-                .collect::<Vec<_>>();
-            let analysis_identity = analysis_identity(&metadata);
-            let (analysis, status) = self.cached_repository(
-                &repository.state.fingerprint,
-                &analysis_identity,
-                analysis,
-            )?;
+            let analysis_identity = plan
+                .repository_identity(identity)
+                .ok_or_else(|| format!("missing analysis identity for repository {identity}"))?
+                .to_owned();
+            let (analysis, status) =
+                if let Some((analysis, status)) = plan.cached_repositories.get(identity) {
+                    (Arc::clone(analysis), *status)
+                } else {
+                    (
+                        self.store_repository(
+                            &repository.state.fingerprint,
+                            &analysis_identity,
+                            analysis,
+                        ),
+                        CacheStatus::Miss,
+                    )
+                };
             diagnostics.extend(
                 analysis
                     .diagnostics
@@ -699,8 +983,9 @@ impl Indexer {
                 cache: status,
             });
         }
+        bind_graphql_resolvers(&mut repositories, graphql_resolvers);
         Ok(WorkspaceAnalysis {
-            analysis_identity: self.analysis_identity(snapshot),
+            analysis_identity: plan.analysis_identity.clone(),
             repositories,
             overrides,
             diagnostics,
@@ -722,37 +1007,34 @@ impl Indexer {
         Ok(())
     }
 
-    fn cached_repository(
+    fn lookup_repository(
+        &self,
+        fingerprint: &str,
+        analysis_identity: &str,
+    ) -> Option<(Arc<CanonicalRepositoryAnalysis>, CacheStatus)> {
+        let key = (fingerprint.to_owned(), analysis_identity.to_owned());
+        if let Some(analysis) = self.repository_cache.lock().unwrap().get(&key) {
+            return Some((Arc::clone(analysis), CacheStatus::Memory));
+        }
+        let path = self.repository_cache_path(fingerprint, analysis_identity);
+        let file = File::open(path).ok()?;
+        let analysis = serde_json::from_reader(BufReader::new(file)).ok()?;
+        let analysis = Arc::new(analysis);
+        self.repository_cache
+            .lock()
+            .unwrap()
+            .insert(key, Arc::clone(&analysis));
+        Some((analysis, CacheStatus::Disk))
+    }
+
+    fn store_repository(
         &self,
         fingerprint: &str,
         analysis_identity: &str,
         analysis: CanonicalRepositoryAnalysis,
-    ) -> Result<(Arc<CanonicalRepositoryAnalysis>, CacheStatus), AnalyzerError> {
+    ) -> Arc<CanonicalRepositoryAnalysis> {
         let key = (fingerprint.to_owned(), analysis_identity.to_owned());
-        if let Some(analysis) = self.repository_cache.lock().unwrap().get(&key) {
-            return Ok((Arc::clone(analysis), CacheStatus::Memory));
-        }
-        let encoded_identity = analysis_identity
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let path = self
-            .cache_dir
-            .join("repository")
-            .join("semantic")
-            .join(encoded_identity)
-            .join(format!("{fingerprint}.json"));
-        if let Ok(file) = File::open(&path)
-            && let Ok(analysis) = serde_json::from_reader(BufReader::new(file))
-        {
-            let analysis = Arc::new(analysis);
-            self.repository_cache
-                .lock()
-                .unwrap()
-                .insert(key, Arc::clone(&analysis));
-            return Ok((analysis, CacheStatus::Disk));
-        }
+        let path = self.repository_cache_path(fingerprint, analysis_identity);
         let analysis = Arc::new(analysis);
         if let Some(parent) = path.parent()
             && fs::create_dir_all(parent).is_ok()
@@ -766,23 +1048,65 @@ impl Indexer {
             .lock()
             .unwrap()
             .insert(key, Arc::clone(&analysis));
-        Ok((analysis, CacheStatus::Miss))
+        analysis
+    }
+
+    fn repository_cache_path(&self, fingerprint: &str, analysis_identity: &str) -> PathBuf {
+        let encoded_identity = analysis_identity
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.cache_dir
+            .join("repository")
+            .join("semantic")
+            .join(encoded_identity)
+            .join(format!("{fingerprint}.json"))
     }
 }
 
-fn analysis_identity(metadata: &[AnalyzerMetadata]) -> String {
-    let analyzers = metadata
+fn repository_analysis_identity(metadata: &[AnalyzerMetadata]) -> String {
+    if metadata.is_empty() {
+        "none".into()
+    } else {
+        encode_identity(
+            metadata
+                .iter()
+                .map(|metadata| (&metadata.id, &metadata.version)),
+        )
+    }
+}
+
+fn encode_identity<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>) -> String {
+    let mut pairs = pairs.into_iter().collect::<Vec<_>>();
+    pairs.sort();
+    pairs.dedup();
+    pairs
+        .into_iter()
+        .map(|(id, version)| format!("{}:{id}{}:{version}", id.len(), version.len()))
+        .collect()
+}
+
+fn workspace_analysis_identity(repository_identities: &BTreeMap<String, String>) -> String {
+    workspace_analysis_identity_with_rules(repository_identities, CORE_RULE_PACK_VERSION)
+}
+
+fn workspace_analysis_identity_with_rules(
+    repository_identities: &BTreeMap<String, String>,
+    rule_pack_version: &str,
+) -> String {
+    let repositories = repository_identities
         .iter()
-        .map(|metadata| format!("{}:{}", metadata.id, metadata.version))
-        .collect::<Vec<_>>();
-    format!(
-        "{}:core-rules:{CORE_RULE_PACK_VERSION}",
-        if analyzers.is_empty() {
-            "none".into()
-        } else {
-            analyzers.join(":")
-        }
-    )
+        .map(|(repository, identity)| {
+            format!(
+                "{}:{repository}:{}:{identity}",
+                repository.len(),
+                identity.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(":");
+    format!("repositories:{repositories}:core-rules:{rule_pack_version}")
 }
 
 fn extend_unique<T: Clone + Eq + Hash>(target: &mut Vec<T>, source: Vec<T>) {
@@ -795,14 +1119,18 @@ fn extend_unique<T: Clone + Eq + Hash>(target: &mut Vec<T>, source: Vec<T>) {
 }
 
 fn bind_graphql_resolvers(
-    repositories: &mut BTreeMap<String, CanonicalRepositoryAnalysis>,
+    repositories: &mut [AnalyzedRepository],
     bindings: Vec<GraphqlResolverCandidate>,
 ) {
     for binding in bindings {
-        let Some(repository) = repositories.get_mut(&binding.repository) else {
+        let Some(repository) = repositories
+            .iter_mut()
+            .find(|repository| repository.facts.state.repository.identity == binding.repository)
+        else {
             continue;
         };
         let fields = repository
+            .facts
             .entities
             .iter()
             .filter(|entity| entity.kind == beholder_domain::EntityKind::GraphqlField)
@@ -825,12 +1153,15 @@ fn bind_graphql_resolvers(
                 matches.next().is_none().then_some(field)
             });
         if let Some(field) = field {
-            repository.observations.push(Observation::dependency(
+            let observation = Observation::dependency(
                 field,
                 beholder_domain::DependencyRelation::ResolvedBy,
                 binding.resolver,
                 binding.evidence,
-            ));
+            );
+            if !repository.facts.observations.contains(&observation) {
+                repository.facts.observations.push(observation);
+            }
         }
     }
 }
@@ -850,9 +1181,14 @@ pub fn accepted_paths<'a>(
 mod tests {
     use super::*;
     use beholder_domain::{EntityKind, LogicalRepository, RepositoryState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeAnalyzer {
         id: &'static str,
+    }
+
+    struct ResolverAnalyzer {
+        resolver: &'static str,
     }
 
     struct FakeLanguage;
@@ -866,6 +1202,19 @@ mod tests {
     #[derive(Clone, Copy)]
     struct FakePlugin {
         id: &'static str,
+    }
+
+    #[derive(Clone)]
+    struct SourceOnlyPlugin {
+        activations: Arc<AtomicUsize>,
+        version: &'static str,
+        active: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RepositoryOnlyPlugin {
+        version: &'static str,
+        active: bool,
     }
 
     impl Plugin<FakeLanguage> for FakePlugin {
@@ -917,6 +1266,67 @@ mod tests {
         }
     }
 
+    impl Plugin<FakeLanguage> for SourceOnlyPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: "source-only".into(),
+                version: self.version.into(),
+            }
+        }
+
+        fn activate(&self, repository: &RepositorySnapshot) -> Option<PluginActivation> {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            self.active.then(|| PluginActivation {
+                path: repository.inputs[0].path.clone(),
+                reason: "source evidence".into(),
+            })
+        }
+
+        fn install(&self, builder: &mut LanguageAnalyzerBuilder<FakeLanguage>) {
+            builder.install_source_recognizer(self.clone());
+        }
+    }
+
+    impl SourceRecognizer<FakeLanguage> for SourceOnlyPlugin {
+        fn recognize(
+            &self,
+            _: SourceRecognitionInput<'_, FakeLanguage>,
+            _: &mut Vec<String>,
+        ) -> Result<(), AnalyzerError> {
+            Ok(())
+        }
+    }
+
+    impl Plugin<FakeLanguage> for RepositoryOnlyPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata {
+                id: "repository-only".into(),
+                version: self.version.into(),
+            }
+        }
+
+        fn activate(&self, repository: &RepositorySnapshot) -> Option<PluginActivation> {
+            self.active.then(|| PluginActivation {
+                path: repository.inputs[0].path.clone(),
+                reason: "repository evidence".into(),
+            })
+        }
+
+        fn install(&self, builder: &mut LanguageAnalyzerBuilder<FakeLanguage>) {
+            builder.install_repository_enricher(*self);
+        }
+    }
+
+    impl RepositoryEnricher<FakeLanguage> for RepositoryOnlyPlugin {
+        fn enrich(
+            &self,
+            _: &(),
+            _: RepositoryFactsView<'_>,
+        ) -> Result<RepositoryEnrichment, AnalyzerError> {
+            Ok(RepositoryEnrichment::default())
+        }
+    }
+
     impl WorkspaceAnalyzer for FakeAnalyzer {
         fn metadata(&self) -> AnalyzerMetadata {
             AnalyzerMetadata {
@@ -930,19 +1340,20 @@ mod tests {
                 .is_some_and(|extension| extension == "fake")
         }
 
-        fn analyze(
+        fn analyze_prepared(
             &self,
             snapshot: &WorkspaceSnapshot,
+            plan: &AnalyzerPlan,
         ) -> Result<AnalyzerContribution, AnalyzerError> {
-            Ok(AnalyzerContribution {
-                metadata: WorkspaceAnalyzer::metadata(self),
-                active_repositories: snapshot
-                    .repositories
-                    .iter()
-                    .map(|repository| repository.state.repository.identity.clone())
-                    .collect(),
-                repositories: vec![RepositoryContribution {
-                    repository: snapshot.repositories[0].state.repository.identity.clone(),
+            let repositories = snapshot
+                .repositories
+                .iter()
+                .filter(|repository| {
+                    plan.cached_repository(&repository.state.repository.identity)
+                        .is_none()
+                })
+                .map(|repository| RepositoryContribution {
+                    repository: repository.state.repository.identity.clone(),
                     completeness: AnalysisCompleteness::Complete,
                     entities: vec![EntityFact {
                         id: format!("rust-function://{}", self.id).into(),
@@ -952,14 +1363,77 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
-                }],
+                })
+                .collect::<Vec<_>>();
+            Ok(AnalyzerContribution {
+                metadata: WorkspaceAnalyzer::metadata(self),
+                active_repositories: snapshot
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.state.repository.identity.clone())
+                    .collect(),
+                cache: CacheStatistics {
+                    misses: repositories.len(),
+                    ..Default::default()
+                },
+                repositories,
                 overrides: Vec::new(),
                 graphql_resolvers: Vec::new(),
                 diagnostics: Vec::new(),
-                cache: CacheStatistics {
-                    misses: 1,
-                    ..Default::default()
-                },
+            })
+        }
+    }
+
+    impl WorkspaceAnalyzer for ResolverAnalyzer {
+        fn metadata(&self) -> AnalyzerMetadata {
+            AnalyzerMetadata {
+                id: "resolver".into(),
+                version: "1".into(),
+            }
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            path.extension()
+                .is_some_and(|extension| extension == "fake")
+        }
+
+        fn analyze_prepared(
+            &self,
+            snapshot: &WorkspaceSnapshot,
+            plan: &AnalyzerPlan,
+        ) -> Result<AnalyzerContribution, AnalyzerError> {
+            let identity = snapshot.repositories[0].state.repository.identity.clone();
+            let repositories = plan
+                .cached_repository(&identity)
+                .is_none()
+                .then(|| RepositoryContribution {
+                    repository: identity.clone(),
+                    completeness: AnalysisCompleteness::Complete,
+                    entities: vec![EntityFact {
+                        id: "graphql-field://Query/item".into(),
+                        kind: EntityKind::GraphqlField,
+                        metadata: None,
+                    }],
+                    grpc_bindings: Vec::new(),
+                    observations: Vec::new(),
+                    diagnostics: Vec::new(),
+                })
+                .into_iter()
+                .collect();
+            Ok(AnalyzerContribution {
+                metadata: self.metadata(),
+                active_repositories: vec![identity.clone()],
+                repositories,
+                overrides: Vec::new(),
+                graphql_resolvers: vec![GraphqlResolverCandidate {
+                    repository: identity,
+                    field: "item".into(),
+                    parent: Some("Query".into()),
+                    resolver: self.resolver.into(),
+                    evidence: "resolver evidence".into(),
+                }],
+                diagnostics: Vec::new(),
+                cache: CacheStatistics::default(),
             })
         }
     }
@@ -1023,6 +1497,126 @@ mod tests {
         let _ = fs::remove_dir_all(cache_dir);
     }
 
+    #[test]
+    fn persisted_repository_analysis_is_reused_after_restart() {
+        let cache_dir = cache_dir("restart");
+        let first = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "fake" })
+            .build()
+            .unwrap();
+        assert_eq!(
+            first.analyze(&snapshot()).unwrap().repositories[0].cache,
+            CacheStatus::Miss
+        );
+        drop(first);
+
+        let restarted = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "fake" })
+            .build()
+            .unwrap();
+        assert_eq!(
+            restarted.analyze(&snapshot()).unwrap().repositories[0].cache,
+            CacheStatus::Disk
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn prepared_plan_rejects_a_changed_repository_snapshot() {
+        let cache_dir = cache_dir("immutable-plan");
+        let indexer = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "fake" })
+            .build()
+            .unwrap();
+        let original = snapshot();
+        let plan = indexer.prepare(&original);
+        let mut changed = original.clone();
+        changed.repositories[0].state.fingerprint = "changed".into();
+
+        let error = indexer.analyze_prepared(&changed, &plan).err().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "prepared analysis plan does not match workspace repositories"
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn prepared_plan_rejects_duplicate_repository_identities() {
+        let cache_dir = cache_dir("duplicate-repositories");
+        let indexer = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "fake" })
+            .build()
+            .unwrap();
+        let mut duplicated = snapshot();
+        duplicated
+            .repositories
+            .push(duplicated.repositories[0].clone());
+
+        let error = indexer.analyze(&duplicated).err().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "workspace snapshot contains duplicate repository identities"
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn cached_analyzer_views_do_not_include_other_analyzers_facts() {
+        let cache_dir = cache_dir("analyzer-cache-views");
+        let indexer = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "first" })
+            .add_analyzer(FakeAnalyzer { id: "second" })
+            .build()
+            .unwrap();
+        let snapshot = snapshot();
+        indexer.analyze(&snapshot).unwrap();
+
+        let plan = indexer.prepare(&snapshot);
+        for analyzer in &plan.analyzers {
+            let cached = analyzer.cached_repository("example/repo").unwrap();
+            assert_eq!(cached.entities.len(), 1);
+            assert_eq!(
+                cached.entities[0].id.as_str(),
+                format!("rust-function://{}", analyzer.analyzer.id)
+            );
+        }
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn workspace_rules_apply_after_repository_cache_reuse() {
+        let cache_dir = cache_dir("post-cache-workspace-rules");
+        let first = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(ResolverAnalyzer {
+                resolver: "elixir-function://First.resolve/3",
+            })
+            .build()
+            .unwrap()
+            .analyze(&snapshot())
+            .unwrap();
+        assert_eq!(first.repositories[0].cache, CacheStatus::Miss);
+
+        let second = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(ResolverAnalyzer {
+                resolver: "elixir-function://Second.resolve/3",
+            })
+            .build()
+            .unwrap()
+            .analyze(&snapshot())
+            .unwrap();
+
+        assert_eq!(second.repositories[0].cache, CacheStatus::Disk);
+        assert_eq!(second.repositories[0].facts.observations.len(), 1);
+        assert_eq!(
+            second.repositories[0].facts.observations[0].to.as_str(),
+            "elixir-function://Second.resolve/3"
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
     #[tokio::test]
     async fn enrichment_is_separate_from_baseline_analysis() {
         let cache_dir = cache_dir("enrichment");
@@ -1035,8 +1629,8 @@ mod tests {
         let baseline = indexer.analyze(&snapshot()).unwrap();
         let enrichment = indexer.enrich(snapshot(), "semantic").await.unwrap();
 
-        assert!(baseline.analysis_identity.contains("syntax:1"));
-        assert!(!baseline.analysis_identity.contains("semantic:1"));
+        assert!(baseline.analysis_identity.contains("6:syntax1:1"));
+        assert!(!baseline.analysis_identity.contains("8:semantic1:1"));
         assert_eq!(
             baseline.repositories[0].facts.entities[0].id.as_str(),
             "rust-function://syntax"
@@ -1190,7 +1784,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(active.identity(), "active:1");
+        assert_eq!(active.identity(), "6:active1:1");
         assert_eq!(analysis, ["active"]);
         assert_eq!(
             active.plugins().next().unwrap().activation,
@@ -1230,6 +1824,112 @@ mod tests {
                 .activate(&snapshot().repositories[0], false)
                 .identity(),
             ""
+        );
+    }
+
+    #[test]
+    fn prepared_repository_scopes_plugin_identities_by_capability() {
+        let activations = Arc::new(AtomicUsize::new(0));
+        let analyzer = LanguageAnalyzerBuilder::<FakeLanguage>::new()
+            .add_plugin(SourceOnlyPlugin {
+                activations: Arc::clone(&activations),
+                version: "2",
+                active: true,
+            })
+            .add_plugin(RepositoryOnlyPlugin {
+                version: "3",
+                active: true,
+            })
+            .build()
+            .unwrap();
+        let repository = &snapshot().repositories[0];
+
+        let prepared = analyzer
+            .prepare_repository(
+                AnalyzerMetadata {
+                    id: "fake".into(),
+                    version: "frontend:resolver".into(),
+                },
+                repository,
+                true,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(activations.load(Ordering::SeqCst), 1);
+        assert_eq!(prepared.source_plugins, "11:source-only1:2");
+        assert_eq!(
+            prepared.analysis.version,
+            "17:frontend:resolver38:15:repository-only1:311:source-only1:2"
+        );
+        assert_eq!(prepared.active_plugins.plugins().count(), 2);
+    }
+
+    #[test]
+    fn plugin_version_changes_invalidate_only_their_capability_boundaries() {
+        let prepare = |source_version, source_active, repository_version, repository_active| {
+            let analyzer = LanguageAnalyzerBuilder::<FakeLanguage>::new()
+                .add_plugin(SourceOnlyPlugin {
+                    activations: Arc::new(AtomicUsize::new(0)),
+                    version: source_version,
+                    active: source_active,
+                })
+                .add_plugin(RepositoryOnlyPlugin {
+                    version: repository_version,
+                    active: repository_active,
+                })
+                .build()
+                .unwrap();
+            analyzer
+                .prepare_repository(
+                    AnalyzerMetadata {
+                        id: "fake".into(),
+                        version: "frontend:resolver".into(),
+                    },
+                    &snapshot().repositories[0],
+                    true,
+                    true,
+                )
+                .unwrap()
+        };
+
+        let baseline = prepare("1", true, "1", true);
+        let source_changed = prepare("2", true, "1", true);
+        let repository_changed = prepare("1", true, "2", true);
+        let inactive_changed = prepare("1", true, "2", false);
+        let inactive_changed_again = prepare("1", true, "3", false);
+
+        assert_ne!(baseline.source_plugins, source_changed.source_plugins);
+        assert_ne!(baseline.analysis, source_changed.analysis);
+        assert_eq!(baseline.source_plugins, repository_changed.source_plugins);
+        assert_ne!(baseline.analysis, repository_changed.analysis);
+        assert_eq!(
+            inactive_changed.source_plugins,
+            inactive_changed_again.source_plugins
+        );
+        assert_eq!(inactive_changed.analysis, inactive_changed_again.analysis);
+    }
+
+    #[test]
+    fn workspace_identity_is_repository_scoped_and_rule_versioned() {
+        let repositories = BTreeMap::from([
+            ("b/repo".into(), "rust:1:plugin:2".into()),
+            ("a/repo".into(), "csharp:1".into()),
+        ]);
+
+        let identity = workspace_analysis_identity(&repositories);
+
+        assert!(identity.starts_with("repositories:6:a/repo:8:csharp:1"));
+        assert!(identity.contains("6:b/repo:15:rust:1:plugin:2"));
+        assert!(identity.ends_with(":core-rules:5"));
+        assert!(!repository_analysis_identity(&[]).contains("core-rules"));
+        assert_ne!(
+            identity,
+            workspace_analysis_identity_with_rules(&repositories, "6")
+        );
+        assert_ne!(
+            encode_identity([(&"a".into(), &"b:c".into())]),
+            encode_identity([(&"a:b".into(), &"c".into())])
         );
     }
 }
