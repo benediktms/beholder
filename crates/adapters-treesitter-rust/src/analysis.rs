@@ -2,6 +2,7 @@ use super::{
     model::*,
     plugin::{RustLanguage, built_in_plugins},
 };
+use beholder_adapters_treesitter::recover;
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, StructuralRelation, UnsafeTreeRecovery,
@@ -109,46 +110,21 @@ fn collect_tree_sitter_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<Rust
     }
 }
 
-fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.is_error() || node.is_missing() {
-            lines.push(node.start_position().row + 1);
-            *missing |= node.is_missing();
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor));
-    }
-}
-
 fn analyze_tree_sitter(
     source: &str,
     tree: &tree_sitter::Tree,
 ) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
     let source_bytes = source.as_bytes();
     let root = tree.root_node();
-    let mut parse_error_lines = Vec::new();
-    let mut missing = false;
-    collect_parse_errors(root, &mut parse_error_lines, &mut missing);
-    if missing {
-        return Err(UnsafeTreeRecovery::new("Rust", "missing syntax may change nesting").into());
-    }
-    parse_error_lines.sort_unstable();
-    parse_error_lines.dedup();
+    let recovery = recover(root)
+        .map_err(|_| UnsafeTreeRecovery::new("Rust", "missing syntax may change nesting"))?;
+    let incomplete = recovery.is_incomplete();
     let mut functions = Vec::new();
-    if parse_error_lines.is_empty() {
+    for root in recovery.roots {
         collect_tree_sitter_functions(root, source_bytes, &mut Vec::new(), &mut functions);
-    } else {
-        let mut cursor = root.walk();
-        for child in root
-            .named_children(&mut cursor)
-            .filter(|child| !child.has_error())
-        {
-            collect_tree_sitter_functions(child, source_bytes, &mut Vec::new(), &mut functions);
-        }
-        if functions.is_empty() {
-            return Err(UnsafeTreeRecovery::new("Rust", "no unaffected definitions remain").into());
-        }
+    }
+    if incomplete && functions.is_empty() {
+        return Err(UnsafeTreeRecovery::new("Rust", "no unaffected definitions remain").into());
     }
     Ok(RustAnalysis {
         functions: functions
@@ -168,7 +144,7 @@ fn analyze_tree_sitter(
             })
             .collect(),
         tonic: Default::default(),
-        parse_error_lines,
+        parse_error_lines: recovery.error_lines,
     })
 }
 

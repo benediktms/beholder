@@ -2,6 +2,7 @@ use super::{
     model::*,
     plugin::{TypescriptLanguage, built_in_plugins},
 };
+use beholder_adapters_treesitter::{ErrorDisposition, Recovery, RecoveryFailure, recover_with};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
     Observation, Provenance, StructuralRelation, UnsafeTreeRecovery,
@@ -930,7 +931,7 @@ fn collect_definitions(
     }
 }
 
-fn collect_parse_errors(node: Node<'_>, source: &[u8], lines: &mut Vec<usize>, missing: &mut bool) {
+fn known_grammar_error(node: Node<'_>, source: &[u8]) -> ErrorDisposition {
     // Remove this recovery once the grammar includes
     // https://github.com/tree-sitter/tree-sitter-typescript/pull/358.
     let type_only_star_export = node.is_error()
@@ -940,14 +941,18 @@ fn collect_parse_errors(node: Node<'_>, source: &[u8], lines: &mut Vec<usize>, m
                 && text(parent, source)
                     .is_some_and(|statement| statement.starts_with("export type * from"))
         });
-    if (node.is_error() && !type_only_star_export) || node.is_missing() {
-        lines.push(node.start_position().row + 1);
-        *missing |= node.is_missing();
+    if type_only_star_export {
+        ErrorDisposition::IgnoreKnownGrammarBug
+    } else {
+        ErrorDisposition::Report
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_parse_errors(child, source, lines, missing);
-    }
+}
+
+pub(super) fn recover_syntax<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+) -> Result<Recovery<'tree>, RecoveryFailure> {
+    recover_with(root, |node| known_grammar_error(node, source))
 }
 
 fn mask_jsx_attribute_ampersands(source: &str) -> Option<Vec<u8>> {
@@ -1055,33 +1060,12 @@ pub(super) fn analyze_with_plugins(
     let mut exports = Vec::new();
     let mut string_constants = Vec::new();
     let mut graphql_documents = Vec::new();
-    let mut parse_error_lines = Vec::new();
     let root = tree.root_node();
-    let mut missing = false;
-    collect_parse_errors(
-        root,
-        source.as_bytes(),
-        &mut parse_error_lines,
-        &mut missing,
-    );
-    if missing {
-        return Err(UnsafeTreeRecovery::new(
-            "JavaScript/TypeScript",
-            "missing syntax may change nesting",
-        )
-        .into());
-    }
-    parse_error_lines.sort_unstable();
-    parse_error_lines.dedup();
-    let roots = if parse_error_lines.is_empty() {
-        vec![root]
-    } else {
-        let mut cursor = root.walk();
-        root.named_children(&mut cursor)
-            .filter(|child| !child.has_error())
-            .collect()
-    };
-    for root in roots {
+    let recovery = recover_syntax(root, source.as_bytes()).map_err(|_| {
+        UnsafeTreeRecovery::new("JavaScript/TypeScript", "missing syntax may change nesting")
+    })?;
+    let incomplete = recovery.is_incomplete();
+    for root in recovery.roots {
         collect_definitions(root, source.as_bytes(), &mut Vec::new(), &mut definitions);
         collect_top_level_call(root, source.as_bytes(), &mut calls);
         collect_imports(root, source.as_bytes(), &mut imports);
@@ -1089,7 +1073,7 @@ pub(super) fn analyze_with_plugins(
         collect_string_constants(root, source.as_bytes(), &mut string_constants);
         collect_graphql_documents(root, source.as_bytes(), &mut graphql_documents);
     }
-    if !parse_error_lines.is_empty() && definitions.is_empty() && calls.is_empty() {
+    if incomplete && definitions.is_empty() && calls.is_empty() {
         return Err(UnsafeTreeRecovery::new(
             "JavaScript/TypeScript",
             "no unaffected definitions remain",
@@ -1107,7 +1091,7 @@ pub(super) fn analyze_with_plugins(
         nest_modules: Vec::new(),
         nest_providers: Vec::new(),
         generated: false,
-        parse_error_lines,
+        parse_error_lines: recovery.error_lines,
     };
     plugins.recognize(
         SourceRecognitionInput {
@@ -1368,6 +1352,45 @@ mod tests {
 
         assert!(analysis.parse_error_lines.is_empty());
         assert!(analysis.exports.is_empty());
+    }
+
+    #[test]
+    fn preserves_ignored_grammar_siblings_during_recovery() {
+        let source = "export type * from './items';\nconst = ;\nexport function safe() {}";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let recovery = recover_syntax(tree.root_node(), source.as_bytes()).unwrap();
+        let roots = recovery
+            .roots
+            .iter()
+            .map(|root| text(*root, source.as_bytes()).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(recovery.is_incomplete());
+        assert!(roots.contains(&"export type * from './items';"));
+        assert!(roots.contains(&"export function safe() {}"));
+        assert!(!roots.contains(&"const = ;"));
+    }
+
+    #[test]
+    fn ignored_errors_do_not_hide_missing_syntax() {
+        let source = "function broken() {\nfunction nested() {}";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+
+        let error = beholder_adapters_treesitter::recover_with(tree.root_node(), |_| {
+            ErrorDisposition::IgnoreKnownGrammarBug
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, RecoveryFailure::MissingSyntax { .. }));
     }
 
     #[test]

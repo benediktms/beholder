@@ -1,4 +1,5 @@
 use super::model::*;
+use beholder_adapters_treesitter::recover;
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, EntityFact, EntityKind, Observation,
     Provenance, StructuralRelation, UnsafeTreeRecovery,
@@ -325,17 +326,6 @@ fn collect_definitions(
     }
 }
 
-fn collect_parse_errors(node: Node<'_>, lines: &mut Vec<usize>, missing: &mut bool) {
-    if node.is_error() || node.is_missing() {
-        lines.push(node.start_position().row + 1);
-        *missing |= node.is_missing();
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_parse_errors(child, lines, missing);
-    }
-}
-
 pub fn analyze(source: &str) -> Result<CsharpAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into())?;
@@ -343,32 +333,19 @@ pub fn analyze(source: &str) -> Result<CsharpAnalysis, Box<dyn Error + Send + Sy
         .parse(source, None)
         .ok_or("C# parser returned no tree")?;
     let mut definitions = Vec::new();
-    let mut parse_error_lines = Vec::new();
     let root = tree.root_node();
-    let mut missing = false;
-    collect_parse_errors(root, &mut parse_error_lines, &mut missing);
-    if missing {
-        return Err(UnsafeTreeRecovery::new("C#", "missing syntax may change nesting").into());
-    }
-    parse_error_lines.sort_unstable();
-    parse_error_lines.dedup();
-    if parse_error_lines.is_empty() {
+    let recovery = recover(root)
+        .map_err(|_| UnsafeTreeRecovery::new("C#", "missing syntax may change nesting"))?;
+    let incomplete = recovery.is_incomplete();
+    for root in recovery.roots {
         collect_definitions(root, source.as_bytes(), &[], &mut definitions);
-    } else {
-        let mut cursor = root.walk();
-        for child in root
-            .named_children(&mut cursor)
-            .filter(|child| !child.has_error())
-        {
-            collect_definitions(child, source.as_bytes(), &[], &mut definitions);
-        }
-        if definitions.is_empty() {
-            return Err(UnsafeTreeRecovery::new("C#", "no unaffected definitions remain").into());
-        }
+    }
+    if incomplete && definitions.is_empty() {
+        return Err(UnsafeTreeRecovery::new("C#", "no unaffected definitions remain").into());
     }
     Ok(CsharpAnalysis {
         definitions,
-        parse_error_lines,
+        parse_error_lines: recovery.error_lines,
     })
 }
 

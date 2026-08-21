@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+beholder-adapters-treesitter.workspace = true
 beholder-domain.workspace = true
 beholder-indexing.workspace = true
 quick-xml.workspace = true
