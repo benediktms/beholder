@@ -5,6 +5,7 @@ mod analysis;
 mod analyzer;
 mod dotnet_di;
 mod model;
+mod plugin;
 mod project;
 mod resolution;
 mod unity;

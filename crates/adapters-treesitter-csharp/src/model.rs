@@ -1,9 +1,24 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use super::project::CsharpProject;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CsharpAnalysis {
     pub(super) definitions: Vec<Definition>,
     pub(super) parse_error_lines: Vec<usize>,
+}
+
+pub(super) struct CsharpRepository {
+    pub(super) repository: String,
+    pub(super) projects: Vec<CsharpProject>,
+    pub(super) sources: Vec<CsharpRepositorySource>,
+}
+
+pub(super) struct CsharpRepositorySource {
+    pub(super) path: PathBuf,
+    pub(super) assembly: String,
+    pub(super) analysis: CsharpAnalysis,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
