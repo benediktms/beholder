@@ -8,6 +8,11 @@ The worker itself does not compile the target project. It starts a separate Mix
 VM with Beholder's compiler tracer on its code path, preserves existing project
 tracers, and directs compilation output to a Beholder-owned build directory.
 
+When `OTEL_EXPORTER_OTLP_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is configured, the worker exports OTLP/HTTP
+traces as `beholder-worker-elixir`. It extracts W3C trace context from the local
+gRPC request so compiler analysis appears beneath the daemon's worker span.
+
 ## Development
 
 From this directory:

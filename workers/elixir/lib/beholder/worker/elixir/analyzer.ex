@@ -1,7 +1,7 @@
 defmodule Beholder.Worker.Elixir.Analyzer do
   @moduledoc false
 
-  alias Beholder.Worker.Elixir.{Compiler, EventMapper, Snapshot}
+  alias Beholder.Worker.Elixir.{Compiler, EventMapper, Observability, Snapshot}
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
   alias Beholder.Worker.V1.{
@@ -31,26 +31,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
   end
 
   defp analyze_repository(repository, cache_dir) do
-    {contribution, runtime} =
-      case Compiler.run(repository, cache_dir) do
-        {:ok, result} ->
-          {EventMapper.contribution(repository, result),
-           {result.elixir_version, result.otp_release}}
-
-        {:error, reason} ->
-          {%RepositoryContribution{
-             repository: repository.identity,
-             completeness: :ANALYSIS_COMPLETENESS_INCOMPLETE,
-             diagnostics: [
-               %AnalysisDiagnostic{
-                 code: "elixir.compiler.unavailable",
-                 severity: :ANALYSIS_DIAGNOSTIC_SEVERITY_WARNING,
-                 path: "mix.exs",
-                 detail: reason
-               }
-             ]
-           }, {System.version(), :erlang.system_info(:otp_release) |> to_string()}}
-      end
+    {contribution, runtime} = compiler_contribution(repository, cache_dir)
 
     completed = %AnalysisCompleted{
       metadata: %AnalyzerMetadata{id: "elixir", version: metadata_version(runtime)},
@@ -64,6 +45,47 @@ defmodule Beholder.Worker.Elixir.Analyzer do
       |> Enum.map(&%AnalyzeEvent{event: {:repository, &1}})
 
     {:ok, repository_events ++ [%AnalyzeEvent{event: {:completed, completed}}]}
+  end
+
+  defp compiler_contribution(repository, cache_dir) do
+    Observability.with_span(
+      "worker.elixir.semantic_analysis",
+      %{
+        "repository" => repository.identity,
+        "source.count" => length(Repository.source_inputs(repository)),
+        "mix.env" => System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "dev")
+      },
+      fn ->
+        case Compiler.run(repository, cache_dir) do
+          {:ok, result} ->
+            contribution = EventMapper.contribution(repository, result)
+
+            Observability.set_attributes(%{
+              "entity.count" => length(contribution.entities),
+              "observation.count" => length(contribution.observations),
+              "diagnostic.count" => length(contribution.diagnostics)
+            })
+
+            {contribution, {result.elixir_version, result.otp_release}}
+
+          {:error, reason} ->
+            Observability.set_error(reason)
+
+            {%RepositoryContribution{
+               repository: repository.identity,
+               completeness: :ANALYSIS_COMPLETENESS_INCOMPLETE,
+               diagnostics: [
+                 %AnalysisDiagnostic{
+                   code: "elixir.compiler.unavailable",
+                   severity: :ANALYSIS_DIAGNOSTIC_SEVERITY_WARNING,
+                   path: "mix.exs",
+                   detail: reason
+                 }
+               ]
+             }, {System.version(), :erlang.system_info(:otp_release) |> to_string()}}
+        end
+      end
+    )
   end
 
   @doc false

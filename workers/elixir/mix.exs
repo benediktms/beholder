@@ -13,13 +13,19 @@ defmodule BeholderWorkerElixir.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger]]
+    [
+      extra_applications: [:logger],
+      included_applications: [:opentelemetry, :opentelemetry_exporter]
+    ]
   end
 
   defp deps do
     [
       {:grpc, "~> 1.0"},
       {:grpc_server, "~> 1.0"},
+      {:opentelemetry, "~> 1.5"},
+      {:opentelemetry_api, "~> 1.4"},
+      {:opentelemetry_exporter, "~> 1.9"},
       {:protobuf, "~> 0.14"},
       {:protobuf_generate, "~> 0.2.1", only: [:dev, :test], runtime: false}
     ]

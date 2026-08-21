@@ -6,6 +6,7 @@ defmodule Beholder.Worker.Elixir.CLI do
   def main(arguments) do
     with {:ok, options} <- parse(arguments),
          :ok <- prepare_socket(options.socket),
+         :ok <- Beholder.Worker.Elixir.Observability.start(),
          {:ok, _} <- Application.ensure_all_started(:grpc_server),
          :ok <- configure(options.cache_dir),
          {:ok, _pid, _port} <- start_server(options.socket),
