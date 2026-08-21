@@ -15,7 +15,8 @@ use super::{
     },
 };
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, FactChanges, RepositoryFacts, WorkspaceView,
+    AnalysisDiagnostic, DependencyOverride, EntityFact, FactChanges, Observation, RepositoryFacts,
+    WorkspaceView,
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
@@ -48,6 +49,14 @@ pub struct SemanticStore {
     pub(super) db: DbInstance,
     pub(super) read_db: DbInstance,
     pub(super) database_path: Option<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct EnrichmentPayload<'a> {
+    pub entities: &'a [EntityFact],
+    pub observations: &'a [Observation],
+    pub overrides: &'a [DependencyOverride],
+    pub diagnostics: &'a [(String, AnalysisDiagnostic)],
 }
 
 impl SemanticStore {
@@ -147,21 +156,9 @@ impl SemanticStore {
         view: &WorkspaceView,
         analyzer: &str,
         version: &str,
-        entities: &[beholder_domain::EntityFact],
-        observations: &[beholder_domain::Observation],
-        overrides: &[DependencyOverride],
-        diagnostics: &[(String, AnalysisDiagnostic)],
+        payload: EnrichmentPayload<'_>,
     ) -> Result<bool, Box<dyn Error>> {
-        publish_enrichment(
-            &self.db,
-            view,
-            analyzer,
-            version,
-            entities,
-            observations,
-            overrides,
-            diagnostics,
-        )
+        publish_enrichment(&self.db, view, analyzer, version, payload)
     }
 
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {

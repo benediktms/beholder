@@ -1,5 +1,5 @@
 use super::{IndexScheduler, pipeline};
-use beholder_adapters_mnestic::SemanticStore;
+use beholder_adapters_mnestic::{EnrichmentPayload, SemanticStore};
 use beholder_domain::WorkspaceView;
 use beholder_indexing::{AnalyzerMetadata, WorkspaceSnapshot};
 use std::{collections::BTreeMap, error::Error, sync::Arc};
@@ -98,10 +98,12 @@ impl IndexScheduler {
                     &job.view,
                     &job.analyzer.id,
                     &job.analyzer.version,
-                    &entities,
-                    &observations,
-                    &contribution.overrides,
-                    &diagnostics,
+                    EnrichmentPayload {
+                        entities: &entities,
+                        observations: &observations,
+                        overrides: &contribution.overrides,
+                        diagnostics: &diagnostics,
+                    },
                 )
                 .map_err(|error| error.to_string())
         })
@@ -170,10 +172,7 @@ impl IndexScheduler {
                     view,
                     &analyzer.id,
                     &analyzer.version,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
+                    EnrichmentPayload::default(),
                 )?;
             }
         }

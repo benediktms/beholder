@@ -205,7 +205,18 @@ defmodule Beholder.Worker.Elixir.Compiler do
         receive do
           {^port, {:exit_status, _status}} -> :ok
         after
-          @termination_grace_ms -> signal(pid, "KILL", process_group?)
+          @termination_grace_ms -> :ok
+        end
+
+        # The direct process can exit before all of its descendants. Signal the
+        # group again after it exits or the grace period expires so no compiler
+        # children survive a timed-out enrichment.
+        signal(pid, "KILL", process_group?)
+
+        receive do
+          {^port, {:exit_status, _status}} -> :ok
+        after
+          @termination_grace_ms -> :ok
         end
 
       nil ->

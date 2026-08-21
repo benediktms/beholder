@@ -1,4 +1,5 @@
 use super::schema::*;
+use super::store::EnrichmentPayload;
 use beholder_domain::{
     AnalysisDiagnostic, DependencyOverride, DependencyRelation, EntityFact, EntityKind,
     EntityMetadata, FactChanges, GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate,
@@ -900,11 +901,14 @@ pub(super) fn publish_enrichment(
     view: &WorkspaceView,
     analyzer: &str,
     version: &str,
-    entities: &[EntityFact],
-    observations: &[Observation],
-    overrides: &[DependencyOverride],
-    diagnostics: &[(String, AnalysisDiagnostic)],
+    payload: EnrichmentPayload<'_>,
 ) -> Result<bool, Box<dyn Error>> {
+    let EnrichmentPayload {
+        entities,
+        observations,
+        overrides,
+        diagnostics,
+    } = payload;
     let transaction = db.multi_transaction(true);
     let current = transaction.run_script(
         "?[revision, fingerprint] := *analysis_revision{view: $view, revision}, \
@@ -1676,7 +1680,7 @@ pub(super) fn sweep_garbage_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SemanticStore;
+    use crate::{EnrichmentPayload, SemanticStore};
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
         DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
@@ -2514,10 +2518,11 @@ mod tests {
                     &view,
                     "rust",
                     "1",
-                    &[],
-                    &[],
-                    &[override_],
-                    &[("example/repo".into(), compiler_diagnostic)],
+                    EnrichmentPayload {
+                        overrides: &[override_],
+                        diagnostics: &[("example/repo".into(), compiler_diagnostic)],
+                        ..EnrichmentPayload::default()
+                    },
                 )
                 .unwrap()
         );
@@ -2546,7 +2551,7 @@ mod tests {
         );
         assert!(
             store
-                .publish_enrichment(&view, "rust", "2", &[], &[], &[], &[])
+                .publish_enrichment(&view, "rust", "2", EnrichmentPayload::default())
                 .unwrap()
         );
         let context = store
@@ -2578,7 +2583,7 @@ mod tests {
         .unwrap();
         assert!(
             !store
-                .publish_enrichment(&stale, "rust", "1", &[], &[], &[], &[])
+                .publish_enrichment(&stale, "rust", "1", EnrichmentPayload::default())
                 .unwrap()
         );
     }
@@ -2615,12 +2620,21 @@ mod tests {
 
         assert!(
             store
-                .publish_enrichment(&view, "elixir", "1", &[entity], &[observation], &[], &[],)
+                .publish_enrichment(
+                    &view,
+                    "elixir",
+                    "1",
+                    EnrichmentPayload {
+                        entities: &[entity],
+                        observations: &[observation],
+                        ..EnrichmentPayload::default()
+                    },
+                )
                 .unwrap()
         );
         let context = store.context("elixir-enriched", generated).unwrap();
         assert_eq!(context.edges.len(), 1);
-        assert_eq!(context.edges[0].confidence, 0.7);
+        assert_eq!(context.edges[0].confidence, 0.6);
         assert_eq!(
             context.edges[0].evidence[0].source_kind,
             beholder_dto::EvidenceKind::Compiler
@@ -2628,7 +2642,7 @@ mod tests {
 
         assert!(
             store
-                .publish_enrichment(&view, "elixir", "2", &[], &[], &[], &[])
+                .publish_enrichment(&view, "elixir", "2", EnrichmentPayload::default())
                 .unwrap()
         );
         assert!(

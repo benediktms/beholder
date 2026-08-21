@@ -8,7 +8,7 @@ mod storage;
 mod store;
 
 pub use inspection::{InspectionResult, InspectionValue};
-pub use store::SemanticStore;
+pub use store::{EnrichmentPayload, SemanticStore};
 
 #[cfg(feature = "devtools")]
 use database::persistent_database;

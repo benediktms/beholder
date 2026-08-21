@@ -96,7 +96,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     fake_mix =
       fake_mix(
         root,
-        "yes compiler-output | head -c 4096\nsleep 30 &\necho $! > #{shell_quote(child_pid)}\nwait"
+        "yes compiler-output | head -c 4096\n(trap '' TERM; sleep 30) &\necho $! > #{shell_quote(child_pid)}\nwait"
       )
 
     File.write!(Path.join(root, "mix.exs"), "original")
