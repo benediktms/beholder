@@ -1,2 +1,5 @@
 /target
 /.moon/cache
+/workers/elixir/_build
+/workers/elixir/deps
+/workers/elixir/beholder-worker-elixir

@@ -156,6 +156,29 @@ pub(super) const CREATE_ENRICHMENT_DIAGNOSTIC_OWNER_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ENRICHMENT_ENTITY_OWNER_SCHEMA: &str = r#"
+:create analysis_revision_enrichment_entity_owner {
+    view: String,
+    revision: Int,
+    id: String,
+    =>
+    analyzer: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA: &str = r#"
+:create analysis_revision_enrichment_observation_owner {
+    view: String,
+    revision: Int,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    analyzer: String,
+}
+"#;
+
 pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \

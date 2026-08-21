@@ -66,6 +66,16 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_ENRICHMENT_ENTITY_OWNER_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_OBSERVATION_TO_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -246,6 +256,14 @@ pub(super) fn persistent_database(
         (
             "analysis_revision_enrichment_diagnostic_owner",
             CREATE_ENRICHMENT_DIAGNOSTIC_OWNER_SCHEMA,
+        ),
+        (
+            "analysis_revision_enrichment_entity_owner",
+            CREATE_ENRICHMENT_ENTITY_OWNER_SCHEMA,
+        ),
+        (
+            "analysis_revision_enrichment_observation_owner",
+            CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA,
         ),
     ] {
         if initialize

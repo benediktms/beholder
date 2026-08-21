@@ -30,8 +30,6 @@ tasks:
 
   lint:
     command: 'cargo clippy --workspace --all-targets --no-deps -- -D warnings'
-    deps:
-      - 'format-check'
     inputs:
       - '@group(sources)'
 
@@ -52,6 +50,16 @@ tasks:
     command: 'cargo build --release -p beholder-cli -p beholder-daemon -p beholder-worker-rust'
     inputs:
       - '@group(sources)'
+    options:
+      cache: false
+      runInCI: false
+
+  release-all:
+    command: 'true'
+    deps:
+      - 'release'
+      - 'worker-elixir:release'
+    toolchains: 'system'
     options:
       cache: false
       runInCI: false

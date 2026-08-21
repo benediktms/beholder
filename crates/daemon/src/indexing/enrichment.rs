@@ -1,5 +1,5 @@
 use super::{IndexScheduler, pipeline};
-use beholder_adapters_mnestic::SemanticStore;
+use beholder_adapters_mnestic::{EnrichmentPayload, SemanticStore};
 use beholder_domain::WorkspaceView;
 use beholder_indexing::{AnalyzerMetadata, WorkspaceSnapshot};
 use std::{collections::BTreeMap, error::Error, sync::Arc};
@@ -78,18 +78,18 @@ impl IndexScheduler {
             .await
             .map_err(|error| error.to_string())?;
         let mut diagnostics = contribution.diagnostics;
-        diagnostics.extend(
-            contribution
-                .repositories
-                .into_iter()
-                .flat_map(|repository| {
-                    let identity = repository.repository;
-                    repository
-                        .diagnostics
-                        .into_iter()
-                        .map(move |diagnostic| (identity.clone(), diagnostic))
-                }),
-        );
+        let mut entities = Vec::new();
+        let mut observations = Vec::new();
+        for repository in contribution.repositories {
+            entities.extend(repository.entities);
+            observations.extend(repository.observations);
+            diagnostics.extend(
+                repository
+                    .diagnostics
+                    .into_iter()
+                    .map(|diagnostic| (repository.repository.clone(), diagnostic)),
+            );
+        }
         pipeline::report_analysis_diagnostics(&job.view.name, &diagnostics);
         let store = Arc::clone(store);
         tokio::task::spawn_blocking(move || {
@@ -98,8 +98,12 @@ impl IndexScheduler {
                     &job.view,
                     &job.analyzer.id,
                     &job.analyzer.version,
-                    &contribution.overrides,
-                    &diagnostics,
+                    EnrichmentPayload {
+                        entities: &entities,
+                        observations: &observations,
+                        overrides: &contribution.overrides,
+                        diagnostics: &diagnostics,
+                    },
                 )
                 .map_err(|error| error.to_string())
         })
@@ -164,7 +168,12 @@ impl IndexScheduler {
                     );
                 queued = true;
             } else {
-                store.publish_enrichment(view, &analyzer.id, &analyzer.version, &[], &[])?;
+                store.publish_enrichment(
+                    view,
+                    &analyzer.id,
+                    &analyzer.version,
+                    EnrichmentPayload::default(),
+                )?;
             }
         }
         if queued {

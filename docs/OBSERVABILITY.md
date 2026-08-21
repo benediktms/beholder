@@ -35,9 +35,12 @@ an instrumented span include top-level `trace_id` and `span_id` fields, allowing
 local tooling to find the corresponding trace without querying the OTLP log
 store. Events outside a span omit both fields.
 
-The Rust analyzer worker exports as the separate `beholder-worker-rust`
-service. Its analysis spans are linked to the daemon trace through W3C trace
-context propagated over the local worker gRPC request.
+The Rust and Elixir analyzer workers export as the separate
+`beholder-worker-rust` and `beholder-worker-elixir` services. Their analysis
+spans are linked to the daemon trace through W3C trace context propagated over
+the local worker gRPC request. The Elixir worker currently exports traces only;
+OpenTelemetry logs for Erlang/Elixir are still developmental, so its local
+Logger output remains on stderr.
 
 Use `beholder daemon run` instead of `start` when foreground output is useful.
 
