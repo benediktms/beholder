@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
@@ -111,13 +111,33 @@ pub struct WorkspaceView {
     pub name: String,
     pub analysis_identity: String,
     pub repository_states: Vec<RepositoryState>,
+    repository_analysis_identities: BTreeMap<String, String>,
 }
 
 impl WorkspaceView {
     pub fn new(
         name: impl Into<String>,
         analysis_identity: impl Into<String>,
+        repository_states: Vec<RepositoryState>,
+    ) -> Result<Self, String> {
+        let analysis_identity = analysis_identity.into();
+        let repository_analysis_identities = repository_states
+            .iter()
+            .map(|state| (state.repository.identity.clone(), analysis_identity.clone()))
+            .collect();
+        Self::new_scoped(
+            name,
+            analysis_identity,
+            repository_states,
+            repository_analysis_identities,
+        )
+    }
+
+    pub fn new_scoped(
+        name: impl Into<String>,
+        analysis_identity: impl Into<String>,
         mut repository_states: Vec<RepositoryState>,
+        repository_analysis_identities: BTreeMap<String, String>,
     ) -> Result<Self, String> {
         let name = name.into();
         let analysis_identity = analysis_identity.into();
@@ -141,10 +161,23 @@ impl WorkspaceView {
                 duplicate[0].repository.identity
             ));
         }
+        if repository_analysis_identities.len() != repository_states.len()
+            || repository_states.iter().any(|state| {
+                repository_analysis_identities
+                    .get(&state.repository.identity)
+                    .is_none_or(String::is_empty)
+            })
+        {
+            return Err(
+                "workspace view repository analysis identities do not match its repositories"
+                    .into(),
+            );
+        }
         Ok(Self {
             name,
             analysis_identity,
             repository_states,
+            repository_analysis_identities,
         })
     }
 
@@ -163,10 +196,14 @@ impl WorkspaceView {
     }
 
     pub fn repository_input_fingerprint(&self, state: &RepositoryState) -> String {
+        let analysis_identity = self
+            .repository_analysis_identities
+            .get(&state.repository.identity)
+            .expect("workspace view repository state must have an analysis identity");
         format!(
             "{}:{}{}",
-            self.analysis_identity.len(),
-            self.analysis_identity,
+            analysis_identity.len(),
+            analysis_identity,
             state.fingerprint
         )
     }
@@ -245,5 +282,47 @@ mod tests {
                 .unwrap()
                 .fingerprint()
         );
+    }
+
+    #[test]
+    fn repository_input_identity_ignores_unrelated_repository_analysis() {
+        let state = |identity: &str| RepositoryState {
+            repository: LogicalRepository {
+                identity: identity.into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "source".into(),
+        };
+        let states = vec![state("example/a"), state("example/b")];
+        let first = WorkspaceView::new_scoped(
+            "main",
+            "workspace-1",
+            states.clone(),
+            BTreeMap::from([
+                ("example/a".into(), "a-1".into()),
+                ("example/b".into(), "b-1".into()),
+            ]),
+        )
+        .unwrap();
+        let second = WorkspaceView::new_scoped(
+            "main",
+            "workspace-2",
+            states.clone(),
+            BTreeMap::from([
+                ("example/a".into(), "a-1".into()),
+                ("example/b".into(), "b-2".into()),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.repository_input_fingerprint(&states[0]),
+            second.repository_input_fingerprint(&states[0])
+        );
+        assert_ne!(
+            first.repository_input_fingerprint(&states[1]),
+            second.repository_input_fingerprint(&states[1])
+        );
+        assert_ne!(first.fingerprint(), second.fingerprint());
     }
 }

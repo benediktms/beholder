@@ -249,7 +249,11 @@ if grep -Fq 'generated.rs' <<<"$compact"; then
     exit 1
 fi
 raw="$(target/debug/beholder trace --raw --workspace main "$rust_client" "$elixir_server")"
-for expected in 'src/generated.rs' 'lib/grpc.pb.ex' 'confidence 1.00' 'revision 1' 'stale=false'; do
+if ! grep -Eq 'revision [0-9]+' <<<"$raw"; then
+    printf 'expected a revision in raw cross-language trace:\n%s\n' "$raw" >&2
+    exit 1
+fi
+for expected in 'src/generated.rs' 'lib/grpc.pb.ex' 'confidence 1.00' 'stale=false'; do
     if ! grep -Fq "$expected" <<<"$raw"; then
         printf 'expected %s in raw cross-language trace:\n%s\n' "$expected" "$raw" >&2
         exit 1

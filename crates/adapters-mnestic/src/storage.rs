@@ -1,5 +1,5 @@
 use super::schema::*;
-use super::store::EnrichmentPayload;
+use super::store::{EnrichmentOwner, EnrichmentPayload};
 use beholder_domain::{
     DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
     GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, Observation,
@@ -1175,11 +1175,14 @@ pub(super) fn publish_enrichment(
     view: &WorkspaceView,
     repository: &str,
     input_fingerprint: &str,
-    analyzer: &str,
-    version: &str,
-    expected_version: Option<&str>,
+    owner: EnrichmentOwner<'_>,
     payload: EnrichmentPayload<'_>,
 ) -> Result<bool, Box<dyn Error>> {
+    let EnrichmentOwner {
+        analyzer,
+        version,
+        expected_version,
+    } = owner;
     let EnrichmentPayload {
         entities,
         observations,
@@ -2026,7 +2029,7 @@ pub(super) fn sweep_garbage_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EnrichmentPayload, SemanticStore};
+    use crate::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
         DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
@@ -2868,9 +2871,11 @@ mod tests {
                 &initial,
                 "example/a",
                 &initial.repository_input_fingerprint(&initial.repository_states[0]),
-                "rust",
-                "1",
-                None,
+                EnrichmentOwner {
+                    analyzer: "rust",
+                    version: "1",
+                    expected_version: None,
+                },
                 EnrichmentPayload {
                     entities: std::slice::from_ref(&entity_a),
                     ..EnrichmentPayload::default()
@@ -2882,9 +2887,11 @@ mod tests {
                 &initial,
                 "example/b",
                 &initial.repository_input_fingerprint(&initial.repository_states[1]),
-                "rust",
-                "1",
-                None,
+                EnrichmentOwner {
+                    analyzer: "rust",
+                    version: "1",
+                    expected_version: None,
+                },
                 EnrichmentPayload {
                     entities: std::slice::from_ref(&entity_b),
                     ..EnrichmentPayload::default()
@@ -3019,9 +3026,11 @@ mod tests {
                     &started,
                     "example/a",
                     &target_input,
-                    "rust",
-                    "1",
-                    None,
+                    EnrichmentOwner {
+                        analyzer: "rust",
+                        version: "1",
+                        expected_version: None,
+                    },
                     EnrichmentPayload::default(),
                 )
                 .unwrap()
@@ -3057,9 +3066,11 @@ mod tests {
                 &view,
                 "example/repo",
                 &input_fingerprint,
-                "rust",
-                "pending:2",
-                None,
+                EnrichmentOwner {
+                    analyzer: "rust",
+                    version: "pending:2",
+                    expected_version: None,
+                },
                 EnrichmentPayload::default(),
             )
             .unwrap();
@@ -3070,9 +3081,11 @@ mod tests {
                     &view,
                     "example/repo",
                     &input_fingerprint,
-                    "rust",
-                    "1",
-                    Some("pending:1"),
+                    EnrichmentOwner {
+                        analyzer: "rust",
+                        version: "1",
+                        expected_version: Some("pending:1"),
+                    },
                     EnrichmentPayload::default(),
                 )
                 .unwrap()
@@ -3135,9 +3148,11 @@ mod tests {
                     &view,
                     "example/repo",
                     &input_fingerprint,
-                    "rust",
-                    "1",
-                    None,
+                    EnrichmentOwner {
+                        analyzer: "rust",
+                        version: "1",
+                        expected_version: None,
+                    },
                     EnrichmentPayload {
                         overrides: &[override_],
                         diagnostics: &[("example/repo".into(), compiler_diagnostic)],
@@ -3179,9 +3194,11 @@ mod tests {
                     &view,
                     "example/repo",
                     &input_fingerprint,
-                    "rust",
-                    "2",
-                    None,
+                    EnrichmentOwner {
+                        analyzer: "rust",
+                        version: "2",
+                        expected_version: None,
+                    },
                     EnrichmentPayload::default(),
                 )
                 .unwrap()
@@ -3219,9 +3236,11 @@ mod tests {
                     &stale,
                     "example/repo",
                     &stale.repository_input_fingerprint(&stale.repository_states[0]),
-                    "rust",
-                    "1",
-                    None,
+                    EnrichmentOwner {
+                        analyzer: "rust",
+                        version: "1",
+                        expected_version: None,
+                    },
                     EnrichmentPayload::default(),
                 )
                 .unwrap()
@@ -3265,9 +3284,11 @@ mod tests {
                     &view,
                     "example/repo",
                     &input_fingerprint,
-                    "elixir",
-                    "1",
-                    None,
+                    EnrichmentOwner {
+                        analyzer: "elixir",
+                        version: "1",
+                        expected_version: None,
+                    },
                     EnrichmentPayload {
                         entities: &[entity],
                         observations: &[observation],
@@ -3290,9 +3311,11 @@ mod tests {
                     &view,
                     "example/repo",
                     &input_fingerprint,
-                    "elixir",
-                    "2",
-                    None,
+                    EnrichmentOwner {
+                        analyzer: "elixir",
+                        version: "2",
+                        expected_version: None,
+                    },
                     EnrichmentPayload::default(),
                 )
                 .unwrap()

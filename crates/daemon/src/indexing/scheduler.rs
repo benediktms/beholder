@@ -1369,14 +1369,16 @@ fn index_workspace_through_port(
         name: workspace.name.clone(),
         repositories,
     };
-    let view = WorkspaceView::new(
+    let analysis_plan = scheduler.indexer.prepare(&snapshot);
+    let view = WorkspaceView::new_scoped(
         &workspace.name,
-        scheduler.indexer.analysis_identity(&snapshot),
+        analysis_plan.analysis_identity(),
         snapshot
             .repositories
             .iter()
             .map(|repository| repository.state.clone())
             .collect(),
+        analysis_plan.repository_enrichment_identities(),
     )?;
     if store.view_matches(&view)? {
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
@@ -1407,7 +1409,12 @@ fn index_workspace_through_port(
         workspace = %workspace.name,
         dirty_source_units
     )
-    .in_scope(|| scheduler.indexer.analyze(&snapshot).map_err(erase_error))?;
+    .in_scope(|| {
+        scheduler
+            .indexer
+            .analyze_prepared(&snapshot, &analysis_plan)
+            .map_err(erase_error)
+    })?;
     let repository_analysis = repository_analysis_started.elapsed();
     let mut memory_hits = 0;
     let mut disk_hits = 0;

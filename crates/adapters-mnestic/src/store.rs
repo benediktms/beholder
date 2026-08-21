@@ -59,6 +59,13 @@ pub struct EnrichmentPayload<'a> {
     pub diagnostics: &'a [(String, AnalysisDiagnostic)],
 }
 
+#[derive(Clone, Copy)]
+pub struct EnrichmentOwner<'a> {
+    pub analyzer: &'a str,
+    pub version: &'a str,
+    pub expected_version: Option<&'a str>,
+}
+
 impl SemanticStore {
     pub fn memory() -> Result<Self, Box<dyn Error>> {
         let db = memory_database()?;
@@ -169,9 +176,7 @@ impl SemanticStore {
         view: &WorkspaceView,
         repository: &str,
         input_fingerprint: &str,
-        analyzer: &str,
-        version: &str,
-        expected_version: Option<&str>,
+        owner: EnrichmentOwner<'_>,
         payload: EnrichmentPayload<'_>,
     ) -> Result<bool, Box<dyn Error>> {
         publish_enrichment(
@@ -179,9 +184,7 @@ impl SemanticStore {
             view,
             repository,
             input_fingerprint,
-            analyzer,
-            version,
-            expected_version,
+            owner,
             payload,
         )
     }

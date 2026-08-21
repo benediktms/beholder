@@ -1,5 +1,5 @@
 use super::{IndexScheduler, pipeline};
-use beholder_adapters_mnestic::{EnrichmentPayload, SemanticStore};
+use beholder_adapters_mnestic::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
 use beholder_domain::WorkspaceView;
 use beholder_indexing::{AnalyzerMetadata, WorkspaceSnapshot};
 use std::{error::Error, sync::Arc, time::Instant};
@@ -163,9 +163,11 @@ impl IndexScheduler {
                     &job.view,
                     &job.repository,
                     &job.input_fingerprint,
-                    &job.analyzer.id,
-                    &job.analyzer.version,
-                    Some(&expected_version),
+                    EnrichmentOwner {
+                        analyzer: &job.analyzer.id,
+                        version: &job.analyzer.version,
+                        expected_version: Some(&expected_version),
+                    },
                     EnrichmentPayload {
                         entities: &entities,
                         observations: &observations,
@@ -227,9 +229,11 @@ impl IndexScheduler {
                             view,
                             &repository_id,
                             &input_fingerprint,
-                            &analyzer.id,
-                            &pending_version,
-                            None,
+                            EnrichmentOwner {
+                                analyzer: &analyzer.id,
+                                version: &pending_version,
+                                expected_version: None,
+                            },
                             EnrichmentPayload::default(),
                         )?;
                         tracing::info!(
@@ -280,9 +284,11 @@ impl IndexScheduler {
                         view,
                         &repository_id,
                         &input_fingerprint,
-                        &analyzer.id,
-                        &analyzer.version,
-                        None,
+                        EnrichmentOwner {
+                            analyzer: &analyzer.id,
+                            version: &analyzer.version,
+                            expected_version: None,
+                        },
                         EnrichmentPayload::default(),
                     )?;
                 }
