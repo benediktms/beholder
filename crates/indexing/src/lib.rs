@@ -323,6 +323,21 @@ impl WorkspaceAnalysisPlan {
         &self.analysis_identity
     }
 
+    pub fn repository_enrichment_identities(&self) -> BTreeMap<String, String> {
+        self.repository_identities
+            .iter()
+            .map(|(repository, identity)| {
+                (
+                    repository.clone(),
+                    format!(
+                        "{}:{identity}:core-rules:{CORE_RULE_PACK_VERSION}",
+                        identity.len()
+                    ),
+                )
+            })
+            .collect()
+    }
+
     fn analyzer(&self, index: usize) -> &AnalyzerPlan {
         &self.analyzers[index]
     }
@@ -836,17 +851,11 @@ impl Indexer {
         )
     }
 
-    pub fn active_enrichers(&self, snapshot: &WorkspaceSnapshot) -> Vec<AnalyzerMetadata> {
+    pub fn enricher_is_active(&self, id: &str, repository: &RepositorySnapshot) -> bool {
         self.enrichers
             .iter()
-            .filter(|analyzer| {
-                snapshot
-                    .repositories
-                    .iter()
-                    .any(|repository| analyzer.is_active(repository))
-            })
-            .map(|analyzer| analyzer.metadata())
-            .collect()
+            .find(|enricher| enricher.metadata().id == id)
+            .is_some_and(|enricher| enricher.is_active(repository))
     }
 
     pub fn enrichment_catalog(&self) -> Vec<AnalyzerMetadata> {

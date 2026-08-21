@@ -8,10 +8,10 @@ use super::{
         inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions, trace,
     },
     storage::{
-        claim_garbage_collection, enrichment_matches, garbage_collection_pending,
-        garbage_collection_queued, publish_enrichment, publish_observations,
-        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
-        view_matches,
+        claim_garbage_collection, enrichment_matches, enrichments_current, ensure_revision_inputs,
+        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
+        publish_observations, store_verification_fingerprint, sweep_garbage_collection,
+        verification_matches, view_matches,
     },
 };
 use beholder_domain::{
@@ -57,6 +57,13 @@ pub struct EnrichmentPayload<'a> {
     pub observations: &'a [Observation],
     pub overrides: &'a [DependencyOverride],
     pub diagnostics: &'a [(String, AnalysisDiagnostic)],
+}
+
+#[derive(Clone, Copy)]
+pub struct EnrichmentOwner<'a> {
+    pub analyzer: &'a str,
+    pub version: &'a str,
+    pub expected_version: Option<&'a str>,
 }
 
 impl SemanticStore {
@@ -145,20 +152,41 @@ impl SemanticStore {
     pub fn enrichment_matches(
         &self,
         view: &str,
+        repository: &str,
         analyzer: &str,
         version: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        enrichment_matches(&self.read_db, view, analyzer, version)
+        enrichment_matches(&self.read_db, view, repository, analyzer, version)
+    }
+
+    pub fn enrichments_current(
+        &self,
+        view: &str,
+        catalog: &[(String, String)],
+    ) -> Result<bool, Box<dyn Error>> {
+        enrichments_current(&self.read_db, view, catalog)
+    }
+
+    pub fn ensure_revision_inputs(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
+        ensure_revision_inputs(&self.db, view)
     }
 
     pub fn publish_enrichment(
         &self,
         view: &WorkspaceView,
-        analyzer: &str,
-        version: &str,
+        repository: &str,
+        input_fingerprint: &str,
+        owner: EnrichmentOwner<'_>,
         payload: EnrichmentPayload<'_>,
     ) -> Result<bool, Box<dyn Error>> {
-        publish_enrichment(&self.db, view, analyzer, version, payload)
+        publish_enrichment(
+            &self.db,
+            view,
+            repository,
+            input_fingerprint,
+            owner,
+            payload,
+        )
     }
 
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {
