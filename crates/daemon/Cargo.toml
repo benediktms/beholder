@@ -20,6 +20,7 @@ beholder-daemon-client.workspace = true
 beholder-domain.workspace = true
 beholder-dto.workspace = true
 beholder-indexing.workspace = true
+beholder-observability.workspace = true
 beholder-protocol.workspace = true
 beholder-worker-client.workspace = true
 notify = "8.2.0"
@@ -31,5 +32,6 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sig
 tokio-stream = { workspace = true, features = ["net"] }
 tonic.workspace = true
 tracing = "0.1.44"
-tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "beholder-observability"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+tonic.workspace = true
+tracing = "0.1.44"
+tracing-appender.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true

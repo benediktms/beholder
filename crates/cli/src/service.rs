@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fs::{self, OpenOptions},
     io::Write,
@@ -8,6 +9,14 @@ use std::{
 
 const LABEL: &str = "dev.beholder.daemon";
 const UNIT: &str = "beholder.service";
+const SERVICE_ENVIRONMENT_VARIABLES: [&str; 6] = [
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_SERVICE_NAME",
+    "OTEL_SDK_DISABLED",
+    "RUST_LOG",
+];
 
 pub struct InstallOutcome {
     pub manifest_path: PathBuf,
@@ -42,13 +51,26 @@ pub fn install(binary: &Path, state_dir: &Path) -> Result<InstallOutcome, Box<dy
         fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
     }
 
+    let environment = service_environment();
     if cfg!(target_os = "macos") {
-        install_macos(binary, state_dir)
+        install_macos(binary, state_dir, &environment)
     } else if cfg!(target_os = "linux") {
-        install_linux(binary)
+        install_linux(binary, &environment)
     } else {
         Err("daemon installation is supported on macOS and Linux".into())
     }
+}
+
+fn service_environment() -> BTreeMap<String, String> {
+    SERVICE_ENVIRONMENT_VARIABLES
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| (name.into(), value))
+        })
+        .collect()
 }
 
 pub fn uninstall() -> Result<UninstallOutcome, Box<dyn Error>> {
@@ -184,7 +206,22 @@ fn current_uid() -> Result<String, Box<dyn Error>> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn render_plist(binary: &Path, log: &Path) -> Result<String, Box<dyn Error>> {
+fn render_plist(
+    binary: &Path,
+    log: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<String, Box<dyn Error>> {
+    let environment = environment
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "    <key>{}</key><string>{}</string>",
+                xml_escape(name),
+                xml_escape(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -195,6 +232,9 @@ fn render_plist(binary: &Path, log: &Path) -> Result<String, Box<dyn Error>> {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key><dict>
+{environment}
+  </dict>
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
@@ -206,11 +246,15 @@ fn render_plist(binary: &Path, log: &Path) -> Result<String, Box<dyn Error>> {
     ))
 }
 
-fn install_macos(binary: &Path, state_dir: &Path) -> Result<InstallOutcome, Box<dyn Error>> {
+fn install_macos(
+    binary: &Path,
+    state_dir: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<InstallOutcome, Box<dyn Error>> {
     let manifest_path = launch_agent_path()?;
     let changed = write_if_changed(
         &manifest_path,
-        &render_plist(binary, &state_dir.join("beholderd.log"))?,
+        &render_plist(binary, &state_dir.join("beholderd.log"), environment)?,
     )?;
     let uid = current_uid()?;
     let domain = format!("gui/{uid}");
@@ -266,20 +310,33 @@ fn systemd_unit_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(config.join(format!("systemd/user/{UNIT}")))
 }
 
-fn render_systemd_unit(binary: &Path) -> Result<String, Box<dyn Error>> {
+fn render_systemd_unit(
+    binary: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<String, Box<dyn Error>> {
     let binary = path_text(binary)?
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
+    let environment = environment
+        .iter()
+        .map(|(name, value)| {
+            let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("Environment=\"{name}={value}\"\n")
+        })
+        .collect::<String>();
     Ok(format!(
         "[Unit]\nDescription=Beholder architecture intelligence daemon\n\n\
-         [Service]\nExecStart=\"{binary}\"\nRestart=on-failure\nRestartSec=1\n\n\
+         [Service]\nExecStart=\"{binary}\"\n{environment}Restart=on-failure\nRestartSec=1\n\n\
          [Install]\nWantedBy=default.target\n"
     ))
 }
 
-fn install_linux(binary: &Path) -> Result<InstallOutcome, Box<dyn Error>> {
+fn install_linux(
+    binary: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<InstallOutcome, Box<dyn Error>> {
     let manifest_path = systemd_unit_path()?;
-    let changed = write_if_changed(&manifest_path, &render_systemd_unit(binary)?)?;
+    let changed = write_if_changed(&manifest_path, &render_systemd_unit(binary, environment)?)?;
     launch(
         vec!["systemctl".into(), "--user".into(), "daemon-reload".into()],
         false,
@@ -329,19 +386,31 @@ mod tests {
 
     #[test]
     fn launchd_manifest_escapes_paths_and_restarts_only_failures() {
+        let environment = BTreeMap::from([(
+            "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+            "http://localhost:4318?a=1&b=2".into(),
+        )]);
         let manifest = render_plist(
             Path::new("/tmp/Beholder & tools/beholderd"),
             Path::new("/tmp/Beholder & tools/beholderd.log"),
+            &environment,
         )
         .unwrap();
         assert!(manifest.contains("/tmp/Beholder &amp; tools/beholderd"));
+        assert!(manifest.contains("http://localhost:4318?a=1&amp;b=2"));
         assert!(manifest.contains("<key>SuccessfulExit</key><false/>"));
     }
 
     #[test]
     fn systemd_manifest_restarts_only_failures() {
-        let unit = render_systemd_unit(Path::new("/tmp/Beholder tools/beholderd")).unwrap();
+        let environment = BTreeMap::from([(
+            "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+            "http://localhost:4318".into(),
+        )]);
+        let unit =
+            render_systemd_unit(Path::new("/tmp/Beholder tools/beholderd"), &environment).unwrap();
         assert!(unit.contains("ExecStart=\"/tmp/Beholder tools/beholderd\""));
+        assert!(unit.contains("Environment=\"OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318\""));
         assert!(unit.contains("Restart=on-failure"));
     }
 

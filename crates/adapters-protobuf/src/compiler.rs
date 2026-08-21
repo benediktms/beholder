@@ -153,14 +153,16 @@ impl SourceCompiler {
             ],
         );
         self.cached("dependencies", key, || {
-            let response = ureq::get(&url)
+            let response = reqwest::blocking::Client::new()
+                .get(&url)
                 .header("Accept", "application/proto")
-                .call()
+                .send()
+                .and_then(reqwest::blocking::Response::error_for_status)
                 .map_err(|error| format!("failed to download {}: {error}", dependency.name))?;
             let bytes = response
-                .into_body()
-                .read_to_vec()
+                .bytes()
                 .map_err(|error| format!("failed to read {}: {error}", dependency.name))?;
+            let bytes = bytes.to_vec();
             DescriptorSetFileResolver::decode(bytes.as_slice()).map_err(|error| {
                 format!("invalid descriptor set for {}: {error}", dependency.name)
             })?;
