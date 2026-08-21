@@ -26,6 +26,7 @@ message RepositoryStart {
   string base = 2;
   optional string head = 3;
   string fingerprint = 4;
+  bool target = 5;
 }
 
 message RepositoryInput {

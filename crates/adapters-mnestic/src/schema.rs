@@ -140,6 +140,15 @@ pub(super) const CREATE_REVISION_INPUT_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_REVISION_CONTEXT_SCHEMA: &str = r#"
+:create analysis_revision_context {
+    view: String,
+    revision: Int,
+    target: String,
+    context: String,
+}
+"#;
+
 pub(super) const CREATE_REPOSITORY_ENRICHMENT_SCHEMA: &str = r#"
 :create analysis_revision_repository_enrichment {
     view: String,

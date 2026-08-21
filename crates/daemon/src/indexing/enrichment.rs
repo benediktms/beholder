@@ -1,7 +1,7 @@
 use super::{IndexScheduler, pipeline};
 use beholder_adapters_mnestic::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
 use beholder_domain::WorkspaceView;
-use beholder_indexing::{AnalyzerMetadata, WorkspaceSnapshot};
+use beholder_indexing::{AnalyzerMetadata, EnrichmentSnapshot, WorkspaceSnapshot};
 use std::{error::Error, sync::Arc, time::Instant};
 use tokio::sync::watch;
 
@@ -13,7 +13,7 @@ pub(super) struct EnrichmentJob {
     pub(super) repository: String,
     pub(super) input_fingerprint: String,
     pub(super) queued_at: Instant,
-    pub(super) snapshot: WorkspaceSnapshot,
+    pub(super) snapshot: EnrichmentSnapshot,
     pub(super) view: WorkspaceView,
 }
 
@@ -207,7 +207,10 @@ impl IndexScheduler {
         let mut queued = false;
         for repository in &snapshot.repositories {
             let repository_id = repository.state.repository.identity.clone();
-            let input_fingerprint = view.repository_input_fingerprint(&repository.state);
+            let input_fingerprint = store
+                .revision_input_fingerprint(&view.name, &repository_id)?
+                .ok_or("published repository input fingerprint is missing")?;
+            let contexts = store.repository_contexts(&view.name, &repository_id)?;
             for analyzer in self.indexer.enrichment_catalog() {
                 if store.enrichment_matches(
                     &view.name,
@@ -271,9 +274,18 @@ impl IndexScheduler {
                                 repository: repository_id.clone(),
                                 input_fingerprint: input_fingerprint.clone(),
                                 queued_at: Instant::now(),
-                                snapshot: WorkspaceSnapshot {
-                                    name: snapshot.name.clone(),
-                                    repositories: vec![repository.clone()],
+                                snapshot: EnrichmentSnapshot {
+                                    target_repository: repository_id.clone(),
+                                    workspace: WorkspaceSnapshot {
+                                        name: snapshot.name.clone(),
+                                        repositories: std::iter::once(repository.clone())
+                                            .chain(contexts.iter().filter_map(|identity| {
+                                                snapshot.repositories.iter().find(|candidate| {
+                                                    candidate.state.repository.identity == *identity
+                                                }).cloned()
+                                            }))
+                                            .collect(),
+                                    },
                                 },
                                 view: view.clone(),
                             },

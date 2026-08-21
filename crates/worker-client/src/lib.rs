@@ -1,7 +1,7 @@
 //! Builder facade for native analyzer workers.
 
 use beholder_indexing::{
-    AnalyzerError, AnalyzerMetadata, EnrichmentFuture, WorkspaceEnricher, WorkspaceSnapshot,
+    AnalyzerError, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot, WorkspaceEnricher,
 };
 use beholder_protocol::{
     analyze_requests, contribution_from_events,
@@ -105,11 +105,12 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 .is_some_and(|file_name| self.file_names.contains(file_name))
     }
 
-    fn enrich<'a>(&'a self, snapshot: WorkspaceSnapshot) -> EnrichmentFuture<'a> {
+    fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
         let span = tracing::info_span!(
             "worker.analyze",
             worker = self.metadata.id,
-            workspace = snapshot.name,
+            workspace = snapshot.workspace.name,
+            target_repository = snapshot.target_repository,
             rpc.system = "grpc",
             rpc.service = "beholder.worker.v1.AnalyzerWorker",
             rpc.method = "Analyze"
@@ -138,7 +139,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     .kill_on_drop(true)
                     .spawn()?;
                 let analysis_started = tokio::time::Instant::now();
-                let workspace = snapshot.name.clone();
+                let workspace = snapshot.workspace.name.clone();
                 let endpoint = format!("unix:{}", socket.display());
                 let started = tokio::time::Instant::now();
                 let mut client = loop {

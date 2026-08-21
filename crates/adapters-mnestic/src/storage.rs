@@ -909,6 +909,27 @@ fn store_revision_inputs(
          :put analysis_revision_input {view, revision, repository => fingerprint}",
         BTreeMap::from([("rows".into(), DataValue::List(rows))]),
     )?;
+    let rows = view
+        .repository_states
+        .iter()
+        .flat_map(|state| {
+            view.repository_contexts(&state.repository.identity)
+                .iter()
+                .map(move |context| {
+                    DataValue::List(vec![
+                        view.name.as_str().into(),
+                        revision.into(),
+                        state.repository.identity.as_str().into(),
+                        context.as_str().into(),
+                    ])
+                })
+        })
+        .collect::<Vec<_>>();
+    transaction.run_script(
+        "?[view, revision, target, context] <- $rows \
+         :put analysis_revision_context {view, revision, target, context}",
+        BTreeMap::from([("rows".into(), DataValue::List(rows))]),
+    )?;
     Ok(())
 }
 
@@ -926,9 +947,60 @@ pub(super) fn ensure_revision_inputs(
         transaction.abort()?;
         return Ok(false);
     }
-    store_revision_inputs(&transaction, view)?;
+    let missing = transaction.run_script(
+        "?[repository] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, repository}, \
+             not *analysis_revision_input{view: $view, revision, repository}",
+        BTreeMap::from([("view".into(), view.name.clone().into())]),
+    )?;
+    if !missing.rows.is_empty() {
+        store_revision_inputs(&transaction, view)?;
+    }
     transaction.commit()?;
     Ok(true)
+}
+
+pub(super) fn revision_input_fingerprint(
+    db: &DbInstance,
+    view: &str,
+    repository: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[fingerprint] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_input{view: $view, revision, repository: $repository, fingerprint}",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("repository".into(), repository.into()),
+        ]),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row[0].get_str())
+        .map(str::to_owned))
+}
+
+pub(super) fn repository_contexts(
+    db: &DbInstance,
+    view: &str,
+    target: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[context] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_context{view: $view, revision, target: $target, context} \
+         :sort context",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("target".into(), target.into()),
+        ]),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(rows
+        .rows
+        .into_iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect())
 }
 
 fn carry_forward_enrichments(
@@ -1256,6 +1328,10 @@ pub(super) fn publish_enrichment(
              *analysis_revision_input{view: $view, revision: $previous, repository, fingerprint}, \
              view = $view, revision = $revision \
          :put analysis_revision_input {view, revision, repository => fingerprint}",
+        "?[view, revision, target, context] := \
+             *analysis_revision_context{view: $view, revision: $previous, target, context}, \
+             view = $view, revision = $revision \
+         :put analysis_revision_context {view, revision, target, context}",
         "?[view, revision, id, kind, metadata] := \
              *analysis_revision_entity{view: $view, revision: $previous, id, kind, metadata}, \
              not *analysis_revision_enrichment_entity_owner{view: $view, revision: $previous, id, analyzer: $owner}, \
@@ -1878,6 +1954,11 @@ pub(super) fn sweep_garbage_collection(
             "superseded revision inputs",
             "analysis_revision_input",
             "view, revision, repository",
+        ),
+        (
+            "superseded revision contexts",
+            "analysis_revision_context",
+            "view, revision, target, context",
         ),
         (
             "superseded revision metadata",

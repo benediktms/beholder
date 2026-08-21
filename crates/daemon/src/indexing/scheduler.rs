@@ -68,12 +68,14 @@ use beholder_domain::{
     Observation, RepositoryFacts, RepositoryState, SourceAnalysisError,
 };
 use beholder_domain::{
-    BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace, WorkspaceView,
+    BeholderError, BeholderErrorCode, BeholderErrorKind, RepositoryDependencyGraph, Workspace,
+    WorkspaceView,
 };
 use beholder_dto::{Freshness, QueryMetadata};
 #[cfg(test)]
 use beholder_indexing::{
-    AnalyzerMetadata, EnrichmentFuture, IndexerBuilder, WorkspaceAnalyzer, WorkspaceEnricher,
+    AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot, IndexerBuilder, WorkspaceAnalyzer,
+    WorkspaceEnricher,
 };
 use beholder_indexing::{CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot};
 use notify::{Event, EventKind};
@@ -1370,7 +1372,7 @@ fn index_workspace_through_port(
         repositories,
     };
     let analysis_plan = scheduler.indexer.prepare(&snapshot);
-    let view = WorkspaceView::new_scoped(
+    let mut view = WorkspaceView::new_scoped(
         &workspace.name,
         analysis_plan.analysis_identity(),
         snapshot
@@ -1431,6 +1433,9 @@ fn index_workspace_through_port(
             repository.facts
         })
         .collect::<Vec<_>>();
+    let dependency_graph =
+        RepositoryDependencyGraph::from_baseline(&repository_facts, &analysis.overrides)?;
+    view = view.with_repository_contexts(dependency_graph.context_map())?;
     let observation_count = repository_facts
         .iter()
         .map(|facts| facts.observations.len())
@@ -1722,7 +1727,7 @@ mod tests {
             path.extension().is_some_and(|extension| extension == "rs")
         }
 
-        fn enrich<'a>(&'a self, _: WorkspaceSnapshot) -> EnrichmentFuture<'a> {
+        fn enrich<'a>(&'a self, _: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
             Box::pin(async { unreachable!("an identical active job must not be queued") })
         }
     }
@@ -1885,6 +1890,11 @@ mod tests {
                 .map(|repository| repository.state.clone())
                 .collect(),
         )
+        .unwrap()
+        .with_repository_contexts(BTreeMap::from([(
+            "repo-a".into(),
+            vec!["repo-b".into()],
+        )]))
         .unwrap();
         let store = SemanticStore::memory().unwrap();
         store
@@ -1924,11 +1934,16 @@ mod tests {
             assert_eq!(workspace, "main");
             assert_eq!(analyzer, "semantic");
             assert_eq!(&job.repository, repository);
-            assert_eq!(job.snapshot.repositories.len(), 1);
+            let expected_repositories = if repository == "repo-a" { 2 } else { 1 };
             assert_eq!(
-                &job.snapshot.repositories[0].state.repository.identity,
+                job.snapshot.workspace.repositories.len(),
+                expected_repositories
+            );
+            assert_eq!(
+                &job.snapshot.workspace.repositories[0].state.repository.identity,
                 repository
             );
+            assert_eq!(&job.snapshot.target_repository, repository);
         }
     }
 

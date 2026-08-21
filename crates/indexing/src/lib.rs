@@ -18,7 +18,7 @@ use std::{
 };
 
 pub type AnalyzerError = Box<dyn Error + Send + Sync>;
-const CORE_RULE_PACK_VERSION: &str = "5";
+const CORE_RULE_PACK_VERSION: &str = "6";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryInput {
@@ -45,6 +45,28 @@ pub struct RepositorySnapshot {
 pub struct WorkspaceSnapshot {
     pub name: String,
     pub repositories: Vec<RepositorySnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnrichmentSnapshot {
+    pub target_repository: String,
+    pub workspace: WorkspaceSnapshot,
+}
+
+impl EnrichmentSnapshot {
+    pub fn target(&self) -> Option<&RepositorySnapshot> {
+        self.workspace
+            .repositories
+            .iter()
+            .find(|repository| repository.state.repository.identity == self.target_repository)
+    }
+
+    pub fn contexts(&self) -> impl Iterator<Item = &RepositorySnapshot> {
+        self.workspace
+            .repositories
+            .iter()
+            .filter(|repository| repository.state.repository.identity != self.target_repository)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,7 +198,7 @@ pub trait WorkspaceEnricher: Send + Sync {
             .iter()
             .any(|input| self.accepts(&input.path))
     }
-    fn enrich<'a>(&'a self, snapshot: WorkspaceSnapshot) -> EnrichmentFuture<'a>;
+    fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a>;
     fn clear_cache(&self) -> Result<(), AnalyzerError> {
         Ok(())
     }
@@ -867,7 +889,7 @@ impl Indexer {
 
     pub async fn enrich(
         &self,
-        snapshot: WorkspaceSnapshot,
+        snapshot: EnrichmentSnapshot,
         id: &str,
     ) -> Result<AnalyzerContribution, AnalyzerError> {
         let analyzer = self
@@ -1456,8 +1478,8 @@ mod tests {
             WorkspaceAnalyzer::accepts(self, path)
         }
 
-        fn enrich<'a>(&'a self, snapshot: WorkspaceSnapshot) -> EnrichmentFuture<'a> {
-            Box::pin(async move { self.analyze(&snapshot) })
+        fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
+            Box::pin(async move { self.analyze(&snapshot.workspace) })
         }
     }
 
@@ -1636,7 +1658,16 @@ mod tests {
             .unwrap();
 
         let baseline = indexer.analyze(&snapshot()).unwrap();
-        let enrichment = indexer.enrich(snapshot(), "semantic").await.unwrap();
+        let enrichment = indexer
+            .enrich(
+                EnrichmentSnapshot {
+                    target_repository: "example/repo".into(),
+                    workspace: snapshot(),
+                },
+                "semantic",
+            )
+            .await
+            .unwrap();
 
         assert!(baseline.analysis_identity.contains("6:syntax1:1"));
         assert!(!baseline.analysis_identity.contains("8:semantic1:1"));
@@ -1930,7 +1961,7 @@ mod tests {
 
         assert!(identity.starts_with("repositories:6:a/repo:8:csharp:1"));
         assert!(identity.contains("6:b/repo:15:rust:1:plugin:2"));
-        assert!(identity.ends_with(":core-rules:5"));
+        assert!(identity.ends_with(":core-rules:6"));
         assert!(!repository_analysis_identity(&[]).contains("core-rules"));
         assert_ne!(
             identity,
