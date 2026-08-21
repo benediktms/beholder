@@ -1,5 +1,7 @@
-use super::analysis::{arguments, call_target, expand_alias, keyword_value, text};
-use super::model::{ElixirAlias, ElixirAnalysis};
+use super::analysis::{
+    alias_definitions, arguments, call_target, expand_alias, keyword_value, text,
+};
+use super::model::{ElixirAlias, ElixirAnalysis, ElixirModule};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, GrpcBindingCandidate,
     GrpcBindingRole, Provenance, RpcCardinality,
@@ -169,6 +171,92 @@ pub(super) fn observe_call(
             });
         }
         _ => {}
+    }
+}
+
+pub(super) fn recognize(root: Node<'_>, source: &[u8], analysis: &mut ElixirAnalysis) {
+    for module in &mut analysis.modules {
+        module.grpc = GrpcModule::default();
+    }
+    recognize_node(root, source, None, &mut Vec::new(), &mut analysis.modules);
+}
+
+fn recognize_node(
+    node: Node<'_>,
+    source: &[u8],
+    module: Option<usize>,
+    aliases: &mut Vec<ElixirAlias>,
+    modules: &mut [ElixirModule],
+) {
+    if node.kind() == "call" {
+        let target = call_target(node, source);
+        if matches!(target, Some("defmodule" | "defprotocol" | "defimpl")) {
+            let line = node.start_position().row + 1;
+            let nested_modules = modules
+                .iter()
+                .enumerate()
+                .filter_map(|(index, module)| (module.line == line).then_some(index))
+                .collect::<Vec<_>>();
+            for nested_module in nested_modules {
+                let mut nested_aliases = aliases.clone();
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    recognize_node(
+                        child,
+                        source,
+                        Some(nested_module),
+                        &mut nested_aliases,
+                        modules,
+                    );
+                }
+            }
+            return;
+        }
+
+        if let Some(module) = module {
+            let current_module = modules[module].name.clone();
+            observe_call(
+                &mut modules[module].grpc,
+                node,
+                source,
+                aliases,
+                &current_module,
+            );
+            match target {
+                Some("alias") => {
+                    let definitions = alias_definitions(node, source)
+                        .into_iter()
+                        .map(|mut alias| {
+                            alias.target = expand_alias(&alias.target, aliases, &current_module);
+                            alias
+                        })
+                        .collect::<Vec<_>>();
+                    aliases.extend(definitions);
+                    return;
+                }
+                Some("require") if keyword_value(node, source, "as").is_some() => {
+                    let definitions = alias_definitions(node, source)
+                        .into_iter()
+                        .map(|mut alias| {
+                            alias.target = expand_alias(&alias.target, aliases, &current_module);
+                            alias
+                        })
+                        .collect::<Vec<_>>();
+                    aliases.extend(definitions);
+                    return;
+                }
+                Some(
+                    "def" | "defp" | "defdelegate" | "defmacro" | "defmacrop" | "import"
+                    | "require" | "use" | "quote",
+                ) => return,
+                _ => {}
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        recognize_node(child, source, module, aliases, modules);
     }
 }
 

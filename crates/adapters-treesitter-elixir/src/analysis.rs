@@ -1,6 +1,8 @@
 use super::model::*;
+use super::plugin::{ElixirLanguage, built_in_plugins};
 use beholder_adapters_treesitter::recover;
 use beholder_domain::{DependencyRelation, Observation, Provenance, UnsafeTreeRecovery};
+use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
 use std::collections::BTreeSet;
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -488,7 +490,7 @@ fn collect_using_semantics(
     }
 }
 
-fn alias_definitions(node: Node<'_>, source: &[u8]) -> Vec<ElixirAlias> {
+pub(super) fn alias_definitions(node: Node<'_>, source: &[u8]) -> Vec<ElixirAlias> {
     let Some(arguments) = arguments(node) else {
         return Vec::new();
     };
@@ -705,7 +707,6 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
         if let Some(module) = module {
             let aliases = modules[module].aliases.clone();
             let name = modules[module].name.clone();
-            super::grpc::observe_call(&mut modules[module].grpc, node, source, &aliases, &name);
             if let Some((resolver, inline_function)) = absinthe_resolver(AbsintheResolverInput {
                 node,
                 source,
@@ -1154,6 +1155,17 @@ fn absinthe_resolver(
 }
 
 pub fn analyze(source: &str) -> Result<ElixirAnalysis, Box<dyn Error + Send + Sync>> {
+    let plugins = built_in_plugins()?;
+    let active = plugins.activate_direct(Path::new("input.ex"));
+    analyze_with_plugins(source, Path::new("input.ex"), &plugins, &active)
+}
+
+pub(super) fn analyze_with_plugins(
+    source: &str,
+    path: &Path,
+    plugins: &LanguageAnalyzer<ElixirLanguage>,
+    active_plugins: &ActivePlugins,
+) -> Result<ElixirAnalysis, Box<dyn Error + Send + Sync>> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_elixir::LANGUAGE.into())?;
     let tree = parser
@@ -1170,10 +1182,20 @@ pub fn analyze(source: &str) -> Result<ElixirAnalysis, Box<dyn Error + Send + Sy
     if incomplete && modules.is_empty() {
         return Err(UnsafeTreeRecovery::new("Elixir", "no unaffected definitions remain").into());
     }
-    Ok(ElixirAnalysis {
+    let mut analysis = ElixirAnalysis {
         modules,
         parse_error_lines: recovery.error_lines,
-    })
+    };
+    plugins.recognize(
+        SourceRecognitionInput {
+            path,
+            text: source,
+            syntax: &tree,
+        },
+        &mut analysis,
+        active_plugins,
+    )?;
+    Ok(analysis)
 }
 
 #[cfg(test)]
