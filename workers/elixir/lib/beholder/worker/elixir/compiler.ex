@@ -4,6 +4,10 @@ defmodule Beholder.Worker.Elixir.Compiler do
   alias Beholder.Worker.Elixir.Compiler.BeamExporter
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
+  @default_timeout_ms 300_000
+  @default_max_output_bytes 1_048_576
+  @termination_grace_ms 1_000
+
   @type result :: %{
           status: :ok | :error,
           diagnostics: [map()],
@@ -19,9 +23,9 @@ defmodule Beholder.Worker.Elixir.Compiler do
          {:ok, mix} <- find_mix() do
       helper_ebin = BeamExporter.export!(cache_dir)
       working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)])
-      build_path = Path.join(working_dir, "build-#{safe_component(repository.fingerprint)}")
-      result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
       mix_env = System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "dev")
+      build_path = Path.join(working_dir, "build-#{build_identity(repository, mix, mix_env)}")
+      result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
 
       env = [
         {"BEHOLDER_ELIXIR_TRACE_RESULT", result_path},
@@ -30,14 +34,23 @@ defmodule Beholder.Worker.Elixir.Compiler do
         {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
       ]
 
-      {output, exit_status} =
-        System.cmd(mix, ["beholder.compile"],
-          cd: repository.base,
-          env: env,
-          stderr_to_stdout: true
+      result =
+        run_command(
+          mix,
+          ["beholder.compile"],
+          repository.base,
+          env,
+          configured_positive_integer(
+            "BEHOLDER_ELIXIR_COMPILER_TIMEOUT_MS",
+            @default_timeout_ms
+          ),
+          configured_positive_integer(
+            "BEHOLDER_ELIXIR_MAX_OUTPUT_BYTES",
+            @default_max_output_bytes
+          )
         )
 
-      read_result(result_path, output, exit_status)
+      finalize_run(repository, result_path, result)
     end
   end
 
@@ -60,10 +73,38 @@ defmodule Beholder.Worker.Elixir.Compiler do
   end
 
   defp find_mix do
-    case System.find_executable("mix") do
-      nil -> {:error, "mix executable not found for Elixir compiler worker"}
-      mix -> {:ok, mix}
+    case System.get_env("BEHOLDER_ELIXIR_MIX_PATH") || System.find_executable("mix") do
+      nil ->
+        {:error, "mix executable not found for Elixir compiler worker"}
+
+      mix ->
+        if File.regular?(mix),
+          do: {:ok, Path.expand(mix)},
+          else: {:error, "configured Mix executable does not exist: #{mix}"}
     end
+  end
+
+  defp finalize_run(repository, result_path, {:ok, output, exit_status}) do
+    case verify_inputs(repository) do
+      :ok ->
+        read_result(result_path, output, exit_status)
+
+      {:error, _reason} = error ->
+        File.rm(result_path)
+        error
+    end
+  end
+
+  defp finalize_run(_repository, result_path, {:error, :timeout, output, timeout_ms}) do
+    File.rm(result_path)
+
+    {:error,
+     "Mix compiler process exceeded #{timeout_ms}ms and was terminated: #{String.trim(output)}"}
+  end
+
+  defp finalize_run(_repository, result_path, {:error, reason}) do
+    File.rm(result_path)
+    {:error, reason}
   end
 
   defp read_result(result_path, output, exit_status) do
@@ -84,6 +125,131 @@ defmodule Beholder.Worker.Elixir.Compiler do
   defp append_code_path(nil, path), do: "-pa #{path}"
   defp append_code_path("", path), do: "-pa #{path}"
   defp append_code_path(flags, path), do: flags <> " -pa #{path}"
+
+  defp build_identity(repository, mix, mix_env) do
+    [
+      repository.fingerprint,
+      mix_env,
+      mix,
+      System.version(),
+      :erlang.system_info(:otp_release)
+    ]
+    |> Enum.join(<<0>>)
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp run_command(mix, arguments, directory, env, timeout_ms, max_output_bytes) do
+    {executable, arguments, process_group?} = isolated_command(mix, arguments)
+
+    port =
+      Port.open(
+        {:spawn_executable, executable},
+        [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          {:args, arguments},
+          {:cd, directory},
+          {:env,
+           Enum.map(env, fn {name, value} ->
+             {String.to_charlist(name), String.to_charlist(value)}
+           end)}
+        ]
+      )
+
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    collect_output(port, deadline, timeout_ms, max_output_bytes, {<<>>, false}, process_group?)
+  rescue
+    error in [ArgumentError, ErlangError] ->
+      {:error, "failed to start Mix compiler process: #{Exception.message(error)}"}
+  end
+
+  defp isolated_command(mix, arguments) do
+    case System.find_executable("setsid") do
+      nil -> {mix, arguments, false}
+      setsid -> {setsid, [mix | arguments], true}
+    end
+  end
+
+  defp collect_output(port, deadline, timeout_ms, max_output_bytes, output, process_group?) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, data}} ->
+        collect_output(
+          port,
+          deadline,
+          timeout_ms,
+          max_output_bytes,
+          append_output(output, data, max_output_bytes),
+          process_group?
+        )
+
+      {^port, {:exit_status, status}} ->
+        {:ok, render_output(output), status}
+    after
+      remaining ->
+        terminate(port, process_group?)
+        {:error, :timeout, render_output(output), timeout_ms}
+    end
+  end
+
+  defp terminate(port, process_group?) do
+    os_pid = Port.info(port, :os_pid)
+
+    case os_pid do
+      {:os_pid, pid} ->
+        signal(pid, "TERM", process_group?)
+
+        receive do
+          {^port, {:exit_status, _status}} -> :ok
+        after
+          @termination_grace_ms -> signal(pid, "KILL", process_group?)
+        end
+
+      nil ->
+        :ok
+    end
+
+    if Port.info(port), do: Port.close(port)
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp signal(pid, signal, process_group?) do
+    case System.find_executable("kill") do
+      nil ->
+        :ok
+
+      kill ->
+        target = if process_group?, do: "-#{pid}", else: Integer.to_string(pid)
+        System.cmd(kill, ["-#{signal}", "--", target], stderr_to_stdout: true)
+        :ok
+    end
+  rescue
+    _error -> :ok
+  end
+
+  defp append_output({output, truncated?}, data, max_output_bytes) do
+    remaining = max(max_output_bytes - byte_size(output), 0)
+
+    cond do
+      remaining == 0 -> {output, true}
+      byte_size(data) <= remaining -> {output <> data, truncated?}
+      true -> {output <> binary_part(data, 0, remaining), true}
+    end
+  end
+
+  defp render_output({output, false}), do: output
+  defp render_output({output, true}), do: output <> "\n[compiler output truncated]"
+
+  defp configured_positive_integer(name, default) do
+    case Integer.parse(System.get_env(name, "")) do
+      {value, ""} when value > 0 -> value
+      _other -> default
+    end
+  end
 
   defp safe_component(value) do
     Base.url_encode64(value, padding: false)

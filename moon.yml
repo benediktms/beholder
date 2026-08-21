@@ -56,6 +56,16 @@ tasks:
       cache: false
       runInCI: false
 
+  release-all:
+    command: 'true'
+    deps:
+      - 'release'
+      - 'worker-elixir:release'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false
+
   install:
     command: 'bash scripts/install.sh'
     deps:

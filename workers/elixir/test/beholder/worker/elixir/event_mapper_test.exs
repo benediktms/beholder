@@ -63,6 +63,26 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     assert contribution.observations == []
   end
 
+  test "marks macro-expanded observations as inferred" do
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: "", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    contribution =
+      EventMapper.contribution(repository, %{
+        status: :ok,
+        diagnostics: [],
+        events: [
+          event(:remote_function, %{target: "Generated", name: "call", arity: 0, from_macro: true})
+        ]
+      })
+
+    assert [%{confidence: :CONFIDENCE_INFERRED, provenance: :PROVENANCE_COMPILER}] =
+             contribution.observations
+  end
+
   defp event(kind, extra) do
     Map.merge(
       %{

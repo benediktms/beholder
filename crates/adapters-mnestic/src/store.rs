@@ -147,10 +147,21 @@ impl SemanticStore {
         view: &WorkspaceView,
         analyzer: &str,
         version: &str,
+        entities: &[beholder_domain::EntityFact],
+        observations: &[beholder_domain::Observation],
         overrides: &[DependencyOverride],
         diagnostics: &[(String, AnalysisDiagnostic)],
     ) -> Result<bool, Box<dyn Error>> {
-        publish_enrichment(&self.db, view, analyzer, version, overrides, diagnostics)
+        publish_enrichment(
+            &self.db,
+            view,
+            analyzer,
+            version,
+            entities,
+            observations,
+            overrides,
+            diagnostics,
+        )
     }
 
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {

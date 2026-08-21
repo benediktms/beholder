@@ -13,7 +13,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
     RepositoryContribution
   }
 
-  @analyzer_version "18:9:elixir-compiler:1"
+  @analyzer_version "18:9:elixir-compiler:2"
   @contribution_chunk_items 2_048
 
   @spec analyze(Snapshot.t(), String.t()) :: {:ok, [AnalyzeEvent.t()]} | {:error, String.t()}
@@ -31,28 +31,29 @@ defmodule Beholder.Worker.Elixir.Analyzer do
   end
 
   defp analyze_repository(repository, cache_dir) do
-    contribution =
+    {contribution, runtime} =
       case Compiler.run(repository, cache_dir) do
         {:ok, result} ->
-          EventMapper.contribution(repository, result)
+          {EventMapper.contribution(repository, result),
+           {result.elixir_version, result.otp_release}}
 
         {:error, reason} ->
-          %RepositoryContribution{
-            repository: repository.identity,
-            completeness: :ANALYSIS_COMPLETENESS_INCOMPLETE,
-            diagnostics: [
-              %AnalysisDiagnostic{
-                code: "elixir.compiler.unavailable",
-                severity: :ANALYSIS_DIAGNOSTIC_SEVERITY_WARNING,
-                path: "mix.exs",
-                detail: reason
-              }
-            ]
-          }
+          {%RepositoryContribution{
+             repository: repository.identity,
+             completeness: :ANALYSIS_COMPLETENESS_INCOMPLETE,
+             diagnostics: [
+               %AnalysisDiagnostic{
+                 code: "elixir.compiler.unavailable",
+                 severity: :ANALYSIS_DIAGNOSTIC_SEVERITY_WARNING,
+                 path: "mix.exs",
+                 detail: reason
+               }
+             ]
+           }, {System.version(), :erlang.system_info(:otp_release) |> to_string()}}
       end
 
     completed = %AnalysisCompleted{
-      metadata: %AnalyzerMetadata{id: "elixir", version: @analyzer_version},
+      metadata: %AnalyzerMetadata{id: "elixir", version: metadata_version(runtime)},
       active_repositories: [repository.identity],
       cache: %CacheStatistics{misses: 1}
     }
@@ -63,6 +64,16 @@ defmodule Beholder.Worker.Elixir.Analyzer do
       |> Enum.map(&%AnalyzeEvent{event: {:repository, &1}})
 
     {:ok, repository_events ++ [%AnalyzeEvent{event: {:completed, completed}}]}
+  end
+
+  @doc false
+  def metadata_version({elixir_version, otp_release} \\ runtime_versions()) do
+    mix_env = System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "dev")
+    "#{@analyzer_version}:mix-#{mix_env}:elixir-#{elixir_version}:otp-#{otp_release}"
+  end
+
+  defp runtime_versions do
+    {System.version(), :erlang.system_info(:otp_release) |> to_string()}
   end
 
   @doc false

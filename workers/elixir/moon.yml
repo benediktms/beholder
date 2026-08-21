@@ -1,0 +1,102 @@
+language: 'elixir'
+layer: 'application'
+
+fileGroups:
+  sources:
+    - '/mise.toml'
+    - '/proto/**/*.proto'
+    - '.formatter.exs'
+    - 'config/**/*.exs'
+    - 'lib/**/*.ex'
+    - 'mix.exs'
+    - 'mix.lock'
+    - 'test/**/*.exs'
+
+tasks:
+  deps:
+    command: 'mise exec -- mix deps.get'
+    inputs:
+      - '/mise.toml'
+      - 'mix.exs'
+      - 'mix.lock'
+    outputs:
+      - 'deps'
+    toolchains: 'system'
+
+  check:
+    command: 'mise exec -- mix compile --warnings-as-errors'
+    deps:
+      - 'deps'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  test:
+    command: 'mise exec -- mix test'
+    deps:
+      - 'deps'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  lint:
+    command: 'mise exec -- mix compile --warnings-as-errors'
+    deps:
+      - 'format-check'
+      - 'deps'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  format-check:
+    command: 'mise exec -- mix format --check-formatted'
+    deps:
+      - 'deps'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  format:
+    command: 'mise exec -- mix format'
+    deps:
+      - 'deps'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false
+
+  protobuf:
+    command: >-
+      mise exec -- mix protobuf.generate
+      --include-path=../../proto
+      --output-path=lib/beholder/proto
+      --plugin=ProtobufGenerate.Plugins.GRPCWithOptions
+      ../../proto/beholder/v1/daemon.proto
+      ../../proto/beholder/worker/v1/worker.proto
+    deps:
+      - 'deps'
+    inputs:
+      - '/proto/**/*.proto'
+      - 'mix.exs'
+      - 'mix.lock'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false
+
+  release:
+    command: 'mise exec -- mix escript.build'
+    deps:
+      - 'deps'
+    env:
+      MIX_ENV: 'prod'
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - 'beholder-worker-elixir'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false

@@ -46,7 +46,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              event.kind == :module and {"call", 1} in event.definitions
            end)
 
-    assert File.dir?(Path.join([cache, "elixir", "Zml4dHVyZQ", "build-YWJjMTIz"]))
+    assert [_build] = Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "build-*"]))
   end
 
   test "rejects a checkout that no longer matches the snapshot" do
@@ -62,6 +62,162 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     assert {:error, "mix.exs changed after the immutable snapshot was created"} =
              Compiler.run(repository, temp_dir("unused-cache"))
+  end
+
+  test "rejects a checkout changed while the compiler is running" do
+    root = temp_dir("changed-during-compile")
+    cache = temp_dir("changed-during-compile-cache")
+    marker = Path.join(root, "compiler-started")
+    fake_mix = fake_mix(root, "touch #{shell_quote(marker)}\nsleep 1")
+    File.write!(Path.join(root, "mix.exs"), "original")
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "abc123",
+      inputs: [%{path: "mix.exs", content: "original", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
+      task = Task.async(fn -> Compiler.run(repository, cache) end)
+      wait_for_file(marker)
+      File.write!(Path.join(root, "mix.exs"), "changed")
+
+      assert {:error, "mix.exs changed after the immutable snapshot was created"} =
+               Task.await(task, 5_000)
+    end)
+  end
+
+  test "terminates an overdue compiler process and bounds its captured output" do
+    root = temp_dir("timeout")
+    cache = temp_dir("timeout-cache")
+    child_pid = Path.join(root, "child-pid")
+
+    fake_mix =
+      fake_mix(
+        root,
+        "yes compiler-output | head -c 4096\nsleep 30 &\necho $! > #{shell_quote(child_pid)}\nwait"
+      )
+
+    File.write!(Path.join(root, "mix.exs"), "original")
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "abc123",
+      inputs: [%{path: "mix.exs", content: "original", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_envs(
+      %{
+        "BEHOLDER_ELIXIR_MIX_PATH" => fake_mix,
+        "BEHOLDER_ELIXIR_COMPILER_TIMEOUT_MS" => "200",
+        "BEHOLDER_ELIXIR_MAX_OUTPUT_BYTES" => "128"
+      },
+      fn ->
+        assert {:error, reason} = Compiler.run(repository, cache)
+        assert reason =~ "exceeded 200ms and was terminated"
+        assert reason =~ "[compiler output truncated]"
+        assert byte_size(reason) < 512
+        wait_for_file(child_pid)
+
+        pid = child_pid |> File.read!() |> String.trim()
+        wait_for_process_exit(pid)
+      end
+    )
+  end
+
+  test "isolates Mix build directories by compilation environment" do
+    root = temp_dir("build-identity")
+    cache = temp_dir("build-identity-cache")
+    fake_mix = fake_mix(root, "mkdir -p \"$MIX_BUILD_PATH\"")
+    File.write!(Path.join(root, "mix.exs"), "original")
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "abc123",
+      inputs: [%{path: "mix.exs", content: "original", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
+      with_env("BEHOLDER_ELIXIR_MIX_ENV", "dev", fn -> Compiler.run(repository, cache) end)
+      with_env("BEHOLDER_ELIXIR_MIX_ENV", "test", fn -> Compiler.run(repository, cache) end)
+    end)
+
+    assert 2 ==
+             cache
+             |> Path.join("elixir/Zml4dHVyZQ/build-*")
+             |> Path.wildcard()
+             |> length()
+  end
+
+  defp fake_mix(root, body) do
+    path = Path.join(root, "fake-mix")
+    File.write!(path, "#!/bin/sh\nset -eu\n#{body}\n")
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp wait_for_file(path, attempts \\ 100)
+  defp wait_for_file(path, 0), do: flunk("timed out waiting for #{path}")
+
+  defp wait_for_file(path, attempts) do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(20)
+      wait_for_file(path, attempts - 1)
+    end
+  end
+
+  defp wait_for_process_exit(pid, attempts \\ 100)
+  defp wait_for_process_exit(pid, 0), do: flunk("compiler child process #{pid} survived")
+
+  defp wait_for_process_exit(pid, attempts) do
+    if process_running?(pid) do
+      Process.sleep(20)
+      wait_for_process_exit(pid, attempts - 1)
+    else
+      :ok
+    end
+  end
+
+  defp process_running?(pid) do
+    case File.read("/proc/#{pid}/stat") do
+      {:ok, stat} ->
+        case String.split(stat, " ") do
+          [_pid, _name, "Z" | _rest] -> false
+          _fields -> true
+        end
+
+      {:error, :enoent} ->
+        false
+
+      {:error, _reason} ->
+        case System.cmd("kill", ["-0", pid], stderr_to_stdout: true) do
+          {_output, 0} -> true
+          {_output, _status} -> false
+        end
+    end
+  end
+
+  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
+
+  defp with_env(name, value, fun), do: with_envs(%{name => value}, fun)
+
+  defp with_envs(values, fun) do
+    previous = Map.new(values, fn {name, _value} -> {name, System.get_env(name)} end)
+    Enum.each(values, fn {name, value} -> System.put_env(name, value) end)
+
+    try do
+      fun.()
+    after
+      Enum.each(previous, fn
+        {name, nil} -> System.delete_env(name)
+        {name, value} -> System.put_env(name, value)
+      end)
+    end
   end
 
   defp temp_dir(label) do

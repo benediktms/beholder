@@ -900,6 +900,8 @@ pub(super) fn publish_enrichment(
     view: &WorkspaceView,
     analyzer: &str,
     version: &str,
+    entities: &[EntityFact],
+    observations: &[Observation],
     overrides: &[DependencyOverride],
     diagnostics: &[(String, AnalysisDiagnostic)],
 ) -> Result<bool, Box<dyn Error>> {
@@ -937,10 +939,12 @@ pub(super) fn publish_enrichment(
          :put analysis_revision_state {view, revision, repository => state}",
         "?[view, revision, id, kind, metadata] := \
              *analysis_revision_entity{view: $view, revision: $previous, id, kind, metadata}, \
+             not *analysis_revision_enrichment_entity_owner{view: $view, revision: $previous, id, analyzer: $analyzer}, \
              view = $view, revision = $revision \
          :put analysis_revision_entity {view, revision, id => kind, metadata}",
         "?[view, revision, from, relation, to, evidence, confidence, provenance] := \
              *analysis_revision_observation{view: $view, revision: $previous, from, relation, to, evidence, confidence, provenance}, \
+             not *analysis_revision_enrichment_observation_owner{view: $view, revision: $previous, from, relation, to, evidence, analyzer: $analyzer}, \
              view = $view, revision = $revision \
          :put analysis_revision_observation {view, revision, from, relation, to, evidence => confidence, provenance}",
         "?[view, revision, incomplete] := \
@@ -978,8 +982,110 @@ pub(super) fn publish_enrichment(
              *analysis_revision_enrichment_diagnostic_owner{view: $view, revision: $previous, repository, code, severity, path, line, analyzer}, \
              analyzer != $analyzer, view = $view, revision = $revision \
          :put analysis_revision_enrichment_diagnostic_owner {view, revision, repository, code, severity, path, line => analyzer}",
+        "?[view, revision, id, analyzer] := \
+             *analysis_revision_enrichment_entity_owner{view: $view, revision: $previous, id, analyzer}, \
+             analyzer != $analyzer, view = $view, revision = $revision \
+         :put analysis_revision_enrichment_entity_owner {view, revision, id => analyzer}",
+        "?[view, revision, from, relation, to, evidence, analyzer] := \
+             *analysis_revision_enrichment_observation_owner{view: $view, revision: $previous, from, relation, to, evidence, analyzer}, \
+             analyzer != $analyzer, view = $view, revision = $revision \
+         :put analysis_revision_enrichment_observation_owner {view, revision, from, relation, to, evidence => analyzer}",
     ] {
         transaction.run_script(script, params.clone())?;
+    }
+    for entities in entities.chunks(FACT_BATCH_SIZE) {
+        let rows = entities
+            .iter()
+            .map(|entity| {
+                DataValue::List(vec![
+                    view.name.as_str().into(),
+                    revision.into(),
+                    entity.id.as_str().into(),
+                    entity_kind(entity.kind).into(),
+                    entity_metadata(entity.metadata).into(),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let values = BTreeMap::from([
+            ("rows".into(), DataValue::List(rows)),
+            ("view".into(), view.name.clone().into()),
+            ("previous".into(), previous.into()),
+            ("analyzer".into(), analyzer.into()),
+        ]);
+        transaction.run_script(
+            "rows[view, revision, id, kind, metadata] <- $rows \
+             incoming[view, revision, id, kind, metadata] := \
+                 rows[view, revision, id, kind, metadata], \
+                 not *analysis_revision_entity{view: $view, revision: $previous, id} \
+             incoming[view, revision, id, kind, metadata] := \
+                 rows[view, revision, id, kind, metadata], \
+                 *analysis_revision_enrichment_entity_owner{view: $view, revision: $previous, id, analyzer: $analyzer} \
+             ?[view, revision, id, kind, metadata] := incoming[view, revision, id, kind, metadata] \
+             :put analysis_revision_entity {view, revision, id => kind, metadata}",
+            values.clone(),
+        )?;
+        transaction.run_script(
+            "rows[view, revision, id, kind, metadata] <- $rows \
+             incoming[view, revision, id] := \
+                 rows[view, revision, id, _, _], \
+                 not *analysis_revision_entity{view: $view, revision: $previous, id} \
+             incoming[view, revision, id] := \
+                 rows[view, revision, id, _, _], \
+                 *analysis_revision_enrichment_entity_owner{view: $view, revision: $previous, id, analyzer: $analyzer} \
+             ?[view, revision, id, analyzer] := \
+                 incoming[view, revision, id], analyzer = $analyzer \
+             :put analysis_revision_enrichment_entity_owner {view, revision, id => analyzer}",
+            values,
+        )?;
+    }
+    for observations in observations.chunks(FACT_BATCH_SIZE) {
+        let rows = observations
+            .iter()
+            .map(|observation| {
+                DataValue::List(vec![
+                    view.name.as_str().into(),
+                    revision.into(),
+                    observation.from.as_str().into(),
+                    observation.relation.as_str().into(),
+                    observation.to.as_str().into(),
+                    observation.evidence.as_str().into(),
+                    observation.confidence.score().into(),
+                    observation.provenance.as_str().into(),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let values = BTreeMap::from([
+            ("rows".into(), DataValue::List(rows)),
+            ("view".into(), view.name.clone().into()),
+            ("previous".into(), previous.into()),
+            ("analyzer".into(), analyzer.into()),
+        ]);
+        transaction.run_script(
+            "rows[view, revision, from, relation, to, evidence, confidence, provenance] <- $rows \
+             incoming[view, revision, from, relation, to, evidence, confidence, provenance] := \
+                 rows[view, revision, from, relation, to, evidence, confidence, provenance], \
+                 not *analysis_revision_observation{view: $view, revision: $previous, from, relation, to, evidence} \
+             incoming[view, revision, from, relation, to, evidence, confidence, provenance] := \
+                 rows[view, revision, from, relation, to, evidence, confidence, provenance], \
+                 *analysis_revision_enrichment_observation_owner{view: $view, revision: $previous, from, relation, to, evidence, analyzer: $analyzer} \
+             ?[view, revision, from, relation, to, evidence, confidence, provenance] := \
+                 incoming[view, revision, from, relation, to, evidence, confidence, provenance] \
+             :put analysis_revision_observation {view, revision, from, relation, to, evidence => confidence, provenance}",
+            values.clone(),
+        )?;
+        transaction.run_script(
+            "rows[view, revision, from, relation, to, evidence, confidence, provenance] <- $rows \
+             incoming[view, revision, from, relation, to, evidence] := \
+                 rows[view, revision, from, relation, to, evidence, _, _], \
+                 not *analysis_revision_observation{view: $view, revision: $previous, from, relation, to, evidence} \
+             incoming[view, revision, from, relation, to, evidence] := \
+                 rows[view, revision, from, relation, to, evidence, _, _], \
+                 *analysis_revision_enrichment_observation_owner{view: $view, revision: $previous, from, relation, to, evidence, analyzer: $analyzer} \
+             ?[view, revision, from, relation, to, evidence, analyzer] := \
+                 incoming[view, revision, from, relation, to, evidence], analyzer = $analyzer \
+             :put analysis_revision_enrichment_observation_owner {view, revision, from, relation, to, evidence => analyzer}",
+            values,
+        )?;
     }
     for overrides in overrides.chunks(FACT_BATCH_SIZE) {
         let rows = overrides
@@ -1449,6 +1555,16 @@ pub(super) fn sweep_garbage_collection(
             "superseded revision enrichment diagnostic owners",
             "analysis_revision_enrichment_diagnostic_owner",
             "view, revision, repository, code, severity, path, line",
+        ),
+        (
+            "superseded revision enrichment entity owners",
+            "analysis_revision_enrichment_entity_owner",
+            "view, revision, id",
+        ),
+        (
+            "superseded revision enrichment observation owners",
+            "analysis_revision_enrichment_observation_owner",
+            "view, revision, from, relation, to, evidence",
         ),
         (
             "superseded revision dependency overrides",
@@ -2398,6 +2514,8 @@ mod tests {
                     &view,
                     "rust",
                     "1",
+                    &[],
+                    &[],
                     &[override_],
                     &[("example/repo".into(), compiler_diagnostic)],
                 )
@@ -2428,7 +2546,7 @@ mod tests {
         );
         assert!(
             store
-                .publish_enrichment(&view, "rust", "2", &[], &[])
+                .publish_enrichment(&view, "rust", "2", &[], &[], &[], &[])
                 .unwrap()
         );
         let context = store
@@ -2460,8 +2578,78 @@ mod tests {
         .unwrap();
         assert!(
             !store
-                .publish_enrichment(&stale, "rust", "1", &[], &[])
+                .publish_enrichment(&stale, "rust", "1", &[], &[], &[], &[])
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn publishes_and_retracts_additive_enrichment_facts() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "elixir-enriched",
+            "syntax",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "source".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .publish(&view, &[facts(&view, Vec::new())], &[])
+            .unwrap();
+
+        let generated = "repo://example/repo/elixir/Example/generated/0";
+        let entity = EntityFact::new(generated, EntityKind::Callable, None).unwrap();
+        let mut observation = Observation::dependency(
+            generated,
+            DependencyRelation::Calls,
+            "elixir-call://External/run/0",
+            "lib/example.ex:2 (compiler remote_function via macro expansion)",
+        );
+        observation.confidence = Confidence::Inferred;
+        observation.provenance = Provenance::Compiler;
+
+        assert!(
+            store
+                .publish_enrichment(&view, "elixir", "1", &[entity], &[observation], &[], &[],)
+                .unwrap()
+        );
+        let context = store.context("elixir-enriched", generated).unwrap();
+        assert_eq!(context.edges.len(), 1);
+        assert_eq!(context.edges[0].confidence, 0.7);
+        assert_eq!(
+            context.edges[0].evidence[0].source_kind,
+            beholder_dto::EvidenceKind::Compiler
+        );
+
+        assert!(
+            store
+                .publish_enrichment(&view, "elixir", "2", &[], &[], &[], &[])
+                .unwrap()
+        );
+        assert!(
+            store
+                .context("elixir-enriched", generated)
+                .unwrap()
+                .edges
+                .is_empty()
+        );
+        let rows = store
+            .db
+            .run_script(
+                "?[id] := *analysis_revision{view: $view, revision}, \
+                     *analysis_revision_entity{view: $view, revision, id: $id}",
+                BTreeMap::from([
+                    ("view".into(), "elixir-enriched".into()),
+                    ("id".into(), generated.into()),
+                ]),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert!(rows.rows.is_empty());
     }
 }

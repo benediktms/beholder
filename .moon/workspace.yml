@@ -1,5 +1,6 @@
 projects:
   beholder: '.'
+  worker-elixir: 'workers/elixir'
 
 versionConstraint: '>=2.4.6'
 

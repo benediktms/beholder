@@ -30,6 +30,27 @@ defmodule Beholder.Worker.Elixir.Compiler.TracerTest do
     assert Enum.any?(events, &(&1.kind == :module and &1.target == inspect_module(module)))
   end
 
+  test "records concurrent tracer events before drain returns" do
+    {:ok, collector} = Collector.start_link()
+
+    on_exit(fn ->
+      if Process.alive?(collector), do: GenServer.stop(collector)
+    end)
+
+    1..2_000
+    |> Task.async_stream(
+      fn index -> Collector.record(%{index: index}) end,
+      max_concurrency: System.schedulers_online() * 2,
+      timeout: 5_000
+    )
+    |> Stream.run()
+
+    events = Collector.drain()
+    assert length(events) == 2_000
+    assert events |> Enum.map(& &1.index) |> Enum.sort() == Enum.to_list(1..2_000)
+    assert Collector.drain() == []
+  end
+
   defp inspect_module(module) do
     module |> Atom.to_string() |> String.trim_leading("Elixir.")
   end

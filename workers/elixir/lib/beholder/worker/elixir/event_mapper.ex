@@ -80,7 +80,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
         relation: :RELATION_KIND_CALLS,
         to: to,
         evidence: evidence,
-        confidence: :CONFIDENCE_EXACT,
+        confidence: confidence(event),
         provenance: :PROVENANCE_COMPILER
       }
     else
@@ -98,7 +98,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
         relation: relation,
         to: module_target(repository.identity, target, definitions),
         evidence: evidence,
-        confidence: :CONFIDENCE_EXACT,
+        confidence: confidence(event),
         provenance: :PROVENANCE_COMPILER
       }
     else
@@ -162,6 +162,9 @@ defmodule Beholder.Worker.Elixir.EventMapper do
       "#{location} (compiler #{event.kind}#{suffix})"
     end
   end
+
+  defp confidence(%{from_macro: true}), do: :CONFIDENCE_INFERRED
+  defp confidence(_event), do: :CONFIDENCE_EXACT
 
   defp diagnostics(repository, result) do
     compiler_diagnostics =

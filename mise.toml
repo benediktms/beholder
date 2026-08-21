@@ -1,3 +1,5 @@
 [tools]
 "github:moonrepo/moon" = "2.5.0"
+erlang = "29.0.5"
+elixir = "1.20.3-otp-29"
 protoc = "33.4"
