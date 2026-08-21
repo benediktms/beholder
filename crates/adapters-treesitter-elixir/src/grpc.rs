@@ -224,28 +224,24 @@ fn recognize_node(
             );
             match target {
                 Some("alias") => {
-                    let definitions =
-                        alias_definitions(node, source)
-                            .into_iter()
-                            .map(|mut alias| {
-                                alias.target =
-                                    expand_alias(&alias.target, aliases, &current_module);
-                                alias
-                            })
-                            .collect::<Vec<_>>();
+                    let definitions = alias_definitions(node, source)
+                        .into_iter()
+                        .map(|mut alias| {
+                            alias.target = expand_alias(&alias.target, aliases, &current_module);
+                            alias
+                        })
+                        .collect::<Vec<_>>();
                     aliases.extend(definitions);
                     return;
                 }
                 Some("require") if keyword_value(node, source, "as").is_some() => {
-                    let definitions =
-                        alias_definitions(node, source)
-                            .into_iter()
-                            .map(|mut alias| {
-                                alias.target =
-                                    expand_alias(&alias.target, aliases, &current_module);
-                                alias
-                            })
-                            .collect::<Vec<_>>();
+                    let definitions = alias_definitions(node, source)
+                        .into_iter()
+                        .map(|mut alias| {
+                            alias.target = expand_alias(&alias.target, aliases, &current_module);
+                            alias
+                        })
+                        .collect::<Vec<_>>();
                     aliases.extend(definitions);
                     return;
                 }
