@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use super::grpc::GrpcModule;
 
@@ -7,6 +7,12 @@ use super::grpc::GrpcModule;
 pub struct ElixirAnalysis {
     pub(super) modules: Vec<ElixirModule>,
     pub(super) parse_error_lines: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ElixirRepository {
+    pub(super) repository: String,
+    pub(super) sources: Vec<(PathBuf, ElixirAnalysis)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
