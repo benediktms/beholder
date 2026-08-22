@@ -1,14 +1,18 @@
+#[cfg(test)]
 use beholder_adapters_git::repository_state_bytes;
 #[cfg(test)]
 use beholder_adapters_treesitter_csharp::{UnityPrefab, parse_unity_meta, parse_unity_prefab};
 #[cfg(test)]
 use beholder_adapters_treesitter_typescript::SourceLanguage;
+#[cfg(test)]
 use beholder_domain::BeholderError;
 #[cfg(test)]
 use beholder_domain::RepositoryState;
 #[cfg(test)]
 use beholder_domain::{BeholderErrorCode, BeholderErrorKind};
-use beholder_indexing::{Indexer, RepositorySnapshot};
+use beholder_indexing::Indexer;
+#[cfg(test)]
+use beholder_indexing::RepositorySnapshot;
 #[cfg(test)]
 use std::{borrow::Cow, fs::File, io::BufReader};
 use std::{
