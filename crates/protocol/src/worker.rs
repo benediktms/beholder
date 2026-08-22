@@ -156,16 +156,17 @@ impl WorkspaceSnapshotBuilder {
         let target_repository = self
             .target_repository
             .ok_or("worker request stream omitted its target repository")?;
-        if !self.repositories.contains_key(&target_repository) {
-            return Err("worker target repository is missing from its snapshot".into());
-        }
+        let mut repositories = self.repositories;
+        let target = repositories
+            .remove(&target_repository)
+            .ok_or("worker target repository is missing from its snapshot")?;
         Ok(EnrichmentSnapshot {
             target_repository,
             workspace: WorkspaceSnapshot {
                 name: self
                     .name
                     .ok_or("worker request stream omitted analysis start")?,
-                repositories: self.repositories.into_values().collect(),
+                repositories: std::iter::once(target).chain(repositories.into_values()).collect(),
             },
         })
     }
