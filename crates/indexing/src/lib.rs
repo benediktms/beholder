@@ -1965,7 +1965,7 @@ mod tests {
         assert!(!repository_analysis_identity(&[]).contains("core-rules"));
         assert_ne!(
             identity,
-            workspace_analysis_identity_with_rules(&repositories, "6")
+            workspace_analysis_identity_with_rules(&repositories, "5")
         );
         assert_ne!(
             encode_identity([(&"a".into(), &"b:c".into())]),
