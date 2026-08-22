@@ -102,33 +102,33 @@ impl RepositoryDependencyGraph {
                 .filter(|observation| observation.relation.dependency().is_some())
         });
         for observation in observations {
-            if let (Some(from), Some(to)) =
-                (owner(observation.from.as_str()), owner(observation.to.as_str()))
-                && let Some(analyzer) = analyzer(from, observation.from.as_str())
+            if let (Some(from), Some(to)) = (
+                owner(observation.from.as_str()),
+                owner(observation.to.as_str()),
+            ) && let Some(analyzer) = analyzer(from, observation.from.as_str())
             {
-                graph
-                    .add_dependency(
-                        from,
-                        to,
-                        analyzer,
-                        RepositoryDependencyKind::SemanticObservation,
-                        observation.evidence.as_str(),
-                    )?;
+                graph.add_dependency(
+                    from,
+                    to,
+                    analyzer,
+                    RepositoryDependencyKind::SemanticObservation,
+                    observation.evidence.as_str(),
+                )?;
             }
         }
         for override_ in overrides {
             if let (Some(from), Some(to)) = (
                 owner(override_.from.as_str()),
                 owner(override_.resolved_to.as_str()),
-            ) && let Some(analyzer) = analyzer(from, override_.from.as_str()) {
-                graph
-                    .add_dependency(
-                        from,
-                        to,
-                        analyzer,
-                        RepositoryDependencyKind::ResolutionOverride,
-                        override_.evidence.as_str(),
-                    )?;
+            ) && let Some(analyzer) = analyzer(from, override_.from.as_str())
+            {
+                graph.add_dependency(
+                    from,
+                    to,
+                    analyzer,
+                    RepositoryDependencyKind::ResolutionOverride,
+                    override_.evidence.as_str(),
+                )?;
             }
         }
         Ok(graph)
@@ -213,10 +213,7 @@ impl RepositoryDependencyGraph {
             .map(String::as_str)
     }
 
-    pub fn dependencies_from(
-        &self,
-        target: &str,
-    ) -> impl Iterator<Item = &RepositoryDependency> {
+    pub fn dependencies_from(&self, target: &str) -> impl Iterator<Item = &RepositoryDependency> {
         self.dependencies
             .get(target)
             .into_iter()
@@ -286,8 +283,14 @@ mod tests {
 
         let graph = RepositoryDependencyGraph::from_baseline(&repositories, &[]).unwrap();
 
-        assert_eq!(graph.direct_context("example/a").collect::<Vec<_>>(), ["example/b"]);
-        assert_eq!(graph.affected_targets("example/b").collect::<Vec<_>>(), ["example/a"]);
+        assert_eq!(
+            graph.direct_context("example/a").collect::<Vec<_>>(),
+            ["example/b"]
+        );
+        assert_eq!(
+            graph.affected_targets("example/b").collect::<Vec<_>>(),
+            ["example/a"]
+        );
         assert!(graph.direct_context("example/c").next().is_none());
     }
 

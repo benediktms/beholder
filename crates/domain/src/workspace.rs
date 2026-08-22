@@ -259,12 +259,11 @@ impl WorkspaceView {
         state: &RepositoryState,
         analyzer: &str,
     ) -> String {
-        let mut repositories = std::iter::once(state.repository.identity.as_str())
-            .chain(
-                self.repository_contexts(&state.repository.identity, analyzer)
-                    .iter()
-                    .map(String::as_str),
-            );
+        let mut repositories = std::iter::once(state.repository.identity.as_str()).chain(
+            self.repository_contexts(&state.repository.identity, analyzer)
+                .iter()
+                .map(String::as_str),
+        );
         repositories
             .try_fold(String::new(), |mut fingerprint, repository| {
                 let state = self
@@ -449,28 +448,24 @@ mod tests {
                 &original.repository_states[0],
                 "typescript",
             ),
-            changed_context
-                .repository_enrichment_input_fingerprint(
-                    &changed_context.repository_states[0],
-                    "typescript",
-                )
+            changed_context.repository_enrichment_input_fingerprint(
+                &changed_context.repository_states[0],
+                "typescript",
+            )
         );
         assert_eq!(
             original.repository_enrichment_input_fingerprint(
                 &original.repository_states[0],
                 "typescript",
             ),
-            changed_unrelated
-                .repository_enrichment_input_fingerprint(
-                    &changed_unrelated.repository_states[0],
-                    "typescript",
-                )
+            changed_unrelated.repository_enrichment_input_fingerprint(
+                &changed_unrelated.repository_states[0],
+                "typescript",
+            )
         );
         assert_eq!(
-            original.repository_enrichment_input_fingerprint(
-                &original.repository_states[0],
-                "rust",
-            ),
+            original
+                .repository_enrichment_input_fingerprint(&original.repository_states[0], "rust",),
             changed_context.repository_enrichment_input_fingerprint(
                 &changed_context.repository_states[0],
                 "rust",

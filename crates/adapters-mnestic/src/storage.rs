@@ -3008,10 +3008,8 @@ mod tests {
             .publish_enrichment(
                 &initial,
                 "example/a",
-                &initial.repository_enrichment_input_fingerprint(
-                    &initial.repository_states[0],
-                    "rust",
-                ),
+                &initial
+                    .repository_enrichment_input_fingerprint(&initial.repository_states[0], "rust"),
                 EnrichmentOwner {
                     analyzer: "rust",
                     version: "1",
@@ -3027,10 +3025,8 @@ mod tests {
             .publish_enrichment(
                 &initial,
                 "example/b",
-                &initial.repository_enrichment_input_fingerprint(
-                    &initial.repository_states[1],
-                    "rust",
-                ),
+                &initial
+                    .repository_enrichment_input_fingerprint(&initial.repository_states[1], "rust"),
                 EnrichmentOwner {
                     analyzer: "rust",
                     version: "1",
@@ -3150,10 +3146,8 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let target_input = started.repository_enrichment_input_fingerprint(
-            &started.repository_states[0],
-            "rust",
-        );
+        let target_input =
+            started.repository_enrichment_input_fingerprint(&started.repository_states[0], "rust");
 
         let current = WorkspaceView::new(
             "concurrent",
@@ -3266,10 +3260,7 @@ mod tests {
         .unwrap()
         .with_repository_contexts(BTreeMap::from([(
             "rust".into(),
-            BTreeMap::from([(
-                "example/target".into(),
-                vec!["example/context".into()],
-            )]),
+            BTreeMap::from([("example/target".into(), vec!["example/context".into()])]),
         )]))
         .unwrap();
         let expected = view.repository_enrichment_input_fingerprint(
@@ -3342,10 +3333,8 @@ mod tests {
         store
             .publish(&view, &[facts(&view, Vec::new())], &[])
             .unwrap();
-        let input_fingerprint = view.repository_enrichment_input_fingerprint(
-            &view.repository_states[0],
-            "rust",
-        );
+        let input_fingerprint =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
         store
             .publish_enrichment(
                 &view,
@@ -3562,10 +3551,8 @@ mod tests {
         store
             .publish(&view, &[facts(&view, Vec::new())], &[])
             .unwrap();
-        let input_fingerprint = view.repository_enrichment_input_fingerprint(
-            &view.repository_states[0],
-            "elixir",
-        );
+        let input_fingerprint =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "elixir");
 
         let generated = "repo://example/repo/elixir/Example/generated/0";
         let entity = EntityFact::new(generated, EntityKind::Callable, None).unwrap();

@@ -25,37 +25,40 @@ pub fn analyze_requests(
             workspace: snapshot.name,
         })),
     };
-    let repositories = snapshot.repositories.into_iter().flat_map(move |repository| {
-        let identity = repository.state.repository.identity;
-        let start = wire::AnalyzeRequest {
-            request: Some(wire::analyze_request::Request::Repository(
-                wire::RepositoryStart {
-                    identity: identity.clone(),
-                    base: repository.base.to_string_lossy().into_owned(),
-                    head: repository.state.head,
-                    fingerprint: repository.state.fingerprint,
-                    target: identity == target_repository,
-                },
-            )),
-        };
-        std::iter::once(start).chain(repository.inputs.into_iter().map(move |input| {
-            wire::AnalyzeRequest {
-                request: Some(wire::analyze_request::Request::Input(
-                    wire::RepositoryInput {
-                        repository: identity.clone(),
-                        path: input.path.to_string_lossy().into_owned(),
-                        content: input.content.to_vec(),
-                        kind: match input.kind {
-                            InputKind::Source => wire::InputKind::Source as i32,
-                            InputKind::ProtobufDescriptor => {
-                                wire::InputKind::ProtobufDescriptor as i32
-                            }
-                        },
+    let repositories = snapshot
+        .repositories
+        .into_iter()
+        .flat_map(move |repository| {
+            let identity = repository.state.repository.identity;
+            let start = wire::AnalyzeRequest {
+                request: Some(wire::analyze_request::Request::Repository(
+                    wire::RepositoryStart {
+                        identity: identity.clone(),
+                        base: repository.base.to_string_lossy().into_owned(),
+                        head: repository.state.head,
+                        fingerprint: repository.state.fingerprint,
+                        target: identity == target_repository,
                     },
                 )),
-            }
-        }))
-    });
+            };
+            std::iter::once(start).chain(repository.inputs.into_iter().map(move |input| {
+                wire::AnalyzeRequest {
+                    request: Some(wire::analyze_request::Request::Input(
+                        wire::RepositoryInput {
+                            repository: identity.clone(),
+                            path: input.path.to_string_lossy().into_owned(),
+                            content: input.content.to_vec(),
+                            kind: match input.kind {
+                                InputKind::Source => wire::InputKind::Source as i32,
+                                InputKind::ProtobufDescriptor => {
+                                    wire::InputKind::ProtobufDescriptor as i32
+                                }
+                            },
+                        },
+                    )),
+                }
+            }))
+        });
     let finish = wire::AnalyzeRequest {
         request: Some(wire::analyze_request::Request::Finish(
             wire::AnalysisFinish {},
@@ -100,9 +103,7 @@ impl WorkspaceSnapshotBuilder {
                     return Err("worker repository preceded analysis start".into());
                 }
                 let identity = repository.identity;
-                if repository.target
-                    && self.target_repository.replace(identity.clone()).is_some()
-                {
+                if repository.target && self.target_repository.replace(identity.clone()).is_some() {
                     return Err("worker analysis identified more than one target repository".into());
                 }
                 if self

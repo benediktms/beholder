@@ -1396,11 +1396,7 @@ fn index_workspace_through_port(
                             let target = &repository.state.repository.identity;
                             Ok((
                                 target.clone(),
-                                store.repository_contexts(
-                                    &workspace.name,
-                                    target,
-                                    &analyzer.id,
-                                )?,
+                                store.repository_contexts(&workspace.name, target, &analyzer.id)?,
                             ))
                         })
                         .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
@@ -1854,10 +1850,7 @@ mod tests {
         };
         let view = WorkspaceView::new("main", "syntax", vec![state])
             .unwrap()
-            .with_repository_contexts(BTreeMap::from([(
-                "semantic".into(),
-                BTreeMap::new(),
-            )]))
+            .with_repository_contexts(BTreeMap::from([("semantic".into(), BTreeMap::new())]))
             .unwrap();
         let scheduler = IndexScheduler::with_indexer(
             IndexerBuilder::new(PathBuf::new(), 1)
@@ -1882,10 +1875,8 @@ mod tests {
             )
             .unwrap();
         let (cancel, cancelled) = tokio::sync::watch::channel(());
-        let input_fingerprint = view.repository_enrichment_input_fingerprint(
-            &view.repository_states[0],
-            "semantic",
-        );
+        let input_fingerprint =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "semantic");
         scheduler.enriching.lock().unwrap().insert(
             ("main".into(), "repo".into(), "semantic".into()),
             EnrichmentRun {
@@ -1984,7 +1975,10 @@ mod tests {
                 expected_repositories
             );
             assert_eq!(
-                &job.snapshot.workspace.repositories[0].state.repository.identity,
+                &job.snapshot.workspace.repositories[0]
+                    .state
+                    .repository
+                    .identity,
                 repository
             );
             assert_eq!(&job.snapshot.target_repository, repository);
@@ -2084,10 +2078,7 @@ mod tests {
             jobs.get(&("main".into(), "target".into(), "semantic".into()))
                 .unwrap()
                 .input_fingerprint,
-            view.repository_enrichment_input_fingerprint(
-                &view.repository_states[1],
-                "semantic",
-            )
+            view.repository_enrichment_input_fingerprint(&view.repository_states[1], "semantic",)
         );
     }
 

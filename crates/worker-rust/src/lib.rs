@@ -286,12 +286,10 @@ fn manifests_match_snapshot(
 
 fn retain_semantic_enrichment(contribution: &mut AnalyzerContribution, target_repository: &str) {
     let target_prefix = format!("repo://{target_repository}/");
-    contribution
-        .overrides
-        .retain(|override_| {
-            override_.provenance == Provenance::Compiler
-                && override_.from.as_str().starts_with(&target_prefix)
-        });
+    contribution.overrides.retain(|override_| {
+        override_.provenance == Provenance::Compiler
+            && override_.from.as_str().starts_with(&target_prefix)
+    });
     contribution
         .active_repositories
         .retain(|repository| repository == target_repository);
@@ -609,8 +607,7 @@ mod tests {
         ));
         fs::create_dir_all(base.join("src")).unwrap();
         fs::create_dir_all(base.join("dependency/src")).unwrap();
-        let manifest =
-            "[package]\nname = \"worker-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+        let manifest = "[package]\nname = \"worker-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
              [dependencies]\ncontext = { path = \"dependency\" }\n";
         let dependency_manifest =
             "[package]\nname = \"context\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
@@ -773,8 +770,7 @@ fn caller() {
         }));
         assert!(overrides.iter().any(|override_| {
             override_.from.as_str() == "repo://example/repo/rust/lib/caller"
-                && override_.resolved_to.as_str()
-                    == "repo://example/context/rust/lib/external"
+                && override_.resolved_to.as_str() == "repo://example/context/rust/lib/external"
                 && override_.provenance == Provenance::Compiler
         }));
         assert!(

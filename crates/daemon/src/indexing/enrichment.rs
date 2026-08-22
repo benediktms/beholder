@@ -275,9 +275,14 @@ impl IndexScheduler {
                                         name: snapshot.name.clone(),
                                         repositories: std::iter::once(repository.clone())
                                             .chain(contexts.iter().filter_map(|identity| {
-                                                snapshot.repositories.iter().find(|candidate| {
-                                                    candidate.state.repository.identity == *identity
-                                                }).cloned()
+                                                snapshot
+                                                    .repositories
+                                                    .iter()
+                                                    .find(|candidate| {
+                                                        candidate.state.repository.identity
+                                                            == *identity
+                                                    })
+                                                    .cloned()
                                             }))
                                             .collect(),
                                     },
@@ -309,26 +314,24 @@ impl IndexScheduler {
 }
 
 fn contribution_escapes_target(contribution: &AnalyzerContribution, target: &str) -> bool {
-    contribution
-        .repositories
+    contribution.repositories.iter().any(|repository| {
+        repository.repository != target
+            || repository
+                .entities
+                .iter()
+                .any(|entity| entity_escapes_target(entity.id.as_str(), target))
+            || repository
+                .grpc_bindings
+                .iter()
+                .any(|binding| !entity_belongs_to_target(binding.local_symbol.as_str(), target))
+            || repository
+                .observations
+                .iter()
+                .any(|observation| entity_escapes_target(observation.from.as_str(), target))
+    }) || contribution
+        .active_repositories
         .iter()
-        .any(|repository| {
-            repository.repository != target
-                || repository
-                    .entities
-                    .iter()
-                    .any(|entity| entity_escapes_target(entity.id.as_str(), target))
-                || repository.grpc_bindings.iter().any(|binding| {
-                    !entity_belongs_to_target(binding.local_symbol.as_str(), target)
-                })
-                || repository.observations.iter().any(|observation| {
-                    entity_escapes_target(observation.from.as_str(), target)
-                })
-        })
-        || contribution
-            .active_repositories
-            .iter()
-            .any(|repository| repository != target)
+        .any(|repository| repository != target)
         || contribution
             .diagnostics
             .iter()
@@ -377,12 +380,14 @@ mod tests {
             repositories: vec![RepositoryContribution {
                 repository: "example/target".into(),
                 completeness: AnalysisCompleteness::Complete,
-                entities: vec![EntityFact::new(
-                    "repo://example/target/rust/lib/local",
-                    EntityKind::Callable,
-                    None,
-                )
-                .unwrap()],
+                entities: vec![
+                    EntityFact::new(
+                        "repo://example/target/rust/lib/local",
+                        EntityKind::Callable,
+                        None,
+                    )
+                    .unwrap(),
+                ],
                 grpc_bindings: Vec::new(),
                 observations: Vec::new(),
                 diagnostics: Vec::new(),
