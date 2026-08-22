@@ -110,6 +110,20 @@ pub fn repository_state_bytes<'a>(
     root: &Path,
     sources: impl IntoIterator<Item = (&'a Path, &'a [u8])>,
 ) -> Result<RepositoryState, Box<dyn Error>> {
+    let (repository, head) = repository_version(root)?;
+
+    Ok(RepositoryState {
+        fingerprint: state_fingerprint(&repository.identity, head.as_deref(), sources),
+        repository,
+        head,
+    })
+}
+
+/// Returns the logical repository and selected worktree revision without
+/// reading repository source inputs.
+pub fn repository_version(
+    root: &Path,
+) -> Result<(LogicalRepository, Option<String>), Box<dyn Error>> {
     let (repository, head) = match gix::discover(root) {
         Ok(git) => {
             let topology = topology_from(git, root)?;
@@ -126,14 +140,63 @@ pub fn repository_state_bytes<'a>(
         }
         Err(_) => (local_repository_identity(root)?, None),
     };
-
-    Ok(RepositoryState {
-        fingerprint: state_fingerprint(&repository, head.as_deref(), sources),
-        repository: LogicalRepository {
+    Ok((
+        LogicalRepository {
             identity: repository,
         },
         head,
+    ))
+}
+
+/// Builds repository state from content-authoritative input digests. Callers
+/// must provide a cryptographic digest of the exact bytes for every input.
+pub fn repository_state_from_content_hashes<'a>(
+    root: &Path,
+    inputs: impl IntoIterator<Item = (&'a Path, u8, &'a str)>,
+) -> Result<RepositoryState, Box<dyn Error>> {
+    let (repository, head) = repository_version(root)?;
+    let mut digest = Sha256::new();
+    digest.update(b"beholder-repository-content-v1");
+    framed(&mut digest, repository.identity.as_bytes());
+    digest.update([u8::from(head.is_some())]);
+    if let Some(head) = &head {
+        framed(&mut digest, head.as_bytes());
+    }
+    for (path, kind, content_hash) in inputs {
+        framed(&mut digest, &path_bytes(path));
+        digest.update([kind]);
+        framed(&mut digest, content_hash.as_bytes());
+    }
+    Ok(RepositoryState {
+        repository,
+        head,
+        fingerprint: format!("{:x}", digest.finalize()),
     })
+}
+
+fn framed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 fn state_fingerprint<P, B>(

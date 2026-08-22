@@ -786,6 +786,10 @@ pub struct Indexer {
 }
 
 impl Indexer {
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
     pub fn accepts(&self, path: &Path) -> bool {
         self.analyzers.iter().any(|analyzer| analyzer.accepts(path))
             || self.enrichers.iter().any(|enricher| enricher.accepts(path))
@@ -1031,7 +1035,7 @@ impl Indexer {
         for enricher in &self.enrichers {
             enricher.clear_cache()?;
         }
-        if self.cache_dir.exists() {
+        if !self.cache_dir.as_os_str().is_empty() && self.cache_dir.exists() {
             fs::remove_dir_all(&self.cache_dir)?;
         }
         self.repository_cache.lock().unwrap().clear();

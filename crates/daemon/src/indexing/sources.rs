@@ -3,18 +3,18 @@ use beholder_adapters_git::repository_state_bytes;
 use beholder_adapters_treesitter_csharp::{UnityPrefab, parse_unity_meta, parse_unity_prefab};
 #[cfg(test)]
 use beholder_adapters_treesitter_typescript::SourceLanguage;
+use beholder_domain::BeholderError;
 #[cfg(test)]
 use beholder_domain::RepositoryState;
-use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind};
-use beholder_indexing::{Indexer, InputKind, RepositoryInput, RepositorySnapshot};
-use sha2::{Digest, Sha256};
+#[cfg(test)]
+use beholder_domain::{BeholderErrorCode, BeholderErrorKind};
+use beholder_indexing::{Indexer, RepositorySnapshot};
 #[cfg(test)]
 use std::{borrow::Cow, fs::File, io::BufReader};
 use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 #[cfg(test)]
@@ -400,7 +400,7 @@ pub(super) fn repository_sources(
     })
 }
 
-fn accepted_files(
+pub(super) fn accepted_files(
     directory: &Path,
     indexer: &Indexer,
     files: &mut Vec<PathBuf>,
@@ -419,139 +419,22 @@ fn accepted_files(
     Ok(())
 }
 
-#[derive(Debug)]
-pub(super) struct RepositoryInventory {
-    base: PathBuf,
-    inputs: Vec<(PathBuf, InputKind)>,
-    pub(super) fingerprint: String,
-}
-
-impl RepositoryInventory {
-    pub(super) fn load(self) -> Result<RepositorySnapshot, BeholderError> {
-        let mut inputs = Vec::with_capacity(self.inputs.len());
-        for (path, kind) in self.inputs {
-            let relative = path
-                .strip_prefix(&self.base)
-                .map(Path::to_path_buf)
-                .map_err(|error| repository_input_error(&self.base, error))?;
-            let content = fs::read(&path).map_err(|error| repository_input_error(&path, error))?;
-            inputs.push(RepositoryInput {
-                path: relative,
-                content: Arc::from(content),
-                kind,
-            });
-        }
-        let state = repository_state_bytes(
-            &self.base,
-            inputs
-                .iter()
-                .map(|input| (input.path.as_path(), input.content.as_ref())),
-        )
-        .map_err(|error| repository_input_error(&self.base, error))?;
-        Ok(RepositorySnapshot {
-            base: self.base,
-            state,
-            inputs,
-        })
-    }
-}
-
-pub(super) fn repository_inventory(
-    root: &Path,
-    descriptor_paths: &[PathBuf],
-    indexer: &Indexer,
-) -> Result<RepositoryInventory, BeholderError> {
-    if !root.is_dir() {
-        return Err(BeholderError::new(
-            BeholderErrorKind::FailedPrecondition,
-            BeholderErrorCode::WorkspaceIndexFailed,
-            format!("repository does not exist: {}", root.display()),
-        ));
-    }
-    let mut files = Vec::new();
-    accepted_files(root, indexer, &mut files)
-        .map_err(|error| repository_input_error(root, error))?;
-    let mut inputs = files
-        .into_iter()
-        .map(|path| (path, InputKind::Source))
-        .chain(
-            descriptor_paths
-                .iter()
-                .cloned()
-                .map(|path| (path, InputKind::ProtobufDescriptor)),
-        )
-        .collect::<Vec<_>>();
-    inputs.sort_by(|left, right| {
-        let left = (left.0.strip_prefix(root).unwrap_or(&left.0), left.1);
-        let right = (right.0.strip_prefix(root).unwrap_or(&right.0), right.1);
-        left.cmp(&right)
-    });
-
-    let mut digest = Sha256::new();
-    let canonical = root
-        .canonicalize()
-        .map_err(|error| repository_input_error(root, error))?;
-    digest.update(canonical.to_string_lossy().as_bytes());
-    for (path, kind) in &inputs {
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|error| repository_input_error(path, error))?;
-        let metadata = fs::metadata(path).map_err(|error| repository_input_error(path, error))?;
-        let relative = relative.to_string_lossy();
-        digest.update((relative.len() as u64).to_le_bytes());
-        digest.update(relative.as_bytes());
-        digest.update([match kind {
-            InputKind::Source => 0,
-            InputKind::ProtobufDescriptor => 1,
-        }]);
-        digest.update(metadata.len().to_le_bytes());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            digest.update(metadata.dev().to_le_bytes());
-            digest.update(metadata.ino().to_le_bytes());
-            digest.update(metadata.mtime().to_le_bytes());
-            digest.update(metadata.mtime_nsec().to_le_bytes());
-            digest.update(metadata.ctime().to_le_bytes());
-            digest.update(metadata.ctime_nsec().to_le_bytes());
-        }
-        #[cfg(not(unix))]
-        {
-            let modified = metadata
-                .modified()
-                .and_then(|modified| {
-                    modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(std::io::Error::other)
-                })
-                .map_err(|error| repository_input_error(path, error))?;
-            digest.update(modified.as_nanos().to_le_bytes());
-        }
-    }
-
-    Ok(RepositoryInventory {
-        base: root.to_path_buf(),
-        inputs,
-        fingerprint: format!("{:x}", digest.finalize()),
-    })
-}
-
-fn repository_input_error(path: &Path, error: impl std::fmt::Display) -> BeholderError {
-    BeholderError::new(
-        BeholderErrorKind::FailedPrecondition,
-        BeholderErrorCode::WorkspaceIndexFailed,
-        format!("failed to load indexing inputs from {}", path.display()),
-    )
-    .with_source(std::io::Error::other(error.to_string()))
-}
-
 #[cfg(test)]
 pub(super) fn repository_snapshot(
     root: &Path,
     descriptor_paths: &[PathBuf],
     indexer: &Indexer,
 ) -> Result<RepositorySnapshot, BeholderError> {
-    repository_inventory(root, descriptor_paths, indexer)?.load()
+    super::inventory::InventoryStore::new(indexer.cache_dir())
+        .refresh(
+            "test",
+            "test",
+            root,
+            descriptor_paths,
+            indexer,
+            super::inventory::RefreshMode::Authoritative,
+        )
+        .map(|refresh| refresh.snapshot)
 }
 
 #[cfg(test)]
@@ -571,7 +454,7 @@ mod tests {
             .build()
             .unwrap();
         let error =
-            repository_inventory(Path::new("/definitely/missing"), &[], &indexer).unwrap_err();
+            repository_snapshot(Path::new("/definitely/missing"), &[], &indexer).unwrap_err();
         assert_eq!(error.kind(), BeholderErrorKind::FailedPrecondition);
         assert_eq!(error.code(), BeholderErrorCode::WorkspaceIndexFailed);
     }
