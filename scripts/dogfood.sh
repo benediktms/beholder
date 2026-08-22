@@ -322,10 +322,23 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     exit 1
 fi
 
+reindex_until_current() {
+    local output=''
+    for _ in {1..100}; do
+        if output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        sleep 0.1
+    done
+    printf '%s' "$output"
+    return 1
+}
+
 echo 'Checking a bad source does not abort workspace indexing...' >&2
 recovery_source="$state/rust/src/recovery.rs"
 printf '%s\n' 'fn broken() {' 'fn nested() {}' >"$recovery_source"
-if ! reindex_output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+if ! reindex_output="$(reindex_until_current)"; then
     printf 'unrecoverable Rust source aborted workspace indexing:\n%s\n' "$reindex_output" >&2
     exit 1
 fi
@@ -335,7 +348,7 @@ if ! grep -Fq '"kind":"calls_rpc"' <<<"$result"; then
     exit 1
 fi
 printf '%s\n' 'fn repaired() {}' >"$recovery_source"
-target/debug/beholder reindex-workspace main >/dev/null
+reindex_until_current >/dev/null
 
 echo 'Garbage collecting obsolete semantic states...' >&2
 gc_result="$(target/debug/beholder cache gc)"
