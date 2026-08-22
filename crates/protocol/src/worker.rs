@@ -166,7 +166,9 @@ impl WorkspaceSnapshotBuilder {
                 name: self
                     .name
                     .ok_or("worker request stream omitted analysis start")?,
-                repositories: std::iter::once(target).chain(repositories.into_values()).collect(),
+                repositories: std::iter::once(target)
+                    .chain(repositories.into_values())
+                    .collect(),
             },
         })
     }
