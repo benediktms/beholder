@@ -1,7 +1,9 @@
 use super::{IndexScheduler, pipeline};
 use beholder_adapters_mnestic::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
 use beholder_domain::WorkspaceView;
-use beholder_indexing::{AnalyzerMetadata, EnrichmentSnapshot, WorkspaceSnapshot};
+use beholder_indexing::{
+    AnalyzerContribution, AnalyzerMetadata, EnrichmentSnapshot, WorkspaceSnapshot,
+};
 use std::{error::Error, sync::Arc, time::Instant};
 use tokio::sync::watch;
 
@@ -126,19 +128,7 @@ impl IndexScheduler {
                 "worker contribution metadata does not match the scheduled analyzer".into(),
             );
         }
-        if contribution
-            .repositories
-            .iter()
-            .any(|repository| repository.repository != job.repository)
-            || contribution
-                .active_repositories
-                .iter()
-                .any(|repository| repository != &job.repository)
-            || contribution
-                .diagnostics
-                .iter()
-                .any(|(repository, _)| repository != &job.repository)
-        {
+        if contribution_escapes_target(&contribution, &job.repository) {
             return Err("worker contribution escaped its target repository".into());
         }
         let mut diagnostics = contribution.diagnostics;
@@ -207,11 +197,16 @@ impl IndexScheduler {
         let mut queued = false;
         for repository in &snapshot.repositories {
             let repository_id = repository.state.repository.identity.clone();
-            let input_fingerprint = store
-                .revision_input_fingerprint(&view.name, &repository_id)?
-                .ok_or("published repository input fingerprint is missing")?;
-            let contexts = store.repository_contexts(&view.name, &repository_id)?;
             for analyzer in self.indexer.enrichment_catalog() {
+                let input_fingerprint = store
+                    .revision_enrichment_input_fingerprint(
+                        &view.name,
+                        &repository_id,
+                        &analyzer.id,
+                    )?
+                    .ok_or("published repository enrichment input fingerprint is missing")?;
+                let contexts =
+                    store.repository_contexts(&view.name, &repository_id, &analyzer.id)?;
                 if store.enrichment_matches(
                     &view.name,
                     &repository_id,
@@ -313,10 +308,124 @@ impl IndexScheduler {
     }
 }
 
+fn contribution_escapes_target(contribution: &AnalyzerContribution, target: &str) -> bool {
+    contribution
+        .repositories
+        .iter()
+        .any(|repository| {
+            repository.repository != target
+                || repository
+                    .entities
+                    .iter()
+                    .any(|entity| entity_escapes_target(entity.id.as_str(), target))
+                || repository.grpc_bindings.iter().any(|binding| {
+                    !entity_belongs_to_target(binding.local_symbol.as_str(), target)
+                })
+                || repository.observations.iter().any(|observation| {
+                    entity_escapes_target(observation.from.as_str(), target)
+                })
+        })
+        || contribution
+            .active_repositories
+            .iter()
+            .any(|repository| repository != target)
+        || contribution
+            .diagnostics
+            .iter()
+            .any(|(repository, _)| repository != target)
+        || contribution.graphql_resolvers.iter().any(|resolver| {
+            resolver.repository != target
+                || !entity_belongs_to_target(resolver.resolver.as_str(), target)
+        })
+        || contribution
+            .overrides
+            .iter()
+            .any(|override_| !entity_belongs_to_target(override_.from.as_str(), target))
+}
+
+fn entity_belongs_to_target(entity: &str, target: &str) -> bool {
+    entity.starts_with(&format!("repo://{target}/"))
+}
+
+fn entity_escapes_target(entity: &str, target: &str) -> bool {
+    entity.starts_with("repo://") && !entity_belongs_to_target(entity, target)
+}
+
 fn enrichment_key(job: &EnrichmentJob) -> EnrichmentKey {
     (
         job.view.name.clone(),
         job.repository.clone(),
         job.analyzer.id.clone(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beholder_domain::{
+        Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, Provenance,
+    };
+    use beholder_indexing::{AnalysisCompleteness, CacheStatistics, RepositoryContribution};
+
+    fn contribution() -> AnalyzerContribution {
+        AnalyzerContribution {
+            metadata: AnalyzerMetadata {
+                id: "rust".into(),
+                version: "1".into(),
+            },
+            active_repositories: vec!["example/target".into()],
+            repositories: vec![RepositoryContribution {
+                repository: "example/target".into(),
+                completeness: AnalysisCompleteness::Complete,
+                entities: vec![EntityFact::new(
+                    "repo://example/target/rust/lib/local",
+                    EntityKind::Callable,
+                    None,
+                )
+                .unwrap()],
+                grpc_bindings: Vec::new(),
+                observations: Vec::new(),
+                diagnostics: Vec::new(),
+            }],
+            overrides: Vec::new(),
+            graphql_resolvers: Vec::new(),
+            diagnostics: Vec::new(),
+            cache: CacheStatistics::default(),
+        }
+    }
+
+    #[test]
+    fn rejects_repository_qualified_facts_owned_by_context() {
+        let mut entity_escape = contribution();
+        entity_escape.repositories[0].entities[0] = EntityFact::new(
+            "repo://example/context/rust/lib/foreign",
+            EntityKind::Callable,
+            None,
+        )
+        .unwrap();
+        assert!(contribution_escapes_target(
+            &entity_escape,
+            "example/target"
+        ));
+
+        let mut override_escape = contribution();
+        override_escape.overrides.push(DependencyOverride {
+            from: "repo://example/context/rust/lib/caller".into(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: "rust-call://callee".into(),
+            resolved_to: "repo://example/target/rust/lib/callee".into(),
+            evidence: "src/lib.rs:1".into(),
+            confidence: Confidence::Exact,
+            provenance: Provenance::Compiler,
+        });
+        assert!(contribution_escapes_target(
+            &override_escape,
+            "example/target"
+        ));
+
+        assert!(!contribution_escapes_target(
+            &contribution(),
+            "example/target"
+        ));
+    }
 }

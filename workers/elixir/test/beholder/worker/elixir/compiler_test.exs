@@ -64,6 +64,30 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              Compiler.run(repository, temp_dir("unused-cache"))
   end
 
+  test "rejects dependency context that no longer matches the snapshot" do
+    target_root = temp_dir("context-target")
+    context_root = temp_dir("context-dependency")
+    File.write!(Path.join(target_root, "mix.exs"), "target")
+    File.write!(Path.join(context_root, "mix.exs"), "changed")
+
+    target = %Repository{
+      identity: "example/target",
+      base: target_root,
+      fingerprint: "target",
+      inputs: [%{path: "mix.exs", content: "target", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    context = %Repository{
+      identity: "example/context",
+      base: context_root,
+      fingerprint: "context",
+      inputs: [%{path: "mix.exs", content: "original", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    assert {:error, "mix.exs changed after the immutable snapshot was created"} =
+             Compiler.run(target, [context], temp_dir("unused-context-cache"))
+  end
+
   test "rejects a checkout changed while the compiler is running" do
     root = temp_dir("changed-during-compile")
     cache = temp_dir("changed-during-compile-cache")
@@ -143,6 +167,40 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
       with_env("BEHOLDER_ELIXIR_MIX_ENV", "dev", fn -> Compiler.run(repository, cache) end)
       with_env("BEHOLDER_ELIXIR_MIX_ENV", "test", fn -> Compiler.run(repository, cache) end)
+    end)
+
+    assert 2 ==
+             cache
+             |> Path.join("elixir/Zml4dHVyZQ/build-*")
+             |> Path.wildcard()
+             |> length()
+  end
+
+  test "isolates Mix build directories by dependency context identity" do
+    root = temp_dir("context-build-identity")
+    context_root = temp_dir("context-build-dependency")
+    cache = temp_dir("context-build-cache")
+    fake_mix = fake_mix(root, "mkdir -p \"$MIX_BUILD_PATH\"")
+    File.write!(Path.join(root, "mix.exs"), "target")
+    File.write!(Path.join(context_root, "mix.exs"), "context")
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "target",
+      inputs: [%{path: "mix.exs", content: "target", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    context = %Repository{
+      identity: "dependency",
+      base: context_root,
+      fingerprint: "context-1",
+      inputs: [%{path: "mix.exs", content: "context", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
+      Compiler.run(repository, [context], cache)
+      Compiler.run(repository, [%{context | fingerprint: "context-2"}], cache)
     end)
 
     assert 2 ==

@@ -1383,6 +1383,31 @@ fn index_workspace_through_port(
         analysis_plan.repository_enrichment_identities(),
     )?;
     if store.view_matches(&view)? {
+        view = view.with_repository_contexts(
+            scheduler
+                .indexer
+                .enrichment_catalog()
+                .into_iter()
+                .map(|analyzer| {
+                    let contexts = snapshot
+                        .repositories
+                        .iter()
+                        .map(|repository| {
+                            let target = &repository.state.repository.identity;
+                            Ok((
+                                target.clone(),
+                                store.repository_contexts(
+                                    &workspace.name,
+                                    target,
+                                    &analyzer.id,
+                                )?,
+                            ))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+                    Ok((analyzer.id, contexts))
+                })
+                .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
+        )?;
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         scheduler.queue_enrichments(store, &snapshot, &view)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
@@ -1435,7 +1460,17 @@ fn index_workspace_through_port(
         .collect::<Vec<_>>();
     let dependency_graph =
         RepositoryDependencyGraph::from_baseline(&repository_facts, &analysis.overrides)?;
-    view = view.with_repository_contexts(dependency_graph.context_map())?;
+    view = view.with_repository_contexts(
+        scheduler
+            .indexer
+            .enrichment_catalog()
+            .into_iter()
+            .map(|analyzer| {
+                let contexts = dependency_graph.context_map_for(&analyzer.id);
+                (analyzer.id, contexts)
+            })
+            .collect(),
+    )?;
     let observation_count = repository_facts
         .iter()
         .map(|facts| facts.observations.len())
@@ -1817,7 +1852,13 @@ mod tests {
                 }],
             }],
         };
-        let view = WorkspaceView::new("main", "syntax", vec![state]).unwrap();
+        let view = WorkspaceView::new("main", "syntax", vec![state])
+            .unwrap()
+            .with_repository_contexts(BTreeMap::from([(
+                "semantic".into(),
+                BTreeMap::new(),
+            )]))
+            .unwrap();
         let scheduler = IndexScheduler::with_indexer(
             IndexerBuilder::new(PathBuf::new(), 1)
                 .add_enricher(FakeEnricher)
@@ -1841,7 +1882,10 @@ mod tests {
             )
             .unwrap();
         let (cancel, cancelled) = tokio::sync::watch::channel(());
-        let input_fingerprint = view.repository_input_fingerprint(&view.repository_states[0]);
+        let input_fingerprint = view.repository_enrichment_input_fingerprint(
+            &view.repository_states[0],
+            "semantic",
+        );
         scheduler.enriching.lock().unwrap().insert(
             ("main".into(), "repo".into(), "semantic".into()),
             EnrichmentRun {
@@ -1892,8 +1936,8 @@ mod tests {
         )
         .unwrap()
         .with_repository_contexts(BTreeMap::from([(
-            "repo-a".into(),
-            vec!["repo-b".into()],
+            "semantic".into(),
+            BTreeMap::from([("repo-a".into(), vec!["repo-b".into()])]),
         )]))
         .unwrap();
         let store = SemanticStore::memory().unwrap();
@@ -1949,39 +1993,56 @@ mod tests {
 
     #[test]
     fn cancels_a_superseded_active_enrichment() {
-        let state = RepositoryState {
+        let state = |identity: &str, fingerprint: &str| RepositoryState {
             repository: LogicalRepository {
-                identity: "repo".into(),
+                identity: identity.into(),
             },
             head: None,
-            fingerprint: "source-2".into(),
+            fingerprint: fingerprint.into(),
         };
+        let target = state("target", "target-source");
+        let context = state("context", "context-2");
         let snapshot = WorkspaceSnapshot {
             name: "main".into(),
-            repositories: vec![beholder_indexing::RepositorySnapshot {
-                base: PathBuf::from("repo"),
-                state: state.clone(),
-                inputs: vec![beholder_indexing::RepositoryInput {
-                    path: PathBuf::from("src/lib.rs"),
-                    content: Arc::from(&b"fn changed() {}"[..]),
-                    kind: beholder_indexing::InputKind::Source,
-                }],
-            }],
+            repositories: vec![target.clone(), context.clone()]
+                .into_iter()
+                .map(|state| beholder_indexing::RepositorySnapshot {
+                    base: PathBuf::from(&state.repository.identity),
+                    state,
+                    inputs: vec![beholder_indexing::RepositoryInput {
+                        path: PathBuf::from("src/lib.rs"),
+                        content: Arc::from(&b"fn source() {}"[..]),
+                        kind: beholder_indexing::InputKind::Source,
+                    }],
+                })
+                .collect(),
         };
-        let view = WorkspaceView::new("main", "syntax", vec![state]).unwrap();
+        let contexts = BTreeMap::from([(
+            "semantic".into(),
+            BTreeMap::from([("target".into(), vec!["context".into()])]),
+        )]);
+        let view = WorkspaceView::new("main", "syntax", vec![target.clone(), context])
+            .unwrap()
+            .with_repository_contexts(contexts.clone())
+            .unwrap();
         let store = SemanticStore::memory().unwrap();
         store
             .publish(
                 &view,
-                &[RepositoryFacts {
-                    state: view.repository_states[0].clone(),
-                    analysis_identity: "syntax".into(),
-                    incomplete: false,
-                    diagnostics: Vec::new(),
-                    entities: Vec::new(),
-                    grpc_bindings: Vec::new(),
-                    observations: Vec::new(),
-                }],
+                &view
+                    .repository_states
+                    .iter()
+                    .cloned()
+                    .map(|state| RepositoryFacts {
+                        state,
+                        analysis_identity: "syntax".into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
+                        entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
+                        observations: Vec::new(),
+                    })
+                    .collect::<Vec<_>>(),
                 &[],
             )
             .unwrap();
@@ -1992,10 +2053,21 @@ mod tests {
                 .unwrap(),
         );
         let (cancel, cancelled) = tokio::sync::watch::channel(());
+        let previous = WorkspaceView::new(
+            "main",
+            "syntax",
+            vec![target, state("context", "context-1")],
+        )
+        .unwrap()
+        .with_repository_contexts(contexts)
+        .unwrap();
         scheduler.enriching.lock().unwrap().insert(
-            ("main".into(), "repo".into(), "semantic".into()),
+            ("main".into(), "target".into(), "semantic".into()),
             EnrichmentRun {
-                input_fingerprint: "6:syntaxsource-1".into(),
+                input_fingerprint: previous.repository_enrichment_input_fingerprint(
+                    &previous.repository_states[1],
+                    "semantic",
+                ),
                 version: "1".into(),
                 cancel,
             },
@@ -2007,10 +2079,15 @@ mod tests {
 
         assert!(cancelled.has_changed().unwrap());
         let jobs = scheduler.enrichment_jobs.lock().unwrap();
-        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs.len(), 2);
         assert_eq!(
-            jobs.values().next().unwrap().input_fingerprint,
-            view.repository_input_fingerprint(&view.repository_states[0])
+            jobs.get(&("main".into(), "target".into(), "semantic".into()))
+                .unwrap()
+                .input_fingerprint,
+            view.repository_enrichment_input_fingerprint(
+                &view.repository_states[1],
+                "semantic",
+            )
         );
     }
 

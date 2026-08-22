@@ -320,7 +320,7 @@ fn enrich_repository(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let cargo = CargoConfig {
         set_test: true,
-        no_deps: true,
+        no_deps: snapshot.repositories.len() == 1,
         ..CargoConfig::default()
     };
     let load = LoadCargoConfig {
@@ -608,13 +608,19 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(base.join("src")).unwrap();
+        fs::create_dir_all(base.join("dependency/src")).unwrap();
         let manifest =
-            "[package]\nname = \"worker-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+            "[package]\nname = \"worker-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [dependencies]\ncontext = { path = \"dependency\" }\n";
+        let dependency_manifest =
+            "[package]\nname = \"context\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        let dependency_source = "pub fn external() {}\n";
         let source = r#"
 mod broken;
 mod inner;
 mod api { pub use crate::inner::renamed; }
 use api::renamed as call_me;
+use context::external;
 trait Run { fn run(&self); }
 struct Thing;
 impl Run for Thing { fn run(&self) {} }
@@ -630,6 +636,7 @@ fn caller() {
     let boxed = Box::new(Thing);
     boxed.inherent();
     generated();
+    external();
 }
 "#;
         let inner = "pub fn renamed() {}\n";
@@ -642,42 +649,72 @@ fn caller() {
         .unwrap();
         fs::write(base.join("src/inner.rs"), "pub fn stale_inner() {}").unwrap();
         fs::write(base.join("src/broken.rs"), "pub fn stale_broken() {}").unwrap();
+        fs::write(base.join("dependency/Cargo.toml"), dependency_manifest).unwrap();
+        fs::write(
+            base.join("dependency/src/lib.rs"),
+            "pub fn stale_external() {}",
+        )
+        .unwrap();
         let snapshot = EnrichmentSnapshot {
             target_repository: "example/repo".into(),
             workspace: WorkspaceSnapshot {
                 name: "test".into(),
-                repositories: vec![RepositorySnapshot {
-                    base: base.clone(),
-                    state: RepositoryState {
-                        repository: LogicalRepository {
-                            identity: "example/repo".into(),
+                repositories: vec![
+                    RepositorySnapshot {
+                        base: base.clone(),
+                        state: RepositoryState {
+                            repository: LogicalRepository {
+                                identity: "example/repo".into(),
+                            },
+                            head: None,
+                            fingerprint: "state".into(),
                         },
-                        head: None,
-                        fingerprint: "state".into(),
+                        inputs: vec![
+                            RepositoryInput {
+                                path: "Cargo.toml".into(),
+                                content: Arc::from(manifest.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/lib.rs".into(),
+                                content: Arc::from(source.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/inner.rs".into(),
+                                content: Arc::from(inner.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/broken.rs".into(),
+                                content: Arc::from(broken.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                        ],
                     },
-                    inputs: vec![
-                        RepositoryInput {
-                            path: "Cargo.toml".into(),
-                            content: Arc::from(manifest.as_bytes()),
-                            kind: InputKind::Source,
+                    RepositorySnapshot {
+                        base: base.join("dependency"),
+                        state: RepositoryState {
+                            repository: LogicalRepository {
+                                identity: "example/context".into(),
+                            },
+                            head: None,
+                            fingerprint: "context-state".into(),
                         },
-                        RepositoryInput {
-                            path: "src/lib.rs".into(),
-                            content: Arc::from(source.as_bytes()),
-                            kind: InputKind::Source,
-                        },
-                        RepositoryInput {
-                            path: "src/inner.rs".into(),
-                            content: Arc::from(inner.as_bytes()),
-                            kind: InputKind::Source,
-                        },
-                        RepositoryInput {
-                            path: "src/broken.rs".into(),
-                            content: Arc::from(broken.as_bytes()),
-                            kind: InputKind::Source,
-                        },
-                    ],
-                }],
+                        inputs: vec![
+                            RepositoryInput {
+                                path: "Cargo.toml".into(),
+                                content: Arc::from(dependency_manifest.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/lib.rs".into(),
+                                content: Arc::from(dependency_source.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                        ],
+                    },
+                ],
             },
         };
         let socket = PathBuf::from(format!(
@@ -733,6 +770,12 @@ fn caller() {
                 && override_.resolved_to.as_str() == "repo://example/repo/rust/inner/renamed"
                 && override_.provenance == Provenance::Compiler
                 && override_.confidence == Confidence::Exact
+        }));
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://example/repo/rust/lib/caller"
+                && override_.resolved_to.as_str()
+                    == "repo://example/context/rust/lib/external"
+                && override_.provenance == Provenance::Compiler
         }));
         assert!(
             overrides.iter().any(|override_| {

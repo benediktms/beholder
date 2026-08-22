@@ -13,6 +13,7 @@ pub enum RepositoryDependencyKind {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RepositoryDependencyEvidence {
+    pub analyzer: String,
     pub kind: RepositoryDependencyKind,
     pub detail: String,
 }
@@ -21,6 +22,7 @@ pub struct RepositoryDependencyEvidence {
 pub struct RepositoryDependency {
     pub from: String,
     pub to: String,
+    pub analyzers: BTreeSet<String>,
     pub kinds: BTreeSet<RepositoryDependencyKind>,
     pub evidence: BTreeSet<RepositoryDependencyEvidence>,
 }
@@ -87,6 +89,12 @@ impl RepositoryDependencyGraph {
                     .max_by_key(|repository| repository.len())
             })
         };
+        let analyzer = |repository: &str, entity: &str| {
+            entity
+                .strip_prefix(&format!("repo://{repository}/"))
+                .and_then(|path| path.split('/').next())
+                .filter(|analyzer| !analyzer.is_empty())
+        };
         let observations = repositories.iter().flat_map(|repository| {
             repository
                 .observations
@@ -96,11 +104,13 @@ impl RepositoryDependencyGraph {
         for observation in observations {
             if let (Some(from), Some(to)) =
                 (owner(observation.from.as_str()), owner(observation.to.as_str()))
+                && let Some(analyzer) = analyzer(from, observation.from.as_str())
             {
                 graph
                     .add_dependency(
                         from,
                         to,
+                        analyzer,
                         RepositoryDependencyKind::SemanticObservation,
                         observation.evidence.as_str(),
                     )?;
@@ -110,11 +120,12 @@ impl RepositoryDependencyGraph {
             if let (Some(from), Some(to)) = (
                 owner(override_.from.as_str()),
                 owner(override_.resolved_to.as_str()),
-            ) {
+            ) && let Some(analyzer) = analyzer(from, override_.from.as_str()) {
                 graph
                     .add_dependency(
                         from,
                         to,
+                        analyzer,
                         RepositoryDependencyKind::ResolutionOverride,
                         override_.evidence.as_str(),
                     )?;
@@ -127,16 +138,21 @@ impl RepositoryDependencyGraph {
         &mut self,
         from: impl Into<String>,
         to: impl Into<String>,
+        analyzer: impl Into<String>,
         kind: RepositoryDependencyKind,
         evidence: impl Into<String>,
     ) -> Result<(), String> {
         let from = from.into();
         let to = to.into();
+        let analyzer = analyzer.into();
         if !self.repositories.contains(&from) {
             return Err(format!("unknown dependency source repository {from}"));
         }
         if !self.repositories.contains(&to) {
             return Err(format!("unknown dependency target repository {to}"));
+        }
+        if analyzer.trim().is_empty() {
+            return Err("repository dependency analyzer must not be empty".into());
         }
         if from == to {
             return Ok(());
@@ -157,11 +173,14 @@ impl RepositoryDependencyGraph {
             .or_insert_with(|| RepositoryDependency {
                 from,
                 to,
+                analyzers: BTreeSet::new(),
                 kinds: BTreeSet::new(),
                 evidence: BTreeSet::new(),
             });
+        dependency.analyzers.insert(analyzer.clone());
         dependency.kinds.insert(kind);
         dependency.evidence.insert(RepositoryDependencyEvidence {
+            analyzer,
             kind,
             detail: evidence.into(),
         });
@@ -208,6 +227,20 @@ impl RepositoryDependencyGraph {
         self.outgoing
             .iter()
             .map(|(target, contexts)| (target.clone(), contexts.iter().cloned().collect()))
+            .collect()
+    }
+
+    pub fn context_map_for(&self, analyzer: &str) -> BTreeMap<String, Vec<String>> {
+        self.dependencies
+            .iter()
+            .filter_map(|(target, dependencies)| {
+                let contexts = dependencies
+                    .values()
+                    .filter(|dependency| dependency.analyzers.contains(analyzer))
+                    .map(|dependency| dependency.to.clone())
+                    .collect::<Vec<_>>();
+                (!contexts.is_empty()).then(|| (target.clone(), contexts))
+            })
             .collect()
     }
 }
@@ -265,6 +298,7 @@ mod tests {
             .add_dependency(
                 "example/a",
                 "example/b",
+                "typescript",
                 RepositoryDependencyKind::SemanticObservation,
                 "src/first.ts:1",
             )
@@ -273,6 +307,7 @@ mod tests {
             .add_dependency(
                 "example/a",
                 "example/b",
+                "typescript",
                 RepositoryDependencyKind::ProjectReference,
                 "tsconfig.json",
             )
@@ -283,5 +318,50 @@ mod tests {
         assert!(graph.contains_dependency("example/a", "example/b"));
         assert_eq!(dependency.kinds.len(), 2);
         assert_eq!(dependency.evidence.len(), 2);
+        assert_eq!(
+            graph.context_map_for("typescript"),
+            BTreeMap::from([("example/a".into(), vec!["example/b".into()])])
+        );
+        assert!(graph.context_map_for("rust").is_empty());
+    }
+
+    #[test]
+    fn cycles_remain_direct_edges_without_recursive_expansion() {
+        let mut graph = RepositoryDependencyGraph::new(["example/a", "example/b"]).unwrap();
+        graph
+            .add_dependency(
+                "example/a",
+                "example/b",
+                "rust",
+                RepositoryDependencyKind::PathDependency,
+                "a/Cargo.toml",
+            )
+            .unwrap();
+        graph
+            .add_dependency(
+                "example/b",
+                "example/a",
+                "rust",
+                RepositoryDependencyKind::PathDependency,
+                "b/Cargo.toml",
+            )
+            .unwrap();
+
+        assert_eq!(
+            graph.direct_context("example/a").collect::<Vec<_>>(),
+            ["example/b"]
+        );
+        assert_eq!(
+            graph.direct_context("example/b").collect::<Vec<_>>(),
+            ["example/a"]
+        );
+        assert_eq!(
+            graph.affected_targets("example/a").collect::<Vec<_>>(),
+            ["example/b"]
+        );
+        assert_eq!(
+            graph.affected_targets("example/b").collect::<Vec<_>>(),
+            ["example/a"]
+        );
     }
 }

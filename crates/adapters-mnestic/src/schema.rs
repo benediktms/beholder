@@ -145,7 +145,19 @@ pub(super) const CREATE_REVISION_CONTEXT_SCHEMA: &str = r#"
     view: String,
     revision: Int,
     target: String,
+    analyzer: String,
     context: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_INPUT_SCHEMA: &str = r#"
+:create analysis_revision_enrichment_input {
+    view: String,
+    revision: Int,
+    repository: String,
+    analyzer: String,
+    =>
+    fingerprint: String,
 }
 "#;
 

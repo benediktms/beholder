@@ -37,6 +37,13 @@ defmodule Beholder.Worker.Elixir.Snapshot do
     Map.fetch!(repositories, identity)
   end
 
+  @spec contexts(t()) :: [Repository.t()]
+  def contexts(snapshot) do
+    snapshot
+    |> repositories()
+    |> Enum.reject(&(&1.identity == snapshot.target_repository))
+  end
+
   defp push(%__MODULE__{finished?: true}, %AnalyzeRequest{}),
     do: {:error, "worker request followed analysis finish"}
 

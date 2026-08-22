@@ -21,12 +21,20 @@ defmodule Beholder.Worker.Elixir.Compiler do
 
   @spec run(Repository.t(), String.t()) :: {:ok, result()} | {:error, String.t()}
   def run(repository, cache_dir) do
-    with :ok <- verify_inputs(repository),
+    run(repository, [], cache_dir)
+  end
+
+  @spec run(Repository.t(), [Repository.t()], String.t()) ::
+          {:ok, result()} | {:error, String.t()}
+  def run(repository, contexts, cache_dir) do
+    repositories = [repository | contexts]
+
+    with :ok <- verify_repositories(repositories),
          {:ok, mix} <- find_mix() do
       helper_ebin = BeamExporter.export!(cache_dir)
       working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)])
       mix_env = System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "dev")
-      build_path = Path.join(working_dir, "build-#{build_identity(repository, mix, mix_env)}")
+      build_path = Path.join(working_dir, "build-#{build_identity(repositories, mix, mix_env)}")
       result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
 
       env = [
@@ -52,7 +60,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
           )
         )
 
-      finalize_run(repository, result_path, result)
+      finalize_run(repositories, result_path, result)
     end
   end
 
@@ -74,6 +82,15 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end)
   end
 
+  defp verify_repositories(repositories) do
+    Enum.reduce_while(repositories, :ok, fn repository, :ok ->
+      case verify_inputs(repository) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
   defp find_mix do
     case System.get_env("BEHOLDER_ELIXIR_MIX_PATH") || System.find_executable("mix") do
       nil ->
@@ -86,8 +103,8 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp finalize_run(repository, result_path, {:ok, output, exit_status}) do
-    case verify_inputs(repository) do
+  defp finalize_run(repositories, result_path, {:ok, output, exit_status}) do
+    case verify_repositories(repositories) do
       :ok ->
         read_result(result_path, output, exit_status)
 
@@ -97,14 +114,14 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp finalize_run(_repository, result_path, {:error, :timeout, output, timeout_ms}) do
+  defp finalize_run(_repositories, result_path, {:error, :timeout, output, timeout_ms}) do
     File.rm(result_path)
 
     {:error,
      "Mix compiler process exceeded #{timeout_ms}ms and was terminated: #{String.trim(output)}"}
   end
 
-  defp finalize_run(_repository, result_path, {:error, reason}) do
+  defp finalize_run(_repositories, result_path, {:error, reason}) do
     File.rm(result_path)
     {:error, reason}
   end
@@ -128,14 +145,16 @@ defmodule Beholder.Worker.Elixir.Compiler do
   defp append_code_path("", path), do: "-pa #{path}"
   defp append_code_path(flags, path), do: flags <> " -pa #{path}"
 
-  defp build_identity(repository, mix, mix_env) do
-    [
-      repository.fingerprint,
+  defp build_identity(repositories, mix, mix_env) do
+    repositories
+    |> Enum.sort_by(& &1.identity)
+    |> Enum.flat_map(&[&1.identity, &1.fingerprint])
+    |> Kernel.++([
       mix_env,
       mix,
       System.version(),
       :erlang.system_info(:otp_release)
-    ]
+    ])
     |> Enum.join(<<0>>)
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.url_encode64(padding: false)
