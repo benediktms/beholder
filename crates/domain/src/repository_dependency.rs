@@ -94,6 +94,7 @@ impl RepositoryDependencyGraph {
                 .strip_prefix(&format!("repo://{repository}/"))
                 .and_then(|path| path.split('/').next())
                 .filter(|analyzer| !analyzer.is_empty())
+                .map(str::to_owned)
         };
         let observations = repositories.iter().flat_map(|repository| {
             repository
