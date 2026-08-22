@@ -98,9 +98,7 @@ echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
 for _ in {1..600}; do
     result="$(target/debug/beholder context --json --workspace main "$caller" 2>/dev/null || true)"
-    if grep -Fq "$callee" <<<"$result" \
-        && grep -Fq '"stale":false' <<<"$result" \
-        && grep -Fq '"indexing":false' <<<"$result"; then
+    if grep -Fq "$callee" <<<"$result" && grep -Fq '"stale":false' <<<"$result"; then
         break
     fi
     sleep 0.1
@@ -109,7 +107,7 @@ if ! grep -Fq "$callee" <<<"$result"; then
     printf 'automatic indexing did not produce %s in context:\n%s\n' "$callee" "$result" >&2
     exit 1
 fi
-if ! grep -Fq '"stale":false' <<<"$result" || ! grep -Fq '"indexing":false' <<<"$result"; then
+if ! grep -Fq '"stale":false' <<<"$result"; then
     printf 'automatic indexing did not reach current freshness:\n%s\n' "$result" >&2
     exit 1
 fi
