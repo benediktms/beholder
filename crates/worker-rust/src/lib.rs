@@ -3,9 +3,7 @@ use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
     DependencyRelation, Provenance, SemanticRelation, UnsafeTreeRecovery,
 };
-use beholder_indexing::{
-    AnalyzerContribution, EnrichmentSnapshot, WorkspaceAnalyzer, WorkspaceSnapshot,
-};
+use beholder_indexing::{AnalyzerContribution, WorkspaceAnalyzer, WorkspaceSnapshot};
 use beholder_protocol::{
     WorkspaceSnapshotBuilder, analyze_events,
     worker_v1::{
@@ -584,7 +582,7 @@ fn text_size(offset: usize) -> Result<TextSize, Box<dyn Error + Send + Sync>> {
 mod tests {
     use super::*;
     use beholder_domain::{LogicalRepository, RepositoryState};
-    use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot};
+    use beholder_indexing::{EnrichmentSnapshot, InputKind, RepositoryInput, RepositorySnapshot};
     use beholder_protocol::{
         analyze_requests, contribution_from_events,
         worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
