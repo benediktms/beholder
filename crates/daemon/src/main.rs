@@ -92,7 +92,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity("rust", "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-5")
+        .identity("rust", "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-6")
         .accept_extension("rs")
         .accept_file_name("Cargo.toml")
         .build()

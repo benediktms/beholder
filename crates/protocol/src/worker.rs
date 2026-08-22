@@ -8,49 +8,57 @@ use beholder_domain::{
 };
 use beholder_indexing::{
     AnalysisCompleteness, AnalyzerContribution, AnalyzerMetadata, CacheStatistics,
-    GraphqlResolverCandidate, InputKind, RepositoryContribution, RepositoryInput,
-    RepositorySnapshot, WorkspaceSnapshot,
+    EnrichmentSnapshot, GraphqlResolverCandidate, InputKind, RepositoryContribution,
+    RepositoryInput, RepositorySnapshot, WorkspaceSnapshot,
 };
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 const CONTRIBUTION_CHUNK_ITEMS: usize = 2_048;
 
-pub fn analyze_requests(snapshot: WorkspaceSnapshot) -> impl Iterator<Item = wire::AnalyzeRequest> {
+pub fn analyze_requests(
+    snapshot: EnrichmentSnapshot,
+) -> impl Iterator<Item = wire::AnalyzeRequest> {
+    let target_repository = snapshot.target_repository;
+    let snapshot = snapshot.workspace;
     let start = wire::AnalyzeRequest {
         request: Some(wire::analyze_request::Request::Start(wire::AnalysisStart {
             workspace: snapshot.name,
         })),
     };
-    let repositories = snapshot.repositories.into_iter().flat_map(|repository| {
-        let identity = repository.state.repository.identity;
-        let start = wire::AnalyzeRequest {
-            request: Some(wire::analyze_request::Request::Repository(
-                wire::RepositoryStart {
-                    identity: identity.clone(),
-                    base: repository.base.to_string_lossy().into_owned(),
-                    head: repository.state.head,
-                    fingerprint: repository.state.fingerprint,
-                },
-            )),
-        };
-        std::iter::once(start).chain(repository.inputs.into_iter().map(move |input| {
-            wire::AnalyzeRequest {
-                request: Some(wire::analyze_request::Request::Input(
-                    wire::RepositoryInput {
-                        repository: identity.clone(),
-                        path: input.path.to_string_lossy().into_owned(),
-                        content: input.content.to_vec(),
-                        kind: match input.kind {
-                            InputKind::Source => wire::InputKind::Source as i32,
-                            InputKind::ProtobufDescriptor => {
-                                wire::InputKind::ProtobufDescriptor as i32
-                            }
-                        },
+    let repositories = snapshot
+        .repositories
+        .into_iter()
+        .flat_map(move |repository| {
+            let identity = repository.state.repository.identity;
+            let start = wire::AnalyzeRequest {
+                request: Some(wire::analyze_request::Request::Repository(
+                    wire::RepositoryStart {
+                        identity: identity.clone(),
+                        base: repository.base.to_string_lossy().into_owned(),
+                        head: repository.state.head,
+                        fingerprint: repository.state.fingerprint,
+                        target: identity == target_repository,
                     },
                 )),
-            }
-        }))
-    });
+            };
+            std::iter::once(start).chain(repository.inputs.into_iter().map(move |input| {
+                wire::AnalyzeRequest {
+                    request: Some(wire::analyze_request::Request::Input(
+                        wire::RepositoryInput {
+                            repository: identity.clone(),
+                            path: input.path.to_string_lossy().into_owned(),
+                            content: input.content.to_vec(),
+                            kind: match input.kind {
+                                InputKind::Source => wire::InputKind::Source as i32,
+                                InputKind::ProtobufDescriptor => {
+                                    wire::InputKind::ProtobufDescriptor as i32
+                                }
+                            },
+                        },
+                    )),
+                }
+            }))
+        });
     let finish = wire::AnalyzeRequest {
         request: Some(wire::analyze_request::Request::Finish(
             wire::AnalysisFinish {},
@@ -63,7 +71,7 @@ pub fn analyze_requests(snapshot: WorkspaceSnapshot) -> impl Iterator<Item = wir
 
 pub fn workspace_snapshot(
     requests: impl IntoIterator<Item = wire::AnalyzeRequest>,
-) -> Result<WorkspaceSnapshot, String> {
+) -> Result<EnrichmentSnapshot, String> {
     let mut builder = WorkspaceSnapshotBuilder::default();
     for request in requests {
         builder.push(request)?;
@@ -75,6 +83,7 @@ pub fn workspace_snapshot(
 pub struct WorkspaceSnapshotBuilder {
     name: Option<String>,
     repositories: BTreeMap<String, RepositorySnapshot>,
+    target_repository: Option<String>,
     finished: bool,
 }
 
@@ -94,6 +103,9 @@ impl WorkspaceSnapshotBuilder {
                     return Err("worker repository preceded analysis start".into());
                 }
                 let identity = repository.identity;
+                if repository.target && self.target_repository.replace(identity.clone()).is_some() {
+                    return Err("worker analysis identified more than one target repository".into());
+                }
                 if self
                     .repositories
                     .insert(
@@ -137,15 +149,27 @@ impl WorkspaceSnapshotBuilder {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<WorkspaceSnapshot, String> {
+    pub fn finish(self) -> Result<EnrichmentSnapshot, String> {
         if !self.finished {
             return Err("worker request stream ended before analysis finish".into());
         }
-        Ok(WorkspaceSnapshot {
-            name: self
-                .name
-                .ok_or("worker request stream omitted analysis start")?,
-            repositories: self.repositories.into_values().collect(),
+        let target_repository = self
+            .target_repository
+            .ok_or("worker request stream omitted its target repository")?;
+        let mut repositories = self.repositories;
+        let target = repositories
+            .remove(&target_repository)
+            .ok_or("worker target repository is missing from its snapshot")?;
+        Ok(EnrichmentSnapshot {
+            target_repository,
+            workspace: WorkspaceSnapshot {
+                name: self
+                    .name
+                    .ok_or("worker request stream omitted analysis start")?,
+                repositories: std::iter::once(target)
+                    .chain(repositories.into_values())
+                    .collect(),
+            },
         })
     }
 }
@@ -871,6 +895,33 @@ fn relation_from_wire(value: i32) -> Result<SemanticRelation, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_round_trip_preserves_target_and_contexts() {
+        let repository = |identity: &str| RepositorySnapshot {
+            base: PathBuf::from(identity),
+            state: RepositoryState {
+                repository: LogicalRepository {
+                    identity: identity.into(),
+                },
+                head: None,
+                fingerprint: format!("{identity}-state"),
+            },
+            inputs: Vec::new(),
+        };
+        let snapshot = EnrichmentSnapshot {
+            target_repository: "example/target".into(),
+            workspace: WorkspaceSnapshot {
+                name: "main".into(),
+                repositories: vec![repository("example/target"), repository("example/context")],
+            },
+        };
+
+        assert_eq!(
+            workspace_snapshot(analyze_requests(snapshot.clone())).unwrap(),
+            snapshot
+        );
+    }
 
     #[test]
     fn preserves_grpc_operation_entity_kind() {

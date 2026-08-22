@@ -61,6 +61,16 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_REVISION_CONTEXT_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_ENRICHMENT_INPUT_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_REPOSITORY_ENRICHMENT_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -260,6 +270,11 @@ pub(super) fn persistent_database(
         ),
         ("analysis_revision_enrichment", CREATE_ENRICHMENT_SCHEMA),
         ("analysis_revision_input", CREATE_REVISION_INPUT_SCHEMA),
+        ("analysis_revision_context", CREATE_REVISION_CONTEXT_SCHEMA),
+        (
+            "analysis_revision_enrichment_input",
+            CREATE_ENRICHMENT_INPUT_SCHEMA,
+        ),
         (
             "analysis_revision_repository_enrichment",
             CREATE_REPOSITORY_ENRICHMENT_SCHEMA,

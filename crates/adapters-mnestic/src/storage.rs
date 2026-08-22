@@ -909,6 +909,51 @@ fn store_revision_inputs(
          :put analysis_revision_input {view, revision, repository => fingerprint}",
         BTreeMap::from([("rows".into(), DataValue::List(rows))]),
     )?;
+    let rows = view
+        .enrichment_analyzers()
+        .flat_map(|analyzer| {
+            view.repository_states.iter().map(move |state| {
+                DataValue::List(vec![
+                    view.name.as_str().into(),
+                    revision.into(),
+                    state.repository.identity.as_str().into(),
+                    analyzer.into(),
+                    view.repository_enrichment_input_fingerprint(state, analyzer)
+                        .into(),
+                ])
+            })
+        })
+        .collect::<Vec<_>>();
+    transaction.run_script(
+        "?[view, revision, repository, analyzer, fingerprint] <- $rows \
+         :put analysis_revision_enrichment_input {\
+             view, revision, repository, analyzer => fingerprint\
+         }",
+        BTreeMap::from([("rows".into(), DataValue::List(rows))]),
+    )?;
+    let rows = view
+        .enrichment_analyzers()
+        .flat_map(|analyzer| {
+            view.repository_states.iter().flat_map(move |state| {
+                view.repository_contexts(&state.repository.identity, analyzer)
+                    .iter()
+                    .map(move |context| {
+                        DataValue::List(vec![
+                            view.name.as_str().into(),
+                            revision.into(),
+                            state.repository.identity.as_str().into(),
+                            analyzer.into(),
+                            context.as_str().into(),
+                        ])
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
+    transaction.run_script(
+        "?[view, revision, target, analyzer, context] <- $rows \
+         :put analysis_revision_context {view, revision, target, analyzer, context}",
+        BTreeMap::from([("rows".into(), DataValue::List(rows))]),
+    )?;
     Ok(())
 }
 
@@ -926,9 +971,74 @@ pub(super) fn ensure_revision_inputs(
         transaction.abort()?;
         return Ok(false);
     }
+    transaction.run_script(
+        "?[view, revision, repository, analyzer] := \
+             *analysis_revision{view: $view, revision}, \
+             *analysis_revision_enrichment_input{view, revision, repository, analyzer} \
+         :rm analysis_revision_enrichment_input {view, revision, repository, analyzer}",
+        BTreeMap::from([("view".into(), view.name.clone().into())]),
+    )?;
+    transaction.run_script(
+        "?[view, revision, target, analyzer, context] := \
+             *analysis_revision{view: $view, revision}, \
+             *analysis_revision_context{view, revision, target, analyzer, context} \
+         :rm analysis_revision_context {view, revision, target, analyzer, context}",
+        BTreeMap::from([("view".into(), view.name.clone().into())]),
+    )?;
     store_revision_inputs(&transaction, view)?;
     transaction.commit()?;
     Ok(true)
+}
+
+pub(super) fn revision_enrichment_input_fingerprint(
+    db: &DbInstance,
+    view: &str,
+    repository: &str,
+    analyzer: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[fingerprint] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_enrichment_input{\
+                 view: $view, revision, repository: $repository, analyzer: $analyzer, fingerprint\
+             }",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("repository".into(), repository.into()),
+            ("analyzer".into(), analyzer.into()),
+        ]),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row[0].get_str())
+        .map(str::to_owned))
+}
+
+pub(super) fn repository_contexts(
+    db: &DbInstance,
+    view: &str,
+    target: &str,
+    analyzer: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[context] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_context{\
+                 view: $view, revision, target: $target, analyzer: $analyzer, context\
+             } \
+         :sort context",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("target".into(), target.into()),
+            ("analyzer".into(), analyzer.into()),
+        ]),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(rows
+        .rows
+        .into_iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect())
 }
 
 fn carry_forward_enrichments(
@@ -938,10 +1048,10 @@ fn carry_forward_enrichments(
     let valid_owner = "valid_owner[owner] := \
          *analysis_revision{view: $view, revision}, previous = revision - 1, \
          *analysis_revision_repository_enrichment{\
-             view: $view, revision: previous, owner, repository, input_fingerprint\
+             view: $view, revision: previous, owner, repository, analyzer, input_fingerprint\
          }, \
-         *analysis_revision_input{\
-             view: $view, revision, repository, fingerprint: input_fingerprint\
+         *analysis_revision_enrichment_input{\
+             view: $view, revision, repository, analyzer, fingerprint: input_fingerprint\
          }\n";
     let scripts = [
         format!(
@@ -1106,7 +1216,9 @@ pub(super) fn enrichment_matches(
 ) -> Result<bool, Box<dyn Error>> {
     let rows = db.run_script(
         "?[version] := *analysis_revision{view: $view, revision}, \
-             *analysis_revision_input{view: $view, revision, repository: $repository, fingerprint}, \
+             *analysis_revision_enrichment_input{\
+                 view: $view, revision, repository: $repository, analyzer: $analyzer, fingerprint\
+             }, \
              *analysis_revision_repository_enrichment{\
                  view: $view, revision, repository: $repository, analyzer: $analyzer, \
                  version, input_fingerprint: fingerprint\
@@ -1129,32 +1241,20 @@ pub(super) fn enrichments_current(
     if catalog.is_empty() {
         return Ok(true);
     }
-    let missing_inputs = db.run_script(
-        "with_input[repository] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_input{view: $view, revision, repository}\n\
-         ?[repository] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_state{view: $view, revision, repository}, \
-             not with_input[repository]",
-        BTreeMap::from([("view".into(), view.into())]),
-        ScriptMutability::Immutable,
-    )?;
-    if !missing_inputs.rows.is_empty() {
-        return Ok(false);
-    }
     for (analyzer, version) in catalog {
         let missing = db.run_script(
             "matching[repository] := \
                  *analysis_revision{view: $view, revision}, \
-                 *analysis_revision_input{view: $view, revision, repository, fingerprint}, \
+                 *analysis_revision_enrichment_input{\
+                     view: $view, revision, repository, analyzer: $analyzer, fingerprint\
+                 }, \
                  *analysis_revision_repository_enrichment{\
                      view: $view, revision, repository, analyzer: $analyzer, version: $version, \
                      input_fingerprint: fingerprint\
                  }\n\
              ?[repository] := \
                  *analysis_revision{view: $view, revision}, \
-                 *analysis_revision_input{view: $view, revision, repository}, \
+                 *analysis_revision_state{view: $view, revision, repository}, \
                  not matching[repository]",
             BTreeMap::from([
                 ("view".into(), view.into()),
@@ -1199,12 +1299,13 @@ pub(super) fn publish_enrichment(
     let transaction = db.multi_transaction(true);
     let current = transaction.run_script(
         "?[revision, fingerprint] := *analysis_revision{view: $view, revision}, \
-             *analysis_revision_input{\
-                 view: $view, revision, repository: $repository, fingerprint\
+             *analysis_revision_enrichment_input{\
+                 view: $view, revision, repository: $repository, analyzer: $analyzer, fingerprint\
              }",
         BTreeMap::from([
             ("view".into(), view.name.clone().into()),
             ("repository".into(), repository.into()),
+            ("analyzer".into(), analyzer.into()),
         ]),
     )?;
     let Some(row) = current.rows.first() else {
@@ -1256,6 +1357,20 @@ pub(super) fn publish_enrichment(
              *analysis_revision_input{view: $view, revision: $previous, repository, fingerprint}, \
              view = $view, revision = $revision \
          :put analysis_revision_input {view, revision, repository => fingerprint}",
+        "?[view, revision, repository, analyzer, fingerprint] := \
+             *analysis_revision_enrichment_input{\
+                 view: $view, revision: $previous, repository, analyzer, fingerprint\
+             }, \
+             view = $view, revision = $revision \
+         :put analysis_revision_enrichment_input {\
+             view, revision, repository, analyzer => fingerprint\
+         }",
+        "?[view, revision, target, analyzer, context] := \
+             *analysis_revision_context{\
+                 view: $view, revision: $previous, target, analyzer, context\
+             }, \
+             view = $view, revision = $revision \
+         :put analysis_revision_context {view, revision, target, analyzer, context}",
         "?[view, revision, id, kind, metadata] := \
              *analysis_revision_entity{view: $view, revision: $previous, id, kind, metadata}, \
              not *analysis_revision_enrichment_entity_owner{view: $view, revision: $previous, id, analyzer: $owner}, \
@@ -1880,6 +1995,16 @@ pub(super) fn sweep_garbage_collection(
             "view, revision, repository",
         ),
         (
+            "superseded revision enrichment inputs",
+            "analysis_revision_enrichment_input",
+            "view, revision, repository, analyzer",
+        ),
+        (
+            "superseded revision contexts",
+            "analysis_revision_context",
+            "view, revision, target, analyzer, context",
+        ),
+        (
             "superseded revision metadata",
             "analysis_revision_metadata",
             "view, revision",
@@ -2054,6 +2179,16 @@ mod tests {
             grpc_bindings: Vec::new(),
             observations,
         }
+    }
+
+    fn with_enrichment_analyzers(view: WorkspaceView, analyzers: &[&str]) -> WorkspaceView {
+        view.with_repository_contexts(
+            analyzers
+                .iter()
+                .map(|analyzer| ((*analyzer).into(), BTreeMap::new()))
+                .collect(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2827,12 +2962,15 @@ mod tests {
             head: Some("head".into()),
             fingerprint: fingerprint.into(),
         };
-        let initial = WorkspaceView::new(
-            "incremental",
-            "syntax",
-            vec![state("example/a", "a-1"), state("example/b", "b-1")],
-        )
-        .unwrap();
+        let initial = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "incremental",
+                "syntax",
+                vec![state("example/a", "a-1"), state("example/b", "b-1")],
+            )
+            .unwrap(),
+            &["rust"],
+        );
         let repository_facts = |state: RepositoryState| RepositoryFacts {
             state,
             analysis_identity: "analysis".into(),
@@ -2870,7 +3008,8 @@ mod tests {
             .publish_enrichment(
                 &initial,
                 "example/a",
-                &initial.repository_input_fingerprint(&initial.repository_states[0]),
+                &initial
+                    .repository_enrichment_input_fingerprint(&initial.repository_states[0], "rust"),
                 EnrichmentOwner {
                     analyzer: "rust",
                     version: "1",
@@ -2886,7 +3025,8 @@ mod tests {
             .publish_enrichment(
                 &initial,
                 "example/b",
-                &initial.repository_input_fingerprint(&initial.repository_states[1]),
+                &initial
+                    .repository_enrichment_input_fingerprint(&initial.repository_states[1], "rust"),
                 EnrichmentOwner {
                     analyzer: "rust",
                     version: "1",
@@ -2904,12 +3044,15 @@ mod tests {
                 .unwrap()
         );
 
-        let updated = WorkspaceView::new(
-            "incremental",
-            "syntax",
-            vec![state("example/a", "a-2"), state("example/b", "b-1")],
-        )
-        .unwrap();
+        let updated = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "incremental",
+                "syntax",
+                vec![state("example/a", "a-2"), state("example/b", "b-1")],
+            )
+            .unwrap(),
+            &["rust"],
+        );
         store
             .publish(
                 &updated,
@@ -2975,14 +3118,21 @@ mod tests {
             observations: Vec::new(),
         };
         let store = SemanticStore::memory().unwrap();
+        let contexts = BTreeMap::from([(
+            "rust".into(),
+            BTreeMap::from([("example/a".into(), vec!["example/b".into()])]),
+        )]);
         let started = WorkspaceView::new(
             "concurrent",
             "syntax",
             vec![
                 repository_state("example/a", "a-1"),
                 repository_state("example/b", "b-1"),
+                repository_state("example/c", "c-1"),
             ],
         )
+        .unwrap()
+        .with_repository_contexts(contexts.clone())
         .unwrap();
         store
             .publish(
@@ -2996,16 +3146,20 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let target_input = started.repository_input_fingerprint(&started.repository_states[0]);
+        let target_input =
+            started.repository_enrichment_input_fingerprint(&started.repository_states[0], "rust");
 
         let current = WorkspaceView::new(
             "concurrent",
             "syntax",
             vec![
                 repository_state("example/a", "a-1"),
-                repository_state("example/b", "b-2"),
+                repository_state("example/b", "b-1"),
+                repository_state("example/c", "c-2"),
             ],
         )
+        .unwrap()
+        .with_repository_contexts(contexts.clone())
         .unwrap();
         store
             .publish(
@@ -3040,27 +3194,147 @@ mod tests {
                 .enrichment_matches("concurrent", "example/a", "rust", "1")
                 .unwrap()
         );
+
+        let changed_context = WorkspaceView::new(
+            "concurrent",
+            "syntax",
+            vec![
+                repository_state("example/a", "a-1"),
+                repository_state("example/b", "b-2"),
+                repository_state("example/c", "c-2"),
+            ],
+        )
+        .unwrap()
+        .with_repository_contexts(contexts)
+        .unwrap();
+        store
+            .publish(
+                &changed_context,
+                &changed_context
+                    .repository_states
+                    .iter()
+                    .cloned()
+                    .map(facts)
+                    .collect::<Vec<_>>(),
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !store
+                .publish_enrichment(
+                    &started,
+                    "example/a",
+                    &target_input,
+                    EnrichmentOwner {
+                        analyzer: "rust",
+                        version: "2",
+                        expected_version: None,
+                    },
+                    EnrichmentPayload::default(),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn persists_analyzer_scoped_context_identity_across_restart() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-context-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let database = state_dir.join("beholder.db");
+        let state = |identity: &str| RepositoryState {
+            repository: LogicalRepository {
+                identity: identity.into(),
+            },
+            head: None,
+            fingerprint: format!("{identity}-source"),
+        };
+        let view = WorkspaceView::new(
+            "persistent-context",
+            "syntax",
+            vec![state("example/target"), state("example/context")],
+        )
+        .unwrap()
+        .with_repository_contexts(BTreeMap::from([(
+            "rust".into(),
+            BTreeMap::from([("example/target".into(), vec!["example/context".into()])]),
+        )]))
+        .unwrap();
+        let expected = view.repository_enrichment_input_fingerprint(
+            view.repository_states
+                .iter()
+                .find(|state| state.repository.identity == "example/target")
+                .unwrap(),
+            "rust",
+        );
+        let repositories = view
+            .repository_states
+            .iter()
+            .cloned()
+            .map(|state| RepositoryFacts {
+                state,
+                analysis_identity: "syntax".into(),
+                incomplete: false,
+                diagnostics: Vec::new(),
+                entities: Vec::new(),
+                grpc_bindings: Vec::new(),
+                observations: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let store = SemanticStore::persistent(&database, true).unwrap();
+        store.publish(&view, &repositories, &[]).unwrap();
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let store = SemanticStore::persistent(&database, false).unwrap();
+        assert_eq!(
+            store
+                .revision_enrichment_input_fingerprint(
+                    "persistent-context",
+                    "example/target",
+                    "rust",
+                )
+                .unwrap()
+                .as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            store
+                .repository_contexts("persistent-context", "example/target", "rust")
+                .unwrap(),
+            ["example/context"]
+        );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]
     fn rejects_a_result_after_a_newer_analyzer_run_supersedes_it() {
         let store = SemanticStore::memory().unwrap();
-        let view = WorkspaceView::new(
-            "superseded",
-            "syntax",
-            vec![RepositoryState {
-                repository: LogicalRepository {
-                    identity: "example/repo".into(),
-                },
-                head: None,
-                fingerprint: "source".into(),
-            }],
-        )
-        .unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "superseded",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: "source".into(),
+                }],
+            )
+            .unwrap(),
+            &["rust"],
+        );
         store
             .publish(&view, &[facts(&view, Vec::new())], &[])
             .unwrap();
-        let input_fingerprint = view.repository_input_fingerprint(&view.repository_states[0]);
+        let input_fingerprint =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
         store
             .publish_enrichment(
                 &view,
@@ -3107,8 +3381,11 @@ mod tests {
             head: Some("head".into()),
             fingerprint: "source".into(),
         };
-        let view = WorkspaceView::new("enriched", "syntax", vec![state.clone()]).unwrap();
-        let input_fingerprint = view.repository_input_fingerprint(&state);
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new("enriched", "syntax", vec![state.clone()]).unwrap(),
+            &["rust"],
+        );
+        let input_fingerprint = view.repository_enrichment_input_fingerprint(&state, "rust");
         let call = Observation::dependency(
             "repo://example/repo/rust/lib/caller",
             DependencyRelation::Calls,
@@ -3221,21 +3498,27 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "rust.syntax_recovered");
 
-        let stale = WorkspaceView::new(
-            "enriched",
-            "syntax",
-            vec![RepositoryState {
-                fingerprint: "new-source".into(),
-                ..state
-            }],
-        )
-        .unwrap();
+        let stale = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "enriched",
+                "syntax",
+                vec![RepositoryState {
+                    fingerprint: "new-source".into(),
+                    ..state
+                }],
+            )
+            .unwrap(),
+            &["rust"],
+        );
         assert!(
             !store
                 .publish_enrichment(
                     &stale,
                     "example/repo",
-                    &stale.repository_input_fingerprint(&stale.repository_states[0]),
+                    &stale.repository_enrichment_input_fingerprint(
+                        &stale.repository_states[0],
+                        "rust",
+                    ),
                     EnrichmentOwner {
                         analyzer: "rust",
                         version: "1",
@@ -3250,22 +3533,26 @@ mod tests {
     #[test]
     fn publishes_and_retracts_additive_enrichment_facts() {
         let store = SemanticStore::memory().unwrap();
-        let view = WorkspaceView::new(
-            "elixir-enriched",
-            "syntax",
-            vec![RepositoryState {
-                repository: LogicalRepository {
-                    identity: "example/repo".into(),
-                },
-                head: Some("head".into()),
-                fingerprint: "source".into(),
-            }],
-        )
-        .unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "elixir-enriched",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: Some("head".into()),
+                    fingerprint: "source".into(),
+                }],
+            )
+            .unwrap(),
+            &["elixir"],
+        );
         store
             .publish(&view, &[facts(&view, Vec::new())], &[])
             .unwrap();
-        let input_fingerprint = view.repository_input_fingerprint(&view.repository_states[0]);
+        let input_fingerprint =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "elixir");
 
         let generated = "repo://example/repo/elixir/Example/generated/0";
         let entity = EntityFact::new(generated, EntityKind::Callable, None).unwrap();

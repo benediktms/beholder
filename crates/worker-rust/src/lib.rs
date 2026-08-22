@@ -30,7 +30,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-const ANALYZER_VERSION: &str = "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-5";
+const ANALYZER_VERSION: &str = "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-6";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -87,22 +87,30 @@ impl AnalyzerWorker for RustWorker {
                         return;
                     }
                 };
-                tracing::Span::current().record("workspace", &snapshot.name);
+                tracing::Span::current().record("workspace", &snapshot.workspace.name);
                 if send_progress(&sender, AnalysisPhase::Analyzing).await {
                     return;
                 }
                 let analysis_span = tracing::info_span!(
                     "worker.rust.semantic_analysis",
-                    workspace = snapshot.name,
-                    repositories = snapshot.repositories.len()
+                    workspace = snapshot.workspace.name,
+                    target_repository = snapshot.target_repository,
+                    repositories = snapshot.workspace.repositories.len()
                 );
                 let result = tokio::task::spawn_blocking(
                     move || -> Result<Vec<AnalyzeEvent>, Box<dyn Error + Send + Sync>> {
                         analysis_span.in_scope(|| {
                             analysis_pool.install(|| {
-                                let mut contribution = analyzer.analyze(&snapshot)?;
-                                enrich_semantics(&snapshot, &mut contribution);
-                                retain_semantic_enrichment(&mut contribution);
+                                let mut contribution = analyzer.analyze(&snapshot.workspace)?;
+                                enrich_semantics(
+                                    &snapshot.workspace,
+                                    &snapshot.target_repository,
+                                    &mut contribution,
+                                );
+                                retain_semantic_enrichment(
+                                    &mut contribution,
+                                    &snapshot.target_repository,
+                                );
                                 contribution.metadata.version = ANALYZER_VERSION.into();
                                 analyze_events(contribution).map_err(Into::into)
                             })
@@ -187,34 +195,48 @@ pub async fn serve(socket: &Path, cache_dir: PathBuf) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-fn enrich_semantics(snapshot: &WorkspaceSnapshot, contribution: &mut AnalyzerContribution) {
-    for repository in &snapshot.repositories {
-        let cargo_roots = cargo_roots(repository);
-        if cargo_roots.is_empty() {
-            continue;
-        }
-        let mut enriched = contribution.clone();
-        let result = (|| {
+fn enrich_semantics(
+    snapshot: &WorkspaceSnapshot,
+    target_repository: &str,
+    contribution: &mut AnalyzerContribution,
+) {
+    let Some(repository) = snapshot
+        .repositories
+        .iter()
+        .find(|repository| repository.state.repository.identity == target_repository)
+    else {
+        return;
+    };
+    let cargo_roots = cargo_roots(repository);
+    if cargo_roots.is_empty() {
+        return;
+    }
+    let mut enriched = contribution.clone();
+    let result = (|| {
+        for repository in &snapshot.repositories {
             manifests_match_snapshot(repository)?;
-            for cargo_root in cargo_roots {
-                enrich_repository(repository, &cargo_root, &mut enriched)?;
-            }
-            manifests_match_snapshot(repository)
-        })();
-        if let Err(error) = result {
-            contribution.diagnostics.push((
-                repository.state.repository.identity.clone(),
-                AnalysisDiagnostic {
-                    code: "rust.semantic_resolution_unavailable".into(),
-                    severity: AnalysisDiagnosticSeverity::KnownLimitation,
-                    path: PathBuf::from("Cargo.toml"),
-                    line: None,
-                    detail: Some(error.to_string()),
-                },
-            ));
-        } else {
-            *contribution = enriched;
         }
+        for cargo_root in cargo_roots {
+            enrich_repository(snapshot, repository, &cargo_root, &mut enriched)?;
+        }
+        for repository in &snapshot.repositories {
+            manifests_match_snapshot(repository)?;
+        }
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })();
+    if let Err(error) = result {
+        contribution.diagnostics.push((
+            target_repository.into(),
+            AnalysisDiagnostic {
+                code: "rust.semantic_resolution_unavailable".into(),
+                severity: AnalysisDiagnosticSeverity::KnownLimitation,
+                path: PathBuf::from("Cargo.toml"),
+                line: None,
+                detail: Some(error.to_string()),
+            },
+        ));
+    } else {
+        *contribution = enriched;
     }
 }
 
@@ -260,10 +282,21 @@ fn manifests_match_snapshot(
     Ok(())
 }
 
-fn retain_semantic_enrichment(contribution: &mut AnalyzerContribution) {
+fn retain_semantic_enrichment(contribution: &mut AnalyzerContribution, target_repository: &str) {
+    let target_prefix = format!("repo://{target_repository}/");
+    contribution.overrides.retain(|override_| {
+        override_.provenance == Provenance::Compiler
+            && override_.from.as_str().starts_with(&target_prefix)
+    });
     contribution
-        .overrides
-        .retain(|override_| override_.provenance == Provenance::Compiler);
+        .active_repositories
+        .retain(|repository| repository == target_repository);
+    contribution
+        .repositories
+        .retain(|repository| repository.repository == target_repository);
+    contribution
+        .diagnostics
+        .retain(|(repository, _)| repository == target_repository);
     for repository in &mut contribution.repositories {
         repository.entities.clear();
         repository.grpc_bindings.clear();
@@ -276,13 +309,14 @@ fn retain_semantic_enrichment(contribution: &mut AnalyzerContribution) {
 }
 
 fn enrich_repository(
+    snapshot: &WorkspaceSnapshot,
     repository: &beholder_indexing::RepositorySnapshot,
     cargo_root: &Path,
     contribution: &mut AnalyzerContribution,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let cargo = CargoConfig {
         set_test: true,
-        no_deps: true,
+        no_deps: snapshot.repositories.len() == 1,
         ..CargoConfig::default()
     };
     let load = LoadCargoConfig {
@@ -294,50 +328,58 @@ fn enrich_repository(
     };
     let (mut database, vfs, _) = load_workspace_at(cargo_root, &cargo, &load, &|_| {})?;
     let mut change = ChangeWithProcMacros::default();
-    let mut files = BTreeMap::<PathBuf, (FileId, String)>::new();
-    for input in repository.inputs.iter().filter(|input| {
-        input
-            .path
-            .extension()
-            .is_some_and(|extension| extension == "rs")
-    }) {
-        let source = std::str::from_utf8(&input.content)?.to_owned();
-        let absolute = repository.base.join(&input.path);
-        let path = VfsPath::new_real_path(absolute.to_string_lossy().into_owned());
-        let Some((file_id, _)) = vfs.file_id(&path) else {
-            continue;
-        };
-        change.change_file(file_id, Some(source.clone()));
-        files.insert(input.path.clone(), (file_id, source));
+    let mut snapshot_files = Vec::new();
+    for snapshot_repository in &snapshot.repositories {
+        for input in snapshot_repository.inputs.iter().filter(|input| {
+            input
+                .path
+                .extension()
+                .is_some_and(|extension| extension == "rs")
+        }) {
+            let source = std::str::from_utf8(&input.content)?.to_owned();
+            let absolute = snapshot_repository.base.join(&input.path);
+            let path = VfsPath::new_real_path(absolute.to_string_lossy().into_owned());
+            let Some((file_id, _)) = vfs.file_id(&path) else {
+                continue;
+            };
+            change.change_file(file_id, Some(source.clone()));
+            snapshot_files.push((snapshot_repository, &input.path, file_id, source));
+        }
     }
     database.apply_change(change);
     let analysis = AnalysisHost::with_database(database).analysis();
+    let mut files = BTreeMap::<PathBuf, (FileId, String)>::new();
     let mut definitions = BTreeMap::new();
     let mut call_sites = Vec::new();
-    for (path, (file_id, source)) in &files {
-        let syntax = match analyze(source) {
+    for (snapshot_repository, path, file_id, source) in snapshot_files {
+        let syntax = match analyze(&source) {
             Ok(syntax) => syntax,
             Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => continue,
             Err(error) => return Err(error),
         };
-        let source_id = source_entity_id(&repository.state.repository.identity, path);
+        let source_id = source_entity_id(&snapshot_repository.state.repository.identity, path);
         for function in syntax.functions() {
             let function_id = format!("{source_id}/{}", function.qualified_name());
             definitions.insert(
-                (*file_id, text_size(function.name_offset())?),
+                (file_id, text_size(function.name_offset())?),
                 function_id.clone(),
             );
-            call_sites.extend(function.calls().map(|call| CallSite {
-                file_id: *file_id,
-                from: function_id.clone(),
-                unresolved: if call.receiver_method() {
-                    format!("rust-method://{}", call.name())
-                } else {
-                    format!("rust-call://{}", call.name())
-                },
-                evidence: format!("{}:{}", path.display(), line(source, call.offset())),
-                offset: call.offset(),
-            }));
+            if snapshot_repository.state.repository == repository.state.repository {
+                call_sites.extend(function.calls().map(|call| CallSite {
+                    file_id,
+                    from: function_id.clone(),
+                    unresolved: if call.receiver_method() {
+                        format!("rust-method://{}", call.name())
+                    } else {
+                        format!("rust-call://{}", call.name())
+                    },
+                    evidence: format!("{}:{}", path.display(), line(&source, call.offset())),
+                    offset: call.offset(),
+                }));
+            }
+        }
+        if snapshot_repository.state.repository == repository.state.repository {
+            files.insert(path.clone(), (file_id, source));
         }
     }
     let config = GotoDefinitionConfig {
@@ -540,7 +582,7 @@ fn text_size(offset: usize) -> Result<TextSize, Box<dyn Error + Send + Sync>> {
 mod tests {
     use super::*;
     use beholder_domain::{LogicalRepository, RepositoryState};
-    use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot};
+    use beholder_indexing::{EnrichmentSnapshot, InputKind, RepositoryInput, RepositorySnapshot};
     use beholder_protocol::{
         analyze_requests, contribution_from_events,
         worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
@@ -562,13 +604,18 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(base.join("src")).unwrap();
-        let manifest =
-            "[package]\nname = \"worker-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        fs::create_dir_all(base.join("dependency/src")).unwrap();
+        let manifest = "[package]\nname = \"worker-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [dependencies]\ncontext = { path = \"dependency\" }\n";
+        let dependency_manifest =
+            "[package]\nname = \"context\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        let dependency_source = "pub fn external() {}\n";
         let source = r#"
 mod broken;
 mod inner;
 mod api { pub use crate::inner::renamed; }
 use api::renamed as call_me;
+use context::external;
 trait Run { fn run(&self); }
 struct Thing;
 impl Run for Thing { fn run(&self) {} }
@@ -584,6 +631,7 @@ fn caller() {
     let boxed = Box::new(Thing);
     boxed.inherent();
     generated();
+    external();
 }
 "#;
         let inner = "pub fn renamed() {}\n";
@@ -596,40 +644,73 @@ fn caller() {
         .unwrap();
         fs::write(base.join("src/inner.rs"), "pub fn stale_inner() {}").unwrap();
         fs::write(base.join("src/broken.rs"), "pub fn stale_broken() {}").unwrap();
-        let snapshot = WorkspaceSnapshot {
-            name: "test".into(),
-            repositories: vec![RepositorySnapshot {
-                base: base.clone(),
-                state: RepositoryState {
-                    repository: LogicalRepository {
-                        identity: "example/repo".into(),
+        fs::write(base.join("dependency/Cargo.toml"), dependency_manifest).unwrap();
+        fs::write(
+            base.join("dependency/src/lib.rs"),
+            "pub fn stale_external() {}",
+        )
+        .unwrap();
+        let snapshot = EnrichmentSnapshot {
+            target_repository: "example/repo".into(),
+            workspace: WorkspaceSnapshot {
+                name: "test".into(),
+                repositories: vec![
+                    RepositorySnapshot {
+                        base: base.clone(),
+                        state: RepositoryState {
+                            repository: LogicalRepository {
+                                identity: "example/repo".into(),
+                            },
+                            head: None,
+                            fingerprint: "state".into(),
+                        },
+                        inputs: vec![
+                            RepositoryInput {
+                                path: "Cargo.toml".into(),
+                                content: Arc::from(manifest.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/lib.rs".into(),
+                                content: Arc::from(source.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/inner.rs".into(),
+                                content: Arc::from(inner.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/broken.rs".into(),
+                                content: Arc::from(broken.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                        ],
                     },
-                    head: None,
-                    fingerprint: "state".into(),
-                },
-                inputs: vec![
-                    RepositoryInput {
-                        path: "Cargo.toml".into(),
-                        content: Arc::from(manifest.as_bytes()),
-                        kind: InputKind::Source,
-                    },
-                    RepositoryInput {
-                        path: "src/lib.rs".into(),
-                        content: Arc::from(source.as_bytes()),
-                        kind: InputKind::Source,
-                    },
-                    RepositoryInput {
-                        path: "src/inner.rs".into(),
-                        content: Arc::from(inner.as_bytes()),
-                        kind: InputKind::Source,
-                    },
-                    RepositoryInput {
-                        path: "src/broken.rs".into(),
-                        content: Arc::from(broken.as_bytes()),
-                        kind: InputKind::Source,
+                    RepositorySnapshot {
+                        base: base.join("dependency"),
+                        state: RepositoryState {
+                            repository: LogicalRepository {
+                                identity: "example/context".into(),
+                            },
+                            head: None,
+                            fingerprint: "context-state".into(),
+                        },
+                        inputs: vec![
+                            RepositoryInput {
+                                path: "Cargo.toml".into(),
+                                content: Arc::from(dependency_manifest.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/lib.rs".into(),
+                                content: Arc::from(dependency_source.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                        ],
                     },
                 ],
-            }],
+            },
         };
         let socket = PathBuf::from(format!(
             "/tmp/beholder-worker-{}-{}.sock",
@@ -684,6 +765,11 @@ fn caller() {
                 && override_.resolved_to.as_str() == "repo://example/repo/rust/inner/renamed"
                 && override_.provenance == Provenance::Compiler
                 && override_.confidence == Confidence::Exact
+        }));
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://example/repo/rust/lib/caller"
+                && override_.resolved_to.as_str() == "repo://example/context/rust/lib/external"
+                && override_.provenance == Provenance::Compiler
         }));
         assert!(
             overrides.iter().any(|override_| {

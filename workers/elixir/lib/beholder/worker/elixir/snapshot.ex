@@ -4,11 +4,12 @@ defmodule Beholder.Worker.Elixir.Snapshot do
   alias Beholder.Worker.Elixir.Snapshot.Repository
   alias Beholder.Worker.V1.AnalyzeRequest
 
-  defstruct name: nil, repositories: %{}, finished?: false
+  defstruct name: nil, repositories: %{}, target_repository: nil, finished?: false
 
   @type t :: %__MODULE__{
           name: String.t() | nil,
           repositories: %{String.t() => Repository.t()},
+          target_repository: String.t() | nil,
           finished?: boolean()
         }
 
@@ -29,6 +30,18 @@ defmodule Beholder.Worker.Elixir.Snapshot do
   @spec repositories(t()) :: [Repository.t()]
   def repositories(%__MODULE__{repositories: repositories}) do
     repositories |> Map.values() |> Enum.sort_by(& &1.identity)
+  end
+
+  @spec target(t()) :: Repository.t()
+  def target(%__MODULE__{target_repository: identity, repositories: repositories}) do
+    Map.fetch!(repositories, identity)
+  end
+
+  @spec contexts(t()) :: [Repository.t()]
+  def contexts(snapshot) do
+    snapshot
+    |> repositories()
+    |> Enum.reject(&(&1.identity == snapshot.target_repository))
   end
 
   defp push(%__MODULE__{finished?: true}, %AnalyzeRequest{}),
@@ -65,7 +78,17 @@ defmodule Beholder.Worker.Elixir.Snapshot do
         fingerprint: repository.fingerprint
       }
 
-      {:ok, put_in(snapshot.repositories[repository.identity], value)}
+      cond do
+        repository.target && not is_nil(snapshot.target_repository) ->
+          {:error, "worker analysis identified more than one target repository"}
+
+        repository.target ->
+          snapshot = %{snapshot | target_repository: repository.identity}
+          {:ok, put_in(snapshot.repositories[repository.identity], value)}
+
+        true ->
+          {:ok, put_in(snapshot.repositories[repository.identity], value)}
+      end
     end
   end
 
@@ -87,7 +110,12 @@ defmodule Beholder.Worker.Elixir.Snapshot do
   defp push(_snapshot, %AnalyzeRequest{request: nil}), do: {:error, "worker request is empty"}
   defp push(_snapshot, _request), do: {:error, "worker request has an unknown payload"}
 
-  defp validate_finished(%__MODULE__{finished?: true}), do: :ok
+  defp validate_finished(%__MODULE__{finished?: true, target_repository: target})
+       when not is_nil(target),
+       do: :ok
+
+  defp validate_finished(%__MODULE__{finished?: true}),
+    do: {:error, "worker request stream omitted its target repository"}
 
   defp validate_finished(_snapshot),
     do: {:error, "worker request stream ended before analysis finish"}

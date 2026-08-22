@@ -16,7 +16,23 @@ defmodule Beholder.Worker.Elixir.SnapshotTest do
       %AnalyzeRequest{request: {:start, %AnalysisStart{workspace: "example"}}},
       %AnalyzeRequest{
         request:
-          {:repository, %RepositoryStart{identity: "repo", base: "/tmp/repo", fingerprint: "abc"}}
+          {:repository,
+           %RepositoryStart{
+             identity: "repo",
+             base: "/tmp/repo",
+             fingerprint: "abc",
+             target: true
+           }}
+      },
+      %AnalyzeRequest{
+        request:
+          {:repository,
+           %RepositoryStart{
+             identity: "context",
+             base: "/tmp/context",
+             fingerprint: "def",
+             target: false
+           }}
       },
       %AnalyzeRequest{
         request:
@@ -33,9 +49,13 @@ defmodule Beholder.Worker.Elixir.SnapshotTest do
 
     assert {:ok, snapshot} = Snapshot.from_requests(requests)
     assert snapshot.name == "example"
+    assert snapshot.target_repository == "repo"
 
     assert [%{identity: "repo", inputs: [%{path: "lib/example.ex"}]}] =
              Snapshot.repositories(snapshot)
+             |> Enum.filter(&(&1.identity == "repo"))
+
+    assert [%{identity: "context"}] = Snapshot.contexts(snapshot)
   end
 
   test "rejects input before its repository" do

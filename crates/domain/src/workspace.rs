@@ -112,6 +112,7 @@ pub struct WorkspaceView {
     pub analysis_identity: String,
     pub repository_states: Vec<RepositoryState>,
     repository_analysis_identities: BTreeMap<String, String>,
+    repository_contexts: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 impl WorkspaceView {
@@ -178,7 +179,52 @@ impl WorkspaceView {
             analysis_identity,
             repository_states,
             repository_analysis_identities,
+            repository_contexts: BTreeMap::new(),
         })
+    }
+
+    pub fn with_repository_contexts(
+        mut self,
+        repository_contexts: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    ) -> Result<Self, String> {
+        let repositories = self
+            .repository_states
+            .iter()
+            .map(|state| state.repository.identity.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (analyzer, targets) in &repository_contexts {
+            if analyzer.trim().is_empty() {
+                return Err("enrichment context analyzer must not be empty".into());
+            }
+            for (target, contexts) in targets {
+                if !repositories.contains(target.as_str()) {
+                    return Err(format!("unknown enrichment target repository {target}"));
+                }
+                if contexts
+                    .iter()
+                    .any(|context| context == target || !repositories.contains(context.as_str()))
+                {
+                    return Err(format!(
+                        "invalid {analyzer} enrichment context repository for target {target}"
+                    ));
+                }
+            }
+        }
+        self.repository_contexts = repository_contexts
+            .into_iter()
+            .map(|(analyzer, targets)| {
+                let targets = targets
+                    .into_iter()
+                    .map(|(target, mut contexts)| {
+                        contexts.sort();
+                        contexts.dedup();
+                        (target, contexts)
+                    })
+                    .collect();
+                (analyzer, targets)
+            })
+            .collect();
+        Ok(self)
     }
 
     pub fn fingerprint(&self) -> String {
@@ -206,6 +252,47 @@ impl WorkspaceView {
             analysis_identity,
             state.fingerprint
         )
+    }
+
+    pub fn repository_enrichment_input_fingerprint(
+        &self,
+        state: &RepositoryState,
+        analyzer: &str,
+    ) -> String {
+        let mut repositories = std::iter::once(state.repository.identity.as_str()).chain(
+            self.repository_contexts(&state.repository.identity, analyzer)
+                .iter()
+                .map(String::as_str),
+        );
+        repositories
+            .try_fold(String::new(), |mut fingerprint, repository| {
+                let state = self
+                    .repository_states
+                    .iter()
+                    .find(|state| state.repository.identity == repository)?;
+                let analysis_identity = self.repository_analysis_identities.get(repository)?;
+                fingerprint.push_str(&format!(
+                    "{}:{repository}{}:{analysis_identity}{}:{}",
+                    repository.len(),
+                    analysis_identity.len(),
+                    state.fingerprint.len(),
+                    state.fingerprint
+                ));
+                Some(fingerprint)
+            })
+            .expect("workspace view input repositories must have states and analysis identities")
+    }
+
+    pub fn repository_contexts(&self, repository: &str, analyzer: &str) -> &[String] {
+        self.repository_contexts
+            .get(analyzer)
+            .and_then(|targets| targets.get(repository))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn enrichment_analyzers(&self) -> impl Iterator<Item = &str> {
+        self.repository_contexts.keys().map(String::as_str)
     }
 }
 
@@ -324,5 +411,65 @@ mod tests {
             second.repository_input_fingerprint(&states[1])
         );
         assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn repository_input_identity_includes_only_selected_contexts() {
+        let state = |identity: &str, fingerprint: &str| RepositoryState {
+            repository: LogicalRepository {
+                identity: identity.into(),
+            },
+            head: None,
+            fingerprint: fingerprint.into(),
+        };
+        let view = |context_fingerprint: &str, unrelated_fingerprint: &str| {
+            WorkspaceView::new(
+                "main",
+                "analysis",
+                vec![
+                    state("example/a", "a"),
+                    state("example/b", context_fingerprint),
+                    state("example/c", unrelated_fingerprint),
+                ],
+            )
+            .unwrap()
+            .with_repository_contexts(BTreeMap::from([(
+                "typescript".into(),
+                BTreeMap::from([("example/a".into(), vec!["example/b".into()])]),
+            )]))
+            .unwrap()
+        };
+        let original = view("b-1", "c-1");
+        let changed_context = view("b-2", "c-1");
+        let changed_unrelated = view("b-1", "c-2");
+
+        assert_ne!(
+            original.repository_enrichment_input_fingerprint(
+                &original.repository_states[0],
+                "typescript",
+            ),
+            changed_context.repository_enrichment_input_fingerprint(
+                &changed_context.repository_states[0],
+                "typescript",
+            )
+        );
+        assert_eq!(
+            original.repository_enrichment_input_fingerprint(
+                &original.repository_states[0],
+                "typescript",
+            ),
+            changed_unrelated.repository_enrichment_input_fingerprint(
+                &changed_unrelated.repository_states[0],
+                "typescript",
+            )
+        );
+        assert_eq!(
+            original
+                .repository_enrichment_input_fingerprint(&original.repository_states[0], "rust",),
+            changed_context.repository_enrichment_input_fingerprint(
+                &changed_context.repository_states[0],
+                "rust",
+            )
+        );
     }
 }

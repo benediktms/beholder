@@ -82,6 +82,7 @@ defmodule Beholder.Worker.V1.RepositoryStart do
   field :base, 2, type: :string
   field :head, 3, proto3_optional: true, type: :string
   field :fingerprint, 4, type: :string
+  field :target, 5, type: :bool
 end
 
 defmodule Beholder.Worker.V1.RepositoryInput do

@@ -10,8 +10,9 @@ use super::{
     storage::{
         claim_garbage_collection, enrichment_matches, enrichments_current, ensure_revision_inputs,
         garbage_collection_pending, garbage_collection_queued, publish_enrichment,
-        publish_observations, store_verification_fingerprint, sweep_garbage_collection,
-        verification_matches, view_matches,
+        publish_observations, repository_contexts, revision_enrichment_input_fingerprint,
+        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
+        view_matches,
     },
 };
 use beholder_domain::{
@@ -169,6 +170,24 @@ impl SemanticStore {
 
     pub fn ensure_revision_inputs(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
         ensure_revision_inputs(&self.db, view)
+    }
+
+    pub fn revision_enrichment_input_fingerprint(
+        &self,
+        view: &str,
+        repository: &str,
+        analyzer: &str,
+    ) -> Result<Option<String>, Box<dyn Error>> {
+        revision_enrichment_input_fingerprint(&self.read_db, view, repository, analyzer)
+    }
+
+    pub fn repository_contexts(
+        &self,
+        view: &str,
+        target: &str,
+        analyzer: &str,
+    ) -> Result<Vec<String>, Box<dyn Error>> {
+        repository_contexts(&self.read_db, view, target, analyzer)
     }
 
     pub fn publish_enrichment(
