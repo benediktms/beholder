@@ -89,6 +89,21 @@ Filesystem metadata is only a scheduling hint within a daemon lifetime. It may
 select additional paths for hashing, but equality never establishes content
 equality across daemon restarts or periodic reconciliation boundaries.
 
+```mermaid
+flowchart TD
+    H["Watcher paths and metadata"] --> R["Incremental inventory refresh"]
+    A["Startup or periodic reconciliation"] --> R
+    C["Versioned manifests and content blobs"] <--> R
+    R --> S["Immutable workspace snapshot"]
+    G["Logical repository and selected HEAD"] --> S
+    S --> P["Active analyzer and plugin plan"]
+    P --> D["Desired-state identity"]
+    D --> X["Analyze snapshot"]
+    X --> V{"Generation and identity still current?"}
+    V -- Yes --> M["Atomic Mnestic publication"]
+    V -- No --> Q["Discard result and queue newer generation"]
+```
+
 ### Publication guard
 
 Analysis runs against an immutable `WorkspaceSnapshot`. Immediately before
