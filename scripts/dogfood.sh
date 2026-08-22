@@ -98,11 +98,17 @@ echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
 for _ in {1..600}; do
     result="$(target/debug/beholder context --json --workspace main "$caller" 2>/dev/null || true)"
-    grep -Fq "$callee" <<<"$result" && break
+    if grep -Fq "$callee" <<<"$result" && grep -Fq '"stale":false' <<<"$result"; then
+        break
+    fi
     sleep 0.1
 done
 if ! grep -Fq "$callee" <<<"$result"; then
     printf 'automatic indexing did not produce %s in context:\n%s\n' "$callee" "$result" >&2
+    exit 1
+fi
+if ! grep -Fq '"stale":false' <<<"$result"; then
+    printf 'automatic indexing did not reach current freshness:\n%s\n' "$result" >&2
     exit 1
 fi
 echo 'Checking Elixir module and function indexing...' >&2
@@ -316,10 +322,23 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     exit 1
 fi
 
+reindex_until_current() {
+    local output=''
+    for _ in {1..100}; do
+        if output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+            printf '%s' "$output"
+            return 0
+        fi
+        sleep 0.1
+    done
+    printf '%s' "$output"
+    return 1
+}
+
 echo 'Checking a bad source does not abort workspace indexing...' >&2
 recovery_source="$state/rust/src/recovery.rs"
 printf '%s\n' 'fn broken() {' 'fn nested() {}' >"$recovery_source"
-if ! reindex_output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+if ! reindex_output="$(reindex_until_current)"; then
     printf 'unrecoverable Rust source aborted workspace indexing:\n%s\n' "$reindex_output" >&2
     exit 1
 fi
@@ -329,7 +348,7 @@ if ! grep -Fq '"kind":"calls_rpc"' <<<"$result"; then
     exit 1
 fi
 printf '%s\n' 'fn repaired() {}' >"$recovery_source"
-target/debug/beholder reindex-workspace main >/dev/null
+reindex_until_current >/dev/null
 
 echo 'Garbage collecting obsolete semantic states...' >&2
 gc_result="$(target/debug/beholder cache gc)"
