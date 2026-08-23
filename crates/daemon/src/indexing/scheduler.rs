@@ -113,6 +113,8 @@ mod csharp_analysis;
 mod elixir_analysis;
 #[path = "enrichment.rs"]
 mod enrichment;
+#[path = "inventory.rs"]
+mod inventory;
 #[path = "pipeline.rs"]
 mod pipeline;
 #[cfg(test)]
@@ -126,7 +128,7 @@ mod typescript_analysis;
 #[cfg(test)]
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
 use enrichment::{EnrichmentJob, EnrichmentRun};
-use sources::{RepositoryInventory, repository_inventory};
+use inventory::{InventoryStatistics, InventoryStore, RefreshMode};
 #[cfg(test)]
 use sources::{RepositorySources, decode_csharp_source, repository_sources};
 
@@ -267,6 +269,7 @@ pub struct IndexScheduler {
     enrichment_shutdown: Notify,
     checkpointing: AtomicBool,
     indexer: Indexer,
+    inventory: InventoryStore,
     #[cfg(test)]
     cache_dir: PathBuf,
     #[cfg(test)]
@@ -286,6 +289,7 @@ pub struct IndexScheduler {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DirtyRepository {
     All,
+    Reconcile,
     Sources(BTreeSet<PathBuf>),
 }
 
@@ -329,6 +333,7 @@ impl Drop for ActiveOperation<'_> {
 
 impl IndexScheduler {
     pub fn with_indexer(indexer: Indexer) -> Self {
+        let inventory = InventoryStore::new(indexer.cache_dir());
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
@@ -342,6 +347,7 @@ impl IndexScheduler {
             enrichment_shutdown: Notify::new(),
             checkpointing: AtomicBool::new(false),
             indexer,
+            inventory,
             #[cfg(test)]
             cache_dir: PathBuf::new(),
             #[cfg(test)]
@@ -391,6 +397,7 @@ impl IndexScheduler {
             .add_analyzer(ProtobufAnalyzer::new(cache_dir.clone()))
             .build()
             .expect("built-in analyzers should compose");
+        let inventory = InventoryStore::new(indexer.cache_dir());
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
@@ -404,6 +411,7 @@ impl IndexScheduler {
             enrichment_shutdown: Notify::new(),
             checkpointing: AtomicBool::new(false),
             indexer,
+            inventory,
             cache_dir,
             #[cfg(test)]
             rust_cache: Mutex::new(BTreeMap::new()),
@@ -502,6 +510,7 @@ impl IndexScheduler {
         #[cfg(test)]
         self.protobuf_compiler.clear_memory()?;
         self.indexer.clear_cache().map_err(erase_error)?;
+        self.inventory.clear();
         Ok(())
     }
 
@@ -761,10 +770,23 @@ impl IndexScheduler {
         };
         let workspaces = registry.list();
         drop(registry);
-        for workspace in &workspaces {
-            self.mark(workspace);
+        let mut marked = false;
+        if let Ok(mut generations) = self.generations.lock()
+            && let Ok(mut dirty) = self.dirty_repositories.lock()
+        {
+            for workspace in &workspaces {
+                marked = true;
+                *generations.entry(workspace.name.clone()).or_default() += 1;
+                let repositories = dirty.entry(workspace.name.clone()).or_default();
+                for repository in &workspace.repositories {
+                    repositories.insert(
+                        repository.repository.identity.clone(),
+                        DirtyRepository::Reconcile,
+                    );
+                }
+            }
         }
-        !workspaces.is_empty()
+        marked
     }
 
     fn reindex_dirty(&self, store: &SemanticStore, workspaces: &Mutex<WorkspaceRegistry>) {
@@ -1326,52 +1348,29 @@ fn index_workspace_through_port(
     workspace: &Workspace,
     dirty: Option<&BTreeMap<String, DirtyRepository>>,
 ) -> Result<(usize, bool), Box<dyn Error>> {
+    let indexed_generation = scheduler
+        .generations
+        .lock()
+        .map_err(|_| "index generations lock poisoned")?
+        .get(&workspace.name)
+        .copied();
     let source_loading_started = Instant::now();
-    let inventories = tracing::info_span!(
+    let (snapshot, inventory_statistics) = tracing::info_span!(
         "index.inventory",
         workspace = %workspace.name,
         repositories = workspace.repositories.len()
     )
-    .in_scope(|| {
-        workspace
-            .repositories
-            .iter()
-            .map(|repository| {
-                let descriptors = workspace
-                    .protobuf_descriptors
-                    .iter()
-                    .filter(|descriptor| descriptor.repository == repository.repository)
-                    .map(|descriptor| descriptor.path.clone())
-                    .collect::<Vec<_>>();
-                repository_inventory(&repository.base, &descriptors, &scheduler.indexer)
-            })
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+    .in_scope(|| refresh_workspace_snapshot(scheduler, workspace, dirty))?;
+    let source_loading = source_loading_started.elapsed();
+    let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let verification_fingerprint =
-        workspace_verification_fingerprint(&scheduler.indexer, &inventories);
+        workspace_verification_fingerprint(analysis_plan.analysis_identity(), &snapshot);
     if store.verification_matches(&workspace.name, &verification_fingerprint)?
         && scheduler.enrichments_current(store, &workspace.name)?
     {
         tracing::info!(workspace = %workspace.name, "workspace inputs unchanged");
         return Ok((0, false));
     }
-    let repositories = tracing::info_span!(
-        "index.load_sources",
-        workspace = %workspace.name,
-        repositories = inventories.len()
-    )
-    .in_scope(|| {
-        inventories
-            .into_iter()
-            .map(RepositoryInventory::load)
-            .collect::<Result<Vec<_>, _>>()
-    })?;
-    let source_loading = source_loading_started.elapsed();
-    let snapshot = WorkspaceSnapshot {
-        name: workspace.name.clone(),
-        repositories,
-    };
-    let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let mut view = WorkspaceView::new_scoped(
         &workspace.name,
         analysis_plan.analysis_identity(),
@@ -1418,7 +1417,7 @@ fn index_workspace_through_port(
                 .and_then(|repositories| repositories.get(&repository.state.repository.identity))
             {
                 Some(DirtyRepository::Sources(sources)) => sources.len(),
-                Some(DirtyRepository::All) | None => repository
+                Some(DirtyRepository::All | DirtyRepository::Reconcile) | None => repository
                     .inputs
                     .iter()
                     .filter(|input| input.kind == beholder_indexing::InputKind::Source)
@@ -1472,6 +1471,29 @@ fn index_workspace_through_port(
         .map(|facts| facts.observations.len())
         .sum();
     let publication_started = Instant::now();
+    let (current, verification_statistics) =
+        refresh_workspace_snapshot(scheduler, workspace, dirty)?;
+    let current_plan = scheduler.indexer.prepare(&current);
+    let current_fingerprint =
+        workspace_verification_fingerprint(current_plan.analysis_identity(), &current);
+    let generation_is_current = scheduler
+        .generations
+        .lock()
+        .map_err(|_| "index generations lock poisoned")?
+        .get(&workspace.name)
+        .copied()
+        == indexed_generation;
+    if !generation_is_current {
+        return Err(
+            "workspace inputs changed during indexing; stale analysis was discarded".into(),
+        );
+    }
+    if current_fingerprint != verification_fingerprint {
+        scheduler.mark(workspace);
+        return Err(
+            "workspace inputs changed during indexing; stale analysis was discarded".into(),
+        );
+    }
     let changes = tracing::info_span!(
         "index.publish",
         workspace = %workspace.name,
@@ -1502,6 +1524,19 @@ fn index_workspace_through_port(
         analyzer_cache_disk_hits = analysis.cache.disk_hits,
         analyzer_cache_misses = analysis.cache.misses,
         dirty_source_units,
+        inventory_discovered_inputs = inventory_statistics.discovered_inputs,
+        inventory_watcher_inputs = inventory_statistics.watcher_inputs,
+        inventory_content_hashes = inventory_statistics.content_hashes,
+        inventory_authoritative_hashes = inventory_statistics.authoritative_hashes,
+        inventory_watcher_hashes = inventory_statistics.watcher_hashes,
+        inventory_membership_or_metadata_hashes = inventory_statistics.membership_or_metadata_hashes,
+        inventory_cache_recovery_hashes = inventory_statistics.cache_recovery_hashes,
+        inventory_repository_bytes_read = inventory_statistics.repository_bytes_read,
+        inventory_cached_bytes_reused = inventory_statistics.cached_bytes_reused,
+        inventory_repositories_changed = inventory_statistics.repositories_changed,
+        inventory_repositories_reused = inventory_statistics.repositories_reused,
+        verification_content_hashes = verification_statistics.content_hashes,
+        verification_repository_bytes_read = verification_statistics.repository_bytes_read,
         source_loading_ms = source_loading.as_secs_f64() * 1000.0,
         protobuf_compilation_ms = 0.0,
         repository_analysis_ms = repository_analysis.as_secs_f64() * 1000.0,
@@ -1513,18 +1548,63 @@ fn index_workspace_through_port(
 }
 
 fn workspace_verification_fingerprint(
-    indexer: &Indexer,
-    inventories: &[RepositoryInventory],
+    analysis_identity: &str,
+    snapshot: &WorkspaceSnapshot,
 ) -> String {
     let mut digest = Sha256::new();
-    let identity = indexer.catalog_identity();
-    digest.update((identity.len() as u64).to_le_bytes());
-    digest.update(identity.as_bytes());
-    for inventory in inventories {
-        digest.update((inventory.fingerprint.len() as u64).to_le_bytes());
-        digest.update(inventory.fingerprint.as_bytes());
+    digest.update((analysis_identity.len() as u64).to_le_bytes());
+    digest.update(analysis_identity.as_bytes());
+    for repository in &snapshot.repositories {
+        let fingerprint = &repository.state.fingerprint;
+        digest.update((fingerprint.len() as u64).to_le_bytes());
+        digest.update(fingerprint.as_bytes());
     }
     format!("{:x}", digest.finalize())
+}
+
+fn refresh_workspace_snapshot(
+    scheduler: &IndexScheduler,
+    workspace: &Workspace,
+    dirty: Option<&BTreeMap<String, DirtyRepository>>,
+) -> Result<(WorkspaceSnapshot, InventoryStatistics), BeholderError> {
+    let mut statistics = InventoryStatistics::default();
+    let repositories = workspace
+        .repositories
+        .iter()
+        .map(|repository| {
+            let descriptors = workspace
+                .protobuf_descriptors
+                .iter()
+                .filter(|descriptor| descriptor.repository == repository.repository)
+                .map(|descriptor| descriptor.path.clone())
+                .collect::<Vec<_>>();
+            let configured = dirty.and_then(|dirty| dirty.get(&repository.repository.identity));
+            let mode = match configured {
+                Some(DirtyRepository::Sources(paths)) => RefreshMode::Dirty(paths),
+                Some(DirtyRepository::All | DirtyRepository::Reconcile) => {
+                    RefreshMode::Authoritative
+                }
+                None => RefreshMode::Hinted,
+            };
+            let refresh = scheduler.inventory.refresh(
+                &workspace.name,
+                &repository.repository.identity,
+                &repository.base,
+                &descriptors,
+                &scheduler.indexer,
+                mode,
+            )?;
+            statistics += refresh.statistics;
+            Ok(refresh.snapshot)
+        })
+        .collect::<Result<Vec<_>, BeholderError>>()?;
+    Ok((
+        WorkspaceSnapshot {
+            name: workspace.name.clone(),
+            repositories,
+        },
+        statistics,
+    ))
 }
 
 #[cfg(test)]
@@ -1632,7 +1712,7 @@ fn index_workspace_versioned(
         dirty_source_units +=
             match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
                 Some(DirtyRepository::Sources(sources)) => sources.len(),
-                Some(DirtyRepository::All) | None => {
+                Some(DirtyRepository::All | DirtyRepository::Reconcile) | None => {
                     rust.len()
                         + elixir.len()
                         + csharp.len()
@@ -3139,7 +3219,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_inventory_skips_source_loading_after_restart() {
+    fn persisted_inventory_is_revalidated_after_restart() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -3156,20 +3236,10 @@ mod tests {
         assert!(scheduler.index(&store, &workspace).unwrap().1);
         drop(scheduler);
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
-        let fingerprint = workspace_verification_fingerprint(
-            &scheduler.indexer,
-            &[repository_inventory(&repository, &[], &scheduler.indexer).unwrap()],
-        );
-        assert!(store.verification_matches("main", &fingerprint).unwrap());
         assert!(!scheduler.index(&store, &workspace).unwrap().1);
 
         fs::write(&source, "fn indexed() {}").unwrap();
         assert!(!scheduler.index(&store, &workspace).unwrap().1);
-        let refreshed = workspace_verification_fingerprint(
-            &scheduler.indexer,
-            &[repository_inventory(&repository, &[], &scheduler.indexer).unwrap()],
-        );
-        assert!(store.verification_matches("main", &refreshed).unwrap());
 
         fs::write(&source, "fn changed() {}").unwrap();
         assert!(scheduler.index(&store, &workspace).unwrap().1);
