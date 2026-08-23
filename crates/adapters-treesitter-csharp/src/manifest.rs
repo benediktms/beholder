@@ -26,11 +26,7 @@ pub fn csharp_analysis_input_kind(path: &Path) -> Option<AnalysisInputKind> {
         || name.ends_with(".asmdef")
         || name.ends_with(".asmref")
         || name.ends_with(".asmdef.meta")
-        || matches!(
-            name,
-            "Directory.Packages.props"
-                | "packages.lock.json"
-        )
+        || matches!(name, "Directory.Packages.props" | "packages.lock.json")
         || matches!(name, "manifest.json" | "packages-lock.json") && under(path, "Packages")
     {
         return Some(AnalysisInputKind::Dependency);
@@ -38,7 +34,9 @@ pub fn csharp_analysis_input_kind(path: &Path) -> Option<AnalysisInputKind> {
     if name.ends_with(".props")
         || name.ends_with(".targets")
         || matches!(name, "Directory.Build.rsp" | "NuGet.config")
-        || path.extension().is_some_and(|extension| extension == "asset")
+        || path
+            .extension()
+            .is_some_and(|extension| extension == "asset")
             && under(path, "ProjectSettings")
     {
         return Some(AnalysisInputKind::Configuration);
@@ -95,7 +93,11 @@ pub(crate) fn csharp_repository_dependencies(
                         &resolve_path(&directory, &import),
                         &roots,
                         RepositoryDependencyKind::CompilerDiscovered,
-                        format!("{}: MSBuild import {}", input.path.display(), import.display()),
+                        format!(
+                            "{}: MSBuild import {}",
+                            input.path.display(),
+                            import.display()
+                        ),
                     );
                 }
             } else if name.is_some_and(|name| name.ends_with(".asmdef")) {
@@ -120,7 +122,9 @@ pub(crate) fn csharp_repository_dependencies(
                         });
                     }
                 }
-            } else if name == Some("manifest.json") && input.path.ends_with("Packages/manifest.json") {
+            } else if name == Some("manifest.json")
+                && input.path.ends_with("Packages/manifest.json")
+            {
                 let Ok(manifest) = serde_json::from_slice::<Value>(&input.content) else {
                     continue;
                 };
@@ -171,11 +175,18 @@ fn assembly_owners(snapshot: &WorkspaceSnapshot) -> BTreeMap<String, String> {
     let mut ambiguous = BTreeSet::new();
     for repository in &snapshot.repositories {
         for input in repository.inputs.iter().filter(|input| {
-            input.path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-                name.ends_with(".asmdef") || name.ends_with(".asmdef.meta")
-            })
+            input
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".asmdef") || name.ends_with(".asmdef.meta"))
         }) {
-            let keys = if input.path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.ends_with(".asmdef.meta")) {
+            let keys = if input
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".asmdef.meta"))
+            {
                 unity_guid(&input.content).into_iter().collect()
             } else {
                 serde_json::from_slice::<AssemblyDefinition>(&input.content)
@@ -213,13 +224,18 @@ fn xml_paths(source: &str, element: &[u8], attribute: &[u8]) -> Vec<PathBuf> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(event) | Event::Empty(event)) if event.name().as_ref() == element => {
-                paths.extend(event.attributes().filter_map(Result::ok).filter_map(|value| {
-                    (value.key.as_ref() == attribute)
-                        .then(|| value.unescape_value().ok())
-                        .flatten()
-                        .map(|value| PathBuf::from(value.replace('\\', "/")))
-                        .filter(|path| !dynamic(path))
-                }));
+                paths.extend(
+                    event
+                        .attributes()
+                        .filter_map(Result::ok)
+                        .filter_map(|value| {
+                            (value.key.as_ref() == attribute)
+                                .then(|| value.unescape_value().ok())
+                                .flatten()
+                                .map(|value| PathBuf::from(value.replace('\\', "/")))
+                                .filter(|path| !dynamic(path))
+                        }),
+                );
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -229,11 +245,15 @@ fn xml_paths(source: &str, element: &[u8], attribute: &[u8]) -> Vec<PathBuf> {
 }
 
 fn dynamic(path: &Path) -> bool {
-    path.to_string_lossy().bytes().any(|byte| matches!(byte, b'$' | b'*' | b'?'))
+    path.to_string_lossy()
+        .bytes()
+        .any(|byte| matches!(byte, b'$' | b'*' | b'?'))
 }
 
 fn under(path: &Path, directory: &str) -> bool {
-    path.ancestors().skip(1).any(|parent| parent.ends_with(directory))
+    path.ancestors()
+        .skip(1)
+        .any(|parent| parent.ends_with(directory))
 }
 
 fn add_path_candidate(
@@ -277,7 +297,9 @@ fn absolute_lexical(path: &Path) -> PathBuf {
     let path = if path.is_absolute() {
         path.into()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| ".".into()).join(path)
+        std::env::current_dir()
+            .unwrap_or_else(|_| ".".into())
+            .join(path)
     };
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -303,54 +325,141 @@ mod tests {
         RepositorySnapshot {
             base: base.into(),
             state: RepositoryState {
-                repository: LogicalRepository { identity: identity.into() },
+                repository: LogicalRepository {
+                    identity: identity.into(),
+                },
                 head: None,
                 fingerprint: identity.into(),
             },
-            inputs: inputs.iter().map(|(path, content)| RepositoryInput {
-                path: (*path).into(), content: Arc::from(content.as_bytes()), kind: InputKind::Source,
-            }).collect(),
+            inputs: inputs
+                .iter()
+                .map(|(path, content)| RepositoryInput {
+                    path: (*path).into(),
+                    content: Arc::from(content.as_bytes()),
+                    kind: InputKind::Source,
+                })
+                .collect(),
         }
     }
 
     #[test]
     fn classifies_dotnet_and_unity_inputs_without_generated_outputs() {
-        assert_eq!(csharp_analysis_input_kind(Path::new("src/App.cs")), Some(AnalysisInputKind::Source));
-        assert_eq!(csharp_analysis_input_kind(Path::new("App.csproj")), Some(AnalysisInputKind::Dependency));
-        assert_eq!(csharp_analysis_input_kind(Path::new("global.json")), Some(AnalysisInputKind::Toolchain));
-        assert_eq!(csharp_analysis_input_kind(Path::new("Directory.Build.props")), Some(AnalysisInputKind::Configuration));
-        assert_eq!(csharp_analysis_input_kind(Path::new("ProjectSettings/ProjectVersion.txt")), Some(AnalysisInputKind::Toolchain));
-        assert_eq!(csharp_analysis_input_kind(Path::new("Packages/packages-lock.json")), Some(AnalysisInputKind::Dependency));
-        assert_eq!(csharp_analysis_input_kind(Path::new("obj/project.assets.json")), None);
-        assert_eq!(csharp_analysis_input_kind(Path::new("Library/ArtifactDB")), None);
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("src/App.cs")),
+            Some(AnalysisInputKind::Source)
+        );
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("App.csproj")),
+            Some(AnalysisInputKind::Dependency)
+        );
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("global.json")),
+            Some(AnalysisInputKind::Toolchain)
+        );
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("Directory.Build.props")),
+            Some(AnalysisInputKind::Configuration)
+        );
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("ProjectSettings/ProjectVersion.txt")),
+            Some(AnalysisInputKind::Toolchain)
+        );
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("Packages/packages-lock.json")),
+            Some(AnalysisInputKind::Dependency)
+        );
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("obj/project.assets.json")),
+            None
+        );
+        assert_eq!(
+            csharp_analysis_input_kind(Path::new("Library/ArtifactDB")),
+            None
+        );
     }
 
     #[test]
     fn discovers_project_import_assembly_and_local_package_edges() {
-        let snapshot = WorkspaceSnapshot { name: "main".into(), repositories: vec![
-            repository("app", "/workspace/app", &[
-                ("App.csproj", r#"<Project><Import Project="../build/shared.props"/><ItemGroup><ProjectReference Include="../core/Core.csproj"/></ItemGroup></Project>"#),
-                ("Assets/App.asmdef", r#"{"name":"App","references":["Core"]}"#),
-                ("Packages/manifest.json", r#"{"dependencies":{"tools":"file:../../tools"}}"#),
-            ]),
-            repository("core", "/workspace/core", &[("Core.csproj", "<Project/>"), ("Core.asmdef", r#"{"name":"Core"}"#)]),
-            repository("build", "/workspace/build", &[("shared.props", "<Project/>")]),
-            repository("tools", "/workspace/tools", &[("package.json", "{}")]),
-        ]};
+        let snapshot = WorkspaceSnapshot {
+            name: "main".into(),
+            repositories: vec![
+                repository(
+                    "app",
+                    "/workspace/app",
+                    &[
+                        (
+                            "App.csproj",
+                            r#"<Project><Import Project="../build/shared.props"/><ItemGroup><ProjectReference Include="../core/Core.csproj"/></ItemGroup></Project>"#,
+                        ),
+                        (
+                            "Assets/App.asmdef",
+                            r#"{"name":"App","references":["Core"]}"#,
+                        ),
+                        (
+                            "Packages/manifest.json",
+                            r#"{"dependencies":{"tools":"file:../../tools"}}"#,
+                        ),
+                    ],
+                ),
+                repository(
+                    "core",
+                    "/workspace/core",
+                    &[
+                        ("Core.csproj", "<Project/>"),
+                        ("Core.asmdef", r#"{"name":"Core"}"#),
+                    ],
+                ),
+                repository(
+                    "build",
+                    "/workspace/build",
+                    &[("shared.props", "<Project/>")],
+                ),
+                repository("tools", "/workspace/tools", &[("package.json", "{}")]),
+            ],
+        };
         let dependencies = csharp_repository_dependencies(&snapshot).unwrap();
         assert_eq!(dependencies.len(), 4);
-        assert!(dependencies.iter().all(|dependency| dependency.from == "app" && dependency.analyzer == "csharp"));
-        assert!(dependencies.iter().any(|dependency| dependency.to == "core" && dependency.kind == RepositoryDependencyKind::ProjectReference));
-        assert!(dependencies.iter().any(|dependency| dependency.to == "build" && dependency.kind == RepositoryDependencyKind::CompilerDiscovered));
-        assert!(dependencies.iter().any(|dependency| dependency.to == "tools" && dependency.kind == RepositoryDependencyKind::PathDependency));
+        assert!(
+            dependencies
+                .iter()
+                .all(|dependency| dependency.from == "app" && dependency.analyzer == "csharp")
+        );
+        assert!(dependencies.iter().any(|dependency| dependency.to == "core"
+            && dependency.kind == RepositoryDependencyKind::ProjectReference));
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.to == "build"
+                    && dependency.kind == RepositoryDependencyKind::CompilerDiscovered)
+        );
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.to == "tools"
+                    && dependency.kind == RepositoryDependencyKind::PathDependency)
+        );
     }
 
     #[test]
     fn resolves_guid_assembly_references_and_deduplicates_them() {
-        let snapshot = WorkspaceSnapshot { name: "main".into(), repositories: vec![
-            repository("app", "/workspace/app", &[("App.asmdef", r#"{"name":"App","references":["GUID:abc","GUID:abc"]}"#)]),
-            repository("core", "/workspace/core", &[("Core.asmdef.meta", "guid: abc\n")]),
-        ]};
+        let snapshot = WorkspaceSnapshot {
+            name: "main".into(),
+            repositories: vec![
+                repository(
+                    "app",
+                    "/workspace/app",
+                    &[(
+                        "App.asmdef",
+                        r#"{"name":"App","references":["GUID:abc","GUID:abc"]}"#,
+                    )],
+                ),
+                repository(
+                    "core",
+                    "/workspace/core",
+                    &[("Core.asmdef.meta", "guid: abc\n")],
+                ),
+            ],
+        };
         let dependencies = csharp_repository_dependencies(&snapshot).unwrap();
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].to, "core");
