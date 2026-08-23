@@ -6,7 +6,7 @@ use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     error::Error,
     fs::{self, File},
     future::Future,
@@ -878,6 +878,18 @@ impl Indexer {
     pub fn accepts(&self, path: &Path) -> bool {
         self.analyzers.iter().any(|analyzer| analyzer.accepts(path))
             || self.enrichers.iter().any(|enricher| enricher.accepts(path))
+    }
+
+    pub fn analysis_input_kinds(&self, path: &Path) -> BTreeSet<AnalysisInputKind> {
+        self.analyzers
+            .iter()
+            .filter_map(|analyzer| analyzer.analysis_input_kind(path))
+            .chain(
+                self.enrichers
+                    .iter()
+                    .filter_map(|enricher| enricher.analysis_input_kind(path)),
+            )
+            .collect()
     }
 
     pub fn prepare(&self, snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysisPlan {

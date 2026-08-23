@@ -84,54 +84,59 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
     )
 }
 
-#[cfg(test)]
-pub(super) fn is_index_input(path: &Path) -> bool {
-    !path.components().any(|component| {
+pub(super) fn is_ignored_path(path: &Path) -> bool {
+    path.components().any(|component| {
         component
             .as_os_str()
             .to_str()
             .is_some_and(is_ignored_directory)
-    }) && (path.extension().is_some_and(|extension| {
-        matches!(
-            extension.to_str(),
-            Some(
-                "rs" | "ex"
-                    | "exs"
-                    | "cs"
-                    | "js"
-                    | "jsx"
-                    | "ts"
-                    | "tsx"
-                    | "graphql"
-                    | "gql"
-                    | "proto"
-            )
-        )
-    }) || path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
+    })
+}
+
+#[cfg(test)]
+pub(super) fn is_index_input(path: &Path) -> bool {
+    !is_ignored_path(path)
+        && (path.extension().is_some_and(|extension| {
             matches!(
-                name,
-                "buf.yaml"
-                    | "buf.lock"
-                    | "package.json"
-                    | "package-lock.json"
-                    | "npm-shrinkwrap.json"
-                    | "yarn.lock"
-                    | "pnpm-lock.yaml"
-                    | "pnpm-workspace.yaml"
-                    | "bun.lock"
-                    | "bun.lockb"
-                    | "deno.lock"
-            ) || name.ends_with(".csproj")
-                || name.ends_with(".asmdef")
-                || name.ends_with(".prefab")
-                || name.ends_with(".cs.meta")
-                || name.ends_with(".prefab.meta")
-                || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
-                    && name.ends_with(".json"))
-        }))
+                extension.to_str(),
+                Some(
+                    "rs" | "ex"
+                        | "exs"
+                        | "cs"
+                        | "js"
+                        | "jsx"
+                        | "ts"
+                        | "tsx"
+                        | "graphql"
+                        | "gql"
+                        | "proto"
+                )
+            )
+        }) || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "buf.yaml"
+                        | "buf.lock"
+                        | "package.json"
+                        | "package-lock.json"
+                        | "npm-shrinkwrap.json"
+                        | "yarn.lock"
+                        | "pnpm-lock.yaml"
+                        | "pnpm-workspace.yaml"
+                        | "bun.lock"
+                        | "bun.lockb"
+                        | "deno.lock"
+                ) || name.ends_with(".csproj")
+                    || name.ends_with(".asmdef")
+                    || name.ends_with(".prefab")
+                    || name.ends_with(".cs.meta")
+                    || name.ends_with(".prefab.meta")
+                    || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
+                        && name.ends_with(".json"))
+            }))
 }
 
 #[cfg(test)]
