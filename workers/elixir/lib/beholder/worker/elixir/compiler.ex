@@ -27,20 +27,51 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @spec run(Repository.t(), [Repository.t()], String.t()) ::
           {:ok, result()} | {:error, String.t()}
   def run(repository, contexts, cache_dir) do
+    original_repositories = [repository | contexts]
+
+    with {:ok, materialized_repositories, materialization_root} <-
+           materialize(original_repositories) do
+      [repository | contexts] = materialized_repositories
+
+      try do
+        case run_materialized(repository, contexts, cache_dir) do
+          {:ok, result} ->
+            {:ok,
+             remap_result_paths(result, materialized_repositories, original_repositories)}
+
+          {:error, _reason} = error ->
+            error
+        end
+      after
+        File.rm_rf(materialization_root)
+      end
+    end
+  end
+
+  defp run_materialized(repository, contexts, cache_dir) do
     repositories = [repository | contexts]
 
-    with :ok <- verify_repositories(repositories),
+    with :ok <- validate_local_paths(repositories),
          {:ok, mix} <- find_mix() do
       helper_ebin = BeamExporter.export!(cache_dir)
       working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)])
-      mix_env = System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "dev")
+      mix_env = configured_mix_env()
       build_path = Path.join(working_dir, "build-#{build_identity(repositories, mix, mix_env)}")
       result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
+      mix_home = Path.join(repository.base, ".beholder-mix-home")
+      hex_home = Path.join(repository.base, ".beholder-hex-home")
+      deps_path = Path.join(repository.base, ".beholder-deps")
+      File.mkdir_p!(mix_home)
+      File.mkdir_p!(hex_home)
+      File.mkdir_p!(deps_path)
 
       env = [
         {"BEHOLDER_ELIXIR_TRACE_RESULT", result_path},
         {"MIX_BUILD_PATH", build_path},
+        {"MIX_DEPS_PATH", deps_path},
         {"MIX_ENV", mix_env},
+        {"MIX_HOME", mix_home},
+        {"HEX_HOME", hex_home},
         {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
       ]
 
@@ -66,7 +97,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
 
   @spec verify_inputs(Repository.t()) :: :ok | {:error, String.t()}
   def verify_inputs(repository) do
-    Enum.reduce_while(Repository.source_inputs(repository), :ok, fn input, :ok ->
+    Enum.reduce_while(Repository.sorted_inputs(repository), :ok, fn input, :ok ->
       path = Path.expand(input.path, repository.base)
 
       cond do
@@ -81,6 +112,168 @@ defmodule Beholder.Worker.Elixir.Compiler do
       end
     end)
   end
+
+  defp materialize(repositories) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "beholder-elixir-snapshot-#{System.pid()}-#{System.unique_integer([:positive])}"
+      )
+
+    with :ok <- File.mkdir(root),
+         {:ok, common} <- common_repository_root(repositories),
+         {:ok, materialized} <- materialize_repositories(repositories, common, root) do
+      {:ok, materialized, root}
+    else
+      {:error, reason} ->
+        File.rm_rf(root)
+        {:error, format_materialization_error(reason)}
+    end
+  end
+
+  defp common_repository_root([]), do: {:error, "snapshot contains no repositories"}
+
+  defp common_repository_root(repositories) do
+    components = Enum.map(repositories, &(Path.expand(&1.base) |> Path.split()))
+    common = Enum.reduce(components, hd(components), &common_prefix/2)
+
+    if common == [] do
+      {:error, "snapshot repositories have no common filesystem root"}
+    else
+      {:ok, common}
+    end
+  end
+
+  defp common_prefix([head | left], [head | right]), do: [head | common_prefix(left, right)]
+  defp common_prefix(_left, _right), do: []
+
+  defp materialize_repositories(repositories, common, root) do
+    Enum.reduce_while(repositories, {:ok, [], MapSet.new(), MapSet.new()}, fn repository,
+                                                                             {:ok, result,
+                                                                              identities,
+                                                                              bases} ->
+      relative = repository.base |> Path.expand() |> Path.split() |> Enum.drop(length(common))
+      base = Path.join([root | relative])
+
+      cond do
+        MapSet.member?(identities, repository.identity) ->
+          {:halt, {:error, "snapshot contains duplicate repository #{repository.identity}"}}
+
+        MapSet.member?(bases, base) ->
+          {:halt, {:error, "snapshot maps repositories to the same directory"}}
+
+        true ->
+          case materialize_inputs(repository, base) do
+            :ok ->
+              {:cont,
+               {:ok, [%{repository | base: base} | result],
+                MapSet.put(identities, repository.identity), MapSet.put(bases, base)}}
+
+            {:error, _reason} = error ->
+              {:halt, error}
+          end
+      end
+    end)
+    |> case do
+      {:ok, repositories, _identities, _bases} -> {:ok, Enum.reverse(repositories)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp materialize_inputs(repository, base) do
+    Enum.reduce_while(Repository.sorted_inputs(repository), :ok, fn input, :ok ->
+      destination = Path.expand(input.path, base)
+
+      if Path.type(input.path) != :relative or not within?(destination, base) do
+        {:halt, {:error, "snapshot input escapes repository: #{input.path}"}}
+      else
+        with :ok <- File.mkdir_p(Path.dirname(destination)),
+             :ok <- File.write(destination, input.content) do
+          {:cont, :ok}
+        else
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end
+    end)
+  end
+
+  defp format_materialization_error(reason) when is_binary(reason), do: reason
+  defp format_materialization_error(reason), do: "failed to materialize snapshot: #{inspect(reason)}"
+
+  defp remap_result_paths(result, materialized_repositories, original_repositories) do
+    bases =
+      Enum.zip(materialized_repositories, original_repositories)
+      |> Enum.map(fn {materialized, original} ->
+        {Path.expand(materialized.base), Path.expand(original.base)}
+      end)
+      |> Enum.sort_by(fn {materialized, _original} -> -String.length(materialized) end)
+
+    result
+    |> Map.update(:events, [], &Enum.map(&1, fn event -> remap_file(event, bases) end))
+    |> Map.update(:diagnostics, [], fn diagnostics ->
+      Enum.map(diagnostics, &remap_file(&1, bases))
+    end)
+  end
+
+  defp remap_file(%{file: file} = value, bases) when is_binary(file) do
+    Map.put(value, :file, remap_path(file, bases))
+  end
+
+  defp remap_file(value, _bases), do: value
+
+  defp remap_path(path, bases) do
+    expanded = Path.expand(path)
+
+    Enum.find_value(bases, path, fn {materialized, original} ->
+      if within?(expanded, materialized) do
+        Path.join(original, Path.relative_to(expanded, materialized))
+      end
+    end)
+  end
+
+  defp validate_local_paths(repositories) do
+    repositories
+    |> Enum.flat_map(&Repository.sorted_inputs/1)
+    |> Enum.filter(&configuration_input?/1)
+    |> Enum.reduce_while(:ok, fn input, :ok ->
+      case absolute_local_path(input.content) do
+        nil -> {:cont, :ok}
+        path -> {:halt, {:error, "#{input.path} declares absolute local path #{path}"}}
+      end
+    end)
+  end
+
+  defp configuration_input?(%{path: path}) do
+    Path.basename(path) == "mix.exs" or "config" in Path.split(path)
+  end
+
+  defp configuration_input?(_input), do: false
+
+  defp absolute_local_path(source) do
+    with {:ok, quoted} <- Code.string_to_quoted(source) do
+      {_quoted, path} =
+        Macro.prewalk(quoted, nil, fn
+          node, path when not is_nil(path) ->
+            {node, path}
+
+          {key, value} = node, nil
+          when key in [:path, :apps_path] and is_binary(value) ->
+            {node, absolute_path(value)}
+
+          {:import_config, _metadata, [value]} = node, nil when is_binary(value) ->
+            {node, absolute_path(value)}
+
+          node, nil ->
+            {node, nil}
+        end)
+
+      path
+    else
+      _invalid_source -> nil
+    end
+  end
+
+  defp absolute_path(value), do: if(Path.type(value) == :absolute, do: value, else: nil)
 
   defp verify_repositories(repositories) do
     Enum.reduce_while(repositories, :ok, fn repository, :ok ->
@@ -152,8 +345,12 @@ defmodule Beholder.Worker.Elixir.Compiler do
     |> Kernel.++([
       mix_env,
       mix,
+      Mix.version(),
       System.version(),
-      :erlang.system_info(:otp_release)
+      :erlang.system_info(:otp_release),
+      System.get_env("ELIXIR_ERL_OPTIONS", ""),
+      System.get_env("ERL_AFLAGS", ""),
+      System.get_env("ERL_COMPILER_OPTIONS", "")
     ])
     |> Enum.join(<<0>>)
     |> then(&:crypto.hash(:sha256, &1))
@@ -342,6 +539,13 @@ defmodule Beholder.Worker.Elixir.Compiler do
     case Integer.parse(System.get_env(name, "")) do
       {value, ""} when value > 0 -> value
       _other -> default
+    end
+  end
+
+  defp configured_mix_env do
+    case System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "") |> String.trim() do
+      "" -> "dev"
+      value -> value
     end
   end
 

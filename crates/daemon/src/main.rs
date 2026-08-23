@@ -134,6 +134,70 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         }
         worker.build().map_err(|error| error.to_string())?
     });
+    #[cfg(not(test))]
+    let builder = if let Some(executable) = elixir_worker_executable()? {
+        let mix_env = std::env::var("BEHOLDER_ELIXIR_MIX_ENV")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "dev".into());
+        let mix_program = std::env::var("BEHOLDER_ELIXIR_MIX_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "mix".into());
+        let mut worker = WorkerAnalyzerBuilder::new(
+            executable,
+            cache_dir
+                .parent()
+                .unwrap_or(cache_dir.as_path())
+                .join("workers"),
+        )
+        .identity("elixir", "18:10:elixir-compiler:4")
+        .accept_extension("ex")
+        .accept_extension("exs")
+        .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
+        .accept_file_name_as("mix.lock", AnalysisInputKind::Dependency)
+        .accept_parent_suffix_as("config", AnalysisInputKind::Configuration)
+        .exclude_path_suffix("config/runtime.exs")
+        .identity_input(
+            "$toolchain/elixir",
+            command_identity("elixir", &["--version"]),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$toolchain/mix",
+            command_identity(&mix_program, &["--version"]),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$environment/BEHOLDER_ELIXIR_MIX_ENV",
+            mix_env.as_bytes().to_vec(),
+            AnalysisInputKind::Environment,
+        );
+        for environment in ["dev", "test", "prod"] {
+            if environment != mix_env {
+                worker = worker.exclude_path_suffix(format!("config/{environment}.exs"));
+            }
+        }
+        for variable in [
+            "BEHOLDER_ELIXIR_MIX_PATH",
+            "ELIXIR_ERL_OPTIONS",
+            "ERL_AFLAGS",
+            "ERL_COMPILER_OPTIONS",
+        ] {
+            worker = worker.identity_input(
+                format!("$environment/{variable}"),
+                std::env::var_os(variable)
+                    .map(|value| value.as_encoded_bytes().to_vec())
+                    .unwrap_or_default(),
+                AnalysisInputKind::Environment,
+            );
+        }
+        builder.add_enricher(worker.build().map_err(|error| error.to_string())?)
+    } else {
+        tracing::warn!("Elixir analyzer worker not found; compiler enrichment disabled");
+        builder
+    };
     builder
         .add_analyzer(ElixirAnalyzer::new(cache_dir.clone()))
         .add_analyzer(CsharpAnalyzer::new(cache_dir.clone()))
@@ -164,6 +228,26 @@ fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
         return Err(format!("Rust analyzer worker not found at {}", executable.display()).into());
     }
     Ok(executable)
+}
+
+#[cfg(not(test))]
+fn elixir_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    let configured = std::env::var_os("BEHOLDER_ELIXIR_WORKER_PATH");
+    let executable = configured
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_exe()?.with_file_name("beholder-worker-elixir"));
+    if executable.is_file() {
+        Ok(Some(executable))
+    } else if configured.is_some() {
+        Err(format!(
+            "configured Elixir analyzer worker not found at {}",
+            executable.display()
+        )
+        .into())
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
