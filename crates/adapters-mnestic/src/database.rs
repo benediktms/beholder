@@ -95,6 +95,16 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
+    for script in [
+        CREATE_ENRICHMENT_JOB_SCHEMA,
+        CREATE_ENRICHMENT_OUTPUT_SCHEMA,
+        CREATE_ENRICHMENT_ENTITY_CONTRIBUTION_SCHEMA,
+        CREATE_ENRICHMENT_OBSERVATION_CONTRIBUTION_SCHEMA,
+        CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_SCHEMA,
+        CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA,
+    ] {
+        db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)?;
+    }
     db.run_script(
         CREATE_OBSERVATION_TO_INDEX,
         BTreeMap::new(),
@@ -169,6 +179,7 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
     db.run_script(SEED_METADATA, BTreeMap::new(), ScriptMutability::Mutable)?;
     db.run_script(SEED_REVISIONS, BTreeMap::new(), ScriptMutability::Mutable)?;
     db.run_script(SEED_STATES, BTreeMap::new(), ScriptMutability::Mutable)?;
+    migrate_enrichment_ownership_to_contributions(&db)?;
     Ok(db)
 }
 
@@ -208,6 +219,19 @@ pub(super) fn persistent_database(
         db.run_script(CREATE_SCHEMA, BTreeMap::new(), ScriptMutability::Mutable)?;
     }
     let relations = db.run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?;
+    let migrate_enrichment_ownership = initialize
+        && !relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("enrichment_output"))
+        && relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("analysis_revision_repository_enrichment"))
+        && relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("analysis_revision"));
     if initialize
         && !relations
             .rows
@@ -310,6 +334,24 @@ pub(super) fn persistent_database(
             "analysis_revision_enrichment_observation_owner",
             CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA,
         ),
+        ("enrichment_job", CREATE_ENRICHMENT_JOB_SCHEMA),
+        ("enrichment_output", CREATE_ENRICHMENT_OUTPUT_SCHEMA),
+        (
+            "enrichment_entity_contribution",
+            CREATE_ENRICHMENT_ENTITY_CONTRIBUTION_SCHEMA,
+        ),
+        (
+            "enrichment_observation_contribution",
+            CREATE_ENRICHMENT_OBSERVATION_CONTRIBUTION_SCHEMA,
+        ),
+        (
+            "enrichment_override_contribution",
+            CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_SCHEMA,
+        ),
+        (
+            "enrichment_diagnostic_contribution",
+            CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA,
+        ),
         ("repository_revision", CREATE_REPOSITORY_REVISION_SCHEMA),
         (
             "repository_revision_diagnostic",
@@ -324,6 +366,9 @@ pub(super) fn persistent_database(
         {
             db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)?;
         }
+    }
+    if migrate_enrichment_ownership {
+        migrate_enrichment_ownership_to_contributions(&db)?;
     }
     if initialize
         && !relations
@@ -442,6 +487,69 @@ pub(super) fn persistent_database(
         }
     }
     Ok(db)
+}
+
+fn migrate_enrichment_ownership_to_contributions(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    for script in [
+        "?[view, owner, repository, analyzer, version, input_fingerprint] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_repository_enrichment{\
+                 view, revision, owner, repository, analyzer, version, input_fingerprint\
+             } \
+         :put enrichment_output {\
+             view, owner => repository, analyzer, version, input_fingerprint\
+         }",
+        "?[view, owner, repository, analyzer, version, input_fingerprint, status, attempt, retry_at_ms, error] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_repository_enrichment{\
+                 view, revision, owner, repository, analyzer, version, input_fingerprint\
+             }, status = 'complete', attempt = 0, retry_at_ms = 0, error = '' \
+         :put enrichment_job {\
+             view, owner => repository, analyzer, version, input_fingerprint, status, attempt, \
+             retry_at_ms, error\
+         }",
+        "?[view, owner, id, kind, metadata] := *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_entity_owner{\
+                 view, revision, id, analyzer: owner\
+             }, *analysis_revision_entity{view, revision, id, kind, metadata} \
+         :put enrichment_entity_contribution {view, owner, id => kind, metadata}",
+        "?[view, owner, from, relation, to, evidence, confidence, provenance] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_observation_owner{\
+                 view, revision, from, relation, to, evidence, analyzer: owner\
+             }, *analysis_revision_observation{\
+                 view, revision, from, relation, to, evidence, confidence, provenance\
+             } \
+         :put enrichment_observation_contribution {\
+             view, owner, from, relation, to, evidence => confidence, provenance\
+         }",
+        "?[view, owner, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_override_owner{\
+                 view, revision, from, relation, unresolved_to, analyzer: owner\
+             }, *analysis_revision_dependency_override{\
+                 view, revision, from, relation, unresolved_to, resolved_to, evidence\
+             }, *analysis_revision_dependency_override_metadata{\
+                 view, revision, from, relation, unresolved_to, confidence, provenance\
+             } \
+         :put enrichment_override_contribution {\
+             view, owner, from, relation, unresolved_to => resolved_to, evidence, confidence, \
+             provenance\
+         }",
+        "?[view, owner, repository, code, severity, path, line, detail] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_diagnostic_owner{\
+                 view, revision, repository, code, severity, path, line, analyzer: owner\
+             }, *analysis_revision_diagnostic{\
+                 view, revision, repository, code, severity, path, line, detail\
+             } \
+         :put enrichment_diagnostic_contribution {\
+             view, owner, repository, code, severity, path, line => detail\
+         }",
+    ] {
+        db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -10,10 +10,11 @@ use super::{
     },
     storage::{
         claim_garbage_collection, delete_repository_revision, enrichment_matches,
-        enrichments_current, ensure_revision_inputs, garbage_collection_candidates,
-        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
-        publish_observations, publish_repository, repository_contexts,
-        revision_enrichment_input_fingerprint, store_verification_fingerprint,
+        enrichment_retry_failed, enrichment_retry_started, enrichments_current,
+        ensure_revision_inputs, garbage_collection_candidates, garbage_collection_pending,
+        garbage_collection_queued, prepare_enrichment, publish_enrichment, publish_observations,
+        publish_repository, repository_contexts, revision_enrichment_input_fingerprint,
+        store_verification_fingerprint,
         sweep_garbage_collection, verification_matches, view_matches,
     },
 };
@@ -30,6 +31,7 @@ use std::{
     collections::BTreeSet,
     error::Error,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 fn relevant_entities(
@@ -67,6 +69,14 @@ pub struct EnrichmentOwner<'a> {
     pub analyzer: &'a str,
     pub version: &'a str,
     pub expected_version: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnrichmentSchedule {
+    Current,
+    Queue,
+    RetryAfter(Duration),
+    Exhausted,
 }
 
 impl SemanticStore {
@@ -222,6 +232,62 @@ impl SemanticStore {
             input_fingerprint,
             owner,
             payload,
+        )
+    }
+
+    pub fn prepare_enrichment(
+        &self,
+        view: &str,
+        repository: &str,
+        analyzer: &str,
+        version: &str,
+        input_fingerprint: &str,
+    ) -> Result<EnrichmentSchedule, Box<dyn Error>> {
+        prepare_enrichment(
+            &self.db,
+            view,
+            repository,
+            analyzer,
+            version,
+            input_fingerprint,
+        )
+    }
+
+    pub fn enrichment_retry_started(
+        &self,
+        view: &str,
+        repository: &str,
+        analyzer: &str,
+        version: &str,
+        input_fingerprint: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        enrichment_retry_started(
+            &self.db,
+            view,
+            repository,
+            analyzer,
+            version,
+            input_fingerprint,
+        )
+    }
+
+    pub fn enrichment_retry_failed(
+        &self,
+        view: &str,
+        repository: &str,
+        analyzer: &str,
+        version: &str,
+        input_fingerprint: &str,
+        error: &str,
+    ) -> Result<Option<Duration>, Box<dyn Error>> {
+        enrichment_retry_failed(
+            &self.db,
+            view,
+            repository,
+            analyzer,
+            version,
+            input_fingerprint,
+            error,
         )
     }
 
