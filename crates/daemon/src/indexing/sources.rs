@@ -111,8 +111,20 @@ pub(super) fn is_index_input(path: &Path) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
-            matches!(name, "buf.yaml" | "buf.lock" | "package.json")
-                || name.ends_with(".csproj")
+            matches!(
+                name,
+                "buf.yaml"
+                    | "buf.lock"
+                    | "package.json"
+                    | "package-lock.json"
+                    | "npm-shrinkwrap.json"
+                    | "yarn.lock"
+                    | "pnpm-lock.yaml"
+                    | "pnpm-workspace.yaml"
+                    | "bun.lock"
+                    | "bun.lockb"
+                    | "deno.lock"
+            ) || name.ends_with(".csproj")
                 || name.ends_with(".asmdef")
                 || name.ends_with(".prefab")
                 || name.ends_with(".cs.meta")
