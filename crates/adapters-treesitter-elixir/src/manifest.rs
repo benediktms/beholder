@@ -47,12 +47,11 @@ pub(crate) fn mix_repository_dependencies(
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     for repository in &snapshot.repositories {
-        for input in repository.inputs.iter().filter(|input| {
-            input
-                .path
-                .file_name()
-                .is_some_and(|name| name == "mix.exs")
-        }) {
+        for input in repository
+            .inputs
+            .iter()
+            .filter(|input| input.path.file_name().is_some_and(|name| name == "mix.exs"))
+        {
             let Ok(source) = std::str::from_utf8(&input.content) else {
                 continue;
             };
@@ -150,7 +149,10 @@ fn collect_keyword_paths(node: Node<'_>, source: &[u8], keyword: &str, paths: &m
 }
 
 fn literal_string(value: &str) -> Option<&str> {
-    let quote = value.chars().next().filter(|quote| matches!(quote, '\'' | '"'))?;
+    let quote = value
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))?;
     let value = value.strip_prefix(quote)?.strip_suffix(quote)?;
     (!value.contains("#{")).then_some(value)
 }
@@ -251,8 +253,16 @@ mod tests {
                     "/workspace/root",
                     "def project, do: [apps_path: \"../services\"]\ndefp deps, do: [{:shared, path: \"../shared\"}]\n",
                 ),
-                repository("example/service", "/workspace/services/api", "def project, do: []\n"),
-                repository("example/shared", "/workspace/shared", "def project, do: []\n"),
+                repository(
+                    "example/service",
+                    "/workspace/services/api",
+                    "def project, do: []\n",
+                ),
+                repository(
+                    "example/shared",
+                    "/workspace/shared",
+                    "def project, do: []\n",
+                ),
             ],
         };
 

@@ -406,7 +406,10 @@ mod tests {
             worker.analysis_input_kind(Path::new("config/runtime.exs")),
             None
         );
-        assert_eq!(worker.analysis_input_kind(Path::new("config/prod.exs")), None);
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("config/prod.exs")),
+            None
+        );
         assert_eq!(worker.identity_inputs().len(), 1);
         assert_eq!(
             worker.analysis_input_kind(Path::new("target/generated.rs")),
