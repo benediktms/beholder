@@ -195,7 +195,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         }
         builder.add_enricher(worker.build().map_err(|error| error.to_string())?)
     } else {
-        tracing::warn!("Elixir analyzer worker not found; compiler enrichment disabled");
+        tracing::info!("Elixir analyzer worker not found; compiler enrichment disabled");
         builder
     };
     builder
