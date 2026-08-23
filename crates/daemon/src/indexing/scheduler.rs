@@ -3922,6 +3922,10 @@ mod tests {
         let workspace = registry
             .register("main".into(), vec![repository.clone()], Vec::new())
             .unwrap();
+        let repository = workspace.repositories[0].base.clone();
+        let source = repository.join("src/lib.rs");
+        let configuration = repository.join("Cargo.toml");
+        let ignored = repository.join("target/generated.rs");
         let identity = workspace.repositories[0].repository.identity.clone();
         let registry = Mutex::new(registry);
         let scheduler = IndexScheduler::new(state.join("cache"));
