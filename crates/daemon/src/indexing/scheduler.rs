@@ -1409,7 +1409,7 @@ fn index_workspace_through_port(
                     .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
             )?
             .with_repository_enrichment_inputs(
-                scheduler.indexer.enrichment_input_identities(snapshot),
+                scheduler.indexer.enrichment_input_identities(&snapshot),
             )?;
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         scheduler.queue_enrichments(store, &snapshot, &view)?;
@@ -1477,7 +1477,7 @@ fn index_workspace_through_port(
                 .collect(),
         )?
         .with_repository_enrichment_inputs(
-            scheduler.indexer.enrichment_input_identities(snapshot),
+            scheduler.indexer.enrichment_input_identities(&snapshot),
         )?;
     let observation_count = repository_facts
         .iter()
