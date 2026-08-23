@@ -6,6 +6,8 @@ use beholder_adapters_treesitter_elixir::ElixirAnalyzer;
 use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
+#[cfg(not(test))]
+use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
 use beholder_observability::{ExportMode, LogOutput};
 use beholder_protocol::v1::daemon_server::DaemonServer;
@@ -84,20 +86,54 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
     let builder = IndexerBuilder::new(cache_dir.clone(), workers)
         .add_analyzer(RustAnalyzer::new(cache_dir.clone()));
     #[cfg(not(test))]
-    let builder = builder.add_enricher(
-        WorkerAnalyzerBuilder::new(
+    let builder = builder.add_enricher({
+        let mut worker = WorkerAnalyzerBuilder::new(
             rust_worker_executable()?,
             cache_dir
                 .parent()
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity("rust", "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-6")
+        .identity("rust", "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-7")
         .accept_extension("rs")
-        .accept_file_name("Cargo.toml")
-        .build()
-        .map_err(|error| error.to_string())?,
-    );
+        .accept_file_name_as("Cargo.toml", AnalysisInputKind::Dependency)
+        .accept_file_name_as("Cargo.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("rust-toolchain", AnalysisInputKind::Toolchain)
+        .accept_file_name_as("rust-toolchain.toml", AnalysisInputKind::Toolchain)
+        .accept_path_suffix_as(".cargo/config", AnalysisInputKind::Configuration)
+        .accept_path_suffix_as(".cargo/config.toml", AnalysisInputKind::Configuration)
+        .identity_input(
+            "$toolchain/rustc",
+            command_identity("rustc", &["--version", "--verbose"]),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$toolchain/cargo",
+            command_identity("cargo", &["--version", "--verbose"]),
+            AnalysisInputKind::Toolchain,
+        );
+        for variable in [
+            "CARGO_BUILD_TARGET",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "BEHOLDER_RUST_ALL_FEATURES",
+            "BEHOLDER_RUST_FEATURES",
+            "BEHOLDER_RUST_NO_DEFAULT_FEATURES",
+            "RUSTFLAGS",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            worker = worker.identity_input(
+                format!("$environment/{variable}"),
+                std::env::var_os(variable)
+                    .map(|value| value.as_encoded_bytes().to_vec())
+                    .unwrap_or_default(),
+                AnalysisInputKind::Environment,
+            );
+        }
+        worker.build().map_err(|error| error.to_string())?
+    });
     builder
         .add_analyzer(ElixirAnalyzer::new(cache_dir.clone()))
         .add_analyzer(CsharpAnalyzer::new(cache_dir.clone()))
@@ -106,6 +142,17 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .add_analyzer(ProtobufAnalyzer::new(cache_dir))
         .build()
         .map_err(|error| error.to_string().into())
+}
+
+#[cfg(not(test))]
+fn command_identity(program: &str, arguments: &[&str]) -> Vec<u8> {
+    std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
+        .unwrap_or_else(|| b"unavailable".to_vec())
 }
 
 #[cfg(not(test))]

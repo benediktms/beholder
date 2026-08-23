@@ -1,8 +1,9 @@
 pub const FRONTEND_VERSION: &str = "7";
-pub const RESOLVER_VERSION: &str = "6";
+pub const RESOLVER_VERSION: &str = "7";
 
 mod analysis;
 mod analyzer;
+mod manifest;
 mod model;
 mod plugin;
 mod resolution;
@@ -14,6 +15,7 @@ pub use analysis::{
     observations_from_analysis, source_entity_id,
 };
 pub use analyzer::RustAnalyzer;
+pub use manifest::{rust_analysis_input_kind, validate_immutable_rust_inputs};
 pub use model::{RustAnalysis, RustCall, RustFunction};
 pub use resolution::resolve_repository_calls;
 pub use sources::source_files;

@@ -1,19 +1,23 @@
 //! Builder facade for native analyzer workers.
 
 use beholder_indexing::{
-    AnalyzerError, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot, WorkspaceEnricher,
+    AnalysisInput, AnalysisInputKind, AnalyzerError, AnalyzerMetadata, EnrichmentFuture,
+    EnrichmentSnapshot, WorkspaceEnricher,
 };
 use beholder_protocol::{
     analyze_requests, contribution_from_events,
     worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
 };
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::process::Command;
@@ -28,8 +32,10 @@ pub struct WorkerAnalyzerBuilder {
     metadata: AnalyzerMetadata,
     executable: PathBuf,
     socket_dir: PathBuf,
-    extensions: BTreeSet<OsString>,
-    file_names: BTreeSet<OsString>,
+    extensions: BTreeMap<OsString, AnalysisInputKind>,
+    file_names: BTreeMap<OsString, AnalysisInputKind>,
+    path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
+    identity_inputs: Vec<AnalysisInput>,
 }
 
 impl WorkerAnalyzerBuilder {
@@ -41,8 +47,10 @@ impl WorkerAnalyzerBuilder {
             },
             executable: executable.into(),
             socket_dir: socket_dir.into(),
-            extensions: BTreeSet::new(),
-            file_names: BTreeSet::new(),
+            extensions: BTreeMap::new(),
+            file_names: BTreeMap::new(),
+            path_suffixes: BTreeMap::new(),
+            identity_inputs: Vec::new(),
         }
     }
 
@@ -55,12 +63,55 @@ impl WorkerAnalyzerBuilder {
     }
 
     pub fn accept_extension(mut self, extension: impl Into<OsString>) -> Self {
-        self.extensions.insert(extension.into());
+        self.extensions
+            .insert(extension.into(), AnalysisInputKind::Source);
+        self
+    }
+
+    pub fn accept_extension_as(
+        mut self,
+        extension: impl Into<OsString>,
+        kind: AnalysisInputKind,
+    ) -> Self {
+        self.extensions.insert(extension.into(), kind);
         self
     }
 
     pub fn accept_file_name(mut self, file_name: impl Into<OsString>) -> Self {
-        self.file_names.insert(file_name.into());
+        self.file_names
+            .insert(file_name.into(), AnalysisInputKind::Source);
+        self
+    }
+
+    pub fn accept_file_name_as(
+        mut self,
+        file_name: impl Into<OsString>,
+        kind: AnalysisInputKind,
+    ) -> Self {
+        self.file_names.insert(file_name.into(), kind);
+        self
+    }
+
+    pub fn accept_path_suffix_as(
+        mut self,
+        suffix: impl Into<PathBuf>,
+        kind: AnalysisInputKind,
+    ) -> Self {
+        self.path_suffixes.insert(suffix.into(), kind);
+        self
+    }
+
+    pub fn identity_input(
+        mut self,
+        path: impl Into<PathBuf>,
+        content: impl Into<Vec<u8>>,
+        kind: AnalysisInputKind,
+    ) -> Self {
+        self.identity_inputs.push(AnalysisInput {
+            path: path.into(),
+            content: Arc::from(content.into()),
+            kind,
+        });
         self
     }
 
@@ -71,7 +122,8 @@ impl WorkerAnalyzerBuilder {
         if self.metadata.version.is_empty() {
             return Err("worker analyzer version must not be empty".into());
         }
-        if self.extensions.is_empty() && self.file_names.is_empty() {
+        if self.extensions.is_empty() && self.file_names.is_empty() && self.path_suffixes.is_empty()
+        {
             return Err("worker analyzer must accept at least one input".into());
         }
         Ok(WorkerAnalyzer {
@@ -80,6 +132,8 @@ impl WorkerAnalyzerBuilder {
             socket_dir: self.socket_dir,
             extensions: self.extensions,
             file_names: self.file_names,
+            path_suffixes: self.path_suffixes,
+            identity_inputs: self.identity_inputs,
         })
     }
 }
@@ -88,8 +142,10 @@ pub struct WorkerAnalyzer {
     metadata: AnalyzerMetadata,
     executable: PathBuf,
     socket_dir: PathBuf,
-    extensions: BTreeSet<OsString>,
-    file_names: BTreeSet<OsString>,
+    extensions: BTreeMap<OsString, AnalysisInputKind>,
+    file_names: BTreeMap<OsString, AnalysisInputKind>,
+    path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
+    identity_inputs: Vec<AnalysisInput>,
 }
 
 impl WorkspaceEnricher for WorkerAnalyzer {
@@ -98,11 +154,25 @@ impl WorkspaceEnricher for WorkerAnalyzer {
     }
 
     fn accepts(&self, path: &Path) -> bool {
-        path.extension()
-            .is_some_and(|extension| self.extensions.contains(extension))
-            || path
-                .file_name()
-                .is_some_and(|file_name| self.file_names.contains(file_name))
+        self.analysis_input_kind(path).is_some()
+    }
+
+    fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        self.path_suffixes
+            .iter()
+            .find_map(|(suffix, kind)| path.ends_with(suffix).then_some(*kind))
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|file_name| self.file_names.get(file_name).copied())
+            })
+            .or_else(|| {
+                path.extension()
+                    .and_then(|extension| self.extensions.get(extension).copied())
+            })
+    }
+
+    fn identity_inputs(&self) -> Vec<AnalysisInput> {
+        self.identity_inputs.clone()
     }
 
     fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
@@ -234,5 +304,44 @@ struct SocketFile(PathBuf);
 impl Drop for SocketFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_inputs_preserve_semantic_roles_and_shared_identity() {
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("rust", "1")
+            .accept_extension("rs")
+            .accept_file_name_as("Cargo.lock", AnalysisInputKind::Dependency)
+            .accept_path_suffix_as(".cargo/config.toml", AnalysisInputKind::Configuration)
+            .identity_input(
+                "$toolchain/rustc",
+                b"rustc 1".to_vec(),
+                AnalysisInputKind::Toolchain,
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("src/lib.rs")),
+            Some(AnalysisInputKind::Source)
+        );
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("Cargo.lock")),
+            Some(AnalysisInputKind::Dependency)
+        );
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("nested/.cargo/config.toml")),
+            Some(AnalysisInputKind::Configuration)
+        );
+        assert_eq!(worker.identity_inputs().len(), 1);
+        assert_eq!(
+            worker.identity_inputs()[0].kind,
+            AnalysisInputKind::Toolchain
+        );
     }
 }
