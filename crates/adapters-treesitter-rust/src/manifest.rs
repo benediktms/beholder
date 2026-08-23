@@ -49,7 +49,7 @@ pub(crate) fn cargo_repository_dependencies(
             let Ok(text) = str::from_utf8(&input.content) else {
                 continue;
             };
-            let Ok(manifest) = text.parse::<toml::Value>() else {
+            let Ok(manifest) = toml::from_str::<toml::Value>(text) else {
                 continue;
             };
             let manifest_directory = absolute_lexical(
@@ -119,8 +119,7 @@ pub fn validate_immutable_rust_inputs(snapshot: &WorkspaceSnapshot) -> Result<()
             }
             let text = str::from_utf8(&input.content)
                 .map_err(|error| SourceAnalysisError::from_source(&input.path, Box::new(error)))?;
-            let document = text
-                .parse::<toml::Value>()
+            let document = toml::from_str::<toml::Value>(text)
                 .map_err(|error| SourceAnalysisError::from_source(&input.path, Box::new(error)))?;
             reject_absolute_local_paths(&document, &input.path)?;
         }
