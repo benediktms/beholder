@@ -11,8 +11,8 @@ use crate::{
 };
 use beholder_domain::{AnalysisDiagnostic, AnalysisDiagnosticSeverity, SourceAnalysisError};
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, AnalyzerPlan,
-    CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
+    AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
+    AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
     WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
@@ -114,17 +114,11 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
     }
 
     fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|extension| extension == "cs")
-            || path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.ends_with(".csproj")
-                        || name.ends_with(".asmdef")
-                        || name.ends_with(".prefab")
-                        || name.ends_with(".cs.meta")
-                        || name.ends_with(".prefab.meta")
-                })
+        crate::manifest::csharp_analysis_input_kind(path).is_some()
+    }
+
+    fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        crate::manifest::csharp_analysis_input_kind(path)
     }
 
     fn prepare(&self, snapshot: &WorkspaceSnapshot) -> AnalyzerPlan {
@@ -149,6 +143,13 @@ impl WorkspaceAnalyzer for CsharpAnalyzer {
                 )
             }),
         )
+    }
+
+    fn repository_dependencies(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<beholder_domain::RepositoryDependencyCandidate>, AnalyzerError> {
+        crate::manifest::csharp_repository_dependencies(snapshot)
     }
 
     fn analyze_prepared(
