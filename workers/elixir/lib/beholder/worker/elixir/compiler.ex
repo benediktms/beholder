@@ -36,8 +36,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
       try do
         case run_materialized(repository, contexts, cache_dir) do
           {:ok, result} ->
-            {:ok,
-             remap_result_paths(result, materialized_repositories, original_repositories)}
+            {:ok, remap_result_paths(result, materialized_repositories, original_repositories)}
 
           {:error, _reason} = error ->
             error
@@ -149,9 +148,8 @@ defmodule Beholder.Worker.Elixir.Compiler do
 
   defp materialize_repositories(repositories, common, root) do
     Enum.reduce_while(repositories, {:ok, [], MapSet.new(), MapSet.new()}, fn repository,
-                                                                             {:ok, result,
-                                                                              identities,
-                                                                              bases} ->
+                                                                              {:ok, result,
+                                                                               identities, bases} ->
       relative = repository.base |> Path.expand() |> Path.split() |> Enum.drop(length(common))
       base = Path.join([root | relative])
 
@@ -198,7 +196,9 @@ defmodule Beholder.Worker.Elixir.Compiler do
   end
 
   defp format_materialization_error(reason) when is_binary(reason), do: reason
-  defp format_materialization_error(reason), do: "failed to materialize snapshot: #{inspect(reason)}"
+
+  defp format_materialization_error(reason),
+    do: "failed to materialize snapshot: #{inspect(reason)}"
 
   defp remap_result_paths(result, materialized_repositories, original_repositories) do
     bases =
