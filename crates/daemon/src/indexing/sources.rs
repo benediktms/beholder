@@ -471,9 +471,19 @@ mod tests {
             .as_nanos();
         let repository = std::env::temp_dir().join(format!("beholder-analyzer-inputs-{unique}"));
         fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join(".cargo")).unwrap();
         fs::create_dir_all(repository.join("target")).unwrap();
         fs::create_dir_all(repository.join("infra/.terraform/modules/dependency")).unwrap();
         fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        fs::write(repository.join("Cargo.toml"), "[package]\nname = \"indexed\"\n").unwrap();
+        fs::write(repository.join("Cargo.lock"), "version = 4\n").unwrap();
+        fs::write(repository.join("rust-toolchain.toml"), "[toolchain]\nchannel = \"stable\"\n")
+            .unwrap();
+        fs::write(
+            repository.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"target\"\n",
+        )
+        .unwrap();
         fs::write(
             repository.join("src/schema.graphql"),
             "type Query { ok: Boolean! }",
@@ -499,7 +509,14 @@ mod tests {
                 .iter()
                 .map(|input| input.path.as_path())
                 .collect::<Vec<_>>(),
-            [Path::new("src/lib.rs"), Path::new("src/schema.graphql")]
+            [
+                Path::new(".cargo/config.toml"),
+                Path::new("Cargo.lock"),
+                Path::new("Cargo.toml"),
+                Path::new("rust-toolchain.toml"),
+                Path::new("src/lib.rs"),
+                Path::new("src/schema.graphql"),
+            ]
         );
         fs::remove_dir_all(repository).unwrap();
     }

@@ -171,20 +171,6 @@ impl IndexScheduler {
         .map_err(|error| error.to_string())?
     }
 
-    pub(super) fn enrichments_current(
-        &self,
-        store: &SemanticStore,
-        workspace: &str,
-    ) -> Result<bool, Box<dyn Error>> {
-        let catalog = self
-            .indexer
-            .enrichment_catalog()
-            .into_iter()
-            .map(|analyzer| (analyzer.id, analyzer.version))
-            .collect::<Vec<_>>();
-        store.enrichments_current(workspace, &catalog)
-    }
-
     pub(super) fn queue_enrichments(
         &self,
         store: &SemanticStore,

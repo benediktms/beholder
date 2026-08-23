@@ -18,6 +18,17 @@ pub struct RepositoryDependencyEvidence {
     pub detail: String,
 }
 
+/// Analyzer-owned evidence for a repository dependency discovered outside the
+/// indexed semantic graph, for example from a language manifest.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RepositoryDependencyCandidate {
+    pub from: String,
+    pub to: String,
+    pub analyzer: String,
+    pub kind: RepositoryDependencyKind,
+    pub evidence: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryDependency {
     pub from: String,
@@ -185,6 +196,22 @@ impl RepositoryDependencyGraph {
             kind,
             detail: evidence.into(),
         });
+        Ok(())
+    }
+
+    pub fn add_candidates(
+        &mut self,
+        candidates: impl IntoIterator<Item = RepositoryDependencyCandidate>,
+    ) -> Result<(), String> {
+        for candidate in candidates {
+            self.add_dependency(
+                candidate.from,
+                candidate.to,
+                candidate.analyzer,
+                candidate.kind,
+                candidate.evidence,
+            )?;
+        }
         Ok(())
     }
 

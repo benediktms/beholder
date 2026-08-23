@@ -1365,8 +1365,8 @@ fn index_workspace_through_port(
     let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let verification_fingerprint =
         workspace_verification_fingerprint(analysis_plan.analysis_identity(), &snapshot);
-    if store.verification_matches(&workspace.name, &verification_fingerprint)?
-        && scheduler.enrichments_current(store, &workspace.name)?
+    if scheduler.indexer.enrichment_catalog().is_empty()
+        && store.verification_matches(&workspace.name, &verification_fingerprint)?
     {
         tracing::info!(workspace = %workspace.name, "workspace inputs unchanged");
         return Ok((0, false));
@@ -1402,6 +1402,9 @@ fn index_workspace_through_port(
                     Ok((analyzer.id, contexts))
                 })
                 .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
+        )?
+        .with_repository_enrichment_inputs(
+            scheduler.indexer.enrichment_input_identities(snapshot),
         )?;
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         scheduler.queue_enrichments(store, &snapshot, &view)?;
@@ -1453,8 +1456,9 @@ fn index_workspace_through_port(
             repository.facts
         })
         .collect::<Vec<_>>();
-    let dependency_graph =
+    let mut dependency_graph =
         RepositoryDependencyGraph::from_baseline(&repository_facts, &analysis.overrides)?;
+    dependency_graph.add_candidates(analysis.repository_dependencies)?;
     view = view.with_repository_contexts(
         scheduler
             .indexer
@@ -1465,7 +1469,8 @@ fn index_workspace_through_port(
                 (analyzer.id, contexts)
             })
             .collect(),
-    )?;
+    )?
+    .with_repository_enrichment_inputs(scheduler.indexer.enrichment_input_identities(snapshot))?;
     let observation_count = repository_facts
         .iter()
         .map(|facts| facts.observations.len())

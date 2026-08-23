@@ -1,9 +1,10 @@
 use beholder_domain::{
     AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, Evidence, GrpcBindingCandidate,
-    Observation, RepositoryFacts, RepositoryState,
+    Observation, RepositoryDependencyCandidate, RepositoryFacts, RepositoryState,
 };
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     error::Error,
@@ -186,6 +187,7 @@ pub struct WorkspaceAnalysis {
     pub repositories: Vec<AnalyzedRepository>,
     pub overrides: Vec<DependencyOverride>,
     pub diagnostics: Vec<(String, AnalysisDiagnostic)>,
+    pub repository_dependencies: Vec<RepositoryDependencyCandidate>,
     pub cache: CacheStatistics,
 }
 
@@ -211,6 +213,16 @@ pub trait WorkspaceAnalyzer: Send + Sync {
             self.is_active(repository)
         })
     }
+    /// Discovers analyzer-owned repository dependencies from immutable inputs.
+    ///
+    /// Language adapters retain ownership of manifest parsing and return only
+    /// normalized scheduling evidence to the generic dependency graph.
+    fn repository_dependencies(
+        &self,
+        _snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<RepositoryDependencyCandidate>, AnalyzerError> {
+        Ok(Vec::new())
+    }
     fn analyze_prepared(
         &self,
         snapshot: &WorkspaceSnapshot,
@@ -234,6 +246,21 @@ pub trait WorkspaceEnricher: Send + Sync {
     /// Declares the semantic role of an accepted enrichment input.
     fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
         self.accepts(path).then_some(AnalysisInputKind::Source)
+    }
+    fn analysis_inputs(&self, repository: &RepositorySnapshot) -> Vec<AnalysisInput> {
+        repository
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                self.analysis_input_kind(&input.path)
+                    .map(|kind| AnalysisInput::from_repository(input, kind))
+            })
+            .collect()
+    }
+    /// Synthetic toolchain and environment inputs which affect every target
+    /// handled by this enricher.
+    fn identity_inputs(&self) -> Vec<AnalysisInput> {
+        Vec::new()
     }
     fn is_active(&self, repository: &RepositorySnapshot) -> bool {
         repository
@@ -934,6 +961,32 @@ impl Indexer {
             .collect()
     }
 
+    pub fn enrichment_input_identities(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.enrichers
+            .iter()
+            .map(|enricher| {
+                let metadata = enricher.metadata();
+                let shared = enricher.identity_inputs();
+                let repositories = snapshot
+                    .repositories
+                    .iter()
+                    .map(|repository| {
+                        let mut inputs = enricher.analysis_inputs(repository);
+                        inputs.extend(shared.iter().cloned());
+                        (
+                            repository.state.repository.identity.clone(),
+                            analysis_inputs_identity(inputs),
+                        )
+                    })
+                    .collect();
+                (metadata.id, repositories)
+            })
+            .collect()
+    }
+
     pub async fn enrich(
         &self,
         snapshot: EnrichmentSnapshot,
@@ -981,6 +1034,7 @@ impl Indexer {
         let mut overrides = Vec::new();
         let mut graphql_resolvers = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut repository_dependencies = Vec::new();
         let mut cache = CacheStatistics::default();
         for (index, analyzer) in self.analyzers.iter().enumerate() {
             let analyzer_plan = plan.analyzer(index);
@@ -991,6 +1045,7 @@ impl Indexer {
                 )
                 .into());
             }
+            repository_dependencies.extend(analyzer.repository_dependencies(snapshot)?);
             let contribution = self
                 .pool
                 .install(|| analyzer.analyze_prepared(snapshot, analyzer_plan))?;
@@ -1062,11 +1117,14 @@ impl Indexer {
             });
         }
         bind_graphql_resolvers(&mut repositories, graphql_resolvers);
+        repository_dependencies.sort();
+        repository_dependencies.dedup();
         Ok(WorkspaceAnalysis {
             analysis_identity: plan.analysis_identity.clone(),
             repositories,
             overrides,
             diagnostics,
+            repository_dependencies,
             cache,
         })
     }
@@ -1141,6 +1199,40 @@ impl Indexer {
             .join(encoded_identity)
             .join(format!("{fingerprint}.json"))
     }
+}
+
+fn analysis_inputs_identity(inputs: impl IntoIterator<Item = AnalysisInput>) -> String {
+    let mut inputs = inputs.into_iter().collect::<Vec<_>>();
+    inputs.sort_by(|left, right| {
+        (&left.kind, &left.path, left.content.as_ref()).cmp(&(
+            &right.kind,
+            &right.path,
+            right.content.as_ref(),
+        ))
+    });
+    inputs.dedup();
+    let mut digest = Sha256::new();
+    for input in inputs {
+        digest.update([analysis_input_kind_tag(input.kind)]);
+        framed_digest(&mut digest, input.path.as_os_str().as_encoded_bytes());
+        framed_digest(&mut digest, input.content.as_ref());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn analysis_input_kind_tag(kind: AnalysisInputKind) -> u8 {
+    match kind {
+        AnalysisInputKind::Source => 0,
+        AnalysisInputKind::Configuration => 1,
+        AnalysisInputKind::Dependency => 2,
+        AnalysisInputKind::Toolchain => 3,
+        AnalysisInputKind::Environment => 4,
+    }
+}
+
+fn framed_digest(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
 }
 
 fn repository_analysis_identity(metadata: &[AnalyzerMetadata]) -> String {
@@ -1267,6 +1359,10 @@ mod tests {
 
     struct ResolverAnalyzer {
         resolver: &'static str,
+    }
+
+    struct ScopedEnricher {
+        environment: &'static [u8],
     }
 
     struct FakeLanguage;
@@ -1530,6 +1626,42 @@ mod tests {
         }
     }
 
+    impl WorkspaceEnricher for ScopedEnricher {
+        fn metadata(&self) -> AnalyzerMetadata {
+            AnalyzerMetadata {
+                id: "scoped".into(),
+                version: "1".into(),
+            }
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("fake" | "config")
+            )
+        }
+
+        fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("fake") => Some(AnalysisInputKind::Source),
+                Some("config") => Some(AnalysisInputKind::Configuration),
+                _ => None,
+            }
+        }
+
+        fn identity_inputs(&self) -> Vec<AnalysisInput> {
+            vec![AnalysisInput {
+                path: "$environment/SCOPED".into(),
+                content: Arc::from(self.environment),
+                kind: AnalysisInputKind::Environment,
+            }]
+        }
+
+        fn enrich<'a>(&'a self, _: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
+            Box::pin(async { Err("not exercised".into()) })
+        }
+    }
+
     fn snapshot() -> WorkspaceSnapshot {
         WorkspaceSnapshot {
             name: "test".into(),
@@ -1573,6 +1705,92 @@ mod tests {
             CacheStatus::Memory
         );
         let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn enrichment_input_identity_uses_only_declared_semantic_inputs() {
+        let indexer = IndexerBuilder::new(cache_dir("scoped-enrichment-inputs"), 1)
+            .add_enricher(ScopedEnricher {
+                environment: b"one",
+            })
+            .build()
+            .unwrap();
+        let mut original = snapshot();
+        original.repositories[0].inputs.extend([
+            RepositoryInput {
+                path: "compiler.config".into(),
+                content: Arc::from(&b"configuration-one"[..]),
+                kind: InputKind::Source,
+            },
+            RepositoryInput {
+                path: "README.md".into(),
+                content: Arc::from(&b"unrelated-one"[..]),
+                kind: InputKind::Source,
+            },
+        ]);
+        let original_identity = indexer.enrichment_input_identities(&original);
+        let mut unrelated = original.clone();
+        unrelated.repositories[0].inputs[2].content = Arc::from(&b"unrelated-two"[..]);
+        unrelated.repositories[0].state.fingerprint = "repository-changed".into();
+        let mut configured = original.clone();
+        configured.repositories[0].inputs[1].content = Arc::from(&b"configuration-two"[..]);
+
+        assert_eq!(
+            original_identity,
+            indexer.enrichment_input_identities(&unrelated)
+        );
+        assert_ne!(
+            original_identity,
+            indexer.enrichment_input_identities(&configured)
+        );
+
+        let changed_environment = IndexerBuilder::new(cache_dir("changed-environment"), 1)
+            .add_enricher(ScopedEnricher {
+                environment: b"two",
+            })
+            .build()
+            .unwrap();
+        assert_ne!(
+            original_identity,
+            changed_environment.enrichment_input_identities(&original)
+        );
+    }
+
+    #[test]
+    fn rust_feature_target_and_compiler_flags_change_semantic_identity() {
+        let identity = |features: &'static [u8], target: &'static [u8], flags: &'static [u8]| {
+            analysis_inputs_identity([
+                AnalysisInput {
+                    path: "$environment/BEHOLDER_RUST_FEATURES".into(),
+                    content: Arc::from(features),
+                    kind: AnalysisInputKind::Environment,
+                },
+                AnalysisInput {
+                    path: "$environment/CARGO_BUILD_TARGET".into(),
+                    content: Arc::from(target),
+                    kind: AnalysisInputKind::Environment,
+                },
+                AnalysisInput {
+                    path: "$environment/RUSTFLAGS".into(),
+                    content: Arc::from(flags),
+                    kind: AnalysisInputKind::Environment,
+                },
+            ])
+        };
+        let baseline = identity(b"default", b"x86_64-unknown-linux-gnu", b"");
+
+        assert_ne!(
+            baseline,
+            identity(b"api", b"x86_64-unknown-linux-gnu", b"")
+        );
+        assert_ne!(
+            baseline,
+            identity(b"default", b"wasm32-unknown-unknown", b"")
+        );
+        assert_ne!(
+            baseline,
+            identity(b"default", b"x86_64-unknown-linux-gnu", b"--cfg loom")
+        );
     }
 
     #[test]

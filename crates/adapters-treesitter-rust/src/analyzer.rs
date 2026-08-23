@@ -11,9 +11,9 @@ use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, SourceAnalysisError, UnsafeTreeRecovery,
 };
 use beholder_indexing::{
-    ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
-    AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
-    WorkspaceAnalyzer, WorkspaceSnapshot,
+    ActivePlugins, AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError,
+    AnalyzerMetadata, AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution,
+    RepositoryFactsView, WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -118,7 +118,11 @@ impl WorkspaceAnalyzer for RustAnalyzer {
     }
 
     fn accepts(&self, path: &Path) -> bool {
-        is_rust_source(path) || path.file_name().is_some_and(|name| name == "Cargo.toml")
+        crate::manifest::rust_analysis_input_kind(path).is_some()
+    }
+
+    fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        crate::manifest::rust_analysis_input_kind(path)
     }
 
     fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
@@ -141,6 +145,13 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                     .prepare_repository(analyzer.clone(), repository, active, active)
             }),
         )
+    }
+
+    fn repository_dependencies(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<beholder_domain::RepositoryDependencyCandidate>, AnalyzerError> {
+        crate::manifest::cargo_repository_dependencies(snapshot)
     }
 
     fn analyze_prepared(

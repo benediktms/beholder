@@ -1,4 +1,6 @@
-use beholder_adapters_treesitter_rust::{RustAnalyzer, analyze, source_entity_id};
+use beholder_adapters_treesitter_rust::{
+    RustAnalyzer, analyze, source_entity_id, validate_immutable_rust_inputs,
+};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
     DependencyRelation, Provenance, SemanticRelation, UnsafeTreeRecovery,
@@ -16,22 +18,26 @@ use ra_ap_ide::{
 };
 use ra_ap_ide_db::ChangeWithProcMacros;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
-use ra_ap_project_model::CargoConfig;
+use ra_ap_project_model::{CargoConfig, CargoFeatures};
 use ra_ap_vfs::VfsPath;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-const ANALYZER_VERSION: &str = "7:6:rust.tonic:1:rust-analyzer-0.0.348:worker-6";
+const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-7";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+static MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct RustWorker {
@@ -160,6 +166,135 @@ async fn send_progress(
         .is_err()
 }
 
+struct MaterializedWorkspace {
+    root: PathBuf,
+    repositories: BTreeMap<String, PathBuf>,
+}
+
+impl MaterializedWorkspace {
+    fn new(snapshot: &WorkspaceSnapshot) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let bases = snapshot
+            .repositories
+            .iter()
+            .map(|repository| absolute_lexical(&repository.base))
+            .collect::<Vec<_>>();
+        let mut common = bases
+            .first()
+            .cloned()
+            .ok_or("Rust enrichment snapshot contains no repositories")?;
+        while !bases.iter().all(|base| base.starts_with(&common)) {
+            if !common.pop() {
+                return Err("Rust enrichment repositories have no common filesystem root".into());
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "beholder-rust-snapshot-{}-{}",
+            std::process::id(),
+            MATERIALIZATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root)?;
+        let result = (|| {
+            let mut repositories = BTreeMap::new();
+            for (repository, base) in snapshot.repositories.iter().zip(bases) {
+                let relative = base.strip_prefix(&common)?;
+                let materialized_base = root.join(relative);
+                if repositories
+                    .values()
+                    .any(|existing| existing == &materialized_base)
+                {
+                    return Err(
+                        "Rust enrichment snapshot maps repositories to the same directory".into(),
+                    );
+                }
+                if repositories
+                    .insert(
+                        repository.state.repository.identity.clone(),
+                        materialized_base.clone(),
+                    )
+                    .is_some()
+                {
+                    return Err("Rust enrichment snapshot contains duplicate repositories".into());
+                }
+                for input in &repository.inputs {
+                    if input.path.is_absolute()
+                        || input.path.components().any(|component| {
+                            matches!(component, std::path::Component::ParentDir)
+                        })
+                    {
+                        return Err(format!(
+                            "Rust enrichment input escapes its repository: {}",
+                            input.path.display()
+                        )
+                        .into());
+                    }
+                    let destination = materialized_base.join(&input.path);
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(destination, input.content.as_ref())?;
+                }
+            }
+            Ok::<_, Box<dyn Error + Send + Sync>>(repositories)
+        })();
+        match result {
+            Ok(repositories) => Ok(Self { root, repositories }),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                Err(error)
+            }
+        }
+    }
+
+    fn repository(&self, identity: &str) -> Option<&Path> {
+        self.repositories.get(identity).map(PathBuf::as_path)
+    }
+
+    fn verify(&self, snapshot: &WorkspaceSnapshot) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for repository in &snapshot.repositories {
+            let base = self
+                .repository(&repository.state.repository.identity)
+                .ok_or("materialized Rust repository is missing")?;
+            for input in &repository.inputs {
+                if fs::read(base.join(&input.path))?.as_slice() != input.content.as_ref() {
+                    return Err(format!(
+                        "{} changed during immutable Rust analysis",
+                        input.path.display()
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MaterializedWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn absolute_lexical(path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 pub async fn serve(socket: &Path, cache_dir: PathBuf) -> Result<(), Box<dyn Error + Send + Sync>> {
     match fs::remove_file(socket) {
         Ok(()) => {}
@@ -207,21 +342,42 @@ fn enrich_semantics(
     else {
         return;
     };
-    let cargo_roots = cargo_roots(repository);
+    let materialized = match MaterializedWorkspace::new(snapshot) {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            contribution.diagnostics.push((
+                target_repository.into(),
+                AnalysisDiagnostic {
+                    code: "rust.semantic_resolution_unavailable".into(),
+                    severity: AnalysisDiagnosticSeverity::KnownLimitation,
+                    path: PathBuf::from("Cargo.toml"),
+                    line: None,
+                    detail: Some(error.to_string()),
+                },
+            ));
+            return;
+        }
+    };
+    let Some(materialized_target) = materialized.repository(target_repository) else {
+        return;
+    };
+    let cargo_roots = cargo_roots(repository, materialized_target);
     if cargo_roots.is_empty() {
         return;
     }
     let mut enriched = contribution.clone();
     let result = (|| {
-        for repository in &snapshot.repositories {
-            manifests_match_snapshot(repository)?;
-        }
+        validate_immutable_rust_inputs(snapshot)?;
         for cargo_root in cargo_roots {
-            enrich_repository(snapshot, repository, &cargo_root, &mut enriched)?;
+            enrich_repository(
+                snapshot,
+                &materialized,
+                repository,
+                &cargo_root,
+                &mut enriched,
+            )?;
         }
-        for repository in &snapshot.repositories {
-            manifests_match_snapshot(repository)?;
-        }
+        materialized.verify(snapshot)?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })();
     if let Err(error) = result {
@@ -240,7 +396,10 @@ fn enrich_semantics(
     }
 }
 
-fn cargo_roots(repository: &beholder_indexing::RepositorySnapshot) -> Vec<PathBuf> {
+fn cargo_roots(
+    repository: &beholder_indexing::RepositorySnapshot,
+    materialized_base: &Path,
+) -> Vec<PathBuf> {
     let manifest_dirs = repository
         .inputs
         .iter()
@@ -260,26 +419,8 @@ fn cargo_roots(repository: &beholder_indexing::RepositorySnapshot) -> Vec<PathBu
                 .skip(1)
                 .any(|ancestor| manifest_dirs.contains(ancestor))
         })
-        .map(|directory| repository.base.join(directory))
+        .map(|directory| materialized_base.join(directory))
         .collect()
-}
-
-fn manifests_match_snapshot(
-    repository: &beholder_indexing::RepositorySnapshot,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    for input in repository.inputs.iter().filter(|input| {
-        input
-            .path
-            .file_name()
-            .is_some_and(|name| name == "Cargo.toml")
-    }) {
-        if fs::read(repository.base.join(&input.path))?.as_slice() != input.content.as_ref() {
-            return Err(
-                format!("{} changed during compiler analysis", input.path.display()).into(),
-            );
-        }
-    }
-    Ok(())
 }
 
 fn retain_semantic_enrichment(contribution: &mut AnalyzerContribution, target_repository: &str) {
@@ -310,15 +451,30 @@ fn retain_semantic_enrichment(contribution: &mut AnalyzerContribution, target_re
 
 fn enrich_repository(
     snapshot: &WorkspaceSnapshot,
+    materialized: &MaterializedWorkspace,
     repository: &beholder_indexing::RepositorySnapshot,
     cargo_root: &Path,
     contribution: &mut AnalyzerContribution,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let cargo = CargoConfig {
+    let mut cargo = CargoConfig {
+        features: cargo_features(
+            std::env::var("BEHOLDER_RUST_FEATURES").ok().as_deref(),
+            environment_enabled("BEHOLDER_RUST_ALL_FEATURES"),
+            environment_enabled("BEHOLDER_RUST_NO_DEFAULT_FEATURES"),
+        ),
+        target: std::env::var("CARGO_BUILD_TARGET")
+            .ok()
+            .filter(|target| !target.trim().is_empty()),
         set_test: true,
         no_deps: snapshot.repositories.len() == 1,
         ..CargoConfig::default()
     };
+    let cargo_home = materialized.root.join(".cargo-home");
+    fs::create_dir_all(&cargo_home)?;
+    cargo.extra_env.insert(
+        "CARGO_HOME".into(),
+        Some(cargo_home.to_string_lossy().into_owned()),
+    );
     let load = LoadCargoConfig {
         load_out_dirs_from_check: false,
         with_proc_macro_server: ProcMacroServerChoice::None,
@@ -330,6 +486,11 @@ fn enrich_repository(
     let mut change = ChangeWithProcMacros::default();
     let mut snapshot_files = Vec::new();
     for snapshot_repository in &snapshot.repositories {
+        let Some(materialized_base) = materialized.repository(
+            &snapshot_repository.state.repository.identity,
+        ) else {
+            continue;
+        };
         for input in snapshot_repository.inputs.iter().filter(|input| {
             input
                 .path
@@ -337,7 +498,7 @@ fn enrich_repository(
                 .is_some_and(|extension| extension == "rs")
         }) {
             let source = std::str::from_utf8(&input.content)?.to_owned();
-            let absolute = snapshot_repository.base.join(&input.path);
+            let absolute = materialized_base.join(&input.path);
             let path = VfsPath::new_real_path(absolute.to_string_lossy().into_owned());
             let Some((file_id, _)) = vfs.file_id(&path) else {
                 continue;
@@ -549,6 +710,32 @@ fn enrich_repository(
     Ok(())
 }
 
+fn cargo_features(
+    selected: Option<&str>,
+    all_features: bool,
+    no_default_features: bool,
+) -> CargoFeatures {
+    if all_features {
+        return CargoFeatures::All;
+    }
+    CargoFeatures::Selected {
+        features: selected
+            .into_iter()
+            .flat_map(|features| features.split(','))
+            .map(str::trim)
+            .filter(|feature| !feature.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        no_default_features,
+    }
+}
+
+fn environment_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    })
+}
+
 struct CallSite {
     file_id: FileId,
     from: String,
@@ -605,11 +792,14 @@ mod tests {
         ));
         fs::create_dir_all(base.join("src")).unwrap();
         fs::create_dir_all(base.join("dependency/src")).unwrap();
+        fs::create_dir_all(base.join(".cargo")).unwrap();
         let manifest = "[package]\nname = \"worker-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
              [dependencies]\ncontext = { path = \"dependency\" }\n";
         let dependency_manifest =
             "[package]\nname = \"context\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        let lockfile = "version = 4\n\n[[package]]\nname = \"context\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"worker-test\"\nversion = \"0.1.0\"\ndependencies = [\n \"context\",\n]\n";
         let dependency_source = "pub fn external() {}\n";
+        let cargo_config = "[build]\ntarget-dir = \"target\"\n";
         let source = r#"
 mod broken;
 mod inner;
@@ -636,7 +826,9 @@ fn caller() {
 "#;
         let inner = "pub fn renamed() {}\n";
         let broken = "fn broken( {\n";
-        fs::write(base.join("Cargo.toml"), manifest).unwrap();
+        fs::write(base.join("Cargo.toml"), "not the snapshot manifest").unwrap();
+        fs::write(base.join("Cargo.lock"), "not the snapshot lockfile").unwrap();
+        fs::write(base.join(".cargo/config.toml"), "not snapshot configuration").unwrap();
         fs::write(
             base.join("src/lib.rs"),
             "mod inner; pub fn stale_disk_source() {}",
@@ -668,6 +860,16 @@ fn caller() {
                             RepositoryInput {
                                 path: "Cargo.toml".into(),
                                 content: Arc::from(manifest.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "Cargo.lock".into(),
+                                content: Arc::from(lockfile.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: ".cargo/config.toml".into(),
+                                content: Arc::from(cargo_config.as_bytes()),
                                 kind: InputKind::Source,
                             },
                             RepositoryInput {
@@ -857,11 +1059,23 @@ fn caller() {
         };
 
         assert_eq!(
-            cargo_roots(&repository),
+            cargo_roots(&repository, Path::new("repo")),
             [
                 PathBuf::from("repo/services/one"),
                 PathBuf::from("repo/tools/two")
             ]
+        );
+    }
+
+    #[test]
+    fn selects_explicit_cargo_features() {
+        assert_eq!(cargo_features(None, true, false), CargoFeatures::All);
+        assert_eq!(
+            cargo_features(Some("api, serde ,"), false, true),
+            CargoFeatures::Selected {
+                features: vec!["api".into(), "serde".into()],
+                no_default_features: true,
+            }
         );
     }
 }

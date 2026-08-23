@@ -113,6 +113,7 @@ pub struct WorkspaceView {
     pub repository_states: Vec<RepositoryState>,
     repository_analysis_identities: BTreeMap<String, String>,
     repository_contexts: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    repository_enrichment_input_identities: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl WorkspaceView {
@@ -180,6 +181,7 @@ impl WorkspaceView {
             repository_states,
             repository_analysis_identities,
             repository_contexts: BTreeMap::new(),
+            repository_enrichment_input_identities: BTreeMap::new(),
         })
     }
 
@@ -227,6 +229,38 @@ impl WorkspaceView {
         Ok(self)
     }
 
+    pub fn with_repository_enrichment_inputs(
+        mut self,
+        identities: BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Result<Self, String> {
+        if identities.keys().ne(self.repository_contexts.keys()) {
+            return Err(
+                "enrichment input analyzers do not match configured context analyzers".into(),
+            );
+        }
+        let repositories = self
+            .repository_states
+            .iter()
+            .map(|state| state.repository.identity.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (analyzer, inputs) in &identities {
+            if analyzer.trim().is_empty() {
+                return Err("enrichment input analyzer must not be empty".into());
+            }
+            if inputs.len() != repositories.len()
+                || inputs.iter().any(|(repository, identity)| {
+                    !repositories.contains(repository.as_str()) || identity.is_empty()
+                })
+            {
+                return Err(format!(
+                    "{analyzer} enrichment input identities do not match view repositories"
+                ));
+            }
+        }
+        self.repository_enrichment_input_identities = identities;
+        Ok(self)
+    }
+
     pub fn fingerprint(&self) -> String {
         std::iter::once(format!(
             "{}:{}",
@@ -259,6 +293,24 @@ impl WorkspaceView {
         state: &RepositoryState,
         analyzer: &str,
     ) -> String {
+        if let Some(inputs) = self.repository_enrichment_input_identities.get(analyzer) {
+            return std::iter::once(state.repository.identity.as_str())
+                .chain(
+                    self.repository_contexts(&state.repository.identity, analyzer)
+                        .iter()
+                        .map(String::as_str),
+                )
+                .try_fold(String::new(), |mut fingerprint, repository| {
+                    let identity = inputs.get(repository)?;
+                    fingerprint.push_str(&format!(
+                        "{}:{repository}{}:{identity}",
+                        repository.len(),
+                        identity.len()
+                    ));
+                    Some(fingerprint)
+                })
+                .expect("workspace view input repositories must have enrichment identities");
+        }
         let mut repositories = std::iter::once(state.repository.identity.as_str()).chain(
             self.repository_contexts(&state.repository.identity, analyzer)
                 .iter()
@@ -468,6 +520,63 @@ mod tests {
                 .repository_enrichment_input_fingerprint(&original.repository_states[0], "rust",),
             changed_context.repository_enrichment_input_fingerprint(
                 &changed_context.repository_states[0],
+                "rust",
+            )
+        );
+    }
+
+    #[test]
+    fn enrichment_identity_uses_analyzer_inputs_for_only_selected_contexts() {
+        let state = |identity: &str| RepositoryState {
+            repository: LogicalRepository {
+                identity: identity.into(),
+            },
+            head: None,
+            fingerprint: format!("repository-{identity}"),
+        };
+        let view = |context: &str, unrelated: &str| {
+            WorkspaceView::new(
+                "main",
+                "analysis",
+                vec![state("example/a"), state("example/b"), state("example/c")],
+            )
+            .unwrap()
+            .with_repository_contexts(BTreeMap::from([(
+                "rust".into(),
+                BTreeMap::from([("example/a".into(), vec!["example/b".into()])]),
+            )]))
+            .unwrap()
+            .with_repository_enrichment_inputs(BTreeMap::from([(
+                "rust".into(),
+                BTreeMap::from([
+                    ("example/a".into(), "target".into()),
+                    ("example/b".into(), context.into()),
+                    ("example/c".into(), unrelated.into()),
+                ]),
+            )]))
+            .unwrap()
+        };
+        let original = view("context-one", "unrelated-one");
+        let changed_context = view("context-two", "unrelated-one");
+        let changed_unrelated = view("context-one", "unrelated-two");
+
+        assert_ne!(
+            original.repository_enrichment_input_fingerprint(
+                &original.repository_states[0],
+                "rust",
+            ),
+            changed_context.repository_enrichment_input_fingerprint(
+                &changed_context.repository_states[0],
+                "rust",
+            )
+        );
+        assert_eq!(
+            original.repository_enrichment_input_fingerprint(
+                &original.repository_states[0],
+                "rust",
+            ),
+            changed_unrelated.repository_enrichment_input_fingerprint(
+                &changed_unrelated.repository_states[0],
                 "rust",
             )
         );
