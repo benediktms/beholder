@@ -345,7 +345,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
     |> Kernel.++([
       mix_env,
       mix,
-      Mix.version(),
+      mix_version(),
       System.version(),
       :erlang.system_info(:otp_release),
       System.get_env("ELIXIR_ERL_OPTIONS", ""),
@@ -546,6 +546,13 @@ defmodule Beholder.Worker.Elixir.Compiler do
     case System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "") |> String.trim() do
       "" -> "dev"
       value -> value
+    end
+  end
+
+  defp mix_version do
+    case Application.spec(:mix, :vsn) do
+      nil -> "unavailable"
+      version -> to_string(version)
     end
   end
 
