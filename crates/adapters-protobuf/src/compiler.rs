@@ -1,6 +1,7 @@
+use beholder_indexing::{AnalysisInput, AnalysisInputKind};
 use protox::{
-    Compiler,
-    file::{ChainFileResolver, DescriptorSetFileResolver, GoogleFileResolver, IncludeFileResolver},
+    Compiler, Error as ProtoxError,
+    file::{ChainFileResolver, DescriptorSetFileResolver, File, FileResolver, GoogleFileResolver},
 };
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -12,7 +13,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const COMPILER_ID: &str = "protox-0.9.1-v1";
+const COMPILER_ID: &str = "protox-0.9.1-v2";
 
 pub struct SourceCompiler {
     cache_dir: PathBuf,
@@ -53,8 +54,51 @@ struct Module {
     name: PathBuf,
     roots: Vec<PathBuf>,
     protos: Vec<PathBuf>,
-    inputs: Vec<(PathBuf, Vec<u8>)>,
+    inputs: Vec<AnalysisInput>,
     dependencies: Vec<LockedDependency>,
+}
+
+#[derive(Debug)]
+struct SnapshotFileResolver {
+    roots: Vec<PathBuf>,
+    sources: BTreeMap<PathBuf, String>,
+}
+
+impl SnapshotFileResolver {
+    fn new(roots: Vec<PathBuf>, inputs: &[AnalysisInput]) -> Result<Self, String> {
+        let sources = inputs
+            .iter()
+            .filter(|input| input.kind == AnalysisInputKind::Source)
+            .map(|input| {
+                let source = std::str::from_utf8(&input.content).map_err(|error| {
+                    format!("invalid UTF-8 in {}: {error}", input.path.display())
+                })?;
+                Ok((input.path.clone(), source.to_owned()))
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Self { roots, sources })
+    }
+}
+
+impl FileResolver for SnapshotFileResolver {
+    fn resolve_path(&self, path: &Path) -> Option<String> {
+        self.roots
+            .iter()
+            .find_map(|root| path.strip_prefix(root).ok().and_then(protobuf_file_name))
+    }
+
+    fn open_file(&self, name: &str) -> Result<File, ProtoxError> {
+        let name_path = relative_path(Path::new(name)).ok();
+        let source = name_path.as_ref().and_then(|name_path| {
+            self.roots
+                .iter()
+                .find_map(|root| self.sources.get(&root.join(name_path)))
+        });
+        source.map_or_else(
+            || Err(ProtoxError::file_not_found(name)),
+            |source| File::from_source(name, source),
+        )
+    }
 }
 
 impl SourceCompiler {
@@ -67,10 +111,9 @@ impl SourceCompiler {
 
     pub fn compile_repository(
         &self,
-        repository: &Path,
-        files: &[(PathBuf, Vec<u8>)],
+        inputs: &[AnalysisInput],
     ) -> Result<Vec<Arc<Vec<u8>>>, String> {
-        let modules = modules(repository, files)?;
+        let modules = modules(inputs)?;
         let mut dependencies = BTreeMap::new();
         for dependency in modules.iter().flat_map(|module| module.dependencies.iter()) {
             dependencies
@@ -99,28 +142,13 @@ impl SourceCompiler {
     }
 
     fn compile(&self, module: Module) -> Result<Arc<Vec<u8>>, String> {
-        let key = content_key(
-            "compiled",
-            [
-                (Path::new("compiler"), COMPILER_ID.as_bytes()),
-                (
-                    Path::new("module"),
-                    module.name.as_os_str().as_encoded_bytes(),
-                ),
-            ]
-            .into_iter()
-            .chain(
-                module
-                    .inputs
-                    .iter()
-                    .map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
-            ),
-        );
+        let key = compilation_key(&module);
         self.cached("compiled", key, || {
             let mut resolver = ChainFileResolver::new();
-            for root in &module.roots {
-                resolver.add(IncludeFileResolver::new(root.clone()));
-            }
+            resolver.add(SnapshotFileResolver::new(
+                module.roots.clone(),
+                &module.inputs,
+            )?);
             for dependency in &module.dependencies {
                 let descriptor = self.dependency(dependency)?;
                 resolver.add(
@@ -240,43 +268,34 @@ fn dependency_url(dependency: &LockedDependency) -> Result<String, String> {
     ))
 }
 
-fn modules(repository: &Path, files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Module>, String> {
-    let mut configs = files
+fn modules(inputs: &[AnalysisInput]) -> Result<Vec<Module>, String> {
+    let mut configs = inputs
         .iter()
-        .filter(|(path, _)| path.file_name().is_some_and(|name| name == "buf.yaml"))
+        .filter(|input| input.kind == AnalysisInputKind::Configuration)
         .collect::<Vec<_>>();
-    configs.sort_by(|left, right| left.0.cmp(&right.0));
+    configs.sort_by(|left, right| left.path.cmp(&right.path));
     let config_directories = configs
         .iter()
-        .map(|(path, _)| path.parent().unwrap_or(Path::new("")))
+        .map(|input| input.path.parent().unwrap_or(Path::new("")))
         .collect::<Vec<_>>();
-    configs.retain(|(path, _)| {
-        let directory = path.parent().unwrap_or(Path::new(""));
+    configs.retain(|input| {
+        let directory = input.path.parent().unwrap_or(Path::new(""));
         !config_directories
             .iter()
             .any(|ancestor| *ancestor != directory && directory.starts_with(ancestor))
     });
-    let mut protos = files
+    let mut protos = inputs
         .iter()
-        .filter(|(path, _)| {
-            path.extension()
-                .is_some_and(|extension| extension == "proto")
-        })
+        .filter(|input| input.kind == AnalysisInputKind::Source)
         .collect::<Vec<_>>();
-    protos.sort_by(|left, right| left.0.cmp(&right.0));
+    protos.sort_by(|left, right| left.path.cmp(&right.path));
     if configs.is_empty() {
         return Ok((!protos.is_empty())
             .then(|| Module {
                 name: PathBuf::from("."),
-                roots: vec![repository.to_path_buf()],
-                protos: protos
-                    .iter()
-                    .map(|(path, _)| repository.join(path))
-                    .collect(),
-                inputs: protos
-                    .into_iter()
-                    .map(|(path, bytes)| (path.clone(), bytes.clone()))
-                    .collect(),
+                roots: vec![PathBuf::new()],
+                protos: protos.iter().map(|input| input.path.clone()).collect(),
+                inputs: protos.into_iter().cloned().collect(),
                 dependencies: Vec::new(),
             })
             .into_iter()
@@ -285,9 +304,10 @@ fn modules(repository: &Path, files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Module
 
     let configs = configs
         .into_iter()
-        .map(|(config_path, config_bytes)| {
+        .map(|config_input| {
+            let config_path = &config_input.path;
             let directory = config_path.parent().unwrap_or(Path::new("."));
-            let config: BufConfig = serde_yaml::from_slice(config_bytes)
+            let config: BufConfig = serde_yaml::from_slice(&config_input.content)
                 .map_err(|error| format!("invalid {}: {error}", config_path.display()))?;
             let mut module_configs = if config.modules.is_empty() {
                 vec![BufModule {
@@ -316,9 +336,8 @@ fn modules(repository: &Path, files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Module
                 .map(|module| directory.join(&module.path))
                 .collect::<Vec<_>>();
             Ok((
-                config_path,
-                config_bytes,
-                directory,
+                config_input,
+                directory.to_path_buf(),
                 config.deps,
                 module_configs,
                 roots,
@@ -327,94 +346,91 @@ fn modules(repository: &Path, files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Module
         .collect::<Result<Vec<_>, String>>()?;
     let module_roots = configs
         .iter()
-        .flat_map(|(_, _, _, _, _, roots)| roots.iter().cloned())
+        .flat_map(|(_, _, _, _, roots)| roots.iter().cloned())
         .collect::<Vec<_>>();
     let modules = configs
         .into_iter()
-        .map(
-            |(config_path, config_bytes, directory, deps, module_configs, roots)| {
-                let lock_path = directory.join("buf.lock");
-                let lock = files.iter().find(|(path, _)| path == &lock_path);
-                let dependencies = if deps.is_empty() {
-                    Vec::new()
-                } else {
-                    let (_, bytes) = lock.ok_or_else(|| {
-                        format!(
-                            "{} declares dependencies but {} is missing",
-                            config_path.display(),
-                            lock_path.display()
-                        )
-                    })?;
-                    let lock: BufLock = serde_yaml::from_slice(bytes)
-                        .map_err(|error| format!("invalid {}: {error}", lock_path.display()))?;
-                    deps.into_iter()
-                        .map(|declared| {
-                            let name = declared
-                                .split_once(':')
-                                .map_or(declared.as_str(), |(name, _)| name);
-                            lock.deps
-                                .iter()
-                                .find(|dependency| dependency.name == name)
-                                .cloned()
-                                .ok_or_else(|| {
-                                    format!("{name} is missing from {}", lock_path.display())
+        .map(|(config_input, directory, deps, module_configs, roots)| {
+            let config_path = &config_input.path;
+            let lock_path = directory.join("buf.lock");
+            let lock = inputs.iter().find(|input| {
+                input.kind == AnalysisInputKind::Dependency && input.path == lock_path
+            });
+            let dependencies = if deps.is_empty() {
+                Vec::new()
+            } else {
+                let lock = lock.ok_or_else(|| {
+                    format!(
+                        "{} declares dependencies but {} is missing",
+                        config_path.display(),
+                        lock_path.display()
+                    )
+                })?;
+                let lock: BufLock = serde_yaml::from_slice(&lock.content)
+                    .map_err(|error| format!("invalid {}: {error}", lock_path.display()))?;
+                deps.into_iter()
+                    .map(|declared| {
+                        let name = declared
+                            .split_once(':')
+                            .map_or(declared.as_str(), |(name, _)| name);
+                        lock.deps
+                            .iter()
+                            .find(|dependency| dependency.name == name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!("{name} is missing from {}", lock_path.display())
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut config_inputs = vec![config_input.clone()];
+            if let Some(lock) = lock {
+                config_inputs.push(lock.clone());
+            }
+            config_inputs.extend(
+                protos
+                    .iter()
+                    .filter(|input| owning_root(&input.path, &roots).is_some())
+                    .map(|input| (*input).clone()),
+            );
+            config_inputs.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(module_configs
+                .into_iter()
+                .zip(roots.iter().cloned())
+                .filter_map(|(module, root)| {
+                    let selected = protos
+                        .iter()
+                        .filter(|input| {
+                            owning_root(&input.path, &module_roots) == Some(root.as_path())
+                                && input.path.strip_prefix(&root).is_ok_and(|relative| {
+                                    (module.includes.is_empty()
+                                        || module
+                                            .includes
+                                            .iter()
+                                            .any(|include| relative.starts_with(include)))
+                                        && !module
+                                            .excludes
+                                            .iter()
+                                            .any(|exclude| relative.starts_with(exclude))
                                 })
                         })
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let mut config_inputs = vec![(config_path.clone(), config_bytes.clone())];
-                if let Some((path, bytes)) = lock {
-                    config_inputs.push((path.clone(), bytes.clone()));
-                }
-                let resolver_roots = roots
-                    .iter()
-                    .map(|root| repository.join(root))
-                    .collect::<Vec<_>>();
-                config_inputs.extend(
-                    protos
-                        .iter()
-                        .filter(|(path, _)| owning_root(path, &roots).is_some())
-                        .map(|(path, bytes)| ((*path).clone(), (*bytes).clone())),
-                );
-                config_inputs.sort_by(|left, right| left.0.cmp(&right.0));
-                Ok(module_configs
-                    .into_iter()
-                    .zip(roots)
-                    .filter_map(|(module, root)| {
-                        let selected = protos
-                            .iter()
-                            .filter(|(path, _)| {
-                                owning_root(path, &module_roots) == Some(root.as_path())
-                                    && path.strip_prefix(&root).is_ok_and(|relative| {
-                                        (module.includes.is_empty()
-                                            || module
-                                                .includes
-                                                .iter()
-                                                .any(|include| relative.starts_with(include)))
-                                            && !module
-                                                .excludes
-                                                .iter()
-                                                .any(|exclude| relative.starts_with(exclude))
-                                    })
-                            })
-                            .collect::<Vec<_>>();
-                        if selected.is_empty() {
-                            return None;
-                        }
-                        Some(Module {
-                            name: root.clone(),
-                            roots: resolver_roots.clone(),
-                            protos: selected
-                                .into_iter()
-                                .map(|(path, _)| repository.join(path))
-                                .collect(),
-                            inputs: config_inputs.clone(),
-                            dependencies: dependencies.clone(),
-                        })
+                        .collect::<Vec<_>>();
+                    if selected.is_empty() {
+                        return None;
+                    }
+                    Some(Module {
+                        name: root.clone(),
+                        roots: roots.clone(),
+                        protos: selected
+                            .into_iter()
+                            .map(|input| input.path.clone())
+                            .collect(),
+                        inputs: config_inputs.clone(),
+                        dependencies: dependencies.clone(),
                     })
-                    .collect::<Vec<_>>())
-            },
-        )
+                })
+                .collect::<Vec<_>>())
+        })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(modules.into_iter().flatten().collect())
 }
@@ -439,16 +455,56 @@ fn relative_path(path: &Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
+fn protobuf_file_name(path: &Path) -> Option<String> {
+    let path = relative_path(path).ok()?;
+    let mut name = String::new();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        if !name.is_empty() {
+            name.push('/');
+        }
+        name.push_str(component.to_str()?);
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+fn compilation_key(module: &Module) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    framed_hash(&mut hash, b"compiled");
+    framed_hash(&mut hash, COMPILER_ID.as_bytes());
+    framed_hash(&mut hash, module.name.as_os_str().as_encoded_bytes());
+    for input in &module.inputs {
+        framed_hash(&mut hash, &[input_kind_tag(input.kind)]);
+        framed_hash(&mut hash, input.path.as_os_str().as_encoded_bytes());
+        framed_hash(&mut hash, &input.content);
+    }
+    hash.finalize().into()
+}
+
+fn input_kind_tag(kind: AnalysisInputKind) -> u8 {
+    match kind {
+        AnalysisInputKind::Source => 0,
+        AnalysisInputKind::Configuration => 1,
+        AnalysisInputKind::Dependency => 2,
+        AnalysisInputKind::Toolchain => 3,
+        AnalysisInputKind::Environment => 4,
+    }
+}
+
+fn framed_hash(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update(bytes.len().to_le_bytes());
+    hash.update(bytes);
+}
+
 fn content_key<'a>(kind: &str, inputs: impl IntoIterator<Item = (&'a Path, &'a [u8])>) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(kind.len().to_le_bytes());
-    hash.update(kind.as_bytes());
+    framed_hash(&mut hash, kind.as_bytes());
     for (path, bytes) in inputs {
         let path = path.as_os_str().as_encoded_bytes();
-        hash.update(path.len().to_le_bytes());
-        hash.update(path);
-        hash.update(bytes.len().to_le_bytes());
-        hash.update(bytes);
+        framed_hash(&mut hash, path);
+        framed_hash(&mut hash, bytes);
     }
     hash.finalize().into()
 }
@@ -472,26 +528,67 @@ mod tests {
         std::env::temp_dir().join(format!("beholder-{name}-{unique}"))
     }
 
+    fn input(path: impl Into<PathBuf>, content: impl Into<Vec<u8>>) -> AnalysisInput {
+        let path = path.into();
+        let kind = match path.file_name().and_then(|name| name.to_str()) {
+            Some("buf.yaml") => AnalysisInputKind::Configuration,
+            Some("buf.lock") => AnalysisInputKind::Dependency,
+            _ => AnalysisInputKind::Source,
+        };
+        AnalysisInput {
+            path,
+            content: Arc::from(content.into()),
+            kind,
+        }
+    }
+
     #[test]
-    fn compiles_plain_repository_and_reuses_disk_cache() {
+    fn compilation_identity_includes_input_role() {
+        let source = input("contract.proto", b"same bytes".to_vec());
+        let mut configuration = source.clone();
+        configuration.kind = AnalysisInputKind::Configuration;
+        let module = |input| Module {
+            name: PathBuf::from("."),
+            roots: vec![PathBuf::new()],
+            protos: vec![PathBuf::from("contract.proto")],
+            inputs: vec![input],
+            dependencies: Vec::new(),
+        };
+
+        assert_ne!(
+            compilation_key(&module(source)),
+            compilation_key(&module(configuration))
+        );
+    }
+
+    #[test]
+    fn compiles_immutable_snapshot_and_reuses_disk_cache() {
         let state = temporary("protobuf-compiler");
         let repository = state.join("repository");
         let cache = state.join("cache");
         fs::create_dir_all(&repository).unwrap();
         let path = PathBuf::from("contract.proto");
-        let source = b"syntax = \"proto3\"; package example; message Request {} service Example { rpc Get(Request) returns (Request); }".to_vec();
-        fs::write(repository.join(&path), &source).unwrap();
-        let files = vec![(path.clone(), source.clone())];
+        let snapshot = b"syntax = \"proto3\"; package example; message Request {} service Example { rpc Snapshot(Request) returns (Request); }".to_vec();
+        fs::write(
+            repository.join(&path),
+            b"syntax = \"proto3\"; package example; message Request {} service Example { rpc Live(Request) returns (Request); }",
+        )
+        .unwrap();
+        let inputs = vec![input(path.clone(), snapshot)];
 
         let descriptors = SourceCompiler::new(cache.clone())
-            .compile_repository(&repository, &files)
+            .compile_repository(&inputs)
             .unwrap();
+        let entities = facts(&descriptors[0]).unwrap().entities;
         assert!(
-            facts(&descriptors[0])
-                .unwrap()
-                .entities
+            entities
                 .iter()
-                .any(|entity| { entity.id.as_str() == "proto-method://example.Example/Get" })
+                .any(|entity| { entity.id.as_str() == "proto-method://example.Example/Snapshot" })
+        );
+        assert!(
+            !entities
+                .iter()
+                .any(|entity| entity.id.as_str() == "proto-method://example.Example/Live")
         );
         assert_eq!(
             fs::read_dir(cache.join("protobuf/compiled"))
@@ -503,14 +600,13 @@ mod tests {
         fs::remove_file(repository.join(&path)).unwrap();
         assert!(
             SourceCompiler::new(cache.clone())
-                .compile_repository(&repository, &files)
+                .compile_repository(&inputs)
                 .is_ok()
         );
 
         let changed = b"syntax = \"proto3\"; package example; message Request {} message Response {} service Example { rpc Get(Request) returns (Response); }".to_vec();
-        fs::write(repository.join(&path), &changed).unwrap();
         SourceCompiler::new(cache.clone())
-            .compile_repository(&repository, &[(path, changed)])
+            .compile_repository(&[input(path, changed)])
             .unwrap();
         assert_eq!(
             fs::read_dir(cache.join("protobuf/compiled"))
@@ -524,21 +620,21 @@ mod tests {
     #[test]
     fn requires_lock_for_declared_dependencies() {
         let state = temporary("protobuf-lock");
-        let repository = state.join("repository");
-        fs::create_dir_all(&repository).unwrap();
-        let proto = b"syntax = \"proto3\"; package example; message Request {}".to_vec();
-        fs::write(repository.join("contract.proto"), &proto).unwrap();
+        fs::create_dir_all(&state).unwrap();
         let files = vec![
-            (
-                PathBuf::from("buf.yaml"),
+            input(
+                "buf.yaml",
                 b"version: v2\nmodules:\n  - path: .\ndeps:\n  - buf.build/fresha/common\n"
                     .to_vec(),
             ),
-            (PathBuf::from("contract.proto"), proto),
+            input(
+                "contract.proto",
+                b"syntax = \"proto3\"; package example; message Request {}".to_vec(),
+            ),
         ];
 
         let error = SourceCompiler::new(state.join("cache"))
-            .compile_repository(&repository, &files)
+            .compile_repository(&files)
             .unwrap_err();
         assert!(error.contains("declares dependencies but buf.lock is missing"));
         fs::remove_dir_all(state).unwrap();
@@ -547,10 +643,8 @@ mod tests {
     #[test]
     fn compiles_buf_module_with_cached_locked_dependency() {
         let state = temporary("protobuf-dependency");
-        let repository = state.join("repository");
         let dependency = state.join("dependency");
         let cache = state.join("cache");
-        fs::create_dir_all(repository.join("rpc/contracts/ignored")).unwrap();
         fs::create_dir_all(dependency.join("fresha/types")).unwrap();
         let dependency_path = dependency.join("fresha/types/uuid.proto");
         fs::write(
@@ -584,45 +678,23 @@ mod tests {
         let nested_config = b"version: v1beta1\nbuild:\n  roots:\n    - contracts\n".to_vec();
         let lock = b"version: v2\ndeps:\n  - name: buf.build/fresha/common\n    commit: 00000000000000000000000000000000\n    digest: b5:locked-digest\n".to_vec();
         let proto = b"syntax = \"proto3\"; package example; import \"fresha/types/uuid.proto\"; message Request { fresha.types.UUID id = 1; } service Example { rpc Get(Request) returns (Request); }".to_vec();
-        fs::write(repository.join("buf.yaml"), &config).unwrap();
-        fs::write(repository.join("rpc/buf.yaml"), &nested_config).unwrap();
-        fs::write(repository.join("buf.lock"), &lock).unwrap();
-        fs::write(repository.join("rpc/contracts/contract.proto"), &proto).unwrap();
-        fs::create_dir_all(repository.join("events")).unwrap();
-        fs::write(
-            repository.join("events/event.proto"),
-            "syntax = \"proto3\"; package events; message Event {}",
-        )
-        .unwrap();
-        fs::write(
-            repository.join("rpc/contracts/ignored/broken.proto"),
-            "not valid protobuf",
-        )
-        .unwrap();
-        fs::write(repository.join("rpc/legacy.proto"), "not valid protobuf").unwrap();
 
         let descriptors = SourceCompiler::new(cache)
-            .compile_repository(
-                &repository,
-                &[
-                    (PathBuf::from("buf.yaml"), config),
-                    (PathBuf::from("rpc/buf.yaml"), nested_config),
-                    (PathBuf::from("buf.lock"), lock),
-                    (PathBuf::from("rpc/contracts/contract.proto"), proto),
-                    (
-                        PathBuf::from("events/event.proto"),
-                        b"syntax = \"proto3\"; package events; message Event {}".to_vec(),
-                    ),
-                    (
-                        PathBuf::from("rpc/contracts/ignored/broken.proto"),
-                        b"not valid protobuf".to_vec(),
-                    ),
-                    (
-                        PathBuf::from("rpc/legacy.proto"),
-                        b"not valid protobuf".to_vec(),
-                    ),
-                ],
-            )
+            .compile_repository(&[
+                input("buf.yaml", config),
+                input("rpc/buf.yaml", nested_config),
+                input("buf.lock", lock),
+                input("rpc/contracts/contract.proto", proto),
+                input(
+                    "events/event.proto",
+                    b"syntax = \"proto3\"; package events; message Event {}".to_vec(),
+                ),
+                input(
+                    "rpc/contracts/ignored/broken.proto",
+                    b"not valid protobuf".to_vec(),
+                ),
+                input("rpc/legacy.proto", b"not valid protobuf".to_vec()),
+            ])
             .unwrap();
         assert_eq!(descriptors.len(), 2);
         let compiled = facts(&descriptors[0]).unwrap();
@@ -644,25 +716,16 @@ mod tests {
     #[test]
     fn resolves_imports_from_sibling_buf_modules() {
         let state = temporary("protobuf-sibling-modules");
-        let repository = state.join("repository");
-        fs::create_dir_all(repository.join("api")).unwrap();
-        fs::create_dir_all(repository.join("types")).unwrap();
         let config = b"version: v2\nmodules:\n  - path: api\n  - path: types\n".to_vec();
         let service = b"syntax = \"proto3\"; package example; import \"request.proto\"; service Example { rpc Get(Request) returns (Request); }".to_vec();
         let request = b"syntax = \"proto3\"; package example; message Request {}".to_vec();
-        fs::write(repository.join("buf.yaml"), &config).unwrap();
-        fs::write(repository.join("api/service.proto"), &service).unwrap();
-        fs::write(repository.join("types/request.proto"), &request).unwrap();
 
         let descriptors = SourceCompiler::new(state.join("cache"))
-            .compile_repository(
-                &repository,
-                &[
-                    (PathBuf::from("buf.yaml"), config),
-                    (PathBuf::from("api/service.proto"), service),
-                    (PathBuf::from("types/request.proto"), request),
-                ],
-            )
+            .compile_repository(&[
+                input("buf.yaml", config),
+                input("api/service.proto", service),
+                input("types/request.proto", request),
+            ])
             .unwrap();
 
         assert!(descriptors.iter().any(|descriptor| {
