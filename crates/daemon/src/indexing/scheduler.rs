@@ -74,10 +74,12 @@ use beholder_domain::{
 use beholder_dto::{Freshness, QueryMetadata};
 #[cfg(test)]
 use beholder_indexing::{
-    AnalysisInput, AnalysisInputKind, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot,
-    IndexerBuilder, WorkspaceAnalyzer, WorkspaceEnricher,
+    AnalysisInput, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot, IndexerBuilder,
+    WorkspaceAnalyzer, WorkspaceEnricher,
 };
-use beholder_indexing::{CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot};
+use beholder_indexing::{
+    AnalysisInputKind, CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot,
+};
 use notify::{Event, EventKind};
 #[cfg(test)]
 use rayon::prelude::*;
@@ -85,7 +87,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -96,6 +98,7 @@ use std::{
 use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Write},
+    path::Path,
 };
 use tokio::{
     sync::Notify,
@@ -129,14 +132,32 @@ mod typescript_analysis;
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
 use enrichment::{EnrichmentJob, EnrichmentRun};
 use inventory::{InventoryStatistics, InventoryStore, RefreshMode};
+use sources::is_ignored_path;
 #[cfg(test)]
 use sources::{RepositorySources, decode_csharp_source, repository_sources};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
 const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
+const MAX_PENDING_PATHS: usize = 1_024;
+const MAX_PENDING_EVENTS: usize = 4_096;
+const MAX_REINDEX_RETRIES: u8 = 5;
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const CORE_RULE_PACK_VERSION: &str = "5";
+
+fn structural_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    )
+}
+
+fn batch_deadline(first_change: Instant, last_change: Instant) -> Instant {
+    (last_change + QUIET_PERIOD).min(first_change + MAX_LATENCY)
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -259,6 +280,7 @@ fn scheduler_unavailable() -> BeholderError {
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
+    retry_attempts: Mutex<BTreeMap<String, u8>>,
     active_operation: Mutex<Option<String>>,
     enrichment_jobs: Mutex<BTreeMap<(String, String, String), EnrichmentJob>>,
     enriching: Mutex<BTreeMap<(String, String, String), EnrichmentRun>>,
@@ -286,11 +308,115 @@ pub struct IndexScheduler {
     analysis_pool: rayon::ThreadPool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DirtyRepository {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DirtyRepository {
+    all: bool,
+    reconcile: bool,
+    head: bool,
+    sources: BTreeSet<PathBuf>,
+    configuration: BTreeSet<PathBuf>,
+    events: usize,
+}
+
+#[derive(Clone, Debug)]
+enum RepositoryIntent {
     All,
     Reconcile,
-    Sources(BTreeSet<PathBuf>),
+    Head,
+    Source(PathBuf),
+    Configuration(PathBuf),
+}
+
+impl DirtyRepository {
+    fn from_intent(intent: RepositoryIntent) -> Self {
+        let mut dirty = Self::default();
+        dirty.apply(intent);
+        dirty
+    }
+
+    fn apply(&mut self, intent: RepositoryIntent) {
+        match intent {
+            RepositoryIntent::All => {
+                self.all = true;
+                self.reconcile = false;
+                self.sources.clear();
+                self.configuration.clear();
+            }
+            RepositoryIntent::Reconcile if !self.all => {
+                self.reconcile = true;
+                self.sources.clear();
+                self.configuration.clear();
+            }
+            RepositoryIntent::Head => self.head = true,
+            RepositoryIntent::Source(path) if !self.all && !self.reconcile => {
+                self.sources.insert(path);
+            }
+            RepositoryIntent::Configuration(path) if !self.all && !self.reconcile => {
+                self.configuration.insert(path);
+            }
+            RepositoryIntent::Reconcile
+            | RepositoryIntent::Source(_)
+            | RepositoryIntent::Configuration(_) => {}
+        }
+    }
+
+    fn record_event(&mut self) {
+        self.events = self.events.saturating_add(1);
+        if self.events > MAX_PENDING_EVENTS || self.path_count() > MAX_PENDING_PATHS {
+            self.apply(RepositoryIntent::Reconcile);
+        }
+    }
+
+    fn merge(&mut self, incoming: Self) {
+        let incoming_events = incoming.events;
+        if incoming.all {
+            self.apply(RepositoryIntent::All);
+        } else if incoming.reconcile {
+            self.apply(RepositoryIntent::Reconcile);
+        } else {
+            if incoming.head {
+                self.apply(RepositoryIntent::Head);
+            }
+            for path in incoming.sources {
+                self.apply(RepositoryIntent::Source(path));
+            }
+            for path in incoming.configuration {
+                self.apply(RepositoryIntent::Configuration(path));
+            }
+        }
+        self.events = self.events.saturating_add(incoming_events);
+        if self.events > MAX_PENDING_EVENTS || self.path_count() > MAX_PENDING_PATHS {
+            self.apply(RepositoryIntent::Reconcile);
+        }
+    }
+
+    fn paths(&self) -> BTreeSet<PathBuf> {
+        self.sources
+            .iter()
+            .chain(&self.configuration)
+            .cloned()
+            .collect()
+    }
+
+    fn path_count(&self) -> usize {
+        self.sources.len() + self.configuration.len()
+    }
+
+    fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    fn authoritative(&self) -> bool {
+        self.all || self.reconcile
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.all
+            && !self.reconcile
+            && !self.head
+            && self.sources.is_empty()
+            && self.configuration.is_empty()
+    }
 }
 
 struct ActiveOperation<'a> {
@@ -298,6 +424,12 @@ struct ActiveOperation<'a> {
     started: Instant,
     active_operation: &'a Mutex<Option<String>>,
     idle: &'a Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReindexResult {
+    published: bool,
+    retry_after: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -337,6 +469,7 @@ impl IndexScheduler {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
+            retry_attempts: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
             enriching: Mutex::new(BTreeMap::new()),
@@ -401,6 +534,7 @@ impl IndexScheduler {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
+            retry_attempts: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
             enriching: Mutex::new(BTreeMap::new()),
@@ -428,12 +562,18 @@ impl IndexScheduler {
     }
 
     pub fn mark(&self, workspace: &Workspace) {
+        if let Ok(mut retries) = self.retry_attempts.lock() {
+            retries.remove(&workspace.name);
+        }
         if let Ok(mut generations) = self.generations.lock() {
             *generations.entry(workspace.name.clone()).or_default() += 1;
             if let Ok(mut dirty) = self.dirty_repositories.lock() {
                 dirty.entry(workspace.name.clone()).or_default().extend(
                     workspace.repositories.iter().map(|repository| {
-                        (repository.repository.identity.clone(), DirtyRepository::All)
+                        (
+                            repository.repository.identity.clone(),
+                            DirtyRepository::from_intent(RepositoryIntent::All),
+                        )
                     }),
                 );
             }
@@ -599,6 +739,7 @@ impl IndexScheduler {
             Ok(event) => event,
             Err(error) => {
                 tracing::warn!(%error, "filesystem watcher error");
+                self.reconcile_after_watcher_error(workspaces);
                 return;
             }
         };
@@ -615,50 +756,111 @@ impl IndexScheduler {
             return;
         };
         let mut changed = false;
+        let mut changed_workspaces = BTreeSet::new();
         for workspace in registry.list() {
             let dirty = workspace
                 .repositories
                 .iter()
                 .filter_map(|repository| {
-                    let sources = event
-                        .paths
-                        .iter()
-                        .filter_map(|path| {
-                            path.strip_prefix(&repository.base)
-                                .ok()
-                                .filter(|relative| {
-                                    self.indexer.accepts(relative)
-                                        || workspace.protobuf_descriptors.iter().any(|descriptor| {
-                                            descriptor.repository == repository.repository
-                                                && descriptor.path == *path
-                                        })
-                                })
-                                .map(Path::to_path_buf)
-                        })
-                        .collect::<BTreeSet<_>>();
-                    (!sources.is_empty()).then(|| (repository.repository.identity.clone(), sources))
+                    let administrative =
+                        beholder_adapters_git::repository_watch_paths(&repository.base)
+                            .unwrap_or_default();
+                    let mut pending = DirtyRepository::default();
+                    for path in &event.paths {
+                        if administrative.iter().any(|target| {
+                            path == &target.path
+                                || if target.recursive {
+                                    path.starts_with(&target.path)
+                                } else {
+                                    path.parent() == Some(target.path.as_path())
+                                }
+                        }) {
+                            pending.apply(RepositoryIntent::Head);
+                            continue;
+                        }
+                        let Ok(relative) = path.strip_prefix(&repository.base) else {
+                            continue;
+                        };
+                        if is_ignored_path(relative) {
+                            continue;
+                        }
+                        let descriptor = workspace.protobuf_descriptors.iter().any(|descriptor| {
+                            descriptor.repository == repository.repository
+                                && descriptor.path == *path
+                        });
+                        let kinds = self.indexer.analysis_input_kinds(relative);
+                        if descriptor || kinds.contains(&AnalysisInputKind::Source) {
+                            pending.apply(RepositoryIntent::Source(relative.to_path_buf()));
+                        } else if !kinds.is_empty() {
+                            pending.apply(RepositoryIntent::Configuration(relative.to_path_buf()));
+                        } else if structural_event(&event.kind) {
+                            pending.apply(RepositoryIntent::Reconcile);
+                        }
+                    }
+                    if pending.is_empty() {
+                        None
+                    } else {
+                        pending.record_event();
+                        Some((repository.repository.identity.clone(), pending))
+                    }
                 })
                 .collect::<Vec<_>>();
             if !dirty.is_empty() {
-                tracing::debug!(workspace = %workspace.name, repositories = dirty.len(), source_units = dirty.iter().map(|(_, sources)| sources.len()).sum::<usize>(), "workspace marked stale");
+                tracing::debug!(workspace = %workspace.name, repositories = dirty.len(), source_units = dirty.iter().map(|(_, intent)| intent.source_count()).sum::<usize>(), "workspace marked stale");
+                changed_workspaces.insert(workspace.name.clone());
                 *generations.entry(workspace.name.clone()).or_default() += 1;
                 let repositories = dirty_repositories.entry(workspace.name).or_default();
-                for (repository, sources) in dirty {
-                    match repositories.entry(repository) {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(DirtyRepository::Sources(sources));
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            if let DirtyRepository::Sources(pending) = entry.get_mut() {
-                                pending.extend(sources);
-                            }
-                        }
-                    }
+                for (repository, pending) in dirty {
+                    repositories.entry(repository).or_default().merge(pending);
                 }
                 changed = true;
             }
         }
+        drop(dirty_repositories);
+        drop(generations);
+        drop(registry);
         if changed {
+            if let Ok(mut retries) = self.retry_attempts.lock() {
+                for workspace in changed_workspaces {
+                    retries.remove(&workspace);
+                }
+            }
+            self.changed.notify_one();
+        }
+    }
+
+    fn reconcile_after_watcher_error(&self, workspaces: &Mutex<WorkspaceRegistry>) {
+        let Ok(registry) = workspaces.lock() else {
+            return;
+        };
+        let Ok(mut generations) = self.generations.lock() else {
+            return;
+        };
+        let Ok(mut dirty) = self.dirty_repositories.lock() else {
+            return;
+        };
+        let mut changed = false;
+        for workspace in registry.list() {
+            if workspace.repositories.is_empty() {
+                continue;
+            }
+            *generations.entry(workspace.name.clone()).or_default() += 1;
+            let repositories = dirty.entry(workspace.name).or_default();
+            for repository in workspace.repositories {
+                repositories
+                    .entry(repository.repository.identity)
+                    .or_default()
+                    .apply(RepositoryIntent::Reconcile);
+            }
+            changed = true;
+        }
+        drop(dirty);
+        drop(generations);
+        drop(registry);
+        if changed {
+            if let Ok(mut retries) = self.retry_attempts.lock() {
+                retries.clear();
+            }
             self.changed.notify_one();
         }
     }
@@ -725,24 +927,35 @@ impl IndexScheduler {
         );
         reconciliation.set_missed_tick_behavior(MissedTickBehavior::Skip);
         'run: loop {
-            let dirty = tokio::select! {
-                _ = self.changed.notified() => true,
-                _ = reconciliation.tick() => self.mark_registered(&workspaces),
+            let reconcile = tokio::select! {
+                _ = self.changed.notified() => false,
+                _ = reconciliation.tick() => true,
                 _ = self.shutdown.notified() => break 'run,
             };
-            if !dirty {
+            if reconcile {
+                let scheduler = self.clone();
+                let store = store.clone();
+                let checkpoint_store = store.clone();
+                let workspaces = workspaces.clone();
+                match tokio::task::spawn_blocking(move || {
+                    scheduler.reconcile_registered(&store, &workspaces)
+                })
+                .await
+                {
+                    Ok(true) => self.schedule_checkpoint(checkpoint_store),
+                    Ok(false) => {}
+                    Err(error) => tracing::error!(%error, "reconciliation worker failed"),
+                }
                 continue;
             }
             let first_change = Instant::now();
             let mut last_change = first_change;
             loop {
-                let quiet = tokio::time::sleep_until(last_change + QUIET_PERIOD);
-                let maximum = tokio::time::sleep_until(first_change + MAX_LATENCY);
-                tokio::pin!(quiet, maximum);
+                let deadline = tokio::time::sleep_until(batch_deadline(first_change, last_change));
+                tokio::pin!(deadline);
                 tokio::select! {
                     _ = self.changed.notified() => last_change = Instant::now(),
-                    _ = &mut quiet => break,
-                    _ = &mut maximum => break,
+                    _ = &mut deadline => break,
                     _ = self.shutdown.notified() => break 'run,
                 }
             }
@@ -750,13 +963,22 @@ impl IndexScheduler {
             let store = store.clone();
             let checkpoint_store = store.clone();
             let workspaces = workspaces.clone();
-            if let Err(error) =
-                tokio::task::spawn_blocking(move || scheduler.reindex_dirty(&store, &workspaces))
-                    .await
+            match tokio::task::spawn_blocking(move || scheduler.reindex_dirty(&store, &workspaces))
+                .await
             {
-                tracing::error!(%error, "index worker failed");
-            } else {
-                self.schedule_checkpoint(checkpoint_store);
+                Ok(result) => {
+                    if result.published {
+                        self.schedule_checkpoint(checkpoint_store);
+                    }
+                    if let Some(delay) = result.retry_after {
+                        let scheduler = self.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            scheduler.changed.notify_one();
+                        });
+                    }
+                }
+                Err(error) => tracing::error!(%error, "index worker failed"),
             }
         }
         while self.checkpointing.load(Ordering::Acquire) {
@@ -764,52 +986,96 @@ impl IndexScheduler {
         }
     }
 
-    fn mark_registered(&self, workspaces: &Mutex<WorkspaceRegistry>) -> bool {
-        let Ok(registry) = workspaces.lock() else {
-            return false;
+    fn reconcile_registered(
+        &self,
+        store: &SemanticStore,
+        workspaces: &Mutex<WorkspaceRegistry>,
+    ) -> bool {
+        let registered = match workspaces.lock() {
+            Ok(registry) => registry.list(),
+            Err(_) => return false,
         };
-        let workspaces = registry.list();
-        drop(registry);
-        let mut marked = false;
-        if let Ok(mut generations) = self.generations.lock()
-            && let Ok(mut dirty) = self.dirty_repositories.lock()
-        {
-            for workspace in &workspaces {
-                marked = true;
-                *generations.entry(workspace.name.clone()).or_default() += 1;
-                let repositories = dirty.entry(workspace.name.clone()).or_default();
-                for repository in &workspace.repositories {
-                    repositories.insert(
+        let mut published = false;
+        for workspace in registered {
+            let dirty = workspace
+                .repositories
+                .iter()
+                .map(|repository| {
+                    (
                         repository.repository.identity.clone(),
-                        DirtyRepository::Reconcile,
-                    );
+                        DirtyRepository::from_intent(RepositoryIntent::Reconcile),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let result = match self.begin(&workspace.name) {
+                Ok(_active) => index_workspace(self, store, &workspace, Some(&dirty)),
+                Err(error) => Err(Box::new(error) as Box<dyn Error>),
+            };
+            match result {
+                Ok((_, changed)) => published |= changed,
+                Err(error) => {
+                    tracing::error!(workspace = %workspace.name, %error, "workspace reconciliation failed");
                 }
             }
         }
-        marked
+        published
     }
 
-    fn reindex_dirty(&self, store: &SemanticStore, workspaces: &Mutex<WorkspaceRegistry>) {
+    fn reindex_dirty(
+        &self,
+        store: &SemanticStore,
+        workspaces: &Mutex<WorkspaceRegistry>,
+    ) -> ReindexResult {
         let snapshot = match self.generations.lock() {
             Ok(generations) => generations.clone(),
-            Err(_) => return,
+            Err(_) => return ReindexResult::default(),
         };
         let registered = match workspaces.lock() {
             Ok(registry) => snapshot
                 .keys()
                 .filter_map(|name| registry.get(name).cloned())
                 .collect::<Vec<_>>(),
-            Err(_) => return,
+            Err(_) => return ReindexResult::default(),
         };
+        let mut result = ReindexResult::default();
         for workspace in registered {
             match self.index_active(store, &workspace) {
-                Ok(_) => self
-                    .complete_generation(&workspace.name, snapshot.get(&workspace.name).copied()),
+                Ok((_, published)) => {
+                    result.published |= published;
+                    if let Ok(mut retries) = self.retry_attempts.lock() {
+                        retries.remove(&workspace.name);
+                    }
+                    self.complete_generation(
+                        &workspace.name,
+                        snapshot.get(&workspace.name).copied(),
+                    );
+                }
                 Err(error) => {
                     tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed");
+                    let attempt = self
+                        .retry_attempts
+                        .lock()
+                        .ok()
+                        .map(|mut retries| {
+                            let attempt = retries.entry(workspace.name.clone()).or_default();
+                            *attempt = attempt.saturating_add(1);
+                            *attempt
+                        })
+                        .unwrap_or(MAX_REINDEX_RETRIES);
+                    if attempt <= MAX_REINDEX_RETRIES {
+                        let delay = RETRY_BASE_DELAY.saturating_mul(1_u32 << (attempt - 1));
+                        result.retry_after = Some(
+                            result
+                                .retry_after
+                                .map_or(delay, |pending| pending.min(delay)),
+                        );
+                    } else {
+                        tracing::error!(workspace = %workspace.name, attempts = attempt, "workspace reindex retries exhausted");
+                    }
                 }
             }
         }
+        result
     }
 
     #[cfg(test)]
@@ -1421,16 +1687,28 @@ fn index_workspace_through_port(
         .repositories
         .iter()
         .map(|repository| {
-            match dirty
+            dirty
                 .and_then(|repositories| repositories.get(&repository.state.repository.identity))
-            {
-                Some(DirtyRepository::Sources(sources)) => sources.len(),
-                Some(DirtyRepository::All | DirtyRepository::Reconcile) | None => repository
-                    .inputs
-                    .iter()
-                    .filter(|input| input.kind == beholder_indexing::InputKind::Source)
-                    .count(),
-            }
+                .map_or_else(
+                    || {
+                        repository
+                            .inputs
+                            .iter()
+                            .filter(|input| input.kind == beholder_indexing::InputKind::Source)
+                            .count()
+                    },
+                    |dirty| {
+                        if dirty.authoritative() {
+                            repository
+                                .inputs
+                                .iter()
+                                .filter(|input| input.kind == beholder_indexing::InputKind::Source)
+                                .count()
+                        } else {
+                            dirty.source_count()
+                        }
+                    },
+                )
         })
         .sum::<usize>();
     let repository_analysis_started = Instant::now();
@@ -1592,12 +1870,13 @@ fn refresh_workspace_snapshot(
                 .map(|descriptor| descriptor.path.clone())
                 .collect::<Vec<_>>();
             let configured = dirty.and_then(|dirty| dirty.get(&repository.repository.identity));
-            let mode = match configured {
-                Some(DirtyRepository::Sources(paths)) => RefreshMode::Dirty(paths),
-                Some(DirtyRepository::All | DirtyRepository::Reconcile) => {
-                    RefreshMode::Authoritative
-                }
-                None => RefreshMode::Hinted,
+            let dirty_paths = configured.map(DirtyRepository::paths);
+            let mode = if configured.is_some_and(DirtyRepository::authoritative) {
+                RefreshMode::Authoritative
+            } else if let Some(paths) = dirty_paths.as_ref().filter(|paths| !paths.is_empty()) {
+                RefreshMode::Dirty(paths)
+            } else {
+                RefreshMode::Hinted
             };
             let refresh = scheduler.inventory.refresh(
                 &workspace.name,
@@ -1737,8 +2016,8 @@ fn index_workspace_versioned(
             !rust.is_empty() || !elixir.is_empty() || !typescript.is_empty();
         dirty_source_units +=
             match dirty.and_then(|repositories| repositories.get(&state.repository.identity)) {
-                Some(DirtyRepository::Sources(sources)) => sources.len(),
-                Some(DirtyRepository::All | DirtyRepository::Reconcile) | None => {
+                Some(dirty) if !dirty.authoritative() => dirty.source_count(),
+                Some(_) | None => {
                     rust.len()
                         + elixir.len()
                         + csharp.len()
@@ -3563,7 +3842,11 @@ mod tests {
         );
         assert_eq!(
             scheduler.dirty_repositories.lock().unwrap()["main"][&identity],
-            DirtyRepository::Sources(BTreeSet::from([PathBuf::from("src/changed.rs")]))
+            DirtyRepository {
+                sources: BTreeSet::from([PathBuf::from("src/changed.rs")]),
+                events: 1,
+                ..DirtyRepository::default()
+            }
         );
 
         scheduler.index(&store, &workspace).unwrap();
@@ -3587,6 +3870,233 @@ mod tests {
                 .is_empty()
         );
         drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn watcher_intents_share_ignore_policy_and_promote_structural_changes() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-watcher-intents-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join("target")).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-b", "main"])
+                .arg(&repository)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "-C",
+                    repository.to_str().unwrap(),
+                    "-c",
+                    "user.name=Beholder Test",
+                    "-c",
+                    "user.email=beholder@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let source = repository.join("src/lib.rs");
+        let configuration = repository.join("Cargo.toml");
+        let ignored = repository.join("target/generated.rs");
+        fs::write(&source, "fn source() {}").unwrap();
+        fs::write(&configuration, "[package]\nname = \"fixture\"\n").unwrap();
+        fs::write(&ignored, "fn generated() {}").unwrap();
+
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository.clone()], Vec::new())
+            .unwrap();
+        let repository = workspace.repositories[0].base.clone();
+        let source = repository.join("src/lib.rs");
+        let configuration = repository.join("Cargo.toml");
+        let ignored = repository.join("target/generated.rs");
+        let identity = workspace.repositories[0].repository.identity.clone();
+        let registry = Mutex::new(registry);
+        let scheduler = IndexScheduler::new(state.join("cache"));
+        let event = |kind, path| Event {
+            kind,
+            paths: vec![path],
+            attrs: Default::default(),
+        };
+
+        scheduler.add_event(
+            Ok(event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                ignored,
+            )),
+            &registry,
+        );
+        assert!(scheduler.generations.lock().unwrap().is_empty());
+
+        let head = beholder_adapters_git::repository_watch_paths(&repository)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.path.ends_with(".git") && !target.recursive)
+            .unwrap()
+            .path
+            .join("HEAD");
+        scheduler.add_event(
+            Ok(event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                head,
+            )),
+            &registry,
+        );
+        let dirty = scheduler.dirty_repositories.lock().unwrap()["main"][&identity].clone();
+        assert!(dirty.head);
+        assert!(dirty.sources.is_empty());
+        assert!(dirty.configuration.is_empty());
+
+        scheduler.add_event(
+            Ok(event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                configuration,
+            )),
+            &registry,
+        );
+        let dirty = scheduler.dirty_repositories.lock().unwrap()["main"][&identity].clone();
+        assert!(dirty.sources.is_empty());
+        assert_eq!(dirty.configuration, [PathBuf::from("Cargo.toml")].into());
+
+        scheduler.add_event(
+            Ok(event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                source,
+            )),
+            &registry,
+        );
+        let dirty = scheduler.dirty_repositories.lock().unwrap()["main"][&identity].clone();
+        assert_eq!(dirty.sources, [PathBuf::from("src/lib.rs")].into());
+        assert_eq!(dirty.configuration, [PathBuf::from("Cargo.toml")].into());
+
+        scheduler.add_event(
+            Ok(event(
+                EventKind::Remove(notify::event::RemoveKind::Folder),
+                repository.join("src"),
+            )),
+            &registry,
+        );
+        let dirty = scheduler.dirty_repositories.lock().unwrap()["main"][&identity].clone();
+        assert!(dirty.reconcile);
+        assert!(dirty.sources.is_empty());
+        assert!(dirty.configuration.is_empty());
+
+        scheduler.dirty_repositories.lock().unwrap().clear();
+        scheduler.generations.lock().unwrap().clear();
+        scheduler.add_event(
+            Ok(Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::Both,
+                )),
+                paths: vec![repository.join("src/old.rs"), repository.join("src/new.rs")],
+                attrs: Default::default(),
+            }),
+            &registry,
+        );
+        let dirty = scheduler.dirty_repositories.lock().unwrap()["main"][&identity].clone();
+        assert_eq!(
+            dirty.sources,
+            [PathBuf::from("src/new.rs"), PathBuf::from("src/old.rs")].into()
+        );
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn continuous_changes_are_bounded_by_the_maximum_batch_latency() {
+        let first = Instant::now();
+        let mut last = first;
+        for _ in 0..100 {
+            last += Duration::from_millis(100);
+            assert!(batch_deadline(first, last) <= first + MAX_LATENCY);
+        }
+        assert_eq!(batch_deadline(first, last), first + MAX_LATENCY);
+    }
+
+    #[test]
+    fn watcher_storms_and_errors_become_bounded_reconciliation() {
+        let mut storm = DirtyRepository::default();
+        for index in 0..=MAX_PENDING_PATHS {
+            storm.apply(RepositoryIntent::Source(
+                PathBuf::from("src").join(format!("{index}.rs")),
+            ));
+            storm.record_event();
+        }
+        assert!(storm.reconcile);
+        assert_eq!(storm.path_count(), 0);
+
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-watcher-error-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
+        let identity = workspace.repositories[0].repository.identity.clone();
+        let registry = Mutex::new(registry);
+        let scheduler = IndexScheduler::new(state.join("cache"));
+
+        scheduler.add_event(Err(notify::Error::generic("overflow")), &registry);
+
+        assert!(scheduler.dirty_repositories.lock().unwrap()["main"][&identity].reconcile);
+        assert!(scheduler.generations.lock().unwrap().contains_key("main"));
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn failed_reindexing_uses_bounded_exponential_backoff() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-retry-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(&repository).unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository.clone()], Vec::new())
+            .unwrap();
+        let registry = Mutex::new(registry);
+        let scheduler = IndexScheduler::new(state.join("cache"));
+        let store = SemanticStore::memory().unwrap();
+        scheduler.mark(&workspace);
+        fs::remove_dir_all(&repository).unwrap();
+
+        for attempt in 1..=MAX_REINDEX_RETRIES {
+            let result = scheduler.reindex_dirty(&store, &registry);
+            assert_eq!(
+                result.retry_after,
+                Some(RETRY_BASE_DELAY.saturating_mul(1_u32 << (attempt - 1)))
+            );
+        }
+        assert_eq!(scheduler.reindex_dirty(&store, &registry).retry_after, None);
+        scheduler.mark(&workspace);
+        assert!(
+            !scheduler
+                .retry_attempts
+                .lock()
+                .unwrap()
+                .contains_key("main")
+        );
         fs::remove_dir_all(state).unwrap();
     }
 
@@ -3619,7 +4129,11 @@ mod tests {
 
         assert_eq!(
             scheduler.dirty_repositories.lock().unwrap()["main"][&identity],
-            DirtyRepository::Sources(BTreeSet::from([PathBuf::from("contract.proto")]))
+            DirtyRepository {
+                sources: BTreeSet::from([PathBuf::from("contract.proto")]),
+                events: 1,
+                ..DirtyRepository::default()
+            }
         );
         fs::remove_dir_all(state).unwrap();
     }
@@ -3748,7 +4262,11 @@ mod tests {
         );
         assert_eq!(
             scheduler.dirty_repositories.lock().unwrap()["main"][&identity],
-            DirtyRepository::Sources(BTreeSet::from([PathBuf::from("lib/sample.ex")]))
+            DirtyRepository {
+                sources: BTreeSet::from([PathBuf::from("lib/sample.ex")]),
+                events: 1,
+                ..DirtyRepository::default()
+            }
         );
 
         scheduler.index(&store, &workspace).unwrap();
@@ -4252,6 +4770,39 @@ mod tests {
         .expect("periodic reconciliation did not recover the missed event");
         scheduler.stop();
         task.await.unwrap();
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn no_op_reconciliation_does_not_mark_stale_or_publish_a_revision() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-no-op-reconcile-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn stable() {}").unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
+        let registry = Mutex::new(registry);
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let scheduler = IndexScheduler::new(state.join("cache"));
+        assert!(scheduler.index(&store, &workspace).unwrap().1);
+        let revision = store.inspect_revisions().unwrap().rows[0][1].clone();
+
+        assert!(!scheduler.reconcile_registered(&store, &registry));
+
+        assert!(
+            !scheduler
+                .query_metadata("main", 1, Default::default())
+                .freshness
+                .stale
+        );
+        assert_eq!(store.inspect_revisions().unwrap().rows[0][1], revision);
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

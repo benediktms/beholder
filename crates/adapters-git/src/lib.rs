@@ -3,7 +3,17 @@ use beholder_domain::{
 };
 use gix::bstr::ByteSlice;
 use sha2::{Digest, Sha256};
-use std::{error::Error, path::Path, process::Command};
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RepositoryWatchPath {
+    pub path: PathBuf,
+    pub recursive: bool,
+}
 
 pub fn canonical_remote(remote: &str) -> Option<String> {
     let remote = gix::url::parse(remote.trim()).ok()?;
@@ -24,6 +34,37 @@ pub fn repository_identity(root: &Path) -> Result<String, Box<dyn Error>> {
         Ok(repository) => repository_identity_from(&repository),
         Err(_) => local_repository_identity(root),
     }
+}
+
+/// Git administrative paths whose changes can alter the selected repository
+/// revision without touching working-tree source files.
+pub fn repository_watch_paths(root: &Path) -> Result<Vec<RepositoryWatchPath>, Box<dyn Error>> {
+    let repository = match gix::discover(root) {
+        Ok(repository) => repository,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let git_dir = repository.git_dir().canonicalize()?;
+    let common_dir = repository.common_dir().canonicalize()?;
+    let mut paths = [
+        RepositoryWatchPath {
+            path: git_dir,
+            recursive: false,
+        },
+        RepositoryWatchPath {
+            path: common_dir.join("refs"),
+            recursive: true,
+        },
+        RepositoryWatchPath {
+            path: common_dir,
+            recursive: false,
+        },
+    ]
+    .into_iter()
+    .filter(|target| target.path.exists())
+    .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 fn repository_identity_from(repository: &gix::Repository) -> Result<String, Box<dyn Error>> {
@@ -414,6 +455,17 @@ mod tests {
             .filter_map(|worktree| worktree.branch.as_deref())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(branches, ["feature", "main"].into());
+        let linked_watch_paths = repository_watch_paths(&linked)?;
+        assert!(
+            linked_watch_paths
+                .iter()
+                .any(|target| { target.path.ends_with("worktrees/linked") && !target.recursive })
+        );
+        assert!(
+            linked_watch_paths
+                .iter()
+                .any(|target| { target.path.ends_with("refs") && target.recursive })
+        );
 
         let source = |root: &Path| -> Result<Vec<(std::path::PathBuf, String)>, std::io::Error> {
             Ok(vec![(

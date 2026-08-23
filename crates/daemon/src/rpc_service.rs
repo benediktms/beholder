@@ -376,7 +376,8 @@ impl Daemon for BeholderDaemon {
             .watcher
             .lock()
             .map_err(|_| Status::internal("filesystem watcher lock poisoned"))?;
-        crate::daemon::update_workspace_watch(&mut watcher, previous.as_ref(), &workspace)
+        watcher
+            .update(previous.as_ref(), &workspace)
             .map_err(|error| Status::internal(error.to_string()))?;
         self.scheduler.mark(&workspace);
         tracing::info!(workspace = %workspace.name, "workspace registered");

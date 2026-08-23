@@ -5,7 +5,7 @@ use beholder_dto::{GarbageCollectionPhase, GarbageCollectionProgress};
 use beholder_indexing::Indexer;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     sync::{
         Arc, Mutex,
@@ -20,7 +20,7 @@ pub(super) struct BeholderDaemon {
     pub(super) scheduler: Arc<IndexScheduler>,
     pub(super) garbage_collector_running: Arc<AtomicBool>,
     pub(super) garbage_collection_progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
-    pub(super) watcher: Mutex<RecommendedWatcher>,
+    pub(super) watcher: Mutex<WorkspaceWatcher>,
     pub(super) shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -36,15 +36,16 @@ pub(super) fn build(
     let scheduler = Arc::new(IndexScheduler::with_indexer(indexer));
     let callback_workspaces = workspaces.clone();
     let callback_scheduler = scheduler.clone();
-    let mut watcher = notify::recommended_watcher(move |event| {
+    let watcher = notify::recommended_watcher(move |event| {
         callback_scheduler.add_event(event, &callback_workspaces);
     })?;
+    let mut watcher = WorkspaceWatcher::new(watcher);
     let registered = workspaces
         .lock()
         .map_err(|_| "workspace registry lock poisoned")?
         .list();
     for workspace in &registered {
-        watch_workspace(&mut watcher, workspace)?;
+        watcher.update(None, workspace)?;
     }
     for workspace in registered {
         scheduler.mark(&workspace);
@@ -146,33 +147,203 @@ pub(super) fn start_garbage_collector(
     Ok(())
 }
 
-fn watch_workspace(watcher: &mut RecommendedWatcher, workspace: &Workspace) -> notify::Result<()> {
-    for repository in &workspace.repositories {
-        watcher.watch(&repository.base, RecursiveMode::Recursive)?;
-    }
-    Ok(())
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum WatchMode {
+    NonRecursive,
+    Recursive,
 }
 
-pub(super) fn update_workspace_watch(
-    watcher: &mut RecommendedWatcher,
-    previous: Option<&Workspace>,
-    workspace: &Workspace,
-) -> notify::Result<()> {
-    let previous = previous
-        .into_iter()
-        .flat_map(|workspace| &workspace.repositories)
-        .map(|repository| &repository.base)
-        .collect::<BTreeSet<_>>();
-    let current = workspace
+impl From<WatchMode> for RecursiveMode {
+    fn from(mode: WatchMode) -> Self {
+        match mode {
+            WatchMode::NonRecursive => RecursiveMode::NonRecursive,
+            WatchMode::Recursive => RecursiveMode::Recursive,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WatchOwners {
+    non_recursive: usize,
+    recursive: usize,
+}
+
+impl WatchOwners {
+    fn mode(self) -> Option<WatchMode> {
+        if self.recursive > 0 {
+            Some(WatchMode::Recursive)
+        } else if self.non_recursive > 0 {
+            Some(WatchMode::NonRecursive)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct WatchOwnership {
+    targets: BTreeMap<std::path::PathBuf, WatchOwners>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct WatchChanges {
+    remove: Vec<std::path::PathBuf>,
+    add: Vec<(std::path::PathBuf, WatchMode)>,
+}
+
+impl WatchOwnership {
+    fn replace(
+        &mut self,
+        previous: &BTreeSet<(std::path::PathBuf, WatchMode)>,
+        current: &BTreeSet<(std::path::PathBuf, WatchMode)>,
+    ) -> WatchChanges {
+        let before = self
+            .targets
+            .iter()
+            .filter_map(|(path, owners)| owners.mode().map(|mode| (path.clone(), mode)))
+            .collect::<BTreeMap<_, _>>();
+        for (path, mode) in previous {
+            let owners = self.targets.entry(path.clone()).or_default();
+            match mode {
+                WatchMode::NonRecursive => {
+                    owners.non_recursive = owners.non_recursive.saturating_sub(1)
+                }
+                WatchMode::Recursive => owners.recursive = owners.recursive.saturating_sub(1),
+            }
+        }
+        for (path, mode) in current {
+            let owners = self.targets.entry(path.clone()).or_default();
+            match mode {
+                WatchMode::NonRecursive => owners.non_recursive += 1,
+                WatchMode::Recursive => owners.recursive += 1,
+            }
+        }
+        self.targets.retain(|_, owners| owners.mode().is_some());
+        let after = self
+            .targets
+            .iter()
+            .filter_map(|(path, owners)| owners.mode().map(|mode| (path.clone(), mode)))
+            .collect::<BTreeMap<_, _>>();
+        let mut changes = WatchChanges::default();
+        for (path, mode) in &before {
+            if after.get(path) != Some(mode) {
+                changes.remove.push(path.clone());
+            }
+        }
+        for (path, mode) in after {
+            if before.get(&path) != Some(&mode) {
+                changes.add.push((path, mode));
+            }
+        }
+        changes
+    }
+}
+
+pub(super) struct WorkspaceWatcher {
+    watcher: RecommendedWatcher,
+    ownership: WatchOwnership,
+    workspaces: BTreeMap<String, BTreeSet<(std::path::PathBuf, WatchMode)>>,
+}
+
+impl WorkspaceWatcher {
+    fn new(watcher: RecommendedWatcher) -> Self {
+        Self {
+            watcher,
+            ownership: WatchOwnership::default(),
+            workspaces: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn update(
+        &mut self,
+        _previous: Option<&Workspace>,
+        workspace: &Workspace,
+    ) -> notify::Result<()> {
+        let previous = self
+            .workspaces
+            .get(&workspace.name)
+            .cloned()
+            .unwrap_or_default();
+        let current = workspace_watch_targets(workspace);
+        let mut ownership = self.ownership.clone();
+        let changes = ownership.replace(&previous, &current);
+        for path in &changes.remove {
+            self.watcher.unwatch(path)?;
+        }
+        for (path, mode) in &changes.add {
+            self.watcher.watch(path, (*mode).into())?;
+        }
+        self.ownership = ownership;
+        self.workspaces.insert(workspace.name.clone(), current);
+        Ok(())
+    }
+}
+
+fn workspace_watch_targets(workspace: &Workspace) -> BTreeSet<(std::path::PathBuf, WatchMode)> {
+    let repository_roots = workspace
         .repositories
         .iter()
-        .map(|repository| &repository.base)
+        .map(|repository| repository.base.clone())
         .collect::<BTreeSet<_>>();
-    for repository in previous.difference(&current) {
-        watcher.unwatch(repository)?;
+    let mut targets = repository_roots
+        .iter()
+        .cloned()
+        .map(|path| (path, WatchMode::Recursive))
+        .collect::<BTreeSet<_>>();
+    for repository in &workspace.repositories {
+        let administrative =
+            beholder_adapters_git::repository_watch_paths(&repository.base).unwrap_or_default();
+        for target in administrative {
+            if repository_roots
+                .iter()
+                .any(|root| target.path.starts_with(root))
+            {
+                continue;
+            }
+            targets.insert((
+                target.path,
+                if target.recursive {
+                    WatchMode::Recursive
+                } else {
+                    WatchMode::NonRecursive
+                },
+            ));
+        }
     }
-    for repository in current.difference(&previous) {
-        watcher.watch(repository, RecursiveMode::Recursive)?;
+    targets
+}
+
+#[cfg(test)]
+mod watcher_tests {
+    use super::*;
+
+    #[test]
+    fn shared_watch_targets_are_reference_counted() {
+        let root = std::path::PathBuf::from("/workspace/shared");
+        let targets = BTreeSet::from([(root.clone(), WatchMode::Recursive)]);
+        let mut ownership = WatchOwnership::default();
+
+        assert_eq!(
+            ownership.replace(&BTreeSet::new(), &targets),
+            WatchChanges {
+                add: vec![(root.clone(), WatchMode::Recursive)],
+                ..WatchChanges::default()
+            }
+        );
+        assert_eq!(
+            ownership.replace(&BTreeSet::new(), &targets),
+            WatchChanges::default()
+        );
+        assert_eq!(
+            ownership.replace(&targets, &BTreeSet::new()),
+            WatchChanges::default()
+        );
+        assert_eq!(
+            ownership.replace(&targets, &BTreeSet::new()),
+            WatchChanges {
+                remove: vec![root],
+                ..WatchChanges::default()
+            }
+        );
     }
-    Ok(())
 }
