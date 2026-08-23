@@ -267,9 +267,13 @@ fn extended_config_path(
     let direct = normalized(&directory.join(extended));
     let mut appended = direct.as_os_str().to_os_string();
     appended.push(".json");
-    [direct.clone(), PathBuf::from(appended), direct.join("tsconfig.json")]
-        .into_iter()
-        .find(|candidate| configs.contains_key(candidate))
+    [
+        direct.clone(),
+        PathBuf::from(appended),
+        direct.join("tsconfig.json"),
+    ]
+    .into_iter()
+    .find(|candidate| configs.contains_key(candidate))
 }
 
 fn package_owners(snapshot: &WorkspaceSnapshot) -> BTreeMap<String, String> {
