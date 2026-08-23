@@ -30,20 +30,7 @@ defmodule Beholder.Worker.Elixir.AnalyzerTest do
     assert first.completeness == second.completeness
   end
 
-  test "analyzer identity includes Mix, Elixir, and OTP runtime inputs" do
-    previous = System.get_env("BEHOLDER_ELIXIR_MIX_ENV")
-
-    on_exit(fn ->
-      if previous,
-        do: System.put_env("BEHOLDER_ELIXIR_MIX_ENV", previous),
-        else: System.delete_env("BEHOLDER_ELIXIR_MIX_ENV")
-    end)
-
-    System.put_env("BEHOLDER_ELIXIR_MIX_ENV", "test")
-    version = Analyzer.metadata_version({"1.20.3", "29"})
-
-    assert version =~ ":mix-test:"
-    assert version =~ ":elixir-1.20.3:"
-    assert version =~ ":otp-29"
+  test "analyzer code identity is independent of declared runtime inputs" do
+    assert Analyzer.metadata_version({"1.20.3", "29"}) == "18:10:elixir-compiler:4"
   end
 end

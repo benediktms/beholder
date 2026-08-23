@@ -38,19 +38,26 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
       ]
     }
 
+    File.write!(Path.join(root, "mix.exs"), "stale live manifest")
+    File.write!(Path.join(root, "lib/compiler_fixture.ex"), "stale live source")
+
     assert {:ok, result} = Compiler.run(repository, cache)
     assert result.status == :ok, inspect(result)
     assert Enum.any?(result.events, &(&1.kind == :remote_function and &1.target == "Enum"))
 
     assert Enum.any?(result.events, fn event ->
-             event.kind == :module and {"call", 1} in event.definitions
+             event.kind == :module and {"call", 1} in event.definitions and
+               event.file == Path.join(root, "lib/compiler_fixture.ex")
            end)
 
     assert [_build] = Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "build-*"]))
   end
 
-  test "rejects a checkout that no longer matches the snapshot" do
+  test "materializes snapshot bytes instead of reading a changed checkout" do
     root = temp_dir("changed")
+    cache = temp_dir("changed-cache")
+    captured = Path.join(root, "captured")
+    fake_mix = fake_mix(root, "cat mix.exs > #{shell_quote(captured)}")
     File.write!(Path.join(root, "mix.exs"), "changed")
 
     repository = %Repository{
@@ -60,13 +67,23 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
       inputs: [%{path: "mix.exs", content: "original", kind: :INPUT_KIND_SOURCE}]
     }
 
-    assert {:error, "mix.exs changed after the immutable snapshot was created"} =
-             Compiler.run(repository, temp_dir("unused-cache"))
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, cache)
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.read!(captured) == "original"
   end
 
-  test "rejects dependency context that no longer matches the snapshot" do
-    target_root = temp_dir("context-target")
-    context_root = temp_dir("context-dependency")
+  test "materializes dependency context beside the target" do
+    root = temp_dir("context")
+    target_root = Path.join(root, "target")
+    context_root = Path.join(root, "context")
+    cache = temp_dir("context-cache")
+    captured = Path.join(root, "captured")
+    File.mkdir_p!(target_root)
+    File.mkdir_p!(context_root)
+    fake_mix = fake_mix(root, "cat ../context/mix.exs > #{shell_quote(captured)}")
     File.write!(Path.join(target_root, "mix.exs"), "target")
     File.write!(Path.join(context_root, "mix.exs"), "changed")
 
@@ -84,11 +101,15 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
       inputs: [%{path: "mix.exs", content: "original", kind: :INPUT_KIND_SOURCE}]
     }
 
-    assert {:error, "mix.exs changed after the immutable snapshot was created"} =
-             Compiler.run(target, [context], temp_dir("unused-context-cache"))
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
+      assert {:error, reason} = Compiler.run(target, [context], cache)
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.read!(captured) == "original"
   end
 
-  test "rejects a checkout changed while the compiler is running" do
+  test "isolates a checkout changed while the compiler is running" do
     root = temp_dir("changed-during-compile")
     cache = temp_dir("changed-during-compile-cache")
     marker = Path.join(root, "compiler-started")
@@ -107,9 +128,31 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
       wait_for_file(marker)
       File.write!(Path.join(root, "mix.exs"), "changed")
 
-      assert {:error, "mix.exs changed after the immutable snapshot was created"} =
-               Task.await(task, 5_000)
+      assert {:error, reason} = Task.await(task, 5_000)
+      refute reason =~ "changed after the immutable snapshot was created"
     end)
+  end
+
+  test "rejects absolute Mix path dependencies outside the snapshot" do
+    root = temp_dir("absolute-path")
+
+    manifest = """
+    defmodule AbsolutePath.MixProject do
+      use Mix.Project
+      def project, do: [app: :absolute_path, version: "0.1.0"]
+      defp deps, do: [{:external, path: "/live/external"}]
+    end
+    """
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "absolute",
+      inputs: [%{path: "mix.exs", content: manifest, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    assert {:error, reason} = Compiler.run(repository, temp_dir("absolute-path-cache"))
+    assert reason =~ "mix.exs declares absolute local path /live/external"
   end
 
   test "terminates an overdue compiler process and bounds its captured output" do

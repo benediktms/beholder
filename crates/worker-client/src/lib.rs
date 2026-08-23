@@ -35,6 +35,8 @@ pub struct WorkerAnalyzerBuilder {
     extensions: BTreeMap<OsString, AnalysisInputKind>,
     file_names: BTreeMap<OsString, AnalysisInputKind>,
     path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
+    parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
+    excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
 }
 
@@ -50,6 +52,8 @@ impl WorkerAnalyzerBuilder {
             extensions: BTreeMap::new(),
             file_names: BTreeMap::new(),
             path_suffixes: BTreeMap::new(),
+            parent_suffixes: BTreeMap::new(),
+            excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
         }
     }
@@ -101,6 +105,20 @@ impl WorkerAnalyzerBuilder {
         self
     }
 
+    pub fn exclude_path_suffix(mut self, suffix: impl Into<PathBuf>) -> Self {
+        self.excluded_path_suffixes.push(suffix.into());
+        self
+    }
+
+    pub fn accept_parent_suffix_as(
+        mut self,
+        suffix: impl Into<PathBuf>,
+        kind: AnalysisInputKind,
+    ) -> Self {
+        self.parent_suffixes.insert(suffix.into(), kind);
+        self
+    }
+
     pub fn identity_input(
         mut self,
         path: impl Into<PathBuf>,
@@ -133,6 +151,8 @@ impl WorkerAnalyzerBuilder {
             extensions: self.extensions,
             file_names: self.file_names,
             path_suffixes: self.path_suffixes,
+            parent_suffixes: self.parent_suffixes,
+            excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
         })
     }
@@ -145,6 +165,8 @@ pub struct WorkerAnalyzer {
     extensions: BTreeMap<OsString, AnalysisInputKind>,
     file_names: BTreeMap<OsString, AnalysisInputKind>,
     path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
+    parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
+    excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
 }
 
@@ -158,9 +180,24 @@ impl WorkspaceEnricher for WorkerAnalyzer {
     }
 
     fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        if self
+            .excluded_path_suffixes
+            .iter()
+            .any(|suffix| path.ends_with(suffix))
+        {
+            return None;
+        }
         self.path_suffixes
             .iter()
             .find_map(|(suffix, kind)| path.ends_with(suffix).then_some(*kind))
+            .or_else(|| {
+                self.parent_suffixes.iter().find_map(|(suffix, kind)| {
+                    path.ancestors()
+                        .skip(1)
+                        .any(|parent| parent.ends_with(suffix))
+                        .then_some(*kind)
+                })
+            })
             .or_else(|| {
                 path.file_name()
                     .and_then(|file_name| self.file_names.get(file_name).copied())
@@ -176,6 +213,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
     }
 
     fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
+        let snapshot = self.declared_snapshot(snapshot);
         let span = tracing::info_span!(
             "worker.analyze",
             worker = self.metadata.id,
@@ -288,6 +326,17 @@ impl WorkspaceEnricher for WorkerAnalyzer {
     }
 }
 
+impl WorkerAnalyzer {
+    fn declared_snapshot(&self, mut snapshot: EnrichmentSnapshot) -> EnrichmentSnapshot {
+        for repository in &mut snapshot.workspace.repositories {
+            repository
+                .inputs
+                .retain(|input| self.analysis_input_kind(&input.path).is_some());
+        }
+        snapshot
+    }
+}
+
 fn worker_service_name(worker: &str) -> String {
     match std::env::var("OTEL_SERVICE_NAME")
         .ok()
@@ -310,6 +359,9 @@ impl Drop for SocketFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beholder_domain::{LogicalRepository, RepositoryState};
+    use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot, WorkspaceSnapshot};
+    use std::sync::Arc;
 
     #[test]
     fn worker_inputs_preserve_semantic_roles_and_shared_identity() {
@@ -318,6 +370,10 @@ mod tests {
             .accept_extension("rs")
             .accept_file_name_as("Cargo.lock", AnalysisInputKind::Dependency)
             .accept_path_suffix_as(".cargo/config.toml", AnalysisInputKind::Configuration)
+            .accept_parent_suffix_as("config", AnalysisInputKind::Configuration)
+            .exclude_path_suffix("target/generated.rs")
+            .exclude_path_suffix("config/prod.exs")
+            .exclude_path_suffix("config/runtime.exs")
             .identity_input(
                 "$toolchain/rustc",
                 b"rustc 1".to_vec(),
@@ -338,10 +394,69 @@ mod tests {
             worker.analysis_input_kind(Path::new("nested/.cargo/config.toml")),
             Some(AnalysisInputKind::Configuration)
         );
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("config/dev.exs")),
+            Some(AnalysisInputKind::Configuration)
+        );
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("apps/api/config/nested/dev.exs")),
+            Some(AnalysisInputKind::Configuration)
+        );
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("config/runtime.exs")),
+            None
+        );
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("config/prod.exs")),
+            None
+        );
         assert_eq!(worker.identity_inputs().len(), 1);
+        assert_eq!(
+            worker.analysis_input_kind(Path::new("target/generated.rs")),
+            None
+        );
         assert_eq!(
             worker.identity_inputs()[0].kind,
             AnalysisInputKind::Toolchain
+        );
+    }
+
+    #[test]
+    fn worker_snapshot_contains_only_declared_inputs() {
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("rust", "1")
+            .accept_extension("rs")
+            .build()
+            .unwrap();
+        let input = |path: &str| RepositoryInput {
+            path: path.into(),
+            content: Arc::from(&b"contents"[..]),
+            kind: InputKind::Source,
+        };
+        let snapshot = EnrichmentSnapshot {
+            workspace: WorkspaceSnapshot {
+                name: "main".into(),
+                repositories: vec![RepositorySnapshot {
+                    base: "/workspace/example".into(),
+                    state: RepositoryState {
+                        repository: LogicalRepository {
+                            identity: "example".into(),
+                        },
+                        head: None,
+                        fingerprint: "fingerprint".into(),
+                    },
+                    inputs: vec![input("src/lib.rs"), input("README.md")],
+                }],
+            },
+            target_repository: "example".into(),
+        };
+
+        let declared = worker.declared_snapshot(snapshot);
+
+        assert_eq!(declared.workspace.repositories[0].inputs.len(), 1);
+        assert_eq!(
+            declared.workspace.repositories[0].inputs[0].path,
+            Path::new("src/lib.rs")
         );
     }
 }

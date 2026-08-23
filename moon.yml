@@ -67,7 +67,7 @@ tasks:
   install:
     command: 'bash scripts/install.sh'
     deps:
-      - 'release'
+      - 'release-all'
     inputs:
       - 'scripts/install.sh'
     options:

@@ -19,8 +19,11 @@ defmodule Beholder.Worker.Elixir.Snapshot.Repository do
     |> Enum.sort_by(& &1.path)
   end
 
+  @spec sorted_inputs(t()) :: [input()]
+  def sorted_inputs(%__MODULE__{inputs: inputs}), do: Enum.sort_by(inputs, & &1.path)
+
   @spec mix_project?(t()) :: boolean()
   def mix_project?(repository) do
-    Enum.any?(source_inputs(repository), &(&1.path == "mix.exs"))
+    Enum.any?(repository.inputs, &(&1.path == "mix.exs"))
   end
 end

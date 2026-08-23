@@ -445,6 +445,7 @@ pub(super) fn repository_snapshot(
 mod tests {
     use super::*;
     use beholder_adapters_graphql::GraphqlAnalyzer;
+    use beholder_adapters_treesitter_elixir::ElixirAnalyzer;
     use beholder_adapters_treesitter_rust::RustAnalyzer;
     use std::time::SystemTime;
 
@@ -523,6 +524,45 @@ mod tests {
                 Path::new("rust-toolchain.toml"),
                 Path::new("src/lib.rs"),
                 Path::new("src/schema.graphql"),
+            ]
+        );
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn discovers_mix_compiler_inputs_but_excludes_runtime_configuration() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repository = std::env::temp_dir().join(format!("beholder-mix-inputs-{unique}"));
+        fs::create_dir_all(repository.join("lib")).unwrap();
+        fs::create_dir_all(repository.join("config")).unwrap();
+        fs::write(repository.join("lib/app.ex"), "defmodule App, do: nil\n").unwrap();
+        fs::write(repository.join("mix.exs"), "def project, do: []\n").unwrap();
+        fs::write(repository.join("mix.lock"), "%{}\n").unwrap();
+        fs::write(repository.join("config/config.exs"), "import Config\n").unwrap();
+        fs::write(repository.join("config/dev.exs"), "import Config\n").unwrap();
+        fs::write(repository.join("config/runtime.exs"), "import Config\n").unwrap();
+        let indexer = beholder_indexing::IndexerBuilder::new(repository.join("cache"), 1)
+            .add_analyzer(ElixirAnalyzer::new(repository.join("cache")))
+            .build()
+            .unwrap();
+
+        let snapshot = repository_snapshot(&repository, &[], &indexer).unwrap();
+
+        assert_eq!(
+            snapshot
+                .inputs
+                .iter()
+                .map(|input| input.path.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("config/config.exs"),
+                Path::new("config/dev.exs"),
+                Path::new("lib/app.ex"),
+                Path::new("mix.exs"),
+                Path::new("mix.lock"),
             ]
         );
         fs::remove_dir_all(repository).unwrap();

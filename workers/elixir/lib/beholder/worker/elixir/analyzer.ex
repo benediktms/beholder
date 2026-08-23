@@ -13,7 +13,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
     RepositoryContribution
   }
 
-  @analyzer_version "18:9:elixir-compiler:3"
+  @analyzer_version "18:10:elixir-compiler:4"
   @contribution_chunk_items 2_048
 
   @spec analyze(Snapshot.t(), String.t()) :: {:ok, [AnalyzeEvent.t()]} | {:error, String.t()}
@@ -50,7 +50,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
       %{
         "repository" => repository.identity,
         "source.count" => length(Repository.source_inputs(repository)),
-        "mix.env" => System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "dev")
+        "mix.env" => configured_mix_env()
       },
       fn ->
         case Compiler.run(repository, contexts, cache_dir) do
@@ -86,13 +86,17 @@ defmodule Beholder.Worker.Elixir.Analyzer do
   end
 
   @doc false
-  def metadata_version({elixir_version, otp_release} \\ runtime_versions()) do
-    mix_env = System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "dev")
-    "#{@analyzer_version}:mix-#{mix_env}:elixir-#{elixir_version}:otp-#{otp_release}"
-  end
+  def metadata_version(_runtime \\ runtime_versions()), do: @analyzer_version
 
   defp runtime_versions do
     {System.version(), :erlang.system_info(:otp_release) |> to_string()}
+  end
+
+  defp configured_mix_env do
+    case System.get_env("BEHOLDER_ELIXIR_MIX_ENV", "") |> String.trim() do
+      "" -> "dev"
+      value -> value
+    end
   end
 
   @doc false

@@ -1791,6 +1791,28 @@ mod tests {
     }
 
     #[test]
+    fn elixir_mix_environment_and_compiler_options_change_semantic_identity() {
+        let identity = |mix_env: &'static [u8], compiler_options: &'static [u8]| {
+            analysis_inputs_identity([
+                AnalysisInput {
+                    path: "$environment/BEHOLDER_ELIXIR_MIX_ENV".into(),
+                    content: Arc::from(mix_env),
+                    kind: AnalysisInputKind::Environment,
+                },
+                AnalysisInput {
+                    path: "$environment/ERL_COMPILER_OPTIONS".into(),
+                    content: Arc::from(compiler_options),
+                    kind: AnalysisInputKind::Environment,
+                },
+            ])
+        };
+        let baseline = identity(b"dev", b"");
+
+        assert_ne!(baseline, identity(b"test", b""));
+        assert_ne!(baseline, identity(b"dev", b"[debug_info]"));
+    }
+
+    #[test]
     fn persisted_repository_analysis_is_reused_after_restart() {
         let cache_dir = cache_dir("restart");
         let first = IndexerBuilder::new(cache_dir.clone(), 1)

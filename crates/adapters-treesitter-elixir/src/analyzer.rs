@@ -10,8 +10,8 @@ use crate::{
 };
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
-    ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
-    AnalyzerPlan, CacheStatistics, GraphqlResolverCandidate, LanguageAnalyzer,
+    ActivePlugins, AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError,
+    AnalyzerMetadata, AnalyzerPlan, CacheStatistics, GraphqlResolverCandidate, LanguageAnalyzer,
     RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
@@ -117,8 +117,18 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
     }
 
     fn accepts(&self, path: &Path) -> bool {
-        path.extension()
-            .is_some_and(|extension| matches!(extension.to_str(), Some("ex" | "exs")))
+        crate::manifest::elixir_analysis_input_kind(path).is_some()
+    }
+
+    fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        crate::manifest::elixir_analysis_input_kind(path)
+    }
+
+    fn repository_dependencies(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<beholder_domain::RepositoryDependencyCandidate>, AnalyzerError> {
+        crate::manifest::mix_repository_dependencies(snapshot)
     }
 
     fn prepare(&self, snapshot: &WorkspaceSnapshot) -> AnalyzerPlan {
@@ -158,7 +168,9 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
             let sources = repository
                 .inputs
                 .iter()
-                .filter(|input| self.accepts(&input.path))
+                .filter(|input| {
+                    self.analysis_input_kind(&input.path) == Some(AnalysisInputKind::Source)
+                })
                 .map(|input| {
                     std::str::from_utf8(&input.content)
                         .map(|source| (input.path.as_path(), source))

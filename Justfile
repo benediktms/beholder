@@ -44,7 +44,7 @@ alias f := format
 
 # ── Install ──────────────────────────────────────────────────────────────────
 
-# Build, link both binaries into ~/.local/bin, and load the user daemon.
+# Build and link the CLI, daemon, and compiler workers, then load the user daemon.
 [group('install')]
 [unix]
 install:
