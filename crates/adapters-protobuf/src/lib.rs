@@ -3,8 +3,9 @@ use beholder_domain::{
     StructuralRelation,
 };
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata, AnalyzerPlan,
-    CacheStatistics, InputKind, RepositoryContribution, WorkspaceAnalyzer, WorkspaceSnapshot,
+    AnalysisCompleteness, AnalysisInput, AnalysisInputKind, AnalyzerContribution, AnalyzerError,
+    AnalyzerMetadata, AnalyzerPlan, CacheStatistics, InputKind, RepositoryContribution,
+    WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use prost::Message;
 use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
@@ -13,7 +14,7 @@ mod compiler;
 
 pub use compiler::SourceCompiler;
 
-pub const FRONTEND_VERSION: &str = "2";
+pub const FRONTEND_VERSION: &str = "3";
 
 pub struct ProtobufAnalyzer {
     compiler: SourceCompiler,
@@ -36,12 +37,11 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
     }
 
     fn accepts(&self, path: &std::path::Path) -> bool {
-        path.extension()
-            .is_some_and(|extension| extension == "proto")
-            || matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("buf.yaml" | "buf.lock")
-            )
+        protobuf_input_kind(path).is_some()
+    }
+
+    fn analysis_input_kind(&self, path: &std::path::Path) -> Option<AnalysisInputKind> {
+        protobuf_input_kind(path)
     }
 
     fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
@@ -63,7 +63,13 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
                 .inputs
                 .iter()
                 .filter(|input| input.kind == InputKind::Source && self.accepts(&input.path))
-                .map(|input| (input.path.clone(), input.content.to_vec()))
+                .map(|input| {
+                    AnalysisInput::from_repository(
+                        input,
+                        self.analysis_input_kind(&input.path)
+                            .expect("accepted Protobuf input has a declared kind"),
+                    )
+                })
                 .collect::<Vec<_>>();
             let mut descriptors = repository
                 .inputs
@@ -82,10 +88,7 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
                 continue;
             }
             let mut diagnostics = Vec::new();
-            match self
-                .compiler
-                .compile_repository(&repository.base, &source_inputs)
-            {
+            match self.compiler.compile_repository(&source_inputs) {
                 Ok(compiled) => {
                     descriptors.extend(
                         compiled
@@ -145,6 +148,21 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
         self.compiler
             .clear_memory()
             .map_err(|error| std::io::Error::other(error).into())
+    }
+}
+
+fn protobuf_input_kind(path: &std::path::Path) -> Option<AnalysisInputKind> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "proto")
+    {
+        Some(AnalysisInputKind::Source)
+    } else {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("buf.yaml") => Some(AnalysisInputKind::Configuration),
+            Some("buf.lock") => Some(AnalysisInputKind::Dependency),
+            _ => None,
+        }
     }
 }
 
@@ -339,6 +357,28 @@ mod tests {
         EnumDescriptorProto, FieldDescriptorProto, MethodDescriptorProto, ServiceDescriptorProto,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn declares_semantic_input_roles() {
+        let analyzer = ProtobufAnalyzer::new(std::path::PathBuf::new());
+
+        assert_eq!(
+            analyzer.analysis_input_kind(std::path::Path::new("api/service.proto")),
+            Some(AnalysisInputKind::Source)
+        );
+        assert_eq!(
+            analyzer.analysis_input_kind(std::path::Path::new("buf.yaml")),
+            Some(AnalysisInputKind::Configuration)
+        );
+        assert_eq!(
+            analyzer.analysis_input_kind(std::path::Path::new("buf.lock")),
+            Some(AnalysisInputKind::Dependency)
+        );
+        assert_eq!(
+            analyzer.analysis_input_kind(std::path::Path::new("README.md")),
+            None
+        );
+    }
 
     #[test]
     fn decodes_canonical_contract_facts() {

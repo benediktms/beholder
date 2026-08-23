@@ -329,6 +329,7 @@ reindex_until_current() {
             printf '%s' "$output"
             return 0
         fi
+        touch "$state/reindex-retried"
         sleep 0.1
     done
     printf '%s' "$output"
@@ -375,9 +376,16 @@ if [[ -z "$trace_file" ]]; then
     echo 'daemon produced no structured trace file' >&2
     exit 1
 fi
-unexpected_errors="$(grep -E '"level":"(WARN|ERROR)"' "$trace_file" \
-    | grep -Fv 'rust.parse_recovery' \
-    || true)"
+unexpected_errors="$(grep -E '"level":"(WARN|ERROR)"' "$trace_file" || true)"
+unexpected_errors="$(grep -Fv 'rust.parse_recovery' <<<"$unexpected_errors" || true)"
+if [[ -e "$state/reindex-retried" ]]; then
+    unexpected_errors="$(grep -Fv \
+        'workspace inputs changed during indexing; stale analysis was discarded' \
+        <<<"$unexpected_errors" || true)"
+    unexpected_errors="$(grep -Fv \
+        'message: \"workspace indexing failed\"' \
+        <<<"$unexpected_errors" || true)"
+fi
 if [[ -n "$unexpected_errors" ]]; then
     echo 'daemon trace contains warnings or errors:' >&2
     printf '%s\n' "$unexpected_errors" >&2

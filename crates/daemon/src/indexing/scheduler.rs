@@ -74,8 +74,8 @@ use beholder_domain::{
 use beholder_dto::{Freshness, QueryMetadata};
 #[cfg(test)]
 use beholder_indexing::{
-    AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot, IndexerBuilder, WorkspaceAnalyzer,
-    WorkspaceEnricher,
+    AnalysisInput, AnalysisInputKind, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot,
+    IndexerBuilder, WorkspaceAnalyzer, WorkspaceEnricher,
 };
 use beholder_indexing::{CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot};
 use notify::{Event, EventKind};
@@ -1644,11 +1644,24 @@ fn index_workspace_versioned(
     }
     let protobuf_compilation_started = Instant::now();
     let mut diagnostics = Vec::new();
-    for (repository, sources) in workspace.repositories.iter().zip(&mut repositories) {
+    for sources in &mut repositories {
+        let protobuf_inputs = sources
+            .protobuf_source
+            .iter()
+            .map(|(path, bytes)| AnalysisInput {
+                path: path.clone(),
+                content: Arc::from(bytes.as_slice()),
+                kind: match path.file_name().and_then(|name| name.to_str()) {
+                    Some("buf.yaml") => AnalysisInputKind::Configuration,
+                    Some("buf.lock") => AnalysisInputKind::Dependency,
+                    _ => AnalysisInputKind::Source,
+                },
+            })
+            .collect::<Vec<_>>();
         let descriptors = scheduler.analysis_pool.install(|| {
             scheduler
                 .protobuf_compiler
-                .compile_repository(&repository.base, &sources.protobuf_source)
+                .compile_repository(&protobuf_inputs)
         });
         let descriptors = match descriptors {
             Ok(descriptors) => descriptors,

@@ -27,6 +27,37 @@ pub struct RepositoryInput {
     pub kind: InputKind,
 }
 
+/// An immutable input declared by a compiler-backed analyzer.
+///
+/// The input kind describes why the compiler result depends on these bytes;
+/// analyzer and compiler versions remain part of analyzer metadata rather than
+/// being represented as synthetic files.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalysisInput {
+    pub path: PathBuf,
+    pub content: Arc<[u8]>,
+    pub kind: AnalysisInputKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AnalysisInputKind {
+    Source,
+    Configuration,
+    Dependency,
+    Toolchain,
+    Environment,
+}
+
+impl AnalysisInput {
+    pub fn from_repository(input: &RepositoryInput, kind: AnalysisInputKind) -> Self {
+        Self {
+            path: input.path.clone(),
+            content: Arc::clone(&input.content),
+            kind,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum InputKind {
     #[default]
@@ -161,6 +192,14 @@ pub struct WorkspaceAnalysis {
 pub trait WorkspaceAnalyzer: Send + Sync {
     fn metadata(&self) -> AnalyzerMetadata;
     fn accepts(&self, path: &Path) -> bool;
+    /// Declares the semantic role of an accepted input.
+    ///
+    /// Compiler-backed analyzers should override this for configuration,
+    /// dependency, toolchain, and environment inputs. The declared role and
+    /// immutable bytes can then be included in compiler cache identity.
+    fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        self.accepts(path).then_some(AnalysisInputKind::Source)
+    }
     fn is_active(&self, repository: &RepositorySnapshot) -> bool {
         repository
             .inputs
@@ -192,6 +231,10 @@ pub type EnrichmentFuture<'a> =
 pub trait WorkspaceEnricher: Send + Sync {
     fn metadata(&self) -> AnalyzerMetadata;
     fn accepts(&self, path: &Path) -> bool;
+    /// Declares the semantic role of an accepted enrichment input.
+    fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        self.accepts(path).then_some(AnalysisInputKind::Source)
+    }
     fn is_active(&self, repository: &RepositorySnapshot) -> bool {
         repository
             .inputs
