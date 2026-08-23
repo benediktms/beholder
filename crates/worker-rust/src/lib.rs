@@ -217,9 +217,10 @@ impl MaterializedWorkspace {
                 }
                 for input in &repository.inputs {
                     if input.path.is_absolute()
-                        || input.path.components().any(|component| {
-                            matches!(component, std::path::Component::ParentDir)
-                        })
+                        || input
+                            .path
+                            .components()
+                            .any(|component| matches!(component, std::path::Component::ParentDir))
                     {
                         return Err(format!(
                             "Rust enrichment input escapes its repository: {}",
@@ -486,9 +487,9 @@ fn enrich_repository(
     let mut change = ChangeWithProcMacros::default();
     let mut snapshot_files = Vec::new();
     for snapshot_repository in &snapshot.repositories {
-        let Some(materialized_base) = materialized.repository(
-            &snapshot_repository.state.repository.identity,
-        ) else {
+        let Some(materialized_base) =
+            materialized.repository(&snapshot_repository.state.repository.identity)
+        else {
             continue;
         };
         for input in snapshot_repository.inputs.iter().filter(|input| {
@@ -732,7 +733,10 @@ fn cargo_features(
 
 fn environment_enabled(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
     })
 }
 
@@ -828,7 +832,11 @@ fn caller() {
         let broken = "fn broken( {\n";
         fs::write(base.join("Cargo.toml"), "not the snapshot manifest").unwrap();
         fs::write(base.join("Cargo.lock"), "not the snapshot lockfile").unwrap();
-        fs::write(base.join(".cargo/config.toml"), "not snapshot configuration").unwrap();
+        fs::write(
+            base.join(".cargo/config.toml"),
+            "not snapshot configuration",
+        )
+        .unwrap();
         fs::write(
             base.join("src/lib.rs"),
             "mod inner; pub fn stale_disk_source() {}",

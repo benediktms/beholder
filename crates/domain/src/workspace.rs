@@ -561,20 +561,16 @@ mod tests {
         let changed_unrelated = view("context-one", "unrelated-two");
 
         assert_ne!(
-            original.repository_enrichment_input_fingerprint(
-                &original.repository_states[0],
-                "rust",
-            ),
+            original
+                .repository_enrichment_input_fingerprint(&original.repository_states[0], "rust",),
             changed_context.repository_enrichment_input_fingerprint(
                 &changed_context.repository_states[0],
                 "rust",
             )
         );
         assert_eq!(
-            original.repository_enrichment_input_fingerprint(
-                &original.repository_states[0],
-                "rust",
-            ),
+            original
+                .repository_enrichment_input_fingerprint(&original.repository_states[0], "rust",),
             changed_unrelated.repository_enrichment_input_fingerprint(
                 &changed_unrelated.repository_states[0],
                 "rust",

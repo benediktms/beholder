@@ -15,7 +15,9 @@ pub fn rust_analysis_input_kind(path: &Path) -> Option<AnalysisInputKind> {
         Some("Cargo.toml" | "Cargo.lock") => Some(AnalysisInputKind::Dependency),
         Some("rust-toolchain" | "rust-toolchain.toml") => Some(AnalysisInputKind::Toolchain),
         Some("config" | "config.toml")
-            if path.parent().is_some_and(|parent| parent.ends_with(".cargo")) =>
+            if path
+                .parent()
+                .is_some_and(|parent| parent.ends_with(".cargo")) =>
         {
             Some(AnalysisInputKind::Configuration)
         }
@@ -117,9 +119,9 @@ pub fn validate_immutable_rust_inputs(snapshot: &WorkspaceSnapshot) -> Result<()
             }
             let text = str::from_utf8(&input.content)
                 .map_err(|error| SourceAnalysisError::from_source(&input.path, Box::new(error)))?;
-            let document = text.parse::<toml::Value>().map_err(|error| {
-                SourceAnalysisError::from_source(&input.path, Box::new(error))
-            })?;
+            let document = text
+                .parse::<toml::Value>()
+                .map_err(|error| SourceAnalysisError::from_source(&input.path, Box::new(error)))?;
             reject_absolute_local_paths(&document, &input.path)?;
         }
     }
@@ -144,9 +146,10 @@ fn reject_absolute_local_paths(value: &toml::Value, source: &Path) -> Result<(),
                 }
                 if key == "paths"
                     && value.as_array().is_some_and(|paths| {
-                        paths.iter().filter_map(toml::Value::as_str).any(|path| {
-                            Path::new(path).is_absolute()
-                        })
+                        paths
+                            .iter()
+                            .filter_map(toml::Value::as_str)
+                            .any(|path| Path::new(path).is_absolute())
                     })
                 {
                     return Err(format!(
@@ -171,7 +174,12 @@ fn reject_absolute_local_paths(value: &toml::Value, source: &Path) -> Result<(),
 fn dependency_paths(manifest: &toml::Value) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(root) = manifest.as_table() {
-        for name in ["dependencies", "dev-dependencies", "build-dependencies", "replace"] {
+        for name in [
+            "dependencies",
+            "dev-dependencies",
+            "build-dependencies",
+            "replace",
+        ] {
             collect_paths_from_dependency_table(root.get(name), &mut paths);
         }
         if let Some(workspace) = root.get("workspace").and_then(toml::Value::as_table) {
@@ -332,12 +340,16 @@ mod tests {
                 && dependency.to == "example/b"
                 && dependency.analyzer == "rust"
         }));
-        assert!(dependencies
-            .iter()
-            .any(|dependency| dependency.kind == RepositoryDependencyKind::PathDependency));
-        assert!(dependencies
-            .iter()
-            .any(|dependency| dependency.kind == RepositoryDependencyKind::WorkspaceMember));
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.kind == RepositoryDependencyKind::PathDependency)
+        );
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.kind == RepositoryDependencyKind::WorkspaceMember)
+        );
     }
 
     #[test]

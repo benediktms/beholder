@@ -1779,10 +1779,7 @@ mod tests {
         };
         let baseline = identity(b"default", b"x86_64-unknown-linux-gnu", b"");
 
-        assert_ne!(
-            baseline,
-            identity(b"api", b"x86_64-unknown-linux-gnu", b"")
-        );
+        assert_ne!(baseline, identity(b"api", b"x86_64-unknown-linux-gnu", b""));
         assert_ne!(
             baseline,
             identity(b"default", b"wasm32-unknown-unknown", b"")

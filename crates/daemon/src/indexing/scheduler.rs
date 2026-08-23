@@ -1382,30 +1382,35 @@ fn index_workspace_through_port(
         analysis_plan.repository_enrichment_identities(),
     )?;
     if store.view_matches(&view)? {
-        view = view.with_repository_contexts(
-            scheduler
-                .indexer
-                .enrichment_catalog()
-                .into_iter()
-                .map(|analyzer| {
-                    let contexts = snapshot
-                        .repositories
-                        .iter()
-                        .map(|repository| {
-                            let target = &repository.state.repository.identity;
-                            Ok((
-                                target.clone(),
-                                store.repository_contexts(&workspace.name, target, &analyzer.id)?,
-                            ))
-                        })
-                        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
-                    Ok((analyzer.id, contexts))
-                })
-                .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
-        )?
-        .with_repository_enrichment_inputs(
-            scheduler.indexer.enrichment_input_identities(snapshot),
-        )?;
+        view = view
+            .with_repository_contexts(
+                scheduler
+                    .indexer
+                    .enrichment_catalog()
+                    .into_iter()
+                    .map(|analyzer| {
+                        let contexts = snapshot
+                            .repositories
+                            .iter()
+                            .map(|repository| {
+                                let target = &repository.state.repository.identity;
+                                Ok((
+                                    target.clone(),
+                                    store.repository_contexts(
+                                        &workspace.name,
+                                        target,
+                                        &analyzer.id,
+                                    )?,
+                                ))
+                            })
+                            .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+                        Ok((analyzer.id, contexts))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
+            )?
+            .with_repository_enrichment_inputs(
+                scheduler.indexer.enrichment_input_identities(snapshot),
+            )?;
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         scheduler.queue_enrichments(store, &snapshot, &view)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
@@ -1459,18 +1464,21 @@ fn index_workspace_through_port(
     let mut dependency_graph =
         RepositoryDependencyGraph::from_baseline(&repository_facts, &analysis.overrides)?;
     dependency_graph.add_candidates(analysis.repository_dependencies)?;
-    view = view.with_repository_contexts(
-        scheduler
-            .indexer
-            .enrichment_catalog()
-            .into_iter()
-            .map(|analyzer| {
-                let contexts = dependency_graph.context_map_for(&analyzer.id);
-                (analyzer.id, contexts)
-            })
-            .collect(),
-    )?
-    .with_repository_enrichment_inputs(scheduler.indexer.enrichment_input_identities(snapshot))?;
+    view = view
+        .with_repository_contexts(
+            scheduler
+                .indexer
+                .enrichment_catalog()
+                .into_iter()
+                .map(|analyzer| {
+                    let contexts = dependency_graph.context_map_for(&analyzer.id);
+                    (analyzer.id, contexts)
+                })
+                .collect(),
+        )?
+        .with_repository_enrichment_inputs(
+            scheduler.indexer.enrichment_input_identities(snapshot),
+        )?;
     let observation_count = repository_facts
         .iter()
         .map(|facts| facts.observations.len())

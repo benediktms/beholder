@@ -475,10 +475,17 @@ mod tests {
         fs::create_dir_all(repository.join("target")).unwrap();
         fs::create_dir_all(repository.join("infra/.terraform/modules/dependency")).unwrap();
         fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
-        fs::write(repository.join("Cargo.toml"), "[package]\nname = \"indexed\"\n").unwrap();
+        fs::write(
+            repository.join("Cargo.toml"),
+            "[package]\nname = \"indexed\"\n",
+        )
+        .unwrap();
         fs::write(repository.join("Cargo.lock"), "version = 4\n").unwrap();
-        fs::write(repository.join("rust-toolchain.toml"), "[toolchain]\nchannel = \"stable\"\n")
-            .unwrap();
+        fs::write(
+            repository.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
         fs::write(
             repository.join(".cargo/config.toml"),
             "[build]\ntarget-dir = \"target\"\n",

@@ -6,9 +6,9 @@ use beholder_adapters_treesitter_elixir::ElixirAnalyzer;
 use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
-use beholder_indexing::{Indexer, IndexerBuilder};
 #[cfg(not(test))]
 use beholder_indexing::AnalysisInputKind;
+use beholder_indexing::{Indexer, IndexerBuilder};
 use beholder_observability::{ExportMode, LogOutput};
 use beholder_protocol::v1::daemon_server::DaemonServer;
 #[cfg(not(test))]
