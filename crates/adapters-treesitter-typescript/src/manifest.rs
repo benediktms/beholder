@@ -252,15 +252,24 @@ fn collect_config_chain(
     };
     let directory = path.parent().unwrap_or_else(|| Path::new(""));
     for extended in config.extends.values().iter().filter(|path| is_local(path)) {
-        let mut parent = normalized(&directory.join(extended));
-        if parent.extension().is_none() {
-            parent.set_extension("json");
-        }
-        if configs.contains_key(&parent) {
+        if let Some(parent) = extended_config_path(directory, extended, configs) {
             collect_config_chain(&parent, configs, visiting, chain);
         }
     }
     visiting.remove(&path);
+}
+
+fn extended_config_path(
+    directory: &Path,
+    extended: &str,
+    configs: &BTreeMap<PathBuf, ProjectConfig>,
+) -> Option<PathBuf> {
+    let direct = normalized(&directory.join(extended));
+    let mut appended = direct.as_os_str().to_os_string();
+    appended.push(".json");
+    [direct.clone(), PathBuf::from(appended), direct.join("tsconfig.json")]
+        .into_iter()
+        .find(|candidate| configs.contains_key(candidate))
 }
 
 fn package_owners(snapshot: &WorkspaceSnapshot) -> BTreeMap<String, String> {
