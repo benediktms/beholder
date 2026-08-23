@@ -280,11 +280,7 @@ fn baseline_identities_change_only_for_the_owning_language_and_target() {
     for fixture in LANGUAGE_FIXTURES {
         assert_eq!(
             original,
-            indexer.analysis_input_identities(&mutate(
-                &snapshot,
-                fixture.repository,
-                "README.md",
-            ))
+            indexer.analysis_input_identities(&mutate(&snapshot, fixture.repository, "README.md",))
         );
     }
 }
@@ -338,11 +334,7 @@ fn compiler_identities_scope_repository_and_environment_changes() {
     }
     assert_eq!(
         original,
-        indexer.enrichment_input_identities(&mutate(
-            &snapshot,
-            "fixture/rust",
-            "README.md",
-        ))
+        indexer.enrichment_input_identities(&mutate(&snapshot, "fixture/rust", "README.md",))
     );
     assert_eq!(
         original,
@@ -351,8 +343,7 @@ fn compiler_identities_scope_repository_and_environment_changes() {
 
     let rust_environment =
         compiler_indexer(b"--cfg conformance", b"dev").enrichment_input_identities(&snapshot);
-    let elixir_environment =
-        compiler_indexer(b"", b"test").enrichment_input_identities(&snapshot);
+    let elixir_environment = compiler_indexer(b"", b"test").enrichment_input_identities(&snapshot);
     for analyzer in ["rust", "elixir"] {
         for repository in original[analyzer].keys() {
             if analyzer == "rust" {
