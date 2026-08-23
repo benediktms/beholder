@@ -44,6 +44,27 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
         protobuf_input_kind(path)
     }
 
+    fn analysis_inputs(
+        &self,
+        repository: &beholder_indexing::RepositorySnapshot,
+    ) -> Vec<AnalysisInput> {
+        repository
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                if input.kind == InputKind::ProtobufDescriptor {
+                    Some(AnalysisInput::from_repository(
+                        input,
+                        AnalysisInputKind::Source,
+                    ))
+                } else {
+                    self.analysis_input_kind(&input.path)
+                        .map(|kind| AnalysisInput::from_repository(input, kind))
+                }
+            })
+            .collect()
+    }
+
     fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
         repository
             .inputs

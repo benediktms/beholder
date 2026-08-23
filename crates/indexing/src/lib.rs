@@ -202,6 +202,21 @@ pub trait WorkspaceAnalyzer: Send + Sync {
     fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
         self.accepts(path).then_some(AnalysisInputKind::Source)
     }
+    fn analysis_inputs(&self, repository: &RepositorySnapshot) -> Vec<AnalysisInput> {
+        repository
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                self.analysis_input_kind(&input.path)
+                    .map(|kind| AnalysisInput::from_repository(input, kind))
+            })
+            .collect()
+    }
+    /// Synthetic toolchain and environment inputs which affect every target
+    /// handled by this analyzer.
+    fn identity_inputs(&self) -> Vec<AnalysisInput> {
+        Vec::new()
+    }
     fn is_active(&self, repository: &RepositorySnapshot) -> bool {
         repository
             .inputs
@@ -934,6 +949,36 @@ impl Indexer {
         self.prepare(snapshot).analysis_identity
     }
 
+    /// Semantic input identities for every analyzer and repository.
+    ///
+    /// These identities deliberately exclude repository fingerprints so that
+    /// callers can distinguish relevant analyzer inputs from unrelated files.
+    pub fn analysis_input_identities(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.analyzers
+            .iter()
+            .map(|analyzer| {
+                let metadata = analyzer.metadata();
+                let shared = analyzer.identity_inputs();
+                let repositories = snapshot
+                    .repositories
+                    .iter()
+                    .map(|repository| {
+                        let mut inputs = analyzer.analysis_inputs(repository);
+                        inputs.extend(shared.iter().cloned());
+                        (
+                            repository.state.repository.identity.clone(),
+                            analysis_inputs_identity(inputs),
+                        )
+                    })
+                    .collect();
+                (metadata.id, repositories)
+            })
+            .collect()
+    }
+
     pub fn catalog_identity(&self) -> String {
         format!(
             "{}:core-rules:{CORE_RULE_PACK_VERSION}",
@@ -987,6 +1032,21 @@ impl Indexer {
             .collect()
     }
 
+    /// Collects normalized, analyzer-owned dependency evidence without running
+    /// source analysis. The same path feeds workspace analysis and scheduling.
+    pub fn repository_dependencies(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<RepositoryDependencyCandidate>, AnalyzerError> {
+        let mut dependencies = Vec::new();
+        for analyzer in &self.analyzers {
+            dependencies.extend(analyzer.repository_dependencies(snapshot)?);
+        }
+        dependencies.sort();
+        dependencies.dedup();
+        Ok(dependencies)
+    }
+
     pub async fn enrich(
         &self,
         snapshot: EnrichmentSnapshot,
@@ -1034,7 +1094,7 @@ impl Indexer {
         let mut overrides = Vec::new();
         let mut graphql_resolvers = Vec::new();
         let mut diagnostics = Vec::new();
-        let mut repository_dependencies = Vec::new();
+        let repository_dependencies = self.repository_dependencies(snapshot)?;
         let mut cache = CacheStatistics::default();
         for (index, analyzer) in self.analyzers.iter().enumerate() {
             let analyzer_plan = plan.analyzer(index);
@@ -1045,7 +1105,6 @@ impl Indexer {
                 )
                 .into());
             }
-            repository_dependencies.extend(analyzer.repository_dependencies(snapshot)?);
             let contribution = self
                 .pool
                 .install(|| analyzer.analyze_prepared(snapshot, analyzer_plan))?;
@@ -1117,8 +1176,6 @@ impl Indexer {
             });
         }
         bind_graphql_resolvers(&mut repositories, graphql_resolvers);
-        repository_dependencies.sort();
-        repository_dependencies.dedup();
         Ok(WorkspaceAnalysis {
             analysis_identity: plan.analysis_identity.clone(),
             repositories,
