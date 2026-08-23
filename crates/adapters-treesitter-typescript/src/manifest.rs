@@ -1,7 +1,5 @@
 use beholder_domain::{RepositoryDependencyCandidate, RepositoryDependencyKind};
-use beholder_indexing::{
-    AnalysisInputKind, AnalyzerError, RepositorySnapshot, WorkspaceSnapshot,
-};
+use beholder_indexing::{AnalysisInputKind, AnalyzerError, RepositorySnapshot, WorkspaceSnapshot};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -71,8 +69,7 @@ pub fn typescript_analysis_input_kind(path: &Path) -> Option<AnalysisInputKind> 
 }
 
 fn is_project_config_name(name: &str) -> bool {
-    ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
-        && name.ends_with(".json"))
+    ((name.starts_with("tsconfig.") || name.starts_with("jsconfig.")) && name.ends_with(".json"))
         || matches!(name, "tsconfig.json" | "jsconfig.json")
 }
 
@@ -462,11 +459,7 @@ mod tests {
     use beholder_indexing::{InputKind, RepositoryInput};
     use std::sync::Arc;
 
-    fn repository(
-        identity: &str,
-        base: &str,
-        inputs: &[(&str, &str)],
-    ) -> RepositorySnapshot {
+    fn repository(identity: &str, base: &str, inputs: &[(&str, &str)]) -> RepositorySnapshot {
         RepositorySnapshot {
             base: base.into(),
             state: RepositoryState {
@@ -505,10 +498,7 @@ mod tests {
             typescript_analysis_input_kind(Path::new("unrelated.json")),
             None
         );
-        assert_eq!(
-            typescript_analysis_input_kind(Path::new(".env")),
-            None
-        );
+        assert_eq!(typescript_analysis_input_kind(Path::new(".env")), None);
     }
 
     #[test]

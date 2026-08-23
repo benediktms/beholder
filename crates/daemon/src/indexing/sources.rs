@@ -124,8 +124,7 @@ pub(super) fn is_index_input(path: &Path) -> bool {
                     | "bun.lock"
                     | "bun.lockb"
                     | "deno.lock"
-            )
-                || name.ends_with(".csproj")
+            ) || name.ends_with(".csproj")
                 || name.ends_with(".asmdef")
                 || name.ends_with(".prefab")
                 || name.ends_with(".cs.meta")
