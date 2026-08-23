@@ -1,11 +1,12 @@
 pub const FRONTEND_VERSION: &str = "29";
-pub const RESOLVER_VERSION: &str = "20";
+pub const RESOLVER_VERSION: &str = "21";
 
 mod analysis;
 mod analyzer;
 mod graphql;
 mod grats;
 mod grpc;
+mod manifest;
 mod model;
 mod nestjs;
 mod nestjs_di;
@@ -23,6 +24,7 @@ pub use graphql::{
     collect_graphql_resolvers,
 };
 pub use grpc::{GrpcBindingInput, bindings as grpc_bindings};
+pub use manifest::{typescript_analysis_input_kind, typescript_config_chains};
 pub use model::{SourceLanguage, TypescriptAnalysis, TypescriptRepository};
 pub use resolution::{
     resolve_repository_calls, resolve_workspace_calls, unresolved_call_diagnostics,

@@ -12,9 +12,9 @@ use crate::{
 use beholder_adapters_graphql::GraphqlSource;
 use beholder_domain::SourceAnalysisError;
 use beholder_indexing::{
-    ActivePlugins, AnalysisCompleteness, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
-    AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
-    WorkspaceAnalyzer, WorkspaceSnapshot,
+    ActivePlugins, AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError,
+    AnalyzerMetadata, AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution,
+    RepositoryFactsView, WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -122,19 +122,11 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
     }
 
     fn accepts(&self, path: &Path) -> bool {
-        SourceLanguage::from_path(path).is_some()
-            || path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| matches!(extension, "graphql" | "gql"))
-            || path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name == "package.json"
-                        || ((name.starts_with("tsconfig.") || name.starts_with("jsconfig."))
-                            && name.ends_with(".json"))
-                })
+        crate::manifest::typescript_analysis_input_kind(path).is_some()
+    }
+
+    fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        crate::manifest::typescript_analysis_input_kind(path)
     }
 
     fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
@@ -164,6 +156,13 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 )
             }),
         )
+    }
+
+    fn repository_dependencies(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<Vec<beholder_domain::RepositoryDependencyCandidate>, AnalyzerError> {
+        crate::manifest::typescript_repository_dependencies(snapshot)
     }
 
     fn analyze_prepared(
