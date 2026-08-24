@@ -479,6 +479,10 @@ fn max_hops(value: Option<u32>) -> Result<u32, Status> {
 }
 
 fn operation_status(error: BeholderError) -> Status {
+    operation_status_ref(&error)
+}
+
+pub(super) fn operation_status_ref(error: &BeholderError) -> Status {
     let code = match error.kind() {
         BeholderErrorKind::InvalidInput => Code::InvalidArgument,
         BeholderErrorKind::NotFound => Code::NotFound,

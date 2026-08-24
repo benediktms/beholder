@@ -13,6 +13,7 @@ pub enum BeholderErrorCode {
     WorkspaceNotRegistered,
     WorkspaceObservationCountOverflow,
     WorkspaceRegistryFailed,
+    WorkspaceRevisionUnavailable,
 }
 
 impl BeholderErrorCode {
@@ -31,6 +32,7 @@ impl BeholderErrorCode {
                 "beholder.workspace.observation_count_overflow"
             }
             Self::WorkspaceRegistryFailed => "beholder.workspace.registry_failed",
+            Self::WorkspaceRevisionUnavailable => "beholder.workspace.revision_unavailable",
         }
     }
 }
@@ -53,6 +55,7 @@ impl std::str::FromStr for BeholderErrorCode {
                 Ok(Self::WorkspaceObservationCountOverflow)
             }
             "beholder.workspace.registry_failed" => Ok(Self::WorkspaceRegistryFailed),
+            "beholder.workspace.revision_unavailable" => Ok(Self::WorkspaceRevisionUnavailable),
             _ => Err(()),
         }
     }
@@ -199,6 +202,7 @@ mod tests {
             BeholderErrorCode::WorkspaceNotRegistered,
             BeholderErrorCode::WorkspaceObservationCountOverflow,
             BeholderErrorCode::WorkspaceRegistryFailed,
+            BeholderErrorCode::WorkspaceRevisionUnavailable,
         ] {
             assert_eq!(code.as_str().parse(), Ok(code));
         }

@@ -1,4 +1,6 @@
 use super::daemon::BeholderDaemon;
+use super::rpc_service::operation_status_ref;
+use beholder_domain::BeholderError;
 use beholder_dto::{Revisioned, SemanticQueryResult};
 use std::error::Error;
 use tonic::{Response, Status};
@@ -13,7 +15,11 @@ impl BeholderDaemon {
         T: SemanticQueryResult,
         P: From<T>,
     {
-        let revisioned = result.map_err(|error| Status::internal(error.to_string()))?;
+        let revisioned = result.map_err(|error| {
+            error
+                .downcast_ref::<BeholderError>()
+                .map_or_else(|| Status::internal(error.to_string()), operation_status_ref)
+        })?;
         let mut result = revisioned.result;
         *result.metadata_mut() = self.scheduler.query_metadata(
             workspace,

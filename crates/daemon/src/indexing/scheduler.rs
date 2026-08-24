@@ -762,15 +762,10 @@ impl IndexScheduler {
         let Ok(registry) = workspaces.lock() else {
             return;
         };
-        let Ok(mut generations) = self.generations.lock() else {
-            return;
-        };
-        let Ok(mut dirty_repositories) = self.dirty_repositories.lock() else {
-            return;
-        };
-        let mut changed = false;
-        let mut changed_workspaces = BTreeSet::new();
-        for workspace in registry.list() {
+        let registered = registry.list();
+        drop(registry);
+        let mut changes = Vec::new();
+        for workspace in registered {
             let dirty = workspace
                 .repositories
                 .iter()
@@ -819,33 +814,54 @@ impl IndexScheduler {
                 })
                 .collect::<Vec<_>>();
             if !dirty.is_empty() {
-                tracing::debug!(workspace = %workspace.name, repositories = dirty.len(), source_units = dirty.iter().map(|(_, intent)| intent.source_count()).sum::<usize>(), "workspace marked stale");
-                changed_workspaces.insert(workspace.name.clone());
-                *generations.entry(workspace.name.clone()).or_default() += 1;
-                let repositories = dirty_repositories.entry(workspace.name).or_default();
-                for (repository, pending) in dirty {
-                    repositories.entry(repository).or_default().merge(pending);
-                }
-                changed = true;
+                changes.push((workspace.name, dirty));
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let Ok(mut generations) = self.generations.lock() else {
+            return;
+        };
+        let Ok(mut dirty_repositories) = self.dirty_repositories.lock() else {
+            return;
+        };
+        let changed_workspaces = changes
+            .iter()
+            .map(|(workspace, _)| workspace.clone())
+            .collect::<Vec<_>>();
+        for (workspace, dirty) in changes {
+            tracing::debug!(
+                workspace,
+                repositories = dirty.len(),
+                source_units = dirty
+                    .iter()
+                    .map(|(_, intent)| intent.source_count())
+                    .sum::<usize>(),
+                "workspace marked stale"
+            );
+            *generations.entry(workspace.clone()).or_default() += 1;
+            let repositories = dirty_repositories.entry(workspace).or_default();
+            for (repository, pending) in dirty {
+                repositories.entry(repository).or_default().merge(pending);
             }
         }
         drop(dirty_repositories);
         drop(generations);
-        drop(registry);
-        if changed {
-            if let Ok(mut retries) = self.retry_attempts.lock() {
-                for workspace in changed_workspaces {
-                    retries.remove(&workspace);
-                }
+        if let Ok(mut retries) = self.retry_attempts.lock() {
+            for workspace in changed_workspaces {
+                retries.remove(&workspace);
             }
-            self.changed.notify_one();
         }
+        self.changed.notify_one();
     }
 
     fn reconcile_after_watcher_error(&self, workspaces: &Mutex<WorkspaceRegistry>) {
         let Ok(registry) = workspaces.lock() else {
             return;
         };
+        let registered = registry.list();
+        drop(registry);
         let Ok(mut generations) = self.generations.lock() else {
             return;
         };
@@ -853,7 +869,7 @@ impl IndexScheduler {
             return;
         };
         let mut changed = false;
-        for workspace in registry.list() {
+        for workspace in registered {
             if workspace.repositories.is_empty() {
                 continue;
             }
@@ -869,7 +885,6 @@ impl IndexScheduler {
         }
         drop(dirty);
         drop(generations);
-        drop(registry);
         if changed {
             if let Ok(mut retries) = self.retry_attempts.lock() {
                 retries.clear();
@@ -924,8 +939,8 @@ impl IndexScheduler {
     }
 
     #[cfg(test)]
-    pub(crate) fn block_indexing(&self) -> impl Drop + '_ {
-        self.begin("test blocker").unwrap()
+    pub(crate) fn block_indexing(&self, workspace: &str) -> impl Drop + '_ {
+        self.begin(workspace).unwrap()
     }
 
     async fn run_with_reconciliation_period(

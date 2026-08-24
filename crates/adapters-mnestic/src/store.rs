@@ -16,8 +16,8 @@ use super::{
     },
 };
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, EntityFact, FactChanges, Observation, RepositoryFacts,
-    WorkspaceView,
+    AnalysisDiagnostic, BeholderError, BeholderErrorCode, BeholderErrorKind, DependencyOverride,
+    EntityFact, FactChanges, Observation, RepositoryFacts, WorkspaceView,
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
@@ -407,8 +407,16 @@ impl SemanticStore {
         read: impl FnOnce(&MultiTransaction) -> Result<T, Box<dyn Error>>,
     ) -> Result<Revisioned<T>, Box<dyn Error>> {
         let transaction = self.read_db.multi_transaction(false);
-        let result = read(&transaction)?;
         let analysis_revision = analysis_revision(&transaction, view)?;
+        if analysis_revision == 0 {
+            transaction.abort()?;
+            return Err(Box::new(BeholderError::new(
+                BeholderErrorKind::Unavailable,
+                BeholderErrorCode::WorkspaceRevisionUnavailable,
+                format!("workspace has no completed analysis revision: {view}"),
+            )));
+        }
+        let result = read(&transaction)?;
         let analysis = analysis_metadata(&transaction, view, analysis_revision)?;
         transaction.abort()?;
         Ok(Revisioned {
@@ -437,8 +445,9 @@ impl SemanticStore {
 mod tests {
     use crate::SemanticStore;
     use beholder_domain::{
-        AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, LogicalRepository,
-        Observation, RepositoryFacts, RepositoryState, WorkspaceView,
+        AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
+        DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
+        WorkspaceView,
     };
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity as DtoSeverity};
     use std::{
@@ -500,6 +509,20 @@ mod tests {
         assert_eq!(diagnostic.repository, "repo");
         assert_eq!(diagnostic.path, PathBuf::from("src/broken.ts"));
         assert_eq!(diagnostic.line, Some(7));
+    }
+
+    #[test]
+    fn snapshot_requires_a_completed_revision() {
+        let store = SemanticStore::memory().unwrap();
+        let error = store
+            .context_snapshot("pending", "repo/source")
+            .unwrap_err();
+        let error = error.downcast_ref::<BeholderError>().unwrap();
+
+        assert_eq!(
+            error.code(),
+            BeholderErrorCode::WorkspaceRevisionUnavailable
+        );
     }
     #[test]
     fn persistent_reads_serve_the_completed_revision_during_a_write() {
