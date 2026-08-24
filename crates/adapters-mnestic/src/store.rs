@@ -93,12 +93,16 @@ impl SemanticStore {
 
     pub fn persistent(path: &Path, initialize: bool) -> Result<Self, Box<dyn Error>> {
         #[cfg(feature = "sqlite")]
-        if initialize && !path.exists() {
-            sqlite::open(path)?.execute("PRAGMA auto_vacuum = INCREMENTAL")?;
+        {
+            let fresh = initialize && !path.exists();
+            let connection = sqlite::open(path)?;
+            connection.execute("PRAGMA busy_timeout = 5000")?;
+            if fresh {
+                connection.execute("PRAGMA auto_vacuum = INCREMENTAL")?;
+            }
+            connection.execute("PRAGMA journal_mode = WAL")?;
         }
         let db = persistent_database(path, initialize)?;
-        #[cfg(feature = "sqlite")]
-        sqlite::open(path)?.execute("PRAGMA journal_mode=WAL")?;
         let read_db = persistent_database(path, false)?;
         Ok(Self {
             db,
