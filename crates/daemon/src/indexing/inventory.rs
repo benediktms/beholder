@@ -8,11 +8,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::UNIX_EPOCH,
 };
 
 const INVENTORY_VERSION: u32 = 1;
+static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) enum RefreshMode<'a> {
     Hinted,
@@ -90,7 +94,6 @@ impl InventoryStore {
 
     pub(super) fn refresh(
         &self,
-        workspace: &str,
         repository: &str,
         base: &Path,
         descriptors: &[PathBuf],
@@ -106,7 +109,7 @@ impl InventoryStore {
         let canonical = base
             .canonicalize()
             .map_err(|error| input_error(base, error))?;
-        let key = inventory_key(workspace, repository, &canonical, descriptors);
+        let key = inventory_key(repository, &canonical, descriptors);
         let runtime_verified = self
             .verified
             .lock()
@@ -215,7 +218,7 @@ impl InventoryStore {
             });
         }
 
-        let state = repository_state_from_content_hashes(
+        let mut state = repository_state_from_content_hashes(
             base,
             inputs.iter().zip(&entries).map(|(input, entry)| {
                 (
@@ -229,6 +232,7 @@ impl InventoryStore {
             }),
         )
         .map_err(|error| input_error(base, error))?;
+        state.repository.identity = repository.to_owned();
         if previous_fingerprint.as_deref() == Some(state.fingerprint.as_str()) {
             statistics.repositories_reused = 1;
         } else {
@@ -405,7 +409,11 @@ fn store_manifest(
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&temporary, bytes)?;
     fs::rename(temporary, path)
 }
@@ -415,14 +423,8 @@ fn blob_path(root: &Path, hash: &str) -> Option<PathBuf> {
         .then(|| root.join("blobs").join(&hash[..2]).join(hash))
 }
 
-fn inventory_key(
-    workspace: &str,
-    repository: &str,
-    canonical: &Path,
-    descriptors: &[PathBuf],
-) -> String {
+fn inventory_key(repository: &str, canonical: &Path, descriptors: &[PathBuf]) -> String {
     let mut digest = Sha256::new();
-    framed(&mut digest, workspace.as_bytes());
     framed(&mut digest, repository.as_bytes());
     framed(&mut digest, &path_bytes(canonical));
     let mut descriptors = descriptors
@@ -504,25 +506,11 @@ mod tests {
         let store = InventoryStore::new(&cache);
 
         let initial = store
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
         assert_eq!(initial.statistics.content_hashes, 2);
         let unchanged = store
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
         assert_eq!(unchanged.statistics.content_hashes, 0);
         assert_eq!(unchanged.statistics.cached_bytes_reused, 40);
@@ -531,7 +519,6 @@ mod tests {
         let dirty = BTreeSet::from([PathBuf::from("one.graphql")]);
         let changed = store
             .refresh(
-                "main",
                 "repo",
                 &repository,
                 &[],
@@ -558,31 +545,17 @@ mod tests {
         let indexer = indexer(&cache);
         let store = InventoryStore::new(&cache);
         store
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
 
         let restarted = InventoryStore::new(&cache)
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
         assert_eq!(restarted.statistics.content_hashes, 1);
 
         fs::write(repository.join("schema.graphql"), "type Query { b: ID! }").unwrap();
         let canonical = repository.canonicalize().unwrap();
-        let key = inventory_key("main", "repo", &canonical, &[]);
+        let key = inventory_key("repo", &canonical, &[]);
         let manifest_path = cache
             .join("repository-inventory-v1/manifests")
             .join(format!("{key}.json"));
@@ -591,14 +564,7 @@ mod tests {
             MetadataHint::from(&fs::metadata(repository.join("schema.graphql")).unwrap());
         store_manifest(&manifest_path, &manifest, &repository).unwrap();
         let metadata_deceived = store
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
         assert_eq!(metadata_deceived.statistics.content_hashes, 0);
         assert_eq!(
@@ -608,7 +574,6 @@ mod tests {
 
         let reconciled = store
             .refresh(
-                "main",
                 "repo",
                 &repository,
                 &[],
@@ -653,14 +618,7 @@ mod tests {
         let indexer = indexer(&cache);
         let store = InventoryStore::new(&cache);
         let initial = store
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
 
         fs::write(repository.join("README.md"), "second").unwrap();
@@ -683,14 +641,7 @@ mod tests {
                 .success()
         );
         let head_changed = store
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
         assert_eq!(head_changed.statistics.content_hashes, 0);
         assert_ne!(
@@ -708,14 +659,7 @@ mod tests {
         )
         .unwrap();
         let renamed = store
-            .refresh(
-                "main",
-                "repo",
-                &repository,
-                &[],
-                &indexer,
-                RefreshMode::Hinted,
-            )
+            .refresh("repo", &repository, &[], &indexer, RefreshMode::Hinted)
             .unwrap();
         assert_eq!(
             renamed.snapshot.inputs[0].path,

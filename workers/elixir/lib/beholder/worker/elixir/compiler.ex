@@ -4,7 +4,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   alias Beholder.Worker.Elixir.Compiler.BeamExporter
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
-  @default_timeout_ms 300_000
+  @default_timeout_ms 900_000
   @default_max_output_bytes 1_048_576
   @termination_grace_ms 1_000
   @process_group_pid_retries 100

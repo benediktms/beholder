@@ -5,14 +5,15 @@ use super::{
     inspection::{InspectionResult, inspection_result},
     query::{
         analysis_metadata, analysis_revision, context, dependencies, entity_facts, impact,
-        inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions, trace,
+        inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions,
+        repository_revision, trace,
     },
     storage::{
-        claim_garbage_collection, enrichment_matches, enrichments_current, ensure_revision_inputs,
-        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
-        publish_observations, repository_contexts, revision_enrichment_input_fingerprint,
-        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
-        view_matches,
+        claim_garbage_collection, delete_repository_revision, enrichment_matches,
+        enrichments_current, ensure_revision_inputs, garbage_collection_pending,
+        garbage_collection_queued, publish_enrichment, publish_observations, publish_repository,
+        repository_contexts, revision_enrichment_input_fingerprint, store_verification_fingerprint,
+        sweep_garbage_collection, verification_matches, view_matches,
     },
 };
 use beholder_domain::{
@@ -21,7 +22,7 @@ use beholder_domain::{
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
-    Revisioned, TraceResult,
+    RepositoryRevision, Revisioned, TraceResult,
 };
 use mnestic_engine::{DbInstance, MultiTransaction, NamedRows};
 use std::{
@@ -132,6 +133,21 @@ impl SemanticStore {
         overrides: &[DependencyOverride],
     ) -> Result<FactChanges, Box<dyn Error>> {
         publish_observations(&self.db, view, repositories, overrides, None)
+    }
+
+    pub fn publish_repository(&self, facts: &RepositoryFacts) -> Result<bool, Box<dyn Error>> {
+        publish_repository(&self.db, facts)
+    }
+
+    pub fn repository_revision(
+        &self,
+        repository: &str,
+    ) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
+        repository_revision(&self.read_db, repository)
+    }
+
+    pub fn delete_repository_revision(&self, repository: &str) -> Result<u64, Box<dyn Error>> {
+        delete_repository_revision(&self.db, repository)
     }
 
     pub fn publish_verified(
@@ -468,6 +484,140 @@ mod tests {
             grpc_bindings: Vec::new(),
             observations,
         }
+    }
+
+    #[test]
+    fn standalone_repository_facts_are_reused_by_a_workspace() {
+        let store = SemanticStore::memory().unwrap();
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/repository".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "source-state".into(),
+        };
+        let repository = RepositoryFacts {
+            state: state.clone(),
+            analysis_identity: "analysis-v1".into(),
+            incomplete: false,
+            diagnostics: vec![AnalysisDiagnostic {
+                code: "typescript.syntax_recovered".into(),
+                severity: AnalysisDiagnosticSeverity::Warning,
+                path: "src/lib.ts".into(),
+                line: Some(3),
+                detail: Some("recovered".into()),
+            }],
+            entities: Vec::new(),
+            grpc_bindings: Vec::new(),
+            observations: vec![Observation::dependency(
+                "repo/source",
+                DependencyRelation::Calls,
+                "repo/target",
+                "src/lib.rs:1",
+            )],
+        };
+
+        assert!(store.publish_repository(&repository).unwrap());
+        assert!(!store.publish_repository(&repository).unwrap());
+        let standalone = store
+            .db
+            .run_script(
+                "?[source_state, analyzed_state] := \
+                     *repository_revision{repository: 'example/repository', source_state, analyzed_state}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(standalone.rows[0][0].get_str(), Some("source-state"));
+        let analyzed_state = standalone.rows[0][1].get_str().unwrap().to_owned();
+        let revision = store
+            .repository_revision("example/repository")
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.source_state, "source-state");
+        assert_eq!(
+            revision.analysis.diagnostics[0].detail.as_deref(),
+            Some("recovered")
+        );
+        assert_eq!(store.garbage_collect().unwrap().repository_states_queued, 0);
+
+        let view = WorkspaceView::new("standalone-reuse", "rules", vec![state]).unwrap();
+        store.publish(&view, &[repository], &[]).unwrap();
+        let selected = store
+            .db
+            .run_script(
+                "?[state] := *analysis_revision{view: 'standalone-reuse', revision}, \
+                     *analysis_revision_state{view: 'standalone-reuse', revision, repository: 'example/repository', state}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(selected.rows[0][0].get_str(), Some(analyzed_state.as_str()));
+        let observations = store
+            .db
+            .run_script(
+                "?[state] := *state_observation{state, from: 'repo/source', to: 'repo/target'}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(observations.rows.len(), 1);
+        assert_eq!(
+            store
+                .delete_repository_revision("example/repository")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.garbage_collection_queued().unwrap(), 0);
+        assert_eq!(
+            store
+                .context("standalone-reuse", "repo/source")
+                .unwrap()
+                .edges
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn deleting_a_standalone_revision_queues_its_unreferenced_state() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "standalone",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repository".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "source-state".into(),
+            }],
+        )
+        .unwrap();
+        let repository = facts(
+            &view,
+            vec![Observation::dependency(
+                "repo/source",
+                DependencyRelation::Calls,
+                "repo/target",
+                "src/lib.rs:1",
+            )],
+        );
+
+        store.publish_repository(&repository).unwrap();
+        assert_eq!(
+            store
+                .delete_repository_revision("example/repository")
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .repository_revision("example/repository")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.garbage_collection_queued().unwrap(), 1);
     }
 
     #[test]

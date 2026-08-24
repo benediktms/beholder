@@ -1,11 +1,17 @@
-use super::{BenchmarkArgs, BenchmarkQueryArgs, CacheCommand, InspectSubject, WorkspaceCommand};
+use super::{
+    BenchmarkArgs, BenchmarkQueryArgs, CacheCommand, InspectSubject, RepositoryCommand,
+    WorkspaceCommand,
+};
 use crate::stdout;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{
-    clear_cache, garbage_collect, get_garbage_collection_status, list_workspaces,
-    register_workspace,
+    clear_cache, delete_repository, garbage_collect, get_garbage_collection_status, get_repository,
+    index_repository, list_workspaces, register_repository, register_workspace,
 };
-use beholder_dto::{GarbageCollectionEvent, GarbageCollectionPhase, GarbageCollectionProgress};
+use beholder_dto::{
+    AnalysisCompleteness, GarbageCollectionEvent, GarbageCollectionPhase,
+    GarbageCollectionProgress, RepositoryStatus,
+};
 use std::{
     error::Error,
     path::Path,
@@ -33,6 +39,67 @@ pub(super) async fn workspace(command: WorkspaceCommand) -> Result<(), Box<dyn E
                 ))?;
             }
         }
+    }
+    Ok(())
+}
+
+pub(super) async fn repository(command: RepositoryCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        RepositoryCommand::Register { path } => {
+            print_repository(&register_repository(&path).await?)?;
+        }
+        RepositoryCommand::Delete { identity } => {
+            let queued = delete_repository(identity.clone()).await?;
+            stdout(format_args!(
+                "deleted {identity} · {queued} repository states queued for cleanup"
+            ))?;
+        }
+        RepositoryCommand::Show { identity } => {
+            print_repository(&get_repository(identity).await?)?;
+        }
+        RepositoryCommand::Index { identity } => {
+            let (repository, observations, published) = index_repository(identity, false).await?;
+            print_repository(&repository)?;
+            stdout(format_args!(
+                "{observations} observations · {}",
+                if published { "published" } else { "unchanged" }
+            ))?;
+        }
+        RepositoryCommand::Refresh { identity } => {
+            let (repository, observations, published) = index_repository(identity, true).await?;
+            print_repository(&repository)?;
+            stdout(format_args!(
+                "{observations} observations · {}",
+                if published { "published" } else { "unchanged" }
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn print_repository(repository: &RepositoryStatus) -> Result<(), Box<dyn Error>> {
+    let status = match (&repository.revision, repository.indexing) {
+        (_, true) => "indexing",
+        (None, false) => "unindexed",
+        (Some(revision), false)
+            if revision.analysis.completeness == AnalysisCompleteness::Incomplete =>
+        {
+            "incomplete"
+        }
+        (Some(_), false) => "indexed",
+    };
+    stdout(format_args!(
+        "{}\t{}\t{status}",
+        repository.identity,
+        repository.base.display()
+    ))?;
+    if let Some(revision) = &repository.revision {
+        stdout(format_args!(
+            "source {}\thead {}\t{} diagnostics",
+            revision.source_state,
+            revision.head.as_deref().unwrap_or("unknown"),
+            revision.analysis.diagnostics.len()
+        ))?;
     }
     Ok(())
 }

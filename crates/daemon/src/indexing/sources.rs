@@ -449,7 +449,6 @@ pub(super) fn repository_snapshot(
     super::inventory::InventoryStore::new(indexer.cache_dir())
         .refresh(
             "test",
-            "test",
             root,
             descriptor_paths,
             indexer,

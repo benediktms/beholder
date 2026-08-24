@@ -146,6 +146,16 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_REPOSITORY_REVISION_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_REPOSITORY_REVISION_DIAGNOSTIC_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_GARBAGE_COLLECTION_STATE_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -299,6 +309,11 @@ pub(super) fn persistent_database(
         (
             "analysis_revision_enrichment_observation_owner",
             CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA,
+        ),
+        ("repository_revision", CREATE_REPOSITORY_REVISION_SCHEMA),
+        (
+            "repository_revision_diagnostic",
+            CREATE_REPOSITORY_REVISION_DIAGNOSTIC_SCHEMA,
         ),
     ] {
         if initialize

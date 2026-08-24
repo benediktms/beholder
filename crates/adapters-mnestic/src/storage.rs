@@ -351,6 +351,153 @@ pub(super) fn state_exists(
         .is_empty())
 }
 
+pub(super) fn publish_repository(
+    db: &DbInstance,
+    facts: &RepositoryFacts,
+) -> Result<bool, Box<dyn Error>> {
+    if facts.analysis_identity.is_empty() {
+        return Err("repository analysis identity must not be empty".into());
+    }
+    let transaction = db.multi_transaction(true);
+    let analyzed_state = analyzed_state(facts);
+    let params = BTreeMap::from([
+        (
+            "repository".into(),
+            facts.state.repository.identity.clone().into(),
+        ),
+        (
+            "source_state".into(),
+            facts.state.fingerprint.clone().into(),
+        ),
+        ("analyzed_state".into(), analyzed_state.clone().into()),
+        (
+            "analysis_identity".into(),
+            facts.analysis_identity.clone().into(),
+        ),
+        (
+            "head".into(),
+            facts.state.head.clone().unwrap_or_default().into(),
+        ),
+        ("incomplete".into(), facts.incomplete.into()),
+    ]);
+    let previous = transaction.run_script(
+        "?[source_state, analyzed_state, analysis_identity, head, incomplete] := \
+             *repository_revision{repository: $repository, source_state, analyzed_state, analysis_identity, head, incomplete}",
+        params.clone(),
+    )?;
+    let changed = previous.rows.first().is_none_or(|row| {
+        row[0].get_str() != Some(&facts.state.fingerprint)
+            || row[1].get_str() != Some(&analyzed_state)
+            || row[2].get_str() != Some(&facts.analysis_identity)
+            || row[3].get_str() != Some(facts.state.head.as_deref().unwrap_or_default())
+            || row[4] != facts.incomplete.into()
+    });
+    if !state_exists(&transaction, &analyzed_state)? {
+        store_observations(&transaction, &analyzed_state, &facts.observations)?;
+        store_entities(&transaction, &analyzed_state, &facts.entities)?;
+        store_grpc_bindings(&transaction, &analyzed_state, &facts.grpc_bindings)?;
+    }
+    store_repository_state(&transaction, facts, &analyzed_state)?;
+    transaction.run_script(
+        "?[repository, code, severity, path, line] := \
+             *repository_revision_diagnostic{repository: $repository, code, severity, path, line}, \
+             repository = $repository\n\
+         :rm repository_revision_diagnostic {repository, code, severity, path, line}",
+        params.clone(),
+    )?;
+    let diagnostics = facts
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            DataValue::List(vec![
+                facts.state.repository.identity.as_str().into(),
+                diagnostic.code.as_str().into(),
+                diagnostic.severity.as_str().into(),
+                diagnostic.path.to_string_lossy().into_owned().into(),
+                i64::from(diagnostic.line.unwrap_or_default()).into(),
+                diagnostic.detail.as_deref().unwrap_or_default().into(),
+            ])
+        })
+        .collect();
+    transaction.run_script(
+        "?[repository, code, severity, path, line, detail] <- $rows \
+         :put repository_revision_diagnostic {repository, code, severity, path, line => detail}",
+        BTreeMap::from([("rows".into(), DataValue::List(diagnostics))]),
+    )?;
+    transaction.run_script(
+        "?[repository, source_state, analyzed_state, analysis_identity, head, incomplete] <- \
+             [[$repository, $source_state, $analyzed_state, $analysis_identity, $head, $incomplete]] \
+         :put repository_revision {repository => source_state, analyzed_state, analysis_identity, head, incomplete}",
+        params,
+    )?;
+    transaction.commit()?;
+    Ok(changed)
+}
+
+pub(super) fn delete_repository_revision(
+    db: &DbInstance,
+    repository: &str,
+) -> Result<u64, Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    let params = BTreeMap::from([("repository".into(), repository.into())]);
+    let revision = transaction.run_script(
+        "?[repository, analyzed_state] := \
+             *repository_revision{repository: $repository, analyzed_state}, repository = $repository",
+        params.clone(),
+    )?;
+    transaction.run_script(
+        "?[repository, code, severity, path, line] := \
+             *repository_revision_diagnostic{repository: $repository, code, severity, path, line}, \
+             repository = $repository\n\
+         :rm repository_revision_diagnostic {repository, code, severity, path, line}",
+        params.clone(),
+    )?;
+    transaction.run_script(
+        "?[repository] := repository = $repository\n:rm repository_revision {repository}",
+        params,
+    )?;
+    let queued = if let Some(row) = revision.rows.first() {
+        let state = row[1]
+            .get_str()
+            .ok_or("repository revision state is not a string")?;
+        let stale = transaction.run_script(
+            "live_state[state] := \
+                 *analysis_revision{view, revision}, \
+                 *analysis_revision_state{view, revision, state}\n\
+             ?[state, repository, head] := \
+                 *repository_state{fingerprint: state, repository, head}, \
+                 state = $state, not live_state[state]",
+            BTreeMap::from([("state".into(), state.into())]),
+        )?;
+        if !stale.rows.is_empty() {
+            transaction.run_script(
+                "?[state, repository, head] <- $rows \
+                 :put garbage_collection_state {state => repository, head}",
+                BTreeMap::from([(
+                    "rows".into(),
+                    DataValue::List(
+                        stale
+                            .rows
+                            .clone()
+                            .into_iter()
+                            .map(DataValue::List)
+                            .collect(),
+                    ),
+                )]),
+            )?;
+            transaction.run_script(
+                "?[fingerprint] := fingerprint = $state :rm repository_state {fingerprint}",
+                BTreeMap::from([("state".into(), state.into())]),
+            )?;
+        }
+        stale.rows.len().try_into()?
+    } else {
+        0
+    };
+    transaction.commit()?;
+    Ok(queued)
+}
+
 pub(super) fn reusable_current_state(
     transaction: &MultiTransaction,
     view: &WorkspaceView,
@@ -1699,21 +1846,15 @@ pub(super) fn store_repository_states(
     analyzed_states: &[String],
 ) -> Result<(), Box<dyn Error>> {
     for (facts, analyzed_state) in repositories.iter().zip(analyzed_states) {
-        let state = &facts.state;
+        store_repository_state(transaction, facts, analyzed_state)?;
         let params = BTreeMap::from([
             ("view".into(), view.name.clone().into()),
             (
                 "repository".into(),
-                state.repository.identity.clone().into(),
+                facts.state.repository.identity.clone().into(),
             ),
-            ("head".into(), state.head.clone().unwrap_or_default().into()),
             ("state".into(), analyzed_state.as_str().into()),
         ]);
-        transaction.run_script(
-            "?[fingerprint, repository, head] <- [[$state, $repository, $head]]\n\
-             :put repository_state {fingerprint => repository, head}",
-            params.clone(),
-        )?;
         transaction.run_script(
             "?[view, revision, repository, state] := \
                  *analysis_revision{view: $view, revision}, \
@@ -1722,6 +1863,29 @@ pub(super) fn store_repository_states(
             params,
         )?;
     }
+    Ok(())
+}
+
+fn store_repository_state(
+    transaction: &MultiTransaction,
+    facts: &RepositoryFacts,
+    analyzed_state: &str,
+) -> Result<(), Box<dyn Error>> {
+    transaction.run_script(
+        "?[fingerprint, repository, head] <- [[$state, $repository, $head]]\n\
+         :put repository_state {fingerprint => repository, head}",
+        BTreeMap::from([
+            ("state".into(), analyzed_state.into()),
+            (
+                "repository".into(),
+                facts.state.repository.identity.clone().into(),
+            ),
+            (
+                "head".into(),
+                facts.state.head.clone().unwrap_or_default().into(),
+            ),
+        ]),
+    )?;
     Ok(())
 }
 
@@ -1744,6 +1908,7 @@ fn claim_garbage_collection_once(db: &DbInstance) -> Result<u64, Box<dyn Error>>
         "live_state[state] := \
              *analysis_revision{view, revision}, \
              *analysis_revision_state{view, revision, state}\n\
+         live_state[state] := *repository_revision{analyzed_state: state}\n\
          ?[state, repository, head] := \
              *repository_state{fingerprint: state, repository, head}, not live_state[state]",
         BTreeMap::new(),

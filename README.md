@@ -54,9 +54,9 @@ flowchart TD
 
 ### 1. Workspace and repository identity
 
-The workspace is Beholder's primary unit of architectural analysis. Repositories still provide ownership, source discovery, revision tracking, configuration, and incremental invalidation, but they are not graph boundaries.
+The completed repository revision is Beholder's independently indexable unit. A workspace selects completed repository revisions and materializes their cross-repository relationships as one coherent query view; repositories are ownership boundaries, not graph boundaries.
 
-The Git adapter is responsible for repository identity and state. Workspace registration gives the daemon a stable set of repository roots and optional contract inputs, after which a workspace can be reindexed as one coherent view.
+The Git adapter is responsible for repository identity and state. A repository can be registered and indexed before it belongs to any workspace, and the resulting facts are reused when a workspace later selects it.
 
 This distinction matters for distributed systems. A protobuf registry may declare a contract, one repository may implement it, another may call it, and a client may depend on it indirectly. Beholder models those as relationships between semantic entities rather than assuming the repository containing the contract owns every use of it.
 
@@ -120,7 +120,7 @@ Indexing is revision-aware so Beholder can publish coherent workspace states ins
 
 ### 6. Daemon and gRPC boundary
 
-Long-running state belongs to the `beholder` daemon rather than individual CLI invocations. The daemon owns workspace registration, indexing, persistent graph state, caches, and query execution.
+Long-running state belongs to the `beholder` daemon rather than individual CLI invocations. The daemon owns repository and workspace registration, indexing, persistent graph state, caches, and query execution.
 
 The CLI communicates with it over the typed gRPC protocol implemented by the `protocol`, `daemon`, and `daemon-client` crates. Keeping the process boundary explicit gives Beholder one place to coordinate indexing work and avoids every command independently opening and mutating the graph.
 
@@ -187,6 +187,18 @@ just install
 beholder daemon status
 beholder workspace list
 ```
+
+Repositories can be indexed independently and later reused by workspace views:
+
+```bash
+beholder repository register /path/to/repository
+beholder repository index <repository-identity>
+beholder repository show <repository-identity>
+beholder repository refresh <repository-identity>
+beholder repository delete <repository-identity>
+```
+
+Deletion is rejected while a workspace references the repository. It never deletes the source checkout; graph facts not retained by a completed workspace revision are cleaned up in the background.
 
 Re-run `just install` after rebuilding Beholder. `just uninstall` removes the installed binaries and service.
 

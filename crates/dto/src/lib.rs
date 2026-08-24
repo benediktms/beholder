@@ -101,6 +101,24 @@ pub struct AnalysisMetadata {
     pub diagnostics: Vec<AnalysisDiagnostic>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryRevision {
+    pub source_state: String,
+    pub head: Option<String>,
+    pub analysis_identity: String,
+    pub analysis: AnalysisMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryStatus {
+    pub identity: String,
+    pub display_name: String,
+    pub base: PathBuf,
+    pub alternatives: Vec<PathBuf>,
+    pub revision: Option<RepositoryRevision>,
+    pub indexing: bool,
+}
+
 impl AnalysisMetadata {
     fn is_complete(&self) -> bool {
         self.completeness == AnalysisCompleteness::Complete && self.diagnostics.is_empty()

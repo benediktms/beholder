@@ -21,6 +21,7 @@ use tonic::transport::Server;
 mod daemon;
 mod indexing;
 mod ipc;
+mod repository_registry;
 mod rpc;
 mod rpc_service;
 mod single_instance;
@@ -269,17 +270,18 @@ mod tests {
     use beholder_protocol::{
         ERROR_CODE_METADATA_KEY,
         v1::{
-            ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectPhase,
-            GarbageCollectRequest, GetGarbageCollectionStatusRequest, GetStatusRequest,
-            ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-            RelationKind, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
-            garbage_collect_event,
+            ClearCacheRequest, DeleteRepositoryRequest, EntityKind, EntityRequest, EvidenceKind,
+            GarbageCollectPhase, GarbageCollectRequest, GetGarbageCollectionStatusRequest,
+            GetRepositoryRequest, GetStatusRequest, IndexRepositoryRequest, ListWorkspacesRequest,
+            PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
+            ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
+            daemon_client::DaemonClient, garbage_collect_event,
         },
     };
     use std::{env, fs, path::Path, time::Duration};
 
     #[tokio::test]
-    async fn workspace_smoke() {
+    async fn daemon_smoke() {
         let database = env::temp_dir().join(format!("beholderd-{}.db", std::process::id()));
         let state = env::temp_dir().join(format!("beholderd-state-{}", std::process::id()));
         let _ = fs::remove_dir_all(&state);
@@ -344,8 +346,93 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 14);
+        assert_eq!(status.protocol_version, 16);
         assert_eq!(status.pid, std::process::id());
+
+        let standalone = state.join("standalone");
+        fs::create_dir_all(&standalone).unwrap();
+        fs::write(
+            standalone.join("schema.graphql"),
+            "type Query { package: Package! } type Package { id: ID! }",
+        )
+        .unwrap();
+        let registered_repository = client
+            .register_repository(RegisterRepositoryRequest {
+                path: standalone.to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .repository
+            .unwrap();
+        let identity = registered_repository.repository.unwrap().identity;
+        assert!(registered_repository.revision.is_none());
+        let indexed_repository = client
+            .index_repository(IndexRepositoryRequest {
+                identity: identity.clone(),
+                authoritative: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(indexed_repository.published);
+        assert!(indexed_repository.observation_count > 0);
+        assert!(indexed_repository.repository.unwrap().revision.is_some());
+        assert!(
+            client
+                .get_repository(GetRepositoryRequest {
+                    identity: identity.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .repository
+                .unwrap()
+                .revision
+                .is_some()
+        );
+        assert!(
+            !client
+                .index_repository(IndexRepositoryRequest {
+                    identity: identity.clone(),
+                    authoritative: true,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .published
+        );
+        assert_eq!(
+            client
+                .delete_repository(DeleteRepositoryRequest {
+                    identity: identity.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .repository_states_queued,
+            1
+        );
+        let deleted = client
+            .get_repository(GetRepositoryRequest { identity })
+            .await
+            .unwrap_err();
+        assert_eq!(deleted.code(), tonic::Code::NotFound);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = client
+                    .get_garbage_collection_status(GetGarbageCollectionStatusRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if !status.running && status.repository_states_queued == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deleted repository state was not cleaned up");
 
         let unavailable = client
             .context(EntityRequest {
@@ -413,6 +500,22 @@ mod tests {
             .workspace
             .unwrap();
         assert_eq!(registered.name, "main");
+        let referenced = client
+            .delete_repository(DeleteRepositoryRequest {
+                identity: first_identity.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(referenced.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            referenced
+                .metadata()
+                .get(ERROR_CODE_METADATA_KEY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            BeholderErrorCode::RepositoryDeleteFailed.as_str()
+        );
         assert_eq!(
             client
                 .list_workspaces(ListWorkspacesRequest {})

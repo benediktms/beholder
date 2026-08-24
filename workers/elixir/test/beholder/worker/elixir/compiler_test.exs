@@ -282,7 +282,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     fake_mix =
       fake_mix(
         root,
-        "yes compiler-output | head -c 4096\n(trap '' TERM; sleep 30) &\necho $! > #{shell_quote(child_pid)}\nwait"
+        "printf '%0256d' 0\n(trap '' TERM; sleep 30) &\necho $! > #{shell_quote(child_pid)}\nwait"
       )
 
     File.write!(Path.join(root, "mix.exs"), "original")
@@ -297,12 +297,12 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     with_envs(
       %{
         "BEHOLDER_ELIXIR_MIX_PATH" => fake_mix,
-        "BEHOLDER_ELIXIR_COMPILER_TIMEOUT_MS" => "200",
+        "BEHOLDER_ELIXIR_COMPILER_TIMEOUT_MS" => "1000",
         "BEHOLDER_ELIXIR_MAX_OUTPUT_BYTES" => "128"
       },
       fn ->
         assert {:error, reason} = Compiler.run(repository, cache)
-        assert reason =~ "exceeded 200ms and was terminated"
+        assert reason =~ "exceeded 1000ms and was terminated"
         assert reason =~ "[compiler output truncated]"
         assert byte_size(reason) < 512
         wait_for_file(child_pid)

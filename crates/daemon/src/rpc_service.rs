@@ -1,18 +1,23 @@
 use crate::daemon::{BeholderDaemon, start_garbage_collector};
+use crate::repository_registry::RegisteredRepository;
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, SourceAnalysisError};
 use beholder_dto::{
     DEFAULT_MAX_HOPS, GarbageCollectionPhase,
-    GarbageCollectionProgress as DtoGarbageCollectProgress, Revisioned, WhyResult,
+    GarbageCollectionProgress as DtoGarbageCollectProgress,
+    RepositoryStatus as DtoRepositoryStatus, Revisioned, WhyResult,
 };
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
-    ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
-    GarbageCollectEvent, GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest,
-    GarbageCollectResponse, GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse,
-    GetStatusRequest, GetStatusResponse, ImpactResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, PathRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
-    ReindexWorkspaceRequest, ReindexWorkspaceResponse, StopRequest, StopResponse, TraceResponse,
-    TraversalEntityRequest, WhyResponse, daemon_server::Daemon, garbage_collect_event,
+    ClearCacheRequest, ClearCacheResponse, ContextResponse, DeleteRepositoryRequest,
+    DeleteRepositoryResponse, DependenciesResponse, EntityRequest, GarbageCollectEvent,
+    GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
+    GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetRepositoryRequest,
+    GetStatusRequest, GetStatusResponse, ImpactResponse, IndexRepositoryRequest,
+    IndexRepositoryResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
+    RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
+    ReindexWorkspaceRequest, ReindexWorkspaceResponse, RepositoryResponse, StopRequest,
+    StopResponse, TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
+    garbage_collect_event,
 };
 use std::{error::Error, path::PathBuf, sync::atomic::Ordering};
 use tokio::sync::mpsc;
@@ -187,6 +192,39 @@ impl Daemon for BeholderDaemon {
     }
 
     #[tracing::instrument(
+        name = "rpc.delete_repository",
+        skip_all,
+        err,
+        fields(repository = %request.get_ref().identity)
+    )]
+    async fn delete_repository(
+        &self,
+        request: Request<DeleteRepositoryRequest>,
+    ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+        let identity = request.into_inner().identity;
+        let mut registry = self
+            .workspaces
+            .lock()
+            .map_err(|_| repository_registry_unavailable())?;
+        let repository_states_queued = self
+            .scheduler
+            .delete_repository(&self.store, &mut registry, &identity)
+            .map_err(operation_status)?;
+        drop(registry);
+        if let Err(source) = start_garbage_collector(
+            self.store.clone(),
+            self.scheduler.clone(),
+            self.garbage_collector_running.clone(),
+            self.garbage_collection_progress.clone(),
+        ) {
+            tracing::error!(%source, "repository cleanup worker failed to start");
+        }
+        Ok(Response::new(DeleteRepositoryResponse {
+            repository_states_queued,
+        }))
+    }
+
+    #[tracing::instrument(
         name = "rpc.dependencies",
         skip_all,
         fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
@@ -211,8 +249,123 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 14,
+            protocol_version: 16,
             pid: std::process::id(),
+        }))
+    }
+
+    #[tracing::instrument(name = "rpc.register_repository", skip_all, err)]
+    async fn register_repository(
+        &self,
+        request: Request<RegisterRepositoryRequest>,
+    ) -> Result<Response<RepositoryResponse>, Status> {
+        let registered = self
+            .workspaces
+            .lock()
+            .map_err(|_| repository_registry_unavailable())?
+            .register_repository(PathBuf::from(request.into_inner().path))
+            .map_err(|source| {
+                operation_status(
+                    BeholderError::new(
+                        BeholderErrorKind::InvalidInput,
+                        BeholderErrorCode::RepositoryRegistryFailed,
+                        "repository registration failed",
+                    )
+                    .with_source(std::io::Error::other(source.to_string())),
+                )
+            })?;
+        Ok(Response::new(RepositoryResponse {
+            repository: Some(self.repository_status(&registered)?.into()),
+        }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.get_repository",
+        skip_all,
+        err,
+        fields(repository = %request.get_ref().identity)
+    )]
+    async fn get_repository(
+        &self,
+        request: Request<GetRepositoryRequest>,
+    ) -> Result<Response<RepositoryResponse>, Status> {
+        let registered = self.registered_repository(&request.into_inner().identity)?;
+        Ok(Response::new(RepositoryResponse {
+            repository: Some(self.repository_status(&registered)?.into()),
+        }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.index_repository",
+        skip_all,
+        err,
+        fields(repository = %request.get_ref().identity, authoritative = request.get_ref().authoritative)
+    )]
+    async fn index_repository(
+        &self,
+        request: Request<IndexRepositoryRequest>,
+    ) -> Result<Response<IndexRepositoryResponse>, Status> {
+        let request = request.into_inner();
+        let registered = self.registered_repository(&request.identity)?;
+        let selection = registered.selection.clone();
+        let scheduler = self.scheduler.clone();
+        let store = self.store.clone();
+        let parent = tracing::Span::current();
+        let (observation_count, published) = tokio::task::spawn_blocking(move || {
+            parent.in_scope(|| {
+                scheduler
+                    .index_repository(&store, &selection, request.authoritative)
+                    .map_err(|error| {
+                        (
+                            error
+                                .downcast_ref::<SourceAnalysisError>()
+                                .is_some_and(SourceAnalysisError::is_unsafe_recovery),
+                            error.to_string(),
+                        )
+                    })
+            })
+        })
+        .await
+        .map_err(|source| {
+            operation_status(
+                BeholderError::new(
+                    BeholderErrorKind::Internal,
+                    BeholderErrorCode::RepositoryIndexWorkerFailed,
+                    "repository index worker failed",
+                )
+                .with_source(source),
+            )
+        })?
+        .map_err(|(unsafe_recovery, source)| {
+            let (code, message) = if unsafe_recovery {
+                (
+                    BeholderErrorCode::SourceRecoveryUnsafe,
+                    "source recovery was unsafe; the previous repository revision remains active",
+                )
+            } else {
+                (
+                    BeholderErrorCode::RepositoryIndexFailed,
+                    "repository indexing failed",
+                )
+            };
+            operation_status(
+                BeholderError::new(BeholderErrorKind::FailedPrecondition, code, message)
+                    .with_source(std::io::Error::other(source)),
+            )
+        })?;
+        if published {
+            self.scheduler.schedule_checkpoint(self.store.clone());
+        }
+        Ok(Response::new(IndexRepositoryResponse {
+            repository: Some(self.repository_status(&registered)?.into()),
+            observation_count: observation_count.try_into().map_err(|_| {
+                operation_status(BeholderError::new(
+                    BeholderErrorKind::Internal,
+                    BeholderErrorCode::RepositoryObservationCountOverflow,
+                    "repository observation count exceeds protocol capacity",
+                ))
+            })?,
+            published,
         }))
     }
 
@@ -433,6 +586,57 @@ impl Daemon for BeholderDaemon {
             });
         self.query_response(&request.workspace, revisioned)
     }
+}
+
+impl BeholderDaemon {
+    fn registered_repository(&self, identity: &str) -> Result<RegisteredRepository, Status> {
+        self.workspaces
+            .lock()
+            .map_err(|_| repository_registry_unavailable())?
+            .repository(identity)
+            .cloned()
+            .ok_or_else(|| {
+                operation_status(BeholderError::new(
+                    BeholderErrorKind::NotFound,
+                    BeholderErrorCode::RepositoryNotRegistered,
+                    format!("repository not registered: {identity}"),
+                ))
+            })
+    }
+
+    fn repository_status(
+        &self,
+        registered: &RegisteredRepository,
+    ) -> Result<DtoRepositoryStatus, Status> {
+        let selection = &registered.selection;
+        let identity = &selection.repository.identity;
+        let revision = self.store.repository_revision(identity).map_err(|source| {
+            operation_status(
+                BeholderError::new(
+                    BeholderErrorKind::Internal,
+                    BeholderErrorCode::RepositoryIndexFailed,
+                    "repository revision lookup failed",
+                )
+                .with_source(std::io::Error::other(source.to_string())),
+            )
+        })?;
+        Ok(DtoRepositoryStatus {
+            identity: identity.clone(),
+            display_name: selection.display_name.clone(),
+            base: selection.base.clone(),
+            alternatives: selection.alternatives.clone(),
+            revision,
+            indexing: self.scheduler.repository_indexing(identity),
+        })
+    }
+}
+
+fn repository_registry_unavailable() -> Status {
+    operation_status(BeholderError::new(
+        BeholderErrorKind::Internal,
+        BeholderErrorCode::RepositoryRegistryFailed,
+        "repository registry is unavailable",
+    ))
 }
 
 fn progress_event(progress: DtoGarbageCollectProgress) -> GarbageCollectEvent {
