@@ -991,6 +991,7 @@ impl IndexScheduler {
                     Ok(false) => {}
                     Err(error) => tracing::error!(%error, "reconciliation worker failed"),
                 }
+                reconciliation.reset();
                 continue;
             }
             let first_change = Instant::now();
