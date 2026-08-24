@@ -289,6 +289,30 @@ pub(super) const CREATE_REPOSITORY_STATE_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_REPOSITORY_REVISION_SCHEMA: &str = r#"
+:create repository_revision {
+    repository: String,
+    =>
+    source_state: String,
+    analyzed_state: String,
+    analysis_identity: String,
+    head: String,
+    incomplete: Bool,
+}
+"#;
+
+pub(super) const CREATE_REPOSITORY_REVISION_DIAGNOSTIC_SCHEMA: &str = r#"
+:create repository_revision_diagnostic {
+    repository: String,
+    code: String,
+    severity: String,
+    path: String,
+    line: Int,
+    =>
+    detail: String,
+}
+"#;
+
 pub(super) const CREATE_GARBAGE_COLLECTION_STATE_SCHEMA: &str = r#"
 :create garbage_collection_state {
     state: String,

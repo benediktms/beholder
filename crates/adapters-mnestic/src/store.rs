@@ -10,9 +10,9 @@ use super::{
     storage::{
         claim_garbage_collection, enrichment_matches, enrichments_current, ensure_revision_inputs,
         garbage_collection_pending, garbage_collection_queued, publish_enrichment,
-        publish_observations, repository_contexts, revision_enrichment_input_fingerprint,
-        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
-        view_matches,
+        publish_observations, publish_repository, repository_contexts,
+        revision_enrichment_input_fingerprint, store_verification_fingerprint,
+        sweep_garbage_collection, verification_matches, view_matches,
     },
 };
 use beholder_domain::{
@@ -132,6 +132,10 @@ impl SemanticStore {
         overrides: &[DependencyOverride],
     ) -> Result<FactChanges, Box<dyn Error>> {
         publish_observations(&self.db, view, repositories, overrides, None)
+    }
+
+    pub fn publish_repository(&self, facts: &RepositoryFacts) -> Result<bool, Box<dyn Error>> {
+        publish_repository(&self.db, facts)
     }
 
     pub fn publish_verified(
@@ -468,6 +472,84 @@ mod tests {
             grpc_bindings: Vec::new(),
             observations,
         }
+    }
+
+    #[test]
+    fn standalone_repository_facts_are_reused_by_a_workspace() {
+        let store = SemanticStore::memory().unwrap();
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/repository".into(),
+            },
+            head: Some("head".into()),
+            fingerprint: "source-state".into(),
+        };
+        let repository = RepositoryFacts {
+            state: state.clone(),
+            analysis_identity: "analysis-v1".into(),
+            incomplete: false,
+            diagnostics: vec![AnalysisDiagnostic {
+                code: "typescript.syntax_recovered".into(),
+                severity: AnalysisDiagnosticSeverity::Warning,
+                path: "src/lib.ts".into(),
+                line: Some(3),
+                detail: Some("recovered".into()),
+            }],
+            entities: Vec::new(),
+            grpc_bindings: Vec::new(),
+            observations: vec![Observation::dependency(
+                "repo/source",
+                DependencyRelation::Calls,
+                "repo/target",
+                "src/lib.rs:1",
+            )],
+        };
+
+        assert!(store.publish_repository(&repository).unwrap());
+        assert!(!store.publish_repository(&repository).unwrap());
+        let standalone = store
+            .db
+            .run_script(
+                "?[source_state, analyzed_state] := \
+                     *repository_revision{repository: 'example/repository', source_state, analyzed_state}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(standalone.rows[0][0].get_str(), Some("source-state"));
+        let analyzed_state = standalone.rows[0][1].get_str().unwrap().to_owned();
+        let diagnostics = store
+            .db
+            .run_script(
+                "?[detail] := *repository_revision_diagnostic{repository: 'example/repository', detail}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(diagnostics.rows[0][0].get_str(), Some("recovered"));
+        assert_eq!(store.garbage_collect().unwrap().repository_states_queued, 0);
+
+        let view = WorkspaceView::new("standalone-reuse", "rules", vec![state]).unwrap();
+        store.publish(&view, &[repository], &[]).unwrap();
+        let selected = store
+            .db
+            .run_script(
+                "?[state] := *analysis_revision{view: 'standalone-reuse', revision}, \
+                     *analysis_revision_state{view: 'standalone-reuse', revision, repository: 'example/repository', state}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(selected.rows[0][0].get_str(), Some(analyzed_state.as_str()));
+        let observations = store
+            .db
+            .run_script(
+                "?[state] := *state_observation{state, from: 'repo/source', to: 'repo/target'}",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(observations.rows.len(), 1);
     }
 
     #[test]
