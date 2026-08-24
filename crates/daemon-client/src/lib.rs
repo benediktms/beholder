@@ -2,17 +2,17 @@ use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Works
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionEvent,
     GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus, ImpactResult,
-    TraceResult, WhyResult,
+    RepositoryStatus, TraceResult, WhyResult,
 };
 use beholder_protocol::{
     ERROR_CODE_METADATA_KEY,
     v1::{
         ClearCacheRequest, EntityRequest, GarbageCollectEvent as ProtocolGarbageCollectEvent,
         GarbageCollectPhase, GarbageCollectProgress as ProtocolGarbageCollectProgress,
-        GarbageCollectRequest, GetGarbageCollectionStatusRequest, GetStatusRequest,
-        GetStatusResponse, ListWorkspacesRequest, PathRequest, RegisterWorkspaceRequest,
-        ReindexWorkspaceRequest, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
-        garbage_collect_event,
+        GarbageCollectRequest, GetGarbageCollectionStatusRequest, GetRepositoryRequest,
+        GetStatusRequest, GetStatusResponse, IndexRepositoryRequest, ListWorkspacesRequest,
+        PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
+        StopRequest, TraversalEntityRequest, daemon_client::DaemonClient, garbage_collect_event,
     },
 };
 use std::path::{Path, PathBuf};
@@ -330,6 +330,61 @@ pub async fn register_workspace(
         .workspace
         .ok_or("daemon returned no workspace")?;
     Ok(workspace.try_into()?)
+}
+
+pub async fn register_repository(
+    path: &Path,
+) -> Result<RepositoryStatus, Box<dyn std::error::Error>> {
+    let response = operation_client()
+        .await?
+        .register_repository(request(RegisterRepositoryRequest {
+            path: path_string(path)?,
+        }))
+        .await
+        .map_err(operation_error)?
+        .into_inner();
+    Ok(response
+        .repository
+        .ok_or("daemon returned no repository")?
+        .try_into()?)
+}
+
+pub async fn get_repository(
+    identity: String,
+) -> Result<RepositoryStatus, Box<dyn std::error::Error>> {
+    let response = operation_client()
+        .await?
+        .get_repository(request(GetRepositoryRequest { identity }))
+        .await
+        .map_err(operation_error)?
+        .into_inner();
+    Ok(response
+        .repository
+        .ok_or("daemon returned no repository")?
+        .try_into()?)
+}
+
+pub async fn index_repository(
+    identity: String,
+    authoritative: bool,
+) -> Result<(RepositoryStatus, usize, bool), Box<dyn std::error::Error>> {
+    let response = operation_client()
+        .await?
+        .index_repository(request(IndexRepositoryRequest {
+            identity,
+            authoritative,
+        }))
+        .await
+        .map_err(operation_error)?
+        .into_inner();
+    Ok((
+        response
+            .repository
+            .ok_or("daemon returned no repository")?
+            .try_into()?,
+        response.observation_count.try_into()?,
+        response.published,
+    ))
 }
 
 pub async fn list_workspaces() -> Result<Vec<Workspace>, Box<dyn std::error::Error>> {

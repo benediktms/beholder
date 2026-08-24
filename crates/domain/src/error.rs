@@ -6,6 +6,11 @@ pub enum BeholderErrorCode {
     GarbageCollectionFailed,
     GarbageCollectionWorkerFailed,
     SchedulerUnavailable,
+    RepositoryIndexFailed,
+    RepositoryIndexWorkerFailed,
+    RepositoryNotRegistered,
+    RepositoryObservationCountOverflow,
+    RepositoryRegistryFailed,
     SourceRecoveryUnsafe,
     TransportGrpc,
     WorkspaceIndexFailed,
@@ -23,6 +28,13 @@ impl BeholderErrorCode {
             Self::GarbageCollectionFailed => "beholder.garbage_collection.failed",
             Self::GarbageCollectionWorkerFailed => "beholder.garbage_collection.worker_failed",
             Self::SchedulerUnavailable => "beholder.scheduler.unavailable",
+            Self::RepositoryIndexFailed => "beholder.repository.index_failed",
+            Self::RepositoryIndexWorkerFailed => "beholder.repository.index_worker_failed",
+            Self::RepositoryNotRegistered => "beholder.repository.not_registered",
+            Self::RepositoryObservationCountOverflow => {
+                "beholder.repository.observation_count_overflow"
+            }
+            Self::RepositoryRegistryFailed => "beholder.repository.registry_failed",
             Self::SourceRecoveryUnsafe => "beholder.source.recovery_unsafe",
             Self::TransportGrpc => "beholder.transport.grpc",
             Self::WorkspaceIndexFailed => "beholder.workspace.index_failed",
@@ -46,6 +58,13 @@ impl std::str::FromStr for BeholderErrorCode {
             "beholder.garbage_collection.failed" => Ok(Self::GarbageCollectionFailed),
             "beholder.garbage_collection.worker_failed" => Ok(Self::GarbageCollectionWorkerFailed),
             "beholder.scheduler.unavailable" => Ok(Self::SchedulerUnavailable),
+            "beholder.repository.index_failed" => Ok(Self::RepositoryIndexFailed),
+            "beholder.repository.index_worker_failed" => Ok(Self::RepositoryIndexWorkerFailed),
+            "beholder.repository.not_registered" => Ok(Self::RepositoryNotRegistered),
+            "beholder.repository.observation_count_overflow" => {
+                Ok(Self::RepositoryObservationCountOverflow)
+            }
+            "beholder.repository.registry_failed" => Ok(Self::RepositoryRegistryFailed),
             "beholder.source.recovery_unsafe" => Ok(Self::SourceRecoveryUnsafe),
             "beholder.transport.grpc" => Ok(Self::TransportGrpc),
             "beholder.workspace.index_failed" => Ok(Self::WorkspaceIndexFailed),
@@ -195,6 +214,11 @@ mod tests {
             BeholderErrorCode::GarbageCollectionFailed,
             BeholderErrorCode::GarbageCollectionWorkerFailed,
             BeholderErrorCode::SchedulerUnavailable,
+            BeholderErrorCode::RepositoryIndexFailed,
+            BeholderErrorCode::RepositoryIndexWorkerFailed,
+            BeholderErrorCode::RepositoryNotRegistered,
+            BeholderErrorCode::RepositoryObservationCountOverflow,
+            BeholderErrorCode::RepositoryRegistryFailed,
             BeholderErrorCode::SourceRecoveryUnsafe,
             BeholderErrorCode::TransportGrpc,
             BeholderErrorCode::WorkspaceIndexFailed,

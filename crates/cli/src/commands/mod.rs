@@ -45,6 +45,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Manage independently indexed repositories.
+    Repository {
+        #[command(subcommand)]
+        command: RepositoryCommand,
+    },
     /// Manage disposable analysis caches.
     Cache {
         #[command(subcommand)]
@@ -164,6 +169,30 @@ enum WorkspaceCommand {
     List,
 }
 
+#[derive(Subcommand)]
+enum RepositoryCommand {
+    /// Register a repository without attaching it to a workspace.
+    Register {
+        /// Repository root.
+        path: PathBuf,
+    },
+    /// Show registration and latest completed revision state.
+    Show {
+        /// Logical repository identity.
+        identity: String,
+    },
+    /// Index the repository using the reusable inventory.
+    Index {
+        /// Logical repository identity.
+        identity: String,
+    },
+    /// Authoritatively refresh and index the repository.
+    Refresh {
+        /// Logical repository identity.
+        identity: String,
+    },
+}
+
 #[derive(Clone, Eq, PartialEq, ValueEnum)]
 enum InspectSubject {
     GrpcBindings,
@@ -263,6 +292,7 @@ pub(super) async fn run() -> Result<(), Box<dyn Error>> {
         }
         Some(Command::ReindexWorkspace { workspace }) => index::workspace(workspace).await?,
         Some(Command::Workspace { command }) => admin::workspace(command).await?,
+        Some(Command::Repository { command }) => admin::repository(command).await?,
         Some(Command::Cache { command }) => admin::cache(command).await?,
         Some(Command::Inspect {
             subject,
@@ -355,6 +385,27 @@ mod tests {
             Some(Command::Workspace {
                 command: WorkspaceCommand::Register { repositories, protobuf_descriptors, .. }
             }) if repositories.len() == 2 && protobuf_descriptors.len() == 1
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "repository", "register", "repo-a"])
+                .unwrap()
+                .command,
+            Some(Command::Repository {
+                command: RepositoryCommand::Register { path }
+            }) if path == std::path::Path::new("repo-a")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "beholder",
+                "repository",
+                "refresh",
+                "github.com/example/repo"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Repository {
+                command: RepositoryCommand::Refresh { identity }
+            }) if identity == "github.com/example/repo"
         ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "reindex-workspace", "main"])

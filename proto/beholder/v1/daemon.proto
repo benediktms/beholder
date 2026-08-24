@@ -9,10 +9,13 @@ service Daemon {
   rpc Context(EntityRequest) returns (ContextResponse);
   rpc Dependencies(TraversalEntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc GetRepository(GetRepositoryRequest) returns (RepositoryResponse);
   rpc Impact(TraversalEntityRequest) returns (ImpactResponse);
+  rpc IndexRepository(IndexRepositoryRequest) returns (IndexRepositoryResponse);
   rpc ReindexWorkspace(ReindexWorkspaceRequest) returns (ReindexWorkspaceResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
+  rpc RegisterRepository(RegisterRepositoryRequest) returns (RepositoryResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc Trace(PathRequest) returns (TraceResponse);
   rpc Why(PathRequest) returns (WhyResponse);
@@ -361,6 +364,43 @@ message ListWorkspacesRequest {}
 
 message ListWorkspacesResponse {
   repeated Workspace workspaces = 1;
+}
+
+message RepositoryRevision {
+  string source_state = 1;
+  optional string head = 2;
+  string analysis_identity = 3;
+  bool incomplete = 4;
+  repeated AnalysisDiagnostic diagnostics = 5;
+}
+
+message RepositoryStatus {
+  WorkspaceRepository repository = 1;
+  optional RepositoryRevision revision = 2;
+  bool indexing = 3;
+}
+
+message RegisterRepositoryRequest {
+  string path = 1;
+}
+
+message GetRepositoryRequest {
+  string identity = 1;
+}
+
+message RepositoryResponse {
+  RepositoryStatus repository = 1;
+}
+
+message IndexRepositoryRequest {
+  string identity = 1;
+  bool authoritative = 2;
+}
+
+message IndexRepositoryResponse {
+  RepositoryStatus repository = 1;
+  uint64 observation_count = 2;
+  bool published = 3;
 }
 
 message StopRequest {}

@@ -69,6 +69,37 @@ mod tests {
     }
 
     #[test]
+    fn repository_status_round_trips_latest_revision() {
+        let status = dto::RepositoryStatus {
+            identity: "github.com/company/repo".into(),
+            display_name: "repo".into(),
+            base: "/code/repo".into(),
+            alternatives: vec!["/code/repo-agent".into()],
+            revision: Some(dto::RepositoryRevision {
+                source_state: "source".into(),
+                head: Some("head".into()),
+                analysis_identity: "analysis".into(),
+                analysis: dto::AnalysisMetadata {
+                    completeness: dto::AnalysisCompleteness::Incomplete,
+                    diagnostics: vec![dto::AnalysisDiagnostic {
+                        code: "syntax.recovered".into(),
+                        severity: dto::AnalysisDiagnosticSeverity::Warning,
+                        repository: "github.com/company/repo".into(),
+                        path: "src/lib.ts".into(),
+                        line: Some(3),
+                        detail: Some("recovered".into()),
+                    }],
+                },
+            }),
+            indexing: true,
+        };
+
+        let protocol = v1::RepositoryStatus::from(status.clone());
+
+        assert_eq!(dto::RepositoryStatus::try_from(protocol).unwrap(), status);
+    }
+
+    #[test]
     fn typed_trace_round_trips_without_generic_rows() {
         let mut trace = dto::TraceResult {
             schema: dto::TRACE_SCHEMA_V2.into(),
