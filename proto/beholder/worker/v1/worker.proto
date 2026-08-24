@@ -8,12 +8,78 @@ service AnalyzerWorker {
   rpc Analyze(stream AnalyzeRequest) returns (stream AnalyzeEvent);
 }
 
+service AnalyzerPlugin {
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  PluginDescriptor descriptor = 1;
+}
+
+message PluginDescriptor {
+  string id = 1;
+  uint32 api_version = 2;
+  repeated PluginInputSelector inputs = 3;
+  repeated PluginEntityKind semantic_entities = 4;
+  repeated beholder.v1.RelationKind semantic_relations = 5;
+  repeated PluginEntityKind produces_entities = 6;
+  repeated beholder.v1.RelationKind produces_relations = 7;
+}
+
+enum PluginEntityKind {
+  PLUGIN_ENTITY_KIND_UNSPECIFIED = 0;
+  PLUGIN_ENTITY_KIND_CALLABLE = 1;
+  PLUGIN_ENTITY_KIND_GRAPHQL_ARGUMENT = 2;
+  PLUGIN_ENTITY_KIND_GRAPHQL_ENUM_VALUE = 3;
+  PLUGIN_ENTITY_KIND_GRAPHQL_FIELD = 4;
+  PLUGIN_ENTITY_KIND_GRAPHQL_OPERATION = 5;
+  PLUGIN_ENTITY_KIND_GRAPHQL_TYPE = 6;
+  PLUGIN_ENTITY_KIND_GRPC_OPERATION = 7;
+  PLUGIN_ENTITY_KIND_KAFKA_TOPIC = 8;
+  PLUGIN_ENTITY_KIND_NAMESPACE = 9;
+  PLUGIN_ENTITY_KIND_PROTO_FIELD = 10;
+  PLUGIN_ENTITY_KIND_PROTO_METHOD = 11;
+  PLUGIN_ENTITY_KIND_PROTO_SERVICE = 12;
+  PLUGIN_ENTITY_KIND_PROTO_TYPE = 13;
+  PLUGIN_ENTITY_KIND_SERVICE = 14;
+  PLUGIN_ENTITY_KIND_UNITY_PREFAB = 15;
+}
+
+message PluginInputSelector {
+  PluginInputScope scope = 1;
+  PluginInputKind kind = 2;
+  oneof matcher {
+    string extension = 3;
+    string file_name = 4;
+    string path_suffix = 5;
+  }
+}
+
+enum PluginInputScope {
+  PLUGIN_INPUT_SCOPE_UNSPECIFIED = 0;
+  PLUGIN_INPUT_SCOPE_TARGET = 1;
+  PLUGIN_INPUT_SCOPE_CONTEXT = 2;
+}
+
+enum PluginInputKind {
+  PLUGIN_INPUT_KIND_UNSPECIFIED = 0;
+  PLUGIN_INPUT_KIND_SOURCE = 1;
+  PLUGIN_INPUT_KIND_CONFIGURATION = 2;
+  PLUGIN_INPUT_KIND_DEPENDENCY = 3;
+  PLUGIN_INPUT_KIND_TOOLCHAIN = 4;
+  PLUGIN_INPUT_KIND_ENVIRONMENT = 5;
+}
+
 message AnalyzeRequest {
   oneof request {
     AnalysisStart start = 1;
     RepositoryStart repository = 2;
     RepositoryInput input = 3;
     AnalysisFinish finish = 4;
+    BaselineEntity baseline_entity = 5;
+    BaselineObservation baseline_observation = 6;
   }
 }
 
@@ -37,6 +103,14 @@ message RepositoryInput {
 }
 
 message AnalysisFinish {}
+
+message BaselineEntity {
+  EntityFact entity = 1;
+}
+
+message BaselineObservation {
+  Observation observation = 1;
+}
 
 enum InputKind {
   INPUT_KIND_UNSPECIFIED = 0;

@@ -16,6 +16,7 @@ service Daemon {
   rpc ReindexWorkspace(ReindexWorkspaceRequest) returns (ReindexWorkspaceResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
+  rpc SetWorkspacePlugin(SetWorkspacePluginRequest) returns (SetWorkspacePluginResponse);
   rpc RegisterRepository(RegisterRepositoryRequest) returns (RepositoryResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc Trace(PathRequest) returns (TraceResponse);
@@ -341,6 +342,7 @@ message Workspace {
   string name = 1;
   repeated WorkspaceRepository repositories = 2;
   repeated ProtobufDescriptorSource protobuf_descriptors = 3;
+  repeated string enabled_plugins = 4;
 }
 
 message ProtobufDescriptorSource {
@@ -359,9 +361,20 @@ message RegisterWorkspaceRequest {
   string name = 1;
   repeated string repository_paths = 2;
   repeated string protobuf_descriptor_paths = 3;
+  repeated string enabled_plugins = 4;
 }
 
 message RegisterWorkspaceResponse {
+  Workspace workspace = 1;
+}
+
+message SetWorkspacePluginRequest {
+  string workspace = 1;
+  string plugin = 2;
+  bool enabled = 3;
+}
+
+message SetWorkspacePluginResponse {
   Workspace workspace = 1;
 }
 

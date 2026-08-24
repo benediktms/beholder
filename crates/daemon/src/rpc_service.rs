@@ -15,8 +15,9 @@ use beholder_protocol::v1::{
     GetStatusRequest, GetStatusResponse, ImpactResponse, IndexRepositoryRequest,
     IndexRepositoryResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
     RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
-    ReindexWorkspaceRequest, ReindexWorkspaceResponse, RepositoryResponse, StopRequest,
-    StopResponse, TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
+    ReindexWorkspaceRequest, ReindexWorkspaceResponse, RepositoryResponse,
+    SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest, StopResponse,
+    TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
     garbage_collect_event,
 };
 use std::{error::Error, path::PathBuf, sync::atomic::Ordering};
@@ -529,7 +530,7 @@ impl Daemon for BeholderDaemon {
                 .map_err(|_| Status::internal("workspace registry lock poisoned"))?;
             let previous = workspaces.get(&request.name).cloned();
             let workspace = workspaces
-                .register(
+                .register_with_plugins(
                     request.name,
                     request
                         .repository_paths
@@ -541,6 +542,7 @@ impl Daemon for BeholderDaemon {
                         .into_iter()
                         .map(PathBuf::from)
                         .collect(),
+                    request.enabled_plugins,
                 )
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
             (previous, workspace)
@@ -555,6 +557,29 @@ impl Daemon for BeholderDaemon {
         self.scheduler.mark(&workspace);
         tracing::info!(workspace = %workspace.name, "workspace registered");
         Ok(Response::new(RegisterWorkspaceResponse {
+            workspace: Some(workspace.into()),
+        }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.set_workspace_plugin",
+        skip_all,
+        err,
+        fields(workspace = %request.get_ref().workspace, plugin = %request.get_ref().plugin)
+    )]
+    async fn set_workspace_plugin(
+        &self,
+        request: Request<SetWorkspacePluginRequest>,
+    ) -> Result<Response<SetWorkspacePluginResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = self
+            .workspaces
+            .lock()
+            .map_err(|_| Status::internal("workspace registry lock poisoned"))?
+            .set_plugin(&request.workspace, request.plugin, request.enabled)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.scheduler.mark(&workspace);
+        Ok(Response::new(SetWorkspacePluginResponse {
             workspace: Some(workspace.into()),
         }))
     }

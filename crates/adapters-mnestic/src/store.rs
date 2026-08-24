@@ -14,13 +14,14 @@ use super::{
         ensure_revision_inputs, garbage_collection_candidates, garbage_collection_pending,
         garbage_collection_queued, prepare_enrichment, publish_enrichment, publish_observations,
         publish_repository, repository_contexts, revision_enrichment_input_fingerprint,
-        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
-        view_matches,
+        selected_baseline_semantics, store_verification_fingerprint, sweep_garbage_collection,
+        verification_matches, view_matches,
     },
 };
 use beholder_domain::{
     AnalysisDiagnostic, BeholderError, BeholderErrorCode, BeholderErrorKind, DependencyOverride,
-    EntityFact, FactChanges, Observation, RepositoryFacts, WorkspaceView,
+    EntityFact, EntityKind, FactChanges, Observation, RepositoryFacts, SemanticRelation,
+    WorkspaceView,
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
@@ -221,6 +222,16 @@ impl SemanticStore {
         analyzer: &str,
     ) -> Result<Vec<String>, Box<dyn Error>> {
         repository_contexts(&self.db, view, target, analyzer)
+    }
+
+    pub fn selected_baseline_semantics(
+        &self,
+        view: &str,
+        repository: &str,
+        entity_kinds: &BTreeSet<EntityKind>,
+        relations: &BTreeSet<SemanticRelation>,
+    ) -> Result<(Vec<EntityFact>, Vec<Observation>), Box<dyn Error>> {
+        selected_baseline_semantics(&self.db, view, repository, entity_kinds, relations)
     }
 
     pub fn publish_enrichment(

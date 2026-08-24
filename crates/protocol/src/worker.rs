@@ -7,18 +7,22 @@ use beholder_domain::{
     StructuralRelation,
 };
 use beholder_indexing::{
-    AnalysisCompleteness, AnalyzerContribution, AnalyzerMetadata, CacheStatistics,
-    EnrichmentSnapshot, GraphqlResolverCandidate, InputKind, RepositoryContribution,
-    RepositoryInput, RepositorySnapshot, WorkspaceSnapshot,
+    AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerMetadata,
+    CacheStatistics, EnrichmentSnapshot, GraphqlResolverCandidate, InputKind, PluginDescriptor,
+    PluginInputScope, PluginInputSelector, PluginPathMatcher, RepositoryContribution,
+    RepositoryInput, RepositorySnapshot, SemanticSnapshot, WorkspaceSnapshot,
 };
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 const CONTRIBUTION_CHUNK_ITEMS: usize = 2_048;
 
-pub fn analyze_requests(
-    snapshot: EnrichmentSnapshot,
-) -> impl Iterator<Item = wire::AnalyzeRequest> {
+pub fn analyze_requests(snapshot: EnrichmentSnapshot) -> Result<Vec<wire::AnalyzeRequest>, String> {
     let target_repository = snapshot.target_repository;
+    let baseline = snapshot.baseline;
     let snapshot = snapshot.workspace;
     let start = wire::AnalyzeRequest {
         request: Some(wire::analyze_request::Request::Start(wire::AnalysisStart {
@@ -58,15 +62,45 @@ pub fn analyze_requests(
                     )),
                 }
             }))
-        });
+        })
+        .collect::<Vec<_>>();
+    let baseline_entities = baseline
+        .entities
+        .into_iter()
+        .map(|entity| {
+            Ok(wire::AnalyzeRequest {
+                request: Some(wire::analyze_request::Request::BaselineEntity(
+                    wire::BaselineEntity {
+                        entity: Some(entity_to_wire(entity)?),
+                    },
+                )),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let baseline_observations = baseline
+        .observations
+        .into_iter()
+        .map(|observation| {
+            Ok(wire::AnalyzeRequest {
+                request: Some(wire::analyze_request::Request::BaselineObservation(
+                    wire::BaselineObservation {
+                        observation: Some(observation_to_wire(observation)?),
+                    },
+                )),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let finish = wire::AnalyzeRequest {
         request: Some(wire::analyze_request::Request::Finish(
             wire::AnalysisFinish {},
         )),
     };
-    std::iter::once(start)
+    Ok(std::iter::once(start)
         .chain(repositories)
+        .chain(baseline_entities)
+        .chain(baseline_observations)
         .chain(std::iter::once(finish))
+        .collect())
 }
 
 pub fn workspace_snapshot(
@@ -84,6 +118,7 @@ pub struct WorkspaceSnapshotBuilder {
     name: Option<String>,
     repositories: BTreeMap<String, RepositorySnapshot>,
     target_repository: Option<String>,
+    baseline: SemanticSnapshot,
     finished: bool,
 }
 
@@ -144,6 +179,18 @@ impl WorkspaceSnapshotBuilder {
                     },
                 });
             }
+            wire::analyze_request::Request::BaselineEntity(entity) => {
+                self.baseline.entities.push(entity_from_wire(
+                    entity.entity.ok_or("worker baseline entity is missing")?,
+                )?);
+            }
+            wire::analyze_request::Request::BaselineObservation(observation) => {
+                self.baseline.observations.push(observation_from_wire(
+                    observation
+                        .observation
+                        .ok_or("worker baseline observation is missing")?,
+                )?);
+            }
             wire::analyze_request::Request::Finish(_) => self.finished = true,
         }
         Ok(())
@@ -170,8 +217,182 @@ impl WorkspaceSnapshotBuilder {
                     .chain(repositories.into_values())
                     .collect(),
             },
+            baseline: self.baseline,
         })
     }
+}
+
+pub fn descriptor_to_wire(descriptor: PluginDescriptor) -> wire::PluginDescriptor {
+    wire::PluginDescriptor {
+        id: descriptor.id,
+        api_version: descriptor.api_version,
+        inputs: descriptor
+            .inputs
+            .into_iter()
+            .map(selector_to_wire)
+            .collect(),
+        semantic_entities: descriptor
+            .semantic_entities
+            .into_iter()
+            .map(plugin_entity_kind_to_wire)
+            .map(|kind| kind as i32)
+            .collect(),
+        semantic_relations: descriptor
+            .semantic_relations
+            .into_iter()
+            .map(relation_to_wire)
+            .map(|kind| kind as i32)
+            .collect(),
+        produces_entities: descriptor
+            .produces_entities
+            .into_iter()
+            .map(plugin_entity_kind_to_wire)
+            .map(|kind| kind as i32)
+            .collect(),
+        produces_relations: descriptor
+            .produces_relations
+            .into_iter()
+            .map(relation_to_wire)
+            .map(|kind| kind as i32)
+            .collect(),
+    }
+}
+
+pub fn descriptor_from_wire(
+    descriptor: wire::PluginDescriptor,
+) -> Result<PluginDescriptor, String> {
+    let descriptor = PluginDescriptor {
+        id: descriptor.id,
+        api_version: descriptor.api_version,
+        inputs: descriptor
+            .inputs
+            .into_iter()
+            .map(selector_from_wire)
+            .collect::<Result<_, _>>()?,
+        semantic_entities: descriptor
+            .semantic_entities
+            .into_iter()
+            .map(plugin_entity_kind_from_wire)
+            .collect::<Result<BTreeSet<_>, _>>()?,
+        semantic_relations: descriptor
+            .semantic_relations
+            .into_iter()
+            .map(relation_from_wire)
+            .collect::<Result<BTreeSet<_>, _>>()?,
+        produces_entities: descriptor
+            .produces_entities
+            .into_iter()
+            .map(plugin_entity_kind_from_wire)
+            .collect::<Result<BTreeSet<_>, _>>()?,
+        produces_relations: descriptor
+            .produces_relations
+            .into_iter()
+            .map(relation_from_wire)
+            .collect::<Result<BTreeSet<_>, _>>()?,
+    };
+    descriptor.validate()?;
+    Ok(descriptor)
+}
+
+fn selector_to_wire(selector: PluginInputSelector) -> wire::PluginInputSelector {
+    use wire::plugin_input_selector::Matcher;
+    wire::PluginInputSelector {
+        scope: match selector.scope {
+            PluginInputScope::Target => wire::PluginInputScope::Target,
+            PluginInputScope::Context => wire::PluginInputScope::Context,
+        } as i32,
+        kind: match selector.kind {
+            AnalysisInputKind::Source => wire::PluginInputKind::Source,
+            AnalysisInputKind::Configuration => wire::PluginInputKind::Configuration,
+            AnalysisInputKind::Dependency => wire::PluginInputKind::Dependency,
+            AnalysisInputKind::Toolchain => wire::PluginInputKind::Toolchain,
+            AnalysisInputKind::Environment => wire::PluginInputKind::Environment,
+        } as i32,
+        matcher: Some(match selector.matcher {
+            PluginPathMatcher::Extension(value) => Matcher::Extension(value),
+            PluginPathMatcher::FileName(value) => Matcher::FileName(value),
+            PluginPathMatcher::PathSuffix(value) => {
+                Matcher::PathSuffix(value.to_string_lossy().into_owned())
+            }
+        }),
+    }
+}
+
+fn selector_from_wire(selector: wire::PluginInputSelector) -> Result<PluginInputSelector, String> {
+    use wire::plugin_input_selector::Matcher;
+    Ok(PluginInputSelector {
+        scope: match wire::PluginInputScope::try_from(selector.scope)
+            .map_err(|_| "plugin input scope is unknown")?
+        {
+            wire::PluginInputScope::Unspecified => {
+                return Err("plugin input scope is missing".into());
+            }
+            wire::PluginInputScope::Target => PluginInputScope::Target,
+            wire::PluginInputScope::Context => PluginInputScope::Context,
+        },
+        kind: match wire::PluginInputKind::try_from(selector.kind)
+            .map_err(|_| "plugin input kind is unknown")?
+        {
+            wire::PluginInputKind::Unspecified => {
+                return Err("plugin input kind is missing".into());
+            }
+            wire::PluginInputKind::Source => AnalysisInputKind::Source,
+            wire::PluginInputKind::Configuration => AnalysisInputKind::Configuration,
+            wire::PluginInputKind::Dependency => AnalysisInputKind::Dependency,
+            wire::PluginInputKind::Toolchain => AnalysisInputKind::Toolchain,
+            wire::PluginInputKind::Environment => AnalysisInputKind::Environment,
+        },
+        matcher: match selector.matcher.ok_or("plugin input matcher is missing")? {
+            Matcher::Extension(value) => PluginPathMatcher::Extension(value),
+            Matcher::FileName(value) => PluginPathMatcher::FileName(value),
+            Matcher::PathSuffix(value) => PluginPathMatcher::PathSuffix(value.into()),
+        },
+    })
+}
+
+fn plugin_entity_kind_to_wire(kind: EntityKind) -> wire::PluginEntityKind {
+    match kind {
+        EntityKind::Callable => wire::PluginEntityKind::Callable,
+        EntityKind::GraphqlArgument => wire::PluginEntityKind::GraphqlArgument,
+        EntityKind::GraphqlEnumValue => wire::PluginEntityKind::GraphqlEnumValue,
+        EntityKind::GraphqlField => wire::PluginEntityKind::GraphqlField,
+        EntityKind::GraphqlOperation => wire::PluginEntityKind::GraphqlOperation,
+        EntityKind::GraphqlType => wire::PluginEntityKind::GraphqlType,
+        EntityKind::GrpcOperation => wire::PluginEntityKind::GrpcOperation,
+        EntityKind::KafkaTopic => wire::PluginEntityKind::KafkaTopic,
+        EntityKind::Namespace => wire::PluginEntityKind::Namespace,
+        EntityKind::ProtoField => wire::PluginEntityKind::ProtoField,
+        EntityKind::ProtoMethod => wire::PluginEntityKind::ProtoMethod,
+        EntityKind::ProtoService => wire::PluginEntityKind::ProtoService,
+        EntityKind::ProtoType => wire::PluginEntityKind::ProtoType,
+        EntityKind::Service => wire::PluginEntityKind::Service,
+        EntityKind::UnityPrefab => wire::PluginEntityKind::UnityPrefab,
+    }
+}
+
+fn plugin_entity_kind_from_wire(kind: i32) -> Result<EntityKind, String> {
+    Ok(
+        match wire::PluginEntityKind::try_from(kind).map_err(|_| "plugin entity kind is unknown")? {
+            wire::PluginEntityKind::Unspecified => {
+                return Err("plugin entity kind is missing".into());
+            }
+            wire::PluginEntityKind::Callable => EntityKind::Callable,
+            wire::PluginEntityKind::GraphqlArgument => EntityKind::GraphqlArgument,
+            wire::PluginEntityKind::GraphqlEnumValue => EntityKind::GraphqlEnumValue,
+            wire::PluginEntityKind::GraphqlField => EntityKind::GraphqlField,
+            wire::PluginEntityKind::GraphqlOperation => EntityKind::GraphqlOperation,
+            wire::PluginEntityKind::GraphqlType => EntityKind::GraphqlType,
+            wire::PluginEntityKind::GrpcOperation => EntityKind::GrpcOperation,
+            wire::PluginEntityKind::KafkaTopic => EntityKind::KafkaTopic,
+            wire::PluginEntityKind::Namespace => EntityKind::Namespace,
+            wire::PluginEntityKind::ProtoField => EntityKind::ProtoField,
+            wire::PluginEntityKind::ProtoMethod => EntityKind::ProtoMethod,
+            wire::PluginEntityKind::ProtoService => EntityKind::ProtoService,
+            wire::PluginEntityKind::ProtoType => EntityKind::ProtoType,
+            wire::PluginEntityKind::Service => EntityKind::Service,
+            wire::PluginEntityKind::UnityPrefab => EntityKind::UnityPrefab,
+        },
+    )
 }
 
 pub fn analyze_events(
@@ -915,11 +1136,39 @@ mod tests {
                 name: "main".into(),
                 repositories: vec![repository("example/target"), repository("example/context")],
             },
+            baseline: SemanticSnapshot::default(),
         };
 
         assert_eq!(
-            workspace_snapshot(analyze_requests(snapshot.clone())).unwrap(),
+            workspace_snapshot(analyze_requests(snapshot.clone()).unwrap()).unwrap(),
             snapshot
+        );
+    }
+
+    #[test]
+    fn plugin_descriptor_round_trip_preserves_generic_contract() {
+        let descriptor = PluginDescriptor {
+            id: "example.kafka".into(),
+            api_version: beholder_indexing::PLUGIN_API_VERSION,
+            inputs: vec![PluginInputSelector {
+                scope: PluginInputScope::Target,
+                matcher: PluginPathMatcher::PathSuffix("config/topics.exs".into()),
+                kind: AnalysisInputKind::Configuration,
+            }],
+            semantic_entities: BTreeSet::from([EntityKind::ProtoType]),
+            semantic_relations: BTreeSet::from([SemanticRelation::Dependency(
+                DependencyRelation::BindsContract,
+            )]),
+            produces_entities: BTreeSet::from([EntityKind::KafkaTopic]),
+            produces_relations: BTreeSet::from([
+                SemanticRelation::Dependency(DependencyRelation::Publishes),
+                SemanticRelation::Dependency(DependencyRelation::ConsumedBy),
+            ]),
+        };
+
+        assert_eq!(
+            descriptor_from_wire(descriptor_to_wire(descriptor.clone())).unwrap(),
+            descriptor
         );
     }
 

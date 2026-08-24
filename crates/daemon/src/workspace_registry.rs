@@ -16,6 +16,8 @@ struct StoredWorkspace {
     repositories: Vec<StoredRepository>,
     #[serde(default)]
     protobuf_descriptors: Vec<StoredProtobufDescriptor>,
+    #[serde(default)]
+    enabled_plugins: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -48,6 +50,7 @@ struct StoredWorkspaceOutput {
     name: String,
     repositories: Vec<StoredRepositoryOutput>,
     protobuf_descriptors: Vec<StoredProtobufDescriptor>,
+    enabled_plugins: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -94,7 +97,8 @@ impl WorkspaceRegistry {
                                 path: descriptor.path,
                             })
                             .collect(),
-                    )?;
+                    )?
+                    .with_enabled_plugins(stored.enabled_plugins)?;
                 workspaces.insert(workspace.name.clone(), workspace);
             }
         }
@@ -111,11 +115,22 @@ impl WorkspaceRegistry {
         Ok(registry)
     }
 
+    #[cfg(test)]
     pub fn register(
         &mut self,
         name: String,
         repositories: Vec<PathBuf>,
         protobuf_descriptors: Vec<PathBuf>,
+    ) -> Result<Workspace, Box<dyn Error>> {
+        self.register_with_plugins(name, repositories, protobuf_descriptors, Vec::new())
+    }
+
+    pub fn register_with_plugins(
+        &mut self,
+        name: String,
+        repositories: Vec<PathBuf>,
+        protobuf_descriptors: Vec<PathBuf>,
+        enabled_plugins: Vec<String>,
     ) -> Result<Workspace, Box<dyn Error>> {
         let repositories = repositories
             .into_iter()
@@ -149,8 +164,9 @@ impl WorkspaceRegistry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let workspace =
-            Workspace::new(name, repositories)?.with_protobuf_descriptors(descriptors)?;
+        let workspace = Workspace::new(name, repositories)?
+            .with_protobuf_descriptors(descriptors)?
+            .with_enabled_plugins(enabled_plugins)?;
         let mut registered_repositories = self.repositories.clone();
         for repository in &workspace.repositories {
             registered_repositories.remember_selection(repository.clone());
@@ -162,6 +178,33 @@ impl WorkspaceRegistry {
         self.repositories = registered_repositories;
         self.workspaces = workspaces;
         Ok(workspace)
+    }
+
+    pub fn set_plugin(
+        &mut self,
+        workspace: &str,
+        plugin: String,
+        enabled: bool,
+    ) -> Result<Workspace, Box<dyn Error>> {
+        if plugin.trim().is_empty() {
+            return Err("plugin ID must not be empty".into());
+        }
+        let mut workspaces = self.workspaces.clone();
+        let configured = workspaces
+            .get_mut(workspace)
+            .ok_or_else(|| format!("workspace not registered: {workspace}"))?;
+        if enabled {
+            configured.enabled_plugins.insert(plugin);
+        } else {
+            configured.enabled_plugins.remove(&plugin);
+        }
+        self.persist(&workspaces)?;
+        let configured = workspaces
+            .get(workspace)
+            .cloned()
+            .ok_or("workspace disappeared during plugin configuration")?;
+        self.workspaces = workspaces;
+        Ok(configured)
     }
 
     pub fn get(&self, name: &str) -> Option<&Workspace> {
@@ -300,6 +343,7 @@ fn persist_workspaces(
                         path: descriptor.path.clone(),
                     })
                     .collect(),
+                enabled_plugins: workspace.enabled_plugins.iter().cloned().collect(),
             })
             .collect::<Vec<_>>(),
     )?;
@@ -329,8 +373,16 @@ mod tests {
 
         let path = registry_path(&state);
         let mut registry = WorkspaceRegistry::open(path.clone()).unwrap();
+        registry
+            .register_with_plugins(
+                "main".into(),
+                vec![repository.clone()],
+                Vec::new(),
+                vec!["example.kafka".into()],
+            )
+            .unwrap();
         let workspace = registry
-            .register("main".into(), vec![repository.clone()], Vec::new())
+            .set_plugin("main", "example.rest".into(), true)
             .unwrap();
         let identity = &workspace.repositories[0].repository.identity;
 

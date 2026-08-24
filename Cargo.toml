@@ -21,6 +21,7 @@ members = [
     "crates/dto",
     "crates/indexing",
     "crates/observability",
+    "crates/plugin-sdk",
     "crates/worker-client",
     "crates/worker-rust",
 ]
@@ -44,6 +45,7 @@ beholder-domain = { path = "crates/domain" }
 beholder-dto = { path = "crates/dto" }
 beholder-indexing = { path = "crates/indexing" }
 beholder-observability = { path = "crates/observability" }
+beholder-plugin-sdk = { path = "crates/plugin-sdk" }
 beholder-worker-client = { path = "crates/worker-client" }
 beholder-worker-rust = { path = "crates/worker-rust" }
 beholder-daemon-client = { path = "crates/daemon-client" }

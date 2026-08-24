@@ -115,7 +115,7 @@ impl From<&str> for Evidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuralRelation {
     Defines,
@@ -124,7 +124,7 @@ pub enum StructuralRelation {
     ResponseType,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyRelation {
     BindsContract,
@@ -162,7 +162,7 @@ impl DependencyRelation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum SemanticRelation {
     Structural(StructuralRelation),
     Dependency(DependencyRelation),
@@ -243,7 +243,7 @@ pub struct EntityFact {
     pub metadata: Option<EntityMetadata>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum EntityKind {
     Callable,
     GraphqlArgument,

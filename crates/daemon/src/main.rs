@@ -13,6 +13,7 @@ use beholder_observability::{ExportMode, LogOutput};
 use beholder_protocol::v1::daemon_server::DaemonServer;
 #[cfg(not(test))]
 use beholder_worker_client::WorkerAnalyzerBuilder;
+use beholder_worker_client::{PluginRegistry, plugin_analyzer};
 use std::error::Error;
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
@@ -218,14 +219,37 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         tracing::info!("Elixir analyzer worker not found; compiler enrichment disabled");
         builder
     };
-    builder
+    let mut builder = builder
         .add_analyzer(ElixirAnalyzer::new(cache_dir.clone()))
         .add_analyzer(CsharpAnalyzer::new(cache_dir.clone()))
         .add_analyzer(TypescriptAnalyzer::new(cache_dir.clone()))
         .add_analyzer(GraphqlAnalyzer)
-        .add_analyzer(ProtobufAnalyzer::new(cache_dir))
-        .build()
-        .map_err(|error| error.to_string().into())
+        .add_analyzer(ProtobufAnalyzer::new(cache_dir.clone()));
+    let registry = PluginRegistry::open(cache_dir.parent().unwrap_or(cache_dir.as_path()))?;
+    for plugin in registry.plugins() {
+        let executable = registry.executable(plugin);
+        if executable.is_file() {
+            builder = builder.add_enricher(
+                plugin_analyzer(
+                    executable,
+                    cache_dir
+                        .parent()
+                        .unwrap_or(cache_dir.as_path())
+                        .join("plugin-workers"),
+                    plugin.digest.clone(),
+                    plugin.descriptor.clone(),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        } else {
+            tracing::warn!(
+                plugin = %plugin.descriptor.id,
+                path = %executable.display(),
+                "installed plugin executable is missing"
+            );
+        }
+    }
+    builder.build().map_err(|error| error.to_string().into())
 }
 
 #[cfg(not(test))]
@@ -500,6 +524,7 @@ mod tests {
                 name: "main".into(),
                 repository_paths: vec![repository(&first), repository(&second)],
                 protobuf_descriptor_paths: vec![repository(&descriptor)],
+                enabled_plugins: Vec::new(),
             })
             .await
             .unwrap()
@@ -673,6 +698,7 @@ mod tests {
                 name: "secondary".into(),
                 repository_paths: vec![repository(&third)],
                 protobuf_descriptor_paths: Vec::new(),
+                enabled_plugins: Vec::new(),
             })
             .await
             .unwrap();

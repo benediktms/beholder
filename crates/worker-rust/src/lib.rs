@@ -921,6 +921,7 @@ fn caller() {
                     },
                 ],
             },
+            baseline: Default::default(),
         };
         let socket = PathBuf::from(format!(
             "/tmp/beholder-worker-{}-{}.sock",
@@ -947,7 +948,7 @@ fn caller() {
         .await
         .unwrap();
         let mut stream = client
-            .analyze(tokio_stream::iter(analyze_requests(snapshot)))
+            .analyze(tokio_stream::iter(analyze_requests(snapshot).unwrap()))
             .await
             .unwrap()
             .into_inner();

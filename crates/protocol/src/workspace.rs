@@ -51,6 +51,7 @@ impl From<DomainWorkspace> for v1::Workspace {
                     path: descriptor.path.to_string_lossy().into_owned(),
                 })
                 .collect(),
+            enabled_plugins: workspace.enabled_plugins.into_iter().collect(),
         }
     }
 }
@@ -74,7 +75,8 @@ impl TryFrom<v1::Workspace> for DomainWorkspace {
                     path: PathBuf::from(descriptor.path),
                 })
                 .collect(),
-        )
+        )?
+        .with_enabled_plugins(workspace.enabled_plugins)
     }
 }
 

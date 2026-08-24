@@ -1,5 +1,5 @@
 [package]
-name = "beholder-worker-client"
+name = "beholder-plugin-sdk"
 version.workspace = true
 edition.workspace = true
 
@@ -8,10 +8,7 @@ beholder-domain.workspace = true
 beholder-indexing.workspace = true
 beholder-observability.workspace = true
 beholder-protocol.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha2 = "0.10.9"
-tokio = { workspace = true, features = ["process", "time"] }
-tokio-stream.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
 tonic.workspace = true
 tracing = "0.1.44"

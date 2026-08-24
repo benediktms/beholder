@@ -1,17 +1,19 @@
 use super::{
-    BenchmarkArgs, BenchmarkQueryArgs, CacheCommand, InspectSubject, RepositoryCommand,
-    WorkspaceCommand,
+    BenchmarkArgs, BenchmarkQueryArgs, CacheCommand, InspectSubject, PluginCommand,
+    RepositoryCommand, WorkspaceCommand,
 };
 use crate::stdout;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{
     clear_cache, delete_repository, garbage_collect, get_garbage_collection_status, get_repository,
-    index_repository, list_workspaces, register_repository, register_workspace,
+    get_status, index_repository, list_workspaces, register_repository, register_workspace,
+    set_workspace_plugin, state_dir,
 };
 use beholder_dto::{
     AnalysisCompleteness, GarbageCollectionEvent, GarbageCollectionPhase,
     GarbageCollectionProgress, RepositoryStatus,
 };
+use beholder_worker_client::{PluginRegistry, describe_plugin};
 use std::{
     error::Error,
     path::Path,
@@ -26,10 +28,24 @@ pub(super) async fn workspace(command: WorkspaceCommand) -> Result<(), Box<dyn E
             name,
             repositories,
             protobuf_descriptors,
+            plugins,
         } => stdout(format_args!(
             "{:#?}",
-            register_workspace(name, &repositories, &protobuf_descriptors).await?
+            register_workspace(name, &repositories, &protobuf_descriptors, &plugins).await?
         ))?,
+        WorkspaceCommand::EnablePlugin { workspace, plugin } => {
+            ensure_installed(&plugin)?;
+            stdout(format_args!(
+                "{:#?}",
+                set_workspace_plugin(workspace, plugin, true).await?
+            ))?;
+        }
+        WorkspaceCommand::DisablePlugin { workspace, plugin } => {
+            stdout(format_args!(
+                "{:#?}",
+                set_workspace_plugin(workspace, plugin, false).await?
+            ))?;
+        }
         WorkspaceCommand::List => {
             for workspace in list_workspaces().await? {
                 stdout(format_args!(
@@ -41,6 +57,61 @@ pub(super) async fn workspace(command: WorkspaceCommand) -> Result<(), Box<dyn E
         }
     }
     Ok(())
+}
+
+pub(super) async fn plugin(command: PluginCommand) -> Result<(), Box<dyn Error>> {
+    let state = state_dir()?;
+    let mut registry = PluginRegistry::open(&state)?;
+    match command {
+        PluginCommand::List => {
+            for plugin in registry.plugins() {
+                stdout(format_args!("{}\t{}", plugin.descriptor.id, plugin.digest))?;
+            }
+        }
+        PluginCommand::Install { executable } => {
+            ensure_daemon_stopped().await?;
+            let descriptor = describe_plugin(&executable, &state.join("plugin-discovery")).await?;
+            let plugin = registry.install(&executable, descriptor, false)?;
+            stdout(format_args!(
+                "installed {}\t{}",
+                plugin.descriptor.id, plugin.digest
+            ))?;
+        }
+        PluginCommand::Replace { executable } => {
+            ensure_daemon_stopped().await?;
+            let descriptor = describe_plugin(&executable, &state.join("plugin-discovery")).await?;
+            let plugin = registry.install(&executable, descriptor, true)?;
+            stdout(format_args!(
+                "replaced {}\t{}",
+                plugin.descriptor.id, plugin.digest
+            ))?;
+        }
+        PluginCommand::Remove { id } => {
+            ensure_daemon_stopped().await?;
+            if !registry.remove(&id)? {
+                return Err(format!("plugin is not installed: {id}").into());
+            }
+            stdout(format_args!("removed {id}"))?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_daemon_stopped() -> Result<(), Box<dyn Error>> {
+    if get_status().await.is_ok() {
+        Err("stop the Beholder daemon before changing installed plugins".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_installed(id: &str) -> Result<(), Box<dyn Error>> {
+    let registry = PluginRegistry::open(state_dir()?)?;
+    registry
+        .plugins()
+        .any(|plugin| plugin.descriptor.id == id)
+        .then_some(())
+        .ok_or_else(|| format!("plugin is not installed: {id}").into())
 }
 
 pub(super) async fn repository(command: RepositoryCommand) -> Result<(), Box<dyn Error>> {

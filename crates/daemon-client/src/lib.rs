@@ -12,8 +12,9 @@ use beholder_protocol::{
         GarbageCollectProgress as ProtocolGarbageCollectProgress, GarbageCollectRequest,
         GetGarbageCollectionStatusRequest, GetRepositoryRequest, GetStatusRequest,
         GetStatusResponse, IndexRepositoryRequest, ListWorkspacesRequest, PathRequest,
-        RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
-        TraversalEntityRequest, daemon_client::DaemonClient, garbage_collect_event,
+        RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
+        SetWorkspacePluginRequest, StopRequest, TraversalEntityRequest,
+        daemon_client::DaemonClient, garbage_collect_event,
     },
 };
 use std::path::{Path, PathBuf};
@@ -319,6 +320,7 @@ pub async fn register_workspace(
     name: String,
     repositories: &[PathBuf],
     protobuf_descriptors: &[PathBuf],
+    enabled_plugins: &[String],
 ) -> Result<Workspace, Box<dyn std::error::Error>> {
     let repository_paths = repositories
         .iter()
@@ -333,6 +335,7 @@ pub async fn register_workspace(
                 .iter()
                 .map(|path| path_string(path))
                 .collect::<Result<_, _>>()?,
+            enabled_plugins: enabled_plugins.to_vec(),
         }))
         .await?
         .into_inner()
@@ -416,6 +419,25 @@ pub async fn list_workspaces() -> Result<Vec<Workspace>, Box<dyn std::error::Err
         .into_iter()
         .map(|workspace| workspace.try_into().map_err(Into::into))
         .collect()
+}
+
+pub async fn set_workspace_plugin(
+    workspace: String,
+    plugin: String,
+    enabled: bool,
+) -> Result<Workspace, Box<dyn std::error::Error>> {
+    let workspace = connect()
+        .await?
+        .set_workspace_plugin(request(SetWorkspacePluginRequest {
+            workspace,
+            plugin,
+            enabled,
+        }))
+        .await?
+        .into_inner()
+        .workspace
+        .ok_or("daemon returned no workspace")?;
+    Ok(workspace.try_into()?)
 }
 
 fn path_string(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
