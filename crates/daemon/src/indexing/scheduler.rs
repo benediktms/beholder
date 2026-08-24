@@ -1948,7 +1948,6 @@ fn refresh_workspace_snapshot(
                 RefreshMode::Hinted
             };
             let refresh = scheduler.inventory.refresh(
-                &workspace.name,
                 &repository.repository.identity,
                 &repository.base,
                 &descriptors,
