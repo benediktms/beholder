@@ -30,8 +30,8 @@ fn is_broken_pipe(mut error: &(dyn Error + 'static)) -> bool {
 async fn main() -> Result<(), Box<dyn Error>> {
     let _observability_guard = beholder_observability::init(
         "beholder-cli",
-        beholder_observability::LogOutput::Stderr,
-        beholder_observability::ExportMode::Simple,
+        beholder_observability::LogOutput::Disabled,
+        beholder_observability::ExportMode::Batch,
     );
     run().await
 }

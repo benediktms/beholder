@@ -39,6 +39,7 @@ const DEFAULT_FILTER: &str = "warn,beholder=info";
 pub enum LogOutput {
     Rolling { directory: PathBuf, prefix: String },
     Stderr,
+    Disabled,
 }
 
 #[derive(Clone, Copy)]
@@ -233,6 +234,7 @@ fn log_writer(output: LogOutput) -> (BoxMakeWriter, Option<WorkerGuard>) {
             }
         }
         LogOutput::Stderr => (BoxMakeWriter::new(std::io::stderr), None),
+        LogOutput::Disabled => (BoxMakeWriter::new(std::io::sink), None),
     }
 }
 
