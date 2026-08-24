@@ -1958,6 +1958,25 @@ pub(super) fn garbage_collection_pending(db: &DbInstance) -> Result<bool, Box<dy
         .is_empty())
 }
 
+pub(super) fn garbage_collection_candidates(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
+    db.run_script(
+        "live_state[state] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_state{view, revision, state}\n\
+         live_state[state] := *repository_revision{analyzed_state: state}\n\
+         ?[count(state)] := \
+             *repository_state{fingerprint: state}, not live_state[state]",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?
+    .rows
+    .first()
+    .and_then(|row| row[0].get_int())
+    .unwrap_or_default()
+    .try_into()
+    .map_err(Into::into)
+}
+
 pub(super) fn garbage_collection_queued(db: &DbInstance) -> Result<u64, Box<dyn Error>> {
     db.run_script(
         "?[count(state)] := *garbage_collection_state{state}",
@@ -1987,11 +2006,11 @@ struct RelationCleanup<'a> {
 
 fn sweep_relation(
     db: &DbInstance,
-    progress: &mut impl FnMut(GarbageCollectionProgress),
+    progress: &mut impl FnMut(GarbageCollectionProgress) -> bool,
     cleanup: RelationCleanup<'_>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     let mut completed_rows = 0;
-    progress(GarbageCollectionProgress {
+    if !progress(GarbageCollectionProgress {
         phase: GarbageCollectionPhase::SweepingObsoleteStates,
         step: Some(cleanup.step.clone()),
         rows: None,
@@ -2000,7 +2019,9 @@ fn sweep_relation(
         repositories: Some(cleanup.repositories),
         completed_steps: cleanup.completed_steps,
         total_steps: cleanup.total_steps,
-    });
+    }) {
+        return Ok(false);
+    }
     loop {
         let batch = db
             .run_script(
@@ -2013,14 +2034,14 @@ fn sweep_relation(
             )?
             .rows;
         if batch.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         if !remove_garbage_collection_batch(db, &cleanup, &batch)? {
-            return Ok(());
+            return Ok(true);
         }
         let batch_size: u64 = batch.len().try_into()?;
         completed_rows += batch_size;
-        progress(GarbageCollectionProgress {
+        if !progress(GarbageCollectionProgress {
             phase: GarbageCollectionPhase::SweepingObsoleteStates,
             step: Some(cleanup.step.clone()),
             rows: None,
@@ -2029,7 +2050,9 @@ fn sweep_relation(
             repositories: Some(cleanup.repositories),
             completed_steps: cleanup.completed_steps,
             total_steps: cleanup.total_steps,
-        });
+        }) {
+            return Ok(false);
+        }
     }
 }
 
@@ -2086,7 +2109,7 @@ fn remove_garbage_collection_batch_once(
 
 pub(super) fn sweep_garbage_collection(
     db: &DbInstance,
-    progress: &mut impl FnMut(GarbageCollectionProgress),
+    progress: &mut impl FnMut(GarbageCollectionProgress) -> bool,
 ) -> Result<u64, Box<dyn Error>> {
     let queued = db.run_script(
         "?[state, repository] := *garbage_collection_state{state, repository}",
@@ -2245,7 +2268,7 @@ pub(super) fn sweep_garbage_collection(
             .get_str()
             .ok_or("garbage collection state has a non-string repository")?;
         for (step, select_script, relation, keys) in state_steps {
-            sweep_relation(
+            if !sweep_relation(
                 db,
                 progress,
                 RelationCleanup {
@@ -2260,7 +2283,9 @@ pub(super) fn sweep_garbage_collection(
                     completed_steps: states_resolved,
                     total_steps: total_states,
                 },
-            )?;
+            )? {
+                return Ok(states_resolved.into());
+            }
         }
         db.run_script(
             "?[state] := state = $state\n:rm garbage_collection_state {state}",
@@ -2288,7 +2313,7 @@ pub(super) fn sweep_garbage_collection(
                 .checked_mul(revision_steps_per_view)
                 .and_then(|steps| steps.checked_add(u32::try_from(relation_index).ok()?))
                 .ok_or("garbage collection revision step count overflow")?;
-            sweep_relation(
+            if !sweep_relation(
                 db,
                 progress,
                 RelationCleanup {
@@ -2310,7 +2335,9 @@ pub(super) fn sweep_garbage_collection(
                     completed_steps,
                     total_steps: total_revision_steps,
                 },
-            )?;
+            )? {
+                return Ok(states_resolved.into());
+            }
         }
     }
     Ok(states_resolved.into())

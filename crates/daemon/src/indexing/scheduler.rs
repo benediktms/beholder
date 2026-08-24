@@ -288,6 +288,7 @@ pub struct IndexScheduler {
     idle: Condvar,
     changed: Notify,
     enrichment_changed: Notify,
+    garbage_collection_requested: Notify,
     shutdown: Notify,
     enrichment_shutdown: Notify,
     stopping: AtomicBool,
@@ -492,6 +493,7 @@ impl IndexScheduler {
             idle: Condvar::new(),
             changed: Notify::new(),
             enrichment_changed: Notify::new(),
+            garbage_collection_requested: Notify::new(),
             shutdown: Notify::new(),
             enrichment_shutdown: Notify::new(),
             stopping: AtomicBool::new(false),
@@ -559,6 +561,7 @@ impl IndexScheduler {
             idle: Condvar::new(),
             changed: Notify::new(),
             enrichment_changed: Notify::new(),
+            garbage_collection_requested: Notify::new(),
             shutdown: Notify::new(),
             enrichment_shutdown: Notify::new(),
             stopping: AtomicBool::new(false),
@@ -1079,12 +1082,31 @@ impl IndexScheduler {
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
         self.idle.notify_all();
+        self.shutdown.notify_waiters();
         self.shutdown.notify_one();
         self.enrichment_shutdown.notify_one();
     }
 
-    fn is_stopping(&self) -> bool {
+    pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_stop(&self) {
+        let notified = self.shutdown.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_stopping() {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) async fn wait_for_garbage_collection(&self) {
+        self.garbage_collection_requested.notified().await;
+    }
+
+    pub(crate) fn request_garbage_collection(&self) {
+        self.garbage_collection_requested.notify_one();
     }
 
     pub fn schedule_checkpoint(self: &Arc<Self>, store: Arc<SemanticStore>) {
@@ -1109,6 +1131,7 @@ impl IndexScheduler {
                     ),
                     Err(error) => tracing::warn!(%error, "Mnestic checkpoint failed"),
                 }
+                scheduler.request_garbage_collection();
             })
         {
             self.checkpointing.store(false, Ordering::Release);

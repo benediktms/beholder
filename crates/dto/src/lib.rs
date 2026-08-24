@@ -16,7 +16,9 @@ pub struct GarbageCollection {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GarbageCollectionStatus {
     pub running: bool,
+    pub repository_states_collectible: u64,
     pub repository_states_queued: u64,
+    pub reclaimable_database_pages: u64,
     pub progress: Option<GarbageCollectionProgress>,
 }
 
@@ -59,6 +61,8 @@ impl GarbageCollectionProgress {
 pub enum GarbageCollectionPhase {
     ClaimingObsoleteStates,
     SweepingObsoleteStates,
+    CheckpointingDatabase,
+    ReclaimingDatabaseSpace,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

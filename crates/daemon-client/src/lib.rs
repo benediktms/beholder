@@ -125,7 +125,9 @@ pub async fn get_garbage_collection_status() -> Result<GarbageCollectionStatus, 
         .into_inner();
     Ok(GarbageCollectionStatus {
         running: status.running,
+        repository_states_collectible: status.repository_states_collectible,
         repository_states_queued: status.repository_states_queued,
+        reclaimable_database_pages: status.reclaimable_database_pages,
         progress: status
             .progress
             .map(garbage_collection_progress)
@@ -142,6 +144,12 @@ fn garbage_collection_progress(
         }
         Ok(GarbageCollectPhase::SweepingObsoleteStates) => {
             GarbageCollectionPhase::SweepingObsoleteStates
+        }
+        Ok(GarbageCollectPhase::CheckpointingDatabase) => {
+            GarbageCollectionPhase::CheckpointingDatabase
+        }
+        Ok(GarbageCollectPhase::ReclaimingDatabaseSpace) => {
+            GarbageCollectionPhase::ReclaimingDatabaseSpace
         }
         _ => return Err(invalid_garbage_collection_event()),
     };
