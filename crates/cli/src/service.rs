@@ -9,7 +9,8 @@ use std::{
 
 const LABEL: &str = "dev.beholder.daemon";
 const UNIT: &str = "beholder.service";
-const SERVICE_ENVIRONMENT_VARIABLES: [&str; 6] = [
+const SERVICE_ENVIRONMENT_VARIABLES: [&str; 7] = [
+    "MIX_HOME",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
@@ -51,7 +52,7 @@ pub fn install(binary: &Path, state_dir: &Path) -> Result<InstallOutcome, Box<dy
         fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
     }
 
-    let environment = service_environment();
+    let environment = service_environment(&home_dir()?);
     if cfg!(target_os = "macos") {
         install_macos(binary, state_dir, &environment)
     } else if cfg!(target_os = "linux") {
@@ -61,8 +62,8 @@ pub fn install(binary: &Path, state_dir: &Path) -> Result<InstallOutcome, Box<dy
     }
 }
 
-fn service_environment() -> BTreeMap<String, String> {
-    SERVICE_ENVIRONMENT_VARIABLES
+fn service_environment(home: &Path) -> BTreeMap<String, String> {
+    let mut environment: BTreeMap<_, _> = SERVICE_ENVIRONMENT_VARIABLES
         .into_iter()
         .filter_map(|name| {
             std::env::var(name)
@@ -70,7 +71,17 @@ fn service_environment() -> BTreeMap<String, String> {
                 .filter(|value| !value.is_empty())
                 .map(|value| (name.into(), value))
         })
-        .collect()
+        .collect();
+    environment.insert(
+        "PATH".into(),
+        format!(
+            "{}/.local/share/mise/shims:{}/.cargo/bin:{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            home.display(),
+            home.display(),
+            home.display()
+        ),
+    );
+    environment
 }
 
 pub fn uninstall() -> Result<UninstallOutcome, Box<dyn Error>> {
@@ -385,11 +396,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_environment_includes_stable_tool_paths() {
+        let environment = service_environment(Path::new("/home/test"));
+
+        assert_eq!(
+            environment["PATH"],
+            "/home/test/.local/share/mise/shims:/home/test/.cargo/bin:/home/test/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+    }
+
+    #[test]
     fn launchd_manifest_escapes_paths_and_restarts_only_failures() {
-        let environment = BTreeMap::from([(
-            "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
-            "http://localhost:4318?a=1&b=2".into(),
-        )]);
+        let environment = BTreeMap::from([
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+                "http://localhost:4318?a=1&b=2".into(),
+            ),
+            ("PATH".into(), "/opt/toolchain/bin:/usr/bin".into()),
+        ]);
         let manifest = render_plist(
             Path::new("/tmp/Beholder & tools/beholderd"),
             Path::new("/tmp/Beholder & tools/beholderd.log"),
@@ -398,19 +422,24 @@ mod tests {
         .unwrap();
         assert!(manifest.contains("/tmp/Beholder &amp; tools/beholderd"));
         assert!(manifest.contains("http://localhost:4318?a=1&amp;b=2"));
+        assert!(manifest.contains("<key>PATH</key><string>/opt/toolchain/bin:/usr/bin</string>"));
         assert!(manifest.contains("<key>SuccessfulExit</key><false/>"));
     }
 
     #[test]
     fn systemd_manifest_restarts_only_failures() {
-        let environment = BTreeMap::from([(
-            "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
-            "http://localhost:4318".into(),
-        )]);
+        let environment = BTreeMap::from([
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+                "http://localhost:4318".into(),
+            ),
+            ("PATH".into(), "/opt/toolchain/bin:/usr/bin".into()),
+        ]);
         let unit =
             render_systemd_unit(Path::new("/tmp/Beholder tools/beholderd"), &environment).unwrap();
         assert!(unit.contains("ExecStart=\"/tmp/Beholder tools/beholderd\""));
         assert!(unit.contains("Environment=\"OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318\""));
+        assert!(unit.contains("Environment=\"PATH=/opt/toolchain/bin:/usr/bin\""));
         assert!(unit.contains("Restart=on-failure"));
     }
 

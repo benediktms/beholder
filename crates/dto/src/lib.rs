@@ -66,6 +66,8 @@ pub struct Freshness {
     pub stale: bool,
     pub indexing: bool,
     pub dirty_repositories: Vec<String>,
+    #[serde(default)]
+    pub enriching_repositories: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -123,6 +125,7 @@ impl QueryMetadata {
                 stale: false,
                 indexing: false,
                 dirty_repositories: Vec::new(),
+                enriching_repositories: Vec::new(),
             },
             analysis: AnalysisMetadata::default(),
         }

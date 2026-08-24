@@ -29,12 +29,13 @@ defmodule Beholder.Worker.Elixir.Compiler do
   def run(repository, contexts, cache_dir) do
     original_repositories = [repository | contexts]
 
-    with {:ok, materialized_repositories, materialization_root} <-
+    with {:ok, project_root} <- Repository.mix_project_root(repository),
+         {:ok, materialized_repositories, materialization_root} <-
            materialize(original_repositories) do
       [repository | contexts] = materialized_repositories
 
       try do
-        case run_materialized(repository, contexts, cache_dir) do
+        case run_materialized(repository, contexts, cache_dir, project_root) do
           {:ok, result} ->
             {:ok, remap_result_paths(result, materialized_repositories, original_repositories)}
 
@@ -47,7 +48,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp run_materialized(repository, contexts, cache_dir) do
+  defp run_materialized(repository, contexts, cache_dir, project_root) do
     repositories = [repository | contexts]
 
     with :ok <- validate_local_paths(repositories),
@@ -57,11 +58,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
       mix_env = configured_mix_env()
       build_path = Path.join(working_dir, "build-#{build_identity(repositories, mix, mix_env)}")
       result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
-      mix_home = Path.join(repository.base, ".beholder-mix-home")
-      hex_home = Path.join(repository.base, ".beholder-hex-home")
-      deps_path = Path.join(repository.base, ".beholder-deps")
-      File.mkdir_p!(mix_home)
-      File.mkdir_p!(hex_home)
+      deps_path = Path.join(working_dir, "deps")
       File.mkdir_p!(deps_path)
 
       env = [
@@ -69,8 +66,6 @@ defmodule Beholder.Worker.Elixir.Compiler do
         {"MIX_BUILD_PATH", build_path},
         {"MIX_DEPS_PATH", deps_path},
         {"MIX_ENV", mix_env},
-        {"MIX_HOME", mix_home},
-        {"HEX_HOME", hex_home},
         {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
       ]
 
@@ -78,7 +73,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
         run_command(
           mix,
           ["beholder.compile"],
-          repository.base,
+          Path.join(repository.base, project_root),
           env,
           configured_positive_integer(
             "BEHOLDER_ELIXIR_COMPILER_TIMEOUT_MS",
@@ -115,7 +110,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   defp materialize(repositories) do
     root =
       Path.join(
-        System.tmp_dir!(),
+        physical_tmp_dir(),
         "beholder-elixir-snapshot-#{System.pid()}-#{System.unique_integer([:positive])}"
       )
 
@@ -141,6 +136,11 @@ defmodule Beholder.Worker.Elixir.Compiler do
     else
       {:ok, common}
     end
+  end
+
+  defp physical_tmp_dir do
+    {path, 0} = System.cmd("pwd", ["-P"], cd: System.tmp_dir!())
+    String.trim(path)
   end
 
   defp common_prefix([head | left], [head | right]), do: [head | common_prefix(left, right)]

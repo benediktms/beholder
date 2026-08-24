@@ -7,6 +7,7 @@ impl From<dto::Freshness> for v1::Freshness {
             stale: value.stale,
             indexing: value.indexing,
             dirty_repositories: value.dirty_repositories,
+            enriching_repositories: value.enriching_repositories,
         }
     }
 }
@@ -17,6 +18,7 @@ impl From<v1::Freshness> for dto::Freshness {
             stale: value.stale,
             indexing: value.indexing,
             dirty_repositories: value.dirty_repositories,
+            enriching_repositories: value.enriching_repositories,
         }
     }
 }

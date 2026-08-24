@@ -16,6 +16,7 @@ pub(super) fn raw(
         "{schema} · view {} · revision {} · stale={} · indexing={}",
         metadata.view, metadata.revision, metadata.freshness.stale, metadata.freshness.indexing
     );
+    write_enriching_repositories(&mut output, metadata);
     if metadata.analysis.completeness == beholder_dto::AnalysisCompleteness::Incomplete {
         output.push_str(" · incomplete=true");
     }
@@ -294,6 +295,7 @@ pub(super) fn write_metadata(
         "\nview {} · revision {} · stale={} · indexing={}",
         metadata.view, metadata.revision, metadata.freshness.stale, metadata.freshness.indexing
     );
+    write_enriching_repositories(output, metadata);
     if metadata.analysis.completeness == beholder_dto::AnalysisCompleteness::Incomplete {
         let _ = write!(
             output,
@@ -303,6 +305,16 @@ pub(super) fn write_metadata(
         if include_diagnostics {
             write_diagnostics(output, metadata, "\n", "  ");
         }
+    }
+}
+
+fn write_enriching_repositories(output: &mut String, metadata: &QueryMetadata) {
+    if !metadata.freshness.enriching_repositories.is_empty() {
+        let _ = write!(
+            output,
+            " · enriching={}",
+            metadata.freshness.enriching_repositories.join(",")
+        );
     }
 }
 

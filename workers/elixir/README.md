@@ -7,8 +7,10 @@ gRPC protocol and listens on the Unix socket supplied by the daemon.
 The worker materializes the declared target and context inputs into an isolated
 temporary workspace, then starts a separate Mix VM with Beholder's compiler
 tracer on its code path. It preserves existing project tracers and directs
-compilation output to a Beholder-owned build directory. Live checkout source,
-Mix manifests, lockfiles and compile-time configuration are not used.
+dependencies and compilation output to Beholder-owned directories. Live checkout
+source, Mix manifests, lockfiles and compile-time configuration are not used. The
+child VM inherits `MIX_HOME` and `HEX_HOME`, including configured private Hex
+repositories, while dependency sources remain in Beholder's cache.
 
 When `OTEL_EXPORTER_OTLP_ENDPOINT` or
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is configured, the worker exports OTLP/HTTP

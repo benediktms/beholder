@@ -16,6 +16,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
+use tonic::codegen::http::HeaderMap;
 use tonic::metadata::{Ascii, MetadataKey, MetadataMap, MetadataValue};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -33,10 +34,12 @@ use tracing_subscriber::{
 const OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 const OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
+const DEFAULT_FILTER: &str = "warn,beholder=info";
 
 pub enum LogOutput {
     Rolling { directory: PathBuf, prefix: String },
     Stderr,
+    Disabled,
 }
 
 #[derive(Clone, Copy)]
@@ -72,7 +75,8 @@ pub fn init(
     export_mode: ExportMode,
 ) -> ObservabilityGuard {
     global::set_text_map_propagator(TraceContextPropagator::new());
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
     let (writer, writer_guard) = log_writer(output);
     let dispatch = Arc::new(OnceLock::new());
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -200,6 +204,12 @@ pub fn set_parent_from_metadata(span: &tracing::Span, metadata: &MetadataMap) {
     let _ = span.set_parent(parent);
 }
 
+pub fn set_parent_from_headers(span: &tracing::Span, headers: &HeaderMap) {
+    let parent =
+        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)));
+    let _ = span.set_parent(parent);
+}
+
 fn log_writer(output: LogOutput) -> (BoxMakeWriter, Option<WorkerGuard>) {
     match output {
         LogOutput::Rolling { directory, prefix } => {
@@ -224,6 +234,7 @@ fn log_writer(output: LogOutput) -> (BoxMakeWriter, Option<WorkerGuard>) {
             }
         }
         LogOutput::Stderr => (BoxMakeWriter::new(std::io::stderr), None),
+        LogOutput::Disabled => (BoxMakeWriter::new(std::io::sink), None),
     }
 }
 
@@ -287,7 +298,7 @@ fn telemetry_resource(default_service_name: &str) -> Resource {
 
 fn telemetry_filter() -> EnvFilter {
     EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
         .add_directive("opentelemetry=off".parse().expect("valid directive"))
         .add_directive("reqwest=off".parse().expect("valid directive"))
         .add_directive("hyper=off".parse().expect("valid directive"))
@@ -337,6 +348,18 @@ impl Extractor for MetadataExtractor<'_> {
     }
 }
 
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|key| key.as_str()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +393,31 @@ mod tests {
         let extracted = propagator.extract(&MetadataExtractor(&metadata));
 
         assert_eq!(extracted.span().span_context(), &expected);
+    }
+
+    #[test]
+    fn tracing_span_context_propagates_through_grpc_headers() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(NoopExporter)
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let client = tracing::info_span!("client");
+            let (expected, metadata) = {
+                let _entered = client.enter();
+                let trace_id = client.context().span().span_context().trace_id();
+                let mut metadata = MetadataMap::new();
+                inject_current_context(&mut metadata);
+                (trace_id, metadata)
+            };
+            let server = tracing::info_span!("server");
+            set_parent_from_headers(&server, &metadata.into_headers());
+
+            assert_eq!(server.context().span().span_context().trace_id(), expected);
+        });
     }
 
     #[test]
@@ -426,6 +474,29 @@ mod tests {
             inside.contains(&format!(r#""span_id":"{span_id}""#)),
             "missing span correlation in {inside}"
         );
+    }
+
+    #[test]
+    fn default_filter_keeps_application_info_and_drops_dependency_info() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = {
+            let output = output.clone();
+            move || SharedWriter(output.clone())
+        };
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_filter(EnvFilter::new(DEFAULT_FILTER)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "ra_ap_hir_def", "dependency");
+            tracing::info!(target: "beholder_worker_rust", "application");
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("dependency"));
+        assert!(output.contains("application"));
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);

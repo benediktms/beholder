@@ -587,10 +587,15 @@ impl IndexScheduler {
         analysis_revision: u64,
         analysis: beholder_dto::AnalysisMetadata,
     ) -> QueryMetadata {
-        let stale = self
-            .generations
+        let full_index_active = self
+            .active_operation
             .lock()
-            .is_ok_and(|generations| generations.contains_key(workspace));
+            .is_ok_and(|active| active.as_deref() == Some(workspace));
+        let stale = full_index_active
+            || self
+                .generations
+                .lock()
+                .is_ok_and(|generations| generations.contains_key(workspace));
         let dirty_repositories = self
             .dirty_repositories
             .lock()
@@ -601,14 +606,21 @@ impl IndexScheduler {
                     .map(|repositories| repositories.keys().cloned().collect())
             })
             .unwrap_or_default();
-        let indexing = self
-            .active_operation
+        let enriching_repositories = self
+            .enriching
             .lock()
-            .is_ok_and(|active| active.as_deref() == Some(workspace))
-            || self
-                .enriching
-                .lock()
-                .is_ok_and(|active| active.keys().any(|(active, _, _)| active == workspace))
+            .map(|active| {
+                active
+                    .keys()
+                    .filter(|(active_workspace, _, _)| active_workspace == workspace)
+                    .map(|(_, repository, _)| repository.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let indexing = full_index_active
+            || !enriching_repositories.is_empty()
             || self.enrichment_jobs.lock().is_ok_and(|jobs| {
                 jobs.keys()
                     .any(|(queued_workspace, _, _)| queued_workspace == workspace)
@@ -620,6 +632,7 @@ impl IndexScheduler {
                 stale,
                 indexing,
                 dirty_repositories,
+                enriching_repositories,
             },
             analysis,
         }
@@ -937,8 +950,9 @@ impl IndexScheduler {
                 let store = store.clone();
                 let checkpoint_store = store.clone();
                 let workspaces = workspaces.clone();
+                let span = tracing::info_span!("index.scheduler", trigger = "reconcile");
                 match tokio::task::spawn_blocking(move || {
-                    scheduler.reconcile_registered(&store, &workspaces)
+                    span.in_scope(|| scheduler.reconcile_registered(&store, &workspaces))
                 })
                 .await
                 {
@@ -963,8 +977,11 @@ impl IndexScheduler {
             let store = store.clone();
             let checkpoint_store = store.clone();
             let workspaces = workspaces.clone();
-            match tokio::task::spawn_blocking(move || scheduler.reindex_dirty(&store, &workspaces))
-                .await
+            let span = tracing::info_span!("index.scheduler", trigger = "change");
+            match tokio::task::spawn_blocking(move || {
+                span.in_scope(|| scheduler.reindex_dirty(&store, &workspaces))
+            })
+            .await
             {
                 Ok(result) => {
                     if result.published {
@@ -3651,12 +3668,9 @@ mod tests {
         assert_eq!(pending.freshness.dirty_repositories, ["repo"]);
 
         *scheduler.active_operation.lock().unwrap() = Some("main".into());
-        assert!(
-            scheduler
-                .query_metadata("main", 4, Default::default())
-                .freshness
-                .indexing
-        );
+        let indexing = scheduler.query_metadata("main", 4, Default::default());
+        assert!(indexing.freshness.stale);
+        assert!(indexing.freshness.indexing);
         assert!(
             !scheduler
                 .query_metadata("other", 4, Default::default())
@@ -3680,6 +3694,22 @@ mod tests {
         assert!(!current.freshness.stale);
         assert!(!current.freshness.indexing);
         assert!(current.freshness.dirty_repositories.is_empty());
+        assert!(current.freshness.enriching_repositories.is_empty());
+
+        let (cancel, _) = tokio::sync::watch::channel(());
+        scheduler.enriching.lock().unwrap().insert(
+            ("main".into(), "repo".into(), "semantic".into()),
+            EnrichmentRun {
+                input_fingerprint: "input".into(),
+                version: "1".into(),
+                cancel,
+            },
+        );
+        let enriching = scheduler.query_metadata("main", 5, Default::default());
+        assert!(!enriching.freshness.stale);
+        assert!(enriching.freshness.indexing);
+        assert_eq!(enriching.freshness.enriching_repositories, ["repo"]);
+        scheduler.enriching.lock().unwrap().clear();
         assert!(
             scheduler
                 .query_metadata("other", 4, Default::default())

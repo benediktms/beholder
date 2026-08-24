@@ -13,18 +13,13 @@ defmodule Beholder.Worker.Elixir.Analyzer do
     RepositoryContribution
   }
 
-  @analyzer_version "18:10:elixir-compiler:4"
+  @analyzer_version "18:10:elixir-compiler:9"
   @contribution_chunk_items 2_048
 
   @spec analyze(Snapshot.t(), String.t()) :: {:ok, [AnalyzeEvent.t()]} | {:error, String.t()}
   def analyze(snapshot, cache_dir) do
     repository = Snapshot.target(snapshot)
-
-    if Repository.mix_project?(repository) do
-      analyze_repository(repository, Snapshot.contexts(snapshot), cache_dir)
-    else
-      {:error, "Elixir compiler enrichment target does not contain mix.exs"}
-    end
+    analyze_repository(repository, Snapshot.contexts(snapshot), cache_dir)
   end
 
   defp analyze_repository(repository, contexts, cache_dir) do

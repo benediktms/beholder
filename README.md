@@ -178,6 +178,47 @@ beholder why <from> <to>
 
 Queries support compact human-readable output as well as stable versioned JSON. `--raw` exposes the uncollapsed semantic graph and evidence when deeper inspection is needed. See [`docs/QUERY_OUTPUT.md`](docs/QUERY_OUTPUT.md) for output conventions.
 
+## Running Beholder
+
+On supported Unix systems, install the CLI, analyzer workers, and user-level daemon service with:
+
+```bash
+just install
+beholder daemon status
+beholder workspace list
+```
+
+Re-run `just install` after rebuilding Beholder. `just uninstall` removes the installed binaries and service.
+
+### Shell and daemon environment
+
+Beholder's native analyzers need their language toolchains on `PATH`. With a standard mise installation, expose the shims rather than the `installs` directory, whose immediate children are not executables:
+
+```bash
+# ~/.zshenv, and ~/.zshrc if desired
+export PATH="$PATH:$HOME/.local/share/mise/shims"
+```
+
+Appending avoids an inactive mise shim shadowing a separately installed command, while still making missing toolchain commands available. On macOS, launchd does not source `.zshenv` or `.zshrc`. `just install` therefore writes a stable service PATH containing the conventional mise shims, Cargo, local, Homebrew, and system binary directories. Shell configuration changes affect new shells, not an already-installed daemon service.
+
+### Local observability
+
+To inspect CLI, daemon, and worker traces together with an OTLP/HTTP collector such as `otel-gui`, start the collector before installing Beholder:
+
+```bash
+# Terminal 1
+otel-gui
+
+# Terminal 2
+just install
+
+# `just install` configures the daemon; export these for subsequent CLI commands.
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://localhost:4318/v1/logs
+```
+
+`just install` defaults the daemon to this local endpoint and derives its logs endpoint automatically. Just cannot modify its parent shell, so keep these variables in the shell that runs CLI commands if CLI spans and logs should join the daemon service map.
+
 ## Development
 
 The repository uses Cargo for Rust, Moon for workspace task orchestration, and `just` as the human-facing developer entry point.
@@ -195,8 +236,6 @@ just smoke
 # Explore the CLI without installing it
 cargo run -- --help
 ```
-
-On supported Unix systems, `just install` builds the binaries, links them into `~/.local/bin`, and installs the user-level daemon service. `just uninstall` reverses that setup.
 
 ## Project direction
 

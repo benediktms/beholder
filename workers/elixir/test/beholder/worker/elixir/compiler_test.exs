@@ -53,6 +53,85 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert [_build] = Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "build-*"]))
   end
 
+  test "fetches dependencies before compiling" do
+    root = temp_dir("dependency-project")
+    dependency = temp_dir("dependency-source")
+    cache = temp_dir("dependency-cache")
+    File.mkdir_p!(Path.join(root, "lib"))
+    File.mkdir_p!(Path.join(dependency, "lib"))
+
+    dependency_mix = """
+    defmodule CompilerDependency.MixProject do
+      use Mix.Project
+      def project, do: [app: :compiler_dependency, version: "0.1.0"]
+    end
+    """
+
+    dependency_source = """
+    defmodule CompilerDependency do
+      def value, do: :dependency
+    end
+    """
+
+    File.write!(Path.join(dependency, "mix.exs"), dependency_mix)
+    File.write!(Path.join(dependency, "lib/compiler_dependency.ex"), dependency_source)
+    System.cmd("git", ["init", "--quiet"], cd: dependency)
+    System.cmd("git", ["add", "."], cd: dependency)
+
+    {_, 0} =
+      System.cmd(
+        "git",
+        [
+          "-c",
+          "user.name=Beholder Test",
+          "-c",
+          "user.email=beholder@example.com",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "--quiet",
+          "-m",
+          "fixture"
+        ],
+        cd: dependency
+      )
+
+    mix_source = """
+    defmodule DependencyFixture.MixProject do
+      use Mix.Project
+      def project, do: [app: :dependency_fixture, version: "0.1.0", deps: deps()]
+      defp deps, do: [{:compiler_dependency, git: "file://#{dependency}"}]
+    end
+    """
+
+    source = """
+    defmodule DependencyFixture do
+      def call, do: CompilerDependency.value()
+    end
+    """
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "with-dependency",
+      inputs: [
+        %{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE},
+        %{path: "lib/dependency_fixture.ex", content: source, kind: :INPUT_KIND_SOURCE}
+      ]
+    }
+
+    assert {:ok, result} = Compiler.run(repository, cache)
+    assert result.status == :ok, inspect(result)
+
+    assert Enum.any?(result.events, fn event ->
+             event.kind == :module and {"call", 0} in event.definitions
+           end)
+
+    refute Enum.any?(result.events, fn event ->
+             event.kind == :module and event.target == "CompilerDependency"
+           end)
+  end
+
   test "materializes snapshot bytes instead of reading a changed checkout" do
     root = temp_dir("changed")
     cache = temp_dir("changed-cache")
@@ -73,6 +152,46 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     end)
 
     assert File.read!(captured) == "original"
+  end
+
+  test "runs Mix from the unique shallowest project root" do
+    root = temp_dir("nested-project")
+    cache = temp_dir("nested-project-cache")
+    captured = Path.join(root, "captured")
+
+    fake_mix =
+      fake_mix(
+        root,
+        "printf '%s\\n%s\\n%s\\n%s\\n' \"$PWD\" \"$MIX_HOME\" \"$HEX_HOME\" \"$MIX_DEPS_PATH\" > #{shell_quote(captured)}"
+      )
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "nested",
+      inputs: [
+        %{path: "src/mix.exs", content: "umbrella", kind: :INPUT_KIND_SOURCE},
+        %{path: "src/apps/api/mix.exs", content: "app", kind: :INPUT_KIND_SOURCE}
+      ]
+    }
+
+    with_envs(
+      %{
+        "BEHOLDER_ELIXIR_MIX_PATH" => fake_mix,
+        "MIX_HOME" => "/toolchain/mix",
+        "HEX_HOME" => "/toolchain/hex"
+      },
+      fn ->
+        assert {:error, reason} = Compiler.run(repository, cache)
+        assert reason =~ "before producing a trace"
+      end
+    )
+
+    assert [working_directory, "/toolchain/mix", "/toolchain/hex", deps_path] =
+             captured |> File.read!() |> String.split()
+
+    assert String.ends_with?(working_directory, "/src")
+    assert deps_path == Path.join([cache, "elixir", "Zml4dHVyZQ", "deps"])
   end
 
   test "materializes dependency context beside the target" do

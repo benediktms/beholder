@@ -28,6 +28,16 @@ fn is_broken_pipe(mut error: &(dyn Error + 'static)) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let _observability_guard = beholder_observability::init(
+        "beholder-cli",
+        beholder_observability::LogOutput::Disabled,
+        beholder_observability::ExportMode::Batch,
+    );
+    run().await
+}
+
+#[tracing::instrument(name = "cli.run", err)]
+async fn run() -> Result<(), Box<dyn Error>> {
     match commands::run().await {
         Err(error) if is_broken_pipe(error.as_ref()) => Ok(()),
         result => result,

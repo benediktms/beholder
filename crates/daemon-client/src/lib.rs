@@ -16,7 +16,7 @@ use beholder_protocol::{
     },
 };
 use std::path::{Path, PathBuf};
-use tonic::{Code, Status, transport::Channel};
+use tonic::{Code, Request, Status, transport::Channel};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -59,13 +59,16 @@ fn env_path(name: &str) -> Option<PathBuf> {
 pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .get_status(GetStatusRequest {})
+        .get_status(request(GetStatusRequest {}))
         .await?
         .into_inner())
 }
 
 pub async fn clear_cache() -> Result<(), Box<dyn std::error::Error>> {
-    connect().await?.clear_cache(ClearCacheRequest {}).await?;
+    connect()
+        .await?
+        .clear_cache(request(ClearCacheRequest {}))
+        .await?;
     Ok(())
 }
 
@@ -102,7 +105,7 @@ impl GarbageCollectionStream {
 pub async fn garbage_collect() -> Result<GarbageCollectionStream, BeholderError> {
     let response = operation_client()
         .await?
-        .garbage_collect(GarbageCollectRequest {})
+        .garbage_collect(request(GarbageCollectRequest {}))
         .await
         .map_err(operation_error)?
         .into_inner();
@@ -115,7 +118,7 @@ pub async fn garbage_collect() -> Result<GarbageCollectionStream, BeholderError>
 pub async fn get_garbage_collection_status() -> Result<GarbageCollectionStatus, BeholderError> {
     let status = operation_client()
         .await?
-        .get_garbage_collection_status(GetGarbageCollectionStatusRequest {})
+        .get_garbage_collection_status(request(GetGarbageCollectionStatusRequest {}))
         .await
         .map_err(operation_error)?
         .into_inner();
@@ -167,7 +170,7 @@ pub async fn context(
 ) -> Result<ContextResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .context(EntityRequest { workspace, entity })
+        .context(request(EntityRequest { workspace, entity }))
         .await?
         .into_inner()
         .try_into()?)
@@ -180,11 +183,11 @@ pub async fn dependencies(
 ) -> Result<DependenciesResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .dependencies(TraversalEntityRequest {
+        .dependencies(request(TraversalEntityRequest {
             workspace,
             entity,
             max_hops: Some(max_hops),
-        })
+        }))
         .await?
         .into_inner()
         .try_into()?)
@@ -197,11 +200,11 @@ pub async fn impact(
 ) -> Result<ImpactResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .impact(TraversalEntityRequest {
+        .impact(request(TraversalEntityRequest {
             workspace,
             entity,
             max_hops: Some(max_hops),
-        })
+        }))
         .await?
         .into_inner()
         .try_into()?)
@@ -215,12 +218,12 @@ pub async fn trace(
 ) -> Result<TraceResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .trace(PathRequest {
+        .trace(request(PathRequest {
             workspace,
             from,
             to,
             max_hops: Some(max_hops),
-        })
+        }))
         .await?
         .into_inner()
         .try_into()?)
@@ -234,12 +237,12 @@ pub async fn why(
 ) -> Result<WhyResult, Box<dyn std::error::Error>> {
     Ok(connect()
         .await?
-        .why(PathRequest {
+        .why(request(PathRequest {
             workspace,
             from,
             to,
             max_hops: Some(max_hops),
-        })
+        }))
         .await?
         .into_inner()
         .try_into()?)
@@ -248,7 +251,7 @@ pub async fn why(
 pub async fn reindex_workspace(workspace: String) -> Result<(usize, bool), BeholderError> {
     let response = operation_client()
         .await?
-        .reindex_workspace(ReindexWorkspaceRequest { workspace })
+        .reindex_workspace(request(ReindexWorkspaceRequest { workspace }))
         .await
         .map_err(operation_error)?
         .into_inner();
@@ -314,14 +317,14 @@ pub async fn register_workspace(
         .collect::<Result<_, _>>()?;
     let workspace = connect()
         .await?
-        .register_workspace(RegisterWorkspaceRequest {
+        .register_workspace(request(RegisterWorkspaceRequest {
             name,
             repository_paths,
             protobuf_descriptor_paths: protobuf_descriptors
                 .iter()
                 .map(|path| path_string(path))
                 .collect::<Result<_, _>>()?,
-        })
+        }))
         .await?
         .into_inner()
         .workspace
@@ -332,7 +335,7 @@ pub async fn register_workspace(
 pub async fn list_workspaces() -> Result<Vec<Workspace>, Box<dyn std::error::Error>> {
     connect()
         .await?
-        .list_workspaces(ListWorkspacesRequest {})
+        .list_workspaces(request(ListWorkspacesRequest {}))
         .await?
         .into_inner()
         .workspaces
@@ -351,7 +354,17 @@ pub async fn stop() -> Result<bool, Box<dyn std::error::Error>> {
     let Ok(mut client) = connect().await else {
         return Ok(false);
     };
-    Ok(client.stop(StopRequest {}).await?.into_inner().accepted)
+    Ok(client
+        .stop(request(StopRequest {}))
+        .await?
+        .into_inner()
+        .accepted)
+}
+
+fn request<T>(message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    beholder_observability::inject_current_context(request.metadata_mut());
+    request
 }
 
 #[cfg(test)]
