@@ -74,8 +74,8 @@ use beholder_domain::{
 use beholder_dto::{Freshness, QueryMetadata};
 #[cfg(test)]
 use beholder_indexing::{
-    AnalysisInput, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot, IndexerBuilder,
-    WorkspaceAnalyzer, WorkspaceEnricher,
+    AnalysisInput, AnalyzerContribution, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot,
+    IndexerBuilder, WorkspaceAnalyzer, WorkspaceEnricher,
 };
 use beholder_indexing::{
     AnalysisInputKind, CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot,
@@ -704,7 +704,9 @@ impl IndexScheduler {
         repository: &WorkspaceRepository,
         authoritative: bool,
     ) -> Result<(usize, bool), Box<dyn Error>> {
-        let _active = self.begin_repository(&repository.repository.identity)?;
+        let operation = format!("repository {}", repository.repository.identity);
+        let _active = self.begin(&operation)?;
+        let _repository = self.begin_repository(&repository.repository.identity)?;
         let refresh = self.inventory.refresh(
             &repository.repository.identity,
             &repository.base,
@@ -724,6 +726,8 @@ impl IndexScheduler {
             repositories: vec![refresh.snapshot],
         };
         let plan = self.indexer.prepare(&snapshot);
+        let verification_fingerprint =
+            workspace_verification_fingerprint(plan.analysis_identity(), &snapshot);
         let analysis = self
             .indexer
             .analyze_prepared(&snapshot, &plan)
@@ -739,6 +743,25 @@ impl IndexScheduler {
         if repositories.next().is_some() {
             return Err("repository analysis returned multiple repositories".into());
         }
+        let current = self.inventory.refresh(
+            &repository.repository.identity,
+            &repository.base,
+            &[],
+            &self.indexer,
+            RefreshMode::Authoritative,
+        )?;
+        let current = WorkspaceSnapshot {
+            name: repository.repository.identity.clone(),
+            repositories: vec![current.snapshot],
+        };
+        let current_plan = self.indexer.prepare(&current);
+        if workspace_verification_fingerprint(current_plan.analysis_identity(), &current)
+            != verification_fingerprint
+        {
+            return Err(
+                "repository inputs changed during indexing; stale analysis was discarded".into(),
+            );
+        }
         let observation_count = facts.observations.len();
         let published = store.publish_repository(&facts)?;
         Ok((observation_count, published))
@@ -750,7 +773,9 @@ impl IndexScheduler {
         registry: &mut WorkspaceRegistry,
         identity: &str,
     ) -> Result<u64, BeholderError> {
-        let _active = self.begin_repository(identity)?;
+        let operation = format!("repository deletion {identity}");
+        let _active = self.begin(&operation)?;
+        let _repository = self.begin_repository(identity)?;
         if registry.repository(identity).is_none() {
             return Err(BeholderError::new(
                 BeholderErrorKind::NotFound,
@@ -2337,6 +2362,45 @@ mod tests {
 
     struct FakeEnricher;
 
+    struct MutatingAnalyzer {
+        source: PathBuf,
+    }
+
+    impl WorkspaceAnalyzer for MutatingAnalyzer {
+        fn metadata(&self) -> AnalyzerMetadata {
+            AnalyzerMetadata {
+                id: "mutating".into(),
+                version: "1".into(),
+            }
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            path.extension()
+                .is_some_and(|extension| extension == "fake")
+        }
+
+        fn analyze_prepared(
+            &self,
+            snapshot: &WorkspaceSnapshot,
+            _: &beholder_indexing::AnalyzerPlan,
+        ) -> Result<AnalyzerContribution, beholder_indexing::AnalyzerError> {
+            fs::write(&self.source, "changed")?;
+            Ok(AnalyzerContribution {
+                metadata: self.metadata(),
+                active_repositories: snapshot
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.state.repository.identity.clone())
+                    .collect(),
+                repositories: Vec::new(),
+                overrides: Vec::new(),
+                graphql_resolvers: Vec::new(),
+                diagnostics: Vec::new(),
+                cache: Default::default(),
+            })
+        }
+    }
+
     impl WorkspaceEnricher for FakeEnricher {
         fn metadata(&self) -> AnalyzerMetadata {
             AnalyzerMetadata {
@@ -2420,6 +2484,46 @@ mod tests {
                 .1
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repository_index_discards_analysis_when_inputs_change() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("beholder-repository-stale-{unique}"));
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        let source = repository.join("source.fake");
+        fs::write(&source, "initial").unwrap();
+        let selection = WorkspaceRepository {
+            repository: LogicalRepository {
+                identity: "example/repository".into(),
+            },
+            display_name: "repository".into(),
+            base: repository,
+            alternatives: Vec::new(),
+        };
+        let scheduler = IndexScheduler::with_indexer(
+            IndexerBuilder::new(root.join("cache"), 1)
+                .add_analyzer(MutatingAnalyzer { source })
+                .build()
+                .unwrap(),
+        );
+        let store = SemanticStore::memory().unwrap();
+
+        let error = scheduler
+            .index_repository(&store, &selection, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("stale analysis was discarded"));
+        assert!(
+            store
+                .repository_revision("example/repository")
+                .unwrap()
+                .is_none()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3109,7 +3213,7 @@ mod tests {
                 assert!(
                     context.edges.iter().any(|edge| {
                         edge.from == caller
-                            && edge.to.starts_with("repo://local://")
+                            && edge.to.starts_with("repo://provider/")
                             && edge.to.ends_with(target)
                     }),
                     "{context:?}"
@@ -3995,11 +4099,10 @@ mod tests {
         );
         assert!(
             store
-                .inspect_observations(Some("calls"))
+                .context("main", "repo://repo/rust/lib/old")
                 .unwrap()
-                .rows
-                .iter()
-                .all(|row| row[1].as_str() != Some("repo://repo/rust/lib/old"))
+                .edges
+                .is_empty()
         );
         fs::write(&source, "fn broken() { fn nested() {}").unwrap();
         scheduler.mark(&workspace);
@@ -4057,6 +4160,48 @@ mod tests {
         drop(active);
         claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn repository_index_waits_for_the_active_scheduler_operation() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("beholder-repository-wait-{unique}"));
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(repository.join("schema.graphql"), "type Query { id: ID! }").unwrap();
+        let selection = WorkspaceRepository {
+            repository: LogicalRepository {
+                identity: "example/repository".into(),
+            },
+            display_name: "repository".into(),
+            base: repository,
+            alternatives: Vec::new(),
+        };
+        let scheduler = Arc::new(IndexScheduler::new(root.join("cache")));
+        let store = Arc::new(SemanticStore::memory().unwrap());
+        let active = scheduler.begin("workspace").unwrap();
+        let waiting = scheduler.clone();
+        let waiting_store = store.clone();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            finished_tx
+                .send(
+                    waiting
+                        .index_repository(&waiting_store, &selection, false)
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+
+        assert!(finished_rx.recv_timeout(Duration::from_millis(25)).is_err());
+        drop(active);
+        assert!(finished_rx.recv_timeout(Duration::from_secs(2)).unwrap().1);
+        thread.join().unwrap();
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
