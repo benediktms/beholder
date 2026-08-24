@@ -270,12 +270,12 @@ mod tests {
     use beholder_protocol::{
         ERROR_CODE_METADATA_KEY,
         v1::{
-            ClearCacheRequest, EntityKind, EntityRequest, EvidenceKind, GarbageCollectPhase,
-            GarbageCollectRequest, GetGarbageCollectionStatusRequest, GetRepositoryRequest,
-            GetStatusRequest, IndexRepositoryRequest, ListWorkspacesRequest, PathRequest,
-            RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-            RelationKind, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
-            garbage_collect_event,
+            ClearCacheRequest, DeleteRepositoryRequest, EntityKind, EntityRequest, EvidenceKind,
+            GarbageCollectPhase, GarbageCollectRequest, GetGarbageCollectionStatusRequest,
+            GetRepositoryRequest, GetStatusRequest, IndexRepositoryRequest, ListWorkspacesRequest,
+            PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
+            ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
+            daemon_client::DaemonClient, garbage_collect_event,
         },
     };
     use std::{env, fs, path::Path, time::Duration};
@@ -346,7 +346,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 15);
+        assert_eq!(status.protocol_version, 16);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");
@@ -394,7 +394,7 @@ mod tests {
         assert!(
             !client
                 .index_repository(IndexRepositoryRequest {
-                    identity,
+                    identity: identity.clone(),
                     authoritative: true,
                 })
                 .await
@@ -402,6 +402,37 @@ mod tests {
                 .into_inner()
                 .published
         );
+        assert_eq!(
+            client
+                .delete_repository(DeleteRepositoryRequest {
+                    identity: identity.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .repository_states_queued,
+            1
+        );
+        let deleted = client
+            .get_repository(GetRepositoryRequest { identity })
+            .await
+            .unwrap_err();
+        assert_eq!(deleted.code(), tonic::Code::NotFound);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = client
+                    .get_garbage_collection_status(GetGarbageCollectionStatusRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if !status.running && status.repository_states_queued == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deleted repository state was not cleaned up");
 
         let unavailable = client
             .context(EntityRequest {
@@ -469,6 +500,22 @@ mod tests {
             .workspace
             .unwrap();
         assert_eq!(registered.name, "main");
+        let referenced = client
+            .delete_repository(DeleteRepositoryRequest {
+                identity: first_identity.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(referenced.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            referenced
+                .metadata()
+                .get(ERROR_CODE_METADATA_KEY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            BeholderErrorCode::RepositoryDeleteFailed.as_str()
+        );
         assert_eq!(
             client
                 .list_workspaces(ListWorkspacesRequest {})

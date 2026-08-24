@@ -5,8 +5,8 @@ use super::{
 use crate::stdout;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{
-    clear_cache, garbage_collect, get_garbage_collection_status, get_repository, index_repository,
-    list_workspaces, register_repository, register_workspace,
+    clear_cache, delete_repository, garbage_collect, get_garbage_collection_status, get_repository,
+    index_repository, list_workspaces, register_repository, register_workspace,
 };
 use beholder_dto::{
     AnalysisCompleteness, GarbageCollectionEvent, GarbageCollectionPhase,
@@ -47,6 +47,12 @@ pub(super) async fn repository(command: RepositoryCommand) -> Result<(), Box<dyn
     match command {
         RepositoryCommand::Register { path } => {
             print_repository(&register_repository(&path).await?)?;
+        }
+        RepositoryCommand::Delete { identity } => {
+            let queued = delete_repository(identity.clone()).await?;
+            stdout(format_args!(
+                "deleted {identity} · {queued} repository states queued for cleanup"
+            ))?;
         }
         RepositoryCommand::Show { identity } => {
             print_repository(&get_repository(identity).await?)?;

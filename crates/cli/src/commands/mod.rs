@@ -176,6 +176,11 @@ enum RepositoryCommand {
         /// Repository root.
         path: PathBuf,
     },
+    /// Forget an unreferenced repository and clean up its graph data.
+    Delete {
+        /// Logical repository identity.
+        identity: String,
+    },
     /// Show registration and latest completed revision state.
     Show {
         /// Logical repository identity.
@@ -328,6 +333,19 @@ mod tests {
             Some(Command::Cache {
                 command: CacheCommand::Clear
             })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "beholder",
+                "repository",
+                "delete",
+                "github.com/example/repo"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Repository {
+                command: RepositoryCommand::Delete { identity }
+            }) if identity == "github.com/example/repo"
         ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "cache", "gc"])

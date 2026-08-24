@@ -146,6 +146,22 @@ impl WorkspaceRegistry {
         self.repositories.get(identity)
     }
 
+    pub fn workspace_referencing_repository(&self, identity: &str) -> Option<&str> {
+        self.workspaces
+            .values()
+            .find(|workspace| {
+                workspace
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.repository.identity == identity)
+            })
+            .map(|workspace| workspace.name.as_str())
+    }
+
+    pub fn remove_repository(&mut self, identity: &str) -> Result<bool, Box<dyn Error>> {
+        self.repositories.remove(identity)
+    }
+
     fn persist(&self, workspaces: &BTreeMap<String, Workspace>) -> Result<(), Box<dyn Error>> {
         let temporary = self.path.with_extension("json.tmp");
         let file = File::create(&temporary)?;

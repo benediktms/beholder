@@ -7,12 +7,13 @@ use beholder_dto::{
 use beholder_protocol::{
     ERROR_CODE_METADATA_KEY,
     v1::{
-        ClearCacheRequest, EntityRequest, GarbageCollectEvent as ProtocolGarbageCollectEvent,
-        GarbageCollectPhase, GarbageCollectProgress as ProtocolGarbageCollectProgress,
-        GarbageCollectRequest, GetGarbageCollectionStatusRequest, GetRepositoryRequest,
-        GetStatusRequest, GetStatusResponse, IndexRepositoryRequest, ListWorkspacesRequest,
-        PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-        StopRequest, TraversalEntityRequest, daemon_client::DaemonClient, garbage_collect_event,
+        ClearCacheRequest, DeleteRepositoryRequest, EntityRequest,
+        GarbageCollectEvent as ProtocolGarbageCollectEvent, GarbageCollectPhase,
+        GarbageCollectProgress as ProtocolGarbageCollectProgress, GarbageCollectRequest,
+        GetGarbageCollectionStatusRequest, GetRepositoryRequest, GetStatusRequest,
+        GetStatusResponse, IndexRepositoryRequest, ListWorkspacesRequest, PathRequest,
+        RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest, StopRequest,
+        TraversalEntityRequest, daemon_client::DaemonClient, garbage_collect_event,
     },
 };
 use std::path::{Path, PathBuf};
@@ -362,6 +363,16 @@ pub async fn get_repository(
         .repository
         .ok_or("daemon returned no repository")?
         .try_into()?)
+}
+
+pub async fn delete_repository(identity: String) -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(operation_client()
+        .await?
+        .delete_repository(request(DeleteRepositoryRequest { identity }))
+        .await
+        .map_err(operation_error)?
+        .into_inner()
+        .repository_states_queued)
 }
 
 pub async fn index_repository(

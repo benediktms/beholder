@@ -434,6 +434,70 @@ pub(super) fn publish_repository(
     Ok(changed)
 }
 
+pub(super) fn delete_repository_revision(
+    db: &DbInstance,
+    repository: &str,
+) -> Result<u64, Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    let params = BTreeMap::from([("repository".into(), repository.into())]);
+    let revision = transaction.run_script(
+        "?[repository, analyzed_state] := \
+             *repository_revision{repository: $repository, analyzed_state}, repository = $repository",
+        params.clone(),
+    )?;
+    transaction.run_script(
+        "?[repository, code, severity, path, line] := \
+             *repository_revision_diagnostic{repository: $repository, code, severity, path, line}, \
+             repository = $repository\n\
+         :rm repository_revision_diagnostic {repository, code, severity, path, line}",
+        params.clone(),
+    )?;
+    transaction.run_script(
+        "?[repository] := repository = $repository\n:rm repository_revision {repository}",
+        params,
+    )?;
+    let queued = if let Some(row) = revision.rows.first() {
+        let state = row[1]
+            .get_str()
+            .ok_or("repository revision state is not a string")?;
+        let stale = transaction.run_script(
+            "live_state[state] := \
+                 *analysis_revision{view, revision}, \
+                 *analysis_revision_state{view, revision, state}\n\
+             ?[state, repository, head] := \
+                 *repository_state{fingerprint: state, repository, head}, \
+                 state = $state, not live_state[state]",
+            BTreeMap::from([("state".into(), state.into())]),
+        )?;
+        if !stale.rows.is_empty() {
+            transaction.run_script(
+                "?[state, repository, head] <- $rows \
+                 :put garbage_collection_state {state => repository, head}",
+                BTreeMap::from([(
+                    "rows".into(),
+                    DataValue::List(
+                        stale
+                            .rows
+                            .clone()
+                            .into_iter()
+                            .map(DataValue::List)
+                            .collect(),
+                    ),
+                )]),
+            )?;
+            transaction.run_script(
+                "?[fingerprint] := fingerprint = $state :rm repository_state {fingerprint}",
+                BTreeMap::from([("state".into(), state.into())]),
+            )?;
+        }
+        stale.rows.len().try_into()?
+    } else {
+        0
+    };
+    transaction.commit()?;
+    Ok(queued)
+}
+
 pub(super) fn reusable_current_state(
     transaction: &MultiTransaction,
     view: &WorkspaceView,

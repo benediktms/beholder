@@ -195,7 +195,10 @@ beholder repository register /path/to/repository
 beholder repository index <repository-identity>
 beholder repository show <repository-identity>
 beholder repository refresh <repository-identity>
+beholder repository delete <repository-identity>
 ```
+
+Deletion is rejected while a workspace references the repository. It never deletes the source checkout; graph facts not retained by a completed workspace revision are cleaned up in the background.
 
 Re-run `just install` after rebuilding Beholder. `just uninstall` removes the installed binaries and service.
 

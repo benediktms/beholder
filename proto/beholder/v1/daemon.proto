@@ -7,6 +7,7 @@ service Daemon {
   rpc GarbageCollect(GarbageCollectRequest) returns (stream GarbageCollectEvent);
   rpc GetGarbageCollectionStatus(GetGarbageCollectionStatusRequest) returns (GetGarbageCollectionStatusResponse);
   rpc Context(EntityRequest) returns (ContextResponse);
+  rpc DeleteRepository(DeleteRepositoryRequest) returns (DeleteRepositoryResponse);
   rpc Dependencies(TraversalEntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetRepository(GetRepositoryRequest) returns (RepositoryResponse);
@@ -382,6 +383,14 @@ message RepositoryStatus {
 
 message RegisterRepositoryRequest {
   string path = 1;
+}
+
+message DeleteRepositoryRequest {
+  string identity = 1;
+}
+
+message DeleteRepositoryResponse {
+  uint64 repository_states_queued = 1;
 }
 
 message GetRepositoryRequest {

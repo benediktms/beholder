@@ -744,6 +744,48 @@ impl IndexScheduler {
         Ok((observation_count, published))
     }
 
+    pub fn delete_repository(
+        &self,
+        store: &SemanticStore,
+        registry: &mut WorkspaceRegistry,
+        identity: &str,
+    ) -> Result<u64, BeholderError> {
+        let _active = self.begin_repository(identity)?;
+        if registry.repository(identity).is_none() {
+            return Err(BeholderError::new(
+                BeholderErrorKind::NotFound,
+                BeholderErrorCode::RepositoryNotRegistered,
+                format!("repository not registered: {identity}"),
+            ));
+        }
+        if let Some(workspace) = registry.workspace_referencing_repository(identity) {
+            return Err(BeholderError::new(
+                BeholderErrorKind::FailedPrecondition,
+                BeholderErrorCode::RepositoryDeleteFailed,
+                format!("repository is referenced by workspace: {workspace}"),
+            ));
+        }
+        let queued = store
+            .delete_repository_revision(identity)
+            .map_err(|source| {
+                BeholderError::new(
+                    BeholderErrorKind::Internal,
+                    BeholderErrorCode::RepositoryDeleteFailed,
+                    "repository revision deletion failed",
+                )
+                .with_source(std::io::Error::other(source.to_string()))
+            })?;
+        registry.remove_repository(identity).map_err(|source| {
+            BeholderError::new(
+                BeholderErrorKind::Internal,
+                BeholderErrorCode::RepositoryRegistryFailed,
+                "repository registration deletion failed",
+            )
+            .with_source(std::io::Error::other(source.to_string()))
+        })?;
+        Ok(queued)
+    }
+
     fn begin_repository(&self, identity: &str) -> Result<ActiveRepository<'_>, BeholderError> {
         if self.is_stopping() {
             return Err(scheduler_unavailable());

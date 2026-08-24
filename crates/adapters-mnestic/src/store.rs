@@ -9,10 +9,10 @@ use super::{
         repository_revision, trace,
     },
     storage::{
-        claim_garbage_collection, enrichment_matches, enrichments_current, ensure_revision_inputs,
-        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
-        publish_observations, publish_repository, repository_contexts,
-        revision_enrichment_input_fingerprint, store_verification_fingerprint,
+        claim_garbage_collection, delete_repository_revision, enrichment_matches,
+        enrichments_current, ensure_revision_inputs, garbage_collection_pending,
+        garbage_collection_queued, publish_enrichment, publish_observations, publish_repository,
+        repository_contexts, revision_enrichment_input_fingerprint, store_verification_fingerprint,
         sweep_garbage_collection, verification_matches, view_matches,
     },
 };
@@ -144,6 +144,10 @@ impl SemanticStore {
         repository: &str,
     ) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
         repository_revision(&self.read_db, repository)
+    }
+
+    pub fn delete_repository_revision(&self, repository: &str) -> Result<u64, Box<dyn Error>> {
+        delete_repository_revision(&self.db, repository)
     }
 
     pub fn publish_verified(
@@ -558,6 +562,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(observations.rows.len(), 1);
+        assert_eq!(
+            store
+                .delete_repository_revision("example/repository")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.garbage_collection_queued().unwrap(), 0);
+        assert_eq!(
+            store
+                .context("standalone-reuse", "repo/source")
+                .unwrap()
+                .edges
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn deleting_a_standalone_revision_queues_its_unreferenced_state() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "standalone",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repository".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "source-state".into(),
+            }],
+        )
+        .unwrap();
+        let repository = facts(
+            &view,
+            vec![Observation::dependency(
+                "repo/source",
+                DependencyRelation::Calls,
+                "repo/target",
+                "src/lib.rs:1",
+            )],
+        );
+
+        store.publish_repository(&repository).unwrap();
+        assert_eq!(
+            store
+                .delete_repository_revision("example/repository")
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .repository_revision("example/repository")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.garbage_collection_queued().unwrap(), 1);
     }
 
     #[test]

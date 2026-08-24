@@ -79,6 +79,16 @@ impl RepositoryRegistry {
         self.repositories.get(identity)
     }
 
+    pub fn remove(&mut self, identity: &str) -> Result<bool, Box<dyn Error>> {
+        let mut repositories = self.repositories.clone();
+        let removed = repositories.remove(identity).is_some();
+        if removed {
+            self.persist(&repositories)?;
+            self.repositories = repositories;
+        }
+        Ok(removed)
+    }
+
     fn persist(
         &self,
         repositories: &BTreeMap<String, RegisteredRepository>,
@@ -128,11 +138,25 @@ mod tests {
             .register(repository.canonicalize().unwrap())
             .unwrap();
 
-        let reloaded = RepositoryRegistry::open(path).unwrap();
-        let reloaded = reloaded
+        let mut reloaded = RepositoryRegistry::open(path.clone()).unwrap();
+        let reloaded_entry = reloaded
             .get(&registered.selection.repository.identity)
             .unwrap();
-        assert_eq!(reloaded.selection.base, repository.canonicalize().unwrap());
+        assert_eq!(
+            reloaded_entry.selection.base,
+            repository.canonicalize().unwrap()
+        );
+        assert!(
+            reloaded
+                .remove(&registered.selection.repository.identity)
+                .unwrap()
+        );
+        assert!(
+            RepositoryRegistry::open(path)
+                .unwrap()
+                .get(&registered.selection.repository.identity)
+                .is_none()
+        );
         fs::remove_dir_all(state).unwrap();
     }
 }

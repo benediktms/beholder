@@ -8,12 +8,13 @@ use beholder_dto::{
 };
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
-    ClearCacheRequest, ClearCacheResponse, ContextResponse, DependenciesResponse, EntityRequest,
-    GarbageCollectEvent, GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest,
-    GarbageCollectResponse, GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse,
-    GetRepositoryRequest, GetStatusRequest, GetStatusResponse, ImpactResponse,
-    IndexRepositoryRequest, IndexRepositoryResponse, ListWorkspacesRequest, ListWorkspacesResponse,
-    PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
+    ClearCacheRequest, ClearCacheResponse, ContextResponse, DeleteRepositoryRequest,
+    DeleteRepositoryResponse, DependenciesResponse, EntityRequest, GarbageCollectEvent,
+    GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
+    GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetRepositoryRequest,
+    GetStatusRequest, GetStatusResponse, ImpactResponse, IndexRepositoryRequest,
+    IndexRepositoryResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
+    RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
     ReindexWorkspaceRequest, ReindexWorkspaceResponse, RepositoryResponse, StopRequest,
     StopResponse, TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
     garbage_collect_event,
@@ -191,6 +192,39 @@ impl Daemon for BeholderDaemon {
     }
 
     #[tracing::instrument(
+        name = "rpc.delete_repository",
+        skip_all,
+        err,
+        fields(repository = %request.get_ref().identity)
+    )]
+    async fn delete_repository(
+        &self,
+        request: Request<DeleteRepositoryRequest>,
+    ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+        let identity = request.into_inner().identity;
+        let mut registry = self
+            .workspaces
+            .lock()
+            .map_err(|_| repository_registry_unavailable())?;
+        let repository_states_queued = self
+            .scheduler
+            .delete_repository(&self.store, &mut registry, &identity)
+            .map_err(operation_status)?;
+        drop(registry);
+        if let Err(source) = start_garbage_collector(
+            self.store.clone(),
+            self.scheduler.clone(),
+            self.garbage_collector_running.clone(),
+            self.garbage_collection_progress.clone(),
+        ) {
+            tracing::error!(%source, "repository cleanup worker failed to start");
+        }
+        Ok(Response::new(DeleteRepositoryResponse {
+            repository_states_queued,
+        }))
+    }
+
+    #[tracing::instrument(
         name = "rpc.dependencies",
         skip_all,
         fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
@@ -215,7 +249,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 15,
+            protocol_version: 16,
             pid: std::process::id(),
         }))
     }
