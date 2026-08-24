@@ -14,8 +14,8 @@ use super::{
         ensure_revision_inputs, garbage_collection_candidates, garbage_collection_pending,
         garbage_collection_queued, prepare_enrichment, publish_enrichment, publish_observations,
         publish_repository, repository_contexts, revision_enrichment_input_fingerprint,
-        store_verification_fingerprint,
-        sweep_garbage_collection, verification_matches, view_matches,
+        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
+        view_matches,
     },
 };
 use beholder_domain::{

@@ -5761,7 +5761,7 @@ mod tests {
         );
         assert_eq!(store.garbage_collect().unwrap().repository_states_queued, 0);
         assert!(store.garbage_collection_pending().unwrap());
-        store.sweep_garbage_collection(|_| {}).unwrap();
+        store.sweep_garbage_collection(|_| true).unwrap();
         assert!(!store.garbage_collection_pending().unwrap());
         let old = store
             .db
@@ -5868,7 +5868,7 @@ mod tests {
         assert_eq!(current_revision(&store, "owner-benchmark"), 3);
         let cleanup_started = Instant::now();
         assert_eq!(store.garbage_collect().unwrap().repository_states_queued, 0);
-        store.sweep_garbage_collection(|_| {}).unwrap();
+        store.sweep_garbage_collection(|_| true).unwrap();
         let cleanup_elapsed = cleanup_started.elapsed();
         store.checkpoint().unwrap();
         let final_database_bytes = fs::metadata(&database).map_or(0, |metadata| metadata.len());
