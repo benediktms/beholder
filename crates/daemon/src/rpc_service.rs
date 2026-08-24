@@ -172,7 +172,6 @@ impl Daemon for BeholderDaemon {
     #[tracing::instrument(
         name = "rpc.context",
         skip_all,
-        err,
         fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
     )]
     async fn context(
@@ -190,7 +189,6 @@ impl Daemon for BeholderDaemon {
     #[tracing::instrument(
         name = "rpc.dependencies",
         skip_all,
-        err,
         fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
     )]
     async fn dependencies(
@@ -221,7 +219,6 @@ impl Daemon for BeholderDaemon {
     #[tracing::instrument(
         name = "rpc.impact",
         skip_all,
-        err,
         fields(workspace = %request.get_ref().workspace, entity = %request.get_ref().entity)
     )]
     async fn impact(
@@ -403,7 +400,6 @@ impl Daemon for BeholderDaemon {
     #[tracing::instrument(
         name = "rpc.trace",
         skip_all,
-        err,
         fields(workspace = %request.get_ref().workspace, from = %request.get_ref().from, to = %request.get_ref().to)
     )]
     async fn trace(
@@ -422,7 +418,6 @@ impl Daemon for BeholderDaemon {
     #[tracing::instrument(
         name = "rpc.why",
         skip_all,
-        err,
         fields(workspace = %request.get_ref().workspace, from = %request.get_ref().from, to = %request.get_ref().to)
     )]
     async fn why(&self, request: Request<PathRequest>) -> Result<Response<WhyResponse>, Status> {
@@ -479,6 +474,10 @@ fn max_hops(value: Option<u32>) -> Result<u32, Status> {
 }
 
 fn operation_status(error: BeholderError) -> Status {
+    operation_status_ref(&error)
+}
+
+pub(super) fn operation_status_ref(error: &BeholderError) -> Status {
     let code = match error.kind() {
         BeholderErrorKind::InvalidInput => Code::InvalidArgument,
         BeholderErrorKind::NotFound => Code::NotFound,

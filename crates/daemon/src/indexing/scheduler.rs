@@ -289,6 +289,7 @@ pub struct IndexScheduler {
     enrichment_changed: Notify,
     shutdown: Notify,
     enrichment_shutdown: Notify,
+    stopping: AtomicBool,
     checkpointing: AtomicBool,
     indexer: Indexer,
     inventory: InventoryStore,
@@ -478,6 +479,7 @@ impl IndexScheduler {
             enrichment_changed: Notify::new(),
             shutdown: Notify::new(),
             enrichment_shutdown: Notify::new(),
+            stopping: AtomicBool::new(false),
             checkpointing: AtomicBool::new(false),
             indexer,
             inventory,
@@ -543,6 +545,7 @@ impl IndexScheduler {
             enrichment_changed: Notify::new(),
             shutdown: Notify::new(),
             enrichment_shutdown: Notify::new(),
+            stopping: AtomicBool::new(false),
             checkpointing: AtomicBool::new(false),
             indexer,
             inventory,
@@ -702,11 +705,17 @@ impl IndexScheduler {
     }
 
     fn begin(&self, operation: &str) -> Result<ActiveOperation<'_>, BeholderError> {
+        if self.is_stopping() {
+            return Err(scheduler_unavailable());
+        }
         let mut active = self
             .active_operation
             .lock()
             .map_err(|_| scheduler_unavailable())?;
         while let Some(active_operation) = active.as_deref() {
+            if self.is_stopping() {
+                return Err(scheduler_unavailable());
+            }
             tracing::info!(operation, active_operation, "scheduler operation waiting");
             active = self
                 .idle
@@ -762,15 +771,10 @@ impl IndexScheduler {
         let Ok(registry) = workspaces.lock() else {
             return;
         };
-        let Ok(mut generations) = self.generations.lock() else {
-            return;
-        };
-        let Ok(mut dirty_repositories) = self.dirty_repositories.lock() else {
-            return;
-        };
-        let mut changed = false;
-        let mut changed_workspaces = BTreeSet::new();
-        for workspace in registry.list() {
+        let registered = registry.list();
+        drop(registry);
+        let mut changes = Vec::new();
+        for workspace in registered {
             let dirty = workspace
                 .repositories
                 .iter()
@@ -819,33 +823,54 @@ impl IndexScheduler {
                 })
                 .collect::<Vec<_>>();
             if !dirty.is_empty() {
-                tracing::debug!(workspace = %workspace.name, repositories = dirty.len(), source_units = dirty.iter().map(|(_, intent)| intent.source_count()).sum::<usize>(), "workspace marked stale");
-                changed_workspaces.insert(workspace.name.clone());
-                *generations.entry(workspace.name.clone()).or_default() += 1;
-                let repositories = dirty_repositories.entry(workspace.name).or_default();
-                for (repository, pending) in dirty {
-                    repositories.entry(repository).or_default().merge(pending);
-                }
-                changed = true;
+                changes.push((workspace.name, dirty));
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let Ok(mut generations) = self.generations.lock() else {
+            return;
+        };
+        let Ok(mut dirty_repositories) = self.dirty_repositories.lock() else {
+            return;
+        };
+        let changed_workspaces = changes
+            .iter()
+            .map(|(workspace, _)| workspace.clone())
+            .collect::<Vec<_>>();
+        for (workspace, dirty) in changes {
+            tracing::debug!(
+                workspace,
+                repositories = dirty.len(),
+                source_units = dirty
+                    .iter()
+                    .map(|(_, intent)| intent.source_count())
+                    .sum::<usize>(),
+                "workspace marked stale"
+            );
+            *generations.entry(workspace.clone()).or_default() += 1;
+            let repositories = dirty_repositories.entry(workspace).or_default();
+            for (repository, pending) in dirty {
+                repositories.entry(repository).or_default().merge(pending);
             }
         }
         drop(dirty_repositories);
         drop(generations);
-        drop(registry);
-        if changed {
-            if let Ok(mut retries) = self.retry_attempts.lock() {
-                for workspace in changed_workspaces {
-                    retries.remove(&workspace);
-                }
+        if let Ok(mut retries) = self.retry_attempts.lock() {
+            for workspace in changed_workspaces {
+                retries.remove(&workspace);
             }
-            self.changed.notify_one();
         }
+        self.changed.notify_one();
     }
 
     fn reconcile_after_watcher_error(&self, workspaces: &Mutex<WorkspaceRegistry>) {
         let Ok(registry) = workspaces.lock() else {
             return;
         };
+        let registered = registry.list();
+        drop(registry);
         let Ok(mut generations) = self.generations.lock() else {
             return;
         };
@@ -853,7 +878,7 @@ impl IndexScheduler {
             return;
         };
         let mut changed = false;
-        for workspace in registry.list() {
+        for workspace in registered {
             if workspace.repositories.is_empty() {
                 continue;
             }
@@ -869,7 +894,6 @@ impl IndexScheduler {
         }
         drop(dirty);
         drop(generations);
-        drop(registry);
         if changed {
             if let Ok(mut retries) = self.retry_attempts.lock() {
                 retries.clear();
@@ -890,8 +914,14 @@ impl IndexScheduler {
     }
 
     pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.idle.notify_all();
         self.shutdown.notify_one();
         self.enrichment_shutdown.notify_one();
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
     }
 
     pub fn schedule_checkpoint(self: &Arc<Self>, store: Arc<SemanticStore>) {
@@ -924,8 +954,8 @@ impl IndexScheduler {
     }
 
     #[cfg(test)]
-    pub(crate) fn block_indexing(&self) -> impl Drop + '_ {
-        self.begin("test blocker").unwrap()
+    pub(crate) fn block_indexing(&self, workspace: &str) -> impl Drop + '_ {
+        self.begin(workspace).unwrap()
     }
 
     async fn run_with_reconciliation_period(
@@ -941,9 +971,10 @@ impl IndexScheduler {
         reconciliation.set_missed_tick_behavior(MissedTickBehavior::Skip);
         'run: loop {
             let reconcile = tokio::select! {
+                biased;
+                _ = self.shutdown.notified() => break 'run,
                 _ = self.changed.notified() => false,
                 _ = reconciliation.tick() => true,
-                _ = self.shutdown.notified() => break 'run,
             };
             if reconcile {
                 let scheduler = self.clone();
@@ -960,6 +991,7 @@ impl IndexScheduler {
                     Ok(false) => {}
                     Err(error) => tracing::error!(%error, "reconciliation worker failed"),
                 }
+                reconciliation.reset();
                 continue;
             }
             let first_change = Instant::now();
@@ -1014,6 +1046,9 @@ impl IndexScheduler {
         };
         let mut published = false;
         for workspace in registered {
+            if self.is_stopping() {
+                break;
+            }
             let dirty = workspace
                 .repositories
                 .iter()
@@ -1056,6 +1091,9 @@ impl IndexScheduler {
         };
         let mut result = ReindexResult::default();
         for workspace in registered {
+            if self.is_stopping() {
+                break;
+            }
             match self.index_active(store, &workspace) {
                 Ok((_, published)) => {
                     result.published |= published;
@@ -1644,6 +1682,9 @@ fn index_workspace_through_port(
         repositories = workspace.repositories.len()
     )
     .in_scope(|| refresh_workspace_snapshot(scheduler, workspace, dirty))?;
+    if scheduler.is_stopping() {
+        return Ok((0, false));
+    }
     let source_loading = source_loading_started.elapsed();
     let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let verification_fingerprint =
@@ -1694,6 +1735,9 @@ fn index_workspace_through_port(
             .with_repository_enrichment_inputs(
                 scheduler.indexer.enrichment_input_identities(&snapshot),
             )?;
+        if scheduler.is_stopping() {
+            return Ok((0, false));
+        }
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         scheduler.queue_enrichments(store, &snapshot, &view)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
@@ -1740,6 +1784,9 @@ fn index_workspace_through_port(
             .analyze_prepared(&snapshot, &analysis_plan)
             .map_err(erase_error)
     })?;
+    if scheduler.is_stopping() {
+        return Ok((0, false));
+    }
     let repository_analysis = repository_analysis_started.elapsed();
     let mut memory_hits = 0;
     let mut disk_hits = 0;
@@ -1781,6 +1828,9 @@ fn index_workspace_through_port(
     let publication_started = Instant::now();
     let (current, verification_statistics) =
         refresh_workspace_snapshot(scheduler, workspace, dirty)?;
+    if scheduler.is_stopping() {
+        return Ok((0, false));
+    }
     let current_plan = scheduler.indexer.prepare(&current);
     let current_fingerprint =
         workspace_verification_fingerprint(current_plan.analysis_identity(), &current);
@@ -1815,7 +1865,9 @@ fn index_workspace_through_port(
             &verification_fingerprint,
         )
     })?;
-    scheduler.queue_enrichments(store, &snapshot, &view)?;
+    if !scheduler.is_stopping() {
+        scheduler.queue_enrichments(store, &snapshot, &view)?;
+    }
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
     tracing::info!(

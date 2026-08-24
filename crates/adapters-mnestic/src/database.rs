@@ -106,6 +106,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_REVISION_OBSERVATION_TO_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_OVERRIDE_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -407,6 +412,10 @@ pub(super) fn persistent_database(
         for (name, script) in [
             ("state_observation:by_to", CREATE_OBSERVATION_TO_INDEX),
             ("state_observation_metadata:by_to", CREATE_METADATA_TO_INDEX),
+            (
+                "analysis_revision_observation:by_to",
+                CREATE_REVISION_OBSERVATION_TO_INDEX,
+            ),
         ] {
             if !relations
                 .rows
@@ -521,6 +530,10 @@ mod tests {
                 .unwrap()
                 .paths
                 .is_empty()
+        );
+        assert_eq!(
+            store.context("legacy", "repo/target").unwrap().edges.len(),
+            1
         );
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();

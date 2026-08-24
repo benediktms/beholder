@@ -62,13 +62,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .clone()
                 .run(service.store.clone(), service.workspaces.clone()),
         );
+        let shutdown_scheduler = index_scheduler.clone();
         Server::builder()
             .trace_fn(rpc_span)
             .add_service(DaemonServer::new(service))
-            .serve_with_incoming_shutdown(
-                UnixListenerStream::new(listener),
-                ipc::shutdown_signal(stopped),
-            )
+            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
+                ipc::shutdown_signal(stopped).await;
+                shutdown_scheduler.stop();
+            })
             .await?;
         index_scheduler.stop();
         watcher_task.await?;
@@ -318,11 +319,13 @@ mod tests {
                 .clone()
                 .run(service.store.clone(), service.workspaces.clone()),
         );
+        let shutdown_scheduler = index_scheduler.clone();
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(DaemonServer::new(service))
                 .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
                     let _ = stopped.await;
+                    shutdown_scheduler.stop();
                 })
                 .await
                 .unwrap();
@@ -343,6 +346,24 @@ mod tests {
         assert_eq!(status.status, "ready");
         assert_eq!(status.protocol_version, 14);
         assert_eq!(status.pid, std::process::id());
+
+        let unavailable = client
+            .context(EntityRequest {
+                workspace: "main".into(),
+                entity: "repo/source".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            unavailable
+                .metadata()
+                .get(ERROR_CODE_METADATA_KEY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            BeholderErrorCode::WorkspaceRevisionUnavailable.as_str()
+        );
 
         let missing = client
             .reindex_workspace(ReindexWorkspaceRequest {
@@ -404,14 +425,20 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let context = client
+                let context = match client
                     .context(EntityRequest {
                         workspace: "main".into(),
                         entity: caller.clone(),
                     })
                     .await
-                    .unwrap()
-                    .into_inner();
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(error) if error.code() == tonic::Code::Unavailable => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Err(error) => panic!("initial workspace query failed: {error}"),
+                };
                 if format!("{context:?}").contains(&helper) {
                     break;
                 }
@@ -557,18 +584,17 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if !client
+                match client
                     .context(EntityRequest {
                         workspace: "secondary".into(),
                         entity: isolated.clone(),
                     })
                     .await
-                    .unwrap()
-                    .into_inner()
-                    .edges
-                    .is_empty()
                 {
-                    break;
+                    Ok(response) if !response.get_ref().edges.is_empty() => break,
+                    Ok(_) => {}
+                    Err(error) if error.code() == tonic::Code::Unavailable => {}
+                    Err(error) => panic!("secondary workspace query failed: {error}"),
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -656,6 +682,7 @@ mod tests {
 
         fs::write(first.join("src/lib.rs"), "fn caller() { replacement(); }").unwrap();
         fs::write(second.join("src/lib.rs"), "fn replacement() {}").unwrap();
+        let replacement = format!("repo://{second_identity}/rust/lib/replacement");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let context = client
@@ -666,9 +693,7 @@ mod tests {
                     .await
                     .unwrap()
                     .into_inner();
-                if format!("{context:?}")
-                    .contains(&format!("repo://{}/rust/lib/replacement", second_identity))
-                {
+                if format!("{context:?}").contains(&replacement) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -677,10 +702,59 @@ mod tests {
         .await
         .expect("filesystem change was not indexed");
 
-        let blocker = index_scheduler.block_indexing();
+        let completed = client
+            .context(EntityRequest {
+                workspace: "main".into(),
+                entity: caller.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let completed_revision = completed.metadata.unwrap().revision;
+        let pending = format!("repo://{first_identity}/rust/lib/after_wait");
+        let blocker = index_scheduler.block_indexing("main");
+        fs::write(
+            first.join("src/lib.rs"),
+            "fn caller() { after_wait(); } fn after_wait() {}",
+        )
+        .unwrap();
         let workspace = test_workspaces.lock().unwrap().get("main").unwrap().clone();
         index_scheduler.mark(&workspace);
         tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let during_index = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.context(EntityRequest {
+                workspace: "main".into(),
+                entity: caller.clone(),
+            }),
+        )
+        .await
+        .expect("semantic query blocked behind indexing")
+        .unwrap()
+        .into_inner();
+        let metadata = during_index.metadata.as_ref().unwrap();
+        assert_eq!(metadata.revision, completed_revision);
+        let freshness = metadata.freshness.as_ref().unwrap();
+        assert!(freshness.stale);
+        assert!(freshness.indexing);
+        assert!(format!("{during_index:?}").contains(&replacement));
+        assert!(!format!("{during_index:?}").contains(&pending));
+
+        let other_workspace = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.context(EntityRequest {
+                workspace: "secondary".into(),
+                entity: isolated,
+            }),
+        )
+        .await
+        .expect("indexing one workspace delayed a query against another")
+        .unwrap()
+        .into_inner();
+        let freshness = other_workspace.metadata.unwrap().freshness.unwrap();
+        assert!(!freshness.stale);
+        assert!(!freshness.indexing);
 
         assert!(
             client
@@ -691,17 +765,13 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
-        index_scheduler.stop();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut watcher_task)
-                .await
-                .is_err(),
-            "daemon detached the blocking index worker"
-        );
+        tokio::time::timeout(Duration::from_millis(500), &mut watcher_task)
+            .await
+            .expect("daemon did not cancel queued indexing")
+            .unwrap();
         assert!(socket_path.exists());
         assert!(single_instance::acquire(&state).is_err());
         drop(blocker);
-        watcher_task.await.unwrap();
         drop(socket_file);
         assert!(!socket_path.exists());
         let reloaded = WorkspaceRegistry::open(registry_path).unwrap();
@@ -709,12 +779,12 @@ mod tests {
         assert!(reloaded.get("secondary").is_some());
         let indexed = SemanticStore::persistent(&database, false).unwrap();
         assert!(indexed.inspect_revisions().unwrap().rows.iter().any(|row| {
-            row[0].as_str() == Some("main") && row[1].as_i64().is_some_and(|revision| revision >= 2)
+            row[0].as_str() == Some("main")
+                && row[1]
+                    .as_i64()
+                    .is_some_and(|revision| revision == completed_revision as i64)
         }));
-        assert!(
-            format!("{:?}", indexed.context("main", &caller).unwrap())
-                .contains(&format!("repo://{}/rust/lib/replacement", second_identity))
-        );
+        assert!(!format!("{:?}", indexed.context("main", &caller).unwrap()).contains(&pending));
         drop(indexed);
         drop(lock);
         assert!(

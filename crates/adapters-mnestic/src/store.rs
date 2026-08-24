@@ -16,8 +16,8 @@ use super::{
     },
 };
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, EntityFact, FactChanges, Observation, RepositoryFacts,
-    WorkspaceView,
+    AnalysisDiagnostic, BeholderError, BeholderErrorCode, BeholderErrorKind, DependencyOverride,
+    EntityFact, FactChanges, Observation, RepositoryFacts, WorkspaceView,
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
@@ -106,7 +106,7 @@ impl SemanticStore {
     }
 
     pub fn view_matches(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
-        view_matches(&self.read_db, view)
+        view_matches(&self.db, view)
     }
 
     pub fn verification_matches(
@@ -114,7 +114,7 @@ impl SemanticStore {
         view: &str,
         fingerprint: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        verification_matches(&self.read_db, view, fingerprint)
+        verification_matches(&self.db, view, fingerprint)
     }
 
     pub fn store_verification_fingerprint(
@@ -157,7 +157,7 @@ impl SemanticStore {
         analyzer: &str,
         version: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        enrichment_matches(&self.read_db, view, repository, analyzer, version)
+        enrichment_matches(&self.db, view, repository, analyzer, version)
     }
 
     pub fn enrichments_current(
@@ -165,7 +165,7 @@ impl SemanticStore {
         view: &str,
         catalog: &[(String, String)],
     ) -> Result<bool, Box<dyn Error>> {
-        enrichments_current(&self.read_db, view, catalog)
+        enrichments_current(&self.db, view, catalog)
     }
 
     pub fn ensure_revision_inputs(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
@@ -178,7 +178,7 @@ impl SemanticStore {
         repository: &str,
         analyzer: &str,
     ) -> Result<Option<String>, Box<dyn Error>> {
-        revision_enrichment_input_fingerprint(&self.read_db, view, repository, analyzer)
+        revision_enrichment_input_fingerprint(&self.db, view, repository, analyzer)
     }
 
     pub fn repository_contexts(
@@ -187,7 +187,7 @@ impl SemanticStore {
         target: &str,
         analyzer: &str,
     ) -> Result<Vec<String>, Box<dyn Error>> {
-        repository_contexts(&self.read_db, view, target, analyzer)
+        repository_contexts(&self.db, view, target, analyzer)
     }
 
     pub fn publish_enrichment(
@@ -407,8 +407,16 @@ impl SemanticStore {
         read: impl FnOnce(&MultiTransaction) -> Result<T, Box<dyn Error>>,
     ) -> Result<Revisioned<T>, Box<dyn Error>> {
         let transaction = self.read_db.multi_transaction(false);
-        let result = read(&transaction)?;
         let analysis_revision = analysis_revision(&transaction, view)?;
+        if analysis_revision == 0 {
+            transaction.abort()?;
+            return Err(Box::new(BeholderError::new(
+                BeholderErrorKind::Unavailable,
+                BeholderErrorCode::WorkspaceRevisionUnavailable,
+                format!("workspace has no completed analysis revision: {view}"),
+            )));
+        }
+        let result = read(&transaction)?;
         let analysis = analysis_metadata(&transaction, view, analysis_revision)?;
         transaction.abort()?;
         Ok(Revisioned {
@@ -437,8 +445,9 @@ impl SemanticStore {
 mod tests {
     use crate::SemanticStore;
     use beholder_domain::{
-        AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, LogicalRepository,
-        Observation, RepositoryFacts, RepositoryState, WorkspaceView,
+        AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
+        DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
+        WorkspaceView,
     };
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity as DtoSeverity};
     use std::{
@@ -500,6 +509,20 @@ mod tests {
         assert_eq!(diagnostic.repository, "repo");
         assert_eq!(diagnostic.path, PathBuf::from("src/broken.ts"));
         assert_eq!(diagnostic.line, Some(7));
+    }
+
+    #[test]
+    fn snapshot_requires_a_completed_revision() {
+        let store = SemanticStore::memory().unwrap();
+        let error = store
+            .context_snapshot("pending", "repo/source")
+            .unwrap_err();
+        let error = error.downcast_ref::<BeholderError>().unwrap();
+
+        assert_eq!(
+            error.code(),
+            BeholderErrorCode::WorkspaceRevisionUnavailable
+        );
     }
     #[test]
     fn persistent_reads_serve_the_completed_revision_during_a_write() {
