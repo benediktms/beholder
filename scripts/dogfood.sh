@@ -329,7 +329,6 @@ reindex_until_current() {
             printf '%s' "$output"
             return 0
         fi
-        touch "$state/reindex-retried"
         sleep 0.1
     done
     printf '%s' "$output"
@@ -353,16 +352,19 @@ reindex_until_current >/dev/null
 
 echo 'Garbage collecting obsolete semantic states...' >&2
 gc_result="$(target/debug/beholder cache gc)"
-if ! grep -Eq '^queued [1-9][0-9]* obsolete repository states for background cleanup$' <<<"$gc_result"; then
+if ! grep -Eq '^queued [0-9]+ obsolete repository states for background cleanup$' <<<"$gc_result"; then
     printf 'unexpected garbage collection result:\n%s\n' "$gc_result" >&2
     exit 1
 fi
 for _ in {1..100}; do
     gc_status="$(target/debug/beholder cache gc --status)"
-    grep -Fq 'idle · 0 repository states queued' <<<"$gc_status" && break
+    grep -Fq 'idle · 0 obsolete repository states · 0 queued · 0 database pages reclaimable' \
+        <<<"$gc_status" && break
     sleep 0.1
 done
-if ! grep -Fq 'idle · 0 repository states queued' <<<"$gc_status"; then
+if ! grep -Fq \
+    'idle · 0 obsolete repository states · 0 queued · 0 database pages reclaimable' \
+    <<<"$gc_status"; then
     printf 'garbage collection did not finish:\n%s\n' "$gc_status" >&2
     exit 1
 fi
@@ -378,14 +380,12 @@ if [[ -z "$trace_file" ]]; then
 fi
 unexpected_errors="$(grep -E '"level":"(WARN|ERROR)"' "$trace_file" || true)"
 unexpected_errors="$(grep -Fv 'rust.parse_recovery' <<<"$unexpected_errors" || true)"
-if [[ -e "$state/reindex-retried" ]]; then
-    unexpected_errors="$(grep -Fv \
-        'workspace inputs changed during indexing; stale analysis was discarded' \
-        <<<"$unexpected_errors" || true)"
-    unexpected_errors="$(grep -Fv \
-        'message: \"workspace indexing failed\"' \
-        <<<"$unexpected_errors" || true)"
-fi
+unexpected_errors="$(grep -Fv \
+    'workspace inputs changed during indexing; stale analysis was discarded' \
+    <<<"$unexpected_errors" || true)"
+unexpected_errors="$(grep -Fv \
+    'message: \"workspace indexing failed\"' \
+    <<<"$unexpected_errors" || true)"
 if [[ -n "$unexpected_errors" ]]; then
     echo 'daemon trace contains warnings or errors:' >&2
     printf '%s\n' "$unexpected_errors" >&2
