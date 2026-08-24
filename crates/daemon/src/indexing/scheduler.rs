@@ -1875,12 +1875,6 @@ fn index_workspace_through_port(
     let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let verification_fingerprint =
         workspace_verification_fingerprint(analysis_plan.analysis_identity(), &snapshot);
-    if scheduler.indexer.enrichment_catalog().is_empty()
-        && store.verification_matches(&workspace.name, &verification_fingerprint)?
-    {
-        tracing::info!(workspace = %workspace.name, "workspace inputs unchanged");
-        return Ok((0, false));
-    }
     let mut view = WorkspaceView::new_scoped(
         &workspace.name,
         analysis_plan.analysis_identity(),

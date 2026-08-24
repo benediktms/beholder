@@ -1034,6 +1034,8 @@ pub(super) fn publish_observations(
     }
     replace_baseline_snapshot(&transaction, &view.name)?;
     carry_forward_enrichments(&transaction, &view.name)?;
+    let obsolete = obsolete_enrichment_owners(&transaction, &view.name)?;
+    remove_enrichment_state(&transaction, &view.name, &obsolete)?;
     transaction.commit()?;
     Ok(changes)
 }
@@ -1085,20 +1087,6 @@ fn replace_baseline_snapshot(
              *analysis_revision{view: $view, revision}, *analysis_revision_observation{\
                  view, revision, from, relation, to, evidence, confidence, provenance\
              }, revision_owned = true \
-         :put analysis_baseline_observation {\
-             view, from, relation, to, evidence => confidence, provenance, revision_owned\
-         }",
-        "?[view, id, kind, metadata, revision_owned] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_state{view, revision, state}, \
-             *state_entity{state, id, kind, metadata}, revision_owned = false \
-         :put analysis_baseline_entity {view, id => kind, metadata, revision_owned}",
-        "?[view, from, relation, to, evidence, confidence, provenance, revision_owned] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_state{view, revision, state}, \
-             *state_observation{state, from, relation, to, evidence}, \
-             *state_observation_metadata{state, from, relation, to, confidence, provenance}, \
-             revision_owned = false \
          :put analysis_baseline_observation {\
              view, from, relation, to, evidence => confidence, provenance, revision_owned\
          }",
@@ -1231,6 +1219,7 @@ pub(super) fn ensure_revision_inputs(
         BTreeMap::from([("view".into(), view.name.clone().into())]),
     )?;
     store_revision_inputs(&transaction, view)?;
+    reconcile_obsolete_enrichments(&transaction, &view.name)?;
     transaction.commit()?;
     Ok(true)
 }
@@ -1300,6 +1289,122 @@ fn carry_forward_enrichments(
         .and_then(|row| row[0].get_int())
         .ok_or("published analysis revision is missing")?;
     materialize_enrichment_contributions(transaction, view, revision)
+}
+
+fn obsolete_enrichment_owners(
+    transaction: &MultiTransaction,
+    view: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let rows = transaction.run_script(
+        "current[repository, analyzer] := \
+             *analysis_revision{view: $view, revision}, \
+             *analysis_revision_enrichment_input{view, revision, repository, analyzer}\n\
+         obsolete[owner] := *enrichment_output{\
+             view: $view, owner, repository, analyzer\
+         }, not current[repository, analyzer]\n\
+         obsolete[owner] := *enrichment_job{\
+             view: $view, owner, repository, analyzer\
+         }, not current[repository, analyzer]\n\
+         ?[owner] := obsolete[owner]",
+        BTreeMap::from([("view".into(), view.into())]),
+    )?;
+    rows.rows
+        .into_iter()
+        .map(|row| {
+            row[0]
+                .get_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "enrichment owner is not a string".into())
+        })
+        .collect()
+}
+
+fn reconcile_obsolete_enrichments(
+    transaction: &MultiTransaction,
+    view: &str,
+) -> Result<(), Box<dyn Error>> {
+    let obsolete = obsolete_enrichment_owners(transaction, view)?;
+    if obsolete.is_empty() {
+        return Ok(());
+    }
+    let previous = transaction
+        .run_script(
+            "?[revision] := *analysis_revision{view: $view, revision}",
+            BTreeMap::from([("view".into(), view.into())]),
+        )?
+        .rows
+        .first()
+        .and_then(|row| row[0].get_int())
+        .ok_or("published analysis revision is missing")?;
+    let revision = previous + 1;
+    copy_revision(transaction, view, previous, revision)?;
+    for owner in &obsolete {
+        remove_owner_contribution_keys(transaction, view, owner, revision)?;
+    }
+    remove_enrichment_state(transaction, view, &obsolete)?;
+    materialize_enrichment_contributions(transaction, view, revision)?;
+    if effective_revision_changed(transaction, view, previous, revision)? {
+        transaction.run_script(
+            "?[view, revision] <- [[$view, $revision]] \
+             :put analysis_revision {view => revision}",
+            BTreeMap::from([
+                ("view".into(), view.into()),
+                ("revision".into(), revision.into()),
+            ]),
+        )?;
+    } else {
+        remove_revision_candidate(transaction, view, revision)?;
+    }
+    Ok(())
+}
+
+fn remove_enrichment_state(
+    transaction: &MultiTransaction,
+    view: &str,
+    owners: &[String],
+) -> Result<(), Box<dyn Error>> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let params = BTreeMap::from([
+        ("view".into(), view.into()),
+        (
+            "owners".into(),
+            DataValue::List(
+                owners
+                    .iter()
+                    .map(|owner| DataValue::List(vec![owner.as_str().into()]))
+                    .collect(),
+            ),
+        ),
+    ]);
+    for (relation, keys) in [
+        ("enrichment_entity_contribution", "view, owner, id"),
+        (
+            "enrichment_observation_contribution",
+            "view, owner, from, relation, to, evidence",
+        ),
+        (
+            "enrichment_override_contribution",
+            "view, owner, from, relation, unresolved_to",
+        ),
+        (
+            "enrichment_diagnostic_contribution",
+            "view, owner, repository, code, severity, path, line",
+        ),
+        ("enrichment_output", "view, owner"),
+        ("enrichment_job", "view, owner"),
+    ] {
+        transaction.run_script(
+            &format!(
+                "obsolete[owner] <- $owners\n\
+                 ?[{keys}] := obsolete[owner], *{relation}{{{keys}}}, view = $view \
+                 :rm {relation} {{{keys}}}"
+            ),
+            params.clone(),
+        )?;
+    }
+    Ok(())
 }
 
 fn valid_enrichment_owner_rule() -> &'static str {
@@ -5202,6 +5307,164 @@ mod tests {
         assert_eq!(current_revision(&store, "multi-owner"), 3);
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn removed_enrichment_owners_are_retracted_and_pruned() {
+        let store = SemanticStore::memory().unwrap();
+        let states = ["repo-a", "repo-b"]
+            .into_iter()
+            .map(|repository| RepositoryState {
+                repository: LogicalRepository {
+                    identity: repository.into(),
+                },
+                head: None,
+                fingerprint: format!("{repository}-source"),
+            })
+            .collect::<Vec<_>>();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new("owner-removal", "syntax", states.clone()).unwrap(),
+            &["a", "b"],
+        );
+        let repository_facts = states
+            .iter()
+            .cloned()
+            .map(|state| RepositoryFacts {
+                state,
+                analysis_identity: "analysis".into(),
+                incomplete: false,
+                diagnostics: Vec::new(),
+                entities: Vec::new(),
+                grpc_bindings: Vec::new(),
+                observations: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        store.publish(&view, &repository_facts, &[]).unwrap();
+
+        let shared = EntityFact::new("repo://repo-a/shared", EntityKind::Callable, None).unwrap();
+        let only_a = EntityFact::new("repo://repo-a/only-a", EntityKind::Callable, None).unwrap();
+        for (repository, analyzer, entities) in [
+            ("repo-a", "a", vec![shared.clone(), only_a.clone()]),
+            ("repo-a", "b", vec![shared.clone()]),
+            (
+                "repo-b",
+                "a",
+                vec![EntityFact::new("repo://repo-b/only-a", EntityKind::Callable, None).unwrap()],
+            ),
+        ] {
+            let state = view
+                .repository_states
+                .iter()
+                .find(|state| state.repository.identity == repository)
+                .unwrap();
+            store
+                .publish_enrichment(
+                    &view,
+                    repository,
+                    &view.repository_enrichment_input_fingerprint(state, analyzer),
+                    EnrichmentOwner {
+                        analyzer,
+                        version: "1",
+                        expected_version: None,
+                    },
+                    EnrichmentPayload {
+                        entities: &entities,
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let only_b = with_enrichment_analyzers(
+            WorkspaceView::new("owner-removal", "syntax", states.clone()).unwrap(),
+            &["b"],
+        );
+        assert!(store.ensure_revision_inputs(&only_b).unwrap());
+        assert_eq!(current_revision(&store, "owner-removal"), 4);
+        let current_entity = |id: &str| {
+            !store
+                .db
+                .run_script(
+                    "?[id] := *analysis_revision{view: 'owner-removal', revision}, \
+                         *analysis_revision_entity{view: 'owner-removal', revision, id: $id}, \
+                         id = $id",
+                    BTreeMap::from([("id".into(), id.into())]),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows
+                .is_empty()
+        };
+        assert!(current_entity(shared.id.as_str()));
+        assert!(!current_entity(only_a.id.as_str()));
+
+        let removed_owners: Vec<DataValue> = states
+            .iter()
+            .map(|state| enrichment_owner_key("a", &state.repository.identity))
+            .map(|owner| DataValue::List(vec![owner.into()]))
+            .collect();
+        let removed_state = store
+            .db
+            .run_script(
+                "removed[owner] <- $owners\n\
+                 present[owner] := removed[owner], *enrichment_output{\
+                     view: 'owner-removal', owner\
+                 }\n\
+                 present[owner] := removed[owner], *enrichment_job{\
+                     view: 'owner-removal', owner\
+                 }\n\
+                 present[owner] := removed[owner], *enrichment_entity_contribution{\
+                     view: 'owner-removal', owner\
+                 }\n\
+                 ?[owner] := present[owner]",
+                BTreeMap::from([("owners".into(), DataValue::List(removed_owners))]),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert!(removed_state.rows.is_empty());
+
+        let repo_b_only = with_enrichment_analyzers(
+            WorkspaceView::new("owner-removal", "syntax", vec![states[1].clone()]).unwrap(),
+            &["b"],
+        );
+        store
+            .publish(
+                &repo_b_only,
+                &[RepositoryFacts {
+                    state: states[1].clone(),
+                    analysis_identity: "analysis".into(),
+                    incomplete: false,
+                    diagnostics: Vec::new(),
+                    entities: Vec::new(),
+                    grpc_bindings: Vec::new(),
+                    observations: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        assert!(!current_entity(shared.id.as_str()));
+        let repo_a_owner = enrichment_owner_key("b", "repo-a");
+        assert!(
+            store
+                .db
+                .run_script(
+                    "present[owner] := *enrichment_output{\
+                         view: 'owner-removal', owner\
+                     }, owner = $owner\n\
+                     present[owner] := *enrichment_job{\
+                         view: 'owner-removal', owner\
+                     }, owner = $owner\n\
+                     present[owner] := *enrichment_entity_contribution{\
+                         view: 'owner-removal', owner\
+                     }, owner = $owner\n\
+                     ?[owner] := present[owner]",
+                    BTreeMap::from([("owner".into(), repo_a_owner.into())]),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows
+                .is_empty()
+        );
     }
 
     #[test]
