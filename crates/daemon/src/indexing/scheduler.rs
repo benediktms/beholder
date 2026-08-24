@@ -289,6 +289,7 @@ pub struct IndexScheduler {
     enrichment_changed: Notify,
     shutdown: Notify,
     enrichment_shutdown: Notify,
+    stopping: AtomicBool,
     checkpointing: AtomicBool,
     indexer: Indexer,
     inventory: InventoryStore,
@@ -478,6 +479,7 @@ impl IndexScheduler {
             enrichment_changed: Notify::new(),
             shutdown: Notify::new(),
             enrichment_shutdown: Notify::new(),
+            stopping: AtomicBool::new(false),
             checkpointing: AtomicBool::new(false),
             indexer,
             inventory,
@@ -543,6 +545,7 @@ impl IndexScheduler {
             enrichment_changed: Notify::new(),
             shutdown: Notify::new(),
             enrichment_shutdown: Notify::new(),
+            stopping: AtomicBool::new(false),
             checkpointing: AtomicBool::new(false),
             indexer,
             inventory,
@@ -702,11 +705,17 @@ impl IndexScheduler {
     }
 
     fn begin(&self, operation: &str) -> Result<ActiveOperation<'_>, BeholderError> {
+        if self.is_stopping() {
+            return Err(scheduler_unavailable());
+        }
         let mut active = self
             .active_operation
             .lock()
             .map_err(|_| scheduler_unavailable())?;
         while let Some(active_operation) = active.as_deref() {
+            if self.is_stopping() {
+                return Err(scheduler_unavailable());
+            }
             tracing::info!(operation, active_operation, "scheduler operation waiting");
             active = self
                 .idle
@@ -905,8 +914,14 @@ impl IndexScheduler {
     }
 
     pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.idle.notify_all();
         self.shutdown.notify_one();
         self.enrichment_shutdown.notify_one();
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
     }
 
     pub fn schedule_checkpoint(self: &Arc<Self>, store: Arc<SemanticStore>) {
@@ -956,9 +971,10 @@ impl IndexScheduler {
         reconciliation.set_missed_tick_behavior(MissedTickBehavior::Skip);
         'run: loop {
             let reconcile = tokio::select! {
+                biased;
+                _ = self.shutdown.notified() => break 'run,
                 _ = self.changed.notified() => false,
                 _ = reconciliation.tick() => true,
-                _ = self.shutdown.notified() => break 'run,
             };
             if reconcile {
                 let scheduler = self.clone();
@@ -1029,6 +1045,9 @@ impl IndexScheduler {
         };
         let mut published = false;
         for workspace in registered {
+            if self.is_stopping() {
+                break;
+            }
             let dirty = workspace
                 .repositories
                 .iter()
@@ -1071,6 +1090,9 @@ impl IndexScheduler {
         };
         let mut result = ReindexResult::default();
         for workspace in registered {
+            if self.is_stopping() {
+                break;
+            }
             match self.index_active(store, &workspace) {
                 Ok((_, published)) => {
                     result.published |= published;
@@ -1659,6 +1681,9 @@ fn index_workspace_through_port(
         repositories = workspace.repositories.len()
     )
     .in_scope(|| refresh_workspace_snapshot(scheduler, workspace, dirty))?;
+    if scheduler.is_stopping() {
+        return Ok((0, false));
+    }
     let source_loading = source_loading_started.elapsed();
     let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let verification_fingerprint =
@@ -1709,6 +1734,9 @@ fn index_workspace_through_port(
             .with_repository_enrichment_inputs(
                 scheduler.indexer.enrichment_input_identities(&snapshot),
             )?;
+        if scheduler.is_stopping() {
+            return Ok((0, false));
+        }
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         scheduler.queue_enrichments(store, &snapshot, &view)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
@@ -1755,6 +1783,9 @@ fn index_workspace_through_port(
             .analyze_prepared(&snapshot, &analysis_plan)
             .map_err(erase_error)
     })?;
+    if scheduler.is_stopping() {
+        return Ok((0, false));
+    }
     let repository_analysis = repository_analysis_started.elapsed();
     let mut memory_hits = 0;
     let mut disk_hits = 0;
@@ -1796,6 +1827,9 @@ fn index_workspace_through_port(
     let publication_started = Instant::now();
     let (current, verification_statistics) =
         refresh_workspace_snapshot(scheduler, workspace, dirty)?;
+    if scheduler.is_stopping() {
+        return Ok((0, false));
+    }
     let current_plan = scheduler.indexer.prepare(&current);
     let current_fingerprint =
         workspace_verification_fingerprint(current_plan.analysis_identity(), &current);
@@ -1830,7 +1864,9 @@ fn index_workspace_through_port(
             &verification_fingerprint,
         )
     })?;
-    scheduler.queue_enrichments(store, &snapshot, &view)?;
+    if !scheduler.is_stopping() {
+        scheduler.queue_enrichments(store, &snapshot, &view)?;
+    }
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
     tracing::info!(

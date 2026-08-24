@@ -62,13 +62,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .clone()
                 .run(service.store.clone(), service.workspaces.clone()),
         );
+        let shutdown_scheduler = index_scheduler.clone();
         Server::builder()
             .trace_fn(rpc_span)
             .add_service(DaemonServer::new(service))
-            .serve_with_incoming_shutdown(
-                UnixListenerStream::new(listener),
-                ipc::shutdown_signal(stopped),
-            )
+            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
+                ipc::shutdown_signal(stopped).await;
+                shutdown_scheduler.stop();
+            })
             .await?;
         index_scheduler.stop();
         watcher_task.await?;
@@ -318,11 +319,13 @@ mod tests {
                 .clone()
                 .run(service.store.clone(), service.workspaces.clone()),
         );
+        let shutdown_scheduler = index_scheduler.clone();
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(DaemonServer::new(service))
                 .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
                     let _ = stopped.await;
+                    shutdown_scheduler.stop();
                 })
                 .await
                 .unwrap();
@@ -762,17 +765,13 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
-        index_scheduler.stop();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut watcher_task)
-                .await
-                .is_err(),
-            "daemon detached the blocking index worker"
-        );
+        tokio::time::timeout(Duration::from_millis(500), &mut watcher_task)
+            .await
+            .expect("daemon did not cancel queued indexing")
+            .unwrap();
         assert!(socket_path.exists());
         assert!(single_instance::acquire(&state).is_err());
         drop(blocker);
-        watcher_task.await.unwrap();
         drop(socket_file);
         assert!(!socket_path.exists());
         let reloaded = WorkspaceRegistry::open(registry_path).unwrap();
@@ -783,9 +782,9 @@ mod tests {
             row[0].as_str() == Some("main")
                 && row[1]
                     .as_i64()
-                    .is_some_and(|revision| revision > completed_revision as i64)
+                    .is_some_and(|revision| revision == completed_revision as i64)
         }));
-        assert!(format!("{:?}", indexed.context("main", &caller).unwrap()).contains(&pending));
+        assert!(!format!("{:?}", indexed.context("main", &caller).unwrap()).contains(&pending));
         drop(indexed);
         drop(lock);
         assert!(

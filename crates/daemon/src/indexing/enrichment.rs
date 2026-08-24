@@ -36,8 +36,9 @@ impl IndexScheduler {
     pub(super) async fn run_enrichments(self: Arc<Self>, store: Arc<SemanticStore>) {
         loop {
             tokio::select! {
-                _ = self.enrichment_changed.notified() => {}
+                biased;
                 _ = self.enrichment_shutdown.notified() => break,
+                _ = self.enrichment_changed.notified() => {}
             }
             while let Some(job) = self
                 .enrichment_jobs
@@ -70,16 +71,17 @@ impl IndexScheduler {
                     );
                 });
                 let result = tokio::select! {
-                    result = scheduler.enrich(&store, job).instrument(span.clone()) => Some(result),
-                    changed = cancelled.changed() => {
-                        let _ = changed;
-                        None
-                    }
+                    biased;
                     _ = self.enrichment_shutdown.notified() => {
                         if let Ok(mut active) = self.enriching.lock() {
                             active.remove(&key);
                         }
                         return;
+                    }
+                    result = scheduler.enrich(&store, job).instrument(span.clone()) => Some(result),
+                    changed = cancelled.changed() => {
+                        let _ = changed;
+                        None
                     }
                 };
                 if let Ok(mut active) = self.enriching.lock() {
