@@ -106,7 +106,7 @@ impl SemanticStore {
     }
 
     pub fn view_matches(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
-        view_matches(&self.read_db, view)
+        view_matches(&self.db, view)
     }
 
     pub fn verification_matches(
@@ -114,7 +114,7 @@ impl SemanticStore {
         view: &str,
         fingerprint: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        verification_matches(&self.read_db, view, fingerprint)
+        verification_matches(&self.db, view, fingerprint)
     }
 
     pub fn store_verification_fingerprint(
@@ -157,7 +157,7 @@ impl SemanticStore {
         analyzer: &str,
         version: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        enrichment_matches(&self.read_db, view, repository, analyzer, version)
+        enrichment_matches(&self.db, view, repository, analyzer, version)
     }
 
     pub fn enrichments_current(
@@ -165,7 +165,7 @@ impl SemanticStore {
         view: &str,
         catalog: &[(String, String)],
     ) -> Result<bool, Box<dyn Error>> {
-        enrichments_current(&self.read_db, view, catalog)
+        enrichments_current(&self.db, view, catalog)
     }
 
     pub fn ensure_revision_inputs(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
@@ -178,7 +178,7 @@ impl SemanticStore {
         repository: &str,
         analyzer: &str,
     ) -> Result<Option<String>, Box<dyn Error>> {
-        revision_enrichment_input_fingerprint(&self.read_db, view, repository, analyzer)
+        revision_enrichment_input_fingerprint(&self.db, view, repository, analyzer)
     }
 
     pub fn repository_contexts(
@@ -187,7 +187,7 @@ impl SemanticStore {
         target: &str,
         analyzer: &str,
     ) -> Result<Vec<String>, Box<dyn Error>> {
-        repository_contexts(&self.read_db, view, target, analyzer)
+        repository_contexts(&self.db, view, target, analyzer)
     }
 
     pub fn publish_enrichment(
