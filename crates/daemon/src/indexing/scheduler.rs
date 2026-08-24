@@ -1105,6 +1105,10 @@ impl IndexScheduler {
         self.garbage_collection_requested.notified().await;
     }
 
+    pub(crate) fn request_garbage_collection(&self) {
+        self.garbage_collection_requested.notify_one();
+    }
+
     pub fn schedule_checkpoint(self: &Arc<Self>, store: Arc<SemanticStore>) {
         if self.checkpointing.swap(true, Ordering::AcqRel) {
             return;
@@ -1127,7 +1131,7 @@ impl IndexScheduler {
                     ),
                     Err(error) => tracing::warn!(%error, "Mnestic checkpoint failed"),
                 }
-                scheduler.garbage_collection_requested.notify_one();
+                scheduler.request_garbage_collection();
             })
         {
             self.checkpointing.store(false, Ordering::Release);

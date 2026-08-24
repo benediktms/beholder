@@ -90,8 +90,14 @@ pub(super) async fn run_garbage_collection_monitor(
         if scheduler.is_stopping() {
             return;
         }
-        if running.load(Ordering::Acquire) {
-            continue;
+        while running.load(Ordering::Acquire) {
+            tokio::select! {
+                () = tokio::time::sleep(GARBAGE_COLLECTION_YIELD) => {}
+                () = scheduler.wait_for_stop() => return,
+            }
+        }
+        if scheduler.is_stopping() {
+            return;
         }
         let store = store.clone();
         let scheduler = scheduler.clone();
@@ -124,6 +130,7 @@ pub(super) fn collect_garbage(
     trigger: &'static str,
 ) -> Result<GarbageCollection, Box<dyn Error>> {
     if running.load(Ordering::Acquire) {
+        scheduler.request_garbage_collection();
         return Ok(GarbageCollection {
             repository_states_queued: store.garbage_collection_queued()?,
         });
@@ -551,8 +558,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn automatic_collection_claims_and_sweeps_obsolete_states() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn automatic_collection_preserves_requests_while_a_run_is_active() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -589,29 +596,32 @@ mod tests {
         assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
 
         let scheduler = Arc::new(IndexScheduler::new(state_dir.join("cache")));
-        let running = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
         let progress = Arc::new(Mutex::new(None));
-        assert_eq!(
-            collect_garbage(
-                store.clone(),
-                scheduler.clone(),
-                running.clone(),
-                progress,
-                "test",
-            )
-            .unwrap()
-            .repository_states_queued,
-            1
-        );
+        let monitor = tokio::spawn(run_garbage_collection_monitor(
+            store.clone(),
+            scheduler.clone(),
+            running.clone(),
+            progress,
+        ));
+        scheduler.request_garbage_collection();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
+        running.store(false, Ordering::Release);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while running.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+        while (running.load(Ordering::Acquire)
+            || store.garbage_collection_queued().unwrap() > 0
+            || store.garbage_collection_candidates().unwrap() > 0)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         assert!(!running.load(Ordering::Acquire));
         assert_eq!(store.garbage_collection_candidates().unwrap(), 0);
         assert_eq!(store.garbage_collection_queued().unwrap(), 0);
         scheduler.stop();
+        monitor.await.unwrap();
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }
