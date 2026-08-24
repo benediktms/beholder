@@ -63,6 +63,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .clone()
                 .run(service.store.clone(), service.workspaces.clone()),
         );
+        let garbage_collection_task = tokio::spawn(daemon::run_garbage_collection_monitor(
+            service.store.clone(),
+            service.scheduler.clone(),
+            service.garbage_collector_running.clone(),
+            service.garbage_collection_progress.clone(),
+        ));
         let shutdown_scheduler = index_scheduler.clone();
         Server::builder()
             .trace_fn(rpc_span)
@@ -74,6 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
         index_scheduler.stop();
         watcher_task.await?;
+        garbage_collection_task.await?;
         tracing::info!("daemon stopped");
         Ok(())
     }
@@ -346,7 +353,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 16);
+        assert_eq!(status.protocol_version, 17);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");

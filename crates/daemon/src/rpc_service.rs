@@ -1,4 +1,4 @@
-use crate::daemon::{BeholderDaemon, start_garbage_collector};
+use crate::daemon::{BeholderDaemon, collect_garbage, start_claimed_garbage_collector};
 use crate::repository_registry::RegisteredRepository;
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, SourceAnalysisError};
 use beholder_dto::{
@@ -49,6 +49,7 @@ impl Daemon for BeholderDaemon {
         let scheduler = self.scheduler.clone();
         let garbage_collector_running = self.garbage_collector_running.clone();
         let garbage_collection_progress = self.garbage_collection_progress.clone();
+        let request_span = tracing::Span::current();
         let (sender, receiver) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             if garbage_collector_running.load(Ordering::Acquire) {
@@ -77,9 +78,16 @@ impl Daemon for BeholderDaemon {
             let _ = sender.send(Ok(progress_event(DtoGarbageCollectProgress::phase(
                 GarbageCollectionPhase::ClaimingObsoleteStates,
             ))));
-            let claim_store = store.clone();
             let result = tokio::task::spawn_blocking(move || {
-                claim_store.garbage_collect().map_err(|source| {
+                let _entered = request_span.enter();
+                collect_garbage(
+                    store,
+                    scheduler,
+                    garbage_collector_running,
+                    garbage_collection_progress,
+                    "manual",
+                )
+                .map_err(|source| {
                     BeholderError::new(
                         BeholderErrorKind::Internal,
                         BeholderErrorCode::GarbageCollectionFailed,
@@ -91,22 +99,6 @@ impl Daemon for BeholderDaemon {
             .await;
             let event = match result {
                 Ok(Ok(collected)) => {
-                    if let Err(source) = start_garbage_collector(
-                        store,
-                        scheduler,
-                        garbage_collector_running,
-                        garbage_collection_progress,
-                    ) {
-                        let _ = sender.send(Err(operation_status(
-                            BeholderError::new(
-                                BeholderErrorKind::Internal,
-                                BeholderErrorCode::GarbageCollectionWorkerFailed,
-                                "garbage collection worker failed to start",
-                            )
-                            .with_source(std::io::Error::other(source.to_string())),
-                        )));
-                        return;
-                    }
                     tracing::info!(
                         repository_states_queued = collected.repository_states_queued,
                         "semantic store garbage collection queued"
@@ -150,6 +142,30 @@ impl Daemon for BeholderDaemon {
                     .with_source(std::io::Error::other(source.to_string())),
                 )
             })?;
+        let repository_states_collectible =
+            self.store
+                .garbage_collection_candidates()
+                .map_err(|source| {
+                    operation_status(
+                        BeholderError::new(
+                            BeholderErrorKind::Internal,
+                            BeholderErrorCode::GarbageCollectionFailed,
+                            "garbage collection status failed",
+                        )
+                        .with_source(std::io::Error::other(source.to_string())),
+                    )
+                })?;
+        let reclaimable_database_pages =
+            self.store.reclaimable_database_pages().map_err(|source| {
+                operation_status(
+                    BeholderError::new(
+                        BeholderErrorKind::Internal,
+                        BeholderErrorCode::GarbageCollectionFailed,
+                        "garbage collection status failed",
+                    )
+                    .with_source(std::io::Error::other(source.to_string())),
+                )
+            })?;
         let progress = self
             .garbage_collection_progress
             .lock()
@@ -171,6 +187,8 @@ impl Daemon for BeholderDaemon {
             running: self.garbage_collector_running.load(Ordering::Acquire),
             repository_states_queued,
             progress,
+            repository_states_collectible,
+            reclaimable_database_pages,
         }))
     }
 
@@ -211,11 +229,13 @@ impl Daemon for BeholderDaemon {
             .delete_repository(&self.store, &mut registry, &identity)
             .map_err(operation_status)?;
         drop(registry);
-        if let Err(source) = start_garbage_collector(
+        if let Err(source) = start_claimed_garbage_collector(
             self.store.clone(),
             self.scheduler.clone(),
             self.garbage_collector_running.clone(),
             self.garbage_collection_progress.clone(),
+            "repository_deletion",
+            repository_states_queued,
         ) {
             tracing::error!(%source, "repository cleanup worker failed to start");
         }
@@ -249,7 +269,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 16,
+            protocol_version: 17,
             pid: std::process::id(),
         }))
     }
@@ -654,6 +674,10 @@ fn protocol_progress(progress: DtoGarbageCollectProgress) -> GarbageCollectProgr
         }
         GarbageCollectionPhase::SweepingObsoleteStates => {
             GarbageCollectPhase::SweepingObsoleteStates
+        }
+        GarbageCollectionPhase::CheckpointingDatabase => GarbageCollectPhase::CheckpointingDatabase,
+        GarbageCollectionPhase::ReclaimingDatabaseSpace => {
+            GarbageCollectPhase::ReclaimingDatabaseSpace
         }
     };
     GarbageCollectProgress {

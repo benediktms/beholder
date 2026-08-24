@@ -10,9 +10,10 @@ use super::{
     },
     storage::{
         claim_garbage_collection, delete_repository_revision, enrichment_matches,
-        enrichments_current, ensure_revision_inputs, garbage_collection_pending,
-        garbage_collection_queued, publish_enrichment, publish_observations, publish_repository,
-        repository_contexts, revision_enrichment_input_fingerprint, store_verification_fingerprint,
+        enrichments_current, ensure_revision_inputs, garbage_collection_candidates,
+        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
+        publish_observations, publish_repository, repository_contexts,
+        revision_enrichment_input_fingerprint, store_verification_fingerprint,
         sweep_garbage_collection, verification_matches, view_matches,
     },
 };
@@ -245,7 +246,7 @@ impl SemanticStore {
 
     pub fn sweep_garbage_collection(
         &self,
-        mut progress: impl FnMut(GarbageCollectionProgress),
+        mut progress: impl FnMut(GarbageCollectionProgress) -> bool,
     ) -> Result<u64, Box<dyn Error>> {
         sweep_garbage_collection(&self.db, &mut progress)
     }
@@ -254,8 +255,38 @@ impl SemanticStore {
         garbage_collection_pending(&self.read_db)
     }
 
+    pub fn garbage_collection_candidates(&self) -> Result<u64, Box<dyn Error>> {
+        garbage_collection_candidates(&self.read_db)
+    }
+
     pub fn garbage_collection_queued(&self) -> Result<u64, Box<dyn Error>> {
         garbage_collection_queued(&self.read_db)
+    }
+
+    pub fn reclaimable_database_pages(&self) -> Result<u64, Box<dyn Error>> {
+        #[cfg(feature = "sqlite")]
+        if let Some(path) = &self.database_path {
+            return sqlite_pragma(path, "PRAGMA freelist_count");
+        }
+        Ok(0)
+    }
+
+    pub fn reclaim_database_pages(&self, pages: u32) -> Result<u64, Box<dyn Error>> {
+        if pages == 0 {
+            return Ok(0);
+        }
+        #[cfg(feature = "sqlite")]
+        if let Some(path) = &self.database_path {
+            let before = sqlite_pragma(path, "PRAGMA freelist_count")?;
+            if before == 0 {
+                return Ok(0);
+            }
+            let connection = sqlite::open(path)?;
+            connection.execute("PRAGMA busy_timeout = 5000")?;
+            connection.execute(format!("PRAGMA incremental_vacuum({pages})"))?;
+            return Ok(before.saturating_sub(sqlite_pragma(path, "PRAGMA freelist_count")?));
+        }
+        Ok(0)
     }
 
     pub fn inspect_relations(&self) -> Result<InspectionResult, Box<dyn Error>> {
@@ -455,6 +486,17 @@ impl SemanticStore {
     pub fn benchmark_queries(&self, topology: &str, entities: i64, depth: i64) -> String {
         benchmark_queries(&self.db, topology, entities, depth)
     }
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_pragma(path: &Path, pragma: &str) -> Result<u64, Box<dyn Error>> {
+    let connection = sqlite::open(path)?;
+    connection.execute("PRAGMA busy_timeout = 5000")?;
+    let mut statement = connection.prepare(pragma)?;
+    if statement.next()? != sqlite::State::Row {
+        return Err(format!("SQLite pragma returned no row: {pragma}").into());
+    }
+    statement.read::<i64, _>(0)?.try_into().map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -791,11 +833,40 @@ mod tests {
                 .publish(&view, &[facts(&view, observations)], &[])
                 .unwrap();
         }
+        for fingerprint in ["standalone-old", "standalone-current"] {
+            let standalone_state = RepositoryState {
+                repository: LogicalRepository {
+                    identity: "standalone".into(),
+                },
+                head: Some(fingerprint.into()),
+                fingerprint: fingerprint.into(),
+            };
+            assert!(
+                store
+                    .publish_repository(&RepositoryFacts {
+                        state: standalone_state,
+                        analysis_identity: "analysis".into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
+                        entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
+                        observations: vec![Observation::dependency(
+                            format!("standalone/{fingerprint}"),
+                            DependencyRelation::Calls,
+                            "standalone/target",
+                            "src/lib.rs:1",
+                        )],
+                    })
+                    .unwrap()
+            );
+        }
 
+        assert_eq!(store.garbage_collection_candidates().unwrap(), 3);
         let collected = store.garbage_collect().unwrap();
-        assert_eq!(collected.repository_states_queued, 2);
+        assert_eq!(collected.repository_states_queued, 3);
+        assert_eq!(store.garbage_collection_candidates().unwrap(), 0);
         assert!(store.garbage_collection_pending().unwrap());
-        assert_eq!(store.garbage_collection_queued().unwrap(), 2);
+        assert_eq!(store.garbage_collection_queued().unwrap(), 3);
         drop(store);
         let store = SemanticStore::persistent(&database, true).unwrap();
         assert!(store.garbage_collection_pending().unwrap());
@@ -821,9 +892,12 @@ mod tests {
         let mut progress = Vec::new();
         assert_eq!(
             store
-                .sweep_garbage_collection(|event| progress.push(event))
+                .sweep_garbage_collection(|event| {
+                    progress.push(event);
+                    true
+                })
                 .unwrap(),
-            2
+            3
         );
         let observation_updates = progress
             .iter()
@@ -839,12 +913,13 @@ mod tests {
             .find(|event| event.completed_rows == Some(10_001))
             .unwrap();
         assert_eq!(observations.rows, None);
-        assert_eq!(observations.stale_states, Some(2));
-        assert_eq!(observations.repositories, Some(1));
-        assert!(observations.completed_steps < 2);
+        assert_eq!(observations.stale_states, Some(3));
+        assert_eq!(observations.repositories, Some(2));
+        assert!(observations.completed_steps < 3);
         assert_eq!(
             observation_updates
                 .iter()
+                .filter(|event| event.step == observations.step)
                 .filter_map(|event| event.completed_rows.filter(|rows| *rows > 0))
                 .collect::<Vec<_>>(),
             [10_000, 10_001]
@@ -855,6 +930,9 @@ mod tests {
             store.context("main", "repo/resurrected").unwrap().root.id,
             "repo/resurrected"
         );
+        assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
+        assert_eq!(store.garbage_collect().unwrap().repository_states_queued, 1);
+        assert_eq!(store.sweep_garbage_collection(|_| true).unwrap(), 1);
         let states = store
             .db
             .run_script(
@@ -873,6 +951,13 @@ mod tests {
             )
             .unwrap();
         assert!(old_observations.rows.is_empty());
+        store.checkpoint().unwrap();
+        let size_before_reclaim = fs::metadata(&database).unwrap().len();
+        let pages_before_reclaim = store.reclaimable_database_pages().unwrap();
+        assert!(pages_before_reclaim > 0);
+        while store.reclaim_database_pages(1_024).unwrap() > 0 {}
+        assert_eq!(store.reclaimable_database_pages().unwrap(), 0);
+        assert!(fs::metadata(&database).unwrap().len() < size_before_reclaim);
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }

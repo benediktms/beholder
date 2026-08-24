@@ -1,7 +1,7 @@
 use super::indexing::IndexScheduler;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_domain::Workspace;
-use beholder_dto::{GarbageCollectionPhase, GarbageCollectionProgress};
+use beholder_dto::{GarbageCollection, GarbageCollectionPhase, GarbageCollectionProgress};
 use beholder_indexing::Indexer;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
@@ -11,8 +11,13 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::oneshot;
+
+const GARBAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
+const GARBAGE_COLLECTION_VACUUM_PAGES: u32 = 1_024;
+const GARBAGE_COLLECTION_YIELD: Duration = Duration::from_millis(10);
 
 pub(super) struct BeholderDaemon {
     pub(super) store: Arc<SemanticStore>,
@@ -53,12 +58,6 @@ pub(super) fn build(
     let store = Arc::new(store);
     let garbage_collector_running = Arc::new(AtomicBool::new(false));
     let garbage_collection_progress = Arc::new(Mutex::new(None));
-    start_garbage_collector(
-        store.clone(),
-        scheduler.clone(),
-        garbage_collector_running.clone(),
-        garbage_collection_progress.clone(),
-    )?;
     Ok((
         BeholderDaemon {
             store,
@@ -74,19 +73,152 @@ pub(super) fn build(
     ))
 }
 
-pub(super) fn start_garbage_collector(
+pub(super) async fn run_garbage_collection_monitor(
     store: Arc<SemanticStore>,
     scheduler: Arc<IndexScheduler>,
     running: Arc<AtomicBool>,
     progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
-) -> Result<(), Box<dyn Error>> {
-    if !store.garbage_collection_pending()? {
-        return Ok(());
+) {
+    let mut interval = tokio::time::interval(GARBAGE_COLLECTION_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let trigger = tokio::select! {
+            _ = interval.tick() => "automatic_recovery",
+            () = scheduler.wait_for_garbage_collection() => "publication",
+            () = scheduler.wait_for_stop() => return,
+        };
+        if scheduler.is_stopping() {
+            return;
+        }
+        if running.load(Ordering::Acquire) {
+            continue;
+        }
+        let store = store.clone();
+        let scheduler = scheduler.clone();
+        let running = running.clone();
+        let progress = progress.clone();
+        match tokio::task::spawn_blocking(move || {
+            collect_garbage(store, scheduler, running, progress, trigger)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        {
+            Ok(Ok(collected)) if collected.repository_states_queued > 0 => tracing::info!(
+                repository_states_queued = collected.repository_states_queued,
+                "automatic semantic store garbage collection queued"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "automatic semantic store garbage collection failed")
+            }
+            Err(error) => tracing::error!(%error, "garbage collection monitor worker failed"),
+        }
     }
+}
+
+pub(super) fn collect_garbage(
+    store: Arc<SemanticStore>,
+    scheduler: Arc<IndexScheduler>,
+    running: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
+    trigger: &'static str,
+) -> Result<GarbageCollection, Box<dyn Error>> {
+    if running.load(Ordering::Acquire) {
+        return Ok(GarbageCollection {
+            repository_states_queued: store.garbage_collection_queued()?,
+        });
+    }
+    let collectible = store.garbage_collection_candidates()?;
+    let queued = store.garbage_collection_queued()?;
+    let reclaimable = store.reclaimable_database_pages()?;
+    if trigger == "automatic_recovery" && collectible == 0 && queued == 0 && reclaimable == 0 {
+        return Ok(GarbageCollection {
+            repository_states_queued: 0,
+        });
+    }
+    let span = garbage_collection_span(trigger);
+    span.record("gc.collectible_states", collectible);
+    span.record("gc.queued_states", queued);
+    span.record("gc.reclaimable_pages", reclaimable);
+    let collected = {
+        let _entered = span.enter();
+        let collected = match store.garbage_collect() {
+            Ok(collected) => collected,
+            Err(error) => {
+                record_garbage_collection_error(&span, error.as_ref());
+                tracing::error!(%error, "obsolete repository state claim failed");
+                return Err(error);
+            }
+        };
+        tracing::Span::current().record("gc.claimed_states", collected.repository_states_queued);
+        tracing::info!(
+            repository_states_queued = collected.repository_states_queued,
+            "obsolete repository states claimed"
+        );
+        collected
+    };
+    let worker_span = span.clone();
+    if let Err(error) = start_garbage_collector(store, scheduler, running, progress, span) {
+        record_garbage_collection_error(&worker_span, error.as_ref());
+        return Err(error);
+    }
+    Ok(collected)
+}
+
+pub(super) fn start_claimed_garbage_collector(
+    store: Arc<SemanticStore>,
+    scheduler: Arc<IndexScheduler>,
+    running: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
+    trigger: &'static str,
+    claimed_states: u64,
+) -> Result<(), Box<dyn Error>> {
+    let span = garbage_collection_span(trigger);
+    span.record("gc.claimed_states", claimed_states);
+    let worker_span = span.clone();
+    start_garbage_collector(store, scheduler, running, progress, span).inspect_err(|error| {
+        record_garbage_collection_error(&worker_span, error.as_ref());
+    })
+}
+
+fn garbage_collection_span(trigger: &'static str) -> tracing::Span {
+    tracing::info_span!(
+        "garbage_collection.run",
+        gc.trigger = trigger,
+        gc.collectible_states = tracing::field::Empty,
+        gc.claimed_states = tracing::field::Empty,
+        gc.queued_states = tracing::field::Empty,
+        gc.reclaimable_pages = tracing::field::Empty,
+        gc.states_resolved = tracing::field::Empty,
+        gc.pages_reclaimed = tracing::field::Empty,
+        gc.outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        otel.status_message = tracing::field::Empty,
+    )
+}
+
+fn record_garbage_collection_error(span: &tracing::Span, error: &dyn Error) {
+    span.record("gc.outcome", "failed");
+    span.record("otel.status_code", "ERROR");
+    span.record("otel.status_message", tracing::field::display(error));
+}
+
+fn start_garbage_collector(
+    store: Arc<SemanticStore>,
+    scheduler: Arc<IndexScheduler>,
+    running: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
+    span: tracing::Span,
+) -> Result<(), Box<dyn Error>> {
+    let queued = store.garbage_collection_queued()?;
+    let reclaimable = store.reclaimable_database_pages()?;
+    span.record("gc.queued_states", queued);
+    span.record("gc.reclaimable_pages", reclaimable);
     if running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        span.record("gc.outcome", "already_running");
         return Ok(());
     }
     let restart_store = store.clone();
@@ -97,48 +229,118 @@ pub(super) fn start_garbage_collector(
     let spawn = std::thread::Builder::new()
         .name("beholder-garbage-collector".into())
         .spawn(move || {
-            if let Ok(mut current) = progress.lock() {
-                *current = Some(GarbageCollectionProgress::phase(
-                    GarbageCollectionPhase::SweepingObsoleteStates,
-                ));
-            }
-            let result = scheduler.run_exclusive("garbage collection", || {
-                store.sweep_garbage_collection(|update| {
-                    if let Ok(mut current) = progress.lock() {
-                        *current = Some(update.clone());
+            span.in_scope(|| {
+                let result: Result<u64, Box<dyn Error>> = (|| {
+                    let mut states_resolved = 0;
+                    if store.garbage_collection_pending()? {
+                        if let Ok(mut current) = progress.lock() {
+                            *current = Some(GarbageCollectionProgress::phase(
+                                GarbageCollectionPhase::SweepingObsoleteStates,
+                            ));
+                        }
+                        states_resolved = store.sweep_garbage_collection(|update| {
+                            if let Ok(mut current) = progress.lock() {
+                                *current = Some(update.clone());
+                            }
+                            tracing::info!(
+                                phase = ?update.phase,
+                                step = update.step,
+                                completed_rows = update.completed_rows,
+                                rows = update.rows,
+                                stale_states = update.stale_states,
+                                repositories = update.repositories,
+                                completed_steps = update.completed_steps,
+                                total_steps = update.total_steps,
+                                "semantic store garbage collection progress"
+                            );
+                            !scheduler.is_stopping()
+                        })?;
                     }
-                    tracing::info!(
-                        step = update.step,
-                        completed_rows = update.completed_rows,
-                        rows = update.rows,
-                        "semantic store garbage collection progress"
+                    if scheduler.is_stopping() {
+                        return Ok(states_resolved);
+                    }
+                    if let Ok(mut current) = progress.lock() {
+                        *current = Some(GarbageCollectionProgress::phase(
+                            GarbageCollectionPhase::CheckpointingDatabase,
+                        ));
+                    }
+                    store.checkpoint()?;
+                    let pages = store.reclaimable_database_pages()?;
+                    let mut reclaimed = 0;
+                    while reclaimed < pages && !scheduler.is_stopping() {
+                        if let Ok(mut current) = progress.lock() {
+                            *current = Some(GarbageCollectionProgress {
+                                phase: GarbageCollectionPhase::ReclaimingDatabaseSpace,
+                                step: None,
+                                rows: Some(pages),
+                                completed_rows: Some(reclaimed),
+                                stale_states: None,
+                                repositories: None,
+                                completed_steps: 0,
+                                total_steps: 1,
+                            });
+                        }
+                        let reclaimed_batch = scheduler
+                            .run_exclusive("garbage collection compaction", || {
+                                store.reclaim_database_pages(GARBAGE_COLLECTION_VACUUM_PAGES)
+                            })?;
+                        if reclaimed_batch == 0 {
+                            break;
+                        }
+                        reclaimed += reclaimed_batch;
+                        tracing::info!(
+                            reclaimed_pages = reclaimed,
+                            reclaimable_pages = pages,
+                            "semantic store database space reclaimed"
+                        );
+                        std::thread::sleep(GARBAGE_COLLECTION_YIELD);
+                    }
+                    tracing::Span::current().record("gc.pages_reclaimed", reclaimed);
+                    Ok(states_resolved)
+                })();
+                let pending = restart_store.garbage_collection_pending().unwrap_or(false);
+                match result {
+                    Ok(states_resolved) => {
+                        tracing::Span::current().record("gc.states_resolved", states_resolved);
+                        let outcome = if scheduler.is_stopping() {
+                            "stopped"
+                        } else {
+                            "completed"
+                        };
+                        tracing::Span::current().record("gc.outcome", outcome);
+                        tracing::info!(
+                            states_resolved,
+                            outcome,
+                            "semantic store garbage collection sweep completed"
+                        );
+                    }
+                    Err(error) if pending => {
+                        tracing::Span::current().record("gc.outcome", "retrying");
+                        tracing::info!(
+                            %error,
+                            "semantic store garbage collection interrupted; retrying"
+                        );
+                    }
+                    Err(error) => {
+                        record_garbage_collection_error(&tracing::Span::current(), error.as_ref());
+                        tracing::error!(%error, "semantic store garbage collection failed");
+                    }
+                }
+                worker_running.store(false, Ordering::Release);
+                if let Ok(mut current) = progress.lock() {
+                    *current = None;
+                }
+                if pending && !scheduler.is_stopping() {
+                    let retry_span = tracing::Span::current();
+                    let _ = start_garbage_collector(
+                        restart_store,
+                        restart_scheduler,
+                        restart_running,
+                        restart_progress,
+                        retry_span,
                     );
-                })
-            });
-            let pending = restart_store.garbage_collection_pending().unwrap_or(false);
-            match result {
-                Ok(states_resolved) => tracing::info!(
-                    states_resolved,
-                    "semantic store garbage collection sweep completed"
-                ),
-                Err(error) if pending => tracing::info!(
-                    %error,
-                    "semantic store garbage collection interrupted; retrying"
-                ),
-                Err(error) => tracing::error!(%error, "semantic store garbage collection failed"),
-            }
-            worker_running.store(false, Ordering::Release);
-            if let Ok(mut current) = progress.lock() {
-                *current = None;
-            }
-            if pending {
-                let _ = start_garbage_collector(
-                    restart_store,
-                    restart_scheduler,
-                    restart_running,
-                    restart_progress,
-                );
-            }
+                }
+            })
         });
     if let Err(error) = spawn {
         running.store(false, Ordering::Release);
@@ -314,8 +516,10 @@ fn workspace_watch_targets(workspace: &Workspace) -> BTreeSet<(std::path::PathBu
 }
 
 #[cfg(test)]
-mod watcher_tests {
+mod tests {
     use super::*;
+    use beholder_domain::{LogicalRepository, RepositoryFacts, RepositoryState, WorkspaceView};
+    use std::{fs, time::SystemTime};
 
     #[test]
     fn shared_watch_targets_are_reference_counted() {
@@ -345,5 +549,70 @@ mod watcher_tests {
                 ..WatchChanges::default()
             }
         );
+    }
+
+    #[test]
+    fn automatic_collection_claims_and_sweeps_obsolete_states() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-auto-gc-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let store =
+            Arc::new(SemanticStore::persistent(&state_dir.join("beholder.db"), true).unwrap());
+        for fingerprint in ["old", "current"] {
+            let state = RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repository".into(),
+                },
+                head: Some(fingerprint.into()),
+                fingerprint: fingerprint.into(),
+            };
+            let view = WorkspaceView::new("main", "analysis", vec![state.clone()]).unwrap();
+            store
+                .publish(
+                    &view,
+                    &[RepositoryFacts {
+                        state,
+                        analysis_identity: "analysis".into(),
+                        incomplete: false,
+                        diagnostics: Vec::new(),
+                        entities: Vec::new(),
+                        grpc_bindings: Vec::new(),
+                        observations: Vec::new(),
+                    }],
+                    &[],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
+
+        let scheduler = Arc::new(IndexScheduler::new(state_dir.join("cache")));
+        let running = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(None));
+        assert_eq!(
+            collect_garbage(
+                store.clone(),
+                scheduler.clone(),
+                running.clone(),
+                progress,
+                "test",
+            )
+            .unwrap()
+            .repository_states_queued,
+            1
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!running.load(Ordering::Acquire));
+        assert_eq!(store.garbage_collection_candidates().unwrap(), 0);
+        assert_eq!(store.garbage_collection_queued().unwrap(), 0);
+        scheduler.stop();
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 }

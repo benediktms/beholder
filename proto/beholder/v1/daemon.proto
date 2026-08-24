@@ -50,6 +50,8 @@ enum GarbageCollectPhase {
   GARBAGE_COLLECT_PHASE_UNSPECIFIED = 0;
   GARBAGE_COLLECT_PHASE_CLAIMING_OBSOLETE_STATES = 1;
   GARBAGE_COLLECT_PHASE_SWEEPING_OBSOLETE_STATES = 2;
+  GARBAGE_COLLECT_PHASE_CHECKPOINTING_DATABASE = 3;
+  GARBAGE_COLLECT_PHASE_RECLAIMING_DATABASE_SPACE = 4;
 }
 
 message GarbageCollectResponse {
@@ -62,6 +64,8 @@ message GetGarbageCollectionStatusResponse {
   bool running = 1;
   uint64 repository_states_queued = 2;
   optional GarbageCollectProgress progress = 3;
+  uint64 repository_states_collectible = 4;
+  uint64 reclaimable_database_pages = 5;
 }
 
 message EntityRequest {

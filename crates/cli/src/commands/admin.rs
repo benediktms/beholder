@@ -113,9 +113,11 @@ pub(super) async fn cache(command: CacheCommand) -> Result<(), Box<dyn Error>> {
         CacheCommand::Gc { status: true } => {
             let status = get_garbage_collection_status().await?;
             stdout(format_args!(
-                "{} · {} repository states queued",
+                "{} · {} obsolete repository states · {} queued · {} database pages reclaimable",
                 if status.running { "running" } else { "idle" },
+                status.repository_states_collectible,
                 status.repository_states_queued,
+                status.reclaimable_database_pages,
             ))?;
             if let Some(progress) = status.progress {
                 stdout(format_args!(
@@ -170,10 +172,20 @@ fn garbage_collection_action(phase: GarbageCollectionPhase) -> &'static str {
     match phase {
         GarbageCollectionPhase::ClaimingObsoleteStates => "claiming obsolete repository states",
         GarbageCollectionPhase::SweepingObsoleteStates => "sweeping obsolete repository states",
+        GarbageCollectionPhase::CheckpointingDatabase => "checkpointing the database",
+        GarbageCollectionPhase::ReclaimingDatabaseSpace => "reclaiming database space",
     }
 }
 
 fn garbage_collection_progress_action(progress: &GarbageCollectionProgress) -> String {
+    if progress.phase == GarbageCollectionPhase::ReclaimingDatabaseSpace {
+        return match (progress.completed_rows, progress.rows) {
+            (Some(completed), Some(rows)) => {
+                format!("reclaiming database space ({completed}/{rows} pages)")
+            }
+            _ => garbage_collection_action(progress.phase).into(),
+        };
+    }
     let Some(step) = progress.step.as_deref() else {
         return garbage_collection_action(progress.phase).into();
     };
