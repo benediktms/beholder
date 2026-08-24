@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .run(service.store.clone(), service.workspaces.clone()),
         );
         Server::builder()
+            .trace_fn(rpc_span)
             .add_service(DaemonServer::new(service))
             .serve_with_incoming_shutdown(
                 UnixListenerStream::new(listener),
@@ -74,6 +75,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!("daemon stopped");
         Ok(())
     }
+}
+
+fn rpc_span(request: &tonic::codegen::http::Request<()>) -> tracing::Span {
+    let span = tracing::info_span!(
+        "rpc.server",
+        rpc.system = "grpc",
+        rpc.route = %request.uri().path()
+    );
+    beholder_observability::set_parent_from_headers(&span, request.headers());
+    span
 }
 
 fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Error>> {

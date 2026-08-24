@@ -269,14 +269,17 @@ impl Daemon for BeholderDaemon {
             })?;
         let scheduler = self.scheduler.clone();
         let store = self.store.clone();
+        let parent = tracing::Span::current();
         let (observation_count, published) = tokio::task::spawn_blocking(move || {
-            scheduler.index(&store, &workspace).map_err(|error| {
-                (
-                    error
-                        .downcast_ref::<SourceAnalysisError>()
-                        .is_some_and(SourceAnalysisError::is_unsafe_recovery),
-                    error.to_string(),
-                )
+            parent.in_scope(|| {
+                scheduler.index(&store, &workspace).map_err(|error| {
+                    (
+                        error
+                            .downcast_ref::<SourceAnalysisError>()
+                            .is_some_and(SourceAnalysisError::is_unsafe_recovery),
+                        error.to_string(),
+                    )
+                })
             })
         })
         .await

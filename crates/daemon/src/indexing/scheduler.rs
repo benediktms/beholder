@@ -937,8 +937,9 @@ impl IndexScheduler {
                 let store = store.clone();
                 let checkpoint_store = store.clone();
                 let workspaces = workspaces.clone();
+                let span = tracing::info_span!("index.scheduler", trigger = "reconcile");
                 match tokio::task::spawn_blocking(move || {
-                    scheduler.reconcile_registered(&store, &workspaces)
+                    span.in_scope(|| scheduler.reconcile_registered(&store, &workspaces))
                 })
                 .await
                 {
@@ -963,8 +964,11 @@ impl IndexScheduler {
             let store = store.clone();
             let checkpoint_store = store.clone();
             let workspaces = workspaces.clone();
-            match tokio::task::spawn_blocking(move || scheduler.reindex_dirty(&store, &workspaces))
-                .await
+            let span = tracing::info_span!("index.scheduler", trigger = "change");
+            match tokio::task::spawn_blocking(move || {
+                span.in_scope(|| scheduler.reindex_dirty(&store, &workspaces))
+            })
+            .await
             {
                 Ok(result) => {
                     if result.published {

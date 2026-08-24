@@ -6,6 +6,7 @@ use beholder_indexing::{
 };
 use std::{error::Error, sync::Arc, time::Instant};
 use tokio::sync::watch;
+use tracing::Instrument;
 
 type EnrichmentKey = (String, String, String);
 
@@ -61,15 +62,15 @@ impl IndexScheduler {
                 let workspace = job.view.name.clone();
                 let repository = job.repository.clone();
                 let analyzer = job.analyzer.id.clone();
-                tracing::info!(
-                    workspace,
-                    repository,
-                    analyzer,
-                    queue_ms = job.queued_at.elapsed().as_secs_f64() * 1_000.0,
-                    "repository enrichment started"
-                );
+                let span = tracing::info_span!("index.enrichment", workspace, repository, analyzer);
+                span.in_scope(|| {
+                    tracing::info!(
+                        queue_ms = job.queued_at.elapsed().as_secs_f64() * 1_000.0,
+                        "repository enrichment started"
+                    );
+                });
                 let result = tokio::select! {
-                    result = scheduler.enrich(&store, job) => Some(result),
+                    result = scheduler.enrich(&store, job).instrument(span.clone()) => Some(result),
                     changed = cancelled.changed() => {
                         let _ = changed;
                         None
@@ -84,33 +85,14 @@ impl IndexScheduler {
                 if let Ok(mut active) = self.enriching.lock() {
                     active.remove(&key);
                 }
-                match result {
-                    Some(Ok(true)) => tracing::info!(
-                        workspace,
-                        repository,
-                        analyzer,
-                        "repository enrichment published"
-                    ),
-                    Some(Ok(false)) => tracing::info!(
-                        workspace,
-                        repository,
-                        analyzer,
-                        "stale repository enrichment discarded"
-                    ),
-                    Some(Err(error)) => tracing::error!(
-                        workspace,
-                        repository,
-                        analyzer,
-                        %error,
-                        "repository enrichment failed"
-                    ),
-                    None => tracing::info!(
-                        workspace,
-                        repository,
-                        analyzer,
-                        "superseded repository enrichment cancelled"
-                    ),
-                }
+                span.in_scope(|| match result {
+                    Some(Ok(true)) => tracing::info!("repository enrichment published"),
+                    Some(Ok(false)) => tracing::info!("stale repository enrichment discarded"),
+                    Some(Err(error)) => {
+                        tracing::error!(%error, "repository enrichment failed")
+                    }
+                    None => tracing::info!("superseded repository enrichment cancelled"),
+                });
             }
         }
     }

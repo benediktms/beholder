@@ -49,6 +49,7 @@ alias f := format
 [unix]
 install:
     OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}" \
+    OTEL_EXPORTER_OTLP_LOGS_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}/v1/logs" \
     OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-beholderd}" \
     moon run beholder:install
 

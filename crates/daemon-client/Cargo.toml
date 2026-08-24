@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 beholder-dto.workspace = true
 beholder-domain.workspace = true
+beholder-observability.workspace = true
 beholder-protocol.workspace = true
 tonic.workspace = true
