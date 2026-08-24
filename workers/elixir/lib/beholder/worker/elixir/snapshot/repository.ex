@@ -22,8 +22,28 @@ defmodule Beholder.Worker.Elixir.Snapshot.Repository do
   @spec sorted_inputs(t()) :: [input()]
   def sorted_inputs(%__MODULE__{inputs: inputs}), do: Enum.sort_by(inputs, & &1.path)
 
-  @spec mix_project?(t()) :: boolean()
-  def mix_project?(repository) do
-    Enum.any?(repository.inputs, &(&1.path == "mix.exs"))
+  @spec mix_project_root(t()) :: {:ok, String.t()} | {:error, String.t()}
+  def mix_project_root(repository) do
+    roots =
+      repository.inputs
+      |> Enum.filter(&(Path.basename(&1.path) == "mix.exs"))
+      |> Enum.map(&Path.dirname(&1.path))
+      |> Enum.uniq()
+      |> Enum.sort_by(&{length(Path.split(&1)), &1})
+
+    case roots do
+      [] ->
+        {:error, "Elixir compiler enrichment target does not contain mix.exs"}
+
+      [root] ->
+        {:ok, root}
+
+      [root, next | _] ->
+        if length(Path.split(root)) == length(Path.split(next)) do
+          {:error, "Elixir compiler enrichment target has multiple shallowest mix.exs files"}
+        else
+          {:ok, root}
+        end
+    end
   end
 end

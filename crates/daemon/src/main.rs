@@ -163,7 +163,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity("elixir", "18:10:elixir-compiler:4")
+        .identity("elixir", "18:10:elixir-compiler:9")
         .accept_extension("ex")
         .accept_extension("exs")
         .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
