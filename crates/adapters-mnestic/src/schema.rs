@@ -227,6 +227,8 @@ pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \
      {to, state, from, relation, confidence, provenance}";
+pub(super) const CREATE_REVISION_OBSERVATION_TO_INDEX: &str = "::index create analysis_revision_observation:by_to \
+     {view, revision, to, from, relation, evidence, confidence, provenance}";
 
 pub(super) const CREATE_OVERRIDE_SCHEMA: &str = r#"
 :create analysis_revision_dependency_override {
@@ -400,7 +402,7 @@ pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
          direction = 'outgoing'\n\
      ?[direction, relation, related, evidence, confidence, provenance] := \
          *analysis_revision{view: $view, revision}, \
-         *analysis_revision_observation{\
+         *analysis_revision_observation:by_to{\
              view: $view, revision, from: related, relation, to: $entity, evidence, \
              confidence, provenance\
          }, \
