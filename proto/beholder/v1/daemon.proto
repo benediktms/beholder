@@ -95,6 +95,7 @@ message Freshness {
   bool stale = 1;
   bool indexing = 2;
   repeated string dirty_repositories = 3;
+  repeated string enriching_repositories = 4;
 }
 
 enum AnalysisCompleteness {

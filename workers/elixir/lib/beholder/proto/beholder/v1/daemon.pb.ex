@@ -251,6 +251,11 @@ defmodule Beholder.V1.Freshness do
   field :stale, 1, type: :bool
   field :indexing, 2, type: :bool
   field :dirty_repositories, 3, repeated: true, type: :string, json_name: "dirtyRepositories"
+
+  field :enriching_repositories, 4,
+    repeated: true,
+    type: :string,
+    json_name: "enrichingRepositories"
 end
 
 defmodule Beholder.V1.AnalysisDiagnostic do

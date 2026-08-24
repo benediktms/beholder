@@ -187,6 +187,7 @@ mod tests {
                     stale: false,
                     indexing: false,
                     dirty_repositories: Vec::new(),
+                    enriching_repositories: Vec::new(),
                 },
                 analysis: Default::default(),
             },
@@ -246,7 +247,7 @@ mod tests {
 
     #[test]
     fn trace_json_is_versioned_and_compact_output_is_deterministic() {
-        let result = trace_result();
+        let mut result = trace_result();
         let json = trace(&result, OutputMode::Json.into()).unwrap();
         assert!(json.starts_with(r#"{"schema":"beholder.trace.v2","revision":42,"view":"main""#));
         assert!(json.contains(r#""traversal":{"max_hops":32,"truncated":false}"#));
@@ -254,6 +255,14 @@ mod tests {
         assert_eq!(
             trace(&result, OutputMode::Human.into()).unwrap(),
             "repo · CheckoutPage\n  → repo · Pricing.GetPrice [calls_rpc]\n\n1 hop · 1 repositories · confidence 1.00\ntraversal complete · max depth 32\nview main · revision 42 · stale=false · indexing=false"
+        );
+
+        result.metadata.freshness.indexing = true;
+        result.metadata.freshness.enriching_repositories = vec!["repo".into()];
+        assert!(
+            trace(&result, OutputMode::Human.into())
+                .unwrap()
+                .ends_with("stale=false · indexing=true · enriching=repo")
         );
     }
 
