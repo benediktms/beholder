@@ -609,19 +609,20 @@ mod tests {
         assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
         running.store(false, Ordering::Release);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while (running.load(Ordering::Acquire)
-            || store.garbage_collection_queued().unwrap() > 0
+        while (store.garbage_collection_queued().unwrap() > 0
             || store.garbage_collection_candidates().unwrap() > 0)
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-
-        assert!(!running.load(Ordering::Acquire));
         assert_eq!(store.garbage_collection_candidates().unwrap(), 0);
         assert_eq!(store.garbage_collection_queued().unwrap(), 0);
         scheduler.stop();
         monitor.await.unwrap();
+        while running.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!running.load(Ordering::Acquire));
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }
