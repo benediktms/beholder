@@ -21,6 +21,7 @@ struct StoredRepository {
     alternatives: Vec<PathBuf>,
 }
 
+#[derive(Clone)]
 pub struct RepositoryRegistry {
     path: PathBuf,
     repositories: BTreeMap<String, RegisteredRepository>,
@@ -53,26 +54,49 @@ impl RepositoryRegistry {
     }
 
     pub fn register(&mut self, path: PathBuf) -> Result<RegisteredRepository, Box<dyn Error>> {
+        let selection = Self::selection(path)?;
+        let identity = selection.repository.identity.clone();
+        let mut repositories = self.clone();
+        repositories.replace_selection(selection);
+        repositories.persist()?;
+        let registered = repositories
+            .get(&identity)
+            .cloned()
+            .ok_or("registered repository disappeared")?;
+        *self = repositories;
+        Ok(registered)
+    }
+
+    pub(crate) fn selection(path: PathBuf) -> Result<WorkspaceRepository, Box<dyn Error>> {
         let path = fs::canonicalize(&path)
             .map_err(|error| format!("invalid repository {}: {error}", path.display()))?;
         if !path.is_dir() {
             return Err(format!("repository is not a directory: {}", path.display()).into());
         }
-        let selection = workspace_repository(&path)?;
-        self.register_selection(selection)
+        workspace_repository(&path)
     }
 
-    fn register_selection(
-        &mut self,
-        selection: WorkspaceRepository,
-    ) -> Result<RegisteredRepository, Box<dyn Error>> {
+    pub(crate) fn remember_selection(&mut self, selection: WorkspaceRepository) -> bool {
         let identity = selection.repository.identity.clone();
-        let registered = RegisteredRepository { selection };
-        let mut repositories = self.repositories.clone();
-        repositories.insert(identity, registered.clone());
-        self.persist(&repositories)?;
-        self.repositories = repositories;
-        Ok(registered)
+        if let Some(existing) = self.repositories.get_mut(&identity) {
+            let previous = existing.selection.clone();
+            merge_alternatives(&mut existing.selection, &selection);
+            existing.selection != previous
+        } else {
+            self.repositories
+                .insert(identity, RegisteredRepository { selection });
+            true
+        }
+    }
+
+    fn replace_selection(&mut self, mut selection: WorkspaceRepository) {
+        if let Some(existing) = self.repositories.get(&selection.repository.identity) {
+            merge_alternatives(&mut selection, &existing.selection);
+        }
+        self.repositories.insert(
+            selection.repository.identity.clone(),
+            RegisteredRepository { selection },
+        );
     }
 
     pub fn get(&self, identity: &str) -> Option<&RegisteredRepository> {
@@ -83,21 +107,23 @@ impl RepositoryRegistry {
         let mut repositories = self.repositories.clone();
         let removed = repositories.remove(identity).is_some();
         if removed {
-            self.persist(&repositories)?;
-            self.repositories = repositories;
+            let staged = Self {
+                path: self.path.clone(),
+                repositories,
+            };
+            staged.persist()?;
+            self.repositories = staged.repositories;
         }
         Ok(removed)
     }
 
-    fn persist(
-        &self,
-        repositories: &BTreeMap<String, RegisteredRepository>,
-    ) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn persist(&self) -> Result<(), Box<dyn Error>> {
         let temporary = self.path.with_extension("json.tmp");
         let file = File::create(&temporary)?;
         serde_json::to_writer_pretty(
             &file,
-            &repositories
+            &self
+                .repositories
                 .values()
                 .map(|registered| StoredRepository {
                     identity: registered.selection.repository.identity.clone(),
@@ -111,6 +137,14 @@ impl RepositoryRegistry {
         fs::rename(temporary, &self.path)?;
         Ok(())
     }
+}
+
+fn merge_alternatives(target: &mut WorkspaceRepository, selection: &WorkspaceRepository) {
+    target.alternatives.push(selection.base.clone());
+    target.alternatives.extend(selection.alternatives.clone());
+    target.alternatives.sort();
+    target.alternatives.dedup();
+    target.alternatives.retain(|path| path != &target.base);
 }
 
 pub fn registry_path(state_dir: &Path) -> PathBuf {
