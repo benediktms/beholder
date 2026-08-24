@@ -223,6 +223,148 @@ pub(super) const CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ENRICHMENT_JOB_SCHEMA: &str = r#"
+:create enrichment_job {
+    view: String,
+    owner: String,
+    =>
+    repository: String,
+    analyzer: String,
+    version: String,
+    input_fingerprint: String,
+    status: String,
+    attempt: Int,
+    retry_at_ms: Int,
+    error: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_OUTPUT_SCHEMA: &str = r#"
+:create enrichment_output {
+    view: String,
+    owner: String,
+    =>
+    repository: String,
+    analyzer: String,
+    version: String,
+    input_fingerprint: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_ENTITY_CONTRIBUTION_SCHEMA: &str = r#"
+:create enrichment_entity_contribution {
+    view: String,
+    owner: String,
+    id: String,
+    =>
+    kind: String,
+    metadata: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_OBSERVATION_CONTRIBUTION_SCHEMA: &str = r#"
+:create enrichment_observation_contribution {
+    view: String,
+    owner: String,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_SCHEMA: &str = r#"
+:create enrichment_override_contribution {
+    view: String,
+    owner: String,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    =>
+    resolved_to: String,
+    evidence: String,
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA: &str = r#"
+:create enrichment_diagnostic_contribution {
+    view: String,
+    owner: String,
+    repository: String,
+    code: String,
+    severity: String,
+    path: String,
+    line: Int,
+    =>
+    detail: String,
+}
+"#;
+
+pub(super) const CREATE_BASELINE_ENTITY_SCHEMA: &str = r#"
+:create analysis_baseline_entity {
+    view: String,
+    id: String,
+    =>
+    kind: String,
+    metadata: String,
+    revision_owned: Bool,
+}
+"#;
+
+pub(super) const CREATE_BASELINE_OBSERVATION_SCHEMA: &str = r#"
+:create analysis_baseline_observation {
+    view: String,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    confidence: Float,
+    provenance: String,
+    revision_owned: Bool,
+}
+"#;
+
+pub(super) const CREATE_BASELINE_OVERRIDE_SCHEMA: &str = r#"
+:create analysis_baseline_dependency_override {
+    view: String,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    =>
+    resolved_to: String,
+    evidence: String,
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_BASELINE_DIAGNOSTIC_SCHEMA: &str = r#"
+:create analysis_baseline_diagnostic {
+    view: String,
+    repository: String,
+    code: String,
+    severity: String,
+    path: String,
+    line: Int,
+    =>
+    detail: String,
+}
+"#;
+
+pub(super) const CREATE_SCHEMA_MIGRATION_SCHEMA: &str = r#"
+:create schema_migration {
+    name: String,
+    =>
+    version: Int,
+}
+"#;
+
 pub(super) const CREATE_OBSERVATION_TO_INDEX: &str =
     "::index create state_observation:by_to {to, state, from, relation, evidence}";
 pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observation_metadata:by_to \

@@ -10,11 +10,12 @@ use super::{
     },
     storage::{
         claim_garbage_collection, delete_repository_revision, enrichment_matches,
-        enrichments_current, ensure_revision_inputs, garbage_collection_candidates,
-        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
-        publish_observations, publish_repository, repository_contexts,
-        revision_enrichment_input_fingerprint, store_verification_fingerprint,
-        sweep_garbage_collection, verification_matches, view_matches,
+        enrichment_retry_failed, enrichment_retry_started, enrichments_current,
+        ensure_revision_inputs, garbage_collection_candidates, garbage_collection_pending,
+        garbage_collection_queued, prepare_enrichment, publish_enrichment, publish_observations,
+        publish_repository, repository_contexts, revision_enrichment_input_fingerprint,
+        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
+        view_matches,
     },
 };
 use beholder_domain::{
@@ -30,6 +31,7 @@ use std::{
     collections::BTreeSet,
     error::Error,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 fn relevant_entities(
@@ -69,6 +71,16 @@ pub struct EnrichmentOwner<'a> {
     pub expected_version: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnrichmentSchedule {
+    Current,
+    Queue,
+    Running,
+    RetryAfter(Duration),
+    Exhausted,
+    Superseded,
+}
+
 impl SemanticStore {
     pub fn memory() -> Result<Self, Box<dyn Error>> {
         let db = memory_database()?;
@@ -81,12 +93,16 @@ impl SemanticStore {
 
     pub fn persistent(path: &Path, initialize: bool) -> Result<Self, Box<dyn Error>> {
         #[cfg(feature = "sqlite")]
-        if initialize && !path.exists() {
-            sqlite::open(path)?.execute("PRAGMA auto_vacuum = INCREMENTAL")?;
+        {
+            let fresh = initialize && !path.exists();
+            let connection = sqlite::open(path)?;
+            connection.execute("PRAGMA busy_timeout = 5000")?;
+            if fresh {
+                connection.execute("PRAGMA auto_vacuum = INCREMENTAL")?;
+            }
+            connection.execute("PRAGMA journal_mode = WAL")?;
         }
         let db = persistent_database(path, initialize)?;
-        #[cfg(feature = "sqlite")]
-        sqlite::open(path)?.execute("PRAGMA journal_mode=WAL")?;
         let read_db = persistent_database(path, false)?;
         Ok(Self {
             db,
@@ -222,6 +238,62 @@ impl SemanticStore {
             input_fingerprint,
             owner,
             payload,
+        )
+    }
+
+    pub fn prepare_enrichment(
+        &self,
+        view: &str,
+        repository: &str,
+        analyzer: &str,
+        version: &str,
+        input_fingerprint: &str,
+    ) -> Result<EnrichmentSchedule, Box<dyn Error>> {
+        prepare_enrichment(
+            &self.db,
+            view,
+            repository,
+            analyzer,
+            version,
+            input_fingerprint,
+        )
+    }
+
+    pub fn enrichment_retry_started(
+        &self,
+        view: &str,
+        repository: &str,
+        analyzer: &str,
+        version: &str,
+        input_fingerprint: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        enrichment_retry_started(
+            &self.db,
+            view,
+            repository,
+            analyzer,
+            version,
+            input_fingerprint,
+        )
+    }
+
+    pub fn enrichment_retry_failed(
+        &self,
+        view: &str,
+        repository: &str,
+        analyzer: &str,
+        version: &str,
+        input_fingerprint: &str,
+        error: &str,
+    ) -> Result<Option<Duration>, Box<dyn Error>> {
+        enrichment_retry_failed(
+            &self.db,
+            view,
+            repository,
+            analyzer,
+            version,
+            input_fingerprint,
+            error,
         )
     }
 

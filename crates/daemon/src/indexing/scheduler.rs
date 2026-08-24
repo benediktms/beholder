@@ -1875,12 +1875,6 @@ fn index_workspace_through_port(
     let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let verification_fingerprint =
         workspace_verification_fingerprint(analysis_plan.analysis_identity(), &snapshot);
-    if scheduler.indexer.enrichment_catalog().is_empty()
-        && store.verification_matches(&workspace.name, &verification_fingerprint)?
-    {
-        tracing::info!(workspace = %workspace.name, "workspace inputs unchanged");
-        return Ok((0, false));
-    }
     let mut view = WorkspaceView::new_scoped(
         &workspace.name,
         analysis_plan.analysis_identity(),
@@ -2758,6 +2752,37 @@ mod tests {
             );
             assert_eq!(&job.snapshot.target_repository, repository);
         }
+        drop(jobs);
+
+        scheduler.enrichment_jobs.lock().unwrap().clear();
+        for repository in &snapshot.repositories {
+            let identity = &repository.state.repository.identity;
+            let input = view.repository_enrichment_input_fingerprint(&repository.state, "semantic");
+            assert!(
+                store
+                    .enrichment_retry_failed(
+                        "main",
+                        identity,
+                        "semantic",
+                        "1",
+                        &input,
+                        "worker unavailable",
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        scheduler
+            .queue_enrichments(&store, &snapshot, &view)
+            .unwrap();
+        assert_eq!(scheduler.enrichment_jobs.lock().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .context_snapshot("main", "missing")
+                .unwrap()
+                .analysis_revision,
+            1
+        );
     }
 
     #[test]
@@ -2854,6 +2879,13 @@ mod tests {
                 .unwrap()
                 .input_fingerprint,
             view.repository_enrichment_input_fingerprint(&view.repository_states[1], "semantic",)
+        );
+        assert_eq!(
+            store
+                .context_snapshot("main", "missing")
+                .unwrap()
+                .analysis_revision,
+            1
         );
     }
 

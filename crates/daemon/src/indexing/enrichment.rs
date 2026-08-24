@@ -1,5 +1,7 @@
 use super::{IndexScheduler, pipeline};
-use beholder_adapters_mnestic::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
+use beholder_adapters_mnestic::{
+    EnrichmentOwner, EnrichmentPayload, EnrichmentSchedule, SemanticStore,
+};
 use beholder_domain::WorkspaceView;
 use beholder_indexing::{
     AnalyzerContribution, AnalyzerMetadata, EnrichmentSnapshot, WorkspaceSnapshot,
@@ -47,6 +49,43 @@ impl IndexScheduler {
                 .and_then(|mut jobs| jobs.pop_first().map(|(_, job)| job))
             {
                 let key = enrichment_key(&job);
+                match store.prepare_enrichment(
+                    &job.view.name,
+                    &job.repository,
+                    &job.analyzer.id,
+                    &job.analyzer.version,
+                    &job.input_fingerprint,
+                ) {
+                    Ok(EnrichmentSchedule::Queue) => {}
+                    Ok(EnrichmentSchedule::RetryAfter(delay)) => {
+                        self.schedule_enrichment_retry(store.clone(), job, delay);
+                        continue;
+                    }
+                    Ok(
+                        EnrichmentSchedule::Current
+                        | EnrichmentSchedule::Running
+                        | EnrichmentSchedule::Exhausted
+                        | EnrichmentSchedule::Superseded,
+                    ) => continue,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to prepare repository enrichment");
+                        continue;
+                    }
+                }
+                match store.enrichment_retry_started(
+                    &job.view.name,
+                    &job.repository,
+                    &job.analyzer.id,
+                    &job.analyzer.version,
+                    &job.input_fingerprint,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to start repository enrichment");
+                        continue;
+                    }
+                }
                 let (cancel, mut cancelled) = watch::channel(());
                 if let Ok(mut active) = self.enriching.lock() {
                     active.insert(
@@ -70,6 +109,7 @@ impl IndexScheduler {
                         "repository enrichment started"
                     );
                 });
+                let retry_job = job.clone();
                 let result = tokio::select! {
                     biased;
                     _ = self.enrichment_shutdown.notified() => {
@@ -91,7 +131,28 @@ impl IndexScheduler {
                     Some(Ok(true)) => tracing::info!("repository enrichment published"),
                     Some(Ok(false)) => tracing::info!("stale repository enrichment discarded"),
                     Some(Err(error)) => {
-                        tracing::error!(%error, "repository enrichment failed")
+                        tracing::error!(%error, "repository enrichment failed");
+                        match store.enrichment_retry_failed(
+                            &retry_job.view.name,
+                            &retry_job.repository,
+                            &retry_job.analyzer.id,
+                            &retry_job.analyzer.version,
+                            &retry_job.input_fingerprint,
+                            &error,
+                        ) {
+                            Ok(Some(delay)) => {
+                                scheduler.schedule_enrichment_retry(
+                                    store.clone(),
+                                    retry_job,
+                                    delay,
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(retry_error) => tracing::error!(
+                                %retry_error,
+                                "failed to persist repository enrichment retry"
+                            ),
+                        }
                     }
                     None => tracing::info!("superseded repository enrichment cancelled"),
                 });
@@ -129,7 +190,6 @@ impl IndexScheduler {
             );
         }
         pipeline::report_analysis_diagnostics(&job.view.name, &diagnostics);
-        let expected_version = format!("pending:{}", job.analyzer.version);
         let store = Arc::clone(store);
         tokio::task::spawn_blocking(move || {
             store
@@ -140,7 +200,7 @@ impl IndexScheduler {
                     EnrichmentOwner {
                         analyzer: &job.analyzer.id,
                         version: &job.analyzer.version,
-                        expected_version: Some(&expected_version),
+                        expected_version: Some(&job.analyzer.version),
                     },
                     EnrichmentPayload {
                         entities: &entities,
@@ -153,6 +213,52 @@ impl IndexScheduler {
         })
         .await
         .map_err(|error| error.to_string())?
+    }
+
+    fn schedule_enrichment_retry(
+        self: &Arc<Self>,
+        store: Arc<SemanticStore>,
+        mut job: EnrichmentJob,
+        delay: std::time::Duration,
+    ) {
+        let scheduler = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            loop {
+                let schedule = store
+                    .prepare_enrichment(
+                        &job.view.name,
+                        &job.repository,
+                        &job.analyzer.id,
+                        &job.analyzer.version,
+                        &job.input_fingerprint,
+                    )
+                    .map_err(|error| error.to_string());
+                match schedule {
+                    Ok(EnrichmentSchedule::Queue) => {
+                        job.queued_at = Instant::now();
+                        if let Ok(mut jobs) = scheduler.enrichment_jobs.lock() {
+                            jobs.insert(enrichment_key(&job), job);
+                            scheduler.enrichment_changed.notify_one();
+                        }
+                        break;
+                    }
+                    Ok(EnrichmentSchedule::RetryAfter(delay)) => {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Ok(
+                        EnrichmentSchedule::Current
+                        | EnrichmentSchedule::Running
+                        | EnrichmentSchedule::Exhausted
+                        | EnrichmentSchedule::Superseded,
+                    ) => break,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to prepare repository enrichment retry");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     pub(super) fn queue_enrichments(
@@ -177,41 +283,25 @@ impl IndexScheduler {
                     .ok_or("published repository enrichment input fingerprint is missing")?;
                 let contexts =
                     store.repository_contexts(&view.name, &repository_id, &analyzer.id)?;
-                if store.enrichment_matches(
+                let schedule = store.prepare_enrichment(
                     &view.name,
                     &repository_id,
                     &analyzer.id,
                     &analyzer.version,
-                )? {
+                    &input_fingerprint,
+                )?;
+                let active = self.indexer.enricher_is_active(&analyzer.id, repository);
+                if matches!(
+                    schedule,
+                    EnrichmentSchedule::Current
+                        | EnrichmentSchedule::Running
+                        | EnrichmentSchedule::Exhausted
+                        | EnrichmentSchedule::Superseded
+                ) || matches!(schedule, EnrichmentSchedule::RetryAfter(_)) && !active
+                {
                     continue;
                 }
-                if self.indexer.enricher_is_active(&analyzer.id, repository) {
-                    let pending_version = format!("pending:{}", analyzer.version);
-                    if !store.enrichment_matches(
-                        &view.name,
-                        &repository_id,
-                        &analyzer.id,
-                        &pending_version,
-                    )? {
-                        store.publish_enrichment(
-                            view,
-                            &repository_id,
-                            &input_fingerprint,
-                            EnrichmentOwner {
-                                analyzer: &analyzer.id,
-                                version: &pending_version,
-                                expected_version: None,
-                            },
-                            EnrichmentPayload::default(),
-                        )?;
-                        tracing::info!(
-                            workspace = %view.name,
-                            repository = %repository_id,
-                            analyzer = %analyzer.id,
-                            reason = "input_or_version_changed",
-                            "repository enrichment invalidated"
-                        );
-                    }
+                if active {
                     let key = (
                         view.name.clone(),
                         repository_id.clone(),
@@ -269,7 +359,7 @@ impl IndexScheduler {
                         EnrichmentOwner {
                             analyzer: &analyzer.id,
                             version: &analyzer.version,
-                            expected_version: None,
+                            expected_version: Some(&analyzer.version),
                         },
                         EnrichmentPayload::default(),
                     )?;
