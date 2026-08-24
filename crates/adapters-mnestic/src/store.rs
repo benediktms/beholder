@@ -75,8 +75,10 @@ pub struct EnrichmentOwner<'a> {
 pub enum EnrichmentSchedule {
     Current,
     Queue,
+    Running,
     RetryAfter(Duration),
     Exhausted,
+    Superseded,
 }
 
 impl SemanticStore {

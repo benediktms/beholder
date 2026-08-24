@@ -61,7 +61,12 @@ impl IndexScheduler {
                         self.schedule_enrichment_retry(store.clone(), job, delay);
                         continue;
                     }
-                    Ok(EnrichmentSchedule::Current | EnrichmentSchedule::Exhausted) => continue,
+                    Ok(
+                        EnrichmentSchedule::Current
+                        | EnrichmentSchedule::Running
+                        | EnrichmentSchedule::Exhausted
+                        | EnrichmentSchedule::Superseded,
+                    ) => continue,
                     Err(error) => {
                         tracing::error!(%error, "failed to prepare repository enrichment");
                         continue;
@@ -241,7 +246,12 @@ impl IndexScheduler {
                     Ok(EnrichmentSchedule::RetryAfter(delay)) => {
                         tokio::time::sleep(delay).await;
                     }
-                    Ok(EnrichmentSchedule::Current | EnrichmentSchedule::Exhausted) => break,
+                    Ok(
+                        EnrichmentSchedule::Current
+                        | EnrichmentSchedule::Running
+                        | EnrichmentSchedule::Exhausted
+                        | EnrichmentSchedule::Superseded,
+                    ) => break,
                     Err(error) => {
                         tracing::error!(%error, "failed to prepare repository enrichment retry");
                         break;
@@ -283,7 +293,10 @@ impl IndexScheduler {
                 let active = self.indexer.enricher_is_active(&analyzer.id, repository);
                 if matches!(
                     schedule,
-                    EnrichmentSchedule::Current | EnrichmentSchedule::Exhausted
+                    EnrichmentSchedule::Current
+                        | EnrichmentSchedule::Running
+                        | EnrichmentSchedule::Exhausted
+                        | EnrichmentSchedule::Superseded
                 ) || matches!(schedule, EnrichmentSchedule::RetryAfter(_)) && !active
                 {
                     continue;
