@@ -21,6 +21,7 @@ use tonic::transport::Server;
 mod daemon;
 mod indexing;
 mod ipc;
+mod repository_registry;
 mod rpc;
 mod rpc_service;
 mod single_instance;

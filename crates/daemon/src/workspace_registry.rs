@@ -1,7 +1,5 @@
-use beholder_adapters_git::workspace_repository;
-use beholder_domain::{
-    LogicalRepository, ProtobufDescriptorSource, Workspace, WorkspaceRepository,
-};
+use crate::repository_registry::{self, RepositoryRegistry};
+use beholder_domain::{LogicalRepository, ProtobufDescriptorSource, Workspace};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -25,68 +23,57 @@ struct StoredProtobufDescriptor {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(untagged)]
-enum StoredRepository {
-    Path(PathBuf),
-    Registered {
-        identity: String,
-        display_name: String,
-        base: PathBuf,
-        alternatives: Vec<PathBuf>,
-    },
+struct StoredRepository {
+    identity: String,
 }
 
 pub struct WorkspaceRegistry {
     path: PathBuf,
+    repositories: RepositoryRegistry,
     workspaces: BTreeMap<String, Workspace>,
 }
 
 impl WorkspaceRegistry {
     pub fn open(path: PathBuf) -> Result<Self, Box<dyn Error>> {
-        let workspaces = if path.exists() {
-            serde_json::from_reader::<_, Vec<StoredWorkspace>>(File::open(&path)?)?
-                .into_iter()
-                .map(|stored| {
-                    let repositories = stored
-                        .repositories
-                        .into_iter()
-                        .map(|repository| match repository {
-                            StoredRepository::Path(path) => {
-                                workspace_repository(&path).map_err(|error| error.to_string())
-                            }
-                            StoredRepository::Registered {
-                                identity,
-                                display_name,
-                                base,
-                                alternatives,
-                            } => Ok(WorkspaceRepository {
-                                repository: LogicalRepository { identity },
-                                display_name,
-                                base,
-                                alternatives,
-                            }),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Workspace::new(stored.name, repositories)?
-                        .with_protobuf_descriptors(
-                            stored
-                                .protobuf_descriptors
-                                .into_iter()
-                                .map(|descriptor| ProtobufDescriptorSource {
-                                    repository: LogicalRepository {
-                                        identity: descriptor.repository,
-                                    },
-                                    path: descriptor.path,
-                                })
-                                .collect(),
-                        )
-                        .map(|workspace| (workspace.name.clone(), workspace))
-                })
-                .collect::<Result<_, _>>()?
-        } else {
-            BTreeMap::new()
+        let state_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let repositories = RepositoryRegistry::open(repository_registry::registry_path(state_dir))?;
+        let mut workspaces = BTreeMap::new();
+        if path.exists() {
+            for stored in serde_json::from_reader::<_, Vec<StoredWorkspace>>(File::open(&path)?)? {
+                let selections = stored
+                    .repositories
+                    .into_iter()
+                    .map(|repository| {
+                        repositories
+                            .get(&repository.identity)
+                            .map(|registered| registered.selection.clone())
+                            .ok_or_else(|| {
+                                format!("repository not registered: {}", repository.identity)
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let workspace = Workspace::new(stored.name, selections)?
+                    .with_protobuf_descriptors(
+                        stored
+                            .protobuf_descriptors
+                            .into_iter()
+                            .map(|descriptor| ProtobufDescriptorSource {
+                                repository: LogicalRepository {
+                                    identity: descriptor.repository,
+                                },
+                                path: descriptor.path,
+                            })
+                            .collect(),
+                    )?;
+                workspaces.insert(workspace.name.clone(), workspace);
+            }
+        }
+        let registry = Self {
+            path,
+            repositories,
+            workspaces,
         };
-        Ok(Self { path, workspaces })
+        Ok(registry)
     }
 
     pub fn register(
@@ -98,17 +85,11 @@ impl WorkspaceRegistry {
         let repositories = repositories
             .into_iter()
             .map(|path| {
-                let path = fs::canonicalize(&path)
-                    .map_err(|error| format!("invalid repository {}: {error}", path.display()))?;
-                if !path.is_dir() {
-                    return Err(format!("repository is not a directory: {}", path.display()));
-                }
-                if path.to_str().is_none() {
-                    return Err(format!("repository path is not UTF-8: {}", path.display()));
-                }
-                workspace_repository(&path).map_err(|error| error.to_string())
+                self.repositories
+                    .register(path)
+                    .map(|entry| entry.selection)
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         let descriptors = protobuf_descriptors
             .into_iter()
             .map(|path| {
@@ -166,11 +147,8 @@ impl WorkspaceRegistry {
                     repositories: workspace
                         .repositories
                         .iter()
-                        .map(|repository| StoredRepository::Registered {
+                        .map(|repository| StoredRepository {
                             identity: repository.repository.identity.clone(),
-                            display_name: repository.display_name.clone(),
-                            base: repository.base.clone(),
-                            alternatives: repository.alternatives.clone(),
                         })
                         .collect(),
                     protobuf_descriptors: workspace
@@ -192,4 +170,44 @@ impl WorkspaceRegistry {
 
 pub fn registry_path(state_dir: &Path) -> PathBuf {
     state_dir.join("workspaces.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn workspace_persists_repository_membership_by_identity() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-workspace-registry-{unique}"));
+        let repository = state.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+
+        let path = registry_path(&state);
+        let mut registry = WorkspaceRegistry::open(path.clone()).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
+        let identity = &workspace.repositories[0].repository.identity;
+
+        let stored: serde_json::Value =
+            serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+        assert_eq!(stored[0]["repositories"][0]["identity"], identity.as_str());
+        assert_eq!(stored[0]["repositories"][0].as_object().unwrap().len(), 1);
+
+        let repositories: serde_json::Value = serde_json::from_reader(
+            File::open(repository_registry::registry_path(&state)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repositories[0]["identity"], identity.as_str());
+        assert!(repositories[0].get("base").is_some());
+
+        let reloaded = WorkspaceRegistry::open(path).unwrap();
+        assert_eq!(reloaded.get("main"), Some(&workspace));
+        fs::remove_dir_all(state).unwrap();
+    }
 }
