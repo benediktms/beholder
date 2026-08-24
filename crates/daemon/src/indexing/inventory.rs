@@ -8,11 +8,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::UNIX_EPOCH,
 };
 
 const INVENTORY_VERSION: u32 = 1;
+static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) enum RefreshMode<'a> {
     Hinted,
@@ -214,7 +218,7 @@ impl InventoryStore {
             });
         }
 
-        let state = repository_state_from_content_hashes(
+        let mut state = repository_state_from_content_hashes(
             base,
             inputs.iter().zip(&entries).map(|(input, entry)| {
                 (
@@ -228,6 +232,7 @@ impl InventoryStore {
             }),
         )
         .map_err(|error| input_error(base, error))?;
+        state.repository.identity = repository.to_owned();
         if previous_fingerprint.as_deref() == Some(state.fingerprint.as_str()) {
             statistics.repositories_reused = 1;
         } else {
@@ -404,7 +409,11 @@ fn store_manifest(
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&temporary, bytes)?;
     fs::rename(temporary, path)
 }

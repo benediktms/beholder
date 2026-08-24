@@ -69,7 +69,7 @@ use beholder_domain::{
 };
 use beholder_domain::{
     BeholderError, BeholderErrorCode, BeholderErrorKind, RepositoryDependencyGraph, Workspace,
-    WorkspaceView,
+    WorkspaceRepository, WorkspaceView,
 };
 use beholder_dto::{Freshness, QueryMetadata};
 #[cfg(test)]
@@ -282,6 +282,7 @@ pub struct IndexScheduler {
     dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
     retry_attempts: Mutex<BTreeMap<String, u8>>,
     active_operation: Mutex<Option<String>>,
+    indexing_repositories: Mutex<BTreeSet<String>>,
     enrichment_jobs: Mutex<BTreeMap<(String, String, String), EnrichmentJob>>,
     enriching: Mutex<BTreeMap<(String, String, String), EnrichmentRun>>,
     idle: Condvar,
@@ -427,6 +428,11 @@ struct ActiveOperation<'a> {
     idle: &'a Condvar,
 }
 
+struct ActiveRepository<'a> {
+    identity: String,
+    indexing_repositories: &'a Mutex<BTreeSet<String>>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ReindexResult {
     published: bool,
@@ -464,6 +470,14 @@ impl Drop for ActiveOperation<'_> {
     }
 }
 
+impl Drop for ActiveRepository<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut repositories) = self.indexing_repositories.lock() {
+            repositories.remove(&self.identity);
+        }
+    }
+}
+
 impl IndexScheduler {
     pub fn with_indexer(indexer: Indexer) -> Self {
         let inventory = InventoryStore::new(indexer.cache_dir());
@@ -472,6 +486,7 @@ impl IndexScheduler {
             dirty_repositories: Mutex::new(BTreeMap::new()),
             retry_attempts: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
+            indexing_repositories: Mutex::new(BTreeSet::new()),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
             enriching: Mutex::new(BTreeMap::new()),
             idle: Condvar::new(),
@@ -538,6 +553,7 @@ impl IndexScheduler {
             dirty_repositories: Mutex::new(BTreeMap::new()),
             retry_attempts: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
+            indexing_repositories: Mutex::new(BTreeSet::new()),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
             enriching: Mutex::new(BTreeMap::new()),
             idle: Condvar::new(),
@@ -668,6 +684,86 @@ impl IndexScheduler {
         self.indexer.clear_cache().map_err(erase_error)?;
         self.inventory.clear();
         Ok(())
+    }
+
+    pub fn repository_indexing(&self, repository: &str) -> bool {
+        self.indexing_repositories
+            .lock()
+            .is_ok_and(|repositories| repositories.contains(repository))
+    }
+
+    #[tracing::instrument(
+        name = "index.repository",
+        skip(self, store, repository),
+        err,
+        fields(repository = %repository.repository.identity, authoritative)
+    )]
+    pub fn index_repository(
+        &self,
+        store: &SemanticStore,
+        repository: &WorkspaceRepository,
+        authoritative: bool,
+    ) -> Result<(usize, bool), Box<dyn Error>> {
+        let _active = self.begin_repository(&repository.repository.identity)?;
+        let refresh = self.inventory.refresh(
+            &repository.repository.identity,
+            &repository.base,
+            &[],
+            &self.indexer,
+            if authoritative {
+                RefreshMode::Authoritative
+            } else {
+                RefreshMode::Hinted
+            },
+        )?;
+        if self.is_stopping() {
+            return Err(scheduler_unavailable().into());
+        }
+        let snapshot = WorkspaceSnapshot {
+            name: repository.repository.identity.clone(),
+            repositories: vec![refresh.snapshot],
+        };
+        let plan = self.indexer.prepare(&snapshot);
+        let analysis = self
+            .indexer
+            .analyze_prepared(&snapshot, &plan)
+            .map_err(erase_error)?;
+        if self.is_stopping() {
+            return Err(scheduler_unavailable().into());
+        }
+        let mut repositories = analysis.repositories.into_iter();
+        let facts = repositories
+            .next()
+            .ok_or("repository analysis returned no repository")?
+            .facts;
+        if repositories.next().is_some() {
+            return Err("repository analysis returned multiple repositories".into());
+        }
+        let observation_count = facts.observations.len();
+        let published = store.publish_repository(&facts)?;
+        Ok((observation_count, published))
+    }
+
+    fn begin_repository(&self, identity: &str) -> Result<ActiveRepository<'_>, BeholderError> {
+        if self.is_stopping() {
+            return Err(scheduler_unavailable());
+        }
+        let mut repositories = self
+            .indexing_repositories
+            .lock()
+            .map_err(|_| scheduler_unavailable())?;
+        if !repositories.insert(identity.into()) {
+            return Err(BeholderError::new(
+                BeholderErrorKind::FailedPrecondition,
+                BeholderErrorCode::RepositoryIndexFailed,
+                format!("repository is already indexing: {identity}"),
+            ));
+        }
+        drop(repositories);
+        Ok(ActiveRepository {
+            identity: identity.into(),
+            indexing_repositories: &self.indexing_repositories,
+        })
     }
 
     #[tracing::instrument(name = "index.workspace", skip(self, store), err, fields(workspace = %workspace.name))]
@@ -2229,6 +2325,60 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn indexes_a_repository_without_publishing_a_workspace() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("beholder-repository-index-{unique}"));
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        fs::write(
+            repository.join("schema.graphql"),
+            "type Query { package: Package! } type Package { id: ID! }",
+        )
+        .unwrap();
+        let selection = WorkspaceRepository {
+            repository: LogicalRepository {
+                identity: "example/repository".into(),
+            },
+            display_name: "repository".into(),
+            base: repository,
+            alternatives: Vec::new(),
+        };
+        let scheduler = IndexScheduler::new(root.join("cache"));
+        let store = SemanticStore::memory().unwrap();
+
+        let (observations, published) = scheduler
+            .index_repository(&store, &selection, false)
+            .unwrap();
+        assert!(observations > 0);
+        assert!(published);
+        assert!(
+            store
+                .repository_revision("example/repository")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .inspect_revisions()
+                .unwrap()
+                .rows
+                .iter()
+                .all(|row| { row[0].as_str() != Some("example/repository") })
+        );
+        assert!(
+            !scheduler
+                .index_repository(&store, &selection, true)
+                .unwrap()
+                .1
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

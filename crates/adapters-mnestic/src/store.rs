@@ -5,7 +5,8 @@ use super::{
     inspection::{InspectionResult, inspection_result},
     query::{
         analysis_metadata, analysis_revision, context, dependencies, entity_facts, impact,
-        inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions, trace,
+        inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions,
+        repository_revision, trace,
     },
     storage::{
         claim_garbage_collection, enrichment_matches, enrichments_current, ensure_revision_inputs,
@@ -21,7 +22,7 @@ use beholder_domain::{
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
-    Revisioned, TraceResult,
+    RepositoryRevision, Revisioned, TraceResult,
 };
 use mnestic_engine::{DbInstance, MultiTransaction, NamedRows};
 use std::{
@@ -136,6 +137,13 @@ impl SemanticStore {
 
     pub fn publish_repository(&self, facts: &RepositoryFacts) -> Result<bool, Box<dyn Error>> {
         publish_repository(&self.db, facts)
+    }
+
+    pub fn repository_revision(
+        &self,
+        repository: &str,
+    ) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
+        repository_revision(&self.read_db, repository)
     }
 
     pub fn publish_verified(
@@ -518,15 +526,15 @@ mod tests {
             .unwrap();
         assert_eq!(standalone.rows[0][0].get_str(), Some("source-state"));
         let analyzed_state = standalone.rows[0][1].get_str().unwrap().to_owned();
-        let diagnostics = store
-            .db
-            .run_script(
-                "?[detail] := *repository_revision_diagnostic{repository: 'example/repository', detail}",
-                BTreeMap::new(),
-                mnestic_engine::ScriptMutability::Immutable,
-            )
+        let revision = store
+            .repository_revision("example/repository")
+            .unwrap()
             .unwrap();
-        assert_eq!(diagnostics.rows[0][0].get_str(), Some("recovered"));
+        assert_eq!(revision.source_state, "source-state");
+        assert_eq!(
+            revision.analysis.diagnostics[0].detail.as_deref(),
+            Some("recovered")
+        );
         assert_eq!(store.garbage_collect().unwrap().repository_states_queued, 0);
 
         let view = WorkspaceView::new("standalone-reuse", "rules", vec![state]).unwrap();

@@ -1,4 +1,4 @@
-use crate::repository_registry::{self, RepositoryRegistry};
+use crate::repository_registry::{self, RegisteredRepository, RepositoryRegistry};
 use beholder_domain::{LogicalRepository, ProtobufDescriptorSource, Workspace};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -133,6 +133,17 @@ impl WorkspaceRegistry {
 
     pub fn list(&self) -> Vec<Workspace> {
         self.workspaces.values().cloned().collect()
+    }
+
+    pub fn register_repository(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<RegisteredRepository, Box<dyn Error>> {
+        self.repositories.register(path)
+    }
+
+    pub fn repository(&self, identity: &str) -> Option<&RegisteredRepository> {
+        self.repositories.get(identity)
     }
 
     fn persist(&self, workspaces: &BTreeMap<String, Workspace>) -> Result<(), Box<dyn Error>> {

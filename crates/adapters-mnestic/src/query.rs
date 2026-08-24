@@ -1,6 +1,7 @@
 use super::schema::*;
 use beholder_dto::{
     AnalysisCompleteness, AnalysisDiagnostic, AnalysisDiagnosticSeverity, AnalysisMetadata,
+    RepositoryRevision,
 };
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability};
 use std::collections::{BTreeMap, BTreeSet};
@@ -142,6 +143,76 @@ pub(super) fn analysis_metadata(
         },
         diagnostics,
     })
+}
+
+pub(super) fn repository_revision(
+    db: &impl QueryRunner,
+    repository: &str,
+) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
+    let params = BTreeMap::from([("repository".into(), repository.into())]);
+    let revision = db.run_query(
+        "?[source_state, analysis_identity, head, incomplete] := \
+             *repository_revision{repository: $repository, source_state, analysis_identity, head, incomplete}",
+        params.clone(),
+    )?;
+    let Some(row) = revision.rows.first() else {
+        return Ok(None);
+    };
+    let source_state = row[0]
+        .get_str()
+        .ok_or("stored repository source state is not a string")?
+        .to_owned();
+    let analysis_identity = row[1]
+        .get_str()
+        .ok_or("stored repository analysis identity is not a string")?
+        .to_owned();
+    let head = row[2]
+        .get_str()
+        .ok_or("stored repository head is not a string")?;
+    let incomplete = match &row[3] {
+        DataValue::Bool(value) => *value,
+        _ => return Err("stored repository completeness is not a boolean".into()),
+    };
+    let diagnostics = db.run_query(
+        "?[code, severity, path, line, detail] := \
+             *repository_revision_diagnostic{repository: $repository, code, severity, path, line, detail}\n\
+         :order severity, path, line, code",
+        params,
+    )?;
+    let diagnostics = diagnostics
+        .rows
+        .into_iter()
+        .map(|row| {
+            let severity = match row[1].get_str() {
+                Some("known_limitation") => AnalysisDiagnosticSeverity::KnownLimitation,
+                Some("warning") => AnalysisDiagnosticSeverity::Warning,
+                _ => return Err("unknown stored repository diagnostic severity".into()),
+            };
+            let line = u32::try_from(row[3].get_int().unwrap_or_default())?;
+            let detail = row[4].get_str().unwrap_or_default();
+            Ok(AnalysisDiagnostic {
+                repository: repository.into(),
+                code: row[0].get_str().unwrap_or_default().into(),
+                severity,
+                path: PathBuf::from(row[2].get_str().unwrap_or_default()),
+                line: (line != 0).then_some(line),
+                detail: (!detail.is_empty()).then(|| detail.into()),
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok(Some(RepositoryRevision {
+        source_state,
+        head: (!head.is_empty()).then(|| head.into()),
+        analysis_identity,
+        analysis: AnalysisMetadata {
+            completeness: if incomplete {
+                AnalysisCompleteness::Incomplete
+            } else {
+                AnalysisCompleteness::Complete
+            },
+            diagnostics,
+        },
+    }))
 }
 
 pub(super) fn entity_facts(
