@@ -1908,7 +1908,15 @@ fn index_workspace_through_port(
                                 ))
                             })
                             .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
-                        Ok((analyzer.id, contexts))
+                        Ok((
+                            analyzer.id.clone(),
+                            merge_declared_contexts(
+                                &scheduler.indexer,
+                                &snapshot,
+                                &analyzer.id,
+                                contexts,
+                            ),
+                        ))
                     })
                     .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
             )?
@@ -1919,7 +1927,7 @@ fn index_workspace_through_port(
             return Ok((0, false));
         }
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
-        scheduler.queue_enrichments(store, &snapshot, &view)?;
+        scheduler.queue_enrichments(store, &snapshot, &view, &workspace.enabled_plugins)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
@@ -1994,7 +2002,15 @@ fn index_workspace_through_port(
                 .into_iter()
                 .map(|analyzer| {
                     let contexts = dependency_graph.context_map_for(&analyzer.id);
-                    (analyzer.id, contexts)
+                    (
+                        analyzer.id.clone(),
+                        merge_declared_contexts(
+                            &scheduler.indexer,
+                            &snapshot,
+                            &analyzer.id,
+                            contexts,
+                        ),
+                    )
                 })
                 .collect(),
         )?
@@ -2046,7 +2062,7 @@ fn index_workspace_through_port(
         )
     })?;
     if !scheduler.is_stopping() {
-        scheduler.queue_enrichments(store, &snapshot, &view)?;
+        scheduler.queue_enrichments(store, &snapshot, &view, &workspace.enabled_plugins)?;
     }
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
@@ -2085,6 +2101,22 @@ fn index_workspace_through_port(
         "workspace indexed"
     );
     Ok((observation_count, true))
+}
+
+fn merge_declared_contexts(
+    indexer: &Indexer,
+    snapshot: &WorkspaceSnapshot,
+    analyzer: &str,
+    mut contexts: BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    for repository in &snapshot.repositories {
+        let target = &repository.state.repository.identity;
+        let selected = contexts.entry(target.clone()).or_default();
+        selected.extend(indexer.enrichment_contexts(analyzer, snapshot, target));
+        selected.sort();
+        selected.dedup();
+    }
+    contexts
 }
 
 fn workspace_verification_fingerprint(
@@ -2656,7 +2688,7 @@ mod tests {
         );
 
         scheduler
-            .queue_enrichments(&store, &snapshot, &view)
+            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
             .unwrap();
 
         assert!(scheduler.enrichment_jobs.lock().unwrap().is_empty());
@@ -2729,7 +2761,7 @@ mod tests {
         );
 
         scheduler
-            .queue_enrichments(&store, &snapshot, &view)
+            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
             .unwrap();
 
         let jobs = scheduler.enrichment_jobs.lock().unwrap();
@@ -2773,7 +2805,7 @@ mod tests {
             );
         }
         scheduler
-            .queue_enrichments(&store, &snapshot, &view)
+            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
             .unwrap();
         assert_eq!(scheduler.enrichment_jobs.lock().unwrap().len(), 2);
         assert_eq!(
@@ -2868,7 +2900,7 @@ mod tests {
         );
 
         scheduler
-            .queue_enrichments(&store, &snapshot, &view)
+            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
             .unwrap();
 
         assert!(cancelled.has_changed().unwrap());

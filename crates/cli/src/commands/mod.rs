@@ -45,6 +45,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Manage trusted runtime analyzer plugins.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     /// Manage independently indexed repositories.
     Repository {
         #[command(subcommand)]
@@ -164,9 +169,28 @@ enum WorkspaceCommand {
         /// Compiled FileDescriptorSet paths inside the registered repositories.
         #[arg(long = "protobuf-descriptor")]
         protobuf_descriptors: Vec<PathBuf>,
+        /// Installed plugin IDs enabled for this workspace.
+        #[arg(long = "plugin")]
+        plugins: Vec<String>,
     },
+    /// Enable an installed plugin for a workspace.
+    EnablePlugin { workspace: String, plugin: String },
+    /// Disable a plugin for a workspace.
+    DisablePlugin { workspace: String, plugin: String },
     /// List registered workspaces.
     List,
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Discover and install a trusted plugin executable. The daemon must be stopped.
+    Install { executable: PathBuf },
+    /// Replace an installed plugin with a newly discovered executable. The daemon must be stopped.
+    Replace { executable: PathBuf },
+    /// List installed plugins.
+    List,
+    /// Remove a plugin from the registry. The daemon must be stopped.
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -297,6 +321,7 @@ pub(super) async fn run() -> Result<(), Box<dyn Error>> {
         }
         Some(Command::ReindexWorkspace { workspace }) => index::workspace(workspace).await?,
         Some(Command::Workspace { command }) => admin::workspace(command).await?,
+        Some(Command::Plugin { command }) => admin::plugin(command).await?,
         Some(Command::Repository { command }) => admin::repository(command).await?,
         Some(Command::Cache { command }) => admin::cache(command).await?,
         Some(Command::Inspect {
@@ -386,6 +411,28 @@ mod tests {
             Some(Command::Daemon {
                 command: DaemonCommand::Run
             })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "plugin", "install", "./plugin"])
+                .unwrap()
+                .command,
+            Some(Command::Plugin {
+                command: PluginCommand::Install { executable }
+            }) if executable == std::path::Path::new("./plugin")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "beholder",
+                "workspace",
+                "enable-plugin",
+                "main",
+                "example.kafka"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Workspace {
+                command: WorkspaceCommand::EnablePlugin { workspace, plugin }
+            }) if workspace == "main" && plugin == "example.kafka"
         ));
         assert!(matches!(
             Cli::try_parse_from([

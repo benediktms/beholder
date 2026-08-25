@@ -421,6 +421,7 @@ dependencies = [
  "beholder-dto",
  "beholder-observability",
  "beholder-presentation",
+ "beholder-worker-client",
  "clap",
  "tokio",
  "tracing",
@@ -510,6 +511,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "beholder-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "beholder-domain",
+ "beholder-indexing",
+ "beholder-observability",
+ "beholder-protocol",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "beholder-presentation"
 version = "0.1.0"
 dependencies = [
@@ -539,6 +554,9 @@ dependencies = [
  "beholder-indexing",
  "beholder-observability",
  "beholder-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tonic",

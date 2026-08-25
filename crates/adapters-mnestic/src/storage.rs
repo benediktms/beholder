@@ -1,10 +1,10 @@
 use super::schema::*;
 use super::store::{EnrichmentOwner, EnrichmentPayload};
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, DependencyRelation, EntityFact, EntityKind,
+    AnalysisDiagnostic, Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind,
     EntityMetadata, FactChanges, GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate,
-    GrpcBindingRole, Observation, ProtoTypeKind, RepositoryFacts, RpcCardinality, SemanticRelation,
-    WorkspaceView,
+    GrpcBindingRole, Observation, ProtoTypeKind, Provenance, RepositoryFacts, RpcCardinality,
+    SemanticRelation, StructuralRelation, WorkspaceView,
 };
 use beholder_dto::{GarbageCollectionPhase, GarbageCollectionProgress};
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
@@ -29,6 +29,216 @@ fn enrichment_owner_key(analyzer: &str, repository: &str) -> String {
 
 fn unix_time_ms() -> Result<i64, Box<dyn Error>> {
     i64::try_from(UNIX_EPOCH.elapsed()?.as_millis()).map_err(Into::into)
+}
+
+pub(super) fn selected_baseline_semantics(
+    db: &DbInstance,
+    view: &str,
+    repository: &str,
+    entity_kinds: &BTreeSet<EntityKind>,
+    relations: &BTreeSet<SemanticRelation>,
+) -> Result<(Vec<EntityFact>, Vec<Observation>), Box<dyn Error>> {
+    if entity_kinds.is_empty() && relations.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let state = db.run_script(
+        "?[state] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, repository: $repository, state}",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("repository".into(), repository.into()),
+        ]),
+        ScriptMutability::Immutable,
+    )?;
+    let Some(state) = state.rows.first().and_then(|row| row[0].get_str()) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let params = BTreeMap::from([("state".into(), state.into())]);
+    let stored_entities = db.run_script(
+        "?[id, kind, metadata] := *state_entity{state: $state, id, kind, metadata}",
+        params.clone(),
+        ScriptMutability::Immutable,
+    )?;
+    let mut entities = BTreeMap::new();
+    for row in stored_entities.rows {
+        let id = stored_string(&row, 0, "entity ID")?.to_owned();
+        let kind = parse_entity_kind(stored_string(&row, 1, "entity kind")?)?;
+        let metadata = parse_entity_metadata(stored_string(&row, 2, "entity metadata")?)?;
+        entities.insert(id.clone(), EntityFact::new(id, kind, metadata)?);
+    }
+    let mut selected_ids = entities
+        .iter()
+        .filter(|(_, entity)| entity_kinds.contains(&entity.kind))
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut observations = Vec::new();
+    if !relations.is_empty() {
+        let stored = db.run_script(
+            "?[from, relation, to, evidence, confidence, provenance] := \
+                 *state_observation{state: $state, from, relation, to, evidence}, \
+                 *state_observation_metadata{state: $state, from, relation, to, confidence, provenance}",
+            params,
+            ScriptMutability::Immutable,
+        )?;
+        for row in stored.rows {
+            let relation = parse_relation(stored_string(&row, 1, "relation")?)?;
+            if !relations.contains(&relation) {
+                continue;
+            }
+            let from = stored_string(&row, 0, "source entity")?.to_owned();
+            let to = stored_string(&row, 2, "destination entity")?.to_owned();
+            selected_ids.insert(from.clone());
+            selected_ids.insert(to.clone());
+            observations.push(Observation {
+                from: from.into(),
+                relation,
+                to: to.into(),
+                evidence: stored_string(&row, 3, "evidence")?.into(),
+                confidence: parse_confidence(
+                    row[4]
+                        .get_float()
+                        .ok_or("stored confidence is not a float")?,
+                )?,
+                provenance: parse_provenance(stored_string(&row, 5, "provenance")?)?,
+            });
+        }
+    }
+    let entities = selected_ids
+        .into_iter()
+        .map(|id| {
+            entities.remove(&id).ok_or_else(|| {
+                format!("baseline relationship references missing entity {id}").into()
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok((entities, observations))
+}
+
+fn stored_string<'a>(
+    row: &'a [DataValue],
+    index: usize,
+    field: &str,
+) -> Result<&'a str, Box<dyn Error>> {
+    row.get(index)
+        .and_then(DataValue::get_str)
+        .ok_or_else(|| format!("stored {field} is not a string").into())
+}
+
+fn parse_entity_kind(value: &str) -> Result<EntityKind, Box<dyn Error>> {
+    Ok(match value {
+        "callable" => EntityKind::Callable,
+        "graphql_argument" => EntityKind::GraphqlArgument,
+        "graphql_enum_value" => EntityKind::GraphqlEnumValue,
+        "graphql_field" => EntityKind::GraphqlField,
+        "graphql_operation" => EntityKind::GraphqlOperation,
+        "graphql_type" => EntityKind::GraphqlType,
+        "grpc_operation" => EntityKind::GrpcOperation,
+        "kafka_topic" => EntityKind::KafkaTopic,
+        "namespace" => EntityKind::Namespace,
+        "proto_field" => EntityKind::ProtoField,
+        "proto_method" => EntityKind::ProtoMethod,
+        "proto_service" => EntityKind::ProtoService,
+        "proto_type" => EntityKind::ProtoType,
+        "service" => EntityKind::Service,
+        "unity_prefab" => EntityKind::UnityPrefab,
+        _ => return Err(format!("unknown stored entity kind {value}").into()),
+    })
+}
+
+fn parse_entity_metadata(value: &str) -> Result<Option<EntityMetadata>, Box<dyn Error>> {
+    Ok(match value {
+        "" => None,
+        "graphql_operation:mutation" => Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Mutation,
+        }),
+        "graphql_operation:query" => Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Query,
+        }),
+        "graphql_operation:subscription" => Some(EntityMetadata::GraphqlOperation {
+            kind: GraphqlOperationKind::Subscription,
+        }),
+        "graphql_type:enum" => Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Enum,
+        }),
+        "graphql_type:input" => Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Input,
+        }),
+        "graphql_type:interface" => Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Interface,
+        }),
+        "graphql_type:object" => Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Object,
+        }),
+        "graphql_type:scalar" => Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Scalar,
+        }),
+        "graphql_type:union" => Some(EntityMetadata::GraphqlType {
+            kind: GraphqlTypeKind::Union,
+        }),
+        "rpc_cardinality:bidirectional_streaming" => Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::BidirectionalStreaming,
+        }),
+        "rpc_cardinality:client_streaming" => Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::ClientStreaming,
+        }),
+        "rpc_cardinality:server_streaming" => Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::ServerStreaming,
+        }),
+        "rpc_cardinality:unary" => Some(EntityMetadata::ProtoMethod {
+            cardinality: RpcCardinality::Unary,
+        }),
+        "proto_type:enum" => Some(EntityMetadata::ProtoType {
+            kind: ProtoTypeKind::Enum,
+        }),
+        "proto_type:message" => Some(EntityMetadata::ProtoType {
+            kind: ProtoTypeKind::Message,
+        }),
+        _ => return Err(format!("unknown stored entity metadata {value}").into()),
+    })
+}
+
+fn parse_relation(value: &str) -> Result<SemanticRelation, Box<dyn Error>> {
+    Ok(match value {
+        "defines" => SemanticRelation::Structural(StructuralRelation::Defines),
+        "field_of" => SemanticRelation::Structural(StructuralRelation::FieldOf),
+        "request_type" => SemanticRelation::Structural(StructuralRelation::RequestType),
+        "response_type" => SemanticRelation::Structural(StructuralRelation::ResponseType),
+        "binds_contract" => SemanticRelation::Dependency(DependencyRelation::BindsContract),
+        "calls" => SemanticRelation::Dependency(DependencyRelation::Calls),
+        "calls_graphql" => SemanticRelation::Dependency(DependencyRelation::CallsGraphql),
+        "calls_rpc" => SemanticRelation::Dependency(DependencyRelation::CallsRpc),
+        "consumed_by" => SemanticRelation::Dependency(DependencyRelation::ConsumedBy),
+        "implements" => SemanticRelation::Dependency(DependencyRelation::Implements),
+        "implemented_by" => SemanticRelation::Dependency(DependencyRelation::ImplementedBy),
+        "imports" => SemanticRelation::Dependency(DependencyRelation::Imports),
+        "publishes" => SemanticRelation::Dependency(DependencyRelation::Publishes),
+        "requires" => SemanticRelation::Dependency(DependencyRelation::Requires),
+        "resolved_by" => SemanticRelation::Dependency(DependencyRelation::ResolvedBy),
+        "selects" => SemanticRelation::Dependency(DependencyRelation::Selects),
+        "uses" => SemanticRelation::Dependency(DependencyRelation::Uses),
+        _ => return Err(format!("unknown stored semantic relation {value}").into()),
+    })
+}
+
+fn parse_confidence(value: f64) -> Result<Confidence, Box<dyn Error>> {
+    if value.to_bits() == 1.0f64.to_bits() {
+        Ok(Confidence::Exact)
+    } else if value.to_bits() == 0.6f64.to_bits() {
+        Ok(Confidence::Inferred)
+    } else {
+        Err(format!("unknown stored confidence {value}").into())
+    }
+}
+
+fn parse_provenance(value: &str) -> Result<Provenance, Box<dyn Error>> {
+    Ok(match value {
+        "ast" => Provenance::Ast,
+        "compiler" => Provenance::Compiler,
+        "descriptor" => Provenance::Descriptor,
+        "generated" => Provenance::Generated,
+        "unique_name_heuristic" => Provenance::UniqueNameHeuristic,
+        _ => return Err(format!("unknown stored provenance {value}").into()),
+    })
 }
 
 pub(super) fn store_observations(
@@ -3391,7 +3601,7 @@ mod tests {
     };
     use mnestic_engine::ScriptMutability;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::Path,
         time::{Instant, SystemTime},
@@ -3540,6 +3750,63 @@ mod tests {
                 operation_kind: beholder_dto::GraphqlOperationKind::Mutation,
             })
         );
+    }
+
+    #[test]
+    fn selects_declared_baseline_facts_and_relationship_endpoints() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "app".into(),
+                },
+                head: None,
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let mut facts = facts(
+            &view,
+            vec![Observation::dependency(
+                "repo://app/elixir/Producer.publish/1",
+                DependencyRelation::Publishes,
+                "kafka-topic://events",
+                "lib/producer.ex:3",
+            )],
+        );
+        facts.entities = vec![
+            EntityFact::new(
+                "repo://app/elixir/Producer.publish/1",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+            EntityFact::new("kafka-topic://events", EntityKind::KafkaTopic, None).unwrap(),
+            EntityFact::new(
+                "proto-type://events.Envelope",
+                EntityKind::ProtoType,
+                Some(EntityMetadata::ProtoType {
+                    kind: ProtoTypeKind::Message,
+                }),
+            )
+            .unwrap(),
+        ];
+        store.publish(&view, &[facts], &[]).unwrap();
+
+        let (entities, observations) = store
+            .selected_baseline_semantics(
+                "main",
+                "app",
+                &BTreeSet::from([EntityKind::ProtoType]),
+                &BTreeSet::from([SemanticRelation::Dependency(DependencyRelation::Publishes)]),
+            )
+            .unwrap();
+
+        assert_eq!(entities.len(), 3);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].relation.as_str(), "publishes");
     }
 
     #[test]

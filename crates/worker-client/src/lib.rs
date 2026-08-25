@@ -1,15 +1,19 @@
 //! Builder facade for native analyzer workers.
 
+mod plugin_registry;
+
+pub use plugin_registry::{InstalledPlugin, PluginRegistry, describe_plugin};
+
 use beholder_indexing::{
     AnalysisInput, AnalysisInputKind, AnalyzerError, AnalyzerMetadata, EnrichmentFuture,
-    EnrichmentSnapshot, WorkspaceEnricher,
+    EnrichmentSnapshot, PluginDescriptor, PluginInputScope, WorkspaceEnricher,
 };
 use beholder_protocol::{
     analyze_requests, contribution_from_events,
     worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -25,6 +29,8 @@ use tonic::Request;
 use tracing::Instrument;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(600);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -38,6 +44,7 @@ pub struct WorkerAnalyzerBuilder {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    plugin: Option<PluginDescriptor>,
 }
 
 impl WorkerAnalyzerBuilder {
@@ -55,6 +62,7 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: BTreeMap::new(),
             excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
+            plugin: None,
         }
     }
 
@@ -154,6 +162,7 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: self.parent_suffixes,
             excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
+            plugin: self.plugin,
         })
     }
 }
@@ -168,6 +177,31 @@ pub struct WorkerAnalyzer {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    plugin: Option<PluginDescriptor>,
+}
+
+pub fn plugin_analyzer(
+    executable: impl Into<PathBuf>,
+    socket_dir: impl Into<PathBuf>,
+    digest: impl Into<String>,
+    descriptor: PluginDescriptor,
+) -> Result<WorkerAnalyzer, AnalyzerError> {
+    descriptor.validate()?;
+    Ok(WorkerAnalyzer {
+        metadata: AnalyzerMetadata {
+            id: descriptor.id.clone(),
+            version: digest.into(),
+        },
+        executable: executable.into(),
+        socket_dir: socket_dir.into(),
+        extensions: BTreeMap::new(),
+        file_names: BTreeMap::new(),
+        path_suffixes: BTreeMap::new(),
+        parent_suffixes: BTreeMap::new(),
+        excluded_path_suffixes: Vec::new(),
+        identity_inputs: Vec::new(),
+        plugin: Some(descriptor),
+    })
 }
 
 impl WorkspaceEnricher for WorkerAnalyzer {
@@ -180,6 +214,11 @@ impl WorkspaceEnricher for WorkerAnalyzer {
     }
 
     fn analysis_input_kind(&self, path: &Path) -> Option<AnalysisInputKind> {
+        if let Some(plugin) = &self.plugin {
+            return plugin
+                .input_kind(PluginInputScope::Target, path)
+                .or_else(|| plugin.input_kind(PluginInputScope::Context, path));
+        }
         if self
             .excluded_path_suffixes
             .iter()
@@ -210,6 +249,64 @@ impl WorkspaceEnricher for WorkerAnalyzer {
 
     fn identity_inputs(&self) -> Vec<AnalysisInput> {
         self.identity_inputs.clone()
+    }
+
+    fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
+        if let Some(plugin) = &self.plugin {
+            return repository.inputs.iter().any(|input| {
+                plugin
+                    .input_kind(PluginInputScope::Target, &input.path)
+                    .is_some()
+            });
+        }
+        repository
+            .inputs
+            .iter()
+            .any(|input| self.analysis_input_kind(&input.path).is_some())
+    }
+
+    fn requires_workspace_enablement(&self) -> bool {
+        self.plugin.is_some()
+    }
+
+    fn context_repositories(
+        &self,
+        snapshot: &beholder_indexing::WorkspaceSnapshot,
+        target: &str,
+    ) -> Vec<String> {
+        let Some(plugin) = &self.plugin else {
+            return Vec::new();
+        };
+        snapshot
+            .repositories
+            .iter()
+            .filter(|repository| repository.state.repository.identity != target)
+            .filter(|repository| {
+                repository.inputs.iter().any(|input| {
+                    plugin
+                        .input_kind(PluginInputScope::Context, &input.path)
+                        .is_some()
+                })
+            })
+            .map(|repository| repository.state.repository.identity.clone())
+            .collect()
+    }
+
+    fn semantic_inputs(
+        &self,
+    ) -> (
+        BTreeSet<beholder_domain::EntityKind>,
+        BTreeSet<beholder_domain::SemanticRelation>,
+    ) {
+        self.plugin.as_ref().map_or_else(
+            || (BTreeSet::new(), BTreeSet::new()),
+            |plugin| {
+                (
+                    plugin.semantic_entities.clone(),
+                    plugin.semantic_relations.clone(),
+                )
+            },
+        )
     }
 
     fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
@@ -244,6 +341,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     .arg(self.socket_dir.join("cache"))
                     .stdin(Stdio::null())
                     .env("OTEL_SERVICE_NAME", worker_service_name(&self.metadata.id))
+                    .env("BEHOLDER_PLUGIN_DIGEST", &self.metadata.version)
                     .kill_on_drop(true)
                     .spawn()?;
                 let analysis_started = tokio::time::Instant::now();
@@ -266,27 +364,38 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 }
                 .max_encoding_message_size(MAX_MESSAGE_BYTES)
                 .max_decoding_message_size(MAX_MESSAGE_BYTES);
-                let mut request = Request::new(tokio_stream::iter(analyze_requests(snapshot)));
+                let baseline = snapshot.baseline.clone();
+                let mut request = Request::new(tokio_stream::iter(analyze_requests(snapshot)?));
                 beholder_observability::inject_current_context(request.metadata_mut());
-                let mut stream = client.analyze(request).await?.into_inner();
-                let mut events = Vec::new();
-                while let Some(event) = stream.message().await? {
-                    if let Some(analyze_event::Event::Progress(progress)) = &event.event {
-                        let phase = AnalysisPhase::try_from(progress.phase)
-                            .map_err(|_| "worker progress phase is unknown")?;
-                        if phase == AnalysisPhase::Unspecified {
-                            return Err("worker progress phase is missing".into());
+                let response = tokio::time::timeout(ANALYSIS_TIMEOUT, client.analyze(request))
+                    .await
+                    .map_err(|_| "worker analysis timed out")??;
+                let mut stream = response.into_inner();
+                let events = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
+                    let mut events = Vec::new();
+                    while let Some(event) = stream.message().await? {
+                        if let Some(analyze_event::Event::Progress(progress)) = &event.event {
+                            let phase = AnalysisPhase::try_from(progress.phase)
+                                .map_err(|_| "worker progress phase is unknown")?;
+                            if phase == AnalysisPhase::Unspecified {
+                                return Err::<_, AnalyzerError>(
+                                    "worker progress phase is missing".into(),
+                                );
+                            }
+                            tracing::info!(
+                                worker = self.metadata.id,
+                                workspace,
+                                phase = ?phase,
+                                elapsed_ms = analysis_started.elapsed().as_secs_f64() * 1_000.0,
+                                "worker analysis progress"
+                            );
                         }
-                        tracing::info!(
-                            worker = self.metadata.id,
-                            workspace,
-                            phase = ?phase,
-                            elapsed_ms = analysis_started.elapsed().as_secs_f64() * 1_000.0,
-                            "worker analysis progress"
-                        );
+                        events.push(event);
                     }
-                    events.push(event);
-                }
+                    Ok::<_, AnalyzerError>(events)
+                })
+                .await
+                .map_err(|_| "worker analysis timed out")??;
                 let contribution = contribution_from_events(events)?;
                 if contribution.metadata != self.metadata {
                     return Err(format!(
@@ -297,6 +406,9 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                         self.metadata.version
                     )
                     .into());
+                }
+                if let Some(descriptor) = &self.plugin {
+                    validate_plugin_contribution(descriptor, &baseline, &contribution)?;
                 }
                 tracing::info!(
                     worker = self.metadata.id,
@@ -316,7 +428,10 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                             .sum::<usize>(),
                     "worker analysis completed"
                 );
-                if child.try_wait()?.is_none() {
+                if tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait())
+                    .await
+                    .is_err()
+                {
                     child.kill().await?;
                 }
                 Ok(contribution)
@@ -328,6 +443,19 @@ impl WorkspaceEnricher for WorkerAnalyzer {
 
 impl WorkerAnalyzer {
     fn declared_snapshot(&self, mut snapshot: EnrichmentSnapshot) -> EnrichmentSnapshot {
+        if let Some(plugin) = &self.plugin {
+            for repository in &mut snapshot.workspace.repositories {
+                let scope = if repository.state.repository.identity == snapshot.target_repository {
+                    PluginInputScope::Target
+                } else {
+                    PluginInputScope::Context
+                };
+                repository
+                    .inputs
+                    .retain(|input| plugin.input_kind(scope, &input.path).is_some());
+            }
+            return snapshot;
+        }
         for repository in &mut snapshot.workspace.repositories {
             repository
                 .inputs
@@ -335,6 +463,54 @@ impl WorkerAnalyzer {
         }
         snapshot
     }
+}
+
+fn validate_plugin_contribution(
+    descriptor: &PluginDescriptor,
+    baseline: &beholder_indexing::SemanticSnapshot,
+    contribution: &beholder_indexing::AnalyzerContribution,
+) -> Result<(), AnalyzerError> {
+    let mut known = baseline
+        .entities
+        .iter()
+        .map(|entity| entity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for repository in &contribution.repositories {
+        for entity in &repository.entities {
+            if !descriptor.produces_entities.contains(&entity.kind) {
+                return Err(format!(
+                    "plugin {} produced undeclared entity kind {:?}",
+                    descriptor.id, entity.kind
+                )
+                .into());
+            }
+            known.insert(entity.id.as_str());
+        }
+    }
+    for repository in &contribution.repositories {
+        for observation in &repository.observations {
+            if !descriptor
+                .produces_relations
+                .contains(&observation.relation)
+            {
+                return Err(format!(
+                    "plugin {} produced undeclared relation {:?}",
+                    descriptor.id, observation.relation
+                )
+                .into());
+            }
+            if !known.contains(observation.from.as_str())
+                || !known.contains(observation.to.as_str())
+            {
+                return Err(format!(
+                    "plugin {} produced a relation with an unknown endpoint",
+                    descriptor.id
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn worker_service_name(worker: &str) -> String {
@@ -449,6 +625,7 @@ mod tests {
                 }],
             },
             target_repository: "example".into(),
+            baseline: Default::default(),
         };
 
         let declared = worker.declared_snapshot(snapshot);

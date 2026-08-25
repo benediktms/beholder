@@ -28,11 +28,8 @@ fn is_broken_pipe(mut error: &(dyn Error + 'static)) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let _observability_guard = beholder_observability::init(
-        "beholder-cli",
-        beholder_observability::LogOutput::Disabled,
-        beholder_observability::ExportMode::Batch,
-    );
+    let _observability_guard =
+        beholder_observability::init("beholder-cli", beholder_observability::LogOutput::Disabled);
     run().await
 }
 

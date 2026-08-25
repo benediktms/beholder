@@ -5,7 +5,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let _observability_guard = beholder_observability::init(
         "beholder-worker-rust",
         beholder_observability::LogOutput::Stderr,
-        beholder_observability::ExportMode::Simple,
     );
     let mut args = env::args_os().skip(1);
     let mut socket = None;

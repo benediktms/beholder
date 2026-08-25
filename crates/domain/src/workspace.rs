@@ -1,10 +1,14 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
     pub name: String,
     pub repositories: Vec<WorkspaceRepository>,
     pub protobuf_descriptors: Vec<ProtobufDescriptorSource>,
+    pub enabled_plugins: BTreeSet<String>,
 }
 
 impl Workspace {
@@ -52,6 +56,7 @@ impl Workspace {
             name,
             repositories,
             protobuf_descriptors: Vec::new(),
+            enabled_plugins: BTreeSet::new(),
         })
     }
 
@@ -76,6 +81,21 @@ impl Workspace {
         });
         descriptors.dedup();
         self.protobuf_descriptors = descriptors;
+        Ok(self)
+    }
+
+    pub fn with_enabled_plugins(
+        mut self,
+        plugins: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        self.enabled_plugins = plugins
+            .into_iter()
+            .map(|plugin| {
+                (!plugin.trim().is_empty())
+                    .then_some(plugin)
+                    .ok_or_else(|| "enabled plugin ID must not be empty".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
         Ok(self)
     }
 }

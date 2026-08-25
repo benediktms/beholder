@@ -14,13 +14,14 @@ use super::{
         ensure_revision_inputs, garbage_collection_candidates, garbage_collection_pending,
         garbage_collection_queued, prepare_enrichment, publish_enrichment, publish_observations,
         publish_repository, repository_contexts, revision_enrichment_input_fingerprint,
-        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
-        view_matches,
+        selected_baseline_semantics, store_verification_fingerprint, sweep_garbage_collection,
+        verification_matches, view_matches,
     },
 };
 use beholder_domain::{
     AnalysisDiagnostic, BeholderError, BeholderErrorCode, BeholderErrorKind, DependencyOverride,
-    EntityFact, FactChanges, Observation, RepositoryFacts, WorkspaceView,
+    EntityFact, EntityKind, FactChanges, Observation, RepositoryFacts, SemanticRelation,
+    WorkspaceView,
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
@@ -223,6 +224,16 @@ impl SemanticStore {
         repository_contexts(&self.db, view, target, analyzer)
     }
 
+    pub fn selected_baseline_semantics(
+        &self,
+        view: &str,
+        repository: &str,
+        entity_kinds: &BTreeSet<EntityKind>,
+        relations: &BTreeSet<SemanticRelation>,
+    ) -> Result<(Vec<EntityFact>, Vec<Observation>), Box<dyn Error>> {
+        selected_baseline_semantics(&self.db, view, repository, entity_kinds, relations)
+    }
+
     pub fn publish_enrichment(
         &self,
         view: &WorkspaceView,
@@ -302,9 +313,16 @@ impl SemanticStore {
         if let Some(path) = &self.database_path {
             let connection = sqlite::open(path)?;
             connection.execute("PRAGMA busy_timeout = 5000")?;
-            let mut checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            if checkpoint.next()? != sqlite::State::Row || checkpoint.read::<i64, _>(0)? != 0 {
-                return Err("SQLite WAL checkpoint remained busy".into());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                if checkpoint.next()? == sqlite::State::Row && checkpoint.read::<i64, _>(0)? == 0 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("SQLite WAL checkpoint remained busy".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         Ok(())

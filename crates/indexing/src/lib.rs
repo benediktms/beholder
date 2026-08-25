@@ -1,6 +1,7 @@
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, Evidence, GrpcBindingCandidate,
-    Observation, RepositoryDependencyCandidate, RepositoryFacts, RepositoryState,
+    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, EntityKind, Evidence,
+    GrpcBindingCandidate, Observation, RepositoryDependencyCandidate, RepositoryFacts,
+    RepositoryState, SemanticRelation,
 };
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     error::Error,
+    ffi::OsStr,
     fs::{self, File},
     future::Future,
     hash::Hash,
@@ -40,12 +42,18 @@ pub struct AnalysisInput {
     pub kind: AnalysisInputKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AnalysisInputKind {
+    /// Source code read by the analyzer.
     Source,
+    /// Analyzer or framework configuration.
     Configuration,
+    /// Dependency manifests, lockfiles, or vendored contracts.
     Dependency,
+    /// Toolchain identity or configuration.
     Toolchain,
+    /// Environment state which changes analysis output.
     Environment,
 }
 
@@ -83,6 +91,7 @@ pub struct WorkspaceSnapshot {
 pub struct EnrichmentSnapshot {
     pub target_repository: String,
     pub workspace: WorkspaceSnapshot,
+    pub baseline: SemanticSnapshot,
 }
 
 impl EnrichmentSnapshot {
@@ -98,6 +107,150 @@ impl EnrichmentSnapshot {
             .repositories
             .iter()
             .filter(|repository| repository.state.repository.identity != self.target_repository)
+    }
+}
+
+/// Plugin protocol version supported by this Beholder release.
+pub const PLUGIN_API_VERSION: u32 = 1;
+
+/// Canonical baseline facts made available to one enrichment job.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SemanticSnapshot {
+    /// Selected baseline entities, including relationship endpoints.
+    pub entities: Vec<EntityFact>,
+    /// Selected baseline relationships.
+    pub observations: Vec<Observation>,
+}
+
+/// Whether an input selector applies to the enrichment target or its context.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInputScope {
+    /// Select the repository which will own the plugin contribution.
+    Target,
+    /// Select supporting files from other repositories in the workspace.
+    Context,
+}
+
+/// A portable path predicate declared by a runtime plugin.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum PluginPathMatcher {
+    /// Match one exact extension without a leading dot.
+    Extension(String),
+    /// Match one exact final path component.
+    FileName(String),
+    /// Match a repository-relative path suffix.
+    PathSuffix(PathBuf),
+}
+
+impl PluginPathMatcher {
+    /// Returns whether a repository-relative path matches this predicate.
+    pub fn matches(&self, path: &Path) -> bool {
+        match self {
+            Self::Extension(extension) => path
+                .extension()
+                .is_some_and(|value| value == OsStr::new(extension)),
+            Self::FileName(file_name) => path
+                .file_name()
+                .is_some_and(|value| value == OsStr::new(file_name)),
+            Self::PathSuffix(suffix) => path.ends_with(suffix),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let valid = match self {
+            Self::Extension(value) | Self::FileName(value) => {
+                !value.is_empty() && !value.contains('/') && !value.contains('\\')
+            }
+            Self::PathSuffix(value) => {
+                !value.as_os_str().is_empty()
+                    && !value.is_absolute()
+                    && !value
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+            }
+        };
+        valid
+            .then_some(())
+            .ok_or_else(|| "plugin input selector is invalid".into())
+    }
+}
+
+/// One file selection rule in a runtime plugin descriptor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginInputSelector {
+    /// Whether the rule selects target or context files.
+    pub scope: PluginInputScope,
+    /// Portable repository-relative path predicate.
+    pub matcher: PluginPathMatcher,
+    /// Why the plugin output depends on these bytes.
+    pub kind: AnalysisInputKind,
+}
+
+/// The immutable compatibility and input contract declared by a runtime plugin.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginDescriptor {
+    /// Stable registry and analyzer identity.
+    pub id: String,
+    /// Exact Beholder plugin API version implemented by the executable.
+    pub api_version: u32,
+    /// Immutable file selection rules.
+    pub inputs: Vec<PluginInputSelector>,
+    /// Baseline entity kinds supplied to the plugin.
+    pub semantic_entities: BTreeSet<EntityKind>,
+    /// Baseline relationship kinds supplied to the plugin.
+    pub semantic_relations: BTreeSet<SemanticRelation>,
+    /// Entity kinds the plugin is permitted to produce.
+    pub produces_entities: BTreeSet<EntityKind>,
+    /// Relationship kinds the plugin is permitted to produce.
+    pub produces_relations: BTreeSet<SemanticRelation>,
+}
+
+impl PluginDescriptor {
+    /// Validates the descriptor at the process trust boundary.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty()
+            || self.id.len() > 64
+            || !self.id.is_ascii()
+            || !self.id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_.".contains(&byte)
+            })
+            || !self
+                .id
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            return Err(
+                "plugin ID must be 1-64 lowercase ASCII letters, digits, '-', '_', or '.'".into(),
+            );
+        }
+        if self.api_version != PLUGIN_API_VERSION {
+            return Err(format!(
+                "unsupported plugin API version {}; expected {PLUGIN_API_VERSION}",
+                self.api_version
+            ));
+        }
+        if !self
+            .inputs
+            .iter()
+            .any(|input| input.scope == PluginInputScope::Target)
+        {
+            return Err("plugin must declare at least one target input selector".into());
+        }
+        for input in &self.inputs {
+            input.matcher.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Returns the declared purpose of a selected path, if any.
+    pub fn input_kind(&self, scope: PluginInputScope, path: &Path) -> Option<AnalysisInputKind> {
+        self.inputs
+            .iter()
+            .find(|input| input.scope == scope && input.matcher.matches(path))
+            .map(|input| input.kind)
     }
 }
 
@@ -282,6 +435,15 @@ pub trait WorkspaceEnricher: Send + Sync {
             .inputs
             .iter()
             .any(|input| self.accepts(&input.path))
+    }
+    fn requires_workspace_enablement(&self) -> bool {
+        false
+    }
+    fn context_repositories(&self, _snapshot: &WorkspaceSnapshot, _target: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn semantic_inputs(&self) -> (BTreeSet<EntityKind>, BTreeSet<SemanticRelation>) {
+        (BTreeSet::new(), BTreeSet::new())
     }
     fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a>;
     fn clear_cache(&self) -> Result<(), AnalyzerError> {
@@ -1004,11 +1166,46 @@ impl Indexer {
         )
     }
 
-    pub fn enricher_is_active(&self, id: &str, repository: &RepositorySnapshot) -> bool {
+    pub fn enricher_is_active(
+        &self,
+        id: &str,
+        enabled_plugins: &BTreeSet<String>,
+        repository: &RepositorySnapshot,
+    ) -> bool {
         self.enrichers
             .iter()
             .find(|enricher| enricher.metadata().id == id)
-            .is_some_and(|enricher| enricher.is_active(repository))
+            .is_some_and(|enricher| {
+                (!enricher.requires_workspace_enablement() || enabled_plugins.contains(id))
+                    && enricher.is_active(repository)
+            })
+    }
+
+    pub fn enrichment_contexts(
+        &self,
+        id: &str,
+        snapshot: &WorkspaceSnapshot,
+        target: &str,
+    ) -> Vec<String> {
+        self.enrichers
+            .iter()
+            .find(|enricher| enricher.metadata().id == id)
+            .map_or_else(Vec::new, |enricher| {
+                enricher.context_repositories(snapshot, target)
+            })
+    }
+
+    pub fn enrichment_semantic_inputs(
+        &self,
+        id: &str,
+    ) -> (BTreeSet<EntityKind>, BTreeSet<SemanticRelation>) {
+        self.enrichers
+            .iter()
+            .find(|enricher| enricher.metadata().id == id)
+            .map_or_else(
+                || (BTreeSet::new(), BTreeSet::new()),
+                |enricher| enricher.semantic_inputs(),
+            )
     }
 
     pub fn enrichment_catalog(&self) -> Vec<AnalyzerMetadata> {
@@ -2016,6 +2213,7 @@ mod tests {
                 EnrichmentSnapshot {
                     target_repository: "example/repo".into(),
                     workspace: snapshot(),
+                    baseline: SemanticSnapshot::default(),
                 },
                 "semantic",
             )

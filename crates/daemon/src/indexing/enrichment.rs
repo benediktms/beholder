@@ -4,9 +4,9 @@ use beholder_adapters_mnestic::{
 };
 use beholder_domain::WorkspaceView;
 use beholder_indexing::{
-    AnalyzerContribution, AnalyzerMetadata, EnrichmentSnapshot, WorkspaceSnapshot,
+    AnalyzerContribution, AnalyzerMetadata, EnrichmentSnapshot, SemanticSnapshot, WorkspaceSnapshot,
 };
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{collections::BTreeSet, error::Error, sync::Arc, time::Instant};
 use tokio::sync::watch;
 use tracing::Instrument;
 
@@ -266,6 +266,7 @@ impl IndexScheduler {
         store: &SemanticStore,
         snapshot: &WorkspaceSnapshot,
         view: &WorkspaceView,
+        enabled_plugins: &BTreeSet<String>,
     ) -> Result<(), Box<dyn Error>> {
         if !store.ensure_revision_inputs(view)? {
             return Ok(());
@@ -290,7 +291,9 @@ impl IndexScheduler {
                     &analyzer.version,
                     &input_fingerprint,
                 )?;
-                let active = self.indexer.enricher_is_active(&analyzer.id, repository);
+                let active =
+                    self.indexer
+                        .enricher_is_active(&analyzer.id, enabled_plugins, repository);
                 if matches!(
                     schedule,
                     EnrichmentSchedule::Current
@@ -319,6 +322,14 @@ impl IndexScheduler {
                             let _ = run.cancel.send(());
                         }
                     }
+                    let (entity_kinds, relations) =
+                        self.indexer.enrichment_semantic_inputs(&analyzer.id);
+                    let (entities, observations) = store.selected_baseline_semantics(
+                        &view.name,
+                        &repository_id,
+                        &entity_kinds,
+                        &relations,
+                    )?;
                     self.enrichment_jobs
                         .lock()
                         .map_err(|_| "enrichment queue lock poisoned")?
@@ -345,6 +356,10 @@ impl IndexScheduler {
                                                     .cloned()
                                             }))
                                             .collect(),
+                                    },
+                                    baseline: SemanticSnapshot {
+                                        entities,
+                                        observations,
                                     },
                                 },
                                 view: view.clone(),
