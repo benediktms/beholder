@@ -172,7 +172,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity("elixir", "18:10:elixir-compiler:10")
+        .identity("elixir", "18:10:elixir-compiler:12")
         .timeout(std::time::Duration::from_secs(20 * 60))
         .accept_extension("ex")
         .accept_extension("exs")

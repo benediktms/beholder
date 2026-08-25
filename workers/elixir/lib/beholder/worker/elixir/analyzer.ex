@@ -13,7 +13,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
     RepositoryContribution
   }
 
-  @analyzer_version "18:10:elixir-compiler:10"
+  @analyzer_version "18:10:elixir-compiler:12"
   @contribution_chunk_items 2_048
 
   @spec analyze(Snapshot.t(), String.t()) :: {:ok, [AnalyzeEvent.t()]} | {:error, String.t()}

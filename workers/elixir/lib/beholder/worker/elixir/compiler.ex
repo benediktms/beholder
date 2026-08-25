@@ -9,6 +9,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @termination_grace_ms 1_000
   @process_group_pid_retries 100
   @process_group_pid_retry_ms 10
+  @trace_cache_version 1
   @dependency_progress "BEHOLDER_PROGRESS dependency_preparation"
   @compilation_progress "BEHOLDER_PROGRESS project_compilation"
 
@@ -36,22 +37,20 @@ defmodule Beholder.Worker.Elixir.Compiler do
           {:ok, result()} | {:error, String.t()}
   def run(repository, contexts, cache_dir, on_progress) do
     original_repositories = [repository | contexts]
+    working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)])
+    materialization_root = Path.join(working_dir, "snapshot")
 
     with {:ok, project_root} <- Repository.mix_project_root(repository),
-         {:ok, materialized_repositories, materialization_root} <-
-           materialize(original_repositories) do
+         {:ok, materialized_repositories} <-
+           materialize(original_repositories, materialization_root) do
       [repository | contexts] = materialized_repositories
 
-      try do
-        case run_materialized(repository, contexts, cache_dir, project_root, on_progress) do
-          {:ok, result} ->
-            {:ok, remap_result_paths(result, materialized_repositories, original_repositories)}
+      case run_materialized(repository, contexts, cache_dir, project_root, on_progress) do
+        {:ok, result} ->
+          {:ok, remap_result_paths(result, materialized_repositories, original_repositories)}
 
-          {:error, _reason} = error ->
-            error
-        end
-      after
-        File.rm_rf(materialization_root)
+        {:error, _reason} = error ->
+          error
       end
     end
   end
@@ -64,7 +63,10 @@ defmodule Beholder.Worker.Elixir.Compiler do
       helper_ebin = BeamExporter.export!(cache_dir)
       working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)])
       mix_env = configured_mix_env()
-      build_path = Path.join(working_dir, "build-#{build_identity(repositories, mix, mix_env)}")
+      identity = build_identity(repositories, mix, mix_env)
+      build_path = Path.join(working_dir, "build-#{identity}")
+      trace_cache_path = Path.join(working_dir, "trace-cache-#{identity}.term")
+      trace_cache = read_trace_cache(trace_cache_path)
       result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
       deps_path = Path.join(working_dir, "deps")
       File.mkdir_p!(deps_path)
@@ -74,6 +76,8 @@ defmodule Beholder.Worker.Elixir.Compiler do
         {"MIX_BUILD_PATH", build_path},
         {"MIX_DEPS_PATH", deps_path},
         {"MIX_ENV", mix_env},
+        {"BEHOLDER_ELIXIR_FORCE_COMPILE",
+         if(match?({:ok, _cache}, trace_cache), do: "false", else: "true")},
         {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
       ]
 
@@ -94,7 +98,9 @@ defmodule Beholder.Worker.Elixir.Compiler do
           on_progress
         )
 
-      finalize_run(repositories, result_path, result)
+      with {:ok, result} <- finalize_run(repositories, result_path, result) do
+        {:ok, merge_trace_cache(result, repositories, trace_cache_path, trace_cache)}
+      end
     end
   end
 
@@ -116,21 +122,23 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end)
   end
 
-  defp materialize(repositories) do
-    root =
-      Path.join(
-        physical_tmp_dir(),
-        "beholder-elixir-snapshot-#{System.pid()}-#{System.unique_integer([:positive])}"
-      )
-
-    with :ok <- File.mkdir(root),
+  defp materialize(repositories, root) do
+    with :ok <- File.mkdir_p(root),
+         {:ok, root} <- physical_path(root),
          {:ok, common} <- common_repository_root(repositories),
-         {:ok, materialized} <- materialize_repositories(repositories, common, root) do
-      {:ok, materialized, root}
+         {:ok, materialized} <- map_materialized_repositories(repositories, common, root),
+         :ok <- remove_stale_inputs(root, materialized),
+         :ok <- materialize_inputs(materialized) do
+      {:ok, materialized}
     else
-      {:error, reason} ->
-        File.rm_rf(root)
-        {:error, format_materialization_error(reason)}
+      {:error, reason} -> {:error, format_materialization_error(reason)}
+    end
+  end
+
+  defp physical_path(path) do
+    case System.cmd("pwd", ["-P"], cd: path) do
+      {physical, 0} -> {:ok, String.trim(physical)}
+      {output, status} -> {:error, "failed to resolve snapshot path (#{status}): #{output}"}
     end
   end
 
@@ -147,15 +155,10 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp physical_tmp_dir do
-    {path, 0} = System.cmd("pwd", ["-P"], cd: System.tmp_dir!())
-    String.trim(path)
-  end
-
   defp common_prefix([head | left], [head | right]), do: [head | common_prefix(left, right)]
   defp common_prefix(_left, _right), do: []
 
-  defp materialize_repositories(repositories, common, root) do
+  defp map_materialized_repositories(repositories, common, root) do
     Enum.reduce_while(repositories, {:ok, [], MapSet.new(), MapSet.new()}, fn repository,
                                                                               {:ok, result,
                                                                                identities, bases} ->
@@ -170,15 +173,9 @@ defmodule Beholder.Worker.Elixir.Compiler do
           {:halt, {:error, "snapshot maps repositories to the same directory"}}
 
         true ->
-          case materialize_inputs(repository, base) do
-            :ok ->
-              {:cont,
-               {:ok, [%{repository | base: base} | result],
-                MapSet.put(identities, repository.identity), MapSet.put(bases, base)}}
-
-            {:error, _reason} = error ->
-              {:halt, error}
-          end
+          {:cont,
+           {:ok, [%{repository | base: base} | result],
+            MapSet.put(identities, repository.identity), MapSet.put(bases, base)}}
       end
     end)
     |> case do
@@ -187,21 +184,100 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp materialize_inputs(repository, base) do
-    Enum.reduce_while(Repository.sorted_inputs(repository), :ok, fn input, :ok ->
-      destination = Path.expand(input.path, base)
+  defp materialize_inputs(repositories) do
+    Enum.reduce_while(repositories, :ok, fn repository, :ok ->
+      case materialize_repository_inputs(repository) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
 
-      if Path.type(input.path) != :relative or not within?(destination, base) do
+  defp materialize_repository_inputs(repository) do
+    Enum.reduce_while(Repository.sorted_inputs(repository), :ok, fn input, :ok ->
+      destination = Path.expand(input.path, repository.base)
+
+      if Path.type(input.path) != :relative or not within?(destination, repository.base) do
         {:halt, {:error, "snapshot input escapes repository: #{input.path}"}}
       else
         with :ok <- File.mkdir_p(Path.dirname(destination)),
-             :ok <- File.write(destination, input.content) do
+             :ok <- write_if_changed(destination, input.content) do
           {:cont, :ok}
         else
           {:error, reason} -> {:halt, {:error, reason}}
         end
       end
     end)
+  end
+
+  defp write_if_changed(path, content) do
+    if File.read(path) == {:ok, content}, do: :ok, else: File.write(path, content)
+  end
+
+  defp remove_stale_inputs(root, repositories) do
+    expected =
+      repositories
+      |> Enum.flat_map(fn repository ->
+        Enum.map(Repository.sorted_inputs(repository), &Path.expand(&1.path, repository.base))
+      end)
+      |> MapSet.new()
+
+    with :ok <-
+           root
+           |> files_under()
+           |> Enum.reject(&MapSet.member?(expected, &1))
+           |> Enum.reduce_while(:ok, fn path, :ok ->
+             case File.rm(path) do
+               :ok -> {:cont, :ok}
+               {:error, reason} -> {:halt, {:error, reason}}
+             end
+           end) do
+      remove_empty_directories(root)
+    end
+  end
+
+  defp remove_empty_directories(root) do
+    root
+    |> directories_under()
+    |> Enum.sort_by(&String.length/1, :desc)
+    |> Enum.each(&File.rmdir/1)
+
+    :ok
+  end
+
+  defp directories_under(root) do
+    case File.ls(root) do
+      {:ok, names} ->
+        Enum.flat_map(names, fn name ->
+          path = Path.join(root, name)
+
+          case File.lstat(path) do
+            {:ok, %{type: :directory}} -> [path | directories_under(path)]
+            _not_directory -> []
+          end
+        end)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp files_under(root) do
+    case File.ls(root) do
+      {:ok, names} ->
+        Enum.flat_map(names, fn name ->
+          path = Path.join(root, name)
+
+          case File.lstat(path) do
+            {:ok, %{type: :directory}} -> files_under(path)
+            {:ok, _stat} -> [path]
+            {:error, _reason} -> []
+          end
+        end)
+
+      {:error, _reason} ->
+        []
+    end
   end
 
   defp format_materialization_error(reason) when is_binary(reason), do: reason
@@ -343,6 +419,83 @@ defmodule Beholder.Worker.Elixir.Compiler do
     error -> {:error, "invalid compiler trace result: #{Exception.message(error)}"}
   end
 
+  defp merge_trace_cache(result, repositories, cache_path, trace_cache) do
+    fingerprints = input_fingerprints(repositories)
+
+    cached =
+      if match?({:ok, _cache}, trace_cache), do: elem(trace_cache, 1), else: empty_trace_cache()
+
+    invalidated =
+      Map.keys(fingerprints)
+      |> Kernel.++(Map.keys(cached.fingerprints))
+      |> Enum.filter(&(Map.get(fingerprints, &1) != Map.get(cached.fingerprints, &1)))
+      |> MapSet.new()
+
+    invalidated = MapSet.union(invalidated, MapSet.new(result.events, & &1.file))
+
+    events =
+      cached.events
+      |> Enum.reject(&MapSet.member?(invalidated, &1.file))
+      |> Kernel.++(result.events)
+
+    result = %{result | events: events}
+
+    if result.status == :ok do
+      write_trace_cache(cache_path, %{fingerprints: fingerprints, events: events})
+    end
+
+    result
+  end
+
+  defp input_fingerprints(repositories) do
+    Map.new(repositories, fn repository ->
+      entries =
+        Map.new(Repository.sorted_inputs(repository), fn input ->
+          fingerprint = :erlang.term_to_binary({input.kind, input.content})
+          {Path.expand(input.path, repository.base), :crypto.hash(:sha256, fingerprint)}
+        end)
+
+      {repository.identity, entries}
+    end)
+    |> Enum.flat_map(fn {_repository, entries} -> entries end)
+    |> Map.new()
+  end
+
+  defp read_trace_cache(path) do
+    with {:ok, encoded} <- File.read(path),
+         %{version: @trace_cache_version, fingerprints: fingerprints, events: events}
+         when is_map(fingerprints) and is_list(events) <-
+           :erlang.binary_to_term(encoded, [:safe]) do
+      if Enum.all?(events, &(is_map(&1) and is_binary(&1[:file]))) do
+        {:ok, %{fingerprints: fingerprints, events: events}}
+      else
+        :error
+      end
+    else
+      _missing_or_invalid -> :error
+    end
+  rescue
+    _invalid_cache -> :error
+  end
+
+  defp empty_trace_cache, do: %{fingerprints: %{}, events: []}
+
+  defp write_trace_cache(path, cache) do
+    temporary = "#{path}.#{System.unique_integer([:positive])}.tmp"
+
+    encoded =
+      :erlang.term_to_binary(Map.put(cache, :version, @trace_cache_version), compressed: 6)
+
+    try do
+      with :ok <- File.write(temporary, encoded),
+           :ok <- File.rename(temporary, path) do
+        :ok
+      end
+    after
+      File.rm(temporary)
+    end
+  end
+
   defp append_code_path(nil, path), do: "-pa #{path}"
   defp append_code_path("", path), do: "-pa #{path}"
   defp append_code_path(flags, path), do: flags <> " -pa #{path}"
@@ -350,7 +503,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   defp build_identity(repositories, mix, mix_env) do
     repositories
     |> Enum.sort_by(& &1.identity)
-    |> Enum.flat_map(&[&1.identity, &1.fingerprint])
+    |> Enum.flat_map(&[&1.identity, Path.expand(&1.base)])
     |> Kernel.++([
       mix_env,
       mix,

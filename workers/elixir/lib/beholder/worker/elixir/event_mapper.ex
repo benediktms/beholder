@@ -21,12 +21,13 @@ defmodule Beholder.Worker.Elixir.EventMapper do
 
   @spec contribution(Repository.t(), map()) :: RepositoryContribution.t()
   def contribution(repository, result) do
-    definitions = definitions(repository, result.events)
+    source_paths = source_paths(repository)
+    definitions = definitions(repository, result.events, source_paths)
 
     observations =
       result.events
       |> Enum.filter(&(&1.kind in @call_kinds or not is_nil(module_relation(&1.kind))))
-      |> Enum.map(&observation(repository, &1, definitions))
+      |> Enum.map(&observation(repository, &1, definitions, source_paths))
       |> Enum.reject(&is_nil/1)
       |> Enum.uniq_by(&{&1.from, &1.relation, &1.to, &1.evidence})
 
@@ -40,11 +41,11 @@ defmodule Beholder.Worker.Elixir.EventMapper do
     }
   end
 
-  defp definitions(repository, events) do
+  defp definitions(repository, events, source_paths) do
     Enum.reduce(events, %{}, fn
       %{kind: :module, target: module, definitions: definitions} = event, modules
       when is_binary(module) ->
-        if source_path(repository, event.file) do
+        if source_path(repository, event.file, source_paths) do
           Map.put(modules, module, MapSet.new(definitions))
         else
           modules
@@ -71,10 +72,10 @@ defmodule Beholder.Worker.Elixir.EventMapper do
     end)
   end
 
-  defp observation(repository, event, definitions) when event.kind in @call_kinds do
-    with from when not is_nil(from) <- caller_id(repository, event),
+  defp observation(repository, event, definitions, source_paths) when event.kind in @call_kinds do
+    with from when not is_nil(from) <- caller_id(repository, event, source_paths),
          to when not is_nil(to) <- call_target(repository, event, definitions),
-         evidence when not is_nil(evidence) <- evidence(repository, event) do
+         evidence when not is_nil(evidence) <- evidence(repository, event, source_paths) do
       %Observation{
         from: from,
         relation: :RELATION_KIND_CALLS,
@@ -88,11 +89,11 @@ defmodule Beholder.Worker.Elixir.EventMapper do
     end
   end
 
-  defp observation(repository, event, definitions) do
+  defp observation(repository, event, definitions, source_paths) do
     with relation when not is_nil(relation) <- module_relation(event.kind),
-         from when not is_nil(from) <- caller_id(repository, event),
+         from when not is_nil(from) <- caller_id(repository, event, source_paths),
          target when is_binary(target) <- event.target,
-         evidence when not is_nil(evidence) <- evidence(repository, event) do
+         evidence when not is_nil(evidence) <- evidence(repository, event, source_paths) do
       %Observation{
         from: from,
         relation: relation,
@@ -106,16 +107,20 @@ defmodule Beholder.Worker.Elixir.EventMapper do
     end
   end
 
-  defp caller_id(repository, %{caller_module: module, caller_function: {name, arity}})
+  defp caller_id(
+         repository,
+         %{caller_module: module, caller_function: {name, arity}},
+         _source_paths
+       )
        when is_binary(module) do
     callable_id(repository.identity, module, name, arity)
   end
 
-  defp caller_id(repository, %{caller_module: module}) when is_binary(module),
+  defp caller_id(repository, %{caller_module: module}, _source_paths) when is_binary(module),
     do: module_id(repository.identity, module)
 
-  defp caller_id(repository, event) do
-    case source_path(repository, event.file) do
+  defp caller_id(repository, event, source_paths) do
+    case source_path(repository, event.file, source_paths) do
       nil -> nil
       path -> "repo://#{repository.identity}/elixir-source/#{path}"
     end
@@ -155,8 +160,8 @@ defmodule Beholder.Worker.Elixir.EventMapper do
 
   defp module_relation(_kind), do: nil
 
-  defp evidence(repository, event) do
-    with path when not is_nil(path) <- source_path(repository, event.file) do
+  defp evidence(repository, event, source_paths) do
+    with path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
       location = if event.line in [nil, 0], do: path, else: "#{path}:#{event.line}"
       suffix = if event.from_macro, do: " via macro expansion", else: ""
       "#{location} (compiler #{event.kind}#{suffix})"
@@ -233,9 +238,9 @@ defmodule Beholder.Worker.Elixir.EventMapper do
 
   defp relative_path(_repository, _path), do: nil
 
-  defp source_path(repository, path) do
+  defp source_path(repository, path, source_paths) do
     with relative when not is_nil(relative) <- relative_path(repository, path),
-         true <- MapSet.member?(source_paths(repository), relative) do
+         true <- MapSet.member?(source_paths, relative) do
       relative
     else
       _ -> nil

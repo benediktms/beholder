@@ -63,8 +63,14 @@ defmodule Mix.Tasks.Beholder.Compile do
 
   defp compile do
     try do
-      case Mix.Task.run("compile", ["--return-errors"]) do
+      arguments =
+        if System.get_env("BEHOLDER_ELIXIR_FORCE_COMPILE") == "true",
+          do: ["--return-errors", "--force"],
+          else: ["--return-errors"]
+
+      case Mix.Task.run("compile", arguments) do
         {:ok, diagnostics} -> {:ok, diagnostics}
+        {:noop, diagnostics} -> {:ok, diagnostics}
         {:error, diagnostics} -> {:error, diagnostics}
         :ok -> {:ok, []}
         other -> {:error, [%{message: "unexpected compile result: #{inspect(other)}"}]}

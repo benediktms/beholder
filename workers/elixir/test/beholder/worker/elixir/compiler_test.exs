@@ -53,13 +53,101 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert [_build] = Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "build-*"]))
 
     assert {:ok, second} = Compiler.run(repository, cache)
-    assert second.status == :ok
+    assert second.status == :ok, inspect(second)
 
     assert Enum.any?(second.events, fn event ->
              event.kind == :module and {"call", 1} in event.definitions
            end)
 
     assert Enum.any?(second.events, &(&1.kind == :remote_function and &1.target == "Enum"))
+
+    [trace_cache] =
+      Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "trace-cache-*.term"]))
+
+    File.write!(trace_cache, "invalid")
+    assert {:ok, rebuilt} = Compiler.run(repository, cache)
+    assert rebuilt.status == :ok
+    assert rebuilt.output =~ "Compiling 1 file"
+    assert Enum.any?(rebuilt.events, &(&1.kind == :module and &1.target == "CompilerFixture"))
+  end
+
+  test "reuses unchanged traces while Mix incrementally compiles changed sources" do
+    root = temp_dir("incremental-project")
+    cache = temp_dir("incremental-cache")
+    File.mkdir_p!(Path.join(root, "lib"))
+
+    mix_source = """
+    defmodule IncrementalFixture.MixProject do
+      use Mix.Project
+      def project, do: [app: :incremental_fixture, version: "0.1.0"]
+    end
+    """
+
+    unchanged = "defmodule IncrementalFixture.Unchanged do\n  def call, do: :ok\nend\n"
+    changed = "defmodule IncrementalFixture.Changed do\n  def first, do: :ok\nend\n"
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "first",
+      inputs: [
+        %{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE},
+        %{path: "lib/unchanged.ex", content: unchanged, kind: :INPUT_KIND_SOURCE},
+        %{path: "lib/changed.ex", content: changed, kind: :INPUT_KIND_SOURCE}
+      ]
+    }
+
+    assert {:ok, first} = Compiler.run(repository, cache)
+    assert first.status == :ok
+
+    changed = "defmodule IncrementalFixture.Changed do\n  def second, do: :ok\nend\n"
+
+    repository = %{
+      repository
+      | fingerprint: "second",
+        inputs: [
+          %{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE},
+          %{path: "lib/unchanged.ex", content: unchanged, kind: :INPUT_KIND_SOURCE},
+          %{path: "lib/changed.ex", content: changed, kind: :INPUT_KIND_SOURCE}
+        ]
+    }
+
+    assert {:ok, second} = Compiler.run(repository, cache)
+    assert second.status == :ok
+    assert second.output =~ "Compiling 1 file"
+
+    assert Enum.any?(second.events, fn event ->
+             event.kind == :module and event.target == "IncrementalFixture.Unchanged" and
+               {"call", 0} in event.definitions
+           end)
+
+    assert Enum.any?(second.events, fn event ->
+             event.kind == :module and event.target == "IncrementalFixture.Changed" and
+               {"second", 0} in event.definitions
+           end)
+
+    repository = %{
+      repository
+      | fingerprint: "third",
+        inputs: [
+          %{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE},
+          %{path: "lib/unchanged.ex", content: unchanged, kind: :INPUT_KIND_SOURCE}
+        ]
+    }
+
+    assert {:ok, third} = Compiler.run(repository, cache)
+    assert third.status == :ok
+    refute Enum.any?(third.events, &(&1[:target] == "IncrementalFixture.Changed"))
+
+    refute File.exists?(
+             Path.join([cache, "elixir", "Zml4dHVyZQ", "snapshot", "lib", "changed.ex"])
+           )
+
+    assert 1 ==
+             cache
+             |> Path.join("elixir/Zml4dHVyZQ/build-*")
+             |> Path.wildcard()
+             |> length()
   end
 
   test "reports an unavailable dependency without fetching it" do
@@ -373,7 +461,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              |> length()
   end
 
-  test "isolates Mix build directories by dependency context identity" do
+  test "reuses a Mix build directory across dependency context revisions" do
     root = temp_dir("context-build-identity")
     context_root = temp_dir("context-build-dependency")
     cache = temp_dir("context-build-cache")
@@ -400,7 +488,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
       Compiler.run(repository, [%{context | fingerprint: "context-2"}], cache)
     end)
 
-    assert 2 ==
+    assert 1 ==
              cache
              |> Path.join("elixir/Zml4dHVyZQ/build-*")
              |> Path.wildcard()
