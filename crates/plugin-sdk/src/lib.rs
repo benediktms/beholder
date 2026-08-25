@@ -390,6 +390,14 @@ struct PluginService<A> {
     shutdown: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
+struct CancellationWatcher(tokio::task::JoinHandle<()>);
+
+impl Drop for CancellationWatcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl<A> Clone for PluginService<A> {
     fn clone(&self) -> Self {
         Self {
@@ -450,12 +458,13 @@ impl<A: Analyzer> AnalyzerWorker for PluginService<A> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = Arc::clone(&cancelled);
         let closed = sender.clone();
-        tokio::spawn(async move {
+        let cancellation_watcher = CancellationWatcher(tokio::spawn(async move {
             closed.closed().await;
             cancellation.store(true, Ordering::Release);
-        });
+        }));
         tokio::spawn(
             async move {
+                let _cancellation_watcher = cancellation_watcher;
                 let mut snapshot = WorkspaceSnapshotBuilder::default();
                 loop {
                     match stream.message().await {
