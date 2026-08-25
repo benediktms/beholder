@@ -2805,7 +2805,7 @@ mod tests {
             );
         }
         scheduler
-            .queue_enrichments(&store, &snapshot, &view)
+            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
             .unwrap();
         assert_eq!(scheduler.enrichment_jobs.lock().unwrap().len(), 2);
         assert_eq!(
