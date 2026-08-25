@@ -32,6 +32,7 @@ use std::{
     collections::BTreeSet,
     error::Error,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -55,6 +56,7 @@ pub struct SemanticStore {
     pub(super) db: DbInstance,
     pub(super) read_db: DbInstance,
     pub(super) database_path: Option<PathBuf>,
+    engine: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -89,6 +91,7 @@ impl SemanticStore {
             read_db: db.clone(),
             db,
             database_path: None,
+            engine: Mutex::new(()),
         })
     }
 
@@ -109,6 +112,7 @@ impl SemanticStore {
             db,
             read_db,
             database_path: Some(path.into()),
+            engine: Mutex::new(()),
         })
     }
 
@@ -121,11 +125,23 @@ impl SemanticStore {
                 .then_some(path)
                 .flatten()
                 .map(PathBuf::from),
+            engine: Mutex::new(()),
         })
     }
 
+    fn access<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| "semantic store engine lock poisoned")?;
+        operation()
+    }
+
     pub fn view_matches(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
-        view_matches(&self.db, view)
+        self.access(|| view_matches(&self.db, view))
     }
 
     pub fn verification_matches(
@@ -133,7 +149,7 @@ impl SemanticStore {
         view: &str,
         fingerprint: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        verification_matches(&self.db, view, fingerprint)
+        self.access(|| verification_matches(&self.db, view, fingerprint))
     }
 
     pub fn store_verification_fingerprint(
@@ -141,7 +157,7 @@ impl SemanticStore {
         view: &str,
         fingerprint: &str,
     ) -> Result<(), Box<dyn Error>> {
-        store_verification_fingerprint(&self.db, view, fingerprint)
+        self.access(|| store_verification_fingerprint(&self.db, view, fingerprint))
     }
 
     pub fn publish(
@@ -150,11 +166,11 @@ impl SemanticStore {
         repositories: &[RepositoryFacts],
         overrides: &[DependencyOverride],
     ) -> Result<FactChanges, Box<dyn Error>> {
-        publish_observations(&self.db, view, repositories, overrides, None)
+        self.access(|| publish_observations(&self.db, view, repositories, overrides, None))
     }
 
     pub fn publish_repository(&self, facts: &RepositoryFacts) -> Result<bool, Box<dyn Error>> {
-        publish_repository(&self.db, facts)
+        self.access(|| publish_repository(&self.db, facts))
     }
 
     pub fn repository_revision(
@@ -165,7 +181,7 @@ impl SemanticStore {
     }
 
     pub fn delete_repository_revision(&self, repository: &str) -> Result<u64, Box<dyn Error>> {
-        delete_repository_revision(&self.db, repository)
+        self.access(|| delete_repository_revision(&self.db, repository))
     }
 
     pub fn publish_verified(
@@ -175,13 +191,15 @@ impl SemanticStore {
         overrides: &[DependencyOverride],
         verification_fingerprint: &str,
     ) -> Result<FactChanges, Box<dyn Error>> {
-        publish_observations(
-            &self.db,
-            view,
-            repositories,
-            overrides,
-            Some(verification_fingerprint),
-        )
+        self.access(|| {
+            publish_observations(
+                &self.db,
+                view,
+                repositories,
+                overrides,
+                Some(verification_fingerprint),
+            )
+        })
     }
 
     pub fn enrichment_matches(
@@ -191,7 +209,7 @@ impl SemanticStore {
         analyzer: &str,
         version: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        enrichment_matches(&self.db, view, repository, analyzer, version)
+        self.access(|| enrichment_matches(&self.db, view, repository, analyzer, version))
     }
 
     pub fn enrichments_current(
@@ -199,11 +217,11 @@ impl SemanticStore {
         view: &str,
         catalog: &[(String, String)],
     ) -> Result<bool, Box<dyn Error>> {
-        enrichments_current(&self.db, view, catalog)
+        self.access(|| enrichments_current(&self.db, view, catalog))
     }
 
     pub fn ensure_revision_inputs(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
-        ensure_revision_inputs(&self.db, view)
+        self.access(|| ensure_revision_inputs(&self.db, view))
     }
 
     pub fn revision_enrichment_input_fingerprint(
@@ -212,7 +230,7 @@ impl SemanticStore {
         repository: &str,
         analyzer: &str,
     ) -> Result<Option<String>, Box<dyn Error>> {
-        revision_enrichment_input_fingerprint(&self.db, view, repository, analyzer)
+        self.access(|| revision_enrichment_input_fingerprint(&self.db, view, repository, analyzer))
     }
 
     pub fn repository_contexts(
@@ -221,7 +239,7 @@ impl SemanticStore {
         target: &str,
         analyzer: &str,
     ) -> Result<Vec<String>, Box<dyn Error>> {
-        repository_contexts(&self.db, view, target, analyzer)
+        self.access(|| repository_contexts(&self.db, view, target, analyzer))
     }
 
     pub fn selected_baseline_semantics(
@@ -231,7 +249,9 @@ impl SemanticStore {
         entity_kinds: &BTreeSet<EntityKind>,
         relations: &BTreeSet<SemanticRelation>,
     ) -> Result<(Vec<EntityFact>, Vec<Observation>), Box<dyn Error>> {
-        selected_baseline_semantics(&self.db, view, repository, entity_kinds, relations)
+        self.access(|| {
+            selected_baseline_semantics(&self.db, view, repository, entity_kinds, relations)
+        })
     }
 
     pub fn publish_enrichment(
@@ -242,14 +262,16 @@ impl SemanticStore {
         owner: EnrichmentOwner<'_>,
         payload: EnrichmentPayload<'_>,
     ) -> Result<bool, Box<dyn Error>> {
-        publish_enrichment(
-            &self.db,
-            view,
-            repository,
-            input_fingerprint,
-            owner,
-            payload,
-        )
+        self.access(|| {
+            publish_enrichment(
+                &self.db,
+                view,
+                repository,
+                input_fingerprint,
+                owner,
+                payload,
+            )
+        })
     }
 
     pub fn prepare_enrichment(
@@ -260,14 +282,16 @@ impl SemanticStore {
         version: &str,
         input_fingerprint: &str,
     ) -> Result<EnrichmentSchedule, Box<dyn Error>> {
-        prepare_enrichment(
-            &self.db,
-            view,
-            repository,
-            analyzer,
-            version,
-            input_fingerprint,
-        )
+        self.access(|| {
+            prepare_enrichment(
+                &self.db,
+                view,
+                repository,
+                analyzer,
+                version,
+                input_fingerprint,
+            )
+        })
     }
 
     pub fn enrichment_retry_started(
@@ -278,14 +302,16 @@ impl SemanticStore {
         version: &str,
         input_fingerprint: &str,
     ) -> Result<bool, Box<dyn Error>> {
-        enrichment_retry_started(
-            &self.db,
-            view,
-            repository,
-            analyzer,
-            version,
-            input_fingerprint,
-        )
+        self.access(|| {
+            enrichment_retry_started(
+                &self.db,
+                view,
+                repository,
+                analyzer,
+                version,
+                input_fingerprint,
+            )
+        })
     }
 
     pub fn enrichment_retry_failed(
@@ -297,18 +323,24 @@ impl SemanticStore {
         input_fingerprint: &str,
         error: &str,
     ) -> Result<Option<Duration>, Box<dyn Error>> {
-        enrichment_retry_failed(
-            &self.db,
-            view,
-            repository,
-            analyzer,
-            version,
-            input_fingerprint,
-            error,
-        )
+        self.access(|| {
+            enrichment_retry_failed(
+                &self.db,
+                view,
+                repository,
+                analyzer,
+                version,
+                input_fingerprint,
+                error,
+            )
+        })
     }
 
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| "semantic store engine lock poisoned")?;
         #[cfg(feature = "sqlite")]
         if let Some(path) = &self.database_path {
             let connection = sqlite::open(path)?;
@@ -329,8 +361,10 @@ impl SemanticStore {
     }
 
     pub fn garbage_collect(&self) -> Result<GarbageCollection, Box<dyn Error>> {
-        Ok(GarbageCollection {
-            repository_states_queued: claim_garbage_collection(&self.db)?,
+        self.access(|| {
+            Ok(GarbageCollection {
+                repository_states_queued: claim_garbage_collection(&self.db)?,
+            })
         })
     }
 
@@ -338,7 +372,7 @@ impl SemanticStore {
         &self,
         mut progress: impl FnMut(GarbageCollectionProgress) -> bool,
     ) -> Result<u64, Box<dyn Error>> {
-        sweep_garbage_collection(&self.db, &mut progress)
+        self.access(|| sweep_garbage_collection(&self.db, &mut progress))
     }
 
     pub fn garbage_collection_pending(&self) -> Result<bool, Box<dyn Error>> {
@@ -365,6 +399,10 @@ impl SemanticStore {
         if pages == 0 {
             return Ok(0);
         }
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| "semantic store engine lock poisoned")?;
         #[cfg(feature = "sqlite")]
         if let Some(path) = &self.database_path {
             let before = sqlite_pragma(path, "PRAGMA freelist_count")?;
@@ -570,10 +608,14 @@ impl SemanticStore {
         fanout: i64,
         depth: i64,
     ) -> Result<String, Box<dyn Error>> {
-        benchmark(&self.db, topology, entities, fanout, depth)
+        self.access(|| benchmark(&self.db, topology, entities, fanout, depth))
     }
 
     pub fn benchmark_queries(&self, topology: &str, entities: i64, depth: i64) -> String {
+        let _engine = self
+            .engine
+            .lock()
+            .expect("semantic store engine lock poisoned");
         benchmark_queries(&self.db, topology, entities, depth)
     }
 }
@@ -871,6 +913,37 @@ mod tests {
         reader_thread.join().unwrap();
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn primary_engine_reads_wait_for_the_active_operation() {
+        let store = Arc::new(SemanticStore::memory().unwrap());
+        let access = store.clone();
+        let view = WorkspaceView::new(
+            "missing",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repository".into(),
+                },
+                head: None,
+                fingerprint: "input".into(),
+            }],
+        )
+        .unwrap();
+        let engine = store.engine.lock().unwrap();
+        let (sent, received) = mpsc::channel();
+        let access_thread = thread::spawn(move || {
+            let result = access.view_matches(&view);
+            sent.send(result.is_ok()).unwrap();
+        });
+
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(engine);
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("engine access remained blocked after the active operation finished");
+        access_thread.join().unwrap();
     }
 
     #[test]
