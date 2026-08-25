@@ -284,7 +284,7 @@ impl IndexScheduler {
                     .ok_or("published repository enrichment input fingerprint is missing")?;
                 let contexts =
                     store.repository_contexts(&view.name, &repository_id, &analyzer.id)?;
-                let schedule = store.prepare_enrichment(
+                let mut schedule = store.prepare_enrichment(
                     &view.name,
                     &repository_id,
                     &analyzer.id,
@@ -294,6 +294,36 @@ impl IndexScheduler {
                 let active =
                     self.indexer
                         .enricher_is_active(&analyzer.id, enabled_plugins, repository);
+                let key = (
+                    view.name.clone(),
+                    repository_id.clone(),
+                    analyzer.id.clone(),
+                );
+                if active
+                    && matches!(schedule, EnrichmentSchedule::Running)
+                    && !self
+                        .enriching
+                        .lock()
+                        .map_err(|_| "active enrichment lock poisoned")?
+                        .get(&key)
+                        .is_some_and(|run| run.matches(&input_fingerprint, &analyzer.version))
+                {
+                    store.enrichment_retry_failed(
+                        &view.name,
+                        &repository_id,
+                        &analyzer.id,
+                        &analyzer.version,
+                        &input_fingerprint,
+                        "previous enrichment attempt was interrupted",
+                    )?;
+                    schedule = store.prepare_enrichment(
+                        &view.name,
+                        &repository_id,
+                        &analyzer.id,
+                        &analyzer.version,
+                        &input_fingerprint,
+                    )?;
+                }
                 if matches!(
                     schedule,
                     EnrichmentSchedule::Current
@@ -305,11 +335,6 @@ impl IndexScheduler {
                     continue;
                 }
                 if active {
-                    let key = (
-                        view.name.clone(),
-                        repository_id.clone(),
-                        analyzer.id.clone(),
-                    );
                     {
                         let active = self
                             .enriching

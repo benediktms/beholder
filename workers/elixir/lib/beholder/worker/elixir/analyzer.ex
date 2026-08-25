@@ -13,17 +13,24 @@ defmodule Beholder.Worker.Elixir.Analyzer do
     RepositoryContribution
   }
 
-  @analyzer_version "18:10:elixir-compiler:9"
+  @analyzer_version "18:10:elixir-compiler:12"
   @contribution_chunk_items 2_048
 
   @spec analyze(Snapshot.t(), String.t()) :: {:ok, [AnalyzeEvent.t()]} | {:error, String.t()}
   def analyze(snapshot, cache_dir) do
-    repository = Snapshot.target(snapshot)
-    analyze_repository(repository, Snapshot.contexts(snapshot), cache_dir)
+    analyze(snapshot, cache_dir, fn _detail -> :ok end)
   end
 
-  defp analyze_repository(repository, contexts, cache_dir) do
-    {contribution, runtime} = compiler_contribution(repository, contexts, cache_dir)
+  @spec analyze(Snapshot.t(), String.t(), (String.t() -> any())) ::
+          {:ok, [AnalyzeEvent.t()]} | {:error, String.t()}
+  def analyze(snapshot, cache_dir, on_progress) do
+    repository = Snapshot.target(snapshot)
+    analyze_repository(repository, Snapshot.contexts(snapshot), cache_dir, on_progress)
+  end
+
+  defp analyze_repository(repository, contexts, cache_dir, on_progress) do
+    {contribution, runtime} =
+      compiler_contribution(repository, contexts, cache_dir, on_progress)
 
     completed = %AnalysisCompleted{
       metadata: %AnalyzerMetadata{id: "elixir", version: metadata_version(runtime)},
@@ -39,7 +46,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
     {:ok, repository_events ++ [%AnalyzeEvent{event: {:completed, completed}}]}
   end
 
-  defp compiler_contribution(repository, contexts, cache_dir) do
+  defp compiler_contribution(repository, contexts, cache_dir, on_progress) do
     Observability.with_span(
       "worker.elixir.semantic_analysis",
       %{
@@ -48,7 +55,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
         "mix.env" => configured_mix_env()
       },
       fn ->
-        case Compiler.run(repository, contexts, cache_dir) do
+        case Compiler.run(repository, contexts, cache_dir, on_progress) do
           {:ok, result} ->
             contribution = EventMapper.contribution(repository, result)
 

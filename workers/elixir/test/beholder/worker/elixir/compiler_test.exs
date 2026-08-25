@@ -4,7 +4,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   alias Beholder.Worker.Elixir.Compiler
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
-  test "compiles a Mix project in a child VM and returns trace events" do
+  test "compiles a Mix project and returns trace events from a warm build" do
     root = temp_dir("project")
     cache = temp_dir("cache")
     File.mkdir_p!(Path.join(root, "lib"))
@@ -51,9 +51,106 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
            end)
 
     assert [_build] = Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "build-*"]))
+
+    assert {:ok, second} = Compiler.run(repository, cache)
+    assert second.status == :ok, inspect(second)
+
+    assert Enum.any?(second.events, fn event ->
+             event.kind == :module and {"call", 1} in event.definitions
+           end)
+
+    assert Enum.any?(second.events, &(&1.kind == :remote_function and &1.target == "Enum"))
+
+    [trace_cache] =
+      Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "trace-cache-*.term"]))
+
+    File.write!(trace_cache, "invalid")
+    assert {:ok, rebuilt} = Compiler.run(repository, cache)
+    assert rebuilt.status == :ok
+    assert rebuilt.output =~ "Compiling 1 file"
+    assert Enum.any?(rebuilt.events, &(&1.kind == :module and &1.target == "CompilerFixture"))
   end
 
-  test "fetches dependencies before compiling" do
+  test "reuses unchanged traces while Mix incrementally compiles changed sources" do
+    root = temp_dir("incremental-project")
+    cache = temp_dir("incremental-cache")
+    File.mkdir_p!(Path.join(root, "lib"))
+
+    mix_source = """
+    defmodule IncrementalFixture.MixProject do
+      use Mix.Project
+      def project, do: [app: :incremental_fixture, version: "0.1.0"]
+    end
+    """
+
+    unchanged = "defmodule IncrementalFixture.Unchanged do\n  def call, do: :ok\nend\n"
+    changed = "defmodule IncrementalFixture.Changed do\n  def first, do: :ok\nend\n"
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "first",
+      inputs: [
+        %{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE},
+        %{path: "lib/unchanged.ex", content: unchanged, kind: :INPUT_KIND_SOURCE},
+        %{path: "lib/changed.ex", content: changed, kind: :INPUT_KIND_SOURCE}
+      ]
+    }
+
+    assert {:ok, first} = Compiler.run(repository, cache)
+    assert first.status == :ok
+
+    changed = "defmodule IncrementalFixture.Changed do\n  def second, do: :ok\nend\n"
+
+    repository = %{
+      repository
+      | fingerprint: "second",
+        inputs: [
+          %{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE},
+          %{path: "lib/unchanged.ex", content: unchanged, kind: :INPUT_KIND_SOURCE},
+          %{path: "lib/changed.ex", content: changed, kind: :INPUT_KIND_SOURCE}
+        ]
+    }
+
+    assert {:ok, second} = Compiler.run(repository, cache)
+    assert second.status == :ok
+    assert second.output =~ "Compiling 1 file"
+
+    assert Enum.any?(second.events, fn event ->
+             event.kind == :module and event.target == "IncrementalFixture.Unchanged" and
+               {"call", 0} in event.definitions
+           end)
+
+    assert Enum.any?(second.events, fn event ->
+             event.kind == :module and event.target == "IncrementalFixture.Changed" and
+               {"second", 0} in event.definitions
+           end)
+
+    repository = %{
+      repository
+      | fingerprint: "third",
+        inputs: [
+          %{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE},
+          %{path: "lib/unchanged.ex", content: unchanged, kind: :INPUT_KIND_SOURCE}
+        ]
+    }
+
+    assert {:ok, third} = Compiler.run(repository, cache)
+    assert third.status == :ok
+    refute Enum.any?(third.events, &(&1[:target] == "IncrementalFixture.Changed"))
+
+    refute File.exists?(
+             Path.join([cache, "elixir", "Zml4dHVyZQ", "snapshot", "lib", "changed.ex"])
+           )
+
+    assert 1 ==
+             cache
+             |> Path.join("elixir/Zml4dHVyZQ/build-*")
+             |> Path.wildcard()
+             |> length()
+  end
+
+  test "reports an unavailable dependency without fetching it" do
     root = temp_dir("dependency-project")
     dependency = temp_dir("dependency-source")
     cache = temp_dir("dependency-cache")
@@ -121,15 +218,9 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     }
 
     assert {:ok, result} = Compiler.run(repository, cache)
-    assert result.status == :ok, inspect(result)
-
-    assert Enum.any?(result.events, fn event ->
-             event.kind == :module and {"call", 0} in event.definitions
-           end)
-
-    refute Enum.any?(result.events, fn event ->
-             event.kind == :module and event.target == "CompilerDependency"
-           end)
+    assert result.status == :error
+    assert Enum.any?(result.diagnostics, &(&1.message =~ "errors on dependencies"))
+    assert File.ls!(Path.join([cache, "elixir", "Zml4dHVyZQ", "deps"])) == []
   end
 
   test "materializes snapshot bytes instead of reading a changed checkout" do
@@ -297,8 +388,8 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     with_envs(
       %{
         "BEHOLDER_ELIXIR_MIX_PATH" => fake_mix,
-        "BEHOLDER_ELIXIR_COMPILER_TIMEOUT_MS" => "1000",
-        "BEHOLDER_ELIXIR_MAX_OUTPUT_BYTES" => "128"
+        "BEHOLDER_WORKER_TIMEOUT_MS" => "1000",
+        "BEHOLDER_WORKER_MAX_OUTPUT_BYTES" => "128"
       },
       fn ->
         assert {:error, reason} = Compiler.run(repository, cache)
@@ -311,6 +402,38 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
         wait_for_process_exit(pid)
       end
     )
+  end
+
+  test "reports compiler subphases from child process markers" do
+    root = temp_dir("progress")
+    cache = temp_dir("progress-cache")
+
+    fake_mix =
+      fake_mix(
+        root,
+        "printf 'BEHOLDER_PROGRESS dependency_preparation\\nBEHOLDER_PROGRESS project_compilation\\n'"
+      )
+
+    File.write!(Path.join(root, "mix.exs"), "original")
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "abc123",
+      inputs: [%{path: "mix.exs", content: "original", kind: :INPUT_KIND_SOURCE}]
+    }
+
+    parent = self()
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
+      assert {:error, _reason} =
+               Compiler.run(repository, [], cache, fn detail ->
+                 send(parent, {:progress, detail})
+               end)
+    end)
+
+    assert_received {:progress, "preparing dependencies"}
+    assert_received {:progress, "compiling project"}
   end
 
   test "isolates Mix build directories by compilation environment" do
@@ -338,7 +461,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              |> length()
   end
 
-  test "isolates Mix build directories by dependency context identity" do
+  test "reuses a Mix build directory across dependency context revisions" do
     root = temp_dir("context-build-identity")
     context_root = temp_dir("context-build-dependency")
     cache = temp_dir("context-build-cache")
@@ -365,7 +488,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
       Compiler.run(repository, [%{context | fingerprint: "context-2"}], cache)
     end)
 
-    assert 2 ==
+    assert 1 ==
              cache
              |> Path.join("elixir/Zml4dHVyZQ/build-*")
              |> Path.wildcard()

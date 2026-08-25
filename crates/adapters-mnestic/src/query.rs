@@ -513,9 +513,9 @@ mod tests {
 
     #[test]
     fn workspace_smoke() {
-        let db = memory_database().unwrap();
+        let store = SemanticStore::memory().unwrap();
         let feature = query(
-            &db,
+            &store.db,
             "feature",
             &format!(
                 "{DIRECT_RULES}\n?[provider] := direct[\
@@ -529,11 +529,6 @@ mod tests {
         assert!(feature.contains("pricing/get_price_v2"));
         assert!(!feature.contains("pricing/get_price\""));
 
-        let store = SemanticStore {
-            read_db: db.clone(),
-            db,
-            database_path: None,
-        };
         let result = store.context("main", "rpc/Pricing.GetPrice").unwrap();
         assert_eq!(result.edges.len(), 2);
         assert!(

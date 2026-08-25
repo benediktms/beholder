@@ -455,6 +455,11 @@ pub fn observations(
         &[(path, &analysis)],
         &observations,
     ));
+    observations.extend(super::grpc::configured_delegate_observations(
+        repository,
+        &[(path, &analysis)],
+        &observations,
+    ));
     resolve_repository_calls(&mut observations, &[(path, &analysis)]);
     Ok(observations)
 }

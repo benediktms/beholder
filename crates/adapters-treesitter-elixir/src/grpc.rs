@@ -3,8 +3,9 @@ use super::analysis::{
 };
 use super::model::{ElixirAlias, ElixirAnalysis, ElixirModule};
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, GrpcBindingCandidate,
-    GrpcBindingRole, Provenance, RpcCardinality,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation,
+    GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance, RpcCardinality,
+    SemanticRelation, StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +20,13 @@ pub(super) struct GrpcModule {
     server: bool,
     methods: Vec<GrpcMethod>,
     issues: Vec<GrpcIssue>,
+    configured_delegate: Option<ConfiguredDelegate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ConfiguredDelegate {
+    behaviour: String,
+    line: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -91,6 +99,11 @@ pub(super) fn observe_call(
             };
             let service = option(node, source, "service", aliases, current_module)
                 .map(|service| (service, line));
+            if keyword_value(node, source, "config_key").is_some()
+                && let Some(behaviour) = option(node, source, "behaviour", aliases, current_module)
+            {
+                grpc.configured_delegate = Some(ConfiguredDelegate { behaviour, line });
+            }
             match target.as_str() {
                 "GRPC.Service" => {
                     if let Some(name) = option(node, source, "name", aliases, current_module) {
@@ -283,6 +296,88 @@ fn candidate(
         confidence,
         provenance,
     }
+}
+
+pub(super) fn configured_delegate_observations(
+    repository: &str,
+    sources: &[(&Path, &ElixirAnalysis)],
+    observations: &[Observation],
+) -> Vec<Observation> {
+    let callbacks = sources
+        .iter()
+        .flat_map(|(path, analysis)| {
+            analysis
+                .modules
+                .iter()
+                .filter(|module| !module.callbacks.is_empty())
+                .map(move |module| (module.name.as_str(), (*path, module.callbacks.as_slice())))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut implementations = BTreeMap::<&str, Option<&str>>::new();
+    for module in sources
+        .iter()
+        .flat_map(|(_, analysis)| &analysis.modules)
+        .filter(|module| module.grpc.stub.is_some())
+    {
+        for behaviour in &module.implements {
+            implementations
+                .entry(&behaviour.name)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(&module.name));
+        }
+    }
+    let mut definitions = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+        })
+        .map(|observation| observation.to.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut generated = Vec::new();
+    for (path, analysis) in sources {
+        for module in &analysis.modules {
+            let Some(delegate) = &module.grpc.configured_delegate else {
+                continue;
+            };
+            let Some((_, callbacks)) = callbacks.get(delegate.behaviour.as_str()) else {
+                continue;
+            };
+            let Some(Some(implementation)) = implementations.get(delegate.behaviour.as_str())
+            else {
+                continue;
+            };
+            let module_id = format!("repo://{repository}/elixir/{}", module.name);
+            for callback in *callbacks {
+                let function_id = format!("{module_id}/{}/{}", callback.name, callback.arity);
+                if !definitions.insert(function_id.clone()) {
+                    continue;
+                }
+                generated.push(Observation::generated(
+                    module_id.clone(),
+                    StructuralRelation::Defines,
+                    function_id.clone(),
+                    format!("{}:{}", path.display(), delegate.line),
+                ));
+                let target = format!(
+                    "repo://{repository}/elixir/{implementation}/{}/{}",
+                    callback.name, callback.arity
+                );
+                if !definitions.contains(&target) {
+                    continue;
+                }
+                let mut call = Observation::dependency(
+                    function_id,
+                    DependencyRelation::Calls,
+                    target,
+                    format!("{}:{}", path.display(), delegate.line),
+                );
+                call.confidence = Confidence::Inferred;
+                call.provenance = Provenance::Generated;
+                generated.push(call);
+            }
+        }
+    }
+    generated
 }
 
 pub fn bindings(

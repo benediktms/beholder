@@ -3,6 +3,8 @@ use crate::workspace_registry::WorkspaceRegistry;
 use beholder_adapters_graphql::GraphqlSource;
 #[cfg(test)]
 use beholder_adapters_graphql::{FRONTEND_VERSION as GRAPHQL_FRONTEND_VERSION, GraphqlAnalyzer};
+#[cfg(test)]
+use beholder_adapters_mnestic::EnrichmentSchedule;
 use beholder_adapters_mnestic::SemanticStore;
 #[cfg(test)]
 use beholder_adapters_protobuf::{FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, ProtobufAnalyzer};
@@ -2678,10 +2680,21 @@ mod tests {
         let (cancel, cancelled) = tokio::sync::watch::channel(());
         let input_fingerprint =
             view.repository_enrichment_input_fingerprint(&view.repository_states[0], "semantic");
+        assert_eq!(
+            store
+                .prepare_enrichment("main", "repo", "semantic", "1", &input_fingerprint)
+                .unwrap(),
+            EnrichmentSchedule::Queue
+        );
+        assert!(
+            store
+                .enrichment_retry_started("main", "repo", "semantic", "1", &input_fingerprint)
+                .unwrap()
+        );
         scheduler.enriching.lock().unwrap().insert(
             ("main".into(), "repo".into(), "semantic".into()),
             EnrichmentRun {
-                input_fingerprint,
+                input_fingerprint: input_fingerprint.clone(),
                 version: "1".into(),
                 cancel,
             },
@@ -2693,6 +2706,19 @@ mod tests {
 
         assert!(scheduler.enrichment_jobs.lock().unwrap().is_empty());
         assert!(!cancelled.has_changed().unwrap());
+
+        scheduler.enriching.lock().unwrap().clear();
+        scheduler
+            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
+            .unwrap();
+
+        assert_eq!(scheduler.enrichment_jobs.lock().unwrap().len(), 1);
+        assert!(matches!(
+            store
+                .prepare_enrichment("main", "repo", "semantic", "1", &input_fingerprint)
+                .unwrap(),
+            EnrichmentSchedule::RetryAfter(_)
+        ));
     }
 
     #[test]

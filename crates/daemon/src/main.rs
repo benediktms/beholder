@@ -11,9 +11,9 @@ use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
 use beholder_observability::LogOutput;
 use beholder_protocol::v1::daemon_server::DaemonServer;
-#[cfg(not(test))]
-use beholder_worker_client::WorkerAnalyzerBuilder;
 use beholder_worker_client::{PluginRegistry, plugin_analyzer};
+#[cfg(not(test))]
+use beholder_worker_client::{WorkerAnalyzerBuilder, worker_environment_variable};
 use std::error::Error;
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
@@ -172,7 +172,8 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity("elixir", "18:10:elixir-compiler:9")
+        .identity("elixir", "18:10:elixir-compiler:12")
+        .timeout(std::time::Duration::from_secs(20 * 60))
         .accept_extension("ex")
         .accept_extension("exs")
         .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
@@ -264,7 +265,7 @@ fn command_identity(program: &str, arguments: &[&str]) -> Vec<u8> {
 
 #[cfg(not(test))]
 fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let executable = std::env::var_os("BEHOLDER_RUST_WORKER_PATH")
+    let executable = std::env::var_os(worker_environment_variable("rust", "PATH"))
         .map(std::path::PathBuf::from)
         .unwrap_or(std::env::current_exe()?.with_file_name("beholder-worker-rust"));
     if !executable.is_file() {
@@ -275,7 +276,7 @@ fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
 
 #[cfg(not(test))]
 fn elixir_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
-    let configured = std::env::var_os("BEHOLDER_ELIXIR_WORKER_PATH");
+    let configured = std::env::var_os(worker_environment_variable("elixir", "PATH"));
     let executable = configured
         .as_ref()
         .map(std::path::PathBuf::from)
