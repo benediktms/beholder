@@ -378,7 +378,6 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 let mut worker_environment = configured_worker_environment(&self.metadata.id);
                 let analysis_inactivity_timeout = worker_environment
                     .get("BEHOLDER_WORKER_TIMEOUT_MS")
-                    .as_deref()
                     .and_then(|value| value.to_str())
                     .and_then(|value| value.parse::<u64>().ok())
                     .filter(|value| *value > 0)
