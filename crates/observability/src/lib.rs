@@ -42,12 +42,6 @@ pub enum LogOutput {
     Disabled,
 }
 
-#[derive(Clone, Copy)]
-pub enum ExportMode {
-    Batch,
-    Simple,
-}
-
 pub struct ObservabilityGuard {
     _writer: Option<WorkerGuard>,
     tracer_provider: Option<SdkTracerProvider>,
@@ -69,11 +63,7 @@ impl Drop for ObservabilityGuard {
     }
 }
 
-pub fn init(
-    default_service_name: &str,
-    output: LogOutput,
-    export_mode: ExportMode,
-) -> ObservabilityGuard {
+pub fn init(default_service_name: &str, output: LogOutput) -> ObservabilityGuard {
     global::set_text_map_propagator(TraceContextPropagator::new());
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
@@ -87,16 +77,13 @@ pub fn init(
         .with_writer(writer)
         .with_filter(filter);
 
-    let (tracer_provider, logger_provider) =
-        match telemetry_providers(default_service_name, export_mode) {
-            Ok(providers) => providers,
-            Err(error) => {
-                eprintln!(
-                    "could not initialize OpenTelemetry export ({error}); using local logs only"
-                );
-                (None, None)
-            }
-        };
+    let (tracer_provider, logger_provider) = match telemetry_providers(default_service_name) {
+        Ok(providers) => providers,
+        Err(error) => {
+            eprintln!("could not initialize OpenTelemetry export ({error}); using local logs only");
+            (None, None)
+        }
+    };
     let trace_layer = tracer_provider.as_ref().map(|provider| {
         tracing_opentelemetry::layer()
             .with_tracer(provider.tracer(default_service_name.to_owned()))
@@ -240,7 +227,6 @@ fn log_writer(output: LogOutput) -> (BoxMakeWriter, Option<WorkerGuard>) {
 
 fn telemetry_providers(
     default_service_name: &str,
-    export_mode: ExportMode,
 ) -> Result<(Option<SdkTracerProvider>, Option<SdkLoggerProvider>), Box<dyn Error + Send + Sync>> {
     if sdk_disabled() {
         return Ok((None, None));
@@ -260,10 +246,9 @@ fn telemetry_providers(
                 .with_protocol(Protocol::HttpBinary)
                 .build()?;
             let builder = SdkTracerProvider::builder().with_resource(resource.clone());
-            Ok::<_, opentelemetry_otlp::ExporterBuildError>(match export_mode {
-                ExportMode::Batch => builder.with_batch_exporter(exporter).build(),
-                ExportMode::Simple => builder.with_simple_exporter(exporter).build(),
-            })
+            Ok::<_, opentelemetry_otlp::ExporterBuildError>(
+                builder.with_batch_exporter(exporter).build(),
+            )
         })
         .transpose()?;
     let logger_provider = logs_enabled
@@ -273,10 +258,9 @@ fn telemetry_providers(
                 .with_protocol(Protocol::HttpBinary)
                 .build()?;
             let builder = SdkLoggerProvider::builder().with_resource(resource);
-            Ok::<_, opentelemetry_otlp::ExporterBuildError>(match export_mode {
-                ExportMode::Batch => builder.with_batch_exporter(exporter).build(),
-                ExportMode::Simple => builder.with_simple_exporter(exporter).build(),
-            })
+            Ok::<_, opentelemetry_otlp::ExporterBuildError>(
+                builder.with_batch_exporter(exporter).build(),
+            )
         })
         .transpose()?;
     Ok((tracer_provider, logger_provider))

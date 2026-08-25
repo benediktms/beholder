@@ -539,7 +539,6 @@ pub async fn serve(analyzer: impl Analyzer) -> Result<(), ServeError> {
     let _observability = beholder_observability::init(
         &format!("beholder-worker-{}", descriptor.id),
         beholder_observability::LogOutput::Stderr,
-        beholder_observability::ExportMode::Simple,
     );
     let listener = UnixListener::bind(&socket)?;
     let (shutdown, stopped) = tokio::sync::oneshot::channel();

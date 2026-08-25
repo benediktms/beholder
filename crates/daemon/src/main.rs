@@ -9,7 +9,7 @@ use beholder_daemon_client::{socket_path, state_dir};
 #[cfg(not(test))]
 use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
-use beholder_observability::{ExportMode, LogOutput};
+use beholder_observability::LogOutput;
 use beholder_protocol::v1::daemon_server::DaemonServer;
 #[cfg(not(test))]
 use beholder_worker_client::WorkerAnalyzerBuilder;
@@ -50,7 +50,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 directory: state_dir.clone(),
                 prefix: "beholderd".into(),
             },
-            ExportMode::Batch,
         );
         tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "daemon started");
         let cache_dir = state_dir.join("frontend-cache");
