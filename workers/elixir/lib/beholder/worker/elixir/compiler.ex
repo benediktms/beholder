@@ -9,6 +9,8 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @termination_grace_ms 1_000
   @process_group_pid_retries 100
   @process_group_pid_retry_ms 10
+  @dependency_progress "BEHOLDER_PROGRESS dependency_preparation"
+  @compilation_progress "BEHOLDER_PROGRESS project_compilation"
 
   @type result :: %{
           status: :ok | :error,
@@ -27,6 +29,12 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @spec run(Repository.t(), [Repository.t()], String.t()) ::
           {:ok, result()} | {:error, String.t()}
   def run(repository, contexts, cache_dir) do
+    run(repository, contexts, cache_dir, fn _detail -> :ok end)
+  end
+
+  @spec run(Repository.t(), [Repository.t()], String.t(), (String.t() -> any())) ::
+          {:ok, result()} | {:error, String.t()}
+  def run(repository, contexts, cache_dir, on_progress) do
     original_repositories = [repository | contexts]
 
     with {:ok, project_root} <- Repository.mix_project_root(repository),
@@ -35,7 +43,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
       [repository | contexts] = materialized_repositories
 
       try do
-        case run_materialized(repository, contexts, cache_dir, project_root) do
+        case run_materialized(repository, contexts, cache_dir, project_root, on_progress) do
           {:ok, result} ->
             {:ok, remap_result_paths(result, materialized_repositories, original_repositories)}
 
@@ -48,7 +56,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp run_materialized(repository, contexts, cache_dir, project_root) do
+  defp run_materialized(repository, contexts, cache_dir, project_root, on_progress) do
     repositories = [repository | contexts]
 
     with :ok <- validate_local_paths(repositories),
@@ -76,13 +84,14 @@ defmodule Beholder.Worker.Elixir.Compiler do
           Path.join(repository.base, project_root),
           env,
           configured_positive_integer(
-            "BEHOLDER_ELIXIR_COMPILER_TIMEOUT_MS",
+            "BEHOLDER_WORKER_TIMEOUT_MS",
             @default_timeout_ms
           ),
           configured_positive_integer(
-            "BEHOLDER_ELIXIR_MAX_OUTPUT_BYTES",
+            "BEHOLDER_WORKER_MAX_OUTPUT_BYTES",
             @default_max_output_bytes
-          )
+          ),
+          on_progress
         )
 
       finalize_run(repositories, result_path, result)
@@ -357,7 +366,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
     |> Base.url_encode64(padding: false)
   end
 
-  defp run_command(mix, arguments, directory, env, timeout_ms, max_output_bytes) do
+  defp run_command(mix, arguments, directory, env, timeout_ms, max_output_bytes, on_progress) do
     {executable, arguments, group_file} = isolated_command(mix, arguments)
 
     port =
@@ -378,7 +387,17 @@ defmodule Beholder.Worker.Elixir.Compiler do
 
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     target = process_target(port, group_file)
-    collect_output(port, deadline, timeout_ms, max_output_bytes, {<<>>, false}, target)
+
+    collect_output(
+      port,
+      deadline,
+      timeout_ms,
+      max_output_bytes,
+      {<<>>, false},
+      target,
+      on_progress,
+      {<<>>, MapSet.new()}
+    )
   rescue
     error in [ArgumentError, ErlangError] ->
       {:error, "failed to start Mix compiler process: #{Exception.message(error)}"}
@@ -417,18 +436,31 @@ defmodule Beholder.Worker.Elixir.Compiler do
     {:group_file, group_file, fallback}
   end
 
-  defp collect_output(port, deadline, timeout_ms, max_output_bytes, output, target) do
+  defp collect_output(
+         port,
+         deadline,
+         timeout_ms,
+         max_output_bytes,
+         output,
+         target,
+         on_progress,
+         progress
+       ) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
       {^port, {:data, data}} ->
+        progress = report_progress(progress, data, on_progress)
+
         collect_output(
           port,
           deadline,
           timeout_ms,
           max_output_bytes,
           append_output(output, data, max_output_bytes),
-          target
+          target,
+          on_progress,
+          progress
         )
 
       {^port, {:exit_status, status}} ->
@@ -439,6 +471,35 @@ defmodule Beholder.Worker.Elixir.Compiler do
         terminate(port, target)
         {:error, :timeout, render_output(output), timeout_ms}
     end
+  end
+
+  defp report_progress({tail, reported}, data, on_progress) do
+    buffer = tail <> data
+
+    reported =
+      [
+        {@dependency_progress, "preparing dependencies"},
+        {@compilation_progress, "compiling project"}
+      ]
+      |> Enum.reduce(reported, fn {marker, detail}, reported ->
+        if marker not in reported and :binary.match(buffer, marker) != :nomatch do
+          on_progress.(detail)
+          MapSet.put(reported, marker)
+        else
+          reported
+        end
+      end)
+
+    tail_bytes = max(byte_size(@dependency_progress), byte_size(@compilation_progress)) - 1
+
+    tail =
+      binary_part(
+        buffer,
+        max(byte_size(buffer) - tail_bytes, 0),
+        min(byte_size(buffer), tail_bytes)
+      )
+
+    {tail, reported}
   end
 
   defp terminate(port, unresolved_target) do

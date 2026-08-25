@@ -10,6 +10,8 @@ defmodule Beholder.Worker.V1.AnalyzerWorker.Server do
     AnalyzeEvent
   }
 
+  @heartbeat_interval_ms 30_000
+
   def analyze(requests, stream) do
     stream
     |> GRPC.Stream.get_headers()
@@ -26,8 +28,18 @@ defmodule Beholder.Worker.V1.AnalyzerWorker.Server do
           "repository.count" => length(Snapshot.repositories(snapshot))
         })
 
-        send_progress(stream, :ANALYSIS_PHASE_ANALYZING)
-        Analyzer.analyze(snapshot, cache_dir())
+        send_progress(stream, :ANALYSIS_PHASE_ANALYZING, "materializing compiler snapshot")
+
+        heartbeat = Task.async(fn -> heartbeat(stream) end)
+
+        try do
+          Analyzer.analyze(snapshot, cache_dir(), fn detail ->
+            send_progress(stream, :ANALYSIS_PHASE_ANALYZING, detail)
+          end)
+        after
+          send(heartbeat.pid, :stop)
+          Task.await(heartbeat)
+        end
       end
 
     case result do
@@ -45,11 +57,22 @@ defmodule Beholder.Worker.V1.AnalyzerWorker.Server do
       GRPC.Server.send_reply(stream, failure(Exception.format(:error, error, __STACKTRACE__)))
   end
 
-  defp send_progress(stream, phase) do
+  defp send_progress(stream, phase, detail \\ nil) do
     GRPC.Server.send_reply(
       stream,
-      %AnalyzeEvent{event: {:progress, %AnalysisProgress{phase: phase}}}
+      %AnalyzeEvent{event: {:progress, %AnalysisProgress{phase: phase, detail: detail}}}
     )
+  end
+
+  defp heartbeat(stream) do
+    receive do
+      :stop ->
+        :ok
+    after
+      @heartbeat_interval_ms ->
+        send_progress(stream, :ANALYSIS_PHASE_ANALYZING, "analysis still running")
+        heartbeat(stream)
+    end
   end
 
   defp failure(reason) do

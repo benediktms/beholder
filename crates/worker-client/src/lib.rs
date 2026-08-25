@@ -29,10 +29,41 @@ use tonic::Request;
 use tracing::Instrument;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(600);
+const ANALYSIS_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(600);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const WORKER_SETTINGS: [&str; 2] = ["MAX_OUTPUT_BYTES", "TIMEOUT_MS"];
 static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub fn worker_environment_variable(worker: &str, setting: &str) -> String {
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    format!(
+        "BEHOLDER_{}_WORKER_{}",
+        normalize(worker),
+        normalize(setting)
+    )
+}
+
+fn configured_worker_environment(worker: &str) -> BTreeMap<String, OsString> {
+    WORKER_SETTINGS
+        .into_iter()
+        .filter_map(|setting| {
+            std::env::var_os(worker_environment_variable(worker, setting))
+                .map(|value| (format!("BEHOLDER_WORKER_{setting}"), value))
+        })
+        .collect()
+}
 
 pub struct WorkerAnalyzerBuilder {
     metadata: AnalyzerMetadata,
@@ -45,6 +76,7 @@ pub struct WorkerAnalyzerBuilder {
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     plugin: Option<PluginDescriptor>,
+    timeout: Duration,
 }
 
 impl WorkerAnalyzerBuilder {
@@ -63,6 +95,7 @@ impl WorkerAnalyzerBuilder {
             excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
             plugin: None,
+            timeout: ANALYSIS_INACTIVITY_TIMEOUT,
         }
     }
 
@@ -71,6 +104,11 @@ impl WorkerAnalyzerBuilder {
             id: id.into(),
             version: version.into(),
         };
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -163,6 +201,7 @@ impl WorkerAnalyzerBuilder {
             excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
             plugin: self.plugin,
+            timeout: self.timeout,
         })
     }
 }
@@ -178,6 +217,7 @@ pub struct WorkerAnalyzer {
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     plugin: Option<PluginDescriptor>,
+    timeout: Duration,
 }
 
 pub fn plugin_analyzer(
@@ -201,6 +241,7 @@ pub fn plugin_analyzer(
         excluded_path_suffixes: Vec::new(),
         identity_inputs: Vec::new(),
         plugin: Some(descriptor),
+        timeout: ANALYSIS_INACTIVITY_TIMEOUT,
     })
 }
 
@@ -334,7 +375,21 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 ));
                 let _socket_file = SocketFile(socket.clone());
-                let mut child = Command::new(&self.executable)
+                let mut worker_environment = configured_worker_environment(&self.metadata.id);
+                let analysis_inactivity_timeout = worker_environment
+                    .get("BEHOLDER_WORKER_TIMEOUT_MS")
+                    .as_deref()
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .map(Duration::from_millis)
+                    .unwrap_or(self.timeout);
+                worker_environment.insert(
+                    "BEHOLDER_WORKER_TIMEOUT_MS".into(),
+                    analysis_inactivity_timeout.as_millis().to_string().into(),
+                );
+                let mut command = Command::new(&self.executable);
+                command
                     .arg("--socket")
                     .arg(&socket)
                     .arg("--cache-dir")
@@ -342,8 +397,9 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     .stdin(Stdio::null())
                     .env("OTEL_SERVICE_NAME", worker_service_name(&self.metadata.id))
                     .env("BEHOLDER_PLUGIN_DIGEST", &self.metadata.version)
-                    .kill_on_drop(true)
-                    .spawn()?;
+                    .kill_on_drop(true);
+                command.envs(worker_environment);
+                let mut child = command.spawn()?;
                 let analysis_started = tokio::time::Instant::now();
                 let workspace = snapshot.workspace.name.clone();
                 let endpoint = format!("unix:{}", socket.display());
@@ -367,35 +423,46 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 let baseline = snapshot.baseline.clone();
                 let mut request = Request::new(tokio_stream::iter(analyze_requests(snapshot)?));
                 beholder_observability::inject_current_context(request.metadata_mut());
-                let response = tokio::time::timeout(ANALYSIS_TIMEOUT, client.analyze(request))
-                    .await
-                    .map_err(|_| "worker analysis timed out")??;
+                let response =
+                    tokio::time::timeout(analysis_inactivity_timeout, client.analyze(request))
+                        .await
+                        .map_err(|_| {
+                            format!(
+                                "worker analysis timed out after {}ms without progress",
+                                analysis_inactivity_timeout.as_millis()
+                            )
+                        })??;
                 let mut stream = response.into_inner();
-                let events = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
-                    let mut events = Vec::new();
-                    while let Some(event) = stream.message().await? {
-                        if let Some(analyze_event::Event::Progress(progress)) = &event.event {
-                            let phase = AnalysisPhase::try_from(progress.phase)
-                                .map_err(|_| "worker progress phase is unknown")?;
-                            if phase == AnalysisPhase::Unspecified {
-                                return Err::<_, AnalyzerError>(
-                                    "worker progress phase is missing".into(),
-                                );
-                            }
-                            tracing::info!(
-                                worker = self.metadata.id,
-                                workspace,
-                                phase = ?phase,
-                                elapsed_ms = analysis_started.elapsed().as_secs_f64() * 1_000.0,
-                                "worker analysis progress"
-                            );
+                let mut events = Vec::new();
+                loop {
+                    let event = tokio::time::timeout(analysis_inactivity_timeout, stream.message())
+                        .await
+                        .map_err(|_| {
+                            format!(
+                                "worker analysis timed out after {}ms without progress",
+                                analysis_inactivity_timeout.as_millis()
+                            )
+                        })??;
+                    let Some(event) = event else {
+                        break;
+                    };
+                    if let Some(analyze_event::Event::Progress(progress)) = &event.event {
+                        let phase = AnalysisPhase::try_from(progress.phase)
+                            .map_err(|_| "worker progress phase is unknown")?;
+                        if phase == AnalysisPhase::Unspecified {
+                            return Err("worker progress phase is missing".into());
                         }
-                        events.push(event);
+                        tracing::info!(
+                            worker = self.metadata.id,
+                            workspace,
+                            phase = ?phase,
+                            detail = progress.detail.as_deref().unwrap_or_default(),
+                            elapsed_ms = analysis_started.elapsed().as_secs_f64() * 1_000.0,
+                            "worker analysis progress"
+                        );
                     }
-                    Ok::<_, AnalyzerError>(events)
-                })
-                .await
-                .map_err(|_| "worker analysis timed out")??;
+                    events.push(event);
+                }
                 let contribution = contribution_from_events(events)?;
                 if contribution.metadata != self.metadata {
                     return Err(format!(
@@ -538,6 +605,34 @@ mod tests {
     use beholder_domain::{LogicalRepository, RepositoryState};
     use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot, WorkspaceSnapshot};
     use std::sync::Arc;
+
+    #[test]
+    fn worker_environment_variables_have_one_consistent_shape() {
+        assert_eq!(
+            worker_environment_variable("elixir", "timeout_ms"),
+            "BEHOLDER_ELIXIR_WORKER_TIMEOUT_MS"
+        );
+        assert_eq!(
+            worker_environment_variable("fresha-beholder", "timeout_ms"),
+            "BEHOLDER_FRESHA_BEHOLDER_WORKER_TIMEOUT_MS"
+        );
+        assert_eq!(
+            worker_environment_variable("rust", "max_output_bytes"),
+            "BEHOLDER_RUST_WORKER_MAX_OUTPUT_BYTES"
+        );
+    }
+
+    #[test]
+    fn worker_timeout_can_override_the_shared_default() {
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("elixir", "1")
+            .timeout(Duration::from_secs(1_200))
+            .accept_extension("ex")
+            .build()
+            .unwrap();
+
+        assert_eq!(worker.timeout, Duration::from_secs(1_200));
+    }
 
     #[test]
     fn worker_inputs_preserve_semantic_roles_and_shared_identity() {

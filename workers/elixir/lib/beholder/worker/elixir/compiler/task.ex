@@ -15,8 +15,12 @@ defmodule Mix.Tasks.Beholder.Compile do
 
     {status, diagnostics, events} =
       case prepare_dependencies() do
-        :ok -> trace_compile()
-        {:error, diagnostics} -> {:error, diagnostics, []}
+        :ok ->
+          IO.puts("BEHOLDER_PROGRESS project_compilation")
+          trace_compile()
+
+        {:error, diagnostics} ->
+          {:error, diagnostics, []}
       end
 
     result =
@@ -34,8 +38,8 @@ defmodule Mix.Tasks.Beholder.Compile do
 
   defp prepare_dependencies do
     try do
-      Mix.Task.run("deps.get")
-      Mix.Task.run("deps.compile")
+      IO.puts("BEHOLDER_PROGRESS dependency_preparation")
+      Mix.Task.run("deps.loadpaths")
       :ok
     rescue
       exception -> {:error, [%{message: Exception.format(:error, exception, __STACKTRACE__)}]}
@@ -59,7 +63,7 @@ defmodule Mix.Tasks.Beholder.Compile do
 
   defp compile do
     try do
-      case Mix.Task.run("compile", ["--force", "--return-errors"]) do
+      case Mix.Task.run("compile", ["--return-errors"]) do
         {:ok, diagnostics} -> {:ok, diagnostics}
         {:error, diagnostics} -> {:error, diagnostics}
         :ok -> {:ok, []}
