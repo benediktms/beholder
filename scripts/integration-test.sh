@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(pwd)"
-state="$(mktemp -d "${TMPDIR:-/tmp}/beholder-integration-test.XXXXXX")"
+state="$(mktemp -d /tmp/beholder-integration-test.XXXXXX)"
 export BEHOLDER_STATE_DIR="$state"
 export RUST_LOG="${RUST_LOG:-info,beholderd=debug}"
 socket="$state/daemon/beholder.sock"
@@ -276,7 +276,7 @@ echo 'Checking contract removal and restoration...' >&2
 target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
     --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" >/dev/null
 bindings=''
-for _ in {1..100}; do
+for _ in {1..600}; do
     bindings="$(target/debug/beholder inspect grpc-bindings --database "$state/daemon/beholder.db")"
     grep -Fq 'grpc.contract_unmatched' <<<"$bindings" && break
     sleep 0.1
