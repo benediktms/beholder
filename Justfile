@@ -60,10 +60,10 @@ uninstall:
 
 # ── Manual ────────────────────────────────────────────────────────────────────
 
-# Run the end-to-end dogfood smoke test.
+# Run the deterministic end-to-end integration test.
 [group('manual')]
-smoke:
-    moon run beholder:smoke
+integration-test:
+    moon run beholder:integration-test
 
 # Benchmark cold and warm-frontend indexing with a bounded worker count.
 [group('manual')]

@@ -1912,7 +1912,6 @@ format
 generate-proto
 integration-test
 benchmark
-dogfood
 ```
 
 Possible commands include:
@@ -1922,10 +1921,10 @@ moon run beholder:check
 moon run beholder:test
 moon run beholder:lint
 
-moon run beholder:smoke
+moon run beholder:integration-test
 ```
 
-The dogfooding task should eventually:
+The integration-test task should:
 
 ```text
 build beholderd and CLI

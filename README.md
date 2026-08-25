@@ -242,8 +242,8 @@ just
 # Format, lint, and test
 just check
 
-# Run the end-to-end dogfood smoke test
-just smoke
+# Run the deterministic end-to-end integration test
+just integration-test
 
 # Explore the CLI without installing it
 cargo run -- --help
