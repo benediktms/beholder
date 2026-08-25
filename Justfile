@@ -9,8 +9,7 @@ default:
 # Run all repository formatting, linting, and test checks.
 [group('checks')]
 check:
-    moon run beholder:lint
-    moon run beholder:test
+    moon run :format-check :lint :test
 
 alias c := check
 

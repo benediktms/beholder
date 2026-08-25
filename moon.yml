@@ -3,26 +3,16 @@ layer: 'application'
 
 fileGroups:
   sources:
-    - '.github/workflows/*.yml'
-    - '.moon/*.yml'
     - 'Cargo.toml'
     - 'Cargo.lock'
-    - 'Justfile'
     - 'crates/**/*.rs'
     - 'crates/**/Cargo.toml'
     - 'mise.toml'
-    - 'moon.yml'
     - 'proto/**/*.proto'
     - 'rules/**/*.datalog'
     - 'rust-toolchain.toml'
-    - 'scripts/**/*.sh'
 
 tasks:
-  check:
-    command: 'cargo check --workspace'
-    inputs:
-      - '@group(sources)'
-
   test:
     command: 'cargo test --workspace'
     inputs:
@@ -87,6 +77,8 @@ tasks:
     inputs:
       - '@group(sources)'
       - 'scripts/dogfood.sh'
+      - 'scripts/test-daemon-handover.sh'
+      - 'scripts/fixtures/**/*'
     options:
       cache: false
 

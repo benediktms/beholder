@@ -17,24 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  format:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-          filter: blob:none
-      - uses: moonrepo/setup-rust@v1
-        with:
-          inherit-toolchain: true
-          cache: false
-      - uses: jdx/mise-action@v4
-        with:
-          install_args: github:moonrepo/moon
-      - run: moon ci beholder:format-check
-
-  clippy:
+  ci:
     strategy:
       fail-fast: false
       matrix:
@@ -53,80 +36,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: jdx/mise-action@v4
-        with:
-          install_args: github:moonrepo/moon protoc
-      - run: moon ci beholder:lint
-
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-          filter: blob:none
-      - uses: moonrepo/setup-rust@v1
-        with:
-          inherit-toolchain: true
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - uses: jdx/mise-action@v4
-        with:
-          install_args: github:moonrepo/moon protoc
-      - run: moon ci beholder:test
-
-  elixir:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-          filter: blob:none
-      - uses: jdx/mise-action@v4
-        with:
-          install_args: github:moonrepo/moon
-      - name: Check whether the Elixir worker is affected
-        id: affected
-        shell: bash
-        run: |
-          if moon query projects --affected --id '^worker-elixir$' | jq -e '.projects | length > 0' >/dev/null; then
-            echo 'affected=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'affected=false' >> "$GITHUB_OUTPUT"
-          fi
-      - name: Install Erlang and Elixir
-        if: steps.affected.outputs.affected == 'true'
-        run: mise install erlang elixir
-      - name: Check the Elixir worker
-        if: steps.affected.outputs.affected == 'true'
-        run: moon ci worker-elixir:format-check worker-elixir:lint worker-elixir:test
-
-  smoke:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-          filter: blob:none
-      - uses: moonrepo/setup-rust@v1
-        with:
-          inherit-toolchain: true
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - uses: jdx/mise-action@v4
-        with:
-          install_args: github:moonrepo/moon protoc
-      - run: moon ci beholder:smoke
+      - run: moon ci
