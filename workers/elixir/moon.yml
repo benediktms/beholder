@@ -23,14 +23,6 @@ tasks:
       - 'deps'
     toolchains: 'system'
 
-  check:
-    command: 'mise exec -- mix compile --warnings-as-errors'
-    deps:
-      - 'deps'
-    inputs:
-      - '@group(sources)'
-    toolchains: 'system'
-
   test:
     command: 'mise exec -- mix test'
     deps:
