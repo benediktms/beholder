@@ -72,11 +72,11 @@ tasks:
       cache: false
       runInCI: false
 
-  smoke:
-    command: 'bash scripts/dogfood.sh'
+  integration-test:
+    command: 'bash scripts/integration-test.sh'
     inputs:
       - '@group(sources)'
-      - 'scripts/dogfood.sh'
+      - 'scripts/integration-test.sh'
       - 'scripts/test-daemon-handover.sh'
       - 'scripts/fixtures/**/*'
     options:

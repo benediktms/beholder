@@ -1,20 +1,22 @@
 # ADR 0006: Adopt Apalis for durable background work execution
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-25
-- Tracking: https://github.com/benediktms/beholder/issues/116
+- Tracking: https://github.com/benediktms/beholder/issues/126
+- Foundation: https://github.com/benediktms/beholder/issues/119
 
 ## Decision
 
-Adopt Apalis with its SQLite backend for Beholder's automatic background indexing
+Adopt Apalis with its SQLite backend for Beholder's automatic and manual indexing
 and enrichment work. Store its queue in a dedicated `queue.sqlite`; do not put
 queue tables in Mnestic's database.
 
 Keep Beholder's desired-state reduction, content verification, generation and
 fingerprint guards, cooperative cancellation, and atomic Mnestic publication
-boundaries. Apalis owns durable claiming, retries, worker liveness, orphan
-recovery, and scheduling; it does not become the authority for what repository
-state should exist.
+boundaries. Apalis owns job identity, typed payloads, execution status,
+scheduling, attempts, retry timing, worker ownership and liveness, errors, and
+terminal results. It does not become the authority for what repository state
+should exist.
 
 Use the verified workspace-local `sqlite3-src` compatibility provider so Mnestic
 and Apalis share `libsqlite3-sys` without changing or forking Mnestic.
@@ -116,17 +118,18 @@ blocking operation and checkpoint; it does not interrupt synchronous analyzer
 code in the middle of a call. A process crash relies on transaction atomicity and
 startup reconstruction instead.
 
-### Confirmed recovery defect
+### Legacy recovery during rollout
 
 An enrichment is persisted as `running` before its worker future starts. A daemon
 crash or forced shutdown can leave that row behind. On restart,
 `prepare_enrichment` returns `Running`, while the in-memory `enriching` map is
-empty, so the job is never queued again for the same input fingerprint.
+empty.
 
-This needs a focused fix regardless of Apalis. On daemon startup, or when
-preparing an enrichment with no matching live run, reclaim the persisted
-`running` state into the existing bounded retry policy. Publication remains safe
-because it already rejects stale fingerprints and superseded analyzer versions.
+This foundation intentionally adds no recovery for that legacy orphaned state.
+The first executable migration slice adds startup recovery for durable Apalis
+reservations; slice six replaces the legacy enrichment lifecycle and its recovery
+gap entirely. Publication remains safe because it rejects stale fingerprints and
+superseded analyzer versions.
 
 ## Apalis evaluation
 
@@ -219,111 +222,132 @@ the standalone CLI and combined daemon topologies on the existing Linux and
 macOS CI platforms. A separate `queue.sqlite` file remains a runtime isolation
 choice, not a compile-time fix.
 
-## Recommended target architecture
+## Accepted target architecture
 
 ```mermaid
 flowchart LR
-    subgraph Coordination["Beholder daemon coordination"]
-        W["Watcher and registration signals"] --> D["Desired-state reducer"]
-        D --> Q["Apalis queue.sqlite"]
-        Q --> B["Baseline job handler"]
-        Q --> E["Enrichment job handler"]
-    end
-    subgraph Rebuildable["Rebuildable state"]
-        I["Inventory and analyzer caches"]
-    end
-    subgraph Semantic["Durable semantic authority"]
-        M["Mnestic revisions"]
-        L["Enrichment lifecycle and retry state"]
-    end
-    B <--> I
-    B --> M
-    M --> E
-    E <--> L
-    E --> M
+    W["Watcher and registration signals"] --> D["Desired-state reducer"]
+    C["Manual CLI and RPC submission"] --> Q["Apalis queue.sqlite"]
+    D --> I["Typed IndexJob"] --> Q
+    Q --> B["Index handler"]
+    B --> S["Atomic semantic publication"]
+    S --> E["Typed EnrichmentJob"] --> Q
+    Q --> R["Enrichment handler"] --> S
 ```
 
-Responsibilities remain deliberately split:
+The ownership boundary is final:
 
-- Beholder owns intent subsumption, desired-state identity, repository/worktree
-  selection, view construction, generation checks, supersession, and cancellation.
-- The indexer owns typed analyzer composition and bounded CPU parallelism.
-- Mnestic owns atomic semantic publication and the small amount of durable
-  enrichment lifecycle state whose output is not reconstructed synchronously.
-- Filesystem contents, Git identity, and registered workspace configuration remain
-  the authority from which baseline work is reconstructed.
+- Apalis is the sole authority for job identity, typed payload, status, attempts,
+  retry timing, worker ownership and heartbeat, errors, and terminal results.
+- Beholder owns desired-state reduction, typed targets and triggers, generation
+  and fingerprint guards, prerequisite and supersession policy, cooperative
+  cancellation, content verification, and analyzer selection.
+- The semantic backend owns completed baselines and enrichments, currentness,
+  contribution ownership, and atomic publication. It does not mirror job
+  execution lifecycle or expose backend row identities to the queue.
+- Filesystem contents, Git identity, and registered repository and workspace
+  configuration remain authoritative inputs. Jobs persist identifiers and intent,
+  never source bytes, snapshots, graph facts, plugin environments, or semantic
+  backend row IDs.
 
-Do not introduce a generic `JobQueue` trait. Keep Apalis types inside the daemon
-adapter and expose the existing domain operations such as `mark_workspace`,
-`merge_repository_intent`, and `queue_enrichment`.
+`IndexJob` has a typed workspace or repository target, with an optional workspace
+scope on repository targets; an automatic or manual trigger; prerequisite
+`IndexJob` IDs; an optional automatic workspace generation; and reduced repository
+intents containing relative source or configuration paths, `HEAD` changes, or
+authoritative reconciliation.
+`EnrichmentJob` has a typed workspace-repository or standalone-repository target;
+a stable worker ID and expected version; an automatic or manual trigger;
+prerequisite `IndexJob` IDs; and a resolved input fingerprint when one is
+available.
 
-Use a dedicated `state_dir().join("queue.sqlite")` file and SQLx pool. Do not
-place its tables in `beholder.db`: queue migrations, retention, full `VACUUM`,
-corruption, and deletion have a different lifecycle from rebuildable semantic
-revisions.
+The daemon opens one SQLx pool at `state_dir().join("queue.sqlite")` and derives
+separate typed Apalis storage handles for the stable `index` and `enrichment`
+queues. There is no generic queue trait. Both job kinds initially run with global
+concurrency one and five total attempts, delayed by 250 ms, 500 ms, one second,
+and two seconds before attempts two through five.
 
-## Testing strategy
+### Queue lifecycle and failure policy
 
-Retain the existing focused tests for watcher intent merging, bounded storms,
-maximum batch latency, retry exhaustion, stale publication rejection, concurrent
-reads, and shutdown. Add one deterministic persistent-store integration test:
+Before a normal open, an existing `queue.sqlite` is opened read-only and must
+return exactly `ok` from `PRAGMA quick_check`. The daemon then opens the database
+with create-if-missing and runs `SqliteStorage::setup` on every startup so SQLx and
+Apalis migrations are authoritative. Open, quick-check, migration, and
+incompatible-schema failures abort startup without modifying, moving, or replacing
+the unusable file. Full `integrity_check` and any repair remain manual diagnosis.
 
-1. publish a baseline and mark its enrichment `running`;
-2. drop and reopen the daemon/store without completing it;
-3. reclaim the orphan into the retry policy;
-4. run it once and publish only if its fingerprint remains current;
-5. assert that the previous complete graph remains queryable throughout.
+A missing file, including one deleted externally after a prior daemon run, is a
+fresh queue: recreate and migrate it without a marker or reset command. Deleting
+the queue loses job history but not completed semantic state. Terminal jobs are
+retained indefinitely and Apalis vacuum is never invoked.
 
-Before repository integration is complete, extend the isolated temporary-SQLite
-prototype to cover duplicate enqueue, crash after claim,
-restart recovery, timeout shutdown, poisoned work, two concurrent workers, two
-repositories, stale-generation no-op, retention, and trace-context propagation.
-Run the same semantics suite against the current scheduler so the migration
-cannot weaken an existing guarantee.
+Once execution is enabled, a durable SQLite write or I/O failure is daemon-fatal:
+fail the current submit or acknowledgement, close intake, perform bounded shutdown,
+and exit non-zero. Startup recovers reservations before admitting work. Shutdown
+closes admission first, then gives the entire daemon one fixed ten-second deadline;
+unfinished work is recovered on restart. A publication committed before an
+acknowledgement failure may replay and is made safe by currentness guards.
 
-## Migration and scope
+### Public API and operability
 
-Migrate incrementally, preserving the current domain behavior until each Apalis
-path passes the same semantics tests. The expected implementation remains roughly
-three to five engineering weeks before cross-platform dogfood:
+The final asynchronous API remains four unary methods on `beholder.v1.Daemon`:
+`SubmitIndex`, `SubmitEnrichment`, `ListJobs`, and `GetJob`. Public IDs are opaque
+Apalis ULIDs and public statuses are queued, waiting, running, completed, and
+failed. `beholder jobs list` orders active work first and returns terminal history
+in stable 15-row keyset pages; `beholder job get` exposes typed targets, triggers,
+attempts, prerequisites or wait reasons, safe errors and warnings, timestamps, and
+typed results without raw Apalis payloads or metadata.
 
-1. add the verified native SQLite compatibility provider and validate Mnestic
-   persistence in Linux and macOS CI;
-2. add a dedicated database below the existing platform-specific daemon state
-   directory, with migration, retention, and corruption policy;
-3. keep or rebuild Beholder's desired-state reducer around the Apalis executor;
-4. preserve synchronous manual-index RPC behavior or deliberately version that
-   API;
-5. port enrichment supersession, cooperative cancellation, typed retry policy,
-   and stale-result guards;
-6. wire Beholder-specific spans, trace metadata, queue metrics, shutdown, and
-   deterministic crash tests.
+Manual indexing always enqueues and reports the new ID plus overlapping
+non-terminal work. Repository work targets every containing workspace by default,
+can be scoped to one workspace, and remains first-class standalone work when no
+workspace contains it. Manual enrichment creates or reuses one job per selected
+workspace-worker or standalone-worker target and reuses index prerequisites. The
+synchronous indexing RPCs and commands are deleted in the same slice that adds
+their asynchronous replacement; no fallback executor is retained.
 
-That work would significantly modify `crates/daemon/src/main.rs`,
-`crates/daemon/src/indexing/scheduler.rs`,
-`crates/daemon/src/indexing/enrichment.rs`, and `crates/daemon/Cargo.toml`.
-It would also force SQLite-linkage work in `crates/adapters-mnestic` before the
-queue could compile. Inventory, analyzer adapters, worker protocol, domain facts,
-query presentation, and Mnestic publication semantics should otherwise remain
-unchanged. No current module can be removed wholesale because Apalis does not own
-the hard Beholder-specific responsibilities.
+The jobs API is the lifecycle authority. Existing OpenTelemetry traces and
+structured logs carry a bounded job contract and W3C enqueue context; each attempt
+is a child of the enqueue span and retries are sibling attempts. No metrics
+pipeline or per-attempt ledger is introduced.
 
-| Adoption impact | Modules |
-| --- | --- |
-| Removed | None wholesale; only the existing wake/retry plumbing after equivalent behavior is proven. |
-| Significantly modified | `crates/daemon/src/main.rs`, `crates/daemon/src/indexing/scheduler.rs`, `crates/daemon/src/indexing/enrichment.rs`, `crates/daemon/Cargo.toml`, and SQLite linkage in `crates/adapters-mnestic`. |
-| Remain unchanged | Inventory semantics, analyzer adapters, `crates/indexing`, worker protocol and executables, domain/DTO types, query presentation, and Mnestic publication transactions. |
+## Seven-slice rollout
+
+Each executable slice directly replaces and deletes its predecessor after focused
+equivalence checks. There is no final cleanup slice or runtime fallback switch.
+Only technical dependencies block delivery; slices four and five may proceed in
+parallel with indexing work.
+
+1. [Inert Apalis queue foundation and ADR update](https://github.com/benediktms/beholder/issues/119).
+2. [Automatic indexing plus job inspection](https://github.com/benediktms/beholder/issues/120): move automatic baseline execution to `IndexJob`, add recovery, admission, shutdown and telemetry, and ship `ListJobs` and `GetJob`.
+3. [Asynchronous manual indexing command](https://github.com/benediktms/beholder/issues/121): add `SubmitIndex` and `beholder index`, then delete synchronous indexing APIs and commands.
+4. [Backend-neutral enrichment publication boundary](https://github.com/benediktms/beholder/issues/122): separate currentness and atomic publication from Mnestic execution lifecycle without changing behavior.
+5. [Stable worker-ID namespace protection](https://github.com/benediktms/beholder/issues/123): protect one namespace shared by built-in and plugin workers.
+6. [Automatic enrichment jobs](https://github.com/benediktms/beholder/issues/124): replace the in-memory executor with `EnrichmentJob` and delete Mnestic lifecycle rows and methods.
+7. [Manual enrichment and final migration evidence](https://github.com/benediktms/beholder/issues/125): add `SubmitEnrichment` and `beholder enrich`, then record the bounded Beholder and Fresha evidence.
+
+## Implementation status
+
+| Slice | Status | Current implementation |
+| --- | --- | --- |
+| 1. Inert queue foundation and ADR | Complete | Exact dependency pins, shared SQLite linkage, typed payload and storage handles, read-only quick check, create/open, startup migrations, fail-fast startup, and integration-test terminology. No producer or worker is registered. |
+| 2. Automatic indexing and inspection | Planned | The legacy automatic scheduler remains active; no Apalis producer, worker, recovery, admission, shutdown, telemetry, jobs RPC, or jobs CLI is active. |
+| 3. Manual indexing | Planned | Existing synchronous indexing APIs and commands remain unchanged. |
+| 4. Enrichment publication boundary | Planned | Current Mnestic enrichment operations remain unchanged. |
+| 5. Worker-ID namespace | Planned | Current built-in and plugin worker registration remains unchanged. |
+| 6. Automatic enrichment | Planned | The existing in-memory enrichment executor and Mnestic lifecycle state remain active. |
+| 7. Manual enrichment and evidence | Planned | No submit API or manual enrichment command exists. |
+
+This table is updated in the same change that lands each slice so accepted target
+behavior is never presented as implemented current behavior.
 
 ## Consequences
 
-- Beholder gains durable claiming, retries, worker liveness, orphan recovery, and
-  scheduling instead of maintaining those mechanisms in its daemon schedulers.
-- A new runtime dependency, queue database, migration surface, polling loop,
-  retention policy, and persistence diagnostic path are introduced.
-- Baseline recovery still validates queued work against current authoritative
-  inputs before publishing results.
-- Beholder retains the coalescing and publication rules required for correctness.
-- Mnestic and Apalis use separate SQLite files with independent migrations and
-  lifecycles.
+- Queue usability becomes part of daemon readiness even before execution moves to
+  Apalis.
+- Mnestic and Apalis use separate SQLite files with independent migrations,
+  corruption policy, retention, and deletion consequences.
 - Beholder owns a small native-link compatibility provider and must revalidate it
-  when the SQLite dependency graph changes.
+  on Linux and macOS whenever Mnestic, `sqlite`, `sqlite3-sys`, SQLx, or
+  `libsqlite3-sys` changes.
+- Durable execution removes path-specific retry, recovery, and lifecycle plumbing
+  only as each replacement slice proves equivalent domain behavior.

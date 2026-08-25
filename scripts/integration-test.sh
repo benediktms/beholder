@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(pwd)"
-state="$(mktemp -d "${TMPDIR:-/tmp}/beholder-dogfood.XXXXXX")"
+state="$(mktemp -d "${TMPDIR:-/tmp}/beholder-integration-test.XXXXXX")"
 export BEHOLDER_STATE_DIR="$state"
 export RUST_LOG="${RUST_LOG:-info,beholderd=debug}"
 socket="$state/daemon/beholder.sock"
@@ -52,34 +52,34 @@ mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
 xxd -r -p "$root/scripts/fixtures/grpc-matrix.descriptor.hex" "$state/contracts/grpc-matrix.descriptor.bin"
 mkdir -p "$state/elixir/lib"
-cp "$root/scripts/fixtures/dogfood/elixir/smoke.ex.fixture" "$state/elixir/lib/smoke.ex"
-cp "$root/scripts/fixtures/dogfood/elixir/grpc.pb.ex.fixture" "$state/elixir/lib/grpc.pb.ex"
+cp "$root/scripts/fixtures/integration-test/elixir/smoke.ex.fixture" "$state/elixir/lib/smoke.ex"
+cp "$root/scripts/fixtures/integration-test/elixir/grpc.pb.ex.fixture" "$state/elixir/lib/grpc.pb.ex"
 git -C "$state/elixir" init -q
-git -C "$state/elixir" config user.name 'Beholder Smoke'
-git -C "$state/elixir" config user.email 'smoke@beholder.local'
+git -C "$state/elixir" config user.name 'Beholder Integration Test'
+git -C "$state/elixir" config user.email 'integration-test@beholder.local'
 ssh-keygen -q -t ed25519 -N '' -f "$state/signing-key"
 git -C "$state/elixir" config gpg.format ssh
 git -C "$state/elixir" config gpg.ssh.program "$(command -v ssh-keygen)"
 git -C "$state/elixir" config user.signingkey "$state/signing-key"
 git -C "$state/elixir" config commit.gpgsign true
 git -C "$state/elixir" add lib
-git -C "$state/elixir" commit -qm 'Add Elixir smoke fixture'
+git -C "$state/elixir" commit -qm 'Add Elixir integration-test fixture'
 git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
 mkdir -p "$state/rust/src"
 printf '[dependencies]\ntonic = "0.14"\n' >"$state/rust/Cargo.toml"
-cp "$root/scripts/fixtures/dogfood/rust/protocol.rs.fixture" "$state/rust/src/protocol.rs"
-cp "$root/scripts/fixtures/dogfood/rust/generated.rs.fixture" "$state/rust/src/generated.rs"
-cp "$root/scripts/fixtures/dogfood/rust/client.rs.fixture" "$state/rust/src/client.rs"
-cp "$root/scripts/fixtures/dogfood/rust/server.rs.fixture" "$state/rust/src/server.rs"
+cp "$root/scripts/fixtures/integration-test/rust/protocol.rs.fixture" "$state/rust/src/protocol.rs"
+cp "$root/scripts/fixtures/integration-test/rust/generated.rs.fixture" "$state/rust/src/generated.rs"
+cp "$root/scripts/fixtures/integration-test/rust/client.rs.fixture" "$state/rust/src/client.rs"
+cp "$root/scripts/fixtures/integration-test/rust/server.rs.fixture" "$state/rust/src/server.rs"
 git -C "$state/rust" init -q
-git -C "$state/rust" config user.name 'Beholder Smoke'
-git -C "$state/rust" config user.email 'smoke@beholder.local'
+git -C "$state/rust" config user.name 'Beholder Integration Test'
+git -C "$state/rust" config user.email 'integration-test@beholder.local'
 git -C "$state/rust" config gpg.format ssh
 git -C "$state/rust" config gpg.ssh.program "$(command -v ssh-keygen)"
 git -C "$state/rust" config user.signingkey "$state/signing-key"
 git -C "$state/rust" config commit.gpgsign true
 git -C "$state/rust" add Cargo.toml src
-git -C "$state/rust" commit -qm 'Add Rust smoke fixture'
+git -C "$state/rust" commit -qm 'Add Rust integration-test fixture'
 git -C "$state/rust" remote add origin https://github.com/example/beholder-rust-smoke.git
 target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
     --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" \
@@ -409,4 +409,4 @@ for expected in \
 done
 trace_events="$(wc -l <"$trace_file" | tr -d ' ')"
 echo "Trace inspection passed: $trace_events events, no warnings or errors" >&2
-echo "dogfood smoke passed: indexed Rust, Elixir, and Protobuf semantics" >&2
+echo "integration test passed: indexed Rust, Elixir, and Protobuf semantics" >&2

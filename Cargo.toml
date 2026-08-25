@@ -24,6 +24,7 @@ members = [
     "crates/plugin-sdk",
     "crates/worker-client",
     "crates/worker-rust",
+    "crates/sqlite3-src",
 ]
 
 [workspace.package]
@@ -31,6 +32,9 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+apalis = "=1.0.0-rc.9"
+apalis-codec = "=0.1.0-rc.9"
+apalis-sqlite = "=1.0.0-rc.8"
 apollo-parser = "0.8.6"
 beholder-adapters-graphql = { path = "crates/adapters-graphql" }
 beholder-adapters-mnestic = { path = "crates/adapters-mnestic", default-features = false }
@@ -59,6 +63,7 @@ quick-xml = "0.38.3"
 reqwest = { version = "=0.13.1", default-features = false, features = ["blocking", "default-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sqlx = { version = "=0.8.6", default-features = false }
 toml = "1.1.4"
 tokio = "1.53.1"
 tokio-stream = "0.1.17"
@@ -67,3 +72,6 @@ tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 jsonc-parser = { version = "0.33.1", features = ["serde"] }
+
+[patch.crates-io]
+sqlite3-src = { path = "crates/sqlite3-src" }

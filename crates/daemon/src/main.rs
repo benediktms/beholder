@@ -22,6 +22,7 @@ use tonic::transport::Server;
 mod daemon;
 mod indexing;
 mod ipc;
+pub mod jobs;
 mod repository_registry;
 mod rpc;
 mod rpc_service;
@@ -42,6 +43,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
         let _lock = single_instance::acquire(&state_dir)?;
+        let _jobs = jobs::JobQueue::open(&state_dir.join("queue.sqlite")).await?;
         let socket_path = socket_path()?;
         let (listener, _socket_file) = ipc::bind_socket(&socket_path)?;
         let _observability_guard = beholder_observability::init(
