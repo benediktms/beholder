@@ -313,9 +313,16 @@ impl SemanticStore {
         if let Some(path) = &self.database_path {
             let connection = sqlite::open(path)?;
             connection.execute("PRAGMA busy_timeout = 5000")?;
-            let mut checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            if checkpoint.next()? != sqlite::State::Row || checkpoint.read::<i64, _>(0)? != 0 {
-                return Err("SQLite WAL checkpoint remained busy".into());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                if checkpoint.next()? == sqlite::State::Row && checkpoint.read::<i64, _>(0)? == 0 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("SQLite WAL checkpoint remained busy".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         Ok(())
