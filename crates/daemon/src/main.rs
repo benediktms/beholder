@@ -11,9 +11,11 @@ use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
 use beholder_observability::LogOutput;
 use beholder_protocol::v1::daemon_server::DaemonServer;
-use beholder_worker_client::{PluginRegistry, plugin_analyzer};
 #[cfg(not(test))]
-use beholder_worker_client::{WorkerAnalyzerBuilder, worker_environment_variable};
+use beholder_worker_client::{
+    ELIXIR_WORKER_ID, RUST_WORKER_ID, WorkerAnalyzerBuilder, worker_environment_variable,
+};
+use beholder_worker_client::{PluginRegistry, plugin_analyzer};
 use std::error::Error;
 #[cfg(unix)]
 use std::time::Duration;
@@ -204,7 +206,10 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity("rust", "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-7")
+        .identity(
+            RUST_WORKER_ID,
+            "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-7",
+        )
         .accept_extension("rs")
         .accept_file_name_as("Cargo.toml", AnalysisInputKind::Dependency)
         .accept_file_name_as("Cargo.lock", AnalysisInputKind::Dependency)
@@ -262,7 +267,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity("elixir", "18:10:elixir-compiler:12")
+        .identity(ELIXIR_WORKER_ID, "18:10:elixir-compiler:12")
         .timeout(std::time::Duration::from_secs(20 * 60))
         .accept_extension("ex")
         .accept_extension("exs")

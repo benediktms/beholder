@@ -2227,6 +2227,19 @@ mod tests {
             "rust-function://syntax"
         );
         assert_eq!(enrichment.metadata.id, "semantic");
+
+        let error = indexer
+            .enrich(
+                EnrichmentSnapshot {
+                    target_repository: "example/repo".into(),
+                    workspace: snapshot(),
+                    baseline: SemanticSnapshot::default(),
+                },
+                "unknown",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unknown enricher identity unknown");
         let _ = fs::remove_dir_all(cache_dir);
     }
 
