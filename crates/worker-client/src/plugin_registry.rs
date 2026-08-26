@@ -1,3 +1,4 @@
+use crate::{ELIXIR_WORKER_ID, RUST_WORKER_ID};
 use beholder_indexing::PluginDescriptor;
 use beholder_protocol::{
     descriptor_from_wire,
@@ -94,6 +95,13 @@ impl PluginRegistry {
         replace: bool,
     ) -> Result<InstalledPlugin, Box<dyn Error>> {
         descriptor.validate()?;
+        if [RUST_WORKER_ID, ELIXIR_WORKER_ID].contains(&descriptor.id.as_str()) {
+            return Err(format!(
+                "plugin ID {} is reserved for a built-in worker",
+                descriptor.id
+            )
+            .into());
+        }
         if self.plugins.contains_key(&descriptor.id) && !replace {
             return Err(
                 format!("plugin {} is already installed; use replace", descriptor.id).into(),
@@ -250,9 +258,9 @@ mod tests {
     };
     use std::{collections::BTreeSet, time::SystemTime};
 
-    fn descriptor() -> PluginDescriptor {
+    fn descriptor(id: &str) -> PluginDescriptor {
         PluginDescriptor {
-            id: "example".into(),
+            id: id.into(),
             api_version: PLUGIN_API_VERSION,
             inputs: vec![PluginInputSelector {
                 scope: PluginInputScope::Target,
@@ -278,18 +286,49 @@ mod tests {
         fs::write(&executable, b"one").unwrap();
 
         let mut registry = PluginRegistry::open(&state).unwrap();
-        let first = registry.install(&executable, descriptor(), false).unwrap();
+        for id in [RUST_WORKER_ID, ELIXIR_WORKER_ID] {
+            let error = registry
+                .install(&executable, descriptor(id), false)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("plugin ID {id} is reserved for a built-in worker")
+            );
+            assert!(registry.install(&executable, descriptor(id), true).is_err());
+        }
+
+        let first = registry
+            .install(&executable, descriptor("example"), false)
+            .unwrap();
         let first_path = registry.executable(&first);
         assert_eq!(fs::read(&first_path).unwrap(), b"one");
-        assert!(registry.install(&executable, descriptor(), false).is_err());
+        fs::write(&executable, b"collision").unwrap();
+        assert_eq!(
+            registry
+                .install(&executable, descriptor("example"), false)
+                .unwrap_err()
+                .to_string(),
+            "plugin example is already installed; use replace"
+        );
+        assert_eq!(registry.plugins().next(), Some(&first));
+        assert_eq!(fs::read(&first_path).unwrap(), b"one");
 
         fs::write(&executable, b"two").unwrap();
-        let second = registry.install(&executable, descriptor(), true).unwrap();
+        let second = registry
+            .install(&executable, descriptor("example"), true)
+            .unwrap();
         assert_ne!(first.digest, second.digest);
         assert_eq!(fs::read(&first_path).unwrap(), b"one");
         assert_eq!(fs::read(registry.executable(&second)).unwrap(), b"two");
 
         let mut reloaded = PluginRegistry::open(&state).unwrap();
+        assert_eq!(
+            reloaded
+                .plugins()
+                .map(|plugin| plugin.descriptor.id.as_str())
+                .collect::<Vec<_>>(),
+            ["example"]
+        );
         assert_eq!(reloaded.plugins().next(), Some(&second));
         assert!(reloaded.remove("example").unwrap());
         assert!(

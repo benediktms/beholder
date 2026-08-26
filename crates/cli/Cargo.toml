@@ -26,3 +26,6 @@ beholder-worker-client.workspace = true
 clap = { version = "4.6.6", features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+beholder-indexing.workspace = true

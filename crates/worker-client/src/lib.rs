@@ -35,6 +35,9 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const WORKER_SETTINGS: [&str; 2] = ["MAX_OUTPUT_BYTES", "TIMEOUT_MS"];
 static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub const RUST_WORKER_ID: &str = "rust";
+pub const ELIXIR_WORKER_ID: &str = "elixir";
+
 pub fn worker_environment_variable(worker: &str, setting: &str) -> String {
     let normalize = |value: &str| {
         value

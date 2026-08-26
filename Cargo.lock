@@ -511,6 +511,7 @@ dependencies = [
  "beholder-daemon-client",
  "beholder-domain",
  "beholder-dto",
+ "beholder-indexing",
  "beholder-observability",
  "beholder-presentation",
  "beholder-protocol",
