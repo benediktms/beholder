@@ -4694,6 +4694,15 @@ mod tests {
         );
         assert!(scheduler.generations.lock().unwrap().is_empty());
 
+        scheduler.add_event(
+            Ok(event(
+                EventKind::Create(notify::event::CreateKind::File),
+                repository.join(".moon/cache/ciReport.json"),
+            )),
+            &registry,
+        );
+        assert!(scheduler.generations.lock().unwrap().is_empty());
+
         let head = beholder_adapters_git::repository_watch_paths(&repository)
             .unwrap()
             .into_iter()

@@ -67,6 +67,7 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
     matches!(
         name,
         ".git"
+            | ".moon"
             | ".next"
             | ".next-server"
             | ".terraform"
