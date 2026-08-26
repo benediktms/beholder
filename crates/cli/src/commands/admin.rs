@@ -6,8 +6,8 @@ use crate::stdout;
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_daemon_client::{
     clear_cache, delete_repository, garbage_collect, get_garbage_collection_status, get_repository,
-    get_status, index_repository, list_workspaces, register_repository, register_workspace,
-    set_workspace_plugin, state_dir,
+    get_status, list_workspaces, register_repository, register_workspace, set_workspace_plugin,
+    state_dir,
 };
 use beholder_dto::{
     AnalysisCompleteness, GarbageCollectionEvent, GarbageCollectionPhase,
@@ -127,22 +127,6 @@ pub(super) async fn repository(command: RepositoryCommand) -> Result<(), Box<dyn
         }
         RepositoryCommand::Show { identity } => {
             print_repository(&get_repository(identity).await?)?;
-        }
-        RepositoryCommand::Index { identity } => {
-            let (repository, observations, published) = index_repository(identity, false).await?;
-            print_repository(&repository)?;
-            stdout(format_args!(
-                "{observations} observations · {}",
-                if published { "published" } else { "unchanged" }
-            ))?;
-        }
-        RepositoryCommand::Refresh { identity } => {
-            let (repository, observations, published) = index_repository(identity, true).await?;
-            print_repository(&repository)?;
-            stdout(format_args!(
-                "{observations} observations · {}",
-                if published { "published" } else { "unchanged" }
-            ))?;
         }
     }
     Ok(())

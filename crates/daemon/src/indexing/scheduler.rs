@@ -1,7 +1,8 @@
 use crate::{
     jobs::{
-        IndexJob as DurableIndexJob, IndexJobResult, IndexOutcome, IndexTarget, JobQueue,
-        JobTrigger, RepositoryChange as DurableChange, RepositoryIntent as DurableIntent,
+        IndexDestination, IndexDestinationResult, IndexJob as DurableIndexJob, IndexJobResult,
+        IndexOutcome, IndexTarget, JobQueue, JobTrigger, RepositoryChange as DurableChange,
+        RepositoryIntent as DurableIntent,
     },
     workspace_registry::WorkspaceRegistry,
 };
@@ -1312,9 +1313,98 @@ impl IndexScheduler {
         workspaces: &Mutex<WorkspaceRegistry>,
         job: &DurableIndexJob,
     ) -> Result<IndexJobResult, String> {
-        let IndexTarget::Workspace { workspace } = &job.target else {
-            return Err("automatic index job target is not a workspace".into());
+        let destinations = match (&job.trigger, &job.target) {
+            (JobTrigger::Automatic, IndexTarget::Workspace { workspace }) => {
+                vec![self.run_automatic_workspace_job(store, workspaces, job, workspace)?]
+            }
+            (JobTrigger::Automatic, IndexTarget::Repository { .. }) => {
+                return Err("automatic index jobs must target one workspace".into());
+            }
+            (JobTrigger::Manual, IndexTarget::Workspace { workspace }) => {
+                let workspace = workspaces
+                    .lock()
+                    .map_err(|_| "workspace registry lock poisoned")?
+                    .get(workspace)
+                    .cloned()
+                    .ok_or_else(|| format!("workspace is no longer registered: {workspace}"))?;
+                vec![self.run_manual_workspace(store, &workspace, None, true)?]
+            }
+            (
+                JobTrigger::Manual,
+                IndexTarget::Repository {
+                    repository,
+                    workspace_scope,
+                },
+            ) => {
+                let (registered, targets) = {
+                    let registry = workspaces
+                        .lock()
+                        .map_err(|_| "workspace registry lock poisoned")?;
+                    let registered = registry.repository(repository).cloned().ok_or_else(|| {
+                        format!("repository is no longer registered: {repository}")
+                    })?;
+                    let targets = if let Some(scope) = workspace_scope {
+                        let workspace = registry
+                            .get(scope)
+                            .cloned()
+                            .ok_or_else(|| format!("workspace is no longer registered: {scope}"))?;
+                        if !workspace
+                            .repositories
+                            .iter()
+                            .any(|candidate| candidate.repository.identity == *repository)
+                        {
+                            return Err(format!(
+                                "repository {repository} is not in workspace {scope}"
+                            ));
+                        }
+                        vec![workspace]
+                    } else {
+                        registry.workspaces_referencing_repository(repository)
+                    };
+                    (registered, targets)
+                };
+                if targets.is_empty() {
+                    let (observation_count, published) = self
+                        .index_repository(store, &registered.selection, true)
+                        .map_err(|error| error.to_string())?;
+                    vec![IndexDestinationResult {
+                        destination: IndexDestination::StandaloneRepository {
+                            repository: repository.clone(),
+                        },
+                        observation_count,
+                        published,
+                        outcome: if published {
+                            IndexOutcome::Published
+                        } else {
+                            IndexOutcome::Unchanged
+                        },
+                    }]
+                } else {
+                    targets
+                        .iter()
+                        .enumerate()
+                        .map(|(index, workspace)| {
+                            self.run_manual_workspace(
+                                store,
+                                workspace,
+                                Some(repository),
+                                index == 0,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+            }
         };
+        Ok(IndexJobResult { destinations })
+    }
+
+    fn run_automatic_workspace_job(
+        &self,
+        store: &SemanticStore,
+        workspaces: &Mutex<WorkspaceRegistry>,
+        job: &DurableIndexJob,
+        workspace: &str,
+    ) -> Result<IndexDestinationResult, String> {
         let generation_current = self
             .generations
             .lock()
@@ -1323,8 +1413,10 @@ impl IndexScheduler {
             .copied()
             == job.generation;
         if !generation_current {
-            return Ok(IndexJobResult {
-                workspace: workspace.clone(),
+            return Ok(IndexDestinationResult {
+                destination: IndexDestination::Workspace {
+                    workspace: workspace.into(),
+                },
                 observation_count: 0,
                 published: false,
                 outcome: IndexOutcome::Superseded,
@@ -1359,8 +1451,10 @@ impl IndexScheduler {
         match result {
             Ok((observation_count, published)) => {
                 self.complete_generation(workspace, job.generation);
-                Ok(IndexJobResult {
-                    workspace: workspace.clone(),
+                Ok(IndexDestinationResult {
+                    destination: IndexDestination::Workspace {
+                        workspace: workspace.into(),
+                    },
                     observation_count,
                     published,
                     outcome: if published {
@@ -1375,8 +1469,10 @@ impl IndexScheduler {
                     generations.get(workspace).copied() != job.generation
                 }) =>
             {
-                Ok(IndexJobResult {
-                    workspace: workspace.clone(),
+                Ok(IndexDestinationResult {
+                    destination: IndexDestination::Workspace {
+                        workspace: workspace.into(),
+                    },
                     observation_count: 0,
                     published: false,
                     outcome: IndexOutcome::Superseded,
@@ -1384,6 +1480,58 @@ impl IndexScheduler {
             }
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    fn run_manual_workspace(
+        &self,
+        store: &SemanticStore,
+        workspace: &Workspace,
+        repository: Option<&str>,
+        reconcile: bool,
+    ) -> Result<IndexDestinationResult, String> {
+        let generation = self
+            .generations
+            .lock()
+            .map_err(|_| "index generations lock poisoned")?
+            .get(&workspace.name)
+            .copied();
+        let mut dirty = self
+            .dirty_repositories
+            .lock()
+            .map_err(|_| "dirty repository lock poisoned")?
+            .get(&workspace.name)
+            .cloned()
+            .unwrap_or_default();
+        for candidate in &workspace.repositories {
+            if repository.is_none_or(|repository| candidate.repository.identity == repository)
+                && (repository.is_none() || reconcile)
+            {
+                dirty
+                    .entry(candidate.repository.identity.clone())
+                    .or_default()
+                    .apply(RepositoryIntent::Reconcile);
+            }
+        }
+        let result = match self.begin(&workspace.name) {
+            Ok(_active) => {
+                index_workspace_through_port(self, store, workspace, Some(&dirty), generation, true)
+            }
+            Err(error) => Err(Box::new(error) as Box<dyn Error>),
+        }
+        .map_err(|error| error.to_string())?;
+        self.complete_generation(&workspace.name, generation);
+        Ok(IndexDestinationResult {
+            destination: IndexDestination::Workspace {
+                workspace: workspace.name.clone(),
+            },
+            observation_count: result.0,
+            published: result.1,
+            outcome: if result.1 {
+                IndexOutcome::Published
+            } else {
+                IndexOutcome::Unchanged
+            },
+        })
     }
 
     pub(crate) fn automatic_job_failed(
@@ -4555,6 +4703,110 @@ mod tests {
     }
 
     #[test]
+    fn manual_repository_job_fans_out_scopes_and_falls_back_to_standalone() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-manual-index-{unique}"));
+        let shared = state.join("shared");
+        let standalone = state.join("standalone");
+        fs::create_dir_all(shared.join("src")).unwrap();
+        fs::create_dir_all(standalone.join("src")).unwrap();
+        fs::write(shared.join("src/lib.rs"), "fn shared() {}").unwrap();
+        fs::write(standalone.join("src/lib.rs"), "fn standalone() {}").unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let first = registry
+            .register("first".into(), vec![shared.clone()], Vec::new())
+            .unwrap();
+        registry
+            .register("second".into(), vec![shared], Vec::new())
+            .unwrap();
+        let shared_identity = first.repositories[0].repository.identity.clone();
+        let standalone_identity = registry
+            .register_repository(standalone)
+            .unwrap()
+            .selection
+            .repository
+            .identity;
+        let registry = Mutex::new(registry);
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::memory().unwrap();
+        let manual = |target| DurableIndexJob {
+            target,
+            trigger: JobTrigger::Manual,
+            prerequisite_index_jobs: Vec::new(),
+            generation: None,
+            repository_intents: Vec::new(),
+        };
+
+        let fanout = scheduler
+            .run_index_job(
+                &store,
+                &registry,
+                &manual(IndexTarget::Repository {
+                    repository: shared_identity.clone(),
+                    workspace_scope: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            fanout
+                .destinations
+                .iter()
+                .map(|result| &result.destination)
+                .collect::<Vec<_>>(),
+            [
+                &IndexDestination::Workspace {
+                    workspace: "first".into()
+                },
+                &IndexDestination::Workspace {
+                    workspace: "second".into()
+                },
+            ]
+        );
+        assert!(fanout.destinations.iter().all(|result| result.published));
+
+        let scoped = scheduler
+            .run_index_job(
+                &store,
+                &registry,
+                &manual(IndexTarget::Repository {
+                    repository: shared_identity,
+                    workspace_scope: Some("second".into()),
+                }),
+            )
+            .unwrap();
+        assert_eq!(scoped.destinations.len(), 1);
+        assert_eq!(
+            scoped.destinations[0].destination,
+            IndexDestination::Workspace {
+                workspace: "second".into()
+            }
+        );
+        assert_eq!(scoped.destinations[0].outcome, IndexOutcome::Unchanged);
+
+        let standalone = scheduler
+            .run_index_job(
+                &store,
+                &registry,
+                &manual(IndexTarget::Repository {
+                    repository: standalone_identity.clone(),
+                    workspace_scope: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            standalone.destinations[0].destination,
+            IndexDestination::StandaloneRepository {
+                repository: standalone_identity
+            }
+        );
+        assert!(standalone.destinations[0].published);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn superseded_job_stays_active_until_durable_acknowledgement() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4587,7 +4839,7 @@ mod tests {
 
         let result = scheduler.run_index_job(&store, &workspaces, &job).unwrap();
 
-        assert_eq!(result.outcome, IndexOutcome::Superseded);
+        assert_eq!(result.destinations[0].outcome, IndexOutcome::Superseded);
         assert!(
             scheduler
                 .automatic_jobs

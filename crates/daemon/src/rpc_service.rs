@@ -1,7 +1,9 @@
 use crate::daemon::{BeholderDaemon, collect_garbage, start_claimed_garbage_collector};
-use crate::jobs::{self, StoredJob, StoredJobKind, StoredJobStatus, StoredJobTarget};
+use crate::jobs::{
+    self, IndexJob, IndexTarget, StoredJob, StoredJobKind, StoredJobStatus, StoredJobTarget,
+};
 use crate::repository_registry::RegisteredRepository;
-use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, SourceAnalysisError};
+use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind};
 use beholder_dto::{
     DEFAULT_MAX_HOPS, GarbageCollectionPhase,
     GarbageCollectionProgress as DtoGarbageCollectProgress,
@@ -14,13 +16,13 @@ use beholder_protocol::v1::{
     GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
     GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetJobRequest,
     GetJobResponse, GetRepositoryRequest, GetStatusRequest, GetStatusResponse, ImpactResponse,
-    IndexJobOutcome, IndexRepositoryRequest, IndexRepositoryResponse, Job, JobStatus, JobSummary,
-    JobTarget, JobTrigger, JobType, JobWaitReason, ListJobsRequest, ListJobsResponse,
-    ListWorkspacesRequest, ListWorkspacesResponse, PathRequest, RegisterRepositoryRequest,
-    RegisterWorkspaceRequest, RegisterWorkspaceResponse, ReindexWorkspaceRequest,
-    ReindexWorkspaceResponse, RepositoryResponse, SetWorkspacePluginRequest,
-    SetWorkspacePluginResponse, StopRequest, StopResponse, TraceResponse, TraversalEntityRequest,
-    WhyResponse, daemon_server::Daemon, garbage_collect_event, job_target,
+    IndexJobOutcome, Job, JobStatus, JobSummary, JobTarget, JobTrigger, JobType, JobWaitReason,
+    ListJobsRequest, ListJobsResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
+    RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
+    RepositoryResponse, SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest,
+    StopResponse, SubmitIndexRequest, SubmitIndexResponse, TraceResponse, TraversalEntityRequest,
+    WhyResponse, daemon_server::Daemon, garbage_collect_event, index_destination, job_target,
+    submit_index_request,
 };
 use std::{error::Error, path::PathBuf, sync::atomic::Ordering};
 use tokio::sync::mpsc;
@@ -272,7 +274,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 18,
+            protocol_version: 19,
             pid: std::process::id(),
         }))
     }
@@ -317,6 +319,102 @@ impl Daemon for BeholderDaemon {
         }))
     }
 
+    #[tracing::instrument(name = "rpc.submit_index", skip_all, err)]
+    async fn submit_index(
+        &self,
+        request: Request<SubmitIndexRequest>,
+    ) -> Result<Response<SubmitIndexResponse>, Status> {
+        let target = match request
+            .into_inner()
+            .target
+            .ok_or_else(|| Status::invalid_argument("index target is required"))?
+        {
+            submit_index_request::Target::Workspace(workspace) => {
+                let registry = self
+                    .workspaces
+                    .lock()
+                    .map_err(|_| repository_registry_unavailable())?;
+                if registry.get(&workspace).is_none() {
+                    return Err(operation_status(BeholderError::new(
+                        BeholderErrorKind::NotFound,
+                        BeholderErrorCode::WorkspaceNotRegistered,
+                        format!("workspace not registered: {workspace}"),
+                    )));
+                }
+                IndexTarget::Workspace { workspace }
+            }
+            submit_index_request::Target::Repository(repository) => {
+                let registry = self
+                    .workspaces
+                    .lock()
+                    .map_err(|_| repository_registry_unavailable())?;
+                if registry.repository(&repository.repository).is_none() {
+                    return Err(operation_status(BeholderError::new(
+                        BeholderErrorKind::NotFound,
+                        BeholderErrorCode::RepositoryNotRegistered,
+                        format!("repository not registered: {}", repository.repository),
+                    )));
+                }
+                if let Some(scope) = repository.workspace_scope.as_deref() {
+                    let workspace = registry.get(scope).ok_or_else(|| {
+                        operation_status(BeholderError::new(
+                            BeholderErrorKind::NotFound,
+                            BeholderErrorCode::WorkspaceNotRegistered,
+                            format!("workspace not registered: {scope}"),
+                        ))
+                    })?;
+                    if !workspace
+                        .repositories
+                        .iter()
+                        .any(|candidate| candidate.repository.identity == repository.repository)
+                    {
+                        return Err(Status::invalid_argument(format!(
+                            "repository {} is not in workspace {scope}",
+                            repository.repository
+                        )));
+                    }
+                }
+                IndexTarget::Repository {
+                    repository: repository.repository,
+                    workspace_scope: repository.workspace_scope,
+                }
+            }
+        };
+        let workspaces = self
+            .workspaces
+            .lock()
+            .map_err(|_| repository_registry_unavailable())?
+            .list();
+        let job = IndexJob {
+            target,
+            trigger: jobs::JobTrigger::Manual,
+            prerequisite_index_jobs: Vec::new(),
+            generation: None,
+            repository_intents: Vec::new(),
+        };
+        let (id, overlapping) = self
+            .jobs
+            .enqueue_manual_index(job, &workspaces)
+            .await
+            .map_err(|error| {
+                if error.to_string() == "job admission is closed" {
+                    Status::unavailable("job admission is closed")
+                } else {
+                    Status::internal(error.to_string())
+                }
+            })?;
+        let submitted = self
+            .jobs
+            .get(&id.0)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::internal("submitted index job disappeared"))?;
+        Ok(Response::new(SubmitIndexResponse {
+            job: Some(job_summary(submitted)),
+            overlapping_jobs: overlapping.into_iter().map(job_summary).collect(),
+        }))
+    }
+
     #[tracing::instrument(name = "rpc.register_repository", skip_all, err)]
     async fn register_repository(
         &self,
@@ -345,7 +443,6 @@ impl Daemon for BeholderDaemon {
     #[tracing::instrument(
         name = "rpc.get_repository",
         skip_all,
-        err,
         fields(repository = %request.get_ref().identity)
     )]
     async fn get_repository(
@@ -355,80 +452,6 @@ impl Daemon for BeholderDaemon {
         let registered = self.registered_repository(&request.into_inner().identity)?;
         Ok(Response::new(RepositoryResponse {
             repository: Some(self.repository_status(&registered)?.into()),
-        }))
-    }
-
-    #[tracing::instrument(
-        name = "rpc.index_repository",
-        skip_all,
-        err,
-        fields(repository = %request.get_ref().identity, authoritative = request.get_ref().authoritative)
-    )]
-    async fn index_repository(
-        &self,
-        request: Request<IndexRepositoryRequest>,
-    ) -> Result<Response<IndexRepositoryResponse>, Status> {
-        let request = request.into_inner();
-        let registered = self.registered_repository(&request.identity)?;
-        let selection = registered.selection.clone();
-        let scheduler = self.scheduler.clone();
-        let store = self.store.clone();
-        let parent = tracing::Span::current();
-        let (observation_count, published) = tokio::task::spawn_blocking(move || {
-            parent.in_scope(|| {
-                scheduler
-                    .index_repository(&store, &selection, request.authoritative)
-                    .map_err(|error| {
-                        (
-                            error
-                                .downcast_ref::<SourceAnalysisError>()
-                                .is_some_and(SourceAnalysisError::is_unsafe_recovery),
-                            error.to_string(),
-                        )
-                    })
-            })
-        })
-        .await
-        .map_err(|source| {
-            operation_status(
-                BeholderError::new(
-                    BeholderErrorKind::Internal,
-                    BeholderErrorCode::RepositoryIndexWorkerFailed,
-                    "repository index worker failed",
-                )
-                .with_source(source),
-            )
-        })?
-        .map_err(|(unsafe_recovery, source)| {
-            let (code, message) = if unsafe_recovery {
-                (
-                    BeholderErrorCode::SourceRecoveryUnsafe,
-                    "source recovery was unsafe; the previous repository revision remains active",
-                )
-            } else {
-                (
-                    BeholderErrorCode::RepositoryIndexFailed,
-                    "repository indexing failed",
-                )
-            };
-            operation_status(
-                BeholderError::new(BeholderErrorKind::FailedPrecondition, code, message)
-                    .with_source(std::io::Error::other(source)),
-            )
-        })?;
-        if published {
-            self.scheduler.schedule_checkpoint(self.store.clone());
-        }
-        Ok(Response::new(IndexRepositoryResponse {
-            repository: Some(self.repository_status(&registered)?.into()),
-            observation_count: observation_count.try_into().map_err(|_| {
-                operation_status(BeholderError::new(
-                    BeholderErrorKind::Internal,
-                    BeholderErrorCode::RepositoryObservationCountOverflow,
-                    "repository observation count exceeds protocol capacity",
-                ))
-            })?,
-            published,
         }))
     }
 
@@ -448,94 +471,6 @@ impl Daemon for BeholderDaemon {
             self.store
                 .impact_snapshot(&request.workspace, &request.entity, max_hops),
         )
-    }
-
-    #[tracing::instrument(
-        name = "rpc.reindex_workspace",
-        skip_all,
-        err,
-        fields(workspace = %request.get_ref().workspace)
-    )]
-    async fn reindex_workspace(
-        &self,
-        request: Request<ReindexWorkspaceRequest>,
-    ) -> Result<Response<ReindexWorkspaceResponse>, Status> {
-        let workspace_name = request.into_inner().workspace;
-        let workspace = self
-            .workspaces
-            .lock()
-            .map_err(|_| {
-                operation_status(BeholderError::new(
-                    BeholderErrorKind::Internal,
-                    BeholderErrorCode::WorkspaceRegistryFailed,
-                    "workspace registry is unavailable",
-                ))
-            })?
-            .get(&workspace_name)
-            .cloned()
-            .ok_or_else(|| {
-                operation_status(BeholderError::new(
-                    BeholderErrorKind::NotFound,
-                    BeholderErrorCode::WorkspaceNotRegistered,
-                    format!("workspace not registered: {workspace_name}"),
-                ))
-            })?;
-        let scheduler = self.scheduler.clone();
-        let store = self.store.clone();
-        let parent = tracing::Span::current();
-        let (observation_count, published) = tokio::task::spawn_blocking(move || {
-            parent.in_scope(|| {
-                scheduler.index(&store, &workspace).map_err(|error| {
-                    (
-                        error
-                            .downcast_ref::<SourceAnalysisError>()
-                            .is_some_and(SourceAnalysisError::is_unsafe_recovery),
-                        error.to_string(),
-                    )
-                })
-            })
-        })
-        .await
-        .map_err(|source| {
-            operation_status(
-                BeholderError::new(
-                    BeholderErrorKind::Internal,
-                    BeholderErrorCode::WorkspaceIndexWorkerFailed,
-                    "workspace index worker failed",
-                )
-                .with_source(source),
-            )
-        })?
-        .map_err(|(unsafe_recovery, source)| {
-            let (code, message) = if unsafe_recovery {
-                (
-                    BeholderErrorCode::SourceRecoveryUnsafe,
-                    "source recovery was unsafe; the previous analysis remains active",
-                )
-            } else {
-                (
-                    BeholderErrorCode::WorkspaceIndexFailed,
-                    "workspace indexing failed",
-                )
-            };
-            operation_status(
-                BeholderError::new(BeholderErrorKind::FailedPrecondition, code, message)
-                    .with_source(std::io::Error::other(source)),
-            )
-        })?;
-        if published {
-            self.scheduler.schedule_checkpoint(self.store.clone());
-        }
-        Ok(Response::new(ReindexWorkspaceResponse {
-            observation_count: observation_count.try_into().map_err(|_| {
-                operation_status(BeholderError::new(
-                    BeholderErrorKind::Internal,
-                    BeholderErrorCode::WorkspaceObservationCountOverflow,
-                    "workspace observation count exceeds protocol capacity",
-                ))
-            })?,
-            published,
-        }))
     }
 
     #[tracing::instrument(name = "rpc.list_workspaces", skip_all, err)]
@@ -798,15 +733,30 @@ fn job_detail(job: StoredJob) -> Job {
         index_result: job
             .result
             .map(|result| beholder_protocol::v1::IndexJobResult {
-                workspace: result.workspace,
-                observation_count: result.observation_count as u64,
-                published: result.published,
-                outcome: match result.outcome {
-                    jobs::IndexOutcome::Published => IndexJobOutcome::Published,
-                    jobs::IndexOutcome::Unchanged => IndexJobOutcome::Unchanged,
-                    jobs::IndexOutcome::Superseded => IndexJobOutcome::Superseded,
-                }
-                .into(),
+                destinations: result
+                    .destinations
+                    .into_iter()
+                    .map(|result| beholder_protocol::v1::IndexDestinationResult {
+                        destination: Some(beholder_protocol::v1::IndexDestination {
+                            destination: Some(match result.destination {
+                                jobs::IndexDestination::Workspace { workspace } => {
+                                    index_destination::Destination::Workspace(workspace)
+                                }
+                                jobs::IndexDestination::StandaloneRepository { repository } => {
+                                    index_destination::Destination::StandaloneRepository(repository)
+                                }
+                            }),
+                        }),
+                        observation_count: result.observation_count as u64,
+                        published: result.published,
+                        outcome: match result.outcome {
+                            jobs::IndexOutcome::Published => IndexJobOutcome::Published,
+                            jobs::IndexOutcome::Unchanged => IndexJobOutcome::Unchanged,
+                            jobs::IndexOutcome::Superseded => IndexJobOutcome::Superseded,
+                        }
+                        .into(),
+                    })
+                    .collect(),
             }),
     }
 }

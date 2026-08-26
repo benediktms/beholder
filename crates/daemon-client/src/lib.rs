@@ -11,16 +11,21 @@ use beholder_protocol::{
         GarbageCollectEvent as ProtocolGarbageCollectEvent, GarbageCollectPhase,
         GarbageCollectProgress as ProtocolGarbageCollectProgress, GarbageCollectRequest,
         GetGarbageCollectionStatusRequest, GetJobRequest, GetJobResponse, GetRepositoryRequest,
-        GetStatusRequest, GetStatusResponse, IndexRepositoryRequest, ListJobsRequest,
-        ListJobsResponse, ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest,
-        RegisterWorkspaceRequest, ReindexWorkspaceRequest, SetWorkspacePluginRequest, StopRequest,
-        TraversalEntityRequest, daemon_client::DaemonClient, garbage_collect_event,
+        GetStatusRequest, GetStatusResponse, ListJobsRequest, ListJobsResponse,
+        ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
+        RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest, SubmitIndexRequest,
+        SubmitIndexResponse, TraversalEntityRequest, daemon_client::DaemonClient,
+        garbage_collect_event, submit_index_request,
     },
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tonic::{Code, Request, Status, transport::Channel};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const SUBMIT_INDEX_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn socket_path() -> Result<PathBuf, String> {
     Ok(state_dir()?.join("beholder.sock"))
@@ -81,6 +86,40 @@ pub async fn get_job(id: String) -> Result<GetJobResponse, Box<dyn std::error::E
         .await?
         .get_job(request(GetJobRequest { id }))
         .await?
+        .into_inner())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum IndexTarget {
+    Workspace(String),
+    Repository {
+        repository: String,
+        workspace_scope: Option<String>,
+    },
+}
+
+pub async fn submit_index(
+    target: IndexTarget,
+) -> Result<SubmitIndexResponse, Box<dyn std::error::Error>> {
+    let target = match target {
+        IndexTarget::Workspace(workspace) => submit_index_request::Target::Workspace(workspace),
+        IndexTarget::Repository {
+            repository,
+            workspace_scope,
+        } => submit_index_request::Target::Repository(RepositoryIndexTarget {
+            repository,
+            workspace_scope,
+        }),
+    };
+    let mut request = request(SubmitIndexRequest {
+        target: Some(target),
+    });
+    request.set_timeout(SUBMIT_INDEX_TIMEOUT);
+    Ok(operation_client()
+        .await?
+        .submit_index(request)
+        .await
+        .map_err(operation_error)?
         .into_inner())
 }
 
@@ -276,24 +315,6 @@ pub async fn why(
         .try_into()?)
 }
 
-pub async fn reindex_workspace(workspace: String) -> Result<(usize, bool), BeholderError> {
-    let response = operation_client()
-        .await?
-        .reindex_workspace(request(ReindexWorkspaceRequest { workspace }))
-        .await
-        .map_err(operation_error)?
-        .into_inner();
-    let observation_count = response.observation_count.try_into().map_err(|source| {
-        BeholderError::new(
-            BeholderErrorKind::Internal,
-            BeholderErrorCode::WorkspaceObservationCountOverflow,
-            "workspace observation count exceeds client capacity",
-        )
-        .with_source(source)
-    })?;
-    Ok((observation_count, response.published))
-}
-
 async fn operation_client() -> Result<DaemonClient<Channel>, BeholderError> {
     let endpoint = endpoint().map_err(|source| {
         BeholderError::new(
@@ -404,34 +425,12 @@ pub async fn delete_repository(identity: String) -> Result<u64, Box<dyn std::err
         .repository_states_queued)
 }
 
-pub async fn index_repository(
-    identity: String,
-    authoritative: bool,
-) -> Result<(RepositoryStatus, usize, bool), Box<dyn std::error::Error>> {
-    let response = operation_client()
-        .await?
-        .index_repository(request(IndexRepositoryRequest {
-            identity,
-            authoritative,
-        }))
-        .await
-        .map_err(operation_error)?
-        .into_inner();
-    Ok((
-        response
-            .repository
-            .ok_or("daemon returned no repository")?
-            .try_into()?,
-        response.observation_count.try_into()?,
-        response.published,
-    ))
-}
-
 pub async fn list_workspaces() -> Result<Vec<Workspace>, Box<dyn std::error::Error>> {
-    connect()
+    operation_client()
         .await?
         .list_workspaces(request(ListWorkspacesRequest {}))
-        .await?
+        .await
+        .map_err(operation_error)?
         .into_inner()
         .workspaces
         .into_iter()

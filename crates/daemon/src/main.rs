@@ -372,14 +372,41 @@ mod tests {
         v1::{
             ClearCacheRequest, DeleteRepositoryRequest, EntityKind, EntityRequest, EvidenceKind,
             GarbageCollectPhase, GarbageCollectRequest, GetGarbageCollectionStatusRequest,
-            GetJobRequest, GetRepositoryRequest, GetStatusRequest, IndexRepositoryRequest,
-            JobStatus, JobTrigger, JobType, ListJobsRequest, ListWorkspacesRequest, PathRequest,
-            RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-            RelationKind, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
-            garbage_collect_event,
+            GetJobRequest, GetRepositoryRequest, GetStatusRequest, JobStatus, JobTrigger, JobType,
+            ListJobsRequest, ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest,
+            RegisterWorkspaceRequest, RelationKind, RepositoryIndexTarget, StopRequest,
+            SubmitIndexRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+            garbage_collect_event, submit_index_request,
         },
     };
     use std::{env, fs, path::Path, time::Duration};
+
+    async fn wait_for_job(
+        client: &mut DaemonClient<tonic::transport::Channel>,
+        id: String,
+    ) -> beholder_protocol::v1::Job {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let job = client
+                    .get_job(GetJobRequest { id: id.clone() })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .job
+                    .unwrap();
+                if job
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.status == JobStatus::Completed as i32)
+                {
+                    break job;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("index job did not complete")
+    }
 
     #[tokio::test]
     async fn daemon_smoke() {
@@ -457,7 +484,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 18);
+        assert_eq!(status.protocol_version, 19);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");
@@ -478,17 +505,29 @@ mod tests {
             .unwrap();
         let identity = registered_repository.repository.unwrap().identity;
         assert!(registered_repository.revision.is_none());
-        let indexed_repository = client
-            .index_repository(IndexRepositoryRequest {
-                identity: identity.clone(),
-                authoritative: false,
+        let submitted = client
+            .submit_index(SubmitIndexRequest {
+                target: Some(submit_index_request::Target::Repository(
+                    RepositoryIndexTarget {
+                        repository: identity.clone(),
+                        workspace_scope: None,
+                    },
+                )),
             })
             .await
             .unwrap()
             .into_inner();
-        assert!(indexed_repository.published);
-        assert!(indexed_repository.observation_count > 0);
-        assert!(indexed_repository.repository.unwrap().revision.is_some());
+        assert!(submitted.overlapping_jobs.is_empty());
+        let first_job = submitted.job.unwrap();
+        let first_id = first_job.id.clone();
+        let indexed_repository = wait_for_job(&mut client, first_job.id).await;
+        let destination = &indexed_repository
+            .index_result
+            .as_ref()
+            .unwrap()
+            .destinations[0];
+        assert!(destination.published);
+        assert!(destination.observation_count > 0);
         assert!(
             client
                 .get_repository(GetRepositoryRequest {
@@ -502,15 +541,27 @@ mod tests {
                 .revision
                 .is_some()
         );
+        let submitted_again = client
+            .submit_index(SubmitIndexRequest {
+                target: Some(submit_index_request::Target::Repository(
+                    RepositoryIndexTarget {
+                        repository: identity.clone(),
+                        workspace_scope: None,
+                    },
+                )),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .job
+            .unwrap();
+        assert_ne!(submitted_again.id, first_id);
         assert!(
-            !client
-                .index_repository(IndexRepositoryRequest {
-                    identity: identity.clone(),
-                    authoritative: true,
-                })
+            !wait_for_job(&mut client, submitted_again.id)
                 .await
+                .index_result
                 .unwrap()
-                .into_inner()
+                .destinations[0]
                 .published
         );
         assert_eq!(
@@ -564,8 +615,8 @@ mod tests {
         );
 
         let missing = client
-            .reindex_workspace(ReindexWorkspaceRequest {
-                workspace: "missing".into(),
+            .submit_index(SubmitIndexRequest {
+                target: Some(submit_index_request::Target::Workspace("missing".into())),
             })
             .await
             .unwrap_err();
@@ -703,7 +754,14 @@ mod tests {
         assert!(detail.run_at_ms.is_some());
         assert!(detail.started_at_ms.is_some());
         assert!(detail.completed_at_ms.is_some());
-        assert!(detail.index_result.unwrap().published);
+        assert!(
+            detail
+                .index_result
+                .unwrap()
+                .destinations
+                .iter()
+                .any(|destination| destination.published)
+        );
         let protobuf = client
             .context(EntityRequest {
                 workspace: "main".into(),
@@ -725,14 +783,16 @@ mod tests {
                     .all(|evidence| evidence.source == EvidenceKind::Descriptor as i32)
         }));
         let unchanged = client
-            .reindex_workspace(ReindexWorkspaceRequest {
-                workspace: "main".into(),
+            .submit_index(SubmitIndexRequest {
+                target: Some(submit_index_request::Target::Workspace("main".into())),
             })
             .await
             .unwrap()
-            .into_inner();
-        assert!(!unchanged.published);
-        assert_eq!(unchanged.observation_count, 0);
+            .into_inner()
+            .job
+            .unwrap();
+        let unchanged = wait_for_job(&mut client, unchanged.id).await;
+        assert!(!unchanged.index_result.unwrap().destinations[0].published);
         let mut changed_descriptor = descriptor_bytes;
         let method = changed_descriptor
             .windows(b"GetQuote".len())

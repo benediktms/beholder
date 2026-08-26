@@ -322,23 +322,39 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     exit 1
 fi
 
-reindex_until_current() {
+index_until_current() {
+    local entity="$1"
+    local context=''
     local output=''
-    for _ in {1..100}; do
-        if output="$(target/debug/beholder reindex-workspace main 2>&1)"; then
+    local job_id=''
+    if ! output="$(target/debug/beholder index main 2>&1)"; then
+        printf '%s' "$output"
+        return 1
+    fi
+    job_id="$(awk '$1 == "enqueued" { print $2; exit }' <<<"$output")"
+    for _ in {1..600}; do
+        output="$(target/debug/beholder job get "$job_id" 2>&1)"
+        if grep -Fq 'status: Completed' <<<"$output"; then
+            context="$(target/debug/beholder context --json --workspace main "$entity" 2>&1 || true)"
+            if grep -Fq "$entity" <<<"$context" && grep -Fq '"stale":false' <<<"$context"; then
+                printf '%s' "$output"
+                return 0
+            fi
+        fi
+        if grep -Fq 'status: Failed' <<<"$output"; then
             printf '%s' "$output"
-            return 0
+            return 1
         fi
         sleep 0.1
     done
-    printf '%s' "$output"
+    printf '%s\n%s' "$output" "$context"
     return 1
 }
 
 echo 'Checking a bad source does not abort workspace indexing...' >&2
 recovery_source="$state/rust/src/recovery.rs"
 printf '%s\n' 'fn broken() {' 'fn nested() {}' >"$recovery_source"
-if ! reindex_output="$(reindex_until_current)"; then
+if ! reindex_output="$(index_until_current "$rust_client")"; then
     printf 'unrecoverable Rust source aborted workspace indexing:\n%s\n' "$reindex_output" >&2
     exit 1
 fi
@@ -348,7 +364,11 @@ if ! grep -Fq '"kind":"calls_rpc"' <<<"$result"; then
     exit 1
 fi
 printf '%s\n' 'fn repaired() {}' >"$recovery_source"
-reindex_until_current >/dev/null
+repaired='repo://github.com/example/beholder-rust-smoke/rust/recovery/repaired'
+if ! repaired_output="$(index_until_current "$repaired")"; then
+    printf 'repaired Rust source did not reach current indexing:\n%s\n' "$repaired_output" >&2
+    exit 1
+fi
 
 echo 'Garbage collecting obsolete semantic states...' >&2
 gc_result="$(target/debug/beholder cache gc)"
@@ -384,7 +404,10 @@ unexpected_errors="$(grep -Fv \
     'workspace inputs changed during indexing; stale analysis was discarded' \
     <<<"$unexpected_errors" || true)"
 unexpected_errors="$(grep -Fv \
-    'message: \"workspace indexing failed\"' \
+    '"message":"index job retry scheduled"' \
+    <<<"$unexpected_errors" || true)"
+unexpected_errors="$(grep -Fv \
+    '"message":"index job attempt failed"' \
     <<<"$unexpected_errors" || true)"
 if [[ -n "$unexpected_errors" ]]; then
     echo 'daemon trace contains warnings or errors:' >&2
