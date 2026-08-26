@@ -404,7 +404,7 @@ unexpected_errors="$(grep -Fv \
     'workspace inputs changed during indexing; stale analysis was discarded' \
     <<<"$unexpected_errors" || true)"
 unexpected_errors="$(grep -Fv \
-    '"message":"index job retry scheduled"' \
+    '"message":"job retry scheduled"' \
     <<<"$unexpected_errors" || true)"
 unexpected_errors="$(grep -Fv \
     '"message":"index job attempt failed"' \

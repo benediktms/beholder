@@ -1137,7 +1137,7 @@ impl IndexScheduler {
     }
 
     pub fn schedule_checkpoint(self: &Arc<Self>, store: Arc<SemanticStore>) {
-        if self.checkpointing.swap(true, Ordering::AcqRel) {
+        if self.is_stopping() || self.checkpointing.swap(true, Ordering::AcqRel) {
             return;
         }
         let scheduler = self.clone();
@@ -4175,6 +4175,17 @@ mod tests {
         drop(active);
         claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn stopped_scheduler_does_not_start_checkpointing() {
+        let scheduler = Arc::new(IndexScheduler::new(PathBuf::new()));
+        let store = Arc::new(SemanticStore::memory().unwrap());
+
+        scheduler.stop();
+        scheduler.schedule_checkpoint(store);
+
+        assert!(!scheduler.checkpointing.load(Ordering::Acquire));
     }
 
     #[test]
