@@ -223,22 +223,6 @@ pub(super) const CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA: &str = r#"
 }
 "#;
 
-pub(super) const CREATE_ENRICHMENT_JOB_SCHEMA: &str = r#"
-:create enrichment_job {
-    view: String,
-    owner: String,
-    =>
-    repository: String,
-    analyzer: String,
-    version: String,
-    input_fingerprint: String,
-    status: String,
-    attempt: Int,
-    retry_at_ms: Int,
-    error: String,
-}
-"#;
-
 pub(super) const CREATE_ENRICHMENT_OUTPUT_SCHEMA: &str = r#"
 :create enrichment_output {
     view: String,

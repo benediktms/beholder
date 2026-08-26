@@ -188,10 +188,15 @@ struct EligibleAt {
 #[derive(Clone, Debug)]
 struct EligibleIndexStorage(IndexJobStorage);
 
+#[derive(Clone, Debug)]
+struct EligibleEnrichmentStorage(EnrichmentJobStorage);
+
 struct IndexAttempt {
     attempt: Attempt,
     context: SqliteContext,
 }
+
+struct EnrichmentAttempt(IndexAttempt);
 
 #[derive(Clone)]
 struct AutomaticIndexAcknowledgement {
@@ -233,6 +238,19 @@ impl FromRequest<Task<IndexJob, SqliteContext, Ulid>> for IndexAttempt {
     }
 }
 
+impl FromRequest<Task<EnrichmentJob, SqliteContext, Ulid>> for EnrichmentAttempt {
+    type Error = Infallible;
+
+    async fn from_request(
+        task: &Task<EnrichmentJob, SqliteContext, Ulid>,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self(IndexAttempt {
+            attempt: task.parts.attempt.clone(),
+            context: task.parts.ctx.clone(),
+        }))
+    }
+}
+
 impl Backend for EligibleIndexStorage {
     type Args = <IndexJobStorage as Backend>::Args;
     type IdType = <IndexJobStorage as Backend>::IdType;
@@ -250,6 +268,39 @@ impl Backend for EligibleIndexStorage {
         self.0.middleware()
     }
 
+    fn poll(self, worker: &WorkerContext) -> Self::Stream {
+        let buffer_size = self.0.config().buffer_size();
+        self.0
+            .poll(worker)
+            .map(|item| async move {
+                if let Ok(Some(task)) = &item {
+                    let eligible: Result<EligibleAt, _> = task.parts.ctx.extract();
+                    if let Ok(eligible) = eligible {
+                        wait_until(eligible.millis).await;
+                    }
+                }
+                item
+            })
+            .buffer_unordered(buffer_size)
+            .boxed()
+    }
+}
+
+impl Backend for EligibleEnrichmentStorage {
+    type Args = <EnrichmentJobStorage as Backend>::Args;
+    type IdType = <EnrichmentJobStorage as Backend>::IdType;
+    type Context = <EnrichmentJobStorage as Backend>::Context;
+    type Error = <EnrichmentJobStorage as Backend>::Error;
+    type Stream = TaskStream<Task<EnrichmentJob, SqliteContext, Ulid>, sqlx::Error>;
+    type Beat = <EnrichmentJobStorage as Backend>::Beat;
+    type Layer = <EnrichmentJobStorage as Backend>::Layer;
+
+    fn heartbeat(&self, worker: &WorkerContext) -> Self::Beat {
+        self.0.heartbeat(worker)
+    }
+    fn middleware(&self) -> Self::Layer {
+        self.0.middleware()
+    }
     fn poll(self, worker: &WorkerContext) -> Self::Stream {
         let buffer_size = self.0.config().buffer_size();
         self.0
@@ -331,6 +382,11 @@ pub struct IndexWorker {
     pub task: tokio::task::JoinHandle<Result<(), String>>,
 }
 
+pub struct EnrichmentWorker {
+    pub context: WorkerContext,
+    pub task: tokio::task::JoinHandle<Result<(), String>>,
+}
+
 impl JobQueue {
     pub async fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
         let is_fresh = !path.exists();
@@ -362,7 +418,14 @@ impl JobQueue {
                         .build(),
                 ),
             ),
-            enrichment_jobs: SqliteStorage::new_with_config(&pool, &Config::new(ENRICHMENT_QUEUE)),
+            enrichment_jobs: SqliteStorage::new_with_config(
+                &pool,
+                &Config::new(ENRICHMENT_QUEUE).with_poll_interval(
+                    StrategyBuilder::new()
+                        .apply(IntervalStrategy::new(Duration::from_millis(100)))
+                        .build(),
+                ),
+            ),
             admission: Arc::new(Mutex::new(true)),
         })
     }
@@ -420,6 +483,85 @@ impl JobQueue {
             .collect();
         let id = self.push_index_job(job).await?;
         Ok((id, overlaps))
+    }
+
+    pub async fn enqueue_automatic_enrichment(
+        &self,
+        job: EnrichmentJob,
+    ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        let admitted = self.admission.lock().await;
+        if !*admitted {
+            return Err("job admission is closed".into());
+        }
+        if job.trigger != JobTrigger::Automatic
+            || !matches!(job.target, EnrichmentTarget::WorkspaceRepository { .. })
+        {
+            return Err("automatic enrichment jobs must target a workspace repository".into());
+        }
+        let rows = sqlx::query(
+            "SELECT id, status, job FROM Jobs WHERE job_type = ? AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))",
+        )
+        .bind(ENRICHMENT_QUEUE)
+        .fetch_all(self.enrichment_jobs.pool())
+        .await?;
+        let mut obsolete = Vec::new();
+        for row in rows {
+            let Ok(active) = serde_json::from_slice::<EnrichmentJob>(row.get::<&[u8], _>("job"))
+            else {
+                continue;
+            };
+            if active.target != job.target || active.worker_id != job.worker_id {
+                continue;
+            }
+            if active.expected_worker_version == job.expected_worker_version
+                && active.input_fingerprint == job.input_fingerprint
+            {
+                return Ok(None);
+            }
+            if row.get::<&str, _>("status") != "Running" {
+                obsolete.push(row.get::<String, _>("id"));
+            }
+        }
+        for id in obsolete {
+            sqlx::query("UPDATE Jobs SET status = 'Done', done_at = strftime('%s', 'now'), last_result = ? WHERE id = ?")
+                .bind(r#"{"Ok":null}"#)
+                .bind(id)
+                .execute(self.enrichment_jobs.pool())
+                .await?;
+        }
+        let id = Ulid::new();
+        let (workspace, repository) = match &job.target {
+            EnrichmentTarget::WorkspaceRepository {
+                workspace,
+                repository,
+            } => (Some(workspace.clone()), repository.clone()),
+            EnrichmentTarget::StandaloneRepository { repository } => (None, repository.clone()),
+        };
+        let (task, operation) = queued_task(job, id, ENRICHMENT_QUEUE, unix_millis()?);
+        let mut storage = self.enrichment_jobs.clone();
+        async move {
+            async move {
+                storage.push_task(task).await?;
+                tracing::info!(job.id = %id, "enrichment job enqueued");
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            }
+            .instrument(tracing::info_span!(
+                "job.enqueue",
+                job.trigger = "automatic",
+                job.target = "repository",
+                job.workspace = workspace.as_deref(),
+                job.repository = repository,
+                messaging.system = "apalis",
+                messaging.destination.name = ENRICHMENT_QUEUE,
+                messaging.message.id = %id,
+                messaging.operation.name = "send",
+                messaging.operation.type = "send",
+            ))
+            .await
+        }
+        .instrument(operation)
+        .await?;
+        Ok(Some(id.to_string()))
     }
 
     async fn push_index_job(
@@ -482,6 +624,34 @@ impl JobQueue {
         }))
     }
 
+    pub async fn active_enrichment_repositories(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT job FROM Jobs WHERE job_type = ? AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))",
+        )
+        .bind(ENRICHMENT_QUEUE)
+        .fetch_all(self.enrichment_jobs.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let job =
+                    serde_json::from_slice::<EnrichmentJob>(row.get::<&[u8], _>("job")).ok()?;
+                match job.target {
+                    EnrichmentTarget::WorkspaceRepository {
+                        workspace: active,
+                        repository,
+                    } if active == workspace => Some(repository),
+                    _ => None,
+                }
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+
     async fn terminal_automatic_job(
         &self,
         id: &str,
@@ -538,7 +708,7 @@ impl JobQueue {
             .bind(&id)
             .execute(&mut *transaction)
             .await?;
-            tracing::warn!(job.id = %id, disposition = status, "interrupted index job recovered");
+            tracing::warn!(job.id = %id, disposition = status, "interrupted job recovered");
         }
         transaction.commit().await?;
         tracing::info!(
@@ -571,9 +741,37 @@ impl JobQueue {
             max_attempts = MAX_ATTEMPTS,
             delay_ms,
             eligible_at_ms,
-            "index job retry scheduled"
+            "job retry scheduled"
         );
         Ok(())
+    }
+
+    async fn prerequisites_succeeded(
+        &self,
+        prerequisites: &[IndexJobId],
+    ) -> Result<bool, sqlx::Error> {
+        for prerequisite in prerequisites {
+            loop {
+                let status = sqlx::query_as::<_, (String, i64, i64)>(
+                    "SELECT status, attempts, max_attempts FROM Jobs WHERE id = ?",
+                )
+                .bind(&prerequisite.0)
+                .fetch_optional(self.index_jobs.pool())
+                .await?;
+                match status.as_ref() {
+                    Some((status, _, _)) if status == "Done" => break,
+                    Some((status, _, _)) if status == "Killed" => return Ok(false),
+                    Some((status, attempts, max_attempts))
+                        if status == "Failed" && attempts >= max_attempts =>
+                    {
+                        return Ok(false);
+                    }
+                    None => return Ok(false),
+                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub async fn list(
@@ -832,6 +1030,35 @@ pub fn start_index_worker(
     }
 }
 
+pub fn start_enrichment_worker(
+    queue: JobQueue,
+    scheduler: Arc<IndexScheduler>,
+    store: Arc<SemanticStore>,
+    workspaces: Arc<std::sync::Mutex<WorkspaceRegistry>>,
+) -> EnrichmentWorker {
+    let name = format!("beholder-enrichment-{}-{}", std::process::id(), Ulid::new());
+    let worker = WorkerBuilder::new(&name)
+        .backend(EligibleEnrichmentStorage(queue.enrichment_jobs.clone()))
+        .data(scheduler)
+        .data(store)
+        .data(workspaces)
+        .data(queue)
+        .build(run_enrichment_job);
+    let mut context = WorkerContext::new::<()>(&name);
+    context.start().expect("new enrichment worker starts once");
+    let handle = context.clone();
+    let task = tokio::spawn(async move {
+        worker
+            .run_with_ctx(&mut context)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    EnrichmentWorker {
+        context: handle,
+        task,
+    }
+}
+
 async fn run_index_job(
     job: IndexJob,
     scheduler: Data<Arc<IndexScheduler>>,
@@ -891,6 +1118,29 @@ async fn run_index_job(
         .map_err(|error| error.to_string())?;
         match result {
             Ok(result) => {
+                let published_workspaces = result.destinations.iter().filter_map(|destination| {
+                    (destination.outcome != IndexOutcome::Superseded).then_some(&destination.destination)
+                }).filter_map(|destination| match destination {
+                    IndexDestination::Workspace { workspace } => Some(workspace.clone()),
+                    IndexDestination::StandaloneRepository { .. } => None,
+                }).collect::<Vec<_>>();
+                for workspace in published_workspaces {
+                    let scheduler = Arc::clone(&scheduler);
+                    let store = Arc::clone(&store);
+                    let workspaces = Arc::clone(&workspaces);
+                    let prerequisite = IndexJobId(id.to_string());
+                    let jobs = tokio::task::spawn_blocking(move || {
+                        scheduler.automatic_enrichment_jobs(
+                            &store,
+                            &workspaces,
+                            &workspace,
+                            prerequisite,
+                        )
+                    }).await.map_err(|error| error.to_string())??;
+                    for job in jobs {
+                        queue.enqueue_automatic_enrichment(job).await?;
+                    }
+                }
                 if result.destinations.iter().any(|result| result.published) {
                     scheduler.schedule_checkpoint(Arc::clone(&store));
                 }
@@ -922,6 +1172,87 @@ async fn run_index_job(
                 } else {
                     queue.schedule_retry(&id.to_string(), attempt.current()).await?;
                     tracing::warn!(job.id = %id, %error, attempt = attempt.current(), max_attempts = MAX_ATTEMPTS, "index job attempt failed");
+                }
+                Err(error.into())
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
+async fn run_enrichment_job(
+    job: EnrichmentJob,
+    scheduler: Data<Arc<IndexScheduler>>,
+    store: Data<Arc<SemanticStore>>,
+    workspaces: Data<Arc<std::sync::Mutex<WorkspaceRegistry>>>,
+    queue: Data<JobQueue>,
+    id: TaskId<Ulid>,
+    enrichment_attempt: EnrichmentAttempt,
+) -> Result<(), BoxDynError> {
+    let EnrichmentAttempt(IndexAttempt { attempt, context }) = enrichment_attempt;
+    let (workspace, repository) = match &job.target {
+        EnrichmentTarget::WorkspaceRepository {
+            workspace,
+            repository,
+        } => (Some(workspace.clone()), repository.clone()),
+        EnrichmentTarget::StandaloneRepository { repository } => (None, repository.clone()),
+    };
+    let attempt_started_at_ms = unix_millis().unwrap_or_default();
+    let eligible: Result<EligibleAt, _> = context.extract();
+    let queue_wait_ms = queue_wait_ms(
+        eligible.map_or(attempt_started_at_ms, |eligible| eligible.millis),
+        attempt_started_at_ms,
+    );
+    let span = tracing::info_span!(
+        "job.attempt",
+        job.id = %id,
+        job.kind = "enrichment",
+        job.trigger = "automatic",
+        job.queue = ENRICHMENT_QUEUE,
+        job.workspace = workspace.as_deref(),
+        job.repository = repository,
+        job.worker = job.worker_id,
+        attempt = attempt.current(),
+        max_attempts = MAX_ATTEMPTS,
+        queue_wait_ms,
+        job.outcome = tracing::field::Empty,
+        messaging.system = "apalis",
+        messaging.destination.name = ENRICHMENT_QUEUE,
+        messaging.message.id = %id,
+        messaging.operation.name = "process",
+        messaging.operation.type = "process",
+    );
+    continue_task_trace(&span, &context);
+    async move {
+        if !queue
+            .prerequisites_succeeded(&job.prerequisite_index_jobs)
+            .await?
+        {
+            tracing::Span::current().record("job.outcome", "superseded");
+            return Ok(());
+        }
+        let result = scheduler
+            .run_enrichment_job(&store, &workspaces, &job)
+            .await;
+        match result {
+            Ok(published) => {
+                let outcome = if published { "published" } else { "superseded" };
+                tracing::Span::current().record("job.outcome", outcome);
+                if published {
+                    scheduler.schedule_checkpoint(Arc::clone(&store));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if attempt.current() >= MAX_ATTEMPTS as usize {
+                    tracing::Span::current().record("job.outcome", "failed");
+                    tracing::error!(job.id = %id, %error, "enrichment job failed");
+                } else {
+                    queue
+                        .schedule_retry(&id.to_string(), attempt.current())
+                        .await?;
+                    tracing::warn!(job.id = %id, %error, "enrichment job attempt failed");
                 }
                 Err(error.into())
             }
@@ -1122,6 +1453,20 @@ mod durable_tests {
         }
     }
 
+    fn automatic_enrichment(fingerprint: &str) -> EnrichmentJob {
+        EnrichmentJob {
+            target: EnrichmentTarget::WorkspaceRepository {
+                workspace: "main".into(),
+                repository: "repo".into(),
+            },
+            worker_id: "semantic".into(),
+            expected_worker_version: "1".into(),
+            trigger: JobTrigger::Automatic,
+            prerequisite_index_jobs: vec![IndexJobId("01J00000000000000000000000".into())],
+            input_fingerprint: Some(fingerprint.into()),
+        }
+    }
+
     fn queue_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "beholder-jobs-{name}-{}-{}.sqlite",
@@ -1179,6 +1524,45 @@ mod durable_tests {
                 .await
                 .is_err()
         );
+        queue.close().await;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_enrichments_coalesce_and_supersede_obsolete_queued_work() {
+        let path = queue_path("enrichment-coalescing");
+        let queue = JobQueue::open(&path).await.unwrap();
+        let first = queue
+            .enqueue_automatic_enrichment(automatic_enrichment("first"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            queue
+                .enqueue_automatic_enrichment(automatic_enrichment("first"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let second = queue
+            .enqueue_automatic_enrichment(automatic_enrichment("second"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            queue.get(&first).await.unwrap().unwrap().status,
+            StoredJobStatus::Completed
+        );
+        assert_eq!(
+            queue.get(&second).await.unwrap().unwrap().status,
+            StoredJobStatus::Queued
+        );
+        assert_eq!(
+            queue.active_enrichment_repositories("main").await.unwrap(),
+            ["repo"]
+        );
+
         queue.close().await;
         fs::remove_file(path).unwrap();
     }
@@ -1381,6 +1765,33 @@ mod durable_tests {
         );
         queue.close().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retries_interrupted_enrichment_jobs() {
+        let path = queue_path("enrichment-recovery");
+        let queue = JobQueue::open(&path).await.unwrap();
+        let id = queue
+            .enqueue_automatic_enrichment(automatic_enrichment("input"))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE Jobs SET status = 'Running', attempts = 2 WHERE id = ?")
+            .bind(&id)
+            .execute(queue.enrichment_jobs.pool())
+            .await
+            .unwrap();
+
+        let recovery = queue.recover().await.unwrap();
+        assert_eq!(recovery.interrupted_running, 1);
+        assert_eq!(recovery.immediate_retries, 1);
+        let recovered = queue.get(&id).await.unwrap().unwrap();
+        assert_eq!(recovered.kind, StoredJobKind::Enrichment);
+        assert_eq!(recovered.status, StoredJobStatus::Queued);
+        assert_eq!(recovered.attempts, 3);
+
+        queue.close().await;
         fs::remove_file(path).unwrap();
     }
 

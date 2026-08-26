@@ -10,8 +10,6 @@ use crate::{
 use beholder_adapters_graphql::GraphqlSource;
 #[cfg(test)]
 use beholder_adapters_graphql::{FRONTEND_VERSION as GRAPHQL_FRONTEND_VERSION, GraphqlAnalyzer};
-#[cfg(test)]
-use beholder_adapters_mnestic::EnrichmentSchedule;
 use beholder_adapters_mnestic::SemanticStore;
 #[cfg(test)]
 use beholder_adapters_protobuf::{FRONTEND_VERSION as PROTOBUF_FRONTEND_VERSION, ProtobufAnalyzer};
@@ -83,8 +81,7 @@ use beholder_domain::{
 use beholder_dto::{Freshness, QueryMetadata};
 #[cfg(test)]
 use beholder_indexing::{
-    AnalysisInput, AnalyzerContribution, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot,
-    IndexerBuilder, WorkspaceAnalyzer, WorkspaceEnricher,
+    AnalysisInput, AnalyzerContribution, AnalyzerMetadata, IndexerBuilder, WorkspaceAnalyzer,
 };
 use beholder_indexing::{
     AnalysisInputKind, CacheStatus as IndexerCacheStatus, Indexer, WorkspaceSnapshot,
@@ -136,7 +133,6 @@ mod sources;
 mod typescript_analysis;
 #[cfg(test)]
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
-use enrichment::{EnrichmentJob, EnrichmentRun};
 use inventory::{InventoryStatistics, InventoryStore, RefreshMode};
 use sources::is_ignored_path;
 #[cfg(test)]
@@ -287,14 +283,10 @@ pub struct IndexScheduler {
     automatic_jobs: Mutex<BTreeMap<String, Option<u64>>>,
     active_operation: Mutex<Option<String>>,
     indexing_repositories: Mutex<BTreeSet<String>>,
-    enrichment_jobs: Mutex<BTreeMap<(String, String, String), EnrichmentJob>>,
-    enriching: Mutex<BTreeMap<(String, String, String), EnrichmentRun>>,
     idle: Condvar,
     changed: Notify,
-    enrichment_changed: Notify,
     garbage_collection_requested: Notify,
     shutdown: Notify,
-    enrichment_shutdown: Notify,
     stopping: AtomicBool,
     checkpointing: AtomicBool,
     indexer: Indexer,
@@ -535,14 +527,10 @@ impl IndexScheduler {
             automatic_jobs: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             indexing_repositories: Mutex::new(BTreeSet::new()),
-            enrichment_jobs: Mutex::new(BTreeMap::new()),
-            enriching: Mutex::new(BTreeMap::new()),
             idle: Condvar::new(),
             changed: Notify::new(),
-            enrichment_changed: Notify::new(),
             garbage_collection_requested: Notify::new(),
             shutdown: Notify::new(),
-            enrichment_shutdown: Notify::new(),
             stopping: AtomicBool::new(false),
             checkpointing: AtomicBool::new(false),
             indexer,
@@ -604,14 +592,10 @@ impl IndexScheduler {
             automatic_jobs: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             indexing_repositories: Mutex::new(BTreeSet::new()),
-            enrichment_jobs: Mutex::new(BTreeMap::new()),
-            enriching: Mutex::new(BTreeMap::new()),
             idle: Condvar::new(),
             changed: Notify::new(),
-            enrichment_changed: Notify::new(),
             garbage_collection_requested: Notify::new(),
             shutdown: Notify::new(),
-            enrichment_shutdown: Notify::new(),
             stopping: AtomicBool::new(false),
             checkpointing: AtomicBool::new(false),
             indexer,
@@ -657,6 +641,16 @@ impl IndexScheduler {
         analysis_revision: u64,
         analysis: beholder_dto::AnalysisMetadata,
     ) -> QueryMetadata {
+        self.query_metadata_with_enrichments(workspace, analysis_revision, analysis, None)
+    }
+
+    pub fn query_metadata_with_enrichments(
+        &self,
+        workspace: &str,
+        analysis_revision: u64,
+        analysis: beholder_dto::AnalysisMetadata,
+        durable_enrichments: Option<Vec<String>>,
+    ) -> QueryMetadata {
         let full_index_active = self
             .active_operation
             .lock()
@@ -676,29 +670,13 @@ impl IndexScheduler {
                     .map(|repositories| repositories.keys().cloned().collect())
             })
             .unwrap_or_default();
-        let enriching_repositories = self
-            .enriching
-            .lock()
-            .map(|active| {
-                active
-                    .keys()
-                    .filter(|(active_workspace, _, _)| active_workspace == workspace)
-                    .map(|(_, repository, _)| repository.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let enriching_repositories = durable_enrichments.unwrap_or_default();
         let indexing = full_index_active
             || self
                 .automatic_jobs
                 .lock()
                 .is_ok_and(|jobs| jobs.contains_key(workspace))
-            || !enriching_repositories.is_empty()
-            || self.enrichment_jobs.lock().is_ok_and(|jobs| {
-                jobs.keys()
-                    .any(|(queued_workspace, _, _)| queued_workspace == workspace)
-            });
+            || !enriching_repositories.is_empty();
         QueryMetadata {
             revision: analysis_revision,
             view: workspace.into(),
@@ -1126,10 +1104,7 @@ impl IndexScheduler {
         workspaces: Arc<Mutex<WorkspaceRegistry>>,
         jobs: JobQueue,
     ) -> Result<(), String> {
-        let enrichment = tokio::spawn(self.clone().run_enrichments(store.clone()));
-        let result = self.run_automatic(store, workspaces, jobs).await;
-        let _ = enrichment.await;
-        result
+        self.run_automatic(store, workspaces, jobs).await
     }
 
     pub fn stop(&self) {
@@ -1137,7 +1112,6 @@ impl IndexScheduler {
         self.idle.notify_all();
         self.shutdown.notify_waiters();
         self.shutdown.notify_one();
-        self.enrichment_shutdown.notify_one();
     }
 
     pub(crate) fn is_stopping(&self) -> bool {
@@ -2174,7 +2148,7 @@ fn index_workspace_through_port(
             return Ok((0, false));
         }
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
-        scheduler.queue_enrichments(store, &snapshot, &view, &workspace.enabled_plugins)?;
+        scheduler.ensure_enrichment_inputs(store, &view)?;
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
@@ -2309,7 +2283,7 @@ fn index_workspace_through_port(
         )
     })?;
     if !scheduler.is_stopping() {
-        scheduler.queue_enrichments(store, &snapshot, &view, &workspace.enabled_plugins)?;
+        scheduler.ensure_enrichment_inputs(store, &view)?;
     }
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
@@ -2680,8 +2654,6 @@ mod tests {
     use beholder_dto::{AnalysisCompleteness, EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
-    struct FakeEnricher;
-
     struct MutatingAnalyzer {
         source: PathBuf,
     }
@@ -2718,23 +2690,6 @@ mod tests {
                 diagnostics: Vec::new(),
                 cache: Default::default(),
             })
-        }
-    }
-
-    impl WorkspaceEnricher for FakeEnricher {
-        fn metadata(&self) -> AnalyzerMetadata {
-            AnalyzerMetadata {
-                id: "semantic".into(),
-                version: "1".into(),
-            }
-        }
-
-        fn accepts(&self, path: &Path) -> bool {
-            path.extension().is_some_and(|extension| extension == "rs")
-        }
-
-        fn enrich<'a>(&'a self, _: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
-            Box::pin(async { unreachable!("an identical active job must not be queued") })
         }
     }
 
@@ -2897,323 +2852,6 @@ mod tests {
                 kind: beholder_indexing::InputKind::ProtobufDescriptor,
             }],
         }));
-    }
-
-    #[test]
-    fn does_not_queue_an_identical_active_enrichment() {
-        let state = RepositoryState {
-            repository: LogicalRepository {
-                identity: "repo".into(),
-            },
-            head: None,
-            fingerprint: "source".into(),
-        };
-        let snapshot = WorkspaceSnapshot {
-            name: "main".into(),
-            repositories: vec![beholder_indexing::RepositorySnapshot {
-                base: PathBuf::from("repo"),
-                state: state.clone(),
-                inputs: vec![beholder_indexing::RepositoryInput {
-                    path: PathBuf::from("src/lib.rs"),
-                    content: Arc::from(&b"fn main() {}"[..]),
-                    kind: beholder_indexing::InputKind::Source,
-                }],
-            }],
-        };
-        let view = WorkspaceView::new("main", "syntax", vec![state])
-            .unwrap()
-            .with_repository_contexts(BTreeMap::from([("semantic".into(), BTreeMap::new())]))
-            .unwrap();
-        let scheduler = IndexScheduler::with_indexer(
-            IndexerBuilder::new(PathBuf::new(), 1)
-                .add_enricher(FakeEnricher)
-                .build()
-                .unwrap(),
-        );
-        let store = SemanticStore::memory().unwrap();
-        store
-            .publish(
-                &view,
-                &[RepositoryFacts {
-                    state: view.repository_states[0].clone(),
-                    analysis_identity: "syntax".into(),
-                    incomplete: false,
-                    diagnostics: Vec::new(),
-                    entities: Vec::new(),
-                    grpc_bindings: Vec::new(),
-                    observations: Vec::new(),
-                }],
-                &[],
-            )
-            .unwrap();
-        let (cancel, cancelled) = tokio::sync::watch::channel(());
-        let input_fingerprint =
-            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "semantic");
-        assert_eq!(
-            store
-                .prepare_enrichment("main", "repo", "semantic", "1", &input_fingerprint)
-                .unwrap(),
-            EnrichmentSchedule::Queue
-        );
-        assert!(
-            store
-                .enrichment_retry_started("main", "repo", "semantic", "1", &input_fingerprint)
-                .unwrap()
-        );
-        scheduler.enriching.lock().unwrap().insert(
-            ("main".into(), "repo".into(), "semantic".into()),
-            EnrichmentRun {
-                input_fingerprint: input_fingerprint.clone(),
-                version: "1".into(),
-                cancel,
-            },
-        );
-
-        scheduler
-            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
-            .unwrap();
-
-        assert!(scheduler.enrichment_jobs.lock().unwrap().is_empty());
-        assert!(!cancelled.has_changed().unwrap());
-
-        scheduler.enriching.lock().unwrap().clear();
-        scheduler
-            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
-            .unwrap();
-
-        assert_eq!(scheduler.enrichment_jobs.lock().unwrap().len(), 1);
-        assert!(matches!(
-            store
-                .prepare_enrichment("main", "repo", "semantic", "1", &input_fingerprint)
-                .unwrap(),
-            EnrichmentSchedule::RetryAfter(_)
-        ));
-    }
-
-    #[test]
-    fn queues_enrichments_per_target_repository() {
-        let repository =
-            |identity: &str, fingerprint: &str| beholder_indexing::RepositorySnapshot {
-                base: PathBuf::from(identity),
-                state: RepositoryState {
-                    repository: LogicalRepository {
-                        identity: identity.into(),
-                    },
-                    head: None,
-                    fingerprint: fingerprint.into(),
-                },
-                inputs: vec![beholder_indexing::RepositoryInput {
-                    path: PathBuf::from("src/lib.rs"),
-                    content: Arc::from(&b"fn main() {}"[..]),
-                    kind: beholder_indexing::InputKind::Source,
-                }],
-            };
-        let snapshot = WorkspaceSnapshot {
-            name: "main".into(),
-            repositories: vec![repository("repo-a", "a-1"), repository("repo-b", "b-1")],
-        };
-        let view = WorkspaceView::new(
-            "main",
-            "syntax",
-            snapshot
-                .repositories
-                .iter()
-                .map(|repository| repository.state.clone())
-                .collect(),
-        )
-        .unwrap()
-        .with_repository_contexts(BTreeMap::from([(
-            "semantic".into(),
-            BTreeMap::from([("repo-a".into(), vec!["repo-b".into()])]),
-        )]))
-        .unwrap();
-        let store = SemanticStore::memory().unwrap();
-        store
-            .publish(
-                &view,
-                &view
-                    .repository_states
-                    .iter()
-                    .cloned()
-                    .map(|state| RepositoryFacts {
-                        state,
-                        analysis_identity: "syntax".into(),
-                        incomplete: false,
-                        diagnostics: Vec::new(),
-                        entities: Vec::new(),
-                        grpc_bindings: Vec::new(),
-                        observations: Vec::new(),
-                    })
-                    .collect::<Vec<_>>(),
-                &[],
-            )
-            .unwrap();
-        let scheduler = IndexScheduler::with_indexer(
-            IndexerBuilder::new(PathBuf::new(), 1)
-                .add_enricher(FakeEnricher)
-                .build()
-                .unwrap(),
-        );
-
-        scheduler
-            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
-            .unwrap();
-
-        let jobs = scheduler.enrichment_jobs.lock().unwrap();
-        assert_eq!(jobs.len(), 2);
-        for ((workspace, repository, analyzer), job) in jobs.iter() {
-            assert_eq!(workspace, "main");
-            assert_eq!(analyzer, "semantic");
-            assert_eq!(&job.repository, repository);
-            let expected_repositories = if repository == "repo-a" { 2 } else { 1 };
-            assert_eq!(
-                job.snapshot.workspace.repositories.len(),
-                expected_repositories
-            );
-            assert_eq!(
-                &job.snapshot.workspace.repositories[0]
-                    .state
-                    .repository
-                    .identity,
-                repository
-            );
-            assert_eq!(&job.snapshot.target_repository, repository);
-        }
-        drop(jobs);
-
-        scheduler.enrichment_jobs.lock().unwrap().clear();
-        for repository in &snapshot.repositories {
-            let identity = &repository.state.repository.identity;
-            let input = view.repository_enrichment_input_fingerprint(&repository.state, "semantic");
-            assert!(
-                store
-                    .enrichment_retry_failed(
-                        "main",
-                        identity,
-                        "semantic",
-                        "1",
-                        &input,
-                        "worker unavailable",
-                    )
-                    .unwrap()
-                    .is_some()
-            );
-        }
-        scheduler
-            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
-            .unwrap();
-        assert_eq!(scheduler.enrichment_jobs.lock().unwrap().len(), 2);
-        assert_eq!(
-            store
-                .context_snapshot("main", "missing")
-                .unwrap()
-                .analysis_revision,
-            1
-        );
-    }
-
-    #[test]
-    fn cancels_a_superseded_active_enrichment() {
-        let state = |identity: &str, fingerprint: &str| RepositoryState {
-            repository: LogicalRepository {
-                identity: identity.into(),
-            },
-            head: None,
-            fingerprint: fingerprint.into(),
-        };
-        let target = state("target", "target-source");
-        let context = state("context", "context-2");
-        let snapshot = WorkspaceSnapshot {
-            name: "main".into(),
-            repositories: vec![target.clone(), context.clone()]
-                .into_iter()
-                .map(|state| beholder_indexing::RepositorySnapshot {
-                    base: PathBuf::from(&state.repository.identity),
-                    state,
-                    inputs: vec![beholder_indexing::RepositoryInput {
-                        path: PathBuf::from("src/lib.rs"),
-                        content: Arc::from(&b"fn source() {}"[..]),
-                        kind: beholder_indexing::InputKind::Source,
-                    }],
-                })
-                .collect(),
-        };
-        let contexts = BTreeMap::from([(
-            "semantic".into(),
-            BTreeMap::from([("target".into(), vec!["context".into()])]),
-        )]);
-        let view = WorkspaceView::new("main", "syntax", vec![target.clone(), context])
-            .unwrap()
-            .with_repository_contexts(contexts.clone())
-            .unwrap();
-        let store = SemanticStore::memory().unwrap();
-        store
-            .publish(
-                &view,
-                &view
-                    .repository_states
-                    .iter()
-                    .cloned()
-                    .map(|state| RepositoryFacts {
-                        state,
-                        analysis_identity: "syntax".into(),
-                        incomplete: false,
-                        diagnostics: Vec::new(),
-                        entities: Vec::new(),
-                        grpc_bindings: Vec::new(),
-                        observations: Vec::new(),
-                    })
-                    .collect::<Vec<_>>(),
-                &[],
-            )
-            .unwrap();
-        let scheduler = IndexScheduler::with_indexer(
-            IndexerBuilder::new(PathBuf::new(), 1)
-                .add_enricher(FakeEnricher)
-                .build()
-                .unwrap(),
-        );
-        let (cancel, cancelled) = tokio::sync::watch::channel(());
-        let previous = WorkspaceView::new(
-            "main",
-            "syntax",
-            vec![target, state("context", "context-1")],
-        )
-        .unwrap()
-        .with_repository_contexts(contexts)
-        .unwrap();
-        scheduler.enriching.lock().unwrap().insert(
-            ("main".into(), "target".into(), "semantic".into()),
-            EnrichmentRun {
-                input_fingerprint: previous.repository_enrichment_input_fingerprint(
-                    &previous.repository_states[1],
-                    "semantic",
-                ),
-                version: "1".into(),
-                cancel,
-            },
-        );
-
-        scheduler
-            .queue_enrichments(&store, &snapshot, &view, &BTreeSet::new())
-            .unwrap();
-
-        assert!(cancelled.has_changed().unwrap());
-        let jobs = scheduler.enrichment_jobs.lock().unwrap();
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(
-            jobs.get(&("main".into(), "target".into(), "semantic".into()))
-                .unwrap()
-                .input_fingerprint,
-            view.repository_enrichment_input_fingerprint(&view.repository_states[1], "semantic",)
-        );
-        assert_eq!(
-            store
-                .context_snapshot("main", "missing")
-                .unwrap()
-                .analysis_revision,
-            1
-        );
     }
 
     #[test]
@@ -4425,20 +4063,15 @@ mod tests {
         assert!(current.freshness.dirty_repositories.is_empty());
         assert!(current.freshness.enriching_repositories.is_empty());
 
-        let (cancel, _) = tokio::sync::watch::channel(());
-        scheduler.enriching.lock().unwrap().insert(
-            ("main".into(), "repo".into(), "semantic".into()),
-            EnrichmentRun {
-                input_fingerprint: "input".into(),
-                version: "1".into(),
-                cancel,
-            },
+        let enriching = scheduler.query_metadata_with_enrichments(
+            "main",
+            5,
+            Default::default(),
+            Some(vec!["repo".into()]),
         );
-        let enriching = scheduler.query_metadata("main", 5, Default::default());
         assert!(!enriching.freshness.stale);
         assert!(enriching.freshness.indexing);
         assert_eq!(enriching.freshness.enriching_repositories, ["repo"]);
-        scheduler.enriching.lock().unwrap().clear();
         assert!(
             scheduler
                 .query_metadata("other", 4, Default::default())

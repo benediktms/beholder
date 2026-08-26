@@ -13,22 +13,16 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     thread,
-    time::{Duration, UNIX_EPOCH},
+    time::Duration,
 };
 
 const FACT_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_TRANSACTION_RETRIES: usize = 50;
 const GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(10);
-const MAX_ENRICHMENT_RETRIES: u8 = 5;
-const ENRICHMENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 fn enrichment_owner_key(analyzer: &str, repository: &str) -> String {
     format!("{}:{analyzer}{repository}", analyzer.len())
-}
-
-fn unix_time_ms() -> Result<i64, Box<dyn Error>> {
-    i64::try_from(UNIX_EPOCH.elapsed()?.as_millis()).map_err(Into::into)
 }
 
 pub(super) fn selected_baseline_semantics(
@@ -1512,9 +1506,6 @@ fn obsolete_enrichment_owners(
          obsolete[owner] := *enrichment_output{\
              view: $view, owner, repository, analyzer\
          }, not current[repository, analyzer]\n\
-         obsolete[owner] := *enrichment_job{\
-             view: $view, owner, repository, analyzer\
-         }, not current[repository, analyzer]\n\
          ?[owner] := obsolete[owner]",
         BTreeMap::from([("view".into(), view.into())]),
     )?;
@@ -1603,7 +1594,6 @@ fn remove_enrichment_state(
             "view, owner, repository, code, severity, path, line",
         ),
         ("enrichment_output", "view, owner"),
-        ("enrichment_job", "view, owner"),
     ] {
         transaction.run_script(
             &format!(
@@ -1844,266 +1834,15 @@ pub(super) fn enrichments_current(
     Ok(true)
 }
 
-pub(super) fn prepare_enrichment(
-    db: &DbInstance,
-    view: &str,
-    repository: &str,
-    analyzer: &str,
-    version: &str,
-    input_fingerprint: &str,
-) -> Result<super::store::EnrichmentSchedule, Box<dyn Error>> {
-    use super::store::EnrichmentSchedule;
-
-    let owner = enrichment_owner_key(analyzer, repository);
-    let transaction = db.multi_transaction(true);
-    let current_input = transaction.run_script(
-        "?[fingerprint] := *analysis_revision{view: $view, revision}, \
-             *analysis_revision_enrichment_input{\
-                 view: $view, revision, repository: $repository, analyzer: $analyzer, fingerprint\
-             }",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("repository".into(), repository.into()),
-            ("analyzer".into(), analyzer.into()),
-        ]),
-    )?;
-    if current_input.rows.first().and_then(|row| row[0].get_str()) != Some(input_fingerprint) {
-        transaction.abort()?;
-        return Ok(EnrichmentSchedule::Superseded);
-    }
-    let output = transaction.run_script(
-        "?[owner] := *enrichment_output{\
-                 view: $view, owner: $owner, repository: $repository, analyzer: $analyzer, \
-                 version: $version, input_fingerprint: $input_fingerprint\
-             }, owner = $owner",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("owner".into(), owner.as_str().into()),
-            ("repository".into(), repository.into()),
-            ("analyzer".into(), analyzer.into()),
-            ("version".into(), version.into()),
-            ("input_fingerprint".into(), input_fingerprint.into()),
-        ]),
-    )?;
-    if !output.rows.is_empty() {
-        transaction.abort()?;
-        return Ok(EnrichmentSchedule::Current);
-    }
-    let rows = transaction.run_script(
-        "?[version, input_fingerprint, status, attempt, retry_at_ms] := \
-             *enrichment_job{\
-                 view: $view, owner: $owner, version, input_fingerprint, status, attempt, \
-                 retry_at_ms\
-             }",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("owner".into(), owner.as_str().into()),
-        ]),
-    )?;
-    let now = unix_time_ms()?;
-    if let Some(row) = rows.rows.first() {
-        let matches =
-            row[0].get_str() == Some(version) && row[1].get_str() == Some(input_fingerprint);
-        let status = row[2].get_str().unwrap_or_default();
-        let attempt = row[3].get_int().unwrap_or_default();
-        let retry_at = row[4].get_int().unwrap_or_default();
-        if matches && status == "running" {
-            transaction.abort()?;
-            return Ok(EnrichmentSchedule::Running);
-        }
-        if matches && status == "failed" {
-            if attempt >= i64::from(MAX_ENRICHMENT_RETRIES) {
-                transaction.abort()?;
-                return Ok(EnrichmentSchedule::Exhausted);
-            }
-            if retry_at > now {
-                transaction.abort()?;
-                return Ok(EnrichmentSchedule::RetryAfter(Duration::from_millis(
-                    u64::try_from(retry_at - now)?,
-                )));
-            }
-        }
-    }
-    let attempt = rows
-        .rows
-        .first()
-        .filter(|row| {
-            row[0].get_str() == Some(version) && row[1].get_str() == Some(input_fingerprint)
-        })
-        .and_then(|row| row[3].get_int())
-        .unwrap_or_default();
-    transaction.run_script(
-        "?[view, owner, repository, analyzer, version, input_fingerprint, status, attempt, retry_at_ms, error] <- \
-             [[$view, $owner, $repository, $analyzer, $version, $input_fingerprint, 'queued', $attempt, 0, '']] \
-         :put enrichment_job {\
-             view, owner => repository, analyzer, version, input_fingerprint, status, attempt, \
-             retry_at_ms, error\
-         }",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("owner".into(), owner.into()),
-            ("repository".into(), repository.into()),
-            ("analyzer".into(), analyzer.into()),
-            ("version".into(), version.into()),
-            ("input_fingerprint".into(), input_fingerprint.into()),
-            ("attempt".into(), attempt.into()),
-        ]),
-    )?;
-    transaction.commit()?;
-    Ok(EnrichmentSchedule::Queue)
-}
-
-pub(super) fn enrichment_retry_started(
-    db: &DbInstance,
-    view: &str,
-    repository: &str,
-    analyzer: &str,
-    version: &str,
-    input_fingerprint: &str,
-) -> Result<bool, Box<dyn Error>> {
-    update_enrichment_job_status(
-        db,
-        view,
-        repository,
-        analyzer,
-        version,
-        input_fingerprint,
-        "running",
-    )
-}
-
-fn update_enrichment_job_status(
-    db: &DbInstance,
-    view: &str,
-    repository: &str,
-    analyzer: &str,
-    version: &str,
-    input_fingerprint: &str,
-    status: &str,
-) -> Result<bool, Box<dyn Error>> {
-    let owner = enrichment_owner_key(analyzer, repository);
-    let transaction = db.multi_transaction(true);
-    let current = transaction.run_script(
-        "?[attempt] := *enrichment_job{\
-             view: $view, owner: $owner, repository: $repository, analyzer: $analyzer, \
-             version: $version, input_fingerprint: $input_fingerprint, attempt\
-         }",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("owner".into(), owner.as_str().into()),
-            ("repository".into(), repository.into()),
-            ("analyzer".into(), analyzer.into()),
-            ("version".into(), version.into()),
-            ("input_fingerprint".into(), input_fingerprint.into()),
-        ]),
-    )?;
-    let Some(attempt) = current.rows.first().map(|row| row[0].clone()) else {
-        transaction.abort()?;
-        return Ok(false);
-    };
-    transaction.run_script(
-        "?[view, owner, repository, analyzer, version, input_fingerprint, status, attempt, retry_at_ms, error] <- \
-             [[$view, $owner, $repository, $analyzer, $version, $input_fingerprint, $status, $attempt, 0, '']] \
-         :put enrichment_job {\
-             view, owner => repository, analyzer, version, input_fingerprint, status, attempt, \
-             retry_at_ms, error\
-         }",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("owner".into(), owner.into()),
-            ("repository".into(), repository.into()),
-            ("analyzer".into(), analyzer.into()),
-            ("version".into(), version.into()),
-            ("input_fingerprint".into(), input_fingerprint.into()),
-            ("status".into(), status.into()),
-            ("attempt".into(), attempt),
-        ]),
-    )?;
-    transaction.commit()?;
-    Ok(true)
-}
-
-pub(super) fn enrichment_retry_failed(
-    db: &DbInstance,
-    view: &str,
-    repository: &str,
-    analyzer: &str,
-    version: &str,
-    input_fingerprint: &str,
-    error: &str,
-) -> Result<Option<Duration>, Box<dyn Error>> {
-    let owner = enrichment_owner_key(analyzer, repository);
-    let transaction = db.multi_transaction(true);
-    let current = transaction.run_script(
-        "?[attempt] := *enrichment_job{\
-             view: $view, owner: $owner, repository: $repository, analyzer: $analyzer, \
-             version: $version, input_fingerprint: $input_fingerprint, attempt\
-         }",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("owner".into(), owner.as_str().into()),
-            ("repository".into(), repository.into()),
-            ("analyzer".into(), analyzer.into()),
-            ("version".into(), version.into()),
-            ("input_fingerprint".into(), input_fingerprint.into()),
-        ]),
-    )?;
-    let Some(previous) = current.rows.first().and_then(|row| row[0].get_int()) else {
-        transaction.abort()?;
-        return Ok(None);
-    };
-    let attempt = previous.saturating_add(1);
-    let delay = if attempt < i64::from(MAX_ENRICHMENT_RETRIES) {
-        let exponent = u32::try_from(attempt - 1)?;
-        Some(
-            ENRICHMENT_RETRY_BASE_DELAY
-                .saturating_mul(1_u32.checked_shl(exponent).ok_or("retry delay overflow")?),
-        )
-    } else {
-        None
-    };
-    let retry_at_ms = unix_time_ms()?.saturating_add(
-        delay
-            .map(|delay| i64::try_from(delay.as_millis()))
-            .transpose()?
-            .unwrap_or_default(),
-    );
-    transaction.run_script(
-        "?[view, owner, repository, analyzer, version, input_fingerprint, status, attempt, retry_at_ms, error] <- \
-             [[$view, $owner, $repository, $analyzer, $version, $input_fingerprint, 'failed', $attempt, $retry_at_ms, $error]] \
-         :put enrichment_job {\
-             view, owner => repository, analyzer, version, input_fingerprint, status, attempt, \
-             retry_at_ms, error\
-         }",
-        BTreeMap::from([
-            ("view".into(), view.into()),
-            ("owner".into(), owner.into()),
-            ("repository".into(), repository.into()),
-            ("analyzer".into(), analyzer.into()),
-            ("version".into(), version.into()),
-            ("input_fingerprint".into(), input_fingerprint.into()),
-            ("attempt".into(), attempt.into()),
-            ("retry_at_ms".into(), retry_at_ms.into()),
-            ("error".into(), error.into()),
-        ]),
-    )?;
-    transaction.commit()?;
-    Ok(delay)
-}
-
 pub(super) fn publish_enrichment(
     db: &DbInstance,
-    view: &WorkspaceView,
+    view: &str,
     repository: &str,
     input_fingerprint: &str,
     owner: EnrichmentOwner<'_>,
     payload: EnrichmentPayload<'_>,
 ) -> Result<bool, Box<dyn Error>> {
-    let EnrichmentOwner {
-        analyzer,
-        version,
-        expected_version,
-    } = owner;
+    let EnrichmentOwner { analyzer, version } = owner;
     let EnrichmentPayload {
         entities,
         observations,
@@ -2125,7 +1864,7 @@ pub(super) fn publish_enrichment(
                  view: $view, revision, repository: $repository, analyzer: $analyzer, fingerprint\
              }",
         BTreeMap::from([
-            ("view".into(), view.name.clone().into()),
+            ("view".into(), view.into()),
             ("repository".into(), repository.into()),
             ("analyzer".into(), analyzer.into()),
         ]),
@@ -2138,27 +1877,6 @@ pub(super) fn publish_enrichment(
         transaction.abort()?;
         return Ok(false);
     }
-    if let Some(expected_version) = expected_version {
-        let expected = transaction.run_script(
-            "?[status] := *enrichment_job{\
-                 view: $view, owner: $owner, repository: $repository, analyzer: $analyzer, \
-                 version: $expected_version, input_fingerprint: $input_fingerprint, status\
-             }",
-            BTreeMap::from([
-                ("view".into(), view.name.clone().into()),
-                ("owner".into(), owner.as_str().into()),
-                ("repository".into(), repository.into()),
-                ("analyzer".into(), analyzer.into()),
-                ("expected_version".into(), expected_version.into()),
-                ("input_fingerprint".into(), input_fingerprint.into()),
-            ]),
-        )?;
-        if expected.rows.is_empty() {
-            transaction.abort()?;
-            return Ok(false);
-        }
-    }
-
     let output_is_current = !transaction
         .run_script(
             "?[owner] := *enrichment_output{\
@@ -2166,7 +1884,7 @@ pub(super) fn publish_enrichment(
                  input_fingerprint: $input_fingerprint\
              }, owner = $owner",
             BTreeMap::from([
-                ("view".into(), view.name.clone().into()),
+                ("view".into(), view.into()),
                 ("owner".into(), owner.as_str().into()),
                 ("repository".into(), repository.into()),
                 ("analyzer".into(), analyzer.into()),
@@ -2178,7 +1896,7 @@ pub(super) fn publish_enrichment(
     if output_is_current
         && owner_contributions_match(
             &transaction,
-            &view.name,
+            view,
             &owner,
             entities,
             observations,
@@ -2186,9 +1904,9 @@ pub(super) fn publish_enrichment(
             diagnostics,
         )?
     {
-        complete_enrichment_job(
+        complete_enrichment(
             &transaction,
-            &view.name,
+            view,
             &owner,
             repository,
             analyzer,
@@ -2198,10 +1916,10 @@ pub(super) fn publish_enrichment(
         transaction.commit()?;
         return Ok(true);
     }
-    if owner_contributions_are_empty(&transaction, &view.name, &owner)?
+    if owner_contributions_are_empty(&transaction, view, &owner)?
         && incoming_contributions_are_effective(
             &transaction,
-            &view.name,
+            view,
             entities,
             observations,
             overrides,
@@ -2210,16 +1928,16 @@ pub(super) fn publish_enrichment(
     {
         replace_enrichment_contributions(
             &transaction,
-            &view.name,
+            view,
             &owner,
             entities,
             observations,
             overrides,
             diagnostics,
         )?;
-        complete_enrichment_job(
+        complete_enrichment(
             &transaction,
-            &view.name,
+            view,
             &owner,
             repository,
             analyzer,
@@ -2234,47 +1952,47 @@ pub(super) fn publish_enrichment(
         .get_int()
         .ok_or("published analysis revision is invalid")?;
     let revision = previous + 1;
-    copy_revision(&transaction, &view.name, previous, revision)?;
-    remove_owner_contribution_keys(&transaction, &view.name, &owner, revision)?;
+    copy_revision(&transaction, view, previous, revision)?;
+    remove_owner_contribution_keys(&transaction, view, &owner, revision)?;
     replace_enrichment_contributions(
         &transaction,
-        &view.name,
+        view,
         &owner,
         entities,
         observations,
         overrides,
         diagnostics,
     )?;
-    remove_owner_contribution_keys(&transaction, &view.name, &owner, revision)?;
-    complete_enrichment_job(
+    remove_owner_contribution_keys(&transaction, view, &owner, revision)?;
+    complete_enrichment(
         &transaction,
-        &view.name,
+        view,
         &owner,
         repository,
         analyzer,
         version,
         input_fingerprint,
     )?;
-    materialize_enrichment_contributions(&transaction, &view.name, revision)?;
+    materialize_enrichment_contributions(&transaction, view, revision)?;
 
-    let changed = effective_revision_changed(&transaction, &view.name, previous, revision)?;
+    let changed = effective_revision_changed(&transaction, view, previous, revision)?;
     if changed {
         transaction.run_script(
             "?[view, revision] <- [[$view, $revision]] \
              :put analysis_revision {view => revision}",
             BTreeMap::from([
-                ("view".into(), view.name.clone().into()),
+                ("view".into(), view.into()),
                 ("revision".into(), revision.into()),
             ]),
         )?;
     } else {
-        remove_revision_candidate(&transaction, &view.name, revision)?;
+        remove_revision_candidate(&transaction, view, revision)?;
     }
     transaction.commit()?;
     Ok(true)
 }
 
-fn complete_enrichment_job(
+fn complete_enrichment(
     transaction: &MultiTransaction,
     view: &str,
     owner: &str,
@@ -2296,15 +2014,6 @@ fn complete_enrichment_job(
              [[$view, $owner, $repository, $analyzer, $version, $input_fingerprint]] \
          :put enrichment_output {\
              view, owner => repository, analyzer, version, input_fingerprint\
-         }",
-        params.clone(),
-    )?;
-    transaction.run_script(
-        "?[view, owner, repository, analyzer, version, input_fingerprint, status, attempt, retry_at_ms, error] <- \
-             [[$view, $owner, $repository, $analyzer, $version, $input_fingerprint, 'complete', 0, 0, '']] \
-         :put enrichment_job {\
-             view, owner => repository, analyzer, version, input_fingerprint, status, attempt, \
-             retry_at_ms, error\
          }",
         params,
     )?;
@@ -3591,7 +3300,7 @@ pub(super) fn sweep_garbage_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EnrichmentOwner, EnrichmentPayload, EnrichmentSchedule, SemanticStore};
+    use crate::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
         DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
@@ -4514,14 +4223,13 @@ mod tests {
         .unwrap();
         store
             .publish_enrichment(
-                &initial,
+                &initial.name,
                 "example/a",
                 &initial
                     .repository_enrichment_input_fingerprint(&initial.repository_states[0], "rust"),
                 EnrichmentOwner {
                     analyzer: "rust",
                     version: "1",
-                    expected_version: None,
                 },
                 EnrichmentPayload {
                     entities: std::slice::from_ref(&entity_a),
@@ -4531,14 +4239,13 @@ mod tests {
             .unwrap();
         store
             .publish_enrichment(
-                &initial,
+                &initial.name,
                 "example/b",
                 &initial
                     .repository_enrichment_input_fingerprint(&initial.repository_states[1], "rust"),
                 EnrichmentOwner {
                     analyzer: "rust",
                     version: "1",
-                    expected_version: None,
                 },
                 EnrichmentPayload {
                     entities: std::slice::from_ref(&entity_b),
@@ -4685,13 +4392,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &started,
+                    &started.name,
                     "example/a",
                     &target_input,
                     EnrichmentOwner {
                         analyzer: "rust",
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -4730,13 +4436,12 @@ mod tests {
         assert!(
             !store
                 .publish_enrichment(
-                    &started,
+                    &started.name,
                     "example/a",
                     &target_input,
                     EnrichmentOwner {
                         analyzer: "rust",
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -4821,87 +4526,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_result_after_a_newer_analyzer_run_supersedes_it() {
-        let store = SemanticStore::memory().unwrap();
-        let view = with_enrichment_analyzers(
-            WorkspaceView::new(
-                "superseded",
-                "syntax",
-                vec![RepositoryState {
-                    repository: LogicalRepository {
-                        identity: "example/repo".into(),
-                    },
-                    head: None,
-                    fingerprint: "source".into(),
-                }],
-            )
-            .unwrap(),
-            &["rust"],
-        );
-        store
-            .publish(&view, &[facts(&view, Vec::new())], &[])
-            .unwrap();
-        let input_fingerprint =
-            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
-        assert_eq!(
-            store
-                .prepare_enrichment(
-                    "superseded",
-                    "example/repo",
-                    "rust",
-                    "1",
-                    &input_fingerprint,
-                )
-                .unwrap(),
-            EnrichmentSchedule::Queue
-        );
-        assert!(
-            store
-                .enrichment_retry_started(
-                    "superseded",
-                    "example/repo",
-                    "rust",
-                    "1",
-                    &input_fingerprint,
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            store
-                .prepare_enrichment(
-                    "superseded",
-                    "example/repo",
-                    "rust",
-                    "2",
-                    &input_fingerprint,
-                )
-                .unwrap(),
-            EnrichmentSchedule::Queue
-        );
-
-        assert!(
-            !store
-                .publish_enrichment(
-                    &view,
-                    "example/repo",
-                    &input_fingerprint,
-                    EnrichmentOwner {
-                        analyzer: "rust",
-                        version: "1",
-                        expected_version: Some("1"),
-                    },
-                    EnrichmentPayload::default(),
-                )
-                .unwrap()
-        );
-        assert!(
-            !store
-                .enrichment_matches("superseded", "example/repo", "rust", "1")
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn publishes_enrichment_only_for_the_current_baseline() {
         let store = SemanticStore::memory().unwrap();
         let state = RepositoryState {
@@ -4952,13 +4576,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input_fingerprint,
                     EnrichmentOwner {
                         analyzer: "rust",
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         overrides: &[override_],
@@ -4998,13 +4621,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input_fingerprint,
                     EnrichmentOwner {
                         analyzer: "rust",
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -5043,7 +4665,7 @@ mod tests {
         assert!(
             !store
                 .publish_enrichment(
-                    &stale,
+                    &stale.name,
                     "example/repo",
                     &stale.repository_enrichment_input_fingerprint(
                         &stale.repository_states[0],
@@ -5052,7 +4674,6 @@ mod tests {
                     EnrichmentOwner {
                         analyzer: "rust",
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -5098,13 +4719,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input_fingerprint,
                     EnrichmentOwner {
                         analyzer: "elixir",
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         entities: &[entity],
@@ -5125,13 +4745,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input_fingerprint,
                     EnrichmentOwner {
                         analyzer: "elixir",
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -5228,13 +4847,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input,
                     EnrichmentOwner {
                         analyzer: "compiler",
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         entities: &[analyzer_entity],
@@ -5250,13 +4868,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input,
                     EnrichmentOwner {
                         analyzer: "compiler",
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -5306,101 +4923,6 @@ mod tests {
     }
 
     #[test]
-    fn superseded_retries_cannot_replace_the_current_or_running_job() {
-        let store = SemanticStore::memory().unwrap();
-        let make_view = |fingerprint: &str| {
-            with_enrichment_analyzers(
-                WorkspaceView::new(
-                    "retry-supersession",
-                    "syntax",
-                    vec![RepositoryState {
-                        repository: LogicalRepository {
-                            identity: "example/repo".into(),
-                        },
-                        head: None,
-                        fingerprint: fingerprint.into(),
-                    }],
-                )
-                .unwrap(),
-                &["rust"],
-            )
-        };
-        let first = make_view("source-a");
-        store
-            .publish(&first, &[facts(&first, Vec::new())], &[])
-            .unwrap();
-        let input_a =
-            first.repository_enrichment_input_fingerprint(&first.repository_states[0], "rust");
-        assert_eq!(
-            store
-                .prepare_enrichment("retry-supersession", "example/repo", "rust", "1", &input_a,)
-                .unwrap(),
-            EnrichmentSchedule::Queue
-        );
-        assert!(
-            store
-                .enrichment_retry_failed(
-                    "retry-supersession",
-                    "example/repo",
-                    "rust",
-                    "1",
-                    &input_a,
-                    "temporary failure",
-                )
-                .unwrap()
-                .is_some()
-        );
-
-        let second = make_view("source-b");
-        store
-            .publish(&second, &[facts(&second, Vec::new())], &[])
-            .unwrap();
-        let input_b =
-            second.repository_enrichment_input_fingerprint(&second.repository_states[0], "rust");
-        assert_eq!(
-            store
-                .prepare_enrichment("retry-supersession", "example/repo", "rust", "1", &input_b,)
-                .unwrap(),
-            EnrichmentSchedule::Queue
-        );
-        assert_eq!(
-            store
-                .prepare_enrichment("retry-supersession", "example/repo", "rust", "1", &input_a,)
-                .unwrap(),
-            EnrichmentSchedule::Superseded
-        );
-        assert!(
-            store
-                .enrichment_retry_started(
-                    "retry-supersession",
-                    "example/repo",
-                    "rust",
-                    "1",
-                    &input_b,
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            store
-                .prepare_enrichment("retry-supersession", "example/repo", "rust", "1", &input_b,)
-                .unwrap(),
-            EnrichmentSchedule::Running
-        );
-        let job = store
-            .db
-            .run_script(
-                "?[input_fingerprint, status] := *enrichment_job{\
-                     view: 'retry-supersession', input_fingerprint, status\
-                 }",
-                BTreeMap::new(),
-                ScriptMutability::Immutable,
-            )
-            .unwrap();
-        assert_eq!(job.rows[0][0].get_str(), Some(input_b.as_str()));
-        assert_eq!(job.rows[0][1].get_str(), Some("running"));
-    }
-
-    #[test]
     fn identical_contributions_keep_independent_owners_without_revision_churn() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -5441,13 +4963,12 @@ mod tests {
             assert!(
                 store
                     .publish_enrichment(
-                        &view,
+                        &view.name,
                         "example/repo",
                         &input,
                         EnrichmentOwner {
                             analyzer,
                             version: "1",
-                            expected_version: None,
                         },
                         EnrichmentPayload {
                             entities: std::slice::from_ref(&entity),
@@ -5483,7 +5004,7 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &view.repository_enrichment_input_fingerprint(
                         &view.repository_states[0],
@@ -5492,7 +5013,6 @@ mod tests {
                     EnrichmentOwner {
                         analyzer: "compiler-a",
                         version: "invalid",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         diagnostics: &[("different/repository".into(), invalid_diagnostic)],
@@ -5508,13 +5028,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input_a,
                     EnrichmentOwner {
                         analyzer: "compiler-a",
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         entities: std::slice::from_ref(&entity),
@@ -5532,13 +5051,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input_a,
                     EnrichmentOwner {
                         analyzer: "compiler-a",
                         version: "3",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -5559,13 +5077,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input_b,
                     EnrichmentOwner {
                         analyzer: "compiler-b",
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -5626,13 +5143,12 @@ mod tests {
                 .unwrap();
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     repository,
                     &view.repository_enrichment_input_fingerprint(state, analyzer),
                     EnrichmentOwner {
                         analyzer,
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         entities: &entities,
@@ -5677,9 +5193,6 @@ mod tests {
                  present[owner] := removed[owner], *enrichment_output{\
                      view: 'owner-removal', owner\
                  }\n\
-                 present[owner] := removed[owner], *enrichment_job{\
-                     view: 'owner-removal', owner\
-                 }\n\
                  present[owner] := removed[owner], *enrichment_entity_contribution{\
                      view: 'owner-removal', owner\
                  }\n\
@@ -5716,9 +5229,6 @@ mod tests {
                 .db
                 .run_script(
                     "present[owner] := *enrichment_output{\
-                         view: 'owner-removal', owner\
-                     }, owner = $owner\n\
-                     present[owner] := *enrichment_job{\
                          view: 'owner-removal', owner\
                      }, owner = $owner\n\
                      present[owner] := *enrichment_entity_contribution{\
@@ -5792,13 +5302,12 @@ mod tests {
                 view.repository_enrichment_input_fingerprint(&view.repository_states[0], analyzer);
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input,
                     EnrichmentOwner {
                         analyzer,
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         overrides: std::slice::from_ref(&override_),
@@ -5833,13 +5342,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input,
                     EnrichmentOwner {
                         analyzer: "a",
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )
@@ -5854,133 +5362,6 @@ mod tests {
                 .iter()
                 .any(|edge| edge.to == "repo://example/repo/target-b")
         );
-    }
-
-    #[test]
-    fn enrichment_failure_state_survives_restart_without_creating_a_revision() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let state_dir = std::env::temp_dir().join(format!("beholder-enrichment-retry-{unique}"));
-        fs::create_dir_all(&state_dir).unwrap();
-        let database = state_dir.join("beholder.db");
-        let view = with_enrichment_analyzers(
-            WorkspaceView::new(
-                "retry",
-                "syntax",
-                vec![RepositoryState {
-                    repository: LogicalRepository {
-                        identity: "example/repo".into(),
-                    },
-                    head: None,
-                    fingerprint: "source".into(),
-                }],
-            )
-            .unwrap(),
-            &["rust"],
-        );
-        let input =
-            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
-        let store = SemanticStore::persistent(&database, true).unwrap();
-        store
-            .publish(&view, &[facts(&view, Vec::new())], &[])
-            .unwrap();
-        assert_eq!(
-            store
-                .prepare_enrichment("retry", "example/repo", "rust", "1", &input)
-                .unwrap(),
-            EnrichmentSchedule::Queue
-        );
-        assert!(
-            store
-                .enrichment_retry_started("retry", "example/repo", "rust", "1", &input)
-                .unwrap()
-        );
-        assert!(
-            store
-                .enrichment_retry_failed(
-                    "retry",
-                    "example/repo",
-                    "rust",
-                    "1",
-                    &input,
-                    "worker unavailable",
-                )
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(current_revision(&store, "retry"), 1);
-        drop(store);
-
-        let store = SemanticStore::persistent(&database, false).unwrap();
-        let job = store
-            .db
-            .run_script(
-                "?[status, attempt, error] := *enrichment_job{\
-                     view: 'retry', analyzer: 'rust', status, attempt, error\
-                 }",
-                BTreeMap::new(),
-                ScriptMutability::Immutable,
-            )
-            .unwrap();
-        assert_eq!(job.rows[0][0].get_str(), Some("failed"));
-        assert_eq!(job.rows[0][1].get_int(), Some(1));
-        assert_eq!(job.rows[0][2].get_str(), Some("worker unavailable"));
-        assert_eq!(current_revision(&store, "retry"), 1);
-        drop(store);
-        fs::remove_dir_all(state_dir).unwrap();
-    }
-
-    #[test]
-    fn enrichment_retries_stop_after_the_persisted_attempt_limit() {
-        let store = SemanticStore::memory().unwrap();
-        let view = with_enrichment_analyzers(
-            WorkspaceView::new(
-                "retry-limit",
-                "syntax",
-                vec![RepositoryState {
-                    repository: LogicalRepository {
-                        identity: "example/repo".into(),
-                    },
-                    head: None,
-                    fingerprint: "source".into(),
-                }],
-            )
-            .unwrap(),
-            &["rust"],
-        );
-        store
-            .publish(&view, &[facts(&view, Vec::new())], &[])
-            .unwrap();
-        let input =
-            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
-        assert_eq!(
-            store
-                .prepare_enrichment("retry-limit", "example/repo", "rust", "1", &input)
-                .unwrap(),
-            EnrichmentSchedule::Queue
-        );
-        for attempt in 1..=MAX_ENRICHMENT_RETRIES {
-            let delay = store
-                .enrichment_retry_failed(
-                    "retry-limit",
-                    "example/repo",
-                    "rust",
-                    "1",
-                    &input,
-                    "worker unavailable",
-                )
-                .unwrap();
-            assert_eq!(delay.is_some(), attempt < MAX_ENRICHMENT_RETRIES);
-        }
-        assert_eq!(
-            store
-                .prepare_enrichment("retry-limit", "example/repo", "rust", "1", &input)
-                .unwrap(),
-            EnrichmentSchedule::Exhausted
-        );
-        assert_eq!(current_revision(&store, "retry-limit"), 1);
     }
 
     #[test]
@@ -6011,13 +5392,12 @@ mod tests {
         assert!(
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input,
                     EnrichmentOwner {
                         analyzer: "rust",
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         entities: &[entity],
@@ -6095,13 +5475,12 @@ mod tests {
                 view.repository_enrichment_input_fingerprint(&view.repository_states[0], analyzer);
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input,
                     EnrichmentOwner {
                         analyzer,
                         version: "1",
-                        expected_version: None,
                     },
                     EnrichmentPayload {
                         entities: std::slice::from_ref(&entity),
@@ -6120,13 +5499,12 @@ mod tests {
                 view.repository_enrichment_input_fingerprint(&view.repository_states[0], analyzer);
             store
                 .publish_enrichment(
-                    &view,
+                    &view.name,
                     "example/repo",
                     &input,
                     EnrichmentOwner {
                         analyzer,
                         version: "2",
-                        expected_version: None,
                     },
                     EnrichmentPayload::default(),
                 )

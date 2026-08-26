@@ -207,8 +207,14 @@ impl Daemon for BeholderDaemon {
         request: Request<EntityRequest>,
     ) -> Result<Response<ContextResponse>, Status> {
         let request = request.into_inner();
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&request.workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         self.query_response(
             &request.workspace,
+            enriching,
             self.store
                 .context_snapshot(&request.workspace, &request.entity),
         )
@@ -260,8 +266,14 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<DependenciesResponse>, Status> {
         let request = request.into_inner();
         let max_hops = max_hops(request.max_hops)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&request.workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         self.query_response(
             &request.workspace,
+            enriching,
             self.store
                 .dependencies_snapshot(&request.workspace, &request.entity, max_hops),
         )
@@ -466,8 +478,14 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<ImpactResponse>, Status> {
         let request = request.into_inner();
         let max_hops = max_hops(request.max_hops)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&request.workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         self.query_response(
             &request.workspace,
+            enriching,
             self.store
                 .impact_snapshot(&request.workspace, &request.entity, max_hops),
         )
@@ -583,8 +601,14 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<TraceResponse>, Status> {
         let request = request.into_inner();
         let max_hops = max_hops(request.max_hops)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&request.workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         self.query_response(
             &request.workspace,
+            enriching,
             self.store
                 .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops),
         )
@@ -598,6 +622,11 @@ impl Daemon for BeholderDaemon {
     async fn why(&self, request: Request<PathRequest>) -> Result<Response<WhyResponse>, Status> {
         let request = request.into_inner();
         let max_hops = max_hops(request.max_hops)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&request.workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         let revisioned = self
             .store
             .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops)
@@ -606,7 +635,7 @@ impl Daemon for BeholderDaemon {
                 analysis_revision: revisioned.analysis_revision,
                 analysis: revisioned.analysis,
             });
-        self.query_response(&request.workspace, revisioned)
+        self.query_response(&request.workspace, enriching, revisioned)
     }
 }
 

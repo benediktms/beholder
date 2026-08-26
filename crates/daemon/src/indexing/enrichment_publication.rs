@@ -4,7 +4,6 @@ use beholder_adapters_mnestic::{
 };
 use beholder_domain::{
     AnalysisDiagnostic, DependencyOverride, EntityFact, EntityKind, Observation, SemanticRelation,
-    WorkspaceView,
 };
 use beholder_indexing::SemanticSnapshot;
 use std::{collections::BTreeSet, error::Error};
@@ -39,9 +38,7 @@ pub(crate) struct EnrichmentContribution<'a> {
 
 pub(crate) struct EnrichmentPublicationRequest<'a> {
     pub(crate) target: EnrichmentTarget<'a>,
-    pub(crate) view: &'a WorkspaceView,
     pub(crate) input_fingerprint: &'a str,
-    pub(crate) expected_analyzer_version: Option<&'a str>,
     pub(crate) contribution: EnrichmentContribution<'a>,
 }
 
@@ -104,13 +101,12 @@ impl EnrichmentPublication for SemanticStore {
         let target = request.target;
         SemanticStore::publish_enrichment(
             self,
-            request.view,
+            target.view,
             target.repository,
             request.input_fingerprint,
             MnesticEnrichmentOwner {
                 analyzer: target.analyzer,
                 version: target.version,
-                expected_version: request.expected_analyzer_version,
             },
             MnesticEnrichmentPayload {
                 entities: request.contribution.entities,
