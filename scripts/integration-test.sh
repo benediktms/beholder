@@ -288,13 +288,13 @@ fi
 target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
     --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" \
     --protobuf-descriptor "$state/contracts/grpc-matrix.descriptor.bin" >/dev/null
-for _ in {1..100}; do
+for _ in {1..600}; do
     result="$(target/debug/beholder context --json --workspace main \
         'grpc://phase5.v1.Bridge/RustToElixir' 2>/dev/null || true)"
-    grep -Fq '"kind":"binds_contract"' <<<"$result" && break
+    grep -Fq '"kind":"binds_contract"' <<<"$result" && grep -Fq '"stale":false' <<<"$result" && break
     sleep 0.1
 done
-if ! grep -Fq '"kind":"binds_contract"' <<<"$result"; then
+if ! grep -Fq '"kind":"binds_contract"' <<<"$result" || ! grep -Fq '"stale":false' <<<"$result"; then
     printf 'restoring the contract did not resolve gRPC bindings:\n%s\n' "$result" >&2
     exit 1
 fi
