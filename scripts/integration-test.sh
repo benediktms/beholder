@@ -92,7 +92,7 @@ if remote="$(git -C "$root" remote get-url origin 2>/dev/null)"; then
     repository="${repository/:/\/}"
     repository="${repository%.git}"
 fi
-caller="repo://$repository/rust/crates/daemon/src/main/main"
+caller="repo://$repository/rust/crates/daemon/src/main/run_daemon"
 callee="repo://$repository/rust/crates/daemon-client/src/lib/state_dir"
 echo 'Waiting for automatic Beholder indexing...' >&2
 result=''
@@ -288,24 +288,24 @@ fi
 target/debug/beholder workspace register main "$root" "$state/contracts" "$state/rust" "$state/elixir" \
     --protobuf-descriptor "$state/contracts/pricing.descriptor.bin" \
     --protobuf-descriptor "$state/contracts/grpc-matrix.descriptor.bin" >/dev/null
-for _ in {1..100}; do
+for _ in {1..600}; do
     result="$(target/debug/beholder context --json --workspace main \
         'grpc://phase5.v1.Bridge/RustToElixir' 2>/dev/null || true)"
-    grep -Fq '"kind":"binds_contract"' <<<"$result" && break
+    grep -Fq '"kind":"binds_contract"' <<<"$result" && grep -Fq '"stale":false' <<<"$result" && break
     sleep 0.1
 done
-if ! grep -Fq '"kind":"binds_contract"' <<<"$result"; then
+if ! grep -Fq '"kind":"binds_contract"' <<<"$result" || ! grep -Fq '"stale":false' <<<"$result"; then
     printf 'restoring the contract did not resolve gRPC bindings:\n%s\n' "$result" >&2
     exit 1
 fi
-echo 'Checking main -> state_dir...' >&2
-echo 'Checking state_dir impact reaches main...' >&2
+echo 'Checking run_daemon -> state_dir...' >&2
+echo 'Checking state_dir impact reaches run_daemon...' >&2
 result="$(target/debug/beholder impact --json --workspace main "$callee")"
 if ! grep -Fq "$caller" <<<"$result"; then
     printf 'expected %s in impact result:\n%s\n' "$caller" "$result" >&2
     exit 1
 fi
-echo 'Checking why main reaches state_dir...' >&2
+echo 'Checking why run_daemon reaches state_dir...' >&2
 result="$(target/debug/beholder why --json --workspace main "$caller" "$callee")"
 if ! grep -Fq "$callee" <<<"$result"; then
     printf 'expected %s in why result:\n%s\n' "$callee" "$result" >&2

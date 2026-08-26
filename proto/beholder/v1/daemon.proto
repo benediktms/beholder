@@ -13,6 +13,8 @@ service Daemon {
   rpc GetRepository(GetRepositoryRequest) returns (RepositoryResponse);
   rpc Impact(TraversalEntityRequest) returns (ImpactResponse);
   rpc IndexRepository(IndexRepositoryRequest) returns (IndexRepositoryResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
   rpc ReindexWorkspace(ReindexWorkspaceRequest) returns (ReindexWorkspaceResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
@@ -441,4 +443,94 @@ message GetStatusResponse {
   string status = 1;
   uint32 protocol_version = 2;
   uint32 pid = 3;
+}
+
+message ListJobsRequest {
+  optional string page_token = 1;
+}
+
+message ListJobsResponse {
+  repeated JobSummary jobs = 1;
+  optional string next_page_token = 2;
+}
+
+message GetJobRequest {
+  string id = 1;
+}
+
+message GetJobResponse {
+  Job job = 1;
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_QUEUED = 1;
+  JOB_STATUS_WAITING = 2;
+  JOB_STATUS_RUNNING = 3;
+  JOB_STATUS_COMPLETED = 4;
+  JOB_STATUS_FAILED = 5;
+}
+
+enum JobType {
+  JOB_TYPE_UNSPECIFIED = 0;
+  JOB_TYPE_INDEX = 1;
+  JOB_TYPE_ENRICHMENT = 2;
+}
+
+enum JobTrigger {
+  JOB_TRIGGER_UNSPECIFIED = 0;
+  JOB_TRIGGER_AUTOMATIC = 1;
+  JOB_TRIGGER_MANUAL = 2;
+}
+
+message JobTarget {
+  oneof target {
+    string workspace = 1;
+    string repository = 2;
+  }
+  optional string workspace_scope = 3;
+  optional string worker_id = 4;
+}
+
+message JobSummary {
+  string id = 1;
+  JobStatus status = 2;
+  JobType type = 3;
+  JobTarget target = 4;
+  JobTrigger trigger = 5;
+  uint64 submitted_at_ms = 6;
+}
+
+enum JobWaitReason {
+  JOB_WAIT_REASON_UNSPECIFIED = 0;
+  JOB_WAIT_REASON_RETRY = 1;
+  JOB_WAIT_REASON_PREREQUISITES = 2;
+}
+
+enum IndexJobOutcome {
+  INDEX_JOB_OUTCOME_UNSPECIFIED = 0;
+  INDEX_JOB_OUTCOME_PUBLISHED = 1;
+  INDEX_JOB_OUTCOME_UNCHANGED = 2;
+  INDEX_JOB_OUTCOME_SUPERSEDED = 3;
+}
+
+message IndexJobResult {
+  string workspace = 1;
+  uint64 observation_count = 2;
+  bool published = 3;
+  IndexJobOutcome outcome = 4;
+}
+
+message Job {
+  JobSummary summary = 1;
+  uint32 attempts = 2;
+  uint32 max_attempts = 3;
+  optional uint64 run_at_ms = 4;
+  optional uint64 started_at_ms = 5;
+  optional uint64 completed_at_ms = 6;
+  repeated string prerequisite_job_ids = 7;
+  optional JobWaitReason wait_reason = 8;
+  optional string last_error = 9;
+  repeated string warnings = 10;
+  optional IndexJobResult index_result = 11;
 }

@@ -1,4 +1,10 @@
-use crate::workspace_registry::WorkspaceRegistry;
+use crate::{
+    jobs::{
+        IndexJob as DurableIndexJob, IndexJobResult, IndexOutcome, IndexTarget, JobQueue,
+        JobTrigger, RepositoryChange as DurableChange, RepositoryIntent as DurableIntent,
+    },
+    workspace_registry::WorkspaceRegistry,
+};
 #[cfg(test)]
 use beholder_adapters_graphql::GraphqlSource;
 #[cfg(test)]
@@ -102,10 +108,7 @@ use std::{
     io::{BufReader, BufWriter, Write},
     path::Path,
 };
-use tokio::{
-    sync::Notify,
-    time::{Instant, MissedTickBehavior},
-};
+use tokio::{sync::Notify, time::Instant};
 
 #[cfg(test)]
 #[path = "cache.rs"]
@@ -140,11 +143,8 @@ use sources::{RepositorySources, decode_csharp_source, repository_sources};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(200);
 const MAX_LATENCY: Duration = Duration::from_secs(2);
-const RECONCILIATION_PERIOD: Duration = Duration::from_secs(60);
 const MAX_PENDING_PATHS: usize = 1_024;
 const MAX_PENDING_EVENTS: usize = 4_096;
-const MAX_REINDEX_RETRIES: u8 = 5;
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const CORE_RULE_PACK_VERSION: &str = "5";
 
@@ -282,7 +282,8 @@ fn scheduler_unavailable() -> BeholderError {
 pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
-    retry_attempts: Mutex<BTreeMap<String, u8>>,
+    dormant_generations: Mutex<BTreeMap<String, u64>>,
+    automatic_jobs: Mutex<BTreeMap<String, Option<u64>>>,
     active_operation: Mutex<Option<String>>,
     indexing_repositories: Mutex<BTreeSet<String>>,
     enrichment_jobs: Mutex<BTreeMap<(String, String, String), EnrichmentJob>>,
@@ -422,6 +423,54 @@ impl DirtyRepository {
             && self.sources.is_empty()
             && self.configuration.is_empty()
     }
+
+    fn head_only(&self) -> bool {
+        self.head
+            && !self.all
+            && !self.reconcile
+            && self.sources.is_empty()
+            && self.configuration.is_empty()
+    }
+
+    fn durable(&self, repository: String) -> DurableIntent {
+        let mut changes = Vec::new();
+        if self.all || self.reconcile {
+            changes.push(DurableChange::Reconciliation);
+        } else {
+            changes.extend(
+                self.sources
+                    .iter()
+                    .map(|path| DurableChange::SourcePath(path.to_string_lossy().into_owned())),
+            );
+            changes.extend(
+                self.configuration.iter().map(|path| {
+                    DurableChange::ConfigurationPath(path.to_string_lossy().into_owned())
+                }),
+            );
+        }
+        if self.head {
+            changes.push(DurableChange::Head);
+        }
+        DurableIntent {
+            repository,
+            changes,
+        }
+    }
+
+    fn from_durable(intent: DurableIntent) -> Self {
+        let mut dirty = Self::default();
+        for change in intent.changes {
+            dirty.apply(match change {
+                DurableChange::SourcePath(path) => RepositoryIntent::Source(path.into()),
+                DurableChange::ConfigurationPath(path) => {
+                    RepositoryIntent::Configuration(path.into())
+                }
+                DurableChange::Head => RepositoryIntent::Head,
+                DurableChange::Reconciliation => RepositoryIntent::Reconcile,
+            });
+        }
+        dirty
+    }
 }
 
 struct ActiveOperation<'a> {
@@ -434,12 +483,6 @@ struct ActiveOperation<'a> {
 struct ActiveRepository<'a> {
     identity: String,
     indexing_repositories: &'a Mutex<BTreeSet<String>>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ReindexResult {
-    published: bool,
-    retry_after: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -487,7 +530,8 @@ impl IndexScheduler {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
-            retry_attempts: Mutex::new(BTreeMap::new()),
+            dormant_generations: Mutex::new(BTreeMap::new()),
+            automatic_jobs: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             indexing_repositories: Mutex::new(BTreeSet::new()),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
@@ -555,7 +599,8 @@ impl IndexScheduler {
         Self {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
-            retry_attempts: Mutex::new(BTreeMap::new()),
+            dormant_generations: Mutex::new(BTreeMap::new()),
+            automatic_jobs: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             indexing_repositories: Mutex::new(BTreeSet::new()),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
@@ -586,8 +631,8 @@ impl IndexScheduler {
     }
 
     pub fn mark(&self, workspace: &Workspace) {
-        if let Ok(mut retries) = self.retry_attempts.lock() {
-            retries.remove(&workspace.name);
+        if let Ok(mut dormant) = self.dormant_generations.lock() {
+            dormant.remove(&workspace.name);
         }
         if let Ok(mut generations) = self.generations.lock() {
             *generations.entry(workspace.name.clone()).or_default() += 1;
@@ -644,6 +689,10 @@ impl IndexScheduler {
             })
             .unwrap_or_default();
         let indexing = full_index_active
+            || self
+                .automatic_jobs
+                .lock()
+                .is_ok_and(|jobs| jobs.contains_key(workspace))
             || !enriching_repositories.is_empty()
             || self.enrichment_jobs.lock().is_ok_and(|jobs| {
                 jobs.keys()
@@ -1025,9 +1074,9 @@ impl IndexScheduler {
         }
         drop(dirty_repositories);
         drop(generations);
-        if let Ok(mut retries) = self.retry_attempts.lock() {
+        if let Ok(mut dormant) = self.dormant_generations.lock() {
             for workspace in changed_workspaces {
-                retries.remove(&workspace);
+                dormant.remove(&workspace);
             }
         }
         self.changed.notify_one();
@@ -1063,8 +1112,8 @@ impl IndexScheduler {
         drop(dirty);
         drop(generations);
         if changed {
-            if let Ok(mut retries) = self.retry_attempts.lock() {
-                retries.clear();
+            if let Ok(mut dormant) = self.dormant_generations.lock() {
+                dormant.clear();
             }
             self.changed.notify_one();
         }
@@ -1074,11 +1123,12 @@ impl IndexScheduler {
         self: Arc<Self>,
         store: Arc<SemanticStore>,
         workspaces: Arc<Mutex<WorkspaceRegistry>>,
-    ) {
+        jobs: JobQueue,
+    ) -> Result<(), String> {
         let enrichment = tokio::spawn(self.clone().run_enrichments(store.clone()));
-        self.run_with_reconciliation_period(store, workspaces, RECONCILIATION_PERIOD)
-            .await;
+        let result = self.run_automatic(store, workspaces, jobs).await;
         let _ = enrichment.await;
+        result
     }
 
     pub fn stop(&self) {
@@ -1141,46 +1191,28 @@ impl IndexScheduler {
         }
     }
 
+    pub async fn wait_for_checkpoint(&self) {
+        while self.checkpointing.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn block_indexing(&self, workspace: &str) -> impl Drop + '_ {
         self.begin(workspace).unwrap()
     }
 
-    async fn run_with_reconciliation_period(
+    async fn run_automatic(
         self: Arc<Self>,
         store: Arc<SemanticStore>,
         workspaces: Arc<Mutex<WorkspaceRegistry>>,
-        reconciliation_period: Duration,
-    ) {
-        let mut reconciliation = tokio::time::interval_at(
-            Instant::now() + reconciliation_period,
-            reconciliation_period,
-        );
-        reconciliation.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        jobs: JobQueue,
+    ) -> Result<(), String> {
         'run: loop {
-            let reconcile = tokio::select! {
+            tokio::select! {
                 biased;
                 _ = self.shutdown.notified() => break 'run,
-                _ = self.changed.notified() => false,
-                _ = reconciliation.tick() => true,
-            };
-            if reconcile {
-                let scheduler = self.clone();
-                let store = store.clone();
-                let checkpoint_store = store.clone();
-                let workspaces = workspaces.clone();
-                let span = tracing::info_span!("index.scheduler", trigger = "reconcile");
-                match tokio::task::spawn_blocking(move || {
-                    span.in_scope(|| scheduler.reconcile_registered(&store, &workspaces))
-                })
-                .await
-                {
-                    Ok(true) => self.schedule_checkpoint(checkpoint_store),
-                    Ok(false) => {}
-                    Err(error) => tracing::error!(%error, "reconciliation worker failed"),
-                }
-                reconciliation.reset();
-                continue;
+                _ = self.changed.notified() => {},
             }
             let first_change = Instant::now();
             let mut last_change = first_change;
@@ -1193,132 +1225,188 @@ impl IndexScheduler {
                     _ = self.shutdown.notified() => break 'run,
                 }
             }
-            let scheduler = self.clone();
-            let store = store.clone();
-            let checkpoint_store = store.clone();
-            let workspaces = workspaces.clone();
-            let span = tracing::info_span!("index.scheduler", trigger = "change");
-            match tokio::task::spawn_blocking(move || {
-                span.in_scope(|| scheduler.reindex_dirty(&store, &workspaces))
-            })
-            .await
-            {
-                Ok(result) => {
-                    if result.published {
-                        self.schedule_checkpoint(checkpoint_store);
-                    }
-                    if let Some(delay) = result.retry_after {
-                        let scheduler = self.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(delay).await;
-                            scheduler.changed.notify_one();
-                        });
-                    }
+            if let Err(error) = self.enqueue_dirty(&store, &workspaces, &jobs).await {
+                if self.is_stopping() {
+                    break;
                 }
-                Err(error) => tracing::error!(%error, "index worker failed"),
+                tracing::error!(%error, "durable automatic index enqueue failed");
+                self.stop();
+                return Err(error);
             }
         }
-        while self.checkpointing.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        self.wait_for_checkpoint().await;
+        Ok(())
     }
 
-    fn reconcile_registered(
+    async fn enqueue_dirty(
         &self,
         store: &SemanticStore,
         workspaces: &Mutex<WorkspaceRegistry>,
-    ) -> bool {
-        let registered = match workspaces.lock() {
-            Ok(registry) => registry.list(),
-            Err(_) => return false,
-        };
-        let mut published = false;
-        for workspace in registered {
-            if self.is_stopping() {
-                break;
-            }
-            let dirty = workspace
-                .repositories
-                .iter()
-                .map(|repository| {
-                    (
-                        repository.repository.identity.clone(),
-                        DirtyRepository::from_intent(RepositoryIntent::Reconcile),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            let result = match self.begin(&workspace.name) {
-                Ok(_active) => index_workspace(self, store, &workspace, Some(&dirty)),
-                Err(error) => Err(Box::new(error) as Box<dyn Error>),
-            };
-            match result {
-                Ok((_, changed)) => published |= changed,
-                Err(error) => {
-                    tracing::error!(workspace = %workspace.name, %error, "workspace reconciliation failed");
-                }
-            }
-        }
-        published
-    }
-
-    fn reindex_dirty(
-        &self,
-        store: &SemanticStore,
-        workspaces: &Mutex<WorkspaceRegistry>,
-    ) -> ReindexResult {
+        jobs: &JobQueue,
+    ) -> Result<(), String> {
         let snapshot = match self.generations.lock() {
             Ok(generations) => generations.clone(),
-            Err(_) => return ReindexResult::default(),
+            Err(_) => return Err("index generations lock poisoned".into()),
         };
         let registered = match workspaces.lock() {
             Ok(registry) => snapshot
                 .keys()
                 .filter_map(|name| registry.get(name).cloned())
                 .collect::<Vec<_>>(),
-            Err(_) => return ReindexResult::default(),
+            Err(_) => return Err("workspace registry lock poisoned".into()),
         };
-        let mut result = ReindexResult::default();
         for workspace in registered {
             if self.is_stopping() {
                 break;
             }
-            match self.index_active(store, &workspace) {
-                Ok((_, published)) => {
-                    result.published |= published;
-                    if let Ok(mut retries) = self.retry_attempts.lock() {
-                        retries.remove(&workspace.name);
-                    }
-                    self.complete_generation(
-                        &workspace.name,
-                        snapshot.get(&workspace.name).copied(),
-                    );
+            let generation = snapshot.get(&workspace.name).copied();
+            if generation.is_some_and(|generation| {
+                self.dormant_generations
+                    .lock()
+                    .is_ok_and(|dormant| dormant.get(&workspace.name) == Some(&generation))
+            }) {
+                continue;
+            }
+            let dirty = self
+                .dirty_repositories
+                .lock()
+                .map_err(|_| "dirty repository lock poisoned")?
+                .get(&workspace.name)
+                .cloned()
+                .unwrap_or_default();
+            if git_head_only_noop(store, &workspace, &dirty).map_err(|error| error.to_string())? {
+                self.complete_generation(&workspace.name, generation);
+                tracing::info!(workspace = %workspace.name, "same-commit Git metadata batch dropped");
+                continue;
+            }
+            let job = DurableIndexJob {
+                target: IndexTarget::Workspace {
+                    workspace: workspace.name.clone(),
+                },
+                trigger: JobTrigger::Automatic,
+                prerequisite_index_jobs: Vec::new(),
+                generation,
+                repository_intents: dirty
+                    .into_iter()
+                    .map(|(repository, intent)| intent.durable(repository))
+                    .collect(),
+            };
+            if let Ok(mut active) = self.automatic_jobs.lock() {
+                active.insert(workspace.name.clone(), generation);
+            }
+            if let Err(error) = jobs.enqueue_automatic_index(job).await {
+                if let Ok(mut active) = self.automatic_jobs.lock()
+                    && active.get(&workspace.name) == Some(&generation)
+                {
+                    active.remove(&workspace.name);
                 }
-                Err(error) => {
-                    tracing::error!(workspace = %workspace.name, %error, "workspace reindex failed");
-                    let attempt = self
-                        .retry_attempts
-                        .lock()
-                        .ok()
-                        .map(|mut retries| {
-                            let attempt = retries.entry(workspace.name.clone()).or_default();
-                            *attempt = attempt.saturating_add(1);
-                            *attempt
-                        })
-                        .unwrap_or(MAX_REINDEX_RETRIES);
-                    if attempt <= MAX_REINDEX_RETRIES {
-                        let delay = RETRY_BASE_DELAY.saturating_mul(1_u32 << (attempt - 1));
-                        result.retry_after = Some(
-                            result
-                                .retry_after
-                                .map_or(delay, |pending| pending.min(delay)),
-                        );
-                    } else {
-                        tracing::error!(workspace = %workspace.name, attempts = attempt, "workspace reindex retries exhausted");
-                    }
-                }
+                return Err(error.to_string());
             }
         }
-        result
+        Ok(())
+    }
+
+    pub(crate) fn run_index_job(
+        &self,
+        store: &SemanticStore,
+        workspaces: &Mutex<WorkspaceRegistry>,
+        job: &DurableIndexJob,
+    ) -> Result<IndexJobResult, String> {
+        let IndexTarget::Workspace { workspace } = &job.target else {
+            return Err("automatic index job target is not a workspace".into());
+        };
+        let generation_current = self
+            .generations
+            .lock()
+            .map_err(|_| "index generations lock poisoned")?
+            .get(workspace)
+            .copied()
+            == job.generation;
+        if !generation_current {
+            return Ok(IndexJobResult {
+                workspace: workspace.clone(),
+                observation_count: 0,
+                published: false,
+                outcome: IndexOutcome::Superseded,
+            });
+        }
+        let workspace_config = workspaces
+            .lock()
+            .map_err(|_| "workspace registry lock poisoned")?
+            .get(workspace)
+            .cloned()
+            .ok_or_else(|| format!("workspace is no longer registered: {workspace}"))?;
+        let dirty = job
+            .repository_intents
+            .iter()
+            .cloned()
+            .map(|intent| {
+                let repository = intent.repository.clone();
+                (repository, DirtyRepository::from_durable(intent))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let result = match self.begin(workspace) {
+            Ok(_active) => index_workspace_through_port(
+                self,
+                store,
+                &workspace_config,
+                Some(&dirty),
+                job.generation,
+                true,
+            ),
+            Err(error) => Err(Box::new(error) as Box<dyn Error>),
+        };
+        match result {
+            Ok((observation_count, published)) => {
+                self.complete_generation(workspace, job.generation);
+                Ok(IndexJobResult {
+                    workspace: workspace.clone(),
+                    observation_count,
+                    published,
+                    outcome: if published {
+                        IndexOutcome::Published
+                    } else {
+                        IndexOutcome::Unchanged
+                    },
+                })
+            }
+            Err(_error)
+                if self.generations.lock().is_ok_and(|generations| {
+                    generations.get(workspace).copied() != job.generation
+                }) =>
+            {
+                Ok(IndexJobResult {
+                    workspace: workspace.clone(),
+                    observation_count: 0,
+                    published: false,
+                    outcome: IndexOutcome::Superseded,
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub(crate) fn automatic_job_failed(
+        &self,
+        workspace: &str,
+        generation: Option<u64>,
+        terminal: bool,
+    ) {
+        if terminal
+            && let Some(generation) = generation
+            && let Ok(mut dormant) = self.dormant_generations.lock()
+        {
+            dormant.insert(workspace.into(), generation);
+        }
+    }
+
+    pub(crate) fn automatic_job_finished(&self, workspace: &str, generation: Option<u64>) {
+        if let Ok(mut active) = self.automatic_jobs.lock()
+            && active.get(workspace) == Some(&generation)
+        {
+            active.remove(workspace);
+        }
+        self.changed.notify_one();
     }
 
     #[cfg(test)]
@@ -1848,7 +1936,20 @@ fn index_workspace(
     workspace: &Workspace,
     dirty: Option<&BTreeMap<String, DirtyRepository>>,
 ) -> Result<(usize, bool), Box<dyn Error>> {
-    index_workspace_through_port(scheduler, store, workspace, dirty)
+    let indexed_generation = scheduler
+        .generations
+        .lock()
+        .map_err(|_| "index generations lock poisoned")?
+        .get(&workspace.name)
+        .copied();
+    index_workspace_through_port(
+        scheduler,
+        store,
+        workspace,
+        dirty,
+        indexed_generation,
+        false,
+    )
 }
 
 fn index_workspace_through_port(
@@ -1856,13 +1957,9 @@ fn index_workspace_through_port(
     store: &SemanticStore,
     workspace: &Workspace,
     dirty: Option<&BTreeMap<String, DirtyRepository>>,
+    indexed_generation: Option<u64>,
+    drain_on_shutdown: bool,
 ) -> Result<(usize, bool), Box<dyn Error>> {
-    let indexed_generation = scheduler
-        .generations
-        .lock()
-        .map_err(|_| "index generations lock poisoned")?
-        .get(&workspace.name)
-        .copied();
     let source_loading_started = Instant::now();
     let (snapshot, inventory_statistics) = tracing::info_span!(
         "index.inventory",
@@ -1870,7 +1967,7 @@ fn index_workspace_through_port(
         repositories = workspace.repositories.len()
     )
     .in_scope(|| refresh_workspace_snapshot(scheduler, workspace, dirty))?;
-    if scheduler.is_stopping() {
+    if scheduler.is_stopping() && !drain_on_shutdown {
         return Ok((0, false));
     }
     let source_loading = source_loading_started.elapsed();
@@ -1925,7 +2022,7 @@ fn index_workspace_through_port(
             .with_repository_enrichment_inputs(
                 scheduler.indexer.enrichment_input_identities(&snapshot),
             )?;
-        if scheduler.is_stopping() {
+        if scheduler.is_stopping() && !drain_on_shutdown {
             return Ok((0, false));
         }
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
@@ -1974,7 +2071,7 @@ fn index_workspace_through_port(
             .analyze_prepared(&snapshot, &analysis_plan)
             .map_err(erase_error)
     })?;
-    if scheduler.is_stopping() {
+    if scheduler.is_stopping() && !drain_on_shutdown {
         return Ok((0, false));
     }
     let repository_analysis = repository_analysis_started.elapsed();
@@ -2026,7 +2123,7 @@ fn index_workspace_through_port(
     let publication_started = Instant::now();
     let (current, verification_statistics) =
         refresh_workspace_snapshot(scheduler, workspace, dirty)?;
-    if scheduler.is_stopping() {
+    if scheduler.is_stopping() && !drain_on_shutdown {
         return Ok((0, false));
     }
     let current_plan = scheduler.indexer.prepare(&current);
@@ -2134,6 +2231,30 @@ fn workspace_verification_fingerprint(
         digest.update(fingerprint.as_bytes());
     }
     format!("{:x}", digest.finalize())
+}
+
+fn git_head_only_noop(
+    store: &SemanticStore,
+    workspace: &Workspace,
+    dirty: &BTreeMap<String, DirtyRepository>,
+) -> Result<bool, Box<dyn Error>> {
+    if dirty.is_empty() || !dirty.values().all(DirtyRepository::head_only) {
+        return Ok(false);
+    }
+    for repository in &workspace.repositories {
+        if !dirty.contains_key(&repository.repository.identity) {
+            continue;
+        }
+        let (_, head) = beholder_adapters_git::repository_version(&repository.base)?;
+        if store
+            .repository_revision(&repository.repository.identity)?
+            .and_then(|revision| revision.head)
+            != head
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn refresh_workspace_snapshot(
@@ -4405,6 +4526,104 @@ mod tests {
     }
 
     #[test]
+    fn durable_index_uses_its_persisted_generation_at_publication() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-job-generation-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        let workspace = test_workspace("main", repository);
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        scheduler
+            .generations
+            .lock()
+            .unwrap()
+            .insert("main".into(), 2);
+
+        let error =
+            index_workspace_through_port(&scheduler, &store, &workspace, None, Some(1), true)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("stale analysis was discarded"));
+        assert!(store.inspect_revisions().unwrap().rows.is_empty());
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn superseded_job_stays_active_until_durable_acknowledgement() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-job-ack-{unique}"));
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        scheduler
+            .generations
+            .lock()
+            .unwrap()
+            .insert("main".into(), 2);
+        scheduler
+            .automatic_jobs
+            .lock()
+            .unwrap()
+            .insert("main".into(), Some(1));
+        let job = DurableIndexJob {
+            target: IndexTarget::Workspace {
+                workspace: "main".into(),
+            },
+            trigger: JobTrigger::Automatic,
+            prerequisite_index_jobs: Vec::new(),
+            generation: Some(1),
+            repository_intents: Vec::new(),
+        };
+        let store = SemanticStore::memory().unwrap();
+        let workspaces =
+            Mutex::new(WorkspaceRegistry::open(state.join("workspaces.json")).unwrap());
+
+        let result = scheduler.run_index_job(&store, &workspaces, &job).unwrap();
+
+        assert_eq!(result.outcome, IndexOutcome::Superseded);
+        assert!(
+            scheduler
+                .automatic_jobs
+                .lock()
+                .unwrap()
+                .contains_key("main")
+        );
+        scheduler.automatic_job_finished("main", Some(1));
+        assert!(
+            !scheduler
+                .automatic_jobs
+                .lock()
+                .unwrap()
+                .contains_key("main")
+        );
+        scheduler
+            .automatic_jobs
+            .lock()
+            .unwrap()
+            .insert("main".into(), Some(2));
+        scheduler.automatic_job_finished("main", Some(1));
+        assert_eq!(
+            scheduler.automatic_jobs.lock().unwrap().get("main"),
+            Some(&Some(2))
+        );
+        scheduler.automatic_job_finished("main", Some(2));
+        assert!(
+            !scheduler
+                .automatic_jobs
+                .lock()
+                .unwrap()
+                .contains_key("main")
+        );
+    }
+
+    #[test]
     fn watcher_intents_share_ignore_policy_and_promote_structural_changes() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4470,6 +4689,15 @@ mod tests {
             Ok(event(
                 EventKind::Modify(notify::event::ModifyKind::Any),
                 ignored,
+            )),
+            &registry,
+        );
+        assert!(scheduler.generations.lock().unwrap().is_empty());
+
+        scheduler.add_event(
+            Ok(event(
+                EventKind::Create(notify::event::CreateKind::File),
+                repository.join(".moon/cache/ciReport.json"),
             )),
             &registry,
         );
@@ -4590,44 +4818,6 @@ mod tests {
 
         assert!(scheduler.dirty_repositories.lock().unwrap()["main"][&identity].reconcile);
         assert!(scheduler.generations.lock().unwrap().contains_key("main"));
-        fs::remove_dir_all(state).unwrap();
-    }
-
-    #[test]
-    fn failed_reindexing_uses_bounded_exponential_backoff() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let state = std::env::temp_dir().join(format!("beholder-retry-{unique}"));
-        let repository = state.join("repo");
-        fs::create_dir_all(&repository).unwrap();
-        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
-        let workspace = registry
-            .register("main".into(), vec![repository.clone()], Vec::new())
-            .unwrap();
-        let registry = Mutex::new(registry);
-        let scheduler = IndexScheduler::new(state.join("cache"));
-        let store = SemanticStore::memory().unwrap();
-        scheduler.mark(&workspace);
-        fs::remove_dir_all(&repository).unwrap();
-
-        for attempt in 1..=MAX_REINDEX_RETRIES {
-            let result = scheduler.reindex_dirty(&store, &registry);
-            assert_eq!(
-                result.retry_after,
-                Some(RETRY_BASE_DELAY.saturating_mul(1_u32 << (attempt - 1)))
-            );
-        }
-        assert_eq!(scheduler.reindex_dirty(&store, &registry).retry_after, None);
-        scheduler.mark(&workspace);
-        assert!(
-            !scheduler
-                .retry_attempts
-                .lock()
-                .unwrap()
-                .contains_key("main")
-        );
         fs::remove_dir_all(state).unwrap();
     }
 
@@ -5255,85 +5445,6 @@ mod tests {
                 && edge.to == "proto-type://phase7.checkout.v1.InitializeOrderRequest"
         }));
 
-        drop(store);
-        fs::remove_dir_all(state).unwrap();
-    }
-
-    #[tokio::test]
-    async fn reconciliation_recovers_a_missed_event() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let state = std::env::temp_dir().join(format!("beholder-reconcile-{unique}"));
-        let repository = state.join("repo");
-        fs::create_dir_all(repository.join("src")).unwrap();
-        let source = repository.join("src/lib.rs");
-        fs::write(&source, "fn caller() { before(); } fn before() {}").unwrap();
-
-        let store = Arc::new(SemanticStore::persistent(&state.join("beholder.db"), true).unwrap());
-        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
-        let workspace = registry
-            .register("main".into(), vec![repository], Vec::new())
-            .unwrap();
-        let identity = &workspace.repositories[0].repository.identity;
-        let caller = format!("repo://{identity}/rust/lib/caller");
-        let after = format!("repo://{identity}/rust/lib/after");
-        let registry = Arc::new(Mutex::new(registry));
-        let scheduler = Arc::new(IndexScheduler::new(state.join("frontend-cache")));
-        scheduler.index(&store, &workspace).unwrap();
-        fs::write(&source, "fn caller() { after(); } fn after() {}").unwrap();
-
-        let task = tokio::spawn(scheduler.clone().run_with_reconciliation_period(
-            store.clone(),
-            registry,
-            Duration::from_millis(10),
-        ));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if format!("{:?}", store.context("main", &caller).unwrap()).contains(&after) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("periodic reconciliation did not recover the missed event");
-        scheduler.stop();
-        task.await.unwrap();
-        drop(store);
-        fs::remove_dir_all(state).unwrap();
-    }
-
-    #[test]
-    fn no_op_reconciliation_does_not_mark_stale_or_publish_a_revision() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let state = std::env::temp_dir().join(format!("beholder-no-op-reconcile-{unique}"));
-        let repository = state.join("repo");
-        fs::create_dir_all(repository.join("src")).unwrap();
-        fs::write(repository.join("src/lib.rs"), "fn stable() {}").unwrap();
-        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
-        let workspace = registry
-            .register("main".into(), vec![repository], Vec::new())
-            .unwrap();
-        let registry = Mutex::new(registry);
-        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
-        let scheduler = IndexScheduler::new(state.join("cache"));
-        assert!(scheduler.index(&store, &workspace).unwrap().1);
-        let revision = store.inspect_revisions().unwrap().rows[0][1].clone();
-
-        assert!(!scheduler.reconcile_registered(&store, &registry));
-
-        assert!(
-            !scheduler
-                .query_metadata("main", 1, Default::default())
-                .freshness
-                .stale
-        );
-        assert_eq!(store.inspect_revisions().unwrap().rows[0][1], revision);
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

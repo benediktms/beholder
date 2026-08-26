@@ -16,6 +16,8 @@ use beholder_worker_client::{PluginRegistry, plugin_analyzer};
 use beholder_worker_client::{WorkerAnalyzerBuilder, worker_environment_variable};
 use std::error::Error;
 #[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
@@ -31,60 +33,125 @@ mod workspace_registry;
 
 use workspace_registry::WorkspaceRegistry;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(not(unix))]
     return Err("beholderd local IPC is supported on Unix platforms".into());
 
     #[cfg(unix)]
     {
-        let state_dir = state_dir()?;
-        std::fs::create_dir_all(&state_dir)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
-        let _lock = single_instance::acquire(&state_dir)?;
-        let _jobs = jobs::JobQueue::open(&state_dir.join("queue.sqlite")).await?;
-        let socket_path = socket_path()?;
-        let (listener, _socket_file) = ipc::bind_socket(&socket_path)?;
-        let _observability_guard = beholder_observability::init(
-            "beholderd",
-            LogOutput::Rolling {
-                directory: state_dir.clone(),
-                prefix: "beholderd".into(),
-            },
-        );
-        tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "daemon started");
-        let cache_dir = state_dir.join("frontend-cache");
-        let (service, stopped, index_scheduler) = daemon::build(
-            SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
-            WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
-            built_in_indexer(cache_dir)?,
-        )?;
-        let watcher_task = tokio::spawn(
-            index_scheduler
-                .clone()
-                .run(service.store.clone(), service.workspaces.clone()),
-        );
-        let garbage_collection_task = tokio::spawn(daemon::run_garbage_collection_monitor(
-            service.store.clone(),
-            service.scheduler.clone(),
-            service.garbage_collector_running.clone(),
-            service.garbage_collection_progress.clone(),
-        ));
-        let shutdown_scheduler = index_scheduler.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(run_daemon());
+        runtime.shutdown_timeout(Duration::ZERO);
+        result
+    }
+}
+
+#[cfg(unix)]
+async fn run_daemon() -> Result<(), Box<dyn Error>> {
+    let state_dir = state_dir()?;
+    std::fs::create_dir_all(&state_dir)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
+    let _lock = single_instance::acquire(&state_dir)?;
+    let _observability_guard = beholder_observability::init(
+        "beholderd",
+        LogOutput::Rolling {
+            directory: state_dir.clone(),
+            prefix: "beholderd".into(),
+        },
+    );
+    let jobs = jobs::JobQueue::open(&state_dir.join("queue.sqlite")).await?;
+    jobs.recover().await?;
+    let socket_path = socket_path()?;
+    let (listener, _socket_file) = ipc::bind_socket(&socket_path)?;
+    tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "daemon started");
+    let cache_dir = state_dir.join("frontend-cache");
+    let (service, stopped, index_scheduler) = daemon::build(
+        SemanticStore::persistent(&state_dir.join("beholder.db"), true)?,
+        WorkspaceRegistry::open(workspace_registry::registry_path(&state_dir))?,
+        built_in_indexer(cache_dir)?,
+        jobs.clone(),
+    )?;
+    let mut index_worker = jobs::start_index_worker(
+        jobs.clone(),
+        index_scheduler.clone(),
+        service.store.clone(),
+        service.workspaces.clone(),
+    );
+    while !index_worker.context.is_ready() {
+        if index_worker.task.is_finished() {
+            return Err(format!(
+                "index worker exited during startup: {}",
+                join_result(index_worker.task.await)
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut watcher_task = tokio::spawn(index_scheduler.clone().run(
+        service.store.clone(),
+        service.workspaces.clone(),
+        jobs.clone(),
+    ));
+    let mut garbage_collection_task = tokio::spawn(daemon::run_garbage_collection_monitor(
+        service.store.clone(),
+        service.scheduler.clone(),
+        service.garbage_collector_running.clone(),
+        service.garbage_collection_progress.clone(),
+    ));
+    let server_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let server_stopping = server_shutdown.clone();
+    let mut server_task = tokio::spawn(
         Server::builder()
             .trace_fn(rpc_span)
             .add_service(DaemonServer::new(service))
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
-                ipc::shutdown_signal(stopped).await;
-                shutdown_scheduler.stop();
-            })
-            .await?;
-        index_scheduler.stop();
-        watcher_task.await?;
-        garbage_collection_task.await?;
-        tracing::info!("daemon stopped");
-        Ok(())
+                server_stopping.notified().await;
+            }),
+    );
+    let mut shutdown_signal = Box::pin(ipc::shutdown_signal(stopped));
+    let fatal = tokio::select! {
+        () = &mut shutdown_signal => None,
+        result = &mut index_worker.task => Some(format!("index worker exited unexpectedly: {}", join_result(result))),
+        result = &mut watcher_task => Some(format!("automatic index producer exited unexpectedly: {}", join_result(result))),
+        result = &mut garbage_collection_task => Some(format!("garbage collection monitor exited unexpectedly: {}", join_result(result.map(|()| Ok::<(), String>(()))))),
+        result = &mut server_task => Some(format!("gRPC server exited unexpectedly: {}", join_result(result.map(|result| result.map_err(|error| error.to_string()))))),
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    jobs.close_admission().await;
+    index_scheduler.stop();
+    let _ = index_worker.context.stop();
+    server_shutdown.notify_waiters();
+    let drain = async {
+        if !server_task.is_finished() {
+            let _ = (&mut server_task).await;
+        }
+        if !watcher_task.is_finished() {
+            let _ = (&mut watcher_task).await;
+        }
+        if !index_worker.task.is_finished() {
+            let _ = (&mut index_worker.task).await;
+        }
+        index_scheduler.wait_for_checkpoint().await;
+        if !garbage_collection_task.is_finished() {
+            let _ = (&mut garbage_collection_task).await;
+        }
+    };
+    if tokio::time::timeout_at(deadline, drain).await.is_err() {
+        tracing::error!("daemon shutdown deadline expired; terminating remaining work");
+    }
+    tracing::info!("daemon stopped");
+    fatal.map_or(Ok(()), |error| Err(error.into()))
+}
+
+#[cfg(unix)]
+fn join_result<T: std::fmt::Debug>(result: Result<T, tokio::task::JoinError>) -> String {
+    match result {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => error.to_string(),
     }
 }
 
@@ -305,10 +372,11 @@ mod tests {
         v1::{
             ClearCacheRequest, DeleteRepositoryRequest, EntityKind, EntityRequest, EvidenceKind,
             GarbageCollectPhase, GarbageCollectRequest, GetGarbageCollectionStatusRequest,
-            GetRepositoryRequest, GetStatusRequest, IndexRepositoryRequest, ListWorkspacesRequest,
-            PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
-            ReindexWorkspaceRequest, RelationKind, StopRequest, TraversalEntityRequest,
-            daemon_client::DaemonClient, garbage_collect_event,
+            GetJobRequest, GetRepositoryRequest, GetStatusRequest, IndexRepositoryRequest,
+            JobStatus, JobTrigger, JobType, ListJobsRequest, ListWorkspacesRequest, PathRequest,
+            RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
+            RelationKind, StopRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+            garbage_collect_event,
         },
     };
     use std::{env, fs, path::Path, time::Duration};
@@ -342,18 +410,28 @@ mod tests {
         );
         let _ = fs::remove_file(&database);
         let registry_path = workspace_registry::registry_path(&state);
+        let jobs = jobs::JobQueue::open(&state.join("queue.sqlite"))
+            .await
+            .unwrap();
         let (service, stopped, index_scheduler) = daemon::build(
             SemanticStore::persistent(&database, true).unwrap(),
             WorkspaceRegistry::open(registry_path.clone()).unwrap(),
             built_in_indexer(state.join("frontend-cache")).unwrap(),
+            jobs.clone(),
         )
         .unwrap();
         let test_workspaces = service.workspaces.clone();
-        let mut watcher_task = tokio::spawn(
-            index_scheduler
-                .clone()
-                .run(service.store.clone(), service.workspaces.clone()),
+        let index_worker = jobs::start_index_worker(
+            jobs.clone(),
+            index_scheduler.clone(),
+            service.store.clone(),
+            service.workspaces.clone(),
         );
+        let mut watcher_task = tokio::spawn(index_scheduler.clone().run(
+            service.store.clone(),
+            service.workspaces.clone(),
+            jobs.clone(),
+        ));
         let shutdown_scheduler = index_scheduler.clone();
         let server = tokio::spawn(async move {
             Server::builder()
@@ -379,7 +457,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 17);
+        assert_eq!(status.protocol_version, 18);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");
@@ -584,6 +662,48 @@ mod tests {
         })
         .await
         .expect("registered workspace was not indexed");
+        let indexed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let indexed = client
+                    .list_jobs(ListJobsRequest { page_token: None })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .jobs
+                    .into_iter()
+                    .find(|job| {
+                        job.target
+                            .as_ref()
+                            .and_then(|target| target.target.as_ref())
+                            .is_some_and(|target| {
+                                matches!(target, beholder_protocol::v1::job_target::Target::Workspace(name) if name == "main")
+                            })
+                    });
+                if let Some(indexed) = indexed
+                    && indexed.status == JobStatus::Completed as i32
+                {
+                    break indexed;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("automatic index job did not complete durably");
+        assert_eq!(indexed.r#type, JobType::Index as i32);
+        assert_eq!(indexed.trigger, JobTrigger::Automatic as i32);
+        assert!(indexed.submitted_at_ms > 0);
+        let detail = client
+            .get_job(GetJobRequest { id: indexed.id })
+            .await
+            .unwrap()
+            .into_inner()
+            .job
+            .unwrap();
+        assert_eq!(detail.max_attempts, jobs::MAX_ATTEMPTS);
+        assert!(detail.run_at_ms.is_some());
+        assert!(detail.started_at_ms.is_some());
+        assert!(detail.completed_at_ms.is_some());
+        assert!(detail.index_result.unwrap().published);
         let protobuf = client
             .context(EntityRequest {
                 workspace: "main".into(),
@@ -642,16 +762,26 @@ mod tests {
         })
         .await
         .expect("protobuf descriptor change was not indexed");
-        let metadata = client
-            .context(EntityRequest {
-                workspace: "main".into(),
-                entity: caller.clone(),
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .metadata
-            .unwrap();
+        let metadata = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let metadata = client
+                    .context(EntityRequest {
+                        workspace: "main".into(),
+                        entity: caller.clone(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .metadata
+                    .unwrap();
+                if !metadata.freshness.as_ref().unwrap().indexing {
+                    break metadata;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("automatic index job did not become ready after durable acknowledgement");
         assert_eq!(metadata.revision, 2);
         assert_eq!(metadata.view, "main");
         let freshness = metadata.freshness.unwrap();
@@ -903,9 +1033,16 @@ mod tests {
                 .accepted
         );
         server.await.unwrap();
+        let _ = index_worker.context.stop();
         tokio::time::timeout(Duration::from_millis(500), &mut watcher_task)
             .await
             .expect("daemon did not cancel queued indexing")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), index_worker.task)
+            .await
+            .expect("index worker did not stop")
+            .unwrap()
             .unwrap();
         assert!(socket_path.exists());
         assert!(single_instance::acquire(&state).is_err());

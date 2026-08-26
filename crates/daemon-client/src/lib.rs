@@ -10,11 +10,11 @@ use beholder_protocol::{
         ClearCacheRequest, DeleteRepositoryRequest, EntityRequest,
         GarbageCollectEvent as ProtocolGarbageCollectEvent, GarbageCollectPhase,
         GarbageCollectProgress as ProtocolGarbageCollectProgress, GarbageCollectRequest,
-        GetGarbageCollectionStatusRequest, GetRepositoryRequest, GetStatusRequest,
-        GetStatusResponse, IndexRepositoryRequest, ListWorkspacesRequest, PathRequest,
-        RegisterRepositoryRequest, RegisterWorkspaceRequest, ReindexWorkspaceRequest,
-        SetWorkspacePluginRequest, StopRequest, TraversalEntityRequest,
-        daemon_client::DaemonClient, garbage_collect_event,
+        GetGarbageCollectionStatusRequest, GetJobRequest, GetJobResponse, GetRepositoryRequest,
+        GetStatusRequest, GetStatusResponse, IndexRepositoryRequest, ListJobsRequest,
+        ListJobsResponse, ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest,
+        RegisterWorkspaceRequest, ReindexWorkspaceRequest, SetWorkspacePluginRequest, StopRequest,
+        TraversalEntityRequest, daemon_client::DaemonClient, garbage_collect_event,
     },
 };
 use std::path::{Path, PathBuf};
@@ -62,6 +62,24 @@ pub async fn get_status() -> Result<GetStatusResponse, Box<dyn std::error::Error
     Ok(connect()
         .await?
         .get_status(request(GetStatusRequest {}))
+        .await?
+        .into_inner())
+}
+
+pub async fn list_jobs(
+    page_token: Option<String>,
+) -> Result<ListJobsResponse, Box<dyn std::error::Error>> {
+    Ok(connect()
+        .await?
+        .list_jobs(request(ListJobsRequest { page_token }))
+        .await?
+        .into_inner())
+}
+
+pub async fn get_job(id: String) -> Result<GetJobResponse, Box<dyn std::error::Error>> {
+    Ok(connect()
+        .await?
+        .get_job(request(GetJobRequest { id }))
         .await?
         .into_inner())
 }

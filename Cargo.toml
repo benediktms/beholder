@@ -54,6 +54,7 @@ beholder-worker-client = { path = "crates/worker-client" }
 beholder-worker-rust = { path = "crates/worker-rust" }
 beholder-daemon-client = { path = "crates/daemon-client" }
 beholder-protocol = { path = "crates/protocol" }
+futures-util = "0.3.31"
 opentelemetry = { version = "0.32.0", features = ["logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "logs", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
@@ -71,6 +72,7 @@ tonic = "0.14.6"
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+ulid = "1.2.1"
 jsonc-parser = { version = "0.33.1", features = ["serde"] }
 
 [patch.crates-io]
