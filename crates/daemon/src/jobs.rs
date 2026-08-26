@@ -2,8 +2,9 @@ use apalis::prelude::FromRequest;
 use apalis::{
     layers::tracing::TracingContext,
     prelude::{
-        Acknowledge, AcknowledgementExt, Attempt, Backend, BoxDynError, Data, MetadataExt, Task,
-        TaskBuilder, TaskId, TaskSink, TaskStream, WorkerBuilder, WorkerContext,
+        Acknowledge, AcknowledgementExt, Attempt, Backend, BoxDynError, Data, IntervalStrategy,
+        MetadataExt, StrategyBuilder, Task, TaskBuilder, TaskId, TaskSink, TaskStream,
+        WorkerBuilder, WorkerContext,
     },
 };
 use apalis_codec::json::JsonCodec;
@@ -17,11 +18,12 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
+    collections::BTreeSet,
     convert::Infallible,
     error::Error,
     path::Path,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
 use tracing::Instrument;
@@ -29,6 +31,7 @@ use ulid::Ulid;
 
 use crate::{indexing::IndexScheduler, workspace_registry::WorkspaceRegistry};
 use beholder_adapters_mnestic::SemanticStore;
+use beholder_domain::Workspace;
 
 const INDEX_QUEUE: &str = "index";
 const ENRICHMENT_QUEUE: &str = "enrichment";
@@ -89,11 +92,23 @@ pub enum IndexOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct IndexJobResult {
-    pub workspace: String,
+#[serde(rename_all = "snake_case")]
+pub enum IndexDestination {
+    Workspace { workspace: String },
+    StandaloneRepository { repository: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IndexDestinationResult {
+    pub destination: IndexDestination,
     pub observation_count: usize,
     pub published: bool,
     pub outcome: IndexOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IndexJobResult {
+    pub destinations: Vec<IndexDestinationResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -295,7 +310,14 @@ impl JobQueue {
         }
 
         Ok(Self {
-            index_jobs: SqliteStorage::new_with_config(&pool, &Config::new(INDEX_QUEUE)),
+            index_jobs: SqliteStorage::new_with_config(
+                &pool,
+                &Config::new(INDEX_QUEUE).with_poll_interval(
+                    StrategyBuilder::new()
+                        .apply(IntervalStrategy::new(Duration::from_millis(100)))
+                        .build(),
+                ),
+            ),
             enrichment_jobs: SqliteStorage::new_with_config(&pool, &Config::new(ENRICHMENT_QUEUE)),
             admission: Arc::new(Mutex::new(true)),
         })
@@ -320,12 +342,62 @@ impl JobQueue {
             return Ok(None);
         }
 
+        Ok(Some(self.push_index_job(job).await?))
+    }
+
+    pub async fn enqueue_manual_index(
+        &self,
+        job: IndexJob,
+        workspaces: &[Workspace],
+    ) -> Result<(IndexJobId, Vec<StoredJob>), Box<dyn Error + Send + Sync>> {
+        let admitted = self.admission.lock().await;
+        if !*admitted {
+            return Err("job admission is closed".into());
+        }
+        if job.trigger != JobTrigger::Manual {
+            return Err("manual index submission requires a manual trigger".into());
+        }
+        let requested = index_target_pairs(&job.target, workspaces);
+        let rows = sqlx::query(
+            "SELECT * FROM Jobs WHERE job_type = ? AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts)) ORDER BY id",
+        )
+        .bind(INDEX_QUEUE)
+        .fetch_all(self.index_jobs.pool())
+        .await?;
+        let overlaps = rows
+            .into_iter()
+            .filter_map(|row| {
+                let payload = row.get::<Vec<u8>, _>("job");
+                let active = serde_json::from_slice::<IndexJob>(&payload).ok()?;
+                (!requested.is_disjoint(&index_target_pairs(&active.target, workspaces)))
+                    .then(|| decode_row(row))
+                    .flatten()
+            })
+            .collect();
+        let id = self.push_index_job(job).await?;
+        Ok((id, overlaps))
+    }
+
+    async fn push_index_job(
+        &self,
+        job: IndexJob,
+    ) -> Result<IndexJobId, Box<dyn Error + Send + Sync>> {
+        let (workspace, repository) = match &job.target {
+            IndexTarget::Workspace { workspace } => (Some(workspace.as_str()), None),
+            IndexTarget::Repository { repository, .. } => (None, Some(repository.as_str())),
+        };
+        let trigger = match job.trigger {
+            JobTrigger::Automatic => "automatic",
+            JobTrigger::Manual => "manual",
+        };
+
         let span = tracing::info_span!(
             "job.enqueue",
             job.kind = "index",
-            job.trigger = "automatic",
+            job.trigger = trigger,
             job.queue = INDEX_QUEUE,
             job.workspace = workspace,
+            job.repository = repository,
             job.id = tracing::field::Empty,
         );
         let id = Ulid::new();
@@ -354,12 +426,12 @@ impl JobQueue {
                 })
                 .build();
             storage.push_task(task).await?;
-            tracing::info!(job.id = %id, "automatic index job enqueued");
+            tracing::info!(job.id = %id, "index job enqueued");
             Ok::<(), Box<dyn Error + Send + Sync>>(())
         }
         .instrument(span)
         .await?;
-        Ok(Some(IndexJobId(id.to_string())))
+        Ok(IndexJobId(id.to_string()))
     }
 
     pub async fn automatic_index_active(&self, workspace: &str) -> Result<bool, sqlx::Error> {
@@ -572,6 +644,50 @@ fn queue_wait_ms(eligible_at_ms: i64, started_at_ms: i64) -> u64 {
     started_at_ms.saturating_sub(eligible_at_ms).max(0) as u64
 }
 
+fn index_target_pairs(
+    target: &IndexTarget,
+    workspaces: &[Workspace],
+) -> BTreeSet<(Option<String>, String)> {
+    match target {
+        IndexTarget::Workspace { workspace } => workspaces
+            .iter()
+            .find(|candidate| candidate.name == *workspace)
+            .into_iter()
+            .flat_map(|workspace| {
+                workspace.repositories.iter().map(|repository| {
+                    (
+                        Some(workspace.name.clone()),
+                        repository.repository.identity.clone(),
+                    )
+                })
+            })
+            .collect(),
+        IndexTarget::Repository {
+            repository,
+            workspace_scope: Some(workspace),
+        } => BTreeSet::from([(Some(workspace.clone()), repository.clone())]),
+        IndexTarget::Repository {
+            repository,
+            workspace_scope: None,
+        } => {
+            let mut pairs = workspaces
+                .iter()
+                .filter(|workspace| {
+                    workspace
+                        .repositories
+                        .iter()
+                        .any(|candidate| candidate.repository.identity == *repository)
+                })
+                .map(|workspace| (Some(workspace.name.clone()), repository.clone()))
+                .collect::<BTreeSet<_>>();
+            if pairs.is_empty() {
+                pairs.insert((None, repository.clone()));
+            }
+            pairs
+        }
+    }
+}
+
 pub fn start_index_worker(
     queue: JobQueue,
     scheduler: Arc<IndexScheduler>,
@@ -616,10 +732,14 @@ async fn run_index_job(
     index_attempt: IndexAttempt,
 ) -> Result<IndexJobResult, BoxDynError> {
     let IndexAttempt { attempt, context } = index_attempt;
-    let IndexTarget::Workspace { workspace } = &job.target else {
-        return Err("automatic index job target is not a workspace".into());
+    let (workspace, repository) = match &job.target {
+        IndexTarget::Workspace { workspace } => (Some(workspace.clone()), None),
+        IndexTarget::Repository { repository, .. } => (None, Some(repository.clone())),
     };
-    let workspace = workspace.clone();
+    let trigger = match job.trigger {
+        JobTrigger::Automatic => "automatic",
+        JobTrigger::Manual => "manual",
+    };
     let attempt_started_at_ms = unix_millis().unwrap_or_default();
     let eligible: Result<EligibleAt, _> = context.extract();
     let queue_wait_ms = queue_wait_ms(
@@ -630,9 +750,10 @@ async fn run_index_job(
         "job.attempt",
         job.id = %id,
         job.kind = "index",
-        job.trigger = "automatic",
+        job.trigger = trigger,
         job.queue = INDEX_QUEUE,
-        job.workspace = %workspace,
+        job.workspace = workspace.as_deref(),
+        job.repository = repository.as_deref(),
         attempt = attempt.current(),
         max_attempts = MAX_ATTEMPTS,
         queue_wait_ms,
@@ -665,16 +786,31 @@ async fn run_index_job(
         .map_err(|error| error.to_string())?;
         match result {
             Ok(result) => {
-                if result.published {
+                if result.destinations.iter().any(|result| result.published) {
                     scheduler.schedule_checkpoint(Arc::clone(&store));
                 }
-                tracing::Span::current().record("job.outcome", format!("{:?}", result.outcome));
-                tracing::info!(job.id = %id, outcome = ?result.outcome, "index job completed");
+                let outcome = if result
+                    .destinations
+                    .iter()
+                    .all(|result| result.outcome == IndexOutcome::Superseded)
+                {
+                    "superseded"
+                } else if result.destinations.iter().any(|result| result.published) {
+                    "published"
+                } else {
+                    "unchanged"
+                };
+                tracing::Span::current().record("job.outcome", outcome);
+                tracing::info!(job.id = %id, outcome, "index job completed");
                 Ok(result)
             }
             Err(error) => {
                 let terminal = attempt.current() >= MAX_ATTEMPTS as usize;
-                scheduler.automatic_job_failed(&workspace, job.generation, terminal);
+                if job.trigger == JobTrigger::Automatic
+                    && let Some(workspace) = workspace.as_deref()
+                {
+                    scheduler.automatic_job_failed(workspace, job.generation, terminal);
+                }
                 if terminal {
                     tracing::Span::current().record("job.outcome", "failed");
                     tracing::error!(job.id = %id, %error, attempt = attempt.current(), max_attempts = MAX_ATTEMPTS, "index job failed");
@@ -786,7 +922,7 @@ fn decode_row(row: sqlx::sqlite::SqliteRow) -> Option<StoredJob> {
             .ok()?
             .get("Ok")
             .cloned()
-            .and_then(|result| serde_json::from_value(result).ok())
+            .and_then(decode_index_result)
     });
     Some(StoredJob {
         submitted_at_ms: Ulid::from_string(&id).ok()?.timestamp_ms() as i64,
@@ -805,6 +941,30 @@ fn decode_row(row: sqlx::sqlite::SqliteRow) -> Option<StoredJob> {
         last_error,
         prerequisites,
         result,
+    })
+}
+
+fn decode_index_result(result: serde_json::Value) -> Option<IndexJobResult> {
+    #[derive(Deserialize)]
+    struct LegacyIndexJobResult {
+        workspace: String,
+        observation_count: usize,
+        published: bool,
+        outcome: IndexOutcome,
+    }
+
+    serde_json::from_value(result.clone()).ok().or_else(|| {
+        let legacy = serde_json::from_value::<LegacyIndexJobResult>(result).ok()?;
+        Some(IndexJobResult {
+            destinations: vec![IndexDestinationResult {
+                destination: IndexDestination::Workspace {
+                    workspace: legacy.workspace,
+                },
+                observation_count: legacy.observation_count,
+                published: legacy.published,
+                outcome: legacy.outcome,
+            }],
+        })
     })
 }
 
@@ -842,6 +1002,7 @@ async fn quick_check(path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod durable_tests {
     use super::*;
+    use beholder_domain::{LogicalRepository, WorkspaceRepository};
     use std::{fs, time::Duration};
 
     fn automatic_job(workspace: &str) -> IndexJob {
@@ -862,6 +1023,24 @@ mod durable_tests {
             std::process::id(),
             Ulid::new()
         ))
+    }
+
+    fn workspace(name: &str, repositories: &[&str]) -> Workspace {
+        Workspace::new(
+            name,
+            repositories
+                .iter()
+                .map(|repository| WorkspaceRepository {
+                    repository: LogicalRepository {
+                        identity: (*repository).into(),
+                    },
+                    display_name: (*repository).into(),
+                    base: repository.into(),
+                    alternatives: Vec::new(),
+                })
+                .collect(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -895,6 +1074,100 @@ mod durable_tests {
                 .await
                 .is_err()
         );
+        queue.close().await;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_jobs_always_enqueue_and_report_every_overlapping_index_job() {
+        let path = queue_path("manual-overlap");
+        let queue = JobQueue::open(&path).await.unwrap();
+        let workspaces = vec![
+            workspace("first", &["shared", "first-only"]),
+            workspace("second", &["shared"]),
+            workspace("third", &["third-only"]),
+        ];
+        let automatic_first = queue
+            .enqueue_automatic_index(automatic_job("first"))
+            .await
+            .unwrap()
+            .unwrap();
+        let automatic_second = queue
+            .enqueue_automatic_index(automatic_job("second"))
+            .await
+            .unwrap()
+            .unwrap();
+        let automatic_third = queue
+            .enqueue_automatic_index(automatic_job("third"))
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE Jobs SET status = 'Running' WHERE id = ?")
+            .bind(&automatic_second.0)
+            .execute(queue.index_jobs.pool())
+            .await
+            .unwrap();
+        let manual = || IndexJob {
+            target: IndexTarget::Repository {
+                repository: "shared".into(),
+                workspace_scope: None,
+            },
+            trigger: JobTrigger::Manual,
+            prerequisite_index_jobs: Vec::new(),
+            generation: None,
+            repository_intents: Vec::new(),
+        };
+
+        let (first, overlaps) = queue
+            .enqueue_manual_index(manual(), &workspaces)
+            .await
+            .unwrap();
+        assert_eq!(overlaps.len(), 2);
+        assert_eq!(
+            overlaps
+                .iter()
+                .find(|job| job.id == automatic_first.0)
+                .unwrap()
+                .status,
+            StoredJobStatus::Queued
+        );
+        assert_eq!(
+            overlaps
+                .iter()
+                .find(|job| job.id == automatic_second.0)
+                .unwrap()
+                .status,
+            StoredJobStatus::Running
+        );
+        assert!(!overlaps.iter().any(|job| job.id == automatic_third.0));
+        sqlx::query("UPDATE Jobs SET status = 'Failed', attempts = 1 WHERE id = ?")
+            .bind(&first.0)
+            .execute(queue.index_jobs.pool())
+            .await
+            .unwrap();
+        queue.schedule_retry(&first.0, 4).await.unwrap();
+        let (second, overlaps) = queue
+            .enqueue_manual_index(manual(), &workspaces)
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(overlaps.len(), 3);
+        assert!(overlaps.iter().any(|job| job.id == automatic_first.0));
+        assert!(overlaps.iter().any(|job| job.id == automatic_second.0));
+        assert!(!overlaps.iter().any(|job| job.id == automatic_third.0));
+        assert_eq!(
+            overlaps
+                .iter()
+                .find(|job| job.id == first.0)
+                .unwrap()
+                .status,
+            StoredJobStatus::Waiting
+        );
+        assert_eq!(
+            queue.get(&second.0).await.unwrap().unwrap().trigger,
+            JobTrigger::Manual
+        );
+
         queue.close().await;
         fs::remove_file(path).unwrap();
     }
@@ -1046,6 +1319,38 @@ mod durable_tests {
         .expect("retry was not delivered after its eligible time");
         assert_eq!(delivered.parts.task_id.unwrap().to_string(), id.0);
         assert!(unix_millis().unwrap() >= eligible_at_ms);
+
+        queue.close().await;
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_index_queue_keeps_bounded_pickup_latency() {
+        let path = queue_path("idle-pickup");
+        let queue = JobQueue::open(&path).await.unwrap();
+        let storage = EligibleIndexStorage(queue.index_jobs.clone());
+        let delivery = tokio::spawn(async move {
+            let mut worker = WorkerContext::new::<()>("idle-pickup-test");
+            worker.start().unwrap();
+            let mut stream = storage.poll(&worker);
+            loop {
+                if let Some(task) = stream.next().await.unwrap().unwrap() {
+                    break task;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let id = queue
+            .enqueue_automatic_index(automatic_job("main"))
+            .await
+            .unwrap()
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_millis(500), delivery)
+            .await
+            .expect("idle index queue did not poll within its bounded interval")
+            .unwrap();
+        assert_eq!(delivered.parts.task_id.unwrap().to_string(), id.0);
 
         queue.close().await;
         fs::remove_file(path).unwrap();

@@ -238,6 +238,19 @@ impl WorkspaceRegistry {
             .map(|workspace| workspace.name.as_str())
     }
 
+    pub fn workspaces_referencing_repository(&self, identity: &str) -> Vec<Workspace> {
+        self.workspaces
+            .values()
+            .filter(|workspace| {
+                workspace
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.repository.identity == identity)
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn remove_repository(&mut self, identity: &str) -> Result<bool, Box<dyn Error>> {
         self.repositories.remove(identity)
     }

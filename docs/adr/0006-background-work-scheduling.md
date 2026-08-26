@@ -67,10 +67,10 @@ publication, standalone repository publication, checkpoints, and maintenance;
 source analysis inside that operation is parallel.
 
 Automatic baseline failures retry five times with exponential delays beginning
-at 250 ms. The workspace stays dirty when retries are exhausted, and periodic
-60-second reconciliation or a later signal tries current state again. Manual RPC
-indexing is synchronous from the caller's perspective and uses Tokio's blocking
-pool rather than the automatic scheduler loop.
+at 250 ms. The workspace stays dirty when retries are exhausted, and a later
+filesystem event, watcher reconciliation, restart, or manual request may enqueue
+current state again. Manual indexing uses the same durable worker and guarded
+publication path as automatic indexing.
 
 Compiler jobs use an in-memory map keyed by
 `(workspace, repository, analyzer)`. A newer fingerprint replaces queued work and
@@ -264,7 +264,10 @@ The daemon opens one SQLx pool at `state_dir().join("queue.sqlite")` and derives
 separate typed Apalis storage handles for the stable `index` and `enrichment`
 queues. There is no generic queue trait. Both job kinds initially run with global
 concurrency one and five total attempts, delayed by 250 ms, 500 ms, one second,
-and two seconds before attempts two through five.
+and two seconds before attempts two through five. The deployed index worker polls
+at a fixed 100 ms interval: the pinned SQLite fetcher does not reset its default
+backoff after a successful fetch, so retaining that backoff would leave work idle
+for as long as 60 seconds after quiet periods.
 
 ### Queue lifecycle and failure policy
 
@@ -289,10 +292,10 @@ acknowledgement failure may replay and is made safe by currentness guards.
 
 ### Public API and operability
 
-The final asynchronous API remains four unary methods on `beholder.v1.Daemon`:
+The asynchronous API remains on `beholder.v1.Daemon`; protocol version 19 exposes
 `SubmitIndex`, `SubmitEnrichment`, `ListJobs`, and `GetJob`. Public IDs are opaque
 Apalis ULIDs and public statuses are queued, waiting, running, completed, and
-failed. `beholder jobs list` orders active work first and returns terminal history
+failed. `beholder job list` orders active work first and returns terminal history
 in stable 15-row keyset pages; `beholder job get` exposes typed targets, triggers,
 attempts, prerequisites or wait reasons, safe errors and warnings, timestamps, and
 typed results without raw Apalis payloads or metadata.
@@ -329,9 +332,9 @@ parallel with indexing work.
 
 | Slice | Status | Current implementation |
 | --- | --- | --- |
-| 1. Inert queue foundation and ADR | Complete | Exact dependency pins, shared SQLite linkage, typed payload and storage handles, read-only quick check, create/open, startup migrations, fail-fast startup, and integration-test terminology. No producer or worker is registered. |
-| 2. Automatic indexing and inspection | Complete | Filesystem intent is durably coalesced into automatic `IndexJob` rows and executed by one monitored Apalis worker through the existing guarded publication seam. Startup recovery, five-attempt retry state, admission and one fixed ten-second shutdown deadline are active. `ListJobs`, `GetJob`, `beholder jobs list`, and `beholder job get` expose bounded typed lifecycle state. The superseded direct automatic executor, retry timers, and periodic reconciliation loop are removed. |
-| 3. Manual indexing | Planned | Existing synchronous indexing APIs and commands remain unchanged. |
+| 1. Inert queue foundation and ADR | Complete | Exact dependency pins, shared SQLite linkage, typed payload and storage handles, read-only quick check, create/open, startup migrations, fail-fast startup, and integration-test terminology. The foundation itself registered no producer or worker. |
+| 2. Automatic indexing and inspection | Complete | Filesystem intent is durably coalesced into automatic `IndexJob` rows and executed by one monitored Apalis worker through the existing guarded publication seam. Startup recovery, five-attempt retry state, admission and one fixed ten-second shutdown deadline are active. `ListJobs`, `GetJob`, `beholder job list`, and `beholder job get` expose bounded typed lifecycle state. The superseded direct automatic executor, retry timers, and periodic reconciliation loop are removed. |
+| 3. Manual indexing | Complete | Protocol version 19 adds `SubmitIndex` and `beholder index`. Exact workspace and repository targets create new manual `IndexJob` rows, report overlapping non-terminal work, and execute workspace fan-out, explicit workspace scope, or standalone publication through the deployed worker. Typed terminal results cover every destination. The synchronous `IndexRepository` and `ReindexWorkspace` RPCs and their CLI commands are removed. |
 | 4. Enrichment publication boundary | Planned | Current Mnestic enrichment operations remain unchanged. |
 | 5. Worker-ID namespace | Planned | Current built-in and plugin worker registration remains unchanged. |
 | 6. Automatic enrichment | Planned | The existing in-memory enrichment executor and Mnestic lifecycle state remain active. |

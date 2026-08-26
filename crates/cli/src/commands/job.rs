@@ -1,11 +1,18 @@
-use super::{JobCommand, JobsCommand};
+use super::JobCommand;
 use beholder_protocol::v1::{
-    IndexJobOutcome, JobStatus, JobSummary, JobTrigger, JobType, JobWaitReason, job_target,
+    IndexJobOutcome, JobStatus, JobSummary, JobTrigger, JobType, JobWaitReason, index_destination,
+    job_target,
 };
 use std::{error::Error, fmt::Debug};
 
-pub(super) async fn list(command: JobsCommand) -> Result<(), Box<dyn Error>> {
-    let JobsCommand::List { page_token } = command;
+pub(super) async fn run(command: JobCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        JobCommand::List { page_token } => list(page_token).await,
+        JobCommand::Get { id } => get(id).await,
+    }
+}
+
+async fn list(page_token: Option<String>) -> Result<(), Box<dyn Error>> {
     let response = beholder_daemon_client::list_jobs(page_token).await?;
     for job in response.jobs {
         println!(
@@ -23,8 +30,7 @@ pub(super) async fn list(command: JobsCommand) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub(super) async fn get(command: JobCommand) -> Result<(), Box<dyn Error>> {
-    let JobCommand::Get { id } = command;
+async fn get(id: String) -> Result<(), Box<dyn Error>> {
     let job = beholder_daemon_client::get_job(id)
         .await?
         .job
@@ -59,17 +65,33 @@ pub(super) async fn get(command: JobCommand) -> Result<(), Box<dyn Error>> {
         println!("error: {error}");
     }
     if let Some(result) = job.index_result {
-        println!(
-            "result: {} ({} observations, published={})",
-            enum_name::<IndexJobOutcome>(result.outcome),
-            result.observation_count,
-            result.published,
-        );
+        for result in result.destinations {
+            let destination = result
+                .destination
+                .and_then(|destination| destination.destination)
+                .map_or_else(
+                    || "unknown".into(),
+                    |destination| match destination {
+                        index_destination::Destination::Workspace(workspace) => {
+                            format!("workspace:{workspace}")
+                        }
+                        index_destination::Destination::StandaloneRepository(repository) => {
+                            format!("standalone-repository:{repository}")
+                        }
+                    },
+                );
+            println!(
+                "result: {destination} {} ({} observations, published={})",
+                enum_name::<IndexJobOutcome>(result.outcome),
+                result.observation_count,
+                result.published,
+            );
+        }
     }
     Ok(())
 }
 
-fn target(job: &JobSummary) -> String {
+pub(super) fn target(job: &JobSummary) -> String {
     let Some(target) = &job.target else {
         return "unknown".into();
     };
@@ -89,7 +111,7 @@ fn target(job: &JobSummary) -> String {
     }
 }
 
-fn enum_name<T>(value: i32) -> String
+pub(super) fn enum_name<T>(value: i32) -> String
 where
     T: TryFrom<i32> + Debug,
 {

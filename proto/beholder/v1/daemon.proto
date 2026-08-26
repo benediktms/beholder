@@ -12,10 +12,9 @@ service Daemon {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetRepository(GetRepositoryRequest) returns (RepositoryResponse);
   rpc Impact(TraversalEntityRequest) returns (ImpactResponse);
-  rpc IndexRepository(IndexRepositoryRequest) returns (IndexRepositoryResponse);
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
-  rpc ReindexWorkspace(ReindexWorkspaceRequest) returns (ReindexWorkspaceResponse);
+  rpc SubmitIndex(SubmitIndexRequest) returns (SubmitIndexResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
   rpc SetWorkspacePlugin(SetWorkspacePluginRequest) returns (SetWorkspacePluginResponse);
@@ -330,16 +329,6 @@ message WhyResponse {
   TraversalMetadata traversal = 7;
 }
 
-message ReindexWorkspaceRequest {
-  reserved 1;
-  string workspace = 2;
-}
-
-message ReindexWorkspaceResponse {
-  uint64 observation_count = 1;
-  bool published = 2;
-}
-
 message Workspace {
   string name = 1;
   repeated WorkspaceRepository repositories = 2;
@@ -420,17 +409,6 @@ message RepositoryResponse {
   RepositoryStatus repository = 1;
 }
 
-message IndexRepositoryRequest {
-  string identity = 1;
-  bool authoritative = 2;
-}
-
-message IndexRepositoryResponse {
-  RepositoryStatus repository = 1;
-  uint64 observation_count = 2;
-  bool published = 3;
-}
-
 message StopRequest {}
 
 message StopResponse {
@@ -460,6 +438,23 @@ message GetJobRequest {
 
 message GetJobResponse {
   Job job = 1;
+}
+
+message SubmitIndexRequest {
+  oneof target {
+    string workspace = 1;
+    RepositoryIndexTarget repository = 2;
+  }
+}
+
+message RepositoryIndexTarget {
+  string repository = 1;
+  optional string workspace_scope = 2;
+}
+
+message SubmitIndexResponse {
+  JobSummary job = 1;
+  repeated JobSummary overlapping_jobs = 2;
 }
 
 enum JobStatus {
@@ -514,11 +509,22 @@ enum IndexJobOutcome {
   INDEX_JOB_OUTCOME_SUPERSEDED = 3;
 }
 
-message IndexJobResult {
-  string workspace = 1;
+message IndexDestination {
+  oneof destination {
+    string workspace = 1;
+    string standalone_repository = 2;
+  }
+}
+
+message IndexDestinationResult {
+  IndexDestination destination = 1;
   uint64 observation_count = 2;
   bool published = 3;
   IndexJobOutcome outcome = 4;
+}
+
+message IndexJobResult {
+  repeated IndexDestinationResult destinations = 1;
 }
 
 message Job {

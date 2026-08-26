@@ -192,11 +192,16 @@ Repositories can be indexed independently and later reused by workspace views:
 
 ```bash
 beholder repository register /path/to/repository
-beholder repository index <repository-identity>
+beholder index <repository-identity>
+beholder index <repository-identity> --workspace <workspace-name>
 beholder repository show <repository-identity>
-beholder repository refresh <repository-identity>
 beholder repository delete <repository-identity>
 ```
+
+`beholder index <workspace-name>` indexes one registered workspace. Every manual
+request creates a durable job and prints its ID plus any overlapping work.
+Inspect active and recent work with `beholder job list`, then use
+`beholder job get <job-id>` for its lifecycle details and typed result.
 
 Deletion is rejected while a workspace references the repository. It never deletes the source checkout; graph facts not retained by a completed workspace revision are cleaned up in the background.
 

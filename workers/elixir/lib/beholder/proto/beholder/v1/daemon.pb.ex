@@ -5,6 +5,8 @@ defmodule Beholder.V1.GarbageCollectPhase do
   field :GARBAGE_COLLECT_PHASE_UNSPECIFIED, 0
   field :GARBAGE_COLLECT_PHASE_CLAIMING_OBSOLETE_STATES, 1
   field :GARBAGE_COLLECT_PHASE_SWEEPING_OBSOLETE_STATES, 2
+  field :GARBAGE_COLLECT_PHASE_CHECKPOINTING_DATABASE, 3
+  field :GARBAGE_COLLECT_PHASE_RECLAIMING_DATABASE_SPACE, 4
 end
 
 defmodule Beholder.V1.AnalysisCompleteness do
@@ -138,6 +140,55 @@ defmodule Beholder.V1.RelationKind do
   field :RELATION_KIND_CALLS_GRAPHQL, 17
 end
 
+defmodule Beholder.V1.JobStatus do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :JOB_STATUS_UNSPECIFIED, 0
+  field :JOB_STATUS_QUEUED, 1
+  field :JOB_STATUS_WAITING, 2
+  field :JOB_STATUS_RUNNING, 3
+  field :JOB_STATUS_COMPLETED, 4
+  field :JOB_STATUS_FAILED, 5
+end
+
+defmodule Beholder.V1.JobType do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :JOB_TYPE_UNSPECIFIED, 0
+  field :JOB_TYPE_INDEX, 1
+  field :JOB_TYPE_ENRICHMENT, 2
+end
+
+defmodule Beholder.V1.JobTrigger do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :JOB_TRIGGER_UNSPECIFIED, 0
+  field :JOB_TRIGGER_AUTOMATIC, 1
+  field :JOB_TRIGGER_MANUAL, 2
+end
+
+defmodule Beholder.V1.JobWaitReason do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :JOB_WAIT_REASON_UNSPECIFIED, 0
+  field :JOB_WAIT_REASON_RETRY, 1
+  field :JOB_WAIT_REASON_PREREQUISITES, 2
+end
+
+defmodule Beholder.V1.IndexJobOutcome do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :INDEX_JOB_OUTCOME_UNSPECIFIED, 0
+  field :INDEX_JOB_OUTCOME_PUBLISHED, 1
+  field :INDEX_JOB_OUTCOME_UNCHANGED, 2
+  field :INDEX_JOB_OUTCOME_SUPERSEDED, 3
+end
+
 defmodule Beholder.V1.ClearCacheRequest do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -196,6 +247,8 @@ defmodule Beholder.V1.GetGarbageCollectionStatusResponse do
   field :running, 1, type: :bool
   field :repository_states_queued, 2, type: :uint64, json_name: "repositoryStatesQueued"
   field :progress, 3, proto3_optional: true, type: Beholder.V1.GarbageCollectProgress
+  field :repository_states_collectible, 4, type: :uint64, json_name: "repositoryStatesCollectible"
+  field :reclaimable_database_pages, 5, type: :uint64, json_name: "reclaimableDatabasePages"
 end
 
 defmodule Beholder.V1.EntityRequest do
@@ -442,21 +495,6 @@ defmodule Beholder.V1.WhyResponse do
   field :traversal, 7, type: Beholder.V1.TraversalMetadata
 end
 
-defmodule Beholder.V1.ReindexWorkspaceRequest do
-  @moduledoc false
-  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
-
-  field :workspace, 2, type: :string
-end
-
-defmodule Beholder.V1.ReindexWorkspaceResponse do
-  @moduledoc false
-  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
-
-  field :observation_count, 1, type: :uint64, json_name: "observationCount"
-  field :published, 2, type: :bool
-end
-
 defmodule Beholder.V1.Workspace do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -468,6 +506,8 @@ defmodule Beholder.V1.Workspace do
     repeated: true,
     type: Beholder.V1.ProtobufDescriptorSource,
     json_name: "protobufDescriptors"
+
+  field :enabled_plugins, 4, repeated: true, type: :string, json_name: "enabledPlugins"
 end
 
 defmodule Beholder.V1.ProtobufDescriptorSource do
@@ -499,9 +539,27 @@ defmodule Beholder.V1.RegisterWorkspaceRequest do
     repeated: true,
     type: :string,
     json_name: "protobufDescriptorPaths"
+
+  field :enabled_plugins, 4, repeated: true, type: :string, json_name: "enabledPlugins"
 end
 
 defmodule Beholder.V1.RegisterWorkspaceResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :workspace, 1, type: Beholder.V1.Workspace
+end
+
+defmodule Beholder.V1.SetWorkspacePluginRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :workspace, 1, type: :string
+  field :plugin, 2, type: :string
+  field :enabled, 3, type: :bool
+end
+
+defmodule Beholder.V1.SetWorkspacePluginResponse do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
 
@@ -518,6 +576,61 @@ defmodule Beholder.V1.ListWorkspacesResponse do
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
 
   field :workspaces, 1, repeated: true, type: Beholder.V1.Workspace
+end
+
+defmodule Beholder.V1.RepositoryRevision do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :source_state, 1, type: :string, json_name: "sourceState"
+  field :head, 2, proto3_optional: true, type: :string
+  field :analysis_identity, 3, type: :string, json_name: "analysisIdentity"
+  field :incomplete, 4, type: :bool
+  field :diagnostics, 5, repeated: true, type: Beholder.V1.AnalysisDiagnostic
+end
+
+defmodule Beholder.V1.RepositoryStatus do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :repository, 1, type: Beholder.V1.WorkspaceRepository
+  field :revision, 2, proto3_optional: true, type: Beholder.V1.RepositoryRevision
+  field :indexing, 3, type: :bool
+end
+
+defmodule Beholder.V1.RegisterRepositoryRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :path, 1, type: :string
+end
+
+defmodule Beholder.V1.DeleteRepositoryRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :identity, 1, type: :string
+end
+
+defmodule Beholder.V1.DeleteRepositoryResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :repository_states_queued, 1, type: :uint64, json_name: "repositoryStatesQueued"
+end
+
+defmodule Beholder.V1.GetRepositoryRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :identity, 1, type: :string
+end
+
+defmodule Beholder.V1.RepositoryResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :repository, 1, type: Beholder.V1.RepositoryStatus
 end
 
 defmodule Beholder.V1.StopRequest do
@@ -546,6 +659,143 @@ defmodule Beholder.V1.GetStatusResponse do
   field :pid, 3, type: :uint32
 end
 
+defmodule Beholder.V1.ListJobsRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :page_token, 1, proto3_optional: true, type: :string, json_name: "pageToken"
+end
+
+defmodule Beholder.V1.ListJobsResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :jobs, 1, repeated: true, type: Beholder.V1.JobSummary
+  field :next_page_token, 2, proto3_optional: true, type: :string, json_name: "nextPageToken"
+end
+
+defmodule Beholder.V1.GetJobRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :id, 1, type: :string
+end
+
+defmodule Beholder.V1.GetJobResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :job, 1, type: Beholder.V1.Job
+end
+
+defmodule Beholder.V1.SubmitIndexRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  oneof :target, 0
+
+  field :workspace, 1, type: :string, oneof: 0
+  field :repository, 2, type: Beholder.V1.RepositoryIndexTarget, oneof: 0
+end
+
+defmodule Beholder.V1.RepositoryIndexTarget do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :repository, 1, type: :string
+  field :workspace_scope, 2, proto3_optional: true, type: :string, json_name: "workspaceScope"
+end
+
+defmodule Beholder.V1.SubmitIndexResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :job, 1, type: Beholder.V1.JobSummary
+
+  field :overlapping_jobs, 2,
+    repeated: true,
+    type: Beholder.V1.JobSummary,
+    json_name: "overlappingJobs"
+end
+
+defmodule Beholder.V1.JobTarget do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  oneof :target, 0
+
+  field :workspace, 1, type: :string, oneof: 0
+  field :repository, 2, type: :string, oneof: 0
+  field :workspace_scope, 3, proto3_optional: true, type: :string, json_name: "workspaceScope"
+  field :worker_id, 4, proto3_optional: true, type: :string, json_name: "workerId"
+end
+
+defmodule Beholder.V1.JobSummary do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :id, 1, type: :string
+  field :status, 2, type: Beholder.V1.JobStatus, enum: true
+  field :type, 3, type: Beholder.V1.JobType, enum: true
+  field :target, 4, type: Beholder.V1.JobTarget
+  field :trigger, 5, type: Beholder.V1.JobTrigger, enum: true
+  field :submitted_at_ms, 6, type: :uint64, json_name: "submittedAtMs"
+end
+
+defmodule Beholder.V1.IndexDestination do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  oneof :destination, 0
+
+  field :workspace, 1, type: :string, oneof: 0
+  field :standalone_repository, 2, type: :string, json_name: "standaloneRepository", oneof: 0
+end
+
+defmodule Beholder.V1.IndexDestinationResult do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :destination, 1, type: Beholder.V1.IndexDestination
+  field :observation_count, 2, type: :uint64, json_name: "observationCount"
+  field :published, 3, type: :bool
+  field :outcome, 4, type: Beholder.V1.IndexJobOutcome, enum: true
+end
+
+defmodule Beholder.V1.IndexJobResult do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :destinations, 1, repeated: true, type: Beholder.V1.IndexDestinationResult
+end
+
+defmodule Beholder.V1.Job do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :summary, 1, type: Beholder.V1.JobSummary
+  field :attempts, 2, type: :uint32
+  field :max_attempts, 3, type: :uint32, json_name: "maxAttempts"
+  field :run_at_ms, 4, proto3_optional: true, type: :uint64, json_name: "runAtMs"
+  field :started_at_ms, 5, proto3_optional: true, type: :uint64, json_name: "startedAtMs"
+  field :completed_at_ms, 6, proto3_optional: true, type: :uint64, json_name: "completedAtMs"
+  field :prerequisite_job_ids, 7, repeated: true, type: :string, json_name: "prerequisiteJobIds"
+
+  field :wait_reason, 8,
+    proto3_optional: true,
+    type: Beholder.V1.JobWaitReason,
+    json_name: "waitReason",
+    enum: true
+
+  field :last_error, 9, proto3_optional: true, type: :string, json_name: "lastError"
+  field :warnings, 10, repeated: true, type: :string
+
+  field :index_result, 11,
+    proto3_optional: true,
+    type: Beholder.V1.IndexJobResult,
+    json_name: "indexResult"
+end
+
 defmodule Beholder.V1.Daemon.Service do
   @moduledoc false
   use GRPC.Service, name: "beholder.v1.Daemon", protoc_gen_elixir_version: "0.17.0"
@@ -568,18 +818,26 @@ defmodule Beholder.V1.Daemon.Service do
 
   rpc(:Context, Beholder.V1.EntityRequest, Beholder.V1.ContextResponse, %{})
 
+  rpc(
+    :DeleteRepository,
+    Beholder.V1.DeleteRepositoryRequest,
+    Beholder.V1.DeleteRepositoryResponse,
+    %{}
+  )
+
   rpc(:Dependencies, Beholder.V1.TraversalEntityRequest, Beholder.V1.DependenciesResponse, %{})
 
   rpc(:GetStatus, Beholder.V1.GetStatusRequest, Beholder.V1.GetStatusResponse, %{})
 
+  rpc(:GetRepository, Beholder.V1.GetRepositoryRequest, Beholder.V1.RepositoryResponse, %{})
+
   rpc(:Impact, Beholder.V1.TraversalEntityRequest, Beholder.V1.ImpactResponse, %{})
 
-  rpc(
-    :ReindexWorkspace,
-    Beholder.V1.ReindexWorkspaceRequest,
-    Beholder.V1.ReindexWorkspaceResponse,
-    %{}
-  )
+  rpc(:ListJobs, Beholder.V1.ListJobsRequest, Beholder.V1.ListJobsResponse, %{})
+
+  rpc(:GetJob, Beholder.V1.GetJobRequest, Beholder.V1.GetJobResponse, %{})
+
+  rpc(:SubmitIndex, Beholder.V1.SubmitIndexRequest, Beholder.V1.SubmitIndexResponse, %{})
 
   rpc(:ListWorkspaces, Beholder.V1.ListWorkspacesRequest, Beholder.V1.ListWorkspacesResponse, %{})
 
@@ -587,6 +845,20 @@ defmodule Beholder.V1.Daemon.Service do
     :RegisterWorkspace,
     Beholder.V1.RegisterWorkspaceRequest,
     Beholder.V1.RegisterWorkspaceResponse,
+    %{}
+  )
+
+  rpc(
+    :SetWorkspacePlugin,
+    Beholder.V1.SetWorkspacePluginRequest,
+    Beholder.V1.SetWorkspacePluginResponse,
+    %{}
+  )
+
+  rpc(
+    :RegisterRepository,
+    Beholder.V1.RegisterRepositoryRequest,
+    Beholder.V1.RepositoryResponse,
     %{}
   )
 

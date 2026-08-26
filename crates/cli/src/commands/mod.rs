@@ -6,7 +6,7 @@ use std::{error::Error, path::PathBuf};
 mod admin;
 mod daemon;
 mod index;
-mod jobs;
+mod job;
 mod query;
 
 #[derive(Parser)]
@@ -29,11 +29,6 @@ enum Command {
         command: DaemonCommand,
     },
     /// Inspect durable jobs.
-    Jobs {
-        #[command(subcommand)]
-        command: JobsCommand,
-    },
-    /// Inspect one durable job.
     Job {
         #[command(subcommand)]
         command: JobCommand,
@@ -46,10 +41,13 @@ enum Command {
         #[arg(short, long)]
         database: PathBuf,
     },
-    /// Index a registered workspace as one coherent view.
-    ReindexWorkspace {
-        /// Registered workspace name.
-        workspace: String,
+    /// Enqueue durable indexing for a registered workspace or repository.
+    Index {
+        /// Exact registered workspace name or repository identity.
+        target: String,
+        /// Restrict a repository target to one exact workspace.
+        #[arg(short, long)]
+        workspace: Option<String>,
     },
     /// Manage registered workspaces.
     Workspace {
@@ -169,17 +167,13 @@ enum DaemonCommand {
 }
 
 #[derive(Subcommand)]
-enum JobsCommand {
+enum JobCommand {
     /// List active jobs and the newest terminal history.
     List {
         /// Opaque token returned by the preceding page.
         #[arg(long)]
         page_token: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum JobCommand {
     /// Show durable lifecycle details for one job.
     Get { id: String },
 }
@@ -234,16 +228,6 @@ enum RepositoryCommand {
     },
     /// Show registration and latest completed revision state.
     Show {
-        /// Logical repository identity.
-        identity: String,
-    },
-    /// Index the repository using the reusable inventory.
-    Index {
-        /// Logical repository identity.
-        identity: String,
-    },
-    /// Authoritatively refresh and index the repository.
-    Refresh {
         /// Logical repository identity.
         identity: String,
     },
@@ -343,12 +327,11 @@ impl OutputArgs {
 pub(super) async fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Some(Command::Daemon { command }) => daemon::run(command).await?,
-        Some(Command::Jobs { command }) => jobs::list(command).await?,
-        Some(Command::Job { command }) => jobs::get(command).await?,
+        Some(Command::Job { command }) => job::run(command).await?,
         Some(Command::IndexRust { source, database }) => {
             index::print_result(index::rust(&source, &database)?)?;
         }
-        Some(Command::ReindexWorkspace { workspace }) => index::workspace(workspace).await?,
+        Some(Command::Index { target, workspace }) => index::submit(target, workspace).await?,
         Some(Command::Workspace { command }) => admin::workspace(command).await?,
         Some(Command::Plugin { command }) => admin::plugin(command).await?,
         Some(Command::Repository { command }) => admin::repository(command).await?,
@@ -381,13 +364,14 @@ mod tests {
     fn workspace_smoke() {
         assert!(Cli::try_parse_from(["beholder"]).is_err());
         assert!(matches!(
-            Cli::try_parse_from(["beholder", "jobs", "list"])
+            Cli::try_parse_from(["beholder", "job", "list"])
                 .unwrap()
                 .command,
-            Some(Command::Jobs {
-                command: JobsCommand::List { page_token: None }
+            Some(Command::Job {
+                command: JobCommand::List { page_token: None }
             })
         ));
+        assert!(Cli::try_parse_from(["beholder", "jobs", "list"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["beholder", "job", "get", "01M0XH82E7NSXFZPQEXS3W2310"])
                 .unwrap()
@@ -505,24 +489,15 @@ mod tests {
             }) if path == std::path::Path::new("repo-a")
         ));
         assert!(matches!(
-            Cli::try_parse_from([
-                "beholder",
-                "repository",
-                "refresh",
-                "github.com/example/repo"
-            ])
-            .unwrap()
-            .command,
-            Some(Command::Repository {
-                command: RepositoryCommand::Refresh { identity }
-            }) if identity == "github.com/example/repo"
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["beholder", "reindex-workspace", "main"])
+            Cli::try_parse_from(["beholder", "index", "github.com/example/repo", "--workspace", "main"])
                 .unwrap()
                 .command,
-            Some(Command::ReindexWorkspace { workspace }) if workspace == "main"
+            Some(Command::Index { target, workspace: Some(workspace) })
+                if target == "github.com/example/repo" && workspace == "main"
         ));
+        assert!(Cli::try_parse_from(["beholder", "repository", "index", "repo"]).is_err());
+        assert!(Cli::try_parse_from(["beholder", "repository", "refresh", "repo"]).is_err());
+        assert!(Cli::try_parse_from(["beholder", "reindex-workspace", "main"]).is_err());
         assert!(Cli::try_parse_from(["beholder", "index-rust-workspace", "main"]).is_err());
         assert!(Cli::try_parse_from(["beholder", "index-rust", "src/main.rs"]).is_err());
         assert!(matches!(

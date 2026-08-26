@@ -1,7 +1,7 @@
 use std::{fs, process::Command};
 
 #[test]
-fn reindex_reports_a_stable_error_code_when_the_daemon_is_unavailable() {
+fn index_reports_a_stable_error_code_when_the_daemon_is_unavailable() {
     let state = std::env::temp_dir().join(format!(
         "beholder-cli-operation-error-{}",
         std::process::id()
@@ -11,7 +11,7 @@ fn reindex_reports_a_stable_error_code_when_the_daemon_is_unavailable() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_beholder"))
         .env("BEHOLDER_STATE_DIR", &state)
-        .args(["reindex-workspace", "main"])
+        .args(["index", "main"])
         .output()
         .unwrap();
 
