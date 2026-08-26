@@ -133,6 +133,50 @@ pub struct EnrichmentJob {
     pub input_fingerprint: Option<String>,
 }
 
+trait JobTelemetry {
+    const KIND: &'static str;
+
+    fn summary(&self) -> String;
+}
+
+impl JobTelemetry for IndexJob {
+    const KIND: &'static str = "index";
+
+    fn summary(&self) -> String {
+        match &self.target {
+            IndexTarget::Workspace { workspace } => format!("index workspace {workspace}"),
+            IndexTarget::Repository {
+                repository,
+                workspace_scope: Some(workspace),
+            } => format!("index repository {repository} in workspace {workspace}"),
+            IndexTarget::Repository {
+                repository,
+                workspace_scope: None,
+            } => format!("index repository {repository}"),
+        }
+    }
+}
+
+impl JobTelemetry for EnrichmentJob {
+    const KIND: &'static str = "enrichment";
+
+    fn summary(&self) -> String {
+        match &self.target {
+            EnrichmentTarget::WorkspaceRepository {
+                workspace,
+                repository,
+            } => format!(
+                "enrich repository {repository} in workspace {workspace} with worker {}",
+                self.worker_id
+            ),
+            EnrichmentTarget::StandaloneRepository { repository } => format!(
+                "enrich repository {repository} with worker {}",
+                self.worker_id
+            ),
+        }
+    }
+}
+
 pub type IndexJobStorage = SqliteStorage<IndexJob, JsonCodec<CompactType>, SqliteFetcher>;
 pub type EnrichmentJobStorage = SqliteStorage<EnrichmentJob, JsonCodec<CompactType>, SqliteFetcher>;
 
@@ -383,53 +427,42 @@ impl JobQueue {
         job: IndexJob,
     ) -> Result<IndexJobId, Box<dyn Error + Send + Sync>> {
         let (workspace, repository) = match &job.target {
-            IndexTarget::Workspace { workspace } => (Some(workspace.as_str()), None),
-            IndexTarget::Repository { repository, .. } => (None, Some(repository.as_str())),
+            IndexTarget::Workspace { workspace } => (Some(workspace.clone()), None),
+            IndexTarget::Repository { repository, .. } => (None, Some(repository.clone())),
         };
         let trigger = match job.trigger {
             JobTrigger::Automatic => "automatic",
             JobTrigger::Manual => "manual",
         };
 
-        let span = tracing::info_span!(
-            "job.enqueue",
-            job.kind = "index",
-            job.trigger = trigger,
-            job.queue = INDEX_QUEUE,
-            job.workspace = workspace,
-            job.repository = repository,
-            job.id = tracing::field::Empty,
-        );
+        let target = match &job.target {
+            IndexTarget::Workspace { .. } => "workspace",
+            IndexTarget::Repository { .. } => "repository",
+        };
         let id = Ulid::new();
-        span.record("job.id", id.to_string());
+        let (task, operation) = queued_task(job, id, INDEX_QUEUE, unix_millis()?);
         let mut storage = self.index_jobs.clone();
         async move {
-            let context = beholder_observability::current_w3c_trace_context().map_or_else(
-                TracingContext::new,
-                |context| {
-                    let mut tracing = TracingContext::new()
-                        .with_trace_id(context.trace_id)
-                        .with_span_id(context.span_id)
-                        .with_trace_flags(context.trace_flags);
-                    if let Some(state) = context.trace_state {
-                        tracing = tracing.with_trace_state(state);
-                    }
-                    tracing
-                },
-            );
-            let task: Task<IndexJob, SqliteContext, Ulid> = TaskBuilder::new(job)
-                .with_task_id(TaskId::new(id))
-                .max_attempts(MAX_ATTEMPTS)
-                .meta(context)
-                .meta(EligibleAt {
-                    millis: unix_millis()?,
-                })
-                .build();
-            storage.push_task(task).await?;
-            tracing::info!(job.id = %id, "index job enqueued");
-            Ok::<(), Box<dyn Error + Send + Sync>>(())
+            async move {
+                storage.push_task(task).await?;
+                tracing::info!(job.id = %id, "index job enqueued");
+                Ok::<(), Box<dyn Error + Send + Sync>>(())
+            }
+            .instrument(tracing::info_span!(
+                "job.enqueue",
+                job.trigger = trigger,
+                job.target = target,
+                job.workspace = workspace.as_deref(),
+                job.repository = repository.as_deref(),
+                messaging.system = "apalis",
+                messaging.destination.name = INDEX_QUEUE,
+                messaging.message.id = %id,
+                messaging.operation.name = "send",
+                messaging.operation.type = "send",
+            ))
+            .await
         }
-        .instrument(span)
+        .instrument(operation)
         .await?;
         Ok(IndexJobId(id.to_string()))
     }
@@ -644,6 +677,83 @@ fn queue_wait_ms(eligible_at_ms: i64, started_at_ms: i64) -> u64 {
     started_at_ms.saturating_sub(eligible_at_ms).max(0) as u64
 }
 
+fn queued_task<Args: JobTelemetry>(
+    args: Args,
+    id: Ulid,
+    queue: &'static str,
+    eligible_at_ms: i64,
+) -> (Task<Args, SqliteContext, Ulid>, tracing::Span) {
+    let summary = args.summary();
+    let operation = tracing::info_span!(
+        "job.operation",
+        job.id = %id,
+        job.kind = Args::KIND,
+        job.name = Args::KIND,
+        job.queue = queue,
+        job.summary = %summary,
+        messaging.system = "apalis",
+        messaging.destination.name = queue,
+        messaging.message.id = %id,
+    );
+    let task = operation.in_scope(|| {
+        task_with_trace_context(
+            args,
+            id,
+            eligible_at_ms,
+            beholder_observability::current_w3c_trace_context(),
+        )
+    });
+    (task, operation)
+}
+
+fn task_with_trace_context<Args>(
+    args: Args,
+    id: Ulid,
+    eligible_at_ms: i64,
+    context: Option<beholder_observability::W3cTraceContext>,
+) -> Task<Args, SqliteContext, Ulid> {
+    TaskBuilder::new(args)
+        .with_task_id(TaskId::new(id))
+        .max_attempts(MAX_ATTEMPTS)
+        .meta(task_tracing_context(context))
+        .meta(EligibleAt {
+            millis: eligible_at_ms,
+        })
+        .build()
+}
+
+fn task_tracing_context(
+    context: Option<beholder_observability::W3cTraceContext>,
+) -> TracingContext {
+    context.map_or_else(TracingContext::new, |context| {
+        let mut tracing = TracingContext::new()
+            .with_trace_id(context.trace_id)
+            .with_span_id(context.span_id)
+            .with_trace_flags(context.trace_flags);
+        if let Some(state) = context.trace_state {
+            tracing = tracing.with_trace_state(state);
+        }
+        tracing
+    })
+}
+
+fn continue_task_trace(span: &tracing::Span, context: &SqliteContext) {
+    let tracing_context: Result<TracingContext, _> = context.extract();
+    if let Ok(context) = tracing_context
+        && let (Some(trace_id), Some(span_id)) = (context.trace_id(), context.span_id())
+    {
+        beholder_observability::set_parent_from_w3c(
+            span,
+            &beholder_observability::W3cTraceContext {
+                trace_id: trace_id.clone(),
+                span_id: span_id.clone(),
+                trace_flags: context.trace_flags().unwrap_or_default(),
+                trace_state: context.trace_state().clone(),
+            },
+        );
+    }
+}
+
 fn index_target_pairs(
     target: &IndexTarget,
     workspaces: &[Workspace],
@@ -758,29 +868,24 @@ async fn run_index_job(
         max_attempts = MAX_ATTEMPTS,
         queue_wait_ms,
         job.outcome = tracing::field::Empty,
+        messaging.system = "apalis",
+        messaging.destination.name = INDEX_QUEUE,
+        messaging.message.id = %id,
+        messaging.operation.name = "process",
+        messaging.operation.type = "process",
     );
-    let tracing_context: Result<TracingContext, _> = context.extract();
-    if let Ok(context) = tracing_context
-        && let (Some(trace_id), Some(span_id)) = (context.trace_id(), context.span_id())
-    {
-        beholder_observability::set_parent_from_w3c(
-            &span,
-            &beholder_observability::W3cTraceContext {
-                trace_id: trace_id.clone(),
-                span_id: span_id.clone(),
-                trace_flags: context.trace_flags().unwrap_or_default(),
-                trace_state: context.trace_state().clone(),
-            },
-        );
-    }
+    continue_task_trace(&span, &context);
     async move {
         tracing::info!(job.id = %id, attempt = attempt.current(), queue_wait_ms, "index job attempt started");
         let scheduler_for_job = Arc::clone(&scheduler);
         let store_for_job = Arc::clone(&store);
         let workspaces_for_job = Arc::clone(&workspaces);
         let job_for_run = job.clone();
+        let parent = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
-            scheduler_for_job.run_index_job(&store_for_job, &workspaces_for_job, &job_for_run)
+            parent.in_scope(|| {
+                scheduler_for_job.run_index_job(&store_for_job, &workspaces_for_job, &job_for_run)
+            })
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -1489,5 +1594,27 @@ mod tests {
                 .unwrap(),
             enrichment
         );
+        assert_eq!(
+            enrichment.summary(),
+            "enrich repository example/repository in workspace main with worker rust"
+        );
+        assert!(!enrichment.summary().contains("fingerprint"));
+    }
+
+    #[test]
+    fn queued_tasks_preserve_generic_w3c_context() {
+        let expected = beholder_observability::W3cTraceContext {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            span_id: "00f067aa0ba902b7".into(),
+            trace_flags: 1,
+            trace_state: Some("vendor=value".into()),
+        };
+        let task = task_with_trace_context((), Ulid::new(), 42, Some(expected.clone()));
+        let stored: TracingContext = task.parts.ctx.extract().unwrap();
+
+        assert_eq!(stored.trace_id(), &Some(expected.trace_id));
+        assert_eq!(stored.span_id(), &Some(expected.span_id));
+        assert_eq!(stored.trace_flags(), &Some(expected.trace_flags));
+        assert_eq!(stored.trace_state(), &expected.trace_state);
     }
 }

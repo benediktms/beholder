@@ -1,11 +1,14 @@
 use super::{IndexScheduler, pipeline};
-use beholder_adapters_mnestic::{
-    EnrichmentOwner, EnrichmentPayload, EnrichmentSchedule, SemanticStore,
+use crate::indexing::enrichment_publication::{
+    EnrichmentContribution, EnrichmentPublication, EnrichmentPublicationRequest,
+    EnrichmentSnapshotRead, EnrichmentTarget,
 };
+use beholder_adapters_mnestic::{EnrichmentSchedule, SemanticStore};
 use beholder_domain::WorkspaceView;
 use beholder_indexing::{
-    AnalyzerContribution, AnalyzerMetadata, EnrichmentSnapshot, SemanticSnapshot, WorkspaceSnapshot,
+    AnalyzerContribution, AnalyzerMetadata, EnrichmentSnapshot, WorkspaceSnapshot,
 };
+use beholder_observability::W3cTraceContext;
 use std::{collections::BTreeSet, error::Error, sync::Arc, time::Instant};
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -17,6 +20,7 @@ pub(super) struct EnrichmentJob {
     pub(super) analyzer: AnalyzerMetadata,
     pub(super) repository: String,
     pub(super) input_fingerprint: String,
+    pub(super) parent: Option<W3cTraceContext>,
     pub(super) queued_at: Instant,
     pub(super) snapshot: EnrichmentSnapshot,
     pub(super) view: WorkspaceView,
@@ -102,7 +106,17 @@ impl IndexScheduler {
                 let workspace = job.view.name.clone();
                 let repository = job.repository.clone();
                 let analyzer = job.analyzer.id.clone();
-                let span = tracing::info_span!("index.enrichment", workspace, repository, analyzer);
+                let span = tracing::info_span!(
+                    "index.enrichment",
+                    workspace,
+                    repository,
+                    analyzer,
+                    analyzer_version = job.analyzer.version,
+                    input_fingerprint = job.input_fingerprint,
+                );
+                if let Some(parent) = &job.parent {
+                    beholder_observability::set_parent_from_w3c(&span, parent);
+                }
                 span.in_scope(|| {
                     tracing::info!(
                         queue_ms = job.queued_at.elapsed().as_secs_f64() * 1_000.0,
@@ -192,24 +206,27 @@ impl IndexScheduler {
         pipeline::report_analysis_diagnostics(&job.view.name, &diagnostics);
         let store = Arc::clone(store);
         tokio::task::spawn_blocking(move || {
-            store
-                .publish_enrichment(
-                    &job.view,
-                    &job.repository,
-                    &job.input_fingerprint,
-                    EnrichmentOwner {
+            EnrichmentPublication::publish_enrichment(
+                store.as_ref(),
+                EnrichmentPublicationRequest {
+                    target: EnrichmentTarget {
+                        view: &job.view.name,
+                        repository: &job.repository,
                         analyzer: &job.analyzer.id,
                         version: &job.analyzer.version,
-                        expected_version: Some(&job.analyzer.version),
                     },
-                    EnrichmentPayload {
+                    view: &job.view,
+                    input_fingerprint: &job.input_fingerprint,
+                    expected_analyzer_version: Some(&job.analyzer.version),
+                    contribution: EnrichmentContribution {
                         entities: &entities,
                         observations: &observations,
                         overrides: &contribution.overrides,
                         diagnostics: &diagnostics,
                     },
-                )
-                .map_err(|error| error.to_string())
+                },
+            )
+            .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| error.to_string())?
@@ -275,6 +292,15 @@ impl IndexScheduler {
         for repository in &snapshot.repositories {
             let repository_id = repository.state.repository.identity.clone();
             for analyzer in self.indexer.enrichment_catalog() {
+                let target = EnrichmentTarget {
+                    view: &view.name,
+                    repository: &repository_id,
+                    analyzer: &analyzer.id,
+                    version: &analyzer.version,
+                };
+                if store.enrichment_is_current(target)? {
+                    continue;
+                }
                 let input_fingerprint = store
                     .revision_enrichment_input_fingerprint(
                         &view.name,
@@ -282,8 +308,6 @@ impl IndexScheduler {
                         &analyzer.id,
                     )?
                     .ok_or("published repository enrichment input fingerprint is missing")?;
-                let contexts =
-                    store.repository_contexts(&view.name, &repository_id, &analyzer.id)?;
                 let mut schedule = store.prepare_enrichment(
                     &view.name,
                     &repository_id,
@@ -349,12 +373,16 @@ impl IndexScheduler {
                     }
                     let (entity_kinds, relations) =
                         self.indexer.enrichment_semantic_inputs(&analyzer.id);
-                    let (entities, observations) = store.selected_baseline_semantics(
-                        &view.name,
-                        &repository_id,
-                        &entity_kinds,
-                        &relations,
-                    )?;
+                    let snapshot_state = store
+                        .enrichment_snapshot(EnrichmentSnapshotRead {
+                            target,
+                            input_fingerprint: &input_fingerprint,
+                            entity_kinds: &entity_kinds,
+                            relations: &relations,
+                        })?
+                        .ok_or(
+                            "published repository enrichment changed while rebuilding snapshot",
+                        )?;
                     self.enrichment_jobs
                         .lock()
                         .map_err(|_| "enrichment queue lock poisoned")?
@@ -364,44 +392,43 @@ impl IndexScheduler {
                                 analyzer: analyzer.clone(),
                                 repository: repository_id.clone(),
                                 input_fingerprint: input_fingerprint.clone(),
+                                parent: beholder_observability::current_w3c_trace_context(),
                                 queued_at: Instant::now(),
                                 snapshot: EnrichmentSnapshot {
                                     target_repository: repository_id.clone(),
                                     workspace: WorkspaceSnapshot {
                                         name: snapshot.name.clone(),
                                         repositories: std::iter::once(repository.clone())
-                                            .chain(contexts.iter().filter_map(|identity| {
-                                                snapshot
-                                                    .repositories
-                                                    .iter()
-                                                    .find(|candidate| {
-                                                        candidate.state.repository.identity
-                                                            == *identity
-                                                    })
-                                                    .cloned()
-                                            }))
+                                            .chain(snapshot_state.contexts.iter().filter_map(
+                                                |identity| {
+                                                    snapshot
+                                                        .repositories
+                                                        .iter()
+                                                        .find(|candidate| {
+                                                            candidate.state.repository.identity
+                                                                == *identity
+                                                        })
+                                                        .cloned()
+                                                },
+                                            ))
                                             .collect(),
                                     },
-                                    baseline: SemanticSnapshot {
-                                        entities,
-                                        observations,
-                                    },
+                                    baseline: snapshot_state.baseline,
                                 },
                                 view: view.clone(),
                             },
                         );
                     queued = true;
                 } else {
-                    store.publish_enrichment(
-                        view,
-                        &repository_id,
-                        &input_fingerprint,
-                        EnrichmentOwner {
-                            analyzer: &analyzer.id,
-                            version: &analyzer.version,
-                            expected_version: Some(&analyzer.version),
+                    EnrichmentPublication::publish_enrichment(
+                        store,
+                        EnrichmentPublicationRequest {
+                            target,
+                            view,
+                            input_fingerprint: &input_fingerprint,
+                            expected_analyzer_version: Some(&analyzer.version),
+                            contribution: EnrichmentContribution::default(),
                         },
-                        EnrichmentPayload::default(),
                     )?;
                 }
             }
