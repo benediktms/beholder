@@ -4,7 +4,7 @@ use apalis::{
     prelude::{
         Acknowledge, AcknowledgementExt, Attempt, Backend, BoxDynError, Data, IntervalStrategy,
         MetadataExt, StrategyBuilder, Task, TaskBuilder, TaskId, TaskSink, TaskStream,
-        WorkerBuilder, WorkerContext,
+        WorkerBuilder, WorkerBuilderExt, WorkerContext,
     },
 };
 use apalis_codec::json::JsonCodec;
@@ -749,9 +749,13 @@ impl JobQueue {
     async fn prerequisites_succeeded(
         &self,
         prerequisites: &[IndexJobId],
+        scheduler: &IndexScheduler,
     ) -> Result<bool, sqlx::Error> {
         for prerequisite in prerequisites {
             loop {
+                if scheduler.is_stopping() {
+                    return Ok(false);
+                }
                 let status = sqlx::query_as::<_, (String, i64, i64)>(
                     "SELECT status, attempts, max_attempts FROM Jobs WHERE id = ?",
                 )
@@ -767,11 +771,16 @@ impl JobQueue {
                         return Ok(false);
                     }
                     None => return Ok(false),
-                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                    _ => {
+                        tokio::select! {
+                            () = scheduler.wait_for_stop() => return Ok(false),
+                            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        }
+                    }
                 }
             }
         }
-        Ok(true)
+        Ok(!scheduler.is_stopping())
     }
 
     pub async fn list(
@@ -1039,6 +1048,7 @@ pub fn start_enrichment_worker(
     let name = format!("beholder-enrichment-{}-{}", std::process::id(), Ulid::new());
     let worker = WorkerBuilder::new(&name)
         .backend(EligibleEnrichmentStorage(queue.enrichment_jobs.clone()))
+        .concurrency(1)
         .data(scheduler)
         .data(store)
         .data(workspaces)
@@ -1226,15 +1236,23 @@ async fn run_enrichment_job(
     continue_task_trace(&span, &context);
     async move {
         if !queue
-            .prerequisites_succeeded(&job.prerequisite_index_jobs)
+            .prerequisites_succeeded(&job.prerequisite_index_jobs, &scheduler)
             .await?
         {
             tracing::Span::current().record("job.outcome", "superseded");
             return Ok(());
         }
-        let result = scheduler
-            .run_enrichment_job(&store, &workspaces, &job)
-            .await;
+        let result = tokio::select! {
+            biased;
+            result = scheduler.run_enrichment_job(&store, &workspaces, &job) => result,
+            () = scheduler.wait_for_stop() => {
+                queue
+                    .schedule_retry(&id.to_string(), attempt.current())
+                    .await?;
+                tracing::Span::current().record("job.outcome", "failed");
+                return Err("daemon stopped during enrichment job attempt".into());
+            }
+        };
         match result {
             Ok(published) => {
                 let outcome = if published { "published" } else { "superseded" };
@@ -1439,7 +1457,34 @@ async fn quick_check(path: &Path) -> Result<(), Box<dyn Error>> {
 mod durable_tests {
     use super::*;
     use beholder_domain::{LogicalRepository, WorkspaceRepository};
+    use beholder_indexing::{
+        AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot, IndexerBuilder, WorkspaceEnricher,
+    };
     use std::{fs, time::Duration};
+
+    struct BlockingEnricher {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl WorkspaceEnricher for BlockingEnricher {
+        fn metadata(&self) -> AnalyzerMetadata {
+            AnalyzerMetadata {
+                id: "semantic".into(),
+                version: "1".into(),
+            }
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            path.extension().is_some_and(|extension| extension == "rs")
+        }
+
+        fn enrich<'a>(&'a self, _snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
 
     fn automatic_job(workspace: &str) -> IndexJob {
         IndexJob {
@@ -1565,6 +1610,148 @@ mod durable_tests {
 
         queue.close().await;
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_scheduler_supersedes_prerequisite_wait_and_drains_enrichment_worker() {
+        let state = queue_path("enrichment-shutdown-drain");
+        fs::create_dir(&state).unwrap();
+        let queue = JobQueue::open(&state.join("queue.sqlite")).await.unwrap();
+        let prerequisite = queue
+            .enqueue_automatic_index(automatic_job("main"))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut job = automatic_enrichment("input");
+        job.prerequisite_index_jobs = vec![prerequisite];
+        let id = queue
+            .enqueue_automatic_enrichment(job)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut queued = automatic_enrichment("other-input");
+        queued.target = EnrichmentTarget::WorkspaceRepository {
+            workspace: "main".into(),
+            repository: "other-repo".into(),
+        };
+        let queued_id = queue
+            .enqueue_automatic_enrichment(queued)
+            .await
+            .unwrap()
+            .unwrap();
+        let scheduler = Arc::new(IndexScheduler::new(state.join("cache")));
+        let store = Arc::new(SemanticStore::memory().unwrap());
+        let workspaces = Arc::new(std::sync::Mutex::new(
+            WorkspaceRegistry::open(state.join("workspaces.json")).unwrap(),
+        ));
+        let mut worker =
+            start_enrichment_worker(queue.clone(), Arc::clone(&scheduler), store, workspaces);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if queue.get(&id).await.unwrap().unwrap().status == StoredJobStatus::Running {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("enrichment worker did not start waiting on its prerequisite");
+
+        scheduler.stop();
+        worker.context.stop().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut worker.task)
+            .await
+            .expect("enrichment worker did not drain after scheduler stop")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queue.get(&id).await.unwrap().unwrap().status,
+            StoredJobStatus::Completed
+        );
+        assert_eq!(
+            queue.get(&queued_id).await.unwrap().unwrap().status,
+            StoredJobStatus::Queued
+        );
+
+        queue.close().await;
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_scheduler_interrupts_in_flight_enrichment_and_preserves_queued_work() {
+        let state = queue_path("in-flight-enrichment-shutdown-drain");
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn source() {}\n").unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
+        let workspaces = Arc::new(std::sync::Mutex::new(registry));
+        let store = Arc::new(SemanticStore::memory().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let scheduler = Arc::new(IndexScheduler::with_indexer(
+            IndexerBuilder::new(state.join("cache"), 1)
+                .add_enricher(BlockingEnricher {
+                    entered: Arc::clone(&entered),
+                })
+                .build()
+                .unwrap(),
+        ));
+        scheduler.index(&store, &workspace).unwrap();
+        let mut job = scheduler
+            .automatic_enrichment_jobs(
+                &store,
+                &workspaces,
+                "main",
+                IndexJobId("01J00000000000000000000000".into()),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        job.prerequisite_index_jobs.clear();
+        let queue = JobQueue::open(&state.join("queue.sqlite")).await.unwrap();
+        let id = queue
+            .enqueue_automatic_enrichment(job.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        job.target = EnrichmentTarget::WorkspaceRepository {
+            workspace: "other".into(),
+            repository: "other-repo".into(),
+        };
+        let queued_id = queue
+            .enqueue_automatic_enrichment(job)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut worker =
+            start_enrichment_worker(queue.clone(), Arc::clone(&scheduler), store, workspaces);
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .expect("enrichment worker did not enter analysis");
+
+        scheduler.stop();
+        worker.context.stop().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut worker.task)
+            .await
+            .expect("enrichment worker did not drain after scheduler stop")
+            .unwrap()
+            .unwrap();
+        let interrupted =
+            sqlx::query_as::<_, (String, i64)>("SELECT status, attempts FROM Jobs WHERE id = ?")
+                .bind(&id)
+                .fetch_one(queue.enrichment_jobs.pool())
+                .await
+                .unwrap();
+        assert_eq!(interrupted, ("Failed".into(), 1));
+        assert_eq!(
+            queue.get(&queued_id).await.unwrap().unwrap().status,
+            StoredJobStatus::Queued
+        );
+
+        queue.close().await;
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[tokio::test]
