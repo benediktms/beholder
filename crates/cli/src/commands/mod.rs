@@ -6,6 +6,7 @@ use std::{error::Error, path::PathBuf};
 mod admin;
 mod daemon;
 mod index;
+mod jobs;
 mod query;
 
 #[derive(Parser)]
@@ -26,6 +27,16 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Inspect durable jobs.
+    Jobs {
+        #[command(subcommand)]
+        command: JobsCommand,
+    },
+    /// Inspect one durable job.
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
     },
     /// Index one Rust source file.
     IndexRust {
@@ -155,6 +166,22 @@ enum DaemonCommand {
     Status,
     /// Gracefully stop the daemon. Succeeds when it is already stopped.
     Stop,
+}
+
+#[derive(Subcommand)]
+enum JobsCommand {
+    /// List active jobs and the newest terminal history.
+    List {
+        /// Opaque token returned by the preceding page.
+        #[arg(long)]
+        page_token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobCommand {
+    /// Show durable lifecycle details for one job.
+    Get { id: String },
 }
 
 #[derive(Subcommand)]
@@ -316,6 +343,8 @@ impl OutputArgs {
 pub(super) async fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Some(Command::Daemon { command }) => daemon::run(command).await?,
+        Some(Command::Jobs { command }) => jobs::list(command).await?,
+        Some(Command::Job { command }) => jobs::get(command).await?,
         Some(Command::IndexRust { source, database }) => {
             index::print_result(index::rust(&source, &database)?)?;
         }
@@ -351,6 +380,22 @@ mod tests {
     #[test]
     fn workspace_smoke() {
         assert!(Cli::try_parse_from(["beholder"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "jobs", "list"])
+                .unwrap()
+                .command,
+            Some(Command::Jobs {
+                command: JobsCommand::List { page_token: None }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["beholder", "job", "get", "01M0XH82E7NSXFZPQEXS3W2310"])
+                .unwrap()
+                .command,
+            Some(Command::Job {
+                command: JobCommand::Get { id }
+            }) if id == "01M0XH82E7NSXFZPQEXS3W2310"
+        ));
         assert!(matches!(
             Cli::try_parse_from(["beholder", "cache", "clear"])
                 .unwrap()

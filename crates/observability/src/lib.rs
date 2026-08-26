@@ -48,6 +48,14 @@ pub struct ObservabilityGuard {
     logger_provider: Option<SdkLoggerProvider>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct W3cTraceContext {
+    pub trace_id: String,
+    pub span_id: String,
+    pub trace_flags: u8,
+    pub trace_state: Option<String>,
+}
+
 impl Drop for ObservabilityGuard {
     fn drop(&mut self) {
         if let Some(provider) = self.tracer_provider.take()
@@ -182,6 +190,44 @@ pub fn inject_current_context(metadata: &mut MetadataMap) {
             &mut MetadataInjector(metadata),
         );
     });
+}
+
+pub fn current_w3c_trace_context() -> Option<W3cTraceContext> {
+    let mut metadata = MetadataMap::new();
+    inject_current_context(&mut metadata);
+    let traceparent = metadata.get("traceparent")?.to_str().ok()?;
+    let mut parts = traceparent.split('-');
+    (parts.next()? == "00").then_some(())?;
+    let trace_id = parts.next()?.to_owned();
+    let span_id = parts.next()?.to_owned();
+    let trace_flags = u8::from_str_radix(parts.next()?, 16).ok()?;
+    parts.next().is_none().then_some(())?;
+    Some(W3cTraceContext {
+        trace_id,
+        span_id,
+        trace_flags,
+        trace_state: metadata
+            .get("tracestate")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    })
+}
+
+pub fn set_parent_from_w3c(span: &tracing::Span, context: &W3cTraceContext) {
+    let mut metadata = MetadataMap::new();
+    let traceparent = format!(
+        "00-{}-{}-{:02x}",
+        context.trace_id, context.span_id, context.trace_flags
+    );
+    if let Ok(value) = MetadataValue::try_from(traceparent) {
+        metadata.insert("traceparent", value);
+    }
+    if let Some(state) = &context.trace_state
+        && let Ok(value) = MetadataValue::try_from(state.as_str())
+    {
+        metadata.insert("tracestate", value);
+    }
+    set_parent_from_metadata(span, &metadata);
 }
 
 pub fn set_parent_from_metadata(span: &tracing::Span, metadata: &MetadataMap) {

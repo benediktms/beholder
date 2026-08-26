@@ -1,4 +1,4 @@
-use super::indexing::IndexScheduler;
+use super::{indexing::IndexScheduler, jobs::JobQueue};
 use beholder_adapters_mnestic::SemanticStore;
 use beholder_domain::Workspace;
 use beholder_dto::{GarbageCollection, GarbageCollectionPhase, GarbageCollectionProgress};
@@ -23,6 +23,7 @@ pub(super) struct BeholderDaemon {
     pub(super) store: Arc<SemanticStore>,
     pub(super) workspaces: Arc<Mutex<super::workspace_registry::WorkspaceRegistry>>,
     pub(super) scheduler: Arc<IndexScheduler>,
+    pub(super) jobs: JobQueue,
     pub(super) garbage_collector_running: Arc<AtomicBool>,
     pub(super) garbage_collection_progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
     pub(super) watcher: Mutex<WorkspaceWatcher>,
@@ -35,6 +36,7 @@ pub(super) fn build(
     store: SemanticStore,
     workspaces: super::workspace_registry::WorkspaceRegistry,
     indexer: Indexer,
+    jobs: JobQueue,
 ) -> Result<DaemonParts, Box<dyn Error>> {
     let (shutdown, stopped) = oneshot::channel();
     let workspaces = Arc::new(Mutex::new(workspaces));
@@ -63,6 +65,7 @@ pub(super) fn build(
             store,
             workspaces,
             scheduler: scheduler.clone(),
+            jobs,
             garbage_collector_running,
             garbage_collection_progress,
             watcher: Mutex::new(watcher),

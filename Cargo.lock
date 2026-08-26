@@ -513,6 +513,7 @@ dependencies = [
  "beholder-dto",
  "beholder-observability",
  "beholder-presentation",
+ "beholder-protocol",
  "beholder-worker-client",
  "clap",
  "tokio",
@@ -541,6 +542,7 @@ dependencies = [
  "beholder-observability",
  "beholder-protocol",
  "beholder-worker-client",
+ "futures-util",
  "notify",
  "rayon",
  "serde",
@@ -552,6 +554,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]

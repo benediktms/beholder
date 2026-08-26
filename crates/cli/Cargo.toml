@@ -21,6 +21,7 @@ beholder-domain.workspace = true
 beholder-dto.workspace = true
 beholder-observability.workspace = true
 beholder-presentation = { path = "../presentation" }
+beholder-protocol.workspace = true
 beholder-worker-client.workspace = true
 clap = { version = "4.6.6", features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

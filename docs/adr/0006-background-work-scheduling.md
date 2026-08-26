@@ -330,7 +330,7 @@ parallel with indexing work.
 | Slice | Status | Current implementation |
 | --- | --- | --- |
 | 1. Inert queue foundation and ADR | Complete | Exact dependency pins, shared SQLite linkage, typed payload and storage handles, read-only quick check, create/open, startup migrations, fail-fast startup, and integration-test terminology. No producer or worker is registered. |
-| 2. Automatic indexing and inspection | Planned | The legacy automatic scheduler remains active; no Apalis producer, worker, recovery, admission, shutdown, telemetry, jobs RPC, or jobs CLI is active. |
+| 2. Automatic indexing and inspection | Complete | Filesystem intent is durably coalesced into automatic `IndexJob` rows and executed by one monitored Apalis worker through the existing guarded publication seam. Startup recovery, five-attempt retry state, admission and one fixed ten-second shutdown deadline are active. `ListJobs`, `GetJob`, `beholder jobs list`, and `beholder job get` expose bounded typed lifecycle state. The superseded direct automatic executor, retry timers, and periodic reconciliation loop are removed. |
 | 3. Manual indexing | Planned | Existing synchronous indexing APIs and commands remain unchanged. |
 | 4. Enrichment publication boundary | Planned | Current Mnestic enrichment operations remain unchanged. |
 | 5. Worker-ID namespace | Planned | Current built-in and plugin worker registration remains unchanged. |

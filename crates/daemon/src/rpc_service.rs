@@ -1,4 +1,5 @@
 use crate::daemon::{BeholderDaemon, collect_garbage, start_claimed_garbage_collector};
+use crate::jobs::{self, StoredJob, StoredJobKind, StoredJobStatus, StoredJobTarget};
 use crate::repository_registry::RegisteredRepository;
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, SourceAnalysisError};
 use beholder_dto::{
@@ -11,14 +12,15 @@ use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DeleteRepositoryRequest,
     DeleteRepositoryResponse, DependenciesResponse, EntityRequest, GarbageCollectEvent,
     GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
-    GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetRepositoryRequest,
-    GetStatusRequest, GetStatusResponse, ImpactResponse, IndexRepositoryRequest,
-    IndexRepositoryResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
-    RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
-    ReindexWorkspaceRequest, ReindexWorkspaceResponse, RepositoryResponse,
-    SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest, StopResponse,
-    TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
-    garbage_collect_event,
+    GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetJobRequest,
+    GetJobResponse, GetRepositoryRequest, GetStatusRequest, GetStatusResponse, ImpactResponse,
+    IndexJobOutcome, IndexRepositoryRequest, IndexRepositoryResponse, Job, JobStatus, JobSummary,
+    JobTarget, JobTrigger, JobType, JobWaitReason, ListJobsRequest, ListJobsResponse,
+    ListWorkspacesRequest, ListWorkspacesResponse, PathRequest, RegisterRepositoryRequest,
+    RegisterWorkspaceRequest, RegisterWorkspaceResponse, ReindexWorkspaceRequest,
+    ReindexWorkspaceResponse, RepositoryResponse, SetWorkspacePluginRequest,
+    SetWorkspacePluginResponse, StopRequest, StopResponse, TraceResponse, TraversalEntityRequest,
+    WhyResponse, daemon_server::Daemon, garbage_collect_event, job_target,
 };
 use std::{error::Error, path::PathBuf, sync::atomic::Ordering};
 use tokio::sync::mpsc;
@@ -270,8 +272,48 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 17,
+            protocol_version: 18,
             pid: std::process::id(),
+        }))
+    }
+
+    #[tracing::instrument(name = "rpc.list_jobs", skip_all, err)]
+    async fn list_jobs(
+        &self,
+        request: Request<ListJobsRequest>,
+    ) -> Result<Response<ListJobsResponse>, Status> {
+        let cursor = request
+            .into_inner()
+            .page_token
+            .map(|token| decode_job_page_token(&token))
+            .transpose()?;
+        let (jobs, next) = self
+            .jobs
+            .list(cursor)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(ListJobsResponse {
+            jobs: jobs.into_iter().map(job_summary).collect(),
+            next_page_token: next.map(|(done_at, id)| format!("{done_at}:{id}")),
+        }))
+    }
+
+    #[tracing::instrument(name = "rpc.get_job", skip_all, err)]
+    async fn get_job(
+        &self,
+        request: Request<GetJobRequest>,
+    ) -> Result<Response<GetJobResponse>, Status> {
+        let id = request.into_inner().id;
+        ulid::Ulid::from_string(&id)
+            .map_err(|_| Status::invalid_argument("job ID must be a ULID"))?;
+        let job = self
+            .jobs
+            .get(&id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("job not found"))?;
+        Ok(Response::new(GetJobResponse {
+            job: Some(job_detail(job)),
         }))
     }
 
@@ -676,6 +718,105 @@ impl BeholderDaemon {
     }
 }
 
+fn decode_job_page_token(token: &str) -> Result<(i64, String), Status> {
+    let (done_at, id) = token
+        .split_once(':')
+        .ok_or_else(|| Status::invalid_argument("malformed job page token"))?;
+    let done_at = done_at
+        .parse()
+        .map_err(|_| Status::invalid_argument("malformed job page token"))?;
+    ulid::Ulid::from_string(id)
+        .map_err(|_| Status::invalid_argument("malformed job page token"))?;
+    Ok((done_at, id.into()))
+}
+
+fn job_summary(job: StoredJob) -> JobSummary {
+    JobSummary {
+        id: job.id,
+        status: match job.status {
+            StoredJobStatus::Queued => JobStatus::Queued,
+            StoredJobStatus::Waiting => JobStatus::Waiting,
+            StoredJobStatus::Running => JobStatus::Running,
+            StoredJobStatus::Completed => JobStatus::Completed,
+            StoredJobStatus::Failed => JobStatus::Failed,
+        }
+        .into(),
+        r#type: match job.kind {
+            StoredJobKind::Index => JobType::Index,
+            StoredJobKind::Enrichment => JobType::Enrichment,
+        }
+        .into(),
+        target: Some(JobTarget {
+            target: Some(match &job.target {
+                StoredJobTarget::Workspace(workspace) => {
+                    job_target::Target::Workspace(workspace.clone())
+                }
+                StoredJobTarget::Repository { repository, .. } => {
+                    job_target::Target::Repository(repository.clone())
+                }
+            }),
+            workspace_scope: match &job.target {
+                StoredJobTarget::Repository {
+                    workspace_scope, ..
+                } => workspace_scope.clone(),
+                StoredJobTarget::Workspace(_) => None,
+            },
+            worker_id: match &job.target {
+                StoredJobTarget::Repository { worker_id, .. } => worker_id.clone(),
+                StoredJobTarget::Workspace(_) => None,
+            },
+        }),
+        trigger: match job.trigger {
+            jobs::JobTrigger::Automatic => JobTrigger::Automatic,
+            jobs::JobTrigger::Manual => JobTrigger::Manual,
+        }
+        .into(),
+        submitted_at_ms: job.submitted_at_ms.max(0) as u64,
+    }
+}
+
+fn job_detail(job: StoredJob) -> Job {
+    let summary = job_summary(job.clone());
+    let wait_reason = match job.status {
+        StoredJobStatus::Waiting if !job.prerequisites.is_empty() => {
+            Some(JobWaitReason::Prerequisites.into())
+        }
+        StoredJobStatus::Waiting => Some(JobWaitReason::Retry.into()),
+        _ => None,
+    };
+    Job {
+        summary: Some(summary),
+        attempts: job.attempts,
+        max_attempts: job.max_attempts,
+        run_at_ms: job.eligible_at_ms.map(|millis| millis.max(0) as u64),
+        started_at_ms: seconds_to_millis(job.lock_at),
+        completed_at_ms: seconds_to_millis(job.done_at),
+        prerequisite_job_ids: job.prerequisites,
+        wait_reason,
+        last_error: job.last_error,
+        warnings: Vec::new(),
+        index_result: job
+            .result
+            .map(|result| beholder_protocol::v1::IndexJobResult {
+                workspace: result.workspace,
+                observation_count: result.observation_count as u64,
+                published: result.published,
+                outcome: match result.outcome {
+                    jobs::IndexOutcome::Published => IndexJobOutcome::Published,
+                    jobs::IndexOutcome::Unchanged => IndexJobOutcome::Unchanged,
+                    jobs::IndexOutcome::Superseded => IndexJobOutcome::Superseded,
+                }
+                .into(),
+            }),
+    }
+}
+
+fn seconds_to_millis(value: Option<i64>) -> Option<u64> {
+    value
+        .and_then(|value| u64::try_from(value).ok())
+        .map(|value| value.saturating_mul(1_000))
+}
+
 fn repository_registry_unavailable() -> Status {
     operation_status(BeholderError::new(
         BeholderErrorKind::Internal,
@@ -786,5 +927,22 @@ mod tests {
                 "beholder.transport.grpc"
             );
         }
+    }
+
+    #[test]
+    fn job_page_tokens_are_strict_and_round_trip() {
+        let id = ulid::Ulid::new().to_string();
+        assert_eq!(
+            decode_job_page_token(&format!("42:{id}")).unwrap(),
+            (42, id)
+        );
+        assert_eq!(
+            decode_job_page_token("not-a-token").unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            decode_job_page_token("42:not-a-ulid").unwrap_err().code(),
+            Code::InvalidArgument
+        );
     }
 }
