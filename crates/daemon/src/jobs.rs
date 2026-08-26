@@ -2,8 +2,8 @@ use apalis::prelude::FromRequest;
 use apalis::{
     layers::tracing::TracingContext,
     prelude::{
-        Attempt, Backend, BoxDynError, Data, MetadataExt, Task, TaskBuilder, TaskId, TaskSink,
-        TaskStream, WorkerBuilder, WorkerContext,
+        Acknowledge, AcknowledgementExt, Attempt, Backend, BoxDynError, Data, MetadataExt, Task,
+        TaskBuilder, TaskId, TaskSink, TaskStream, WorkerBuilder, WorkerContext,
     },
 };
 use apalis_codec::json::JsonCodec;
@@ -132,6 +132,35 @@ struct EligibleIndexStorage(IndexJobStorage);
 struct IndexAttempt {
     attempt: Attempt,
     context: SqliteContext,
+}
+
+#[derive(Clone)]
+struct AutomaticIndexAcknowledgement {
+    queue: JobQueue,
+    scheduler: Arc<IndexScheduler>,
+}
+
+impl Acknowledge<IndexJobResult, SqliteContext, Ulid> for AutomaticIndexAcknowledgement {
+    type Error = sqlx::Error;
+    type Future = futures_util::future::BoxFuture<'static, Result<(), Self::Error>>;
+
+    fn ack(
+        &mut self,
+        _result: &Result<IndexJobResult, BoxDynError>,
+        parts: &apalis::prelude::Parts<SqliteContext, Ulid>,
+    ) -> Self::Future {
+        let id = parts.task_id.map(|id| id.to_string());
+        let queue = self.queue.clone();
+        let scheduler = Arc::clone(&self.scheduler);
+        Box::pin(async move {
+            if let Some(id) = id
+                && let Some((workspace, generation)) = queue.terminal_automatic_job(&id).await?
+            {
+                scheduler.automatic_job_finished(&workspace, generation);
+            }
+            Ok(())
+        })
+    }
 }
 
 impl FromRequest<Task<IndexJob, SqliteContext, Ulid>> for IndexAttempt {
@@ -348,6 +377,28 @@ impl JobQueue {
         }))
     }
 
+    async fn terminal_automatic_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, Option<u64>)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT job FROM Jobs WHERE id = ? AND NOT (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts))",
+        )
+        .bind(id)
+        .fetch_optional(self.index_jobs.pool())
+        .await?;
+        Ok(row.and_then(|row| {
+            serde_json::from_slice::<IndexJob>(row.get::<&[u8], _>("job"))
+                .ok()
+                .and_then(|job| match (job.trigger, job.target) {
+                    (JobTrigger::Automatic, IndexTarget::Workspace { workspace }) => {
+                        Some((workspace, job.generation))
+                    }
+                    _ => None,
+                })
+        }))
+    }
+
     pub async fn recover(&self) -> Result<Recovery, sqlx::Error> {
         let mut transaction = self.index_jobs.pool().begin().await?;
         let released_reservations = sqlx::query(
@@ -528,8 +579,13 @@ pub fn start_index_worker(
     workspaces: Arc<std::sync::Mutex<WorkspaceRegistry>>,
 ) -> IndexWorker {
     let name = format!("beholder-index-{}-{}", std::process::id(), Ulid::new());
+    let acknowledgement = AutomaticIndexAcknowledgement {
+        queue: queue.clone(),
+        scheduler: Arc::clone(&scheduler),
+    };
     let worker = WorkerBuilder::new(&name)
         .backend(EligibleIndexStorage(queue.index_jobs.clone()))
+        .ack_with(acknowledgement)
         .data(scheduler)
         .data(store)
         .data(workspaces)

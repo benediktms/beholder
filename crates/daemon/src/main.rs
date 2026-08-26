@@ -662,24 +662,33 @@ mod tests {
         })
         .await
         .expect("registered workspace was not indexed");
-        let jobs = client
-            .list_jobs(ListJobsRequest { page_token: None })
-            .await
-            .unwrap()
-            .into_inner();
-        let indexed = jobs
-            .jobs
-            .into_iter()
-            .find(|job| {
-                job.target
-                    .as_ref()
-                    .and_then(|target| target.target.as_ref())
-                    .is_some_and(|target| {
-                        matches!(target, beholder_protocol::v1::job_target::Target::Workspace(name) if name == "main")
-                    })
-            })
-            .expect("automatic index job was not inspectable");
-        assert_eq!(indexed.status, JobStatus::Completed as i32);
+        let indexed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let indexed = client
+                    .list_jobs(ListJobsRequest { page_token: None })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .jobs
+                    .into_iter()
+                    .find(|job| {
+                        job.target
+                            .as_ref()
+                            .and_then(|target| target.target.as_ref())
+                            .is_some_and(|target| {
+                                matches!(target, beholder_protocol::v1::job_target::Target::Workspace(name) if name == "main")
+                            })
+                    });
+                if let Some(indexed) = indexed
+                    && indexed.status == JobStatus::Completed as i32
+                {
+                    break indexed;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("automatic index job did not complete durably");
         assert_eq!(indexed.r#type, JobType::Index as i32);
         assert_eq!(indexed.trigger, JobTrigger::Automatic as i32);
         assert!(indexed.submitted_at_ms > 0);
@@ -753,16 +762,26 @@ mod tests {
         })
         .await
         .expect("protobuf descriptor change was not indexed");
-        let metadata = client
-            .context(EntityRequest {
-                workspace: "main".into(),
-                entity: caller.clone(),
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .metadata
-            .unwrap();
+        let metadata = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let metadata = client
+                    .context(EntityRequest {
+                        workspace: "main".into(),
+                        entity: caller.clone(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .metadata
+                    .unwrap();
+                if !metadata.freshness.as_ref().unwrap().indexing {
+                    break metadata;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("automatic index job did not become ready after durable acknowledgement");
         assert_eq!(metadata.revision, 2);
         assert_eq!(metadata.view, "main");
         let freshness = metadata.freshness.unwrap();

@@ -283,7 +283,7 @@ pub struct IndexScheduler {
     generations: Mutex<BTreeMap<String, u64>>,
     dirty_repositories: Mutex<BTreeMap<String, BTreeMap<String, DirtyRepository>>>,
     dormant_generations: Mutex<BTreeMap<String, u64>>,
-    automatic_jobs: Mutex<BTreeSet<String>>,
+    automatic_jobs: Mutex<BTreeMap<String, Option<u64>>>,
     active_operation: Mutex<Option<String>>,
     indexing_repositories: Mutex<BTreeSet<String>>,
     enrichment_jobs: Mutex<BTreeMap<(String, String, String), EnrichmentJob>>,
@@ -531,7 +531,7 @@ impl IndexScheduler {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
             dormant_generations: Mutex::new(BTreeMap::new()),
-            automatic_jobs: Mutex::new(BTreeSet::new()),
+            automatic_jobs: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             indexing_repositories: Mutex::new(BTreeSet::new()),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
@@ -600,7 +600,7 @@ impl IndexScheduler {
             generations: Mutex::new(BTreeMap::new()),
             dirty_repositories: Mutex::new(BTreeMap::new()),
             dormant_generations: Mutex::new(BTreeMap::new()),
-            automatic_jobs: Mutex::new(BTreeSet::new()),
+            automatic_jobs: Mutex::new(BTreeMap::new()),
             active_operation: Mutex::new(None),
             indexing_repositories: Mutex::new(BTreeSet::new()),
             enrichment_jobs: Mutex::new(BTreeMap::new()),
@@ -692,7 +692,7 @@ impl IndexScheduler {
             || self
                 .automatic_jobs
                 .lock()
-                .is_ok_and(|jobs| jobs.contains(workspace))
+                .is_ok_and(|jobs| jobs.contains_key(workspace))
             || !enriching_repositories.is_empty()
             || self.enrichment_jobs.lock().is_ok_and(|jobs| {
                 jobs.keys()
@@ -1291,16 +1291,16 @@ impl IndexScheduler {
                     .map(|(repository, intent)| intent.durable(repository))
                     .collect(),
             };
-            let enqueued = jobs
-                .enqueue_automatic_index(job)
-                .await
-                .map_err(|error| error.to_string())?;
             if let Ok(mut active) = self.automatic_jobs.lock() {
-                active.insert(workspace.name);
+                active.insert(workspace.name.clone(), generation);
             }
-            if enqueued.is_none() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                self.changed.notify_one();
+            if let Err(error) = jobs.enqueue_automatic_index(job).await {
+                if let Ok(mut active) = self.automatic_jobs.lock()
+                    && active.get(&workspace.name) == Some(&generation)
+                {
+                    active.remove(&workspace.name);
+                }
+                return Err(error.to_string());
             }
         }
         Ok(())
@@ -1323,7 +1323,6 @@ impl IndexScheduler {
             .copied()
             == job.generation;
         if !generation_current {
-            self.automatic_job_finished(workspace);
             return Ok(IndexJobResult {
                 workspace: workspace.clone(),
                 observation_count: 0,
@@ -1360,7 +1359,6 @@ impl IndexScheduler {
         match result {
             Ok((observation_count, published)) => {
                 self.complete_generation(workspace, job.generation);
-                self.automatic_job_finished(workspace);
                 Ok(IndexJobResult {
                     workspace: workspace.clone(),
                     observation_count,
@@ -1377,7 +1375,6 @@ impl IndexScheduler {
                     generations.get(workspace).copied() != job.generation
                 }) =>
             {
-                self.automatic_job_finished(workspace);
                 Ok(IndexJobResult {
                     workspace: workspace.clone(),
                     observation_count: 0,
@@ -1395,18 +1392,18 @@ impl IndexScheduler {
         generation: Option<u64>,
         terminal: bool,
     ) {
-        if terminal {
-            if let Some(generation) = generation
-                && let Ok(mut dormant) = self.dormant_generations.lock()
-            {
-                dormant.insert(workspace.into(), generation);
-            }
-            self.automatic_job_finished(workspace);
+        if terminal
+            && let Some(generation) = generation
+            && let Ok(mut dormant) = self.dormant_generations.lock()
+        {
+            dormant.insert(workspace.into(), generation);
         }
     }
 
-    fn automatic_job_finished(&self, workspace: &str) {
-        if let Ok(mut active) = self.automatic_jobs.lock() {
+    pub(crate) fn automatic_job_finished(&self, workspace: &str, generation: Option<u64>) {
+        if let Ok(mut active) = self.automatic_jobs.lock()
+            && active.get(workspace) == Some(&generation)
+        {
             active.remove(workspace);
         }
         self.changed.notify_one();
@@ -4555,6 +4552,75 @@ mod tests {
         assert!(store.inspect_revisions().unwrap().rows.is_empty());
         drop(store);
         fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn superseded_job_stays_active_until_durable_acknowledgement() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-job-ack-{unique}"));
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        scheduler
+            .generations
+            .lock()
+            .unwrap()
+            .insert("main".into(), 2);
+        scheduler
+            .automatic_jobs
+            .lock()
+            .unwrap()
+            .insert("main".into(), Some(1));
+        let job = DurableIndexJob {
+            target: IndexTarget::Workspace {
+                workspace: "main".into(),
+            },
+            trigger: JobTrigger::Automatic,
+            prerequisite_index_jobs: Vec::new(),
+            generation: Some(1),
+            repository_intents: Vec::new(),
+        };
+        let store = SemanticStore::memory().unwrap();
+        let workspaces =
+            Mutex::new(WorkspaceRegistry::open(state.join("workspaces.json")).unwrap());
+
+        let result = scheduler.run_index_job(&store, &workspaces, &job).unwrap();
+
+        assert_eq!(result.outcome, IndexOutcome::Superseded);
+        assert!(
+            scheduler
+                .automatic_jobs
+                .lock()
+                .unwrap()
+                .contains_key("main")
+        );
+        scheduler.automatic_job_finished("main", Some(1));
+        assert!(
+            !scheduler
+                .automatic_jobs
+                .lock()
+                .unwrap()
+                .contains_key("main")
+        );
+        scheduler
+            .automatic_jobs
+            .lock()
+            .unwrap()
+            .insert("main".into(), Some(2));
+        scheduler.automatic_job_finished("main", Some(1));
+        assert_eq!(
+            scheduler.automatic_jobs.lock().unwrap().get("main"),
+            Some(&Some(2))
+        );
+        scheduler.automatic_job_finished("main", Some(2));
+        assert!(
+            !scheduler
+                .automatic_jobs
+                .lock()
+                .unwrap()
+                .contains_key("main")
+        );
     }
 
     #[test]
