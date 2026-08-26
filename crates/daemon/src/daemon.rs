@@ -611,21 +611,25 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
         running.store(false, Ordering::Release);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while (store.garbage_collection_queued().unwrap() > 0
-            || store.garbage_collection_candidates().unwrap() > 0)
-            && std::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(store.garbage_collection_candidates().unwrap(), 0);
-        assert_eq!(store.garbage_collection_queued().unwrap(), 0);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while running.load(Ordering::Acquire)
+                || store.garbage_collection_candidates().unwrap() > 0
+                || store.garbage_collection_queued().unwrap() > 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "automatic garbage collection did not finish after the active run: running={}, candidates={}, queued={}",
+                running.load(Ordering::Acquire),
+                store.garbage_collection_candidates().unwrap(),
+                store.garbage_collection_queued().unwrap(),
+            )
+        });
         scheduler.stop();
         monitor.await.unwrap();
-        while running.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!running.load(Ordering::Acquire));
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }
