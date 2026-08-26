@@ -952,6 +952,25 @@ impl IndexScheduler {
         }
     }
 
+    fn ensure_generation_current(
+        &self,
+        workspace: &str,
+        indexed: Option<u64>,
+    ) -> Result<(), Box<dyn Error>> {
+        if self
+            .generations
+            .lock()
+            .map_err(|_| "index generations lock poisoned")?
+            .get(workspace)
+            .copied()
+            == indexed
+        {
+            Ok(())
+        } else {
+            Err("workspace inputs changed during indexing; stale analysis was discarded".into())
+        }
+    }
+
     pub fn add_event(&self, event: notify::Result<Event>, workspaces: &Mutex<WorkspaceRegistry>) {
         let event = match event {
             Ok(event) => event,
@@ -2092,6 +2111,7 @@ fn index_workspace_through_port(
     if scheduler.is_stopping() && !drain_on_shutdown {
         return Ok((0, false));
     }
+    scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
     let source_loading = source_loading_started.elapsed();
     let analysis_plan = scheduler.indexer.prepare(&snapshot);
     let verification_fingerprint =
@@ -2196,6 +2216,7 @@ fn index_workspace_through_port(
     if scheduler.is_stopping() && !drain_on_shutdown {
         return Ok((0, false));
     }
+    scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
     let repository_analysis = repository_analysis_started.elapsed();
     let mut memory_hits = 0;
     let mut disk_hits = 0;
@@ -2248,21 +2269,10 @@ fn index_workspace_through_port(
     if scheduler.is_stopping() && !drain_on_shutdown {
         return Ok((0, false));
     }
+    scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
     let current_plan = scheduler.indexer.prepare(&current);
     let current_fingerprint =
         workspace_verification_fingerprint(current_plan.analysis_identity(), &current);
-    let generation_is_current = scheduler
-        .generations
-        .lock()
-        .map_err(|_| "index generations lock poisoned")?
-        .get(&workspace.name)
-        .copied()
-        == indexed_generation;
-    if !generation_is_current {
-        return Err(
-            "workspace inputs changed during indexing; stale analysis was discarded".into(),
-        );
-    }
     if current_fingerprint != verification_fingerprint {
         scheduler.mark(workspace);
         return Err(
@@ -2368,9 +2378,7 @@ fn git_head_only_noop(
             continue;
         }
         let (_, head) = beholder_adapters_git::repository_version(&repository.base)?;
-        if store
-            .repository_revision(&repository.repository.identity)?
-            .and_then(|revision| revision.head)
+        if store.published_repository_head(&workspace.name, &repository.repository.identity)?
             != head
         {
             return Ok(false);
@@ -2650,7 +2658,9 @@ fn index_workspace_versioned(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::{LogicalRepository, WorkspaceRepository};
+    use beholder_domain::{
+        LogicalRepository, RepositoryFacts, RepositoryState, WorkspaceRepository, WorkspaceView,
+    };
     use beholder_dto::{AnalysisCompleteness, EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
@@ -4325,11 +4335,19 @@ mod tests {
             .as_nanos();
         let state = std::env::temp_dir().join(format!("beholder-job-generation-{unique}"));
         let repository = state.join("repo");
-        fs::create_dir_all(repository.join("src")).unwrap();
-        fs::write(repository.join("src/lib.rs"), "fn indexed() {}").unwrap();
+        fs::create_dir_all(&repository).unwrap();
+        let source = repository.join("source.fake");
+        fs::write(&source, "initial").unwrap();
         let workspace = test_workspace("main", repository);
         let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
-        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let scheduler = IndexScheduler::with_indexer(
+            IndexerBuilder::new(state.join("frontend-cache"), 1)
+                .add_analyzer(MutatingAnalyzer {
+                    source: source.clone(),
+                })
+                .build()
+                .unwrap(),
+        );
         scheduler
             .generations
             .lock()
@@ -4341,6 +4359,7 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.to_string().contains("stale analysis was discarded"));
+        assert_eq!(fs::read_to_string(source).unwrap(), "initial");
         assert!(store.inspect_revisions().unwrap().rows.is_empty());
         drop(store);
         fs::remove_dir_all(state).unwrap();
@@ -4547,6 +4566,8 @@ mod tests {
                     "user.name=Beholder Test",
                     "-c",
                     "user.email=beholder@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
                     "commit",
                     "--allow-empty",
                     "-m",
@@ -4617,6 +4638,47 @@ mod tests {
         assert!(dirty.head);
         assert!(dirty.sources.is_empty());
         assert!(dirty.configuration.is_empty());
+
+        let (_, published_head) = beholder_adapters_git::repository_version(&repository).unwrap();
+        let workspace_state = RepositoryState {
+            repository: LogicalRepository {
+                identity: identity.clone(),
+            },
+            head: published_head,
+            fingerprint: "workspace-state".into(),
+        };
+        let facts = |state| RepositoryFacts {
+            state,
+            analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
+            entities: Vec::new(),
+            grpc_bindings: Vec::new(),
+            observations: Vec::new(),
+        };
+        let store = SemanticStore::memory().unwrap();
+        store
+            .publish(
+                &WorkspaceView::new("main", "analysis", vec![workspace_state.clone()]).unwrap(),
+                &[facts(workspace_state.clone())],
+                &[],
+            )
+            .unwrap();
+        store
+            .publish_repository(&facts(RepositoryState {
+                head: Some("different-standalone-head".into()),
+                fingerprint: "standalone-state".into(),
+                ..workspace_state
+            }))
+            .unwrap();
+        assert!(
+            git_head_only_noop(
+                &store,
+                &workspace,
+                &BTreeMap::from([(identity.clone(), dirty)])
+            )
+            .unwrap()
+        );
 
         scheduler.add_event(
             Ok(event(

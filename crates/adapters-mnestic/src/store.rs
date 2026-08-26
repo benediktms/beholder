@@ -6,7 +6,7 @@ use super::{
     query::{
         analysis_metadata, analysis_revision, context, dependencies, entity_facts, impact,
         inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions,
-        repository_revision, trace,
+        published_repository_head, repository_revision, trace,
     },
     storage::{
         claim_garbage_collection, delete_repository_revision, enrichment_matches,
@@ -166,6 +166,14 @@ impl SemanticStore {
         repository: &str,
     ) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
         repository_revision(&self.read_db, repository)
+    }
+
+    pub fn published_repository_head(
+        &self,
+        view: &str,
+        repository: &str,
+    ) -> Result<Option<String>, Box<dyn Error>> {
+        published_repository_head(&self.read_db, view, repository)
     }
 
     pub fn delete_repository_revision(&self, repository: &str) -> Result<u64, Box<dyn Error>> {
