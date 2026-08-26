@@ -1425,7 +1425,10 @@ mod durable_tests {
         assert_eq!(delivered.parts.task_id.unwrap().to_string(), id.0);
         assert!(unix_millis().unwrap() >= eligible_at_ms);
 
-        queue.close().await;
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), queue.close())
+            .await
+            .expect("queue pool did not close after the retry delivery stream was dropped");
         fs::remove_file(path).unwrap();
     }
 
