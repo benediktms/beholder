@@ -1,12 +1,18 @@
-use super::{JobCommand, JobsCommand};
+use super::JobCommand;
 use beholder_protocol::v1::{
     IndexJobOutcome, JobStatus, JobSummary, JobTrigger, JobType, JobWaitReason, index_destination,
     job_target,
 };
 use std::{error::Error, fmt::Debug};
 
-pub(super) async fn list(command: JobsCommand) -> Result<(), Box<dyn Error>> {
-    let JobsCommand::List { page_token } = command;
+pub(super) async fn run(command: JobCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        JobCommand::List { page_token } => list(page_token).await,
+        JobCommand::Get { id } => get(id).await,
+    }
+}
+
+async fn list(page_token: Option<String>) -> Result<(), Box<dyn Error>> {
     let response = beholder_daemon_client::list_jobs(page_token).await?;
     for job in response.jobs {
         println!(
@@ -24,8 +30,7 @@ pub(super) async fn list(command: JobsCommand) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub(super) async fn get(command: JobCommand) -> Result<(), Box<dyn Error>> {
-    let JobCommand::Get { id } = command;
+async fn get(id: String) -> Result<(), Box<dyn Error>> {
     let job = beholder_daemon_client::get_job(id)
         .await?
         .job

@@ -200,6 +200,8 @@ beholder repository delete <repository-identity>
 
 `beholder index <workspace-name>` indexes one registered workspace. Every manual
 request creates a durable job and prints its ID plus any overlapping work.
+Inspect active and recent work with `beholder job list`, then use
+`beholder job get <job-id>` for its lifecycle details and typed result.
 
 Deletion is rejected while a workspace references the repository. It never deletes the source checkout; graph facts not retained by a completed workspace revision are cleaned up in the background.
 

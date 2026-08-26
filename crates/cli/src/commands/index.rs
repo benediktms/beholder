@@ -1,4 +1,4 @@
-use super::jobs::{enum_name, target as job_target};
+use super::job::{enum_name, target as job_target};
 use crate::stdout;
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
