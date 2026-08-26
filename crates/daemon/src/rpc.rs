@@ -9,6 +9,7 @@ impl BeholderDaemon {
     pub(super) fn query_response<T, P>(
         &self,
         workspace: &str,
+        enriching: Vec<String>,
         result: Result<Revisioned<T>, Box<dyn Error>>,
     ) -> Result<Response<P>, Status>
     where
@@ -21,10 +22,11 @@ impl BeholderDaemon {
                 .map_or_else(|| Status::internal(error.to_string()), operation_status_ref)
         })?;
         let mut result = revisioned.result;
-        *result.metadata_mut() = self.scheduler.query_metadata(
+        *result.metadata_mut() = self.scheduler.query_metadata_with_enrichments(
             workspace,
             revisioned.analysis_revision,
             revisioned.analysis,
+            Some(enriching),
         );
         Ok(Response::new(result.into()))
     }

@@ -96,7 +96,6 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     for script in [
-        CREATE_ENRICHMENT_JOB_SCHEMA,
         CREATE_ENRICHMENT_OUTPUT_SCHEMA,
         CREATE_ENRICHMENT_ENTITY_CONTRIBUTION_SCHEMA,
         CREATE_ENRICHMENT_OBSERVATION_CONTRIBUTION_SCHEMA,
@@ -326,7 +325,6 @@ pub(super) fn persistent_database(
             "analysis_revision_enrichment_observation_owner",
             CREATE_ENRICHMENT_OBSERVATION_OWNER_SCHEMA,
         ),
-        ("enrichment_job", CREATE_ENRICHMENT_JOB_SCHEMA),
         ("enrichment_output", CREATE_ENRICHMENT_OUTPUT_SCHEMA),
         (
             "enrichment_entity_contribution",
@@ -491,6 +489,17 @@ pub(super) fn persistent_database(
     }
     if initialize {
         run_enrichment_migrations(&db)?;
+        if relations
+            .rows
+            .iter()
+            .any(|row| row[0].get_str() == Some("enrichment_job"))
+        {
+            db.run_script(
+                "::remove enrichment_job",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )?;
+        }
     }
     Ok(db)
 }
@@ -527,16 +536,6 @@ fn migrate_enrichment_ownership_to_contributions(db: &DbInstance) -> Result<(), 
              }, not *enrichment_output{view, owner} \
          :put enrichment_output {\
              view, owner => repository, analyzer, version, input_fingerprint\
-         }",
-        "?[view, owner, repository, analyzer, version, input_fingerprint, status, attempt, retry_at_ms, error] := \
-             *analysis_revision{view, revision}, \
-             *analysis_revision_repository_enrichment{\
-                 view, revision, owner, repository, analyzer, version, input_fingerprint\
-             }, not *enrichment_job{view, owner}, status = 'complete', attempt = 0, \
-             retry_at_ms = 0, error = '' \
-         :put enrichment_job {\
-             view, owner => repository, analyzer, version, input_fingerprint, status, attempt, \
-             retry_at_ms, error\
          }",
         "?[view, owner, id, kind, metadata] := *analysis_revision{view, revision}, \
              *analysis_revision_enrichment_entity_owner{\
@@ -822,10 +821,8 @@ mod tests {
         let migrated = store
             .db
             .run_script(
-                "?[kind, status, version] := *enrichment_entity_contribution{\
+                "?[kind, version] := *enrichment_entity_contribution{\
                      view: 'legacy-enrichment', owner: 'owner', id: 'generated', kind\
-                 }, *enrichment_job{\
-                     view: 'legacy-enrichment', owner: 'owner', status\
                  }, *schema_migration{name: 'enrichment-ownership', version}",
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
@@ -833,8 +830,16 @@ mod tests {
             .unwrap();
         assert_eq!(migrated.rows.len(), 1);
         assert_eq!(migrated.rows[0][0].get_str(), Some("callable"));
-        assert_eq!(migrated.rows[0][1].get_str(), Some("complete"));
-        assert_eq!(migrated.rows[0][2].get_int(), Some(1));
+        assert_eq!(migrated.rows[0][1].get_int(), Some(1));
+        assert!(
+            store
+                .db
+                .run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)
+                .unwrap()
+                .rows
+                .iter()
+                .all(|row| row[0].get_str() != Some("enrichment_job"))
+        );
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }

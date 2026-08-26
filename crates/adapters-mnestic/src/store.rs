@@ -10,12 +10,12 @@ use super::{
     },
     storage::{
         claim_garbage_collection, delete_repository_revision, enrichment_matches,
-        enrichment_retry_failed, enrichment_retry_started, enrichments_current,
-        ensure_revision_inputs, garbage_collection_candidates, garbage_collection_pending,
-        garbage_collection_queued, prepare_enrichment, publish_enrichment, publish_observations,
-        publish_repository, repository_contexts, revision_enrichment_input_fingerprint,
-        selected_baseline_semantics, store_verification_fingerprint, sweep_garbage_collection,
-        verification_matches, view_matches,
+        enrichments_current, ensure_revision_inputs, garbage_collection_candidates,
+        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
+        publish_observations, publish_repository, repository_contexts,
+        revision_enrichment_input_fingerprint, selected_baseline_semantics,
+        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
+        view_matches,
     },
 };
 use beholder_domain::{
@@ -33,7 +33,6 @@ use std::{
     error::Error,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
 };
 
 fn relevant_entities(
@@ -71,17 +70,6 @@ pub struct EnrichmentPayload<'a> {
 pub struct EnrichmentOwner<'a> {
     pub analyzer: &'a str,
     pub version: &'a str,
-    pub expected_version: Option<&'a str>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EnrichmentSchedule {
-    Current,
-    Queue,
-    Running,
-    RetryAfter(Duration),
-    Exhausted,
-    Superseded,
 }
 
 impl SemanticStore {
@@ -256,7 +244,7 @@ impl SemanticStore {
 
     pub fn publish_enrichment(
         &self,
-        view: &WorkspaceView,
+        view: &str,
         repository: &str,
         input_fingerprint: &str,
         owner: EnrichmentOwner<'_>,
@@ -274,68 +262,6 @@ impl SemanticStore {
         })
     }
 
-    pub fn prepare_enrichment(
-        &self,
-        view: &str,
-        repository: &str,
-        analyzer: &str,
-        version: &str,
-        input_fingerprint: &str,
-    ) -> Result<EnrichmentSchedule, Box<dyn Error>> {
-        self.access(|| {
-            prepare_enrichment(
-                &self.db,
-                view,
-                repository,
-                analyzer,
-                version,
-                input_fingerprint,
-            )
-        })
-    }
-
-    pub fn enrichment_retry_started(
-        &self,
-        view: &str,
-        repository: &str,
-        analyzer: &str,
-        version: &str,
-        input_fingerprint: &str,
-    ) -> Result<bool, Box<dyn Error>> {
-        self.access(|| {
-            enrichment_retry_started(
-                &self.db,
-                view,
-                repository,
-                analyzer,
-                version,
-                input_fingerprint,
-            )
-        })
-    }
-
-    pub fn enrichment_retry_failed(
-        &self,
-        view: &str,
-        repository: &str,
-        analyzer: &str,
-        version: &str,
-        input_fingerprint: &str,
-        error: &str,
-    ) -> Result<Option<Duration>, Box<dyn Error>> {
-        self.access(|| {
-            enrichment_retry_failed(
-                &self.db,
-                view,
-                repository,
-                analyzer,
-                version,
-                input_fingerprint,
-                error,
-            )
-        })
-    }
-
     pub fn checkpoint(&self) -> Result<(), Box<dyn Error>> {
         let _engine = self
             .engine
@@ -345,7 +271,7 @@ impl SemanticStore {
         if let Some(path) = &self.database_path {
             let connection = sqlite::open(path)?;
             connection.execute("PRAGMA busy_timeout = 5000")?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 let mut checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
                 if checkpoint.next()? == sqlite::State::Row && checkpoint.read::<i64, _>(0)? == 0 {
@@ -354,7 +280,7 @@ impl SemanticStore {
                 if std::time::Instant::now() >= deadline {
                     return Err("SQLite WAL checkpoint remained busy".into());
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         Ok(())
@@ -646,7 +572,7 @@ mod tests {
         path::PathBuf,
         sync::{Arc, mpsc},
         thread,
-        time::{Duration, SystemTime},
+        time::SystemTime,
     };
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
         RepositoryFacts {
@@ -905,7 +831,7 @@ mod tests {
         });
 
         let (revision, edge_count) = received
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(1))
             .expect("read blocked behind the uncommitted writer");
         assert_eq!(revision, 1);
         assert_eq!(edge_count, 1);
@@ -938,10 +864,14 @@ mod tests {
             sent.send(result.is_ok()).unwrap();
         });
 
-        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
         drop(engine);
         received
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(1))
             .expect("engine access remained blocked after the active operation finished");
         access_thread.join().unwrap();
     }

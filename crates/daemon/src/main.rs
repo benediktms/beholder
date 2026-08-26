@@ -80,11 +80,27 @@ async fn run_daemon() -> Result<(), Box<dyn Error>> {
         service.store.clone(),
         service.workspaces.clone(),
     );
+    let mut enrichment_worker = jobs::start_enrichment_worker(
+        jobs.clone(),
+        index_scheduler.clone(),
+        service.store.clone(),
+        service.workspaces.clone(),
+    );
     while !index_worker.context.is_ready() {
         if index_worker.task.is_finished() {
             return Err(format!(
                 "index worker exited during startup: {}",
                 join_result(index_worker.task.await)
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    while !enrichment_worker.context.is_ready() {
+        if enrichment_worker.task.is_finished() {
+            return Err(format!(
+                "enrichment worker exited during startup: {}",
+                join_result(enrichment_worker.task.await)
             )
             .into());
         }
@@ -115,6 +131,7 @@ async fn run_daemon() -> Result<(), Box<dyn Error>> {
     let fatal = tokio::select! {
         () = &mut shutdown_signal => None,
         result = &mut index_worker.task => Some(format!("index worker exited unexpectedly: {}", join_result(result))),
+        result = &mut enrichment_worker.task => Some(format!("enrichment worker exited unexpectedly: {}", join_result(result))),
         result = &mut watcher_task => Some(format!("automatic index producer exited unexpectedly: {}", join_result(result))),
         result = &mut garbage_collection_task => Some(format!("garbage collection monitor exited unexpectedly: {}", join_result(result.map(|()| Ok::<(), String>(()))))),
         result = &mut server_task => Some(format!("gRPC server exited unexpectedly: {}", join_result(result.map(|result| result.map_err(|error| error.to_string()))))),
@@ -124,6 +141,7 @@ async fn run_daemon() -> Result<(), Box<dyn Error>> {
     jobs.close_admission().await;
     index_scheduler.stop();
     let _ = index_worker.context.stop();
+    let _ = enrichment_worker.context.stop();
     server_shutdown.notify_waiters();
     let drain = async {
         if !server_task.is_finished() {
@@ -134,6 +152,9 @@ async fn run_daemon() -> Result<(), Box<dyn Error>> {
         }
         if !index_worker.task.is_finished() {
             let _ = (&mut index_worker.task).await;
+        }
+        if !enrichment_worker.task.is_finished() {
+            let _ = (&mut enrichment_worker.task).await;
         }
         index_scheduler.wait_for_checkpoint().await;
         if !garbage_collection_task.is_finished() {
