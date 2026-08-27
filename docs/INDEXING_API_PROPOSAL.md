@@ -34,8 +34,11 @@ The boundary is already proven: `beholder-indexing` depends inward on
 `beholder-domain` plus Rayon, serialization, and SHA-256, while the 5,412-line
 daemon scheduler contains the watcher, job, mutation, inventory, and publication
 concerns listed above. Installed-daemon traces also show that unchanged analysis is
-cheap once the view matches; the remaining long operations are authoritative input
-verification and Mnestic mutation, not analyzer composition.
+cheap once the view matches. A persisted reconciliation checkpoint now bypasses
+content hydration when membership, metadata, runtime identity, repository state,
+and the Mnestic verification fingerprint all still match; authoritative input
+verification remains the fallback. Mnestic mutation, not analyzer composition,
+dominates changed publication.
 
 ## Minimal API
 

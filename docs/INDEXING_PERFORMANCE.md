@@ -116,6 +116,21 @@ conflating it with indexing time.
 
 A separate attempt to incrementally replace the immutable repository-state baseline
 increased a real Beholder publication to 166.9 seconds, so it was rejected.
-Repository facts remain immutable. The next unchanged-path optimization target is
-the measured prepare/current-view path; changed publication remains a separate
-Mnestic bottleneck. Neither justifies a mutable graph or another cache layer.
+Repository facts remain immutable.
+
+The daemon now persists a reconciliation checkpoint after a verified unchanged run
+or publication. On restart it walks accepted input membership and metadata without
+hydrating content, then requires the same repository fingerprints (including Git
+heads), analyzer and enricher runtime identity, workspace plugin configuration, and
+Mnestic verification fingerprint. Any mismatch falls back to the existing
+content-authoritative inventory and analysis path.
+
+With both checkpoints current, an exact release-binary restart produced:
+
+| Workspace | Checkpoint verification | Outcome |
+| --- | ---: | --- |
+| Fresha (7 repositories) | 724 ms | Unchanged, 0 observations, not published |
+| Beholder (1 repository) | 20.5 ms | Unchanged, 0 observations, not published |
+
+Changed publication remains a separate Mnestic bottleneck. Neither optimization
+requires mutable repository facts or a generic cache layer.

@@ -133,7 +133,7 @@ mod sources;
 mod typescript_analysis;
 #[cfg(test)]
 use cache::{RepositoryAnalysis, RepositoryAnalysisKey, SourceAnalysisKey};
-use inventory::{InventoryStatistics, InventoryStore, RefreshMode};
+use inventory::{InventoryStatistics, InventoryStore, RefreshMode, WorkspaceCheckpoint};
 use sources::is_ignored_path;
 #[cfg(test)]
 use sources::{RepositorySources, decode_csharp_source, repository_sources};
@@ -968,6 +968,22 @@ impl IndexScheduler {
             Ok(())
         } else {
             Err("workspace inputs changed during indexing; stale analysis was discarded".into())
+        }
+    }
+
+    fn store_checkpoint(
+        &self,
+        workspace: &Workspace,
+        snapshot: &WorkspaceSnapshot,
+        verification_fingerprint: &str,
+    ) {
+        if let Err(error) = self.inventory.store_checkpoint(WorkspaceCheckpoint {
+            workspace,
+            snapshot,
+            indexer: &self.indexer,
+            verification_fingerprint,
+        }) {
+            tracing::warn!(workspace = %workspace.name, %error, "failed to store reconciliation checkpoint");
         }
     }
 
@@ -2101,6 +2117,32 @@ fn index_workspace_through_port(
     indexed_generation: Option<u64>,
     drain_on_shutdown: bool,
 ) -> Result<(usize, bool), Box<dyn Error>> {
+    if checkpoint_eligible(workspace, dirty)
+        && let Some(checkpoint) = tracing::info_span!(
+            "index.checkpoint",
+            workspace = %workspace.name,
+            repositories = workspace.repositories.len()
+        )
+        .in_scope(|| {
+            scheduler
+                .inventory
+                .verify_checkpoint(workspace, &scheduler.indexer)
+        })?
+    {
+        if scheduler.is_stopping() && !drain_on_shutdown {
+            return Ok((0, false));
+        }
+        scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
+        if store.verification_matches(&workspace.name, &checkpoint.verification_fingerprint)? {
+            scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
+            scheduler
+                .inventory
+                .accept_checkpoint(&checkpoint, &workspace.repositories[0].base)?;
+            tracing::info!(workspace = %workspace.name, "workspace unchanged from checkpoint");
+            return Ok((0, false));
+        }
+        tracing::debug!(workspace = %workspace.name, "semantic verification checkpoint changed");
+    }
     let source_loading_started = Instant::now();
     let (snapshot, inventory_statistics) = tracing::info_span!(
         "index.inventory",
@@ -2169,6 +2211,7 @@ fn index_workspace_through_port(
         }
         store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
         scheduler.ensure_enrichment_inputs(store, &view)?;
+        scheduler.store_checkpoint(workspace, &snapshot, &verification_fingerprint);
         tracing::info!(workspace = %workspace.name, "workspace unchanged");
         return Ok((0, false));
     }
@@ -2297,6 +2340,7 @@ fn index_workspace_through_port(
     })?;
     if !scheduler.is_stopping() {
         scheduler.ensure_enrichment_inputs(store, &view)?;
+        scheduler.store_checkpoint(workspace, &current, &verification_fingerprint);
     }
     let publication = publication_started.elapsed();
     pipeline::report_analysis_diagnostics(&workspace.name, &analysis.diagnostics);
@@ -2335,6 +2379,20 @@ fn index_workspace_through_port(
         "workspace indexed"
     );
     Ok((observation_count, true))
+}
+
+fn checkpoint_eligible(
+    workspace: &Workspace,
+    dirty: Option<&BTreeMap<String, DirtyRepository>>,
+) -> bool {
+    dirty.is_none_or(|dirty| {
+        dirty.len() == workspace.repositories.len()
+            && workspace.repositories.iter().all(|repository| {
+                dirty
+                    .get(&repository.repository.identity)
+                    .is_some_and(DirtyRepository::authoritative)
+            })
+    })
 }
 
 fn merge_declared_contexts(
@@ -3924,7 +3982,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_inventory_is_revalidated_after_restart() {
+    fn persisted_checkpoint_skips_hydration_and_invalidates_on_change() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -3940,11 +3998,23 @@ mod tests {
 
         assert!(scheduler.index(&store, &workspace).unwrap().1);
         drop(scheduler);
+        let blobs = state.join("frontend-cache/repository-inventory-v1/blobs");
+        fs::remove_dir_all(&blobs).unwrap();
         let scheduler = IndexScheduler::new(state.join("frontend-cache"));
-        assert!(!scheduler.index(&store, &workspace).unwrap().1);
+        let dirty = BTreeMap::from([(
+            workspace.repositories[0].repository.identity.clone(),
+            DirtyRepository::from_intent(RepositoryIntent::Reconcile),
+        )]);
+        assert!(
+            !index_workspace(&scheduler, &store, &workspace, Some(&dirty))
+                .unwrap()
+                .1
+        );
+        assert!(!blobs.exists());
 
         fs::write(&source, "fn indexed() {}").unwrap();
         assert!(!scheduler.index(&store, &workspace).unwrap().1);
+        assert!(blobs.exists());
 
         fs::write(&source, "fn changed() {}").unwrap();
         assert!(scheduler.index(&store, &workspace).unwrap().1);
