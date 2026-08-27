@@ -441,19 +441,23 @@ impl JobQueue {
         Ok(Self {
             index_jobs: SqliteStorage::new_with_config(
                 &pool,
-                &Config::new(INDEX_QUEUE).with_poll_interval(
-                    StrategyBuilder::new()
-                        .apply(IntervalStrategy::new(Duration::from_millis(100)))
-                        .build(),
-                ),
+                &Config::new(INDEX_QUEUE)
+                    .set_buffer_size(1)
+                    .with_poll_interval(
+                        StrategyBuilder::new()
+                            .apply(IntervalStrategy::new(Duration::from_millis(100)))
+                            .build(),
+                    ),
             ),
             enrichment_jobs: SqliteStorage::new_with_config(
                 &pool,
-                &Config::new(ENRICHMENT_QUEUE).with_poll_interval(
-                    StrategyBuilder::new()
-                        .apply(IntervalStrategy::new(Duration::from_millis(100)))
-                        .build(),
-                ),
+                &Config::new(ENRICHMENT_QUEUE)
+                    .set_buffer_size(1)
+                    .with_poll_interval(
+                        StrategyBuilder::new()
+                            .apply(IntervalStrategy::new(Duration::from_millis(100)))
+                            .build(),
+                    ),
             ),
             admission: Arc::new(Mutex::new(true)),
         })
@@ -1712,6 +1716,8 @@ mod durable_tests {
     async fn automatic_jobs_coalesce_and_remain_inspectable() {
         let path = queue_path("inspect");
         let queue = JobQueue::open(&path).await.unwrap();
+        assert_eq!(queue.index_jobs.config().buffer_size(), 1);
+        assert_eq!(queue.enrichment_jobs.config().buffer_size(), 1);
         let id = queue
             .enqueue_automatic_index(automatic_job("main"))
             .await
@@ -1809,6 +1815,13 @@ mod durable_tests {
         }
         let (jobs, _) = queue.list(None).await.unwrap();
         assert_eq!(jobs.len(), 3);
+        let mut fetched = queue
+            .enrichment_jobs
+            .clone()
+            .poll(&WorkerContext::new::<()>("priority-test"));
+        assert!(fetched.next().await.unwrap().unwrap().is_none());
+        let fetched = fetched.next().await.unwrap().unwrap().unwrap();
+        assert_eq!(fetched.parts.task_id.unwrap().to_string(), first);
         let _ = fs::remove_file(path);
     }
 
