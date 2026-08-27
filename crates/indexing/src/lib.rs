@@ -578,6 +578,12 @@ impl AnalyzerPlan {
             })
     }
 
+    pub fn cached_fact_shards(&self, identity: &str) -> Option<&[FactShard]> {
+        self.cached_repositories
+            .get(identity)
+            .map(|analysis| analysis.fact_shards.as_slice())
+    }
+
     fn cache_repository(&mut self, identity: String, analysis: Arc<CanonicalAnalyzerAnalysis>) {
         self.cached_repositories.insert(identity, analysis);
     }

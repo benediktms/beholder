@@ -875,6 +875,22 @@ mod tests {
         assert!(!freshness.indexing);
         assert!(freshness.dirty_repositories.is_empty());
 
+        assert!(
+            format!(
+                "{:?}",
+                client
+                    .context(EntityRequest {
+                        workspace: "main".into(),
+                        entity: caller.clone()
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+            )
+            .contains(&helper),
+            "descriptor-only publication retracted the Rust shard"
+        );
+
         client.clear_cache(ClearCacheRequest {}).await.unwrap();
         assert!(!state.join("frontend-cache").exists());
         let mut events = client

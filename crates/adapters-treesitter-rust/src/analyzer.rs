@@ -118,6 +118,12 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 .ok_or("missing prepared Rust repository")?;
             if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
                 cached_observations.extend_from_slice(cached.observations);
+                cached_observations.extend(
+                    plan.cached_fact_shards(&repository.state.repository.identity)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|shard| shard.observations.iter().cloned()),
+                );
                 continue;
             }
             let active_plugins = &repository_plan.active_plugins;
