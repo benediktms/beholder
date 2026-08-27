@@ -82,7 +82,10 @@ pub(super) async fn run_garbage_collection_monitor(
     running: Arc<AtomicBool>,
     progress: Arc<Mutex<Option<GarbageCollectionProgress>>>,
 ) {
-    let mut interval = tokio::time::interval(GARBAGE_COLLECTION_INTERVAL);
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + GARBAGE_COLLECTION_INTERVAL,
+        GARBAGE_COLLECTION_INTERVAL,
+    );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let trigger = tokio::select! {
@@ -248,23 +251,26 @@ fn start_garbage_collector(
                                 GarbageCollectionPhase::SweepingObsoleteStates,
                             ));
                         }
-                        states_resolved = store.sweep_garbage_collection(|update| {
-                            if let Ok(mut current) = progress.lock() {
-                                *current = Some(update.clone());
-                            }
-                            tracing::info!(
-                                phase = ?update.phase,
-                                step = update.step,
-                                completed_rows = update.completed_rows,
-                                rows = update.rows,
-                                stale_states = update.stale_states,
-                                repositories = update.repositories,
-                                completed_steps = update.completed_steps,
-                                total_steps = update.total_steps,
-                                "semantic store garbage collection progress"
-                            );
-                            !scheduler.is_stopping()
-                        })?;
+                        states_resolved =
+                            scheduler.run_exclusive("garbage collection sweep", || {
+                                store.sweep_garbage_collection(|update| {
+                                    if let Ok(mut current) = progress.lock() {
+                                        *current = Some(update.clone());
+                                    }
+                                    tracing::info!(
+                                        phase = ?update.phase,
+                                        step = update.step,
+                                        completed_rows = update.completed_rows,
+                                        rows = update.rows,
+                                        stale_states = update.stale_states,
+                                        repositories = update.repositories,
+                                        completed_steps = update.completed_steps,
+                                        total_steps = update.total_steps,
+                                        "semantic store garbage collection progress"
+                                    );
+                                    !scheduler.is_stopping()
+                                })
+                            })?;
                     }
                     if scheduler.is_stopping() {
                         return Ok(states_resolved);
@@ -599,18 +605,33 @@ mod tests {
         assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
 
         let scheduler = Arc::new(IndexScheduler::new(state_dir.join("cache")));
-        let running = Arc::new(AtomicBool::new(true));
+        let running = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(None));
+        let indexing = scheduler.block_indexing("startup indexing");
         let monitor = tokio::spawn(run_garbage_collection_monitor(
             store.clone(),
             scheduler.clone(),
             running.clone(),
             progress,
         ));
-        scheduler.request_garbage_collection();
         tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!running.load(Ordering::Acquire));
         assert_eq!(store.garbage_collection_candidates().unwrap(), 1);
-        running.store(false, Ordering::Release);
+        assert_eq!(store.garbage_collection_queued().unwrap(), 0);
+
+        scheduler.request_garbage_collection();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !running.load(Ordering::Acquire)
+                || store.garbage_collection_queued().unwrap() == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("garbage collection did not queue while indexing was active");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(store.garbage_collection_queued().unwrap(), 1);
+        drop(indexing);
         tokio::time::timeout(Duration::from_secs(10), async {
             while running.load(Ordering::Acquire)
                 || store.garbage_collection_candidates().unwrap() > 0
