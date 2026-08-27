@@ -121,6 +121,28 @@ manifest by selecting immutable repository states, fact shards, and enrichments;
 superseded data becomes unreachable and is reclaimed by asynchronous garbage
 collection rather than synchronous publication.
 
+Enrichment uses the same manifest model. Analyzer output is stored once under a
+content-addressed snapshot identity. Each revision selects at most one snapshot
+per repository and analyzer; a base publication copies those small selections
+without copying their entities, observations, overrides, or diagnostics. When an
+input changes, the newest selected snapshot remains queryable but no longer
+matches the revision's expected enrichment fingerprint, so query freshness is
+reported as stale for the affected repository until a replacement snapshot is
+selected.
+
+Queries join the selected snapshots and resolve only their logical collisions:
+base facts win, while competing analyzer facts use confidence and stable analyzer
+identity. Enrichment publication atomically stores a missing immutable snapshot,
+replaces one manifest selection, and advances the revision. Superseded snapshots
+and the former materialized baseline are removed by background garbage collection.
+Base publication must not recreate revision-local enrichment facts.
+
+One persistent Mnestic database retains atomic workspace revisions and direct
+cross-repository queries. Database-per-repository partitioning or a storage-engine
+migration is deferred unless measurements show sustained writer contention; large
+read plans, synchronous materialization, and foreground garbage collection must
+first be excluded because they are independent of SQLite's single-writer limit.
+
 ### Initial Rust slice
 
 The first executable slice must cover the whole hot path rather than proving

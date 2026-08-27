@@ -101,6 +101,10 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         CREATE_ENRICHMENT_OBSERVATION_CONTRIBUTION_SCHEMA,
         CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_SCHEMA,
         CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA,
+        CREATE_ENRICHMENT_ENTITY_SELECTION_SCHEMA,
+        CREATE_ENRICHMENT_OBSERVATION_SELECTION_SCHEMA,
+        CREATE_ENRICHMENT_OVERRIDE_SELECTION_SCHEMA,
+        CREATE_ENRICHMENT_DIAGNOSTIC_SELECTION_SCHEMA,
         CREATE_BASELINE_ENTITY_SCHEMA,
         CREATE_BASELINE_OBSERVATION_SCHEMA,
         CREATE_BASELINE_OVERRIDE_SCHEMA,
@@ -126,6 +130,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
     )?;
     db.run_script(
         CREATE_REVISION_OBSERVATION_TO_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_ENRICHMENT_OBSERVATION_SELECTION_TO_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
@@ -347,6 +356,22 @@ pub(super) fn persistent_database(
             "enrichment_diagnostic_contribution",
             CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA,
         ),
+        (
+            "analysis_enrichment_entity_selection",
+            CREATE_ENRICHMENT_ENTITY_SELECTION_SCHEMA,
+        ),
+        (
+            "analysis_enrichment_observation_selection",
+            CREATE_ENRICHMENT_OBSERVATION_SELECTION_SCHEMA,
+        ),
+        (
+            "analysis_enrichment_override_selection",
+            CREATE_ENRICHMENT_OVERRIDE_SELECTION_SCHEMA,
+        ),
+        (
+            "analysis_enrichment_diagnostic_selection",
+            CREATE_ENRICHMENT_DIAGNOSTIC_SELECTION_SCHEMA,
+        ),
         ("analysis_baseline_entity", CREATE_BASELINE_ENTITY_SCHEMA),
         (
             "analysis_baseline_observation",
@@ -502,6 +527,10 @@ pub(super) fn persistent_database(
                 "analysis_revision_observation:by_to",
                 CREATE_REVISION_OBSERVATION_TO_INDEX,
             ),
+            (
+                "analysis_enrichment_observation_selection:by_to",
+                CREATE_ENRICHMENT_OBSERVATION_SELECTION_TO_INDEX,
+            ),
         ] {
             if !relations
                 .rows
@@ -535,6 +564,12 @@ fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
     }
     if !migration_applied(db, "enrichment-baseline", 1)? {
         migrate_enrichment_baseline(db)?;
+    }
+    if !migration_applied(db, "enrichment-selection", 1)? {
+        migrate_enrichment_selection(db)?;
+    }
+    if !migration_applied(db, "enrichment-winners", 1)? {
+        migrate_enrichment_winners(db)?;
     }
     Ok(())
 }
@@ -674,6 +709,72 @@ fn migrate_enrichment_baseline(db: &DbInstance) -> Result<(), Box<dyn Error>> {
     }
     transaction.run_script(
         "?[name, version] <- [['enrichment-baseline', 1]] \
+         :put schema_migration {name => version}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_enrichment_selection(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    transaction.run_script(
+        "?[view, revision, owner, repository, analyzer, version, input_fingerprint] := \
+             *analysis_revision{view, revision}, \
+             *enrichment_output{\
+                 view, owner, repository, analyzer, version, input_fingerprint\
+             } \
+         :put analysis_revision_repository_enrichment {\
+             view, revision, owner => repository, analyzer, version, input_fingerprint\
+         }",
+        BTreeMap::new(),
+    )?;
+    transaction.run_script(
+        "?[name, version] <- [['enrichment-selection', 1]] \
+         :put schema_migration {name => version}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_enrichment_winners(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    for script in [
+        "?[view, id, owner] := *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_entity_owner{\
+                 view, revision, id, analyzer: owner\
+             }, *analysis_revision_repository_enrichment{view, revision, owner} \
+         :put analysis_enrichment_entity_selection {view, id => owner}",
+        "?[view, from, relation, to, evidence, owner] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_observation_owner{\
+                 view, revision, from, relation, to, evidence, analyzer: owner\
+             }, *analysis_revision_repository_enrichment{view, revision, owner} \
+         :put analysis_enrichment_observation_selection {\
+             view, from, relation, to, evidence => owner\
+         }",
+        "?[view, from, relation, unresolved_to, owner] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_override_owner{\
+                 view, revision, from, relation, unresolved_to, analyzer: owner\
+             }, *analysis_revision_repository_enrichment{view, revision, owner} \
+         :put analysis_enrichment_override_selection {\
+             view, from, relation, unresolved_to => owner\
+         }",
+        "?[view, repository, code, severity, path, line, owner] := \
+             *analysis_revision{view, revision}, \
+             *analysis_revision_enrichment_diagnostic_owner{\
+                 view, revision, repository, code, severity, path, line, analyzer: owner\
+             }, *analysis_revision_repository_enrichment{view, revision, owner} \
+         :put analysis_enrichment_diagnostic_selection {\
+             view, repository, code, severity, path, line => owner\
+         }",
+    ] {
+        transaction.run_script(script, BTreeMap::new())?;
+    }
+    transaction.run_script(
+        "?[name, version] <- [['enrichment-winners', 1]] \
          :put schema_migration {name => version}",
         BTreeMap::new(),
     )?;
@@ -865,6 +966,114 @@ mod tests {
                 .iter()
                 .all(|row| row[0].get_str() != Some("enrichment_job"))
         );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn migrates_materialized_enrichment_to_a_revision_selection() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-selection-migration-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let path = state_dir.join("beholder.db");
+        let store = SemanticStore::persistent(&path, true).unwrap();
+        let view = WorkspaceView::new(
+            "legacy-selection",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repo".into(),
+                },
+                head: None,
+                fingerprint: "source".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .publish(&view, &[facts(&view, Vec::new())], &[])
+            .unwrap();
+        for script in [
+            "?[view, owner, repository, analyzer, version, input_fingerprint] <- \
+                 [['legacy-selection', 'owner', 'example/repo', 'rust', '1', 'input']] \
+             :put enrichment_output {\
+                 view, owner => repository, analyzer, version, input_fingerprint\
+             }",
+            "?[view, owner, id, kind, metadata] <- \
+                 [['legacy-selection', 'owner', 'generated', 'callable', '']] \
+             :put enrichment_entity_contribution {view, owner, id => kind, metadata}",
+            "?[view, revision, id, kind, metadata] <- \
+                 [['legacy-selection', 1, 'generated', 'callable', '']] \
+             :put analysis_revision_entity {view, revision, id => kind, metadata}",
+            "?[view, revision, id, analyzer] <- \
+                 [['legacy-selection', 1, 'generated', 'owner']] \
+             :put analysis_revision_enrichment_entity_owner {\
+                 view, revision, id => analyzer\
+             }",
+            "?[name] <- [['enrichment-selection']] :rm schema_migration {name}",
+            "?[name] <- [['enrichment-winners']] :rm schema_migration {name}",
+        ] {
+            store
+                .db
+                .run_script(script, BTreeMap::new(), ScriptMutability::Mutable)
+                .unwrap();
+        }
+        drop(store);
+
+        let store = SemanticStore::persistent(&path, true).unwrap();
+        let selected = store
+            .db
+            .run_script(
+                "?[owner, version] := *analysis_revision{view: 'legacy-selection', revision}, \
+                     *analysis_revision_repository_enrichment{\
+                         view: 'legacy-selection', revision, owner, repository: 'example/repo', \
+                         analyzer: 'rust'\
+                     }, *schema_migration{name: 'enrichment-selection', version}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(selected.rows.len(), 1);
+        assert_eq!(selected.rows[0][0].get_str(), Some("owner"));
+        assert_eq!(selected.rows[0][1].get_int(), Some(1));
+        let winner = store
+            .db
+            .run_script(
+                "?[owner, version] := *analysis_enrichment_entity_selection{\
+                     view: 'legacy-selection', id: 'generated', owner\
+                 }, *schema_migration{name: 'enrichment-winners', version}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(winner.rows.len(), 1);
+        assert_eq!(winner.rows[0][0].get_str(), Some("owner"));
+        assert_eq!(winner.rows[0][1].get_int(), Some(1));
+        let materialized = store
+            .db
+            .run_script(
+                "?[id] := *analysis_revision{view: 'legacy-selection', revision}, \
+                     *analysis_revision_entity{view: 'legacy-selection', revision, id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(materialized.rows.len(), 1);
+        store
+            .publish(&view, &[facts(&view, Vec::new())], &[])
+            .unwrap();
+        let materialized = store
+            .db
+            .run_script(
+                "?[id] := *analysis_revision{view: 'legacy-selection', revision}, \
+                     *analysis_revision_entity{view: 'legacy-selection', revision, id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert!(materialized.rows.is_empty());
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }

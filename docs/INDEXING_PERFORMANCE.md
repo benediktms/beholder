@@ -140,7 +140,7 @@ ADR 0007 replaces Rust repository-wide semantic publication with Salsa-backed
 file queries and immutable fact shards selected per stable semantic owner. A
 source edit propagates through parsing, file summary, and shard production only
 while each semantic output changes. Mnestic retains unchanged shard versions and
-rebuilds the remaining legacy baseline only when its semantic fingerprint changes.
+advances a selection manifest without rebuilding a workspace baseline.
 
 The 2026-08-27 self-index benchmark used four workers, 178 accepted inputs, and
 2,573,785 bytes:
@@ -174,6 +174,15 @@ reading 25,570 effective observations, 50 ms replacing 1,966 shard selections,
 enrichment contributions, and 77 ms committing. The remaining hot path is
 therefore revision-local enrichment materialisation, not shard persistence,
 baseline replacement, or SQLite commit throughput.
+
+Revision-local enrichment materialisation was subsequently removed. Enrichment
+payloads are content-addressed immutable snapshots, and an analysis revision now
+selects a snapshot per repository and analyzer. A base publication carries only
+those selection rows; it does not copy or re-resolve enrichment facts. Selected
+snapshots remain visible when stale, while their stored input fingerprint makes
+freshness explicit. Enrichment publication swaps one selection atomically, and
+background garbage collection removes superseded snapshots and the deprecated
+materialized baseline.
 
 This is the first executable slice, not the final performance target. Salsa state
 is process-local, compiler enrichment still uses its existing input identity, and

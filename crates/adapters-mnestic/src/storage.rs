@@ -1,10 +1,10 @@
 use super::schema::*;
 use super::store::{EnrichmentOwner, EnrichmentPayload};
 use beholder_domain::{
-    AnalysisDiagnostic, Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind,
-    EntityMetadata, FactChanges, FactShard, GraphqlOperationKind, GraphqlTypeKind,
-    GrpcBindingCandidate, GrpcBindingRole, Observation, ProtoTypeKind, Provenance, RepositoryFacts,
-    RpcCardinality, SemanticRelation, StructuralRelation, WorkspaceView,
+    Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata,
+    FactChanges, FactShard, GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate,
+    GrpcBindingRole, Observation, ProtoTypeKind, Provenance, RepositoryFacts, RpcCardinality,
+    SemanticRelation, StructuralRelation, WorkspaceView,
 };
 use beholder_dto::{GarbageCollectionPhase, GarbageCollectionProgress};
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
@@ -1191,112 +1191,6 @@ fn resolve_grpc_bindings(
     Ok(resolution)
 }
 
-fn baseline_fingerprint(
-    repositories: &[RepositoryFacts],
-    resolution: &GrpcResolution,
-    overrides: &[DependencyOverride],
-) -> String {
-    let mut hash = Sha256::new();
-    for facts in repositories {
-        hash_string(&mut hash, &facts.state.repository.identity);
-        for (id, (kind, metadata)) in normalized_entities(facts) {
-            for value in [&id, &kind, &metadata] {
-                hash_string(&mut hash, value);
-            }
-        }
-        for ((from, relation, to), (evidence, confidence, provenance)) in
-            normalized_observations(facts)
-        {
-            for value in [&from, &relation, &to, &evidence, &provenance] {
-                hash_string(&mut hash, value);
-            }
-            hash.update(confidence.to_le_bytes());
-        }
-        let diagnostics = facts
-            .diagnostics
-            .iter()
-            .map(|diagnostic| {
-                (
-                    (
-                        diagnostic.code.as_str(),
-                        diagnostic.severity.as_str(),
-                        diagnostic.path.to_string_lossy(),
-                        diagnostic.line.unwrap_or_default(),
-                    ),
-                    diagnostic.detail.as_deref().unwrap_or_default(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for ((code, severity, path, line), detail) in diagnostics {
-            for value in [code, severity, path.as_ref(), detail] {
-                hash_string(&mut hash, value);
-            }
-            hash.update(line.to_le_bytes());
-        }
-    }
-    for entity in resolution.entities.values() {
-        for value in [
-            entity.id.as_str(),
-            entity_kind(entity.kind),
-            entity_metadata(entity.metadata),
-        ] {
-            hash_string(&mut hash, value);
-        }
-    }
-    for observation in &resolution.observations {
-        for value in [
-            observation.from.as_str(),
-            observation.relation.as_str(),
-            observation.to.as_str(),
-            observation.evidence.as_str(),
-            observation.provenance.as_str(),
-        ] {
-            hash_string(&mut hash, value);
-        }
-        hash.update(observation.confidence.score().to_bits().to_le_bytes());
-    }
-    let overrides = overrides
-        .iter()
-        .map(|override_| {
-            (
-                (
-                    override_.from.as_str(),
-                    override_.relation.as_str(),
-                    override_.unresolved_to.as_str(),
-                ),
-                override_,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for ((from, relation, unresolved_to), override_) in overrides {
-        for value in [
-            from,
-            relation,
-            unresolved_to,
-            override_.resolved_to.as_str(),
-            override_.evidence.as_str(),
-            override_.provenance.as_str(),
-        ] {
-            hash_string(&mut hash, value);
-        }
-        hash.update(override_.confidence.score().to_bits().to_le_bytes());
-    }
-    for diagnostic in &resolution.diagnostics {
-        for value in [
-            diagnostic.candidate.local_symbol.as_str(),
-            diagnostic.candidate.role.as_str(),
-            diagnostic.candidate.service.as_str(),
-            diagnostic.candidate.method.as_str(),
-            diagnostic.candidate.evidence.as_str(),
-            diagnostic.code,
-            diagnostic.detail.as_str(),
-        ] {
-            hash_string(&mut hash, value);
-        }
-    }
-    format!("{:x}", hash.finalize())
-}
-
 fn store_grpc_resolution(
     transaction: &MultiTransaction,
     view: &str,
@@ -1418,7 +1312,6 @@ pub(super) fn publish_observations(
         observations = resolution.observations.len(),
         "Mnestic publication stage completed"
     );
-    let baseline_fingerprint = baseline_fingerprint(repositories, &resolution, overrides);
     let params = BTreeMap::from([
         ("view".into(), view.name.clone().into()),
         ("fingerprint".into(), view.fingerprint().into()),
@@ -1427,9 +1320,9 @@ pub(super) fn publish_observations(
     let started = Instant::now();
     let current = transaction.run_script(
         &format!(
-            "{DIRECT_RULES}\n\
+            "{BASE_DIRECT_RULES}\n\
              ?[from, relation, to, evidence] := \
-                 effective_observation[from, to, relation, evidence, _, _]"
+                 base_effective_observation[from, to, relation, evidence, _, _]"
         ),
         BTreeMap::from([("view".into(), view.name.clone().into())]),
     )?;
@@ -1594,6 +1487,7 @@ pub(super) fn publish_observations(
     }
     store_repository_states(&transaction, view, repositories, &analyzed_states)?;
     store_revision_inputs(&transaction, view)?;
+    carry_forward_enrichment_selections(&transaction, &view.name)?;
     store_analysis_metadata(&transaction, view, repositories)?;
     store_grpc_resolution(&transaction, &view.name, &resolution)?;
     for override_ in overrides {
@@ -1641,64 +1535,12 @@ pub(super) fn publish_observations(
         "Mnestic publication stage completed"
     );
     let started = Instant::now();
-    let baseline_changed = transaction
-        .run_script(
-            "?[fingerprint] := *analysis_baseline_fingerprint{view: $view, fingerprint}",
-            BTreeMap::from([("view".into(), view.name.clone().into())]),
-        )?
-        .rows
-        .first()
-        .and_then(|row| row[0].get_str())
-        != Some(baseline_fingerprint.as_str());
+    let obsolete = remove_obsolete_enrichment_selections(&transaction, &view.name)?;
     tracing::info!(
         target: "beholder::publication",
-        stage = "read_baseline_fingerprint",
+        stage = "remove_obsolete_enrichment_selections",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        baseline_changed,
-        "Mnestic publication stage completed"
-    );
-    if baseline_changed {
-        let started = Instant::now();
-        replace_baseline_snapshot(&transaction, &view.name)?;
-        tracing::info!(
-            target: "beholder::publication",
-            stage = "replace_baseline_snapshot",
-            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "Mnestic publication stage completed"
-        );
-        transaction.run_script(
-            "?[view, fingerprint] <- [[$view, $fingerprint]] \
-             :put analysis_baseline_fingerprint {view => fingerprint}",
-            BTreeMap::from([
-                ("view".into(), view.name.clone().into()),
-                ("fingerprint".into(), baseline_fingerprint.into()),
-            ]),
-        )?;
-    }
-    let started = Instant::now();
-    carry_forward_enrichments(&transaction, &view.name)?;
-    tracing::info!(
-        target: "beholder::publication",
-        stage = "carry_forward_enrichments",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        "Mnestic publication stage completed"
-    );
-    let started = Instant::now();
-    let obsolete = obsolete_enrichment_owners(&transaction, &view.name)?;
-    tracing::info!(
-        target: "beholder::publication",
-        stage = "find_obsolete_enrichments",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        obsolete_owners = obsolete.len(),
-        "Mnestic publication stage completed"
-    );
-    let started = Instant::now();
-    remove_enrichment_state(&transaction, &view.name, &obsolete)?;
-    tracing::info!(
-        target: "beholder::publication",
-        stage = "remove_obsolete_enrichments",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        obsolete_owners = obsolete.len(),
+        obsolete_selections = obsolete,
         "Mnestic publication stage completed"
     );
     let started = Instant::now();
@@ -1716,124 +1558,6 @@ pub(super) fn publish_observations(
         "Mnestic publication completed"
     );
     Ok(changes)
-}
-
-fn replace_baseline_snapshot(
-    transaction: &MultiTransaction,
-    view: &str,
-) -> Result<(), Box<dyn Error>> {
-    let params = BTreeMap::from([("view".into(), view.into())]);
-    for (relation, script) in [
-        (
-            "entities",
-            "?[view, id] := *analysis_baseline_entity{view: $view, id}, view = $view \
-         :rm analysis_baseline_entity {view, id}",
-        ),
-        (
-            "observations",
-            "?[view, from, relation, to, evidence] := *analysis_baseline_observation{\
-             view: $view, from, relation, to, evidence\
-         }, view = $view \
-         :rm analysis_baseline_observation {view, from, relation, to, evidence}",
-        ),
-        (
-            "overrides",
-            "?[view, from, relation, unresolved_to] := *analysis_baseline_dependency_override{\
-             view: $view, from, relation, unresolved_to\
-         }, view = $view \
-         :rm analysis_baseline_dependency_override {view, from, relation, unresolved_to}",
-        ),
-        (
-            "diagnostics",
-            "?[view, repository, code, severity, path, line] := *analysis_baseline_diagnostic{\
-             view: $view, repository, code, severity, path, line\
-         }, view = $view \
-         :rm analysis_baseline_diagnostic {view, repository, code, severity, path, line}",
-        ),
-    ] {
-        let started = Instant::now();
-        transaction.run_script(script, params.clone())?;
-        tracing::info!(
-            target: "beholder::publication",
-            stage = "replace_baseline.delete",
-            relation,
-            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "Mnestic publication stage completed"
-        );
-    }
-    for (relation, script) in [
-        (
-            "state_entities",
-            "?[view, id, kind, metadata, revision_owned] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_state{view, revision, state}, \
-             *state_entity{state, id, kind, metadata}, revision_owned = false \
-         :put analysis_baseline_entity {view, id => kind, metadata, revision_owned}",
-        ),
-        (
-            "state_observations",
-            "?[view, from, relation, to, evidence, confidence, provenance, revision_owned] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_state{view, revision, state}, \
-             *state_observation{state, from, relation, to, evidence}, \
-             *state_observation_metadata{state, from, relation, to, confidence, provenance}, \
-             revision_owned = false \
-         :put analysis_baseline_observation {\
-             view, from, relation, to, evidence => confidence, provenance, revision_owned\
-         }",
-        ),
-        (
-            "revision_entities",
-            "?[view, id, kind, metadata, revision_owned] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_entity{view, revision, id, kind, metadata}, \
-             revision_owned = true \
-         :put analysis_baseline_entity {view, id => kind, metadata, revision_owned}",
-        ),
-        (
-            "revision_observations",
-            "?[view, from, relation, to, evidence, confidence, provenance, revision_owned] := \
-             *analysis_revision{view: $view, revision}, *analysis_revision_observation{\
-                 view, revision, from, relation, to, evidence, confidence, provenance\
-             }, revision_owned = true \
-         :put analysis_baseline_observation {\
-             view, from, relation, to, evidence => confidence, provenance, revision_owned\
-         }",
-        ),
-        (
-            "overrides",
-            "?[view, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
-             *analysis_revision{view: $view, revision}, *analysis_revision_dependency_override{\
-                 view, revision, from, relation, unresolved_to, resolved_to, evidence\
-             }, *analysis_revision_dependency_override_metadata{\
-                 view, revision, from, relation, unresolved_to, confidence, provenance\
-             } \
-         :put analysis_baseline_dependency_override {\
-             view, from, relation, unresolved_to => resolved_to, evidence, confidence, provenance\
-         }",
-        ),
-        (
-            "diagnostics",
-            "?[view, repository, code, severity, path, line, detail] := \
-             *analysis_revision{view: $view, revision}, *analysis_revision_diagnostic{\
-                 view, revision, repository, code, severity, path, line, detail\
-             } \
-         :put analysis_baseline_diagnostic {\
-             view, repository, code, severity, path, line => detail\
-         }",
-        ),
-    ] {
-        let started = Instant::now();
-        transaction.run_script(script, params.clone())?;
-        tracing::info!(
-            target: "beholder::publication",
-            stage = "replace_baseline.populate",
-            relation,
-            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "Mnestic publication stage completed"
-        );
-    }
-    Ok(())
 }
 
 fn store_revision_inputs(
@@ -1999,53 +1723,220 @@ pub(super) fn repository_contexts(
         .collect())
 }
 
-fn carry_forward_enrichments(
+fn carry_forward_enrichment_selections(
     transaction: &MultiTransaction,
     view: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let revision = transaction
-        .run_script(
-            "?[revision] := *analysis_revision{view: $view, revision}",
-            BTreeMap::from([("view".into(), view.into())]),
-        )?
-        .rows
-        .first()
-        .and_then(|row| row[0].get_int())
-        .ok_or("published analysis revision is missing")?;
-    materialize_enrichment_contributions(transaction, view, revision)
-}
-
-fn obsolete_enrichment_owners(
-    transaction: &MultiTransaction,
-    view: &str,
-) -> Result<Vec<String>, Box<dyn Error>> {
-    let rows = transaction.run_script(
-        "current[repository, analyzer] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_enrichment_input{view, revision, repository, analyzer}\n\
-         obsolete[owner] := *enrichment_output{\
-             view: $view, owner, repository, analyzer\
-         }, not current[repository, analyzer]\n\
-         ?[owner] := obsolete[owner]",
+    transaction.run_script(
+        "?[view, revision, owner, repository, analyzer, version, input_fingerprint] := \
+             *analysis_revision{view: $view, revision}, previous = revision - 1, \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: previous, owner, repository, analyzer, version, \
+                 input_fingerprint\
+             }, view = $view \
+         :put analysis_revision_repository_enrichment {\
+             view, revision, owner => repository, analyzer, version, input_fingerprint\
+         }",
         BTreeMap::from([("view".into(), view.into())]),
     )?;
-    rows.rows
-        .into_iter()
-        .map(|row| {
-            row[0]
-                .get_str()
-                .map(str::to_owned)
-                .ok_or_else(|| "enrichment owner is not a string".into())
-        })
-        .collect()
+    Ok(())
+}
+
+fn remove_obsolete_enrichment_selections(
+    transaction: &MultiTransaction,
+    view: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let params = BTreeMap::from([("view".into(), view.into())]);
+    let obsolete = transaction.run_script(
+        "?[view, revision, owner] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision, owner, repository, analyzer\
+             }, not *analysis_revision_enrichment_input{\
+                 view: $view, revision, repository, analyzer\
+             }, view = $view",
+        params.clone(),
+    )?;
+    let owners = obsolete
+        .rows
+        .iter()
+        .filter_map(|row| row[2].get_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let count = owners.len();
+    if count != 0 {
+        transaction.run_script(
+            "?[view, revision, owner] := *analysis_revision{view: $view, revision}, \
+                 *analysis_revision_repository_enrichment{\
+                     view: $view, revision, owner, repository, analyzer\
+                 }, not *analysis_revision_enrichment_input{\
+                     view: $view, revision, repository, analyzer\
+                 }, view = $view \
+             :rm analysis_revision_repository_enrichment {view, revision, owner}",
+            params,
+        )?;
+        let revision = transaction
+            .run_script(
+                "?[revision] := *analysis_revision{view: $view, revision}",
+                BTreeMap::from([("view".into(), view.into())]),
+            )?
+            .rows
+            .first()
+            .and_then(|row| row[0].get_int())
+            .ok_or("published analysis revision is missing")?;
+        refresh_enrichment_fact_selections(transaction, view, revision, &owners)?;
+    }
+    Ok(count)
+}
+
+fn refresh_enrichment_fact_selections(
+    transaction: &MultiTransaction,
+    view: &str,
+    revision: i64,
+    changed_owners: &BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    if changed_owners.is_empty() {
+        return Ok(());
+    }
+    let params = BTreeMap::from([
+        ("view".into(), view.into()),
+        ("revision".into(), revision.into()),
+        (
+            "owners".into(),
+            DataValue::List(
+                changed_owners
+                    .iter()
+                    .map(|owner| DataValue::List(vec![owner.as_str().into()]))
+                    .collect(),
+            ),
+        ),
+    ]);
+    for script in [
+        "changed[owner] <- $owners\n\
+         affected[id] := changed[owner], \
+             *enrichment_entity_contribution{view: $view, owner, id}\n\
+         ?[view, id] := affected[id], view = $view \
+         :rm analysis_enrichment_entity_selection {view, id}",
+        "changed[owner] <- $owners\n\
+         affected[id] := changed[owner], \
+             *enrichment_entity_contribution{view: $view, owner, id}\n\
+         candidate[id, cost, owner] := affected[id], \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_entity_contribution{view: $view, owner, id}, \
+             cost = [analyzer, repository]\n\
+         winner[id, smallest_by(owner_pair)] := candidate[id, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, id, owner] := winner[id, owner], view = $view \
+         :put analysis_enrichment_entity_selection {view, id => owner}",
+        "changed[owner] <- $owners\n\
+         affected[from, relation, to, evidence] := changed[owner], \
+             *enrichment_observation_contribution{\
+                 view: $view, owner, from, relation, to, evidence\
+             }\n\
+         ?[view, from, relation, to, evidence] := \
+             affected[from, relation, to, evidence], view = $view \
+         :rm analysis_enrichment_observation_selection {\
+             view, from, relation, to, evidence\
+         }",
+        "changed[owner] <- $owners\n\
+         affected[from, relation, to, evidence] := changed[owner], \
+             *enrichment_observation_contribution{\
+                 view: $view, owner, from, relation, to, evidence\
+             }\n\
+         candidate[from, relation, to, evidence, cost, owner] := \
+             affected[from, relation, to, evidence], \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_observation_contribution{\
+                 view: $view, owner, from, relation, to, evidence, confidence\
+             }, cost = [-confidence, analyzer, repository]\n\
+         winner[from, relation, to, evidence, smallest_by(owner_pair)] := \
+             candidate[from, relation, to, evidence, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, from, relation, to, evidence, owner] := \
+             winner[from, relation, to, evidence, owner], view = $view \
+         :put analysis_enrichment_observation_selection {\
+             view, from, relation, to, evidence => owner\
+         }",
+        "changed[owner] <- $owners\n\
+         affected[from, relation, unresolved_to] := changed[owner], \
+             *enrichment_override_contribution{\
+                 view: $view, owner, from, relation, unresolved_to\
+             }\n\
+         ?[view, from, relation, unresolved_to] := \
+             affected[from, relation, unresolved_to], view = $view \
+         :rm analysis_enrichment_override_selection {\
+             view, from, relation, unresolved_to\
+         }",
+        "changed[owner] <- $owners\n\
+         affected[from, relation, unresolved_to] := changed[owner], \
+             *enrichment_override_contribution{\
+                 view: $view, owner, from, relation, unresolved_to\
+             }\n\
+         candidate[from, relation, unresolved_to, cost, owner] := \
+             affected[from, relation, unresolved_to], \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_override_contribution{\
+                 view: $view, owner, from, relation, unresolved_to, confidence\
+             }, cost = [-confidence, analyzer, repository]\n\
+         winner[from, relation, unresolved_to, smallest_by(owner_pair)] := \
+             candidate[from, relation, unresolved_to, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, from, relation, unresolved_to, owner] := \
+             winner[from, relation, unresolved_to, owner], view = $view \
+         :put analysis_enrichment_override_selection {\
+             view, from, relation, unresolved_to => owner\
+         }",
+        "changed[owner] <- $owners\n\
+         affected[repository, code, severity, path, line] := changed[owner], \
+             *enrichment_diagnostic_contribution{\
+                 view: $view, owner, repository, code, severity, path, line\
+             }\n\
+         ?[view, repository, code, severity, path, line] := \
+             affected[repository, code, severity, path, line], view = $view \
+         :rm analysis_enrichment_diagnostic_selection {\
+             view, repository, code, severity, path, line\
+         }",
+        "changed[owner] <- $owners\n\
+         affected[repository, code, severity, path, line] := changed[owner], \
+             *enrichment_diagnostic_contribution{\
+                 view: $view, owner, repository, code, severity, path, line\
+             }\n\
+         candidate[repository, code, severity, path, line, cost, owner] := \
+             affected[repository, code, severity, path, line], \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_diagnostic_contribution{\
+                 view: $view, owner, repository, code, severity, path, line\
+             }, cost = [analyzer, repository]\n\
+         winner[repository, code, severity, path, line, smallest_by(owner_pair)] := \
+             candidate[repository, code, severity, path, line, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, repository, code, severity, path, line, owner] := \
+             winner[repository, code, severity, path, line, owner], view = $view \
+         :put analysis_enrichment_diagnostic_selection {\
+             view, repository, code, severity, path, line => owner\
+         }",
+    ] {
+        transaction.run_script(script, params.clone())?;
+    }
+    Ok(())
 }
 
 fn reconcile_obsolete_enrichments(
     transaction: &MultiTransaction,
     view: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let obsolete = obsolete_enrichment_owners(transaction, view)?;
-    if obsolete.is_empty() {
+    let obsolete = transaction.run_script(
+        "?[owner] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision, owner, repository, analyzer\
+             }, not *analysis_revision_enrichment_input{\
+                 view: $view, revision, repository, analyzer\
+             } :limit 1",
+        BTreeMap::from([("view".into(), view.into())]),
+    )?;
+    if obsolete.rows.is_empty() {
         return Ok(());
     }
     let previous = transaction
@@ -2059,264 +1950,15 @@ fn reconcile_obsolete_enrichments(
         .ok_or("published analysis revision is missing")?;
     let revision = previous + 1;
     copy_revision(transaction, view, previous, revision)?;
-    for owner in &obsolete {
-        remove_owner_contribution_keys(transaction, view, owner, revision)?;
-    }
-    remove_enrichment_state(transaction, view, &obsolete)?;
-    materialize_enrichment_contributions(transaction, view, revision)?;
-    if effective_revision_changed(transaction, view, previous, revision)? {
-        transaction.run_script(
-            "?[view, revision] <- [[$view, $revision]] \
-             :put analysis_revision {view => revision}",
-            BTreeMap::from([
-                ("view".into(), view.into()),
-                ("revision".into(), revision.into()),
-            ]),
-        )?;
-    } else {
-        remove_revision_candidate(transaction, view, revision)?;
-    }
-    Ok(())
-}
-
-fn remove_enrichment_state(
-    transaction: &MultiTransaction,
-    view: &str,
-    owners: &[String],
-) -> Result<(), Box<dyn Error>> {
-    if owners.is_empty() {
-        return Ok(());
-    }
-    let params = BTreeMap::from([
-        ("view".into(), view.into()),
-        (
-            "owners".into(),
-            DataValue::List(
-                owners
-                    .iter()
-                    .map(|owner| DataValue::List(vec![owner.as_str().into()]))
-                    .collect(),
-            ),
-        ),
-    ]);
-    for (relation, keys) in [
-        ("enrichment_entity_contribution", "view, owner, id"),
-        (
-            "enrichment_observation_contribution",
-            "view, owner, from, relation, to, evidence",
-        ),
-        (
-            "enrichment_override_contribution",
-            "view, owner, from, relation, unresolved_to",
-        ),
-        (
-            "enrichment_diagnostic_contribution",
-            "view, owner, repository, code, severity, path, line",
-        ),
-        ("enrichment_output", "view, owner"),
-    ] {
-        transaction.run_script(
-            &format!(
-                "obsolete[owner] <- $owners\n\
-                 ?[{keys}] := obsolete[owner], *{relation}{{{keys}}}, view = $view \
-                 :rm {relation} {{{keys}}}"
-            ),
-            params.clone(),
-        )?;
-    }
-    Ok(())
-}
-
-fn valid_enrichment_owner_rule() -> &'static str {
-    "valid_owner[owner] := \
-         *enrichment_output{\
-             view: $view, owner, repository, analyzer, input_fingerprint\
-         }, \
-         *analysis_revision_enrichment_input{\
-             view: $view, revision: $revision, repository, analyzer, \
-             fingerprint: input_fingerprint\
-         }\n"
-}
-
-fn materialize_enrichment_contributions(
-    transaction: &MultiTransaction,
-    view: &str,
-    revision: i64,
-) -> Result<(), Box<dyn Error>> {
-    // Baseline facts always win collisions. Analyzer conflicts are deterministic: observations
-    // and overrides prefer higher confidence, then the lexicographically smallest owner; entities
-    // and diagnostics use the owner tie-break directly. Existing rows are left untouched so an
-    // enrichment publication only rematerializes keys removed from its candidate revision.
-    let valid_owner = valid_enrichment_owner_rule();
-    let scripts = [
-        (
-            "entities",
-            format!(
-                "{valid_owner}\
-             state_baseline[id] := *analysis_baseline_entity{{\
-                 view: $view, id, revision_owned: false\
-             }}\n\
-             state_baseline[id] := *analysis_fact_shard_selection{{\
-                 view: $view, producer, owner, version\
-             }}, *analysis_fact_shard_entity{{producer, owner, version, id}}\n\
-             candidate[id, cost, kind, metadata] := *analysis_baseline_entity{{\
-                 view: $view, id, kind, metadata, revision_owned: true\
-             }}, cost = [0, '']\n\
-             candidate[id, cost, kind, metadata] := valid_owner[owner], \
-                 *enrichment_entity_contribution{{view: $view, owner, id, kind, metadata}}, \
-                 cost = [1, owner]\n\
-             winner[id, smallest_by(kind_pair), smallest_by(metadata_pair)] := \
-                 candidate[id, cost, kind, metadata], kind_pair = [kind, cost], \
-                 metadata_pair = [metadata, cost]\n\
-             ?[view, revision, id, kind, metadata] := winner[id, kind, metadata], \
-                 not state_baseline[id], \
-                 not *analysis_revision_entity{{view: $view, revision: $revision, id}}, \
-                 view = $view, revision = $revision \
-             :put analysis_revision_entity {{view, revision, id => kind, metadata}}"
-            ),
-        ),
-        (
-            "observations",
-            format!(
-                "{valid_owner}\
-             state_baseline[from, relation, to, evidence] := *analysis_baseline_observation{{\
-                 view: $view, from, relation, to, evidence, revision_owned: false\
-             }}\n\
-             state_baseline[from, relation, to, evidence] := \
-                 *analysis_fact_shard_selection{{view: $view, producer, owner, version}}, \
-                 *analysis_fact_shard_observation{{\
-                     producer, owner, version, from, relation, to, evidence\
-                 }}\n\
-             candidate[from, relation, to, evidence, cost, confidence, provenance] := \
-                 *analysis_baseline_observation{{\
-                     view: $view, from, relation, to, evidence, confidence, provenance, \
-                     revision_owned: true\
-                 }}, cost = [0, 0.0, '']\n\
-             candidate[from, relation, to, evidence, cost, confidence, provenance] := \
-                 valid_owner[owner], *enrichment_observation_contribution{{\
-                     view: $view, owner, from, relation, to, evidence, confidence, provenance\
-                 }}, cost = [1, -confidence, owner]\n\
-             winner[from, relation, to, evidence, smallest_by(confidence_pair), \
-                     smallest_by(provenance_pair)] := \
-                 candidate[from, relation, to, evidence, cost, confidence, provenance], \
-                 confidence_pair = [confidence, cost], \
-                 provenance_pair = [provenance, cost]\n\
-             ?[view, revision, from, relation, to, evidence, confidence, provenance] := \
-                 winner[from, relation, to, evidence, confidence, provenance], \
-                 not state_baseline[from, relation, to, evidence], \
-                 not *analysis_revision_observation{{\
-                     view: $view, revision: $revision, from, relation, to, evidence\
-                 }}, \
-                 view = $view, revision = $revision \
-             :put analysis_revision_observation {{\
-                 view, revision, from, relation, to, evidence => confidence, provenance\
-             }}"
-            ),
-        ),
-        (
-            "overrides",
-            format!(
-                "{valid_owner}\
-             candidate[from, relation, unresolved_to, cost, resolved_to, evidence, confidence, provenance] := \
-                 *analysis_baseline_dependency_override{{\
-                     view: $view, from, relation, unresolved_to, resolved_to, evidence, \
-                     confidence, provenance\
-                 }}, cost = [0, 0.0, '']\n\
-             candidate[from, relation, unresolved_to, cost, resolved_to, evidence, confidence, provenance] := \
-                 valid_owner[owner], *enrichment_override_contribution{{\
-                     view: $view, owner, from, relation, unresolved_to, resolved_to, evidence, \
-                     confidence, provenance\
-                 }}, cost = [1, -confidence, owner]\n\
-             winner[from, relation, unresolved_to, smallest_by(resolved_pair), \
-                     smallest_by(evidence_pair)] := \
-                 candidate[from, relation, unresolved_to, cost, resolved_to, evidence, \
-                     _, _], \
-                 resolved_pair = [resolved_to, cost], evidence_pair = [evidence, cost]\n\
-             ?[view, revision, from, relation, unresolved_to, resolved_to, evidence] := \
-                 winner[from, relation, unresolved_to, resolved_to, evidence], \
-                 not *analysis_revision_dependency_override{{\
-                     view: $view, revision: $revision, from, relation, unresolved_to\
-                 }}, \
-                 view = $view, revision = $revision \
-             :put analysis_revision_dependency_override {{\
-                 view, revision, from, relation, unresolved_to => resolved_to, evidence\
-             }}"
-            ),
-        ),
-        (
-            "override_metadata",
-            format!(
-                "{valid_owner}\
-             candidate[from, relation, unresolved_to, cost, confidence, provenance] := \
-                 *analysis_baseline_dependency_override{{\
-                     view: $view, from, relation, unresolved_to, confidence, provenance\
-                 }}, cost = [0, 0.0, '']\n\
-             candidate[from, relation, unresolved_to, cost, confidence, provenance] := \
-                 valid_owner[owner], *enrichment_override_contribution{{\
-                     view: $view, owner, from, relation, unresolved_to, confidence, provenance\
-                 }}, cost = [1, -confidence, owner]\n\
-             winner[from, relation, unresolved_to, smallest_by(confidence_pair), \
-                     smallest_by(provenance_pair)] := \
-                 candidate[from, relation, unresolved_to, cost, confidence, provenance], \
-                 confidence_pair = [confidence, cost], \
-                 provenance_pair = [provenance, cost]\n\
-             ?[view, revision, from, relation, unresolved_to, confidence, provenance] := \
-                 winner[from, relation, unresolved_to, confidence, provenance], \
-                 not *analysis_revision_dependency_override_metadata{{\
-                     view: $view, revision: $revision, from, relation, unresolved_to\
-                 }}, \
-                 view = $view, revision = $revision \
-             :put analysis_revision_dependency_override_metadata {{\
-                 view, revision, from, relation, unresolved_to => confidence, provenance\
-             }}"
-            ),
-        ),
-        (
-            "diagnostics",
-            format!(
-                "{valid_owner}\
-             candidate[repository, code, severity, path, line, cost, detail] := \
-                 *analysis_baseline_diagnostic{{\
-                     view: $view, repository, code, severity, path, line, detail\
-                 }}, cost = [0, '']\n\
-             candidate[repository, code, severity, path, line, cost, detail] := \
-                 valid_owner[owner], *enrichment_diagnostic_contribution{{\
-                     view: $view, owner, repository, code, severity, path, line, detail\
-                 }}, cost = [1, owner]\n\
-             winner[repository, code, severity, path, line, smallest_by(detail_pair)] := \
-                 candidate[repository, code, severity, path, line, cost, detail], \
-                 detail_pair = [detail, cost]\n\
-             ?[view, revision, repository, code, severity, path, line, detail] := \
-                 winner[repository, code, severity, path, line, detail], \
-                 not *analysis_revision_diagnostic{{\
-                     view: $view, revision: $revision, repository, code, severity, path, line\
-                 }}, \
-                 view = $view, revision = $revision \
-             :put analysis_revision_diagnostic {{\
-                 view, revision, repository, code, severity, path, line => detail\
-             }}"
-            ),
-        ),
-    ];
-    let params = BTreeMap::from([
-        ("view".into(), view.into()),
-        ("revision".into(), revision.into()),
-    ]);
-    for (relation, script) in scripts {
-        let started = Instant::now();
-        transaction
-            .run_script(&script, params.clone())
-            .map_err(|error| {
-                format!("failed to materialize enrichment relation {relation}: {error}")
-            })?;
-        tracing::info!(
-            target: "beholder::publication",
-            stage = "materialize_enrichment_contributions",
-            relation,
-            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "Mnestic publication stage completed"
-        );
-    }
+    transaction.run_script(
+        "?[view, revision] <- [[$view, $revision]] \
+         :put analysis_revision {view => revision}",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("revision".into(), revision.into()),
+        ]),
+    )?;
+    remove_obsolete_enrichment_selections(transaction, view)?;
     Ok(())
 }
 
@@ -2327,19 +1969,17 @@ pub(super) fn enrichment_matches(
     analyzer: &str,
     version: &str,
 ) -> Result<bool, Box<dyn Error>> {
-    let owner = enrichment_owner_key(analyzer, repository);
     let rows = db.run_script(
         "?[version] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_enrichment_input{\
                  view: $view, revision, repository: $repository, analyzer: $analyzer, fingerprint\
              }, \
-             *enrichment_output{\
-                 view: $view, owner: $owner, repository: $repository, analyzer: $analyzer, \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision, repository: $repository, analyzer: $analyzer, \
                  version, input_fingerprint: fingerprint\
              }",
         BTreeMap::from([
             ("view".into(), view.into()),
-            ("owner".into(), owner.into()),
             ("repository".into(), repository.into()),
             ("analyzer".into(), analyzer.into()),
         ]),
@@ -2363,8 +2003,8 @@ pub(super) fn enrichments_current(
                  *analysis_revision_enrichment_input{\
                      view: $view, revision, repository, analyzer: $analyzer, fingerprint\
                  }, \
-                 *enrichment_output{\
-                     view: $view, repository, analyzer: $analyzer, version: $version, \
+                 *analysis_revision_repository_enrichment{\
+                     view: $view, revision, repository, analyzer: $analyzer, version: $version, \
                      input_fingerprint: fingerprint\
                  }\n\
              ?[repository] := \
@@ -2385,6 +2025,68 @@ pub(super) fn enrichments_current(
     Ok(true)
 }
 
+fn enrichment_snapshot_id(
+    repository: &str,
+    input_fingerprint: &str,
+    owner: &EnrichmentOwner<'_>,
+    payload: &EnrichmentPayload<'_>,
+) -> String {
+    let mut rows = BTreeSet::new();
+    rows.extend(payload.entities.iter().map(|entity| {
+        vec![
+            "entity".to_owned(),
+            entity.id.as_str().to_owned(),
+            entity_kind(entity.kind).to_owned(),
+            entity_metadata(entity.metadata).to_owned(),
+        ]
+    }));
+    rows.extend(payload.observations.iter().map(|observation| {
+        vec![
+            "observation".to_owned(),
+            observation.from.as_str().to_owned(),
+            observation.relation.as_str().to_owned(),
+            observation.to.as_str().to_owned(),
+            observation.evidence.as_str().to_owned(),
+            observation.confidence.score().to_bits().to_string(),
+            observation.provenance.as_str().to_owned(),
+        ]
+    }));
+    rows.extend(payload.overrides.iter().map(|override_| {
+        vec![
+            "override".to_owned(),
+            override_.from.as_str().to_owned(),
+            override_.relation.as_str().to_owned(),
+            override_.unresolved_to.as_str().to_owned(),
+            override_.resolved_to.as_str().to_owned(),
+            override_.evidence.as_str().to_owned(),
+            override_.confidence.score().to_bits().to_string(),
+            override_.provenance.as_str().to_owned(),
+        ]
+    }));
+    rows.extend(payload.diagnostics.iter().map(|(repository, diagnostic)| {
+        vec![
+            "diagnostic".to_owned(),
+            repository.clone(),
+            diagnostic.code.clone(),
+            diagnostic.severity.as_str().to_owned(),
+            diagnostic.path.to_string_lossy().into_owned(),
+            diagnostic.line.unwrap_or_default().to_string(),
+            diagnostic.detail.clone().unwrap_or_default(),
+        ]
+    }));
+    let logical_owner = enrichment_owner_key(owner.analyzer, repository);
+    let mut hash = Sha256::new();
+    for value in [&logical_owner, owner.version, input_fingerprint] {
+        hash_string(&mut hash, value);
+    }
+    for row in rows {
+        for value in row {
+            hash_string(&mut hash, &value);
+        }
+    }
+    format!("{logical_owner}@{:x}", hash.finalize())
+}
+
 pub(super) fn publish_enrichment(
     db: &DbInstance,
     view: &str,
@@ -2393,6 +2095,16 @@ pub(super) fn publish_enrichment(
     owner: EnrichmentOwner<'_>,
     payload: EnrichmentPayload<'_>,
 ) -> Result<bool, Box<dyn Error>> {
+    let publication_started = Instant::now();
+    if payload
+        .diagnostics
+        .iter()
+        .any(|(diagnostic_repository, _)| diagnostic_repository != repository)
+    {
+        return Err("enrichment diagnostic belongs to a different target repository".into());
+    }
+
+    let snapshot = enrichment_snapshot_id(repository, input_fingerprint, &owner, &payload);
     let EnrichmentOwner { analyzer, version } = owner;
     let EnrichmentPayload {
         entities,
@@ -2400,14 +2112,7 @@ pub(super) fn publish_enrichment(
         overrides,
         diagnostics,
     } = payload;
-    if diagnostics
-        .iter()
-        .any(|(diagnostic_repository, _)| diagnostic_repository != repository)
-    {
-        return Err("enrichment diagnostic belongs to a different target repository".into());
-    }
-
-    let owner = enrichment_owner_key(analyzer, repository);
+    let owner = snapshot;
     let transaction = db.multi_transaction(true);
     let current = transaction.run_script(
         "?[revision, fingerprint] := *analysis_revision{view: $view, revision}, \
@@ -2430,53 +2135,46 @@ pub(super) fn publish_enrichment(
     }
     let output_is_current = !transaction
         .run_script(
+            "?[owner] := *analysis_revision{view: $view, revision}, \
+                 *analysis_revision_repository_enrichment{\
+                     view: $view, revision, owner: $owner, repository: $repository, \
+                     analyzer: $analyzer, version: $version, \
+                     input_fingerprint: $input_fingerprint\
+                 }, owner = $owner",
+            BTreeMap::from([
+                ("view".into(), view.into()),
+                ("owner".into(), owner.as_str().into()),
+                ("repository".into(), repository.into()),
+                ("analyzer".into(), analyzer.into()),
+                ("version".into(), version.into()),
+                ("input_fingerprint".into(), input_fingerprint.into()),
+            ]),
+        )?
+        .rows
+        .is_empty();
+    if output_is_current {
+        transaction.abort()?;
+        return Ok(true);
+    }
+    let snapshot_exists = !transaction
+        .run_script(
             "?[owner] := *enrichment_output{\
                  view: $view, owner: $owner, repository: $repository, analyzer: $analyzer, \
-                 input_fingerprint: $input_fingerprint\
+                 version: $version, input_fingerprint: $input_fingerprint\
              }, owner = $owner",
             BTreeMap::from([
                 ("view".into(), view.into()),
                 ("owner".into(), owner.as_str().into()),
                 ("repository".into(), repository.into()),
                 ("analyzer".into(), analyzer.into()),
+                ("version".into(), version.into()),
                 ("input_fingerprint".into(), input_fingerprint.into()),
             ]),
         )?
         .rows
         .is_empty();
-    if output_is_current
-        && owner_contributions_match(
-            &transaction,
-            view,
-            &owner,
-            entities,
-            observations,
-            overrides,
-            diagnostics,
-        )?
-    {
-        complete_enrichment(
-            &transaction,
-            view,
-            &owner,
-            repository,
-            analyzer,
-            version,
-            input_fingerprint,
-        )?;
-        transaction.commit()?;
-        return Ok(true);
-    }
-    if owner_contributions_are_empty(&transaction, view, &owner)?
-        && incoming_contributions_are_effective(
-            &transaction,
-            view,
-            entities,
-            observations,
-            overrides,
-            diagnostics,
-        )?
-    {
+    if !snapshot_exists {
+        let started = Instant::now();
         replace_enrichment_contributions(
             &transaction,
             view,
@@ -2495,51 +2193,107 @@ pub(super) fn publish_enrichment(
             version,
             input_fingerprint,
         )?;
-        transaction.commit()?;
-        return Ok(true);
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "enrichment_store_snapshot",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            entities = entities.len(),
+            observations = observations.len(),
+            overrides = overrides.len(),
+            diagnostics = diagnostics.len(),
+            "Mnestic enrichment publication stage completed"
+        );
     }
 
+    let started = Instant::now();
     let previous = row[0]
         .get_int()
         .ok_or("published analysis revision is invalid")?;
     let revision = previous + 1;
     copy_revision(&transaction, view, previous, revision)?;
-    remove_owner_contribution_keys(&transaction, view, &owner, revision)?;
-    replace_enrichment_contributions(
-        &transaction,
-        view,
-        &owner,
-        entities,
-        observations,
-        overrides,
-        diagnostics,
-    )?;
-    remove_owner_contribution_keys(&transaction, view, &owner, revision)?;
-    complete_enrichment(
-        &transaction,
-        view,
-        &owner,
-        repository,
-        analyzer,
-        version,
-        input_fingerprint,
-    )?;
-    materialize_enrichment_contributions(&transaction, view, revision)?;
-
-    let changed = effective_revision_changed(&transaction, view, previous, revision)?;
-    if changed {
-        transaction.run_script(
-            "?[view, revision] <- [[$view, $revision]] \
-             :put analysis_revision {view => revision}",
+    let mut changed_owners = transaction
+        .run_script(
+            "?[owner] := *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository: $repository, \
+                 analyzer: $analyzer\
+             }",
             BTreeMap::from([
                 ("view".into(), view.into()),
                 ("revision".into(), revision.into()),
+                ("repository".into(), repository.into()),
+                ("analyzer".into(), analyzer.into()),
             ]),
-        )?;
-    } else {
-        remove_revision_candidate(&transaction, view, revision)?;
-    }
+        )?
+        .rows
+        .into_iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    changed_owners.insert(owner.clone());
+    let params = BTreeMap::from([
+        ("view".into(), view.into()),
+        ("revision".into(), revision.into()),
+        ("owner".into(), owner.as_str().into()),
+        ("repository".into(), repository.into()),
+        ("analyzer".into(), analyzer.into()),
+        ("version".into(), version.into()),
+        ("input_fingerprint".into(), input_fingerprint.into()),
+    ]);
+    transaction.run_script(
+        "?[view, revision, owner] := *analysis_revision_repository_enrichment{\
+             view: $view, revision: $revision, owner, repository: $repository, \
+             analyzer: $analyzer\
+         }, view = $view, revision = $revision \
+         :rm analysis_revision_repository_enrichment {view, revision, owner}",
+        params.clone(),
+    )?;
+    transaction.run_script(
+        "?[view, revision, owner, repository, analyzer, version, input_fingerprint] <- \
+             [[$view, $revision, $owner, $repository, $analyzer, $version, \
+               $input_fingerprint]] \
+         :put analysis_revision_repository_enrichment {\
+             view, revision, owner => repository, analyzer, version, input_fingerprint\
+         }",
+        params.clone(),
+    )?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "enrichment_copy_revision_manifest",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        changed_owners = changed_owners.len(),
+        "Mnestic enrichment publication stage completed"
+    );
+    let started = Instant::now();
+    refresh_enrichment_fact_selections(&transaction, view, revision, &changed_owners)?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "enrichment_refresh_fact_selections",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        changed_owners = changed_owners.len(),
+        "Mnestic enrichment publication stage completed"
+    );
+    transaction.run_script(
+        "?[view, revision] <- [[$view, $revision]] \
+         :put analysis_revision {view => revision}",
+        params,
+    )?;
+    let started = Instant::now();
     transaction.commit()?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "enrichment_transaction_commit",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "Mnestic enrichment publication stage completed"
+    );
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "enrichment_total",
+        elapsed_ms = publication_started.elapsed().as_secs_f64() * 1000.0,
+        repository,
+        analyzer,
+        revision,
+        snapshot_exists,
+        "Mnestic enrichment publication completed"
+    );
     Ok(true)
 }
 
@@ -2569,343 +2323,6 @@ fn complete_enrichment(
         params,
     )?;
     Ok(())
-}
-
-fn owner_contributions_match(
-    transaction: &MultiTransaction,
-    view: &str,
-    owner: &str,
-    entities: &[EntityFact],
-    observations: &[Observation],
-    overrides: &[DependencyOverride],
-    diagnostics: &[(String, AnalysisDiagnostic)],
-) -> Result<bool, Box<dyn Error>> {
-    let entity_rows = entities
-        .iter()
-        .map(|entity| {
-            DataValue::List(vec![
-                entity.id.as_str().into(),
-                entity_kind(entity.kind).into(),
-                entity_metadata(entity.metadata).into(),
-            ])
-        })
-        .collect();
-    if relation_differs(
-        transaction,
-        "incoming[id, kind, metadata] <- $rows\n\
-         different[id] := *enrichment_entity_contribution{\
-             view: $view, owner: $owner, id, kind, metadata\
-         }, not incoming[id, kind, metadata]\n\
-         different[id] := incoming[id, kind, metadata], \
-             not *enrichment_entity_contribution{\
-                 view: $view, owner: $owner, id, kind, metadata\
-             }\n\
-         ?[id] := different[id] :limit 1",
-        entity_rows,
-        view,
-        owner,
-    )? {
-        return Ok(false);
-    }
-    let observation_rows = observations
-        .iter()
-        .map(|observation| {
-            DataValue::List(vec![
-                observation.from.as_str().into(),
-                observation.relation.as_str().into(),
-                observation.to.as_str().into(),
-                observation.evidence.as_str().into(),
-                observation.confidence.score().into(),
-                observation.provenance.as_str().into(),
-            ])
-        })
-        .collect();
-    if relation_differs(
-        transaction,
-        "incoming[from, relation, to, evidence, confidence, provenance] <- $rows\n\
-         different[from, relation, to, evidence] := \
-             *enrichment_observation_contribution{\
-                 view: $view, owner: $owner, from, relation, to, evidence, confidence, provenance\
-             }, not incoming[from, relation, to, evidence, confidence, provenance]\n\
-         different[from, relation, to, evidence] := \
-             incoming[from, relation, to, evidence, confidence, provenance], \
-             not *enrichment_observation_contribution{\
-                 view: $view, owner: $owner, from, relation, to, evidence, confidence, provenance\
-             }\n\
-         ?[from, relation, to, evidence] := different[from, relation, to, evidence] :limit 1",
-        observation_rows,
-        view,
-        owner,
-    )? {
-        return Ok(false);
-    }
-    let override_rows = overrides
-        .iter()
-        .map(|override_| {
-            DataValue::List(vec![
-                override_.from.as_str().into(),
-                override_.relation.as_str().into(),
-                override_.unresolved_to.as_str().into(),
-                override_.resolved_to.as_str().into(),
-                override_.evidence.as_str().into(),
-                override_.confidence.score().into(),
-                override_.provenance.as_str().into(),
-            ])
-        })
-        .collect();
-    if relation_differs(
-        transaction,
-        "incoming[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] <- $rows\n\
-         different[from, relation, unresolved_to] := *enrichment_override_contribution{\
-             view: $view, owner: $owner, from, relation, unresolved_to, resolved_to, evidence, \
-             confidence, provenance\
-         }, not incoming[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance]\n\
-         different[from, relation, unresolved_to] := incoming[\
-             from, relation, unresolved_to, resolved_to, evidence, confidence, provenance\
-         ], not *enrichment_override_contribution{\
-             view: $view, owner: $owner, from, relation, unresolved_to, resolved_to, evidence, \
-             confidence, provenance\
-         }\n\
-         ?[from, relation, unresolved_to] := different[from, relation, unresolved_to] :limit 1",
-        override_rows,
-        view,
-        owner,
-    )? {
-        return Ok(false);
-    }
-    let diagnostic_rows = diagnostics
-        .iter()
-        .map(|(repository, diagnostic)| {
-            DataValue::List(vec![
-                repository.as_str().into(),
-                diagnostic.code.as_str().into(),
-                diagnostic.severity.as_str().into(),
-                diagnostic.path.to_string_lossy().into_owned().into(),
-                i64::from(diagnostic.line.unwrap_or_default()).into(),
-                diagnostic.detail.as_deref().unwrap_or_default().into(),
-            ])
-        })
-        .collect();
-    Ok(!relation_differs(
-        transaction,
-        "incoming[repository, code, severity, path, line, detail] <- $rows\n\
-         different[repository, code, severity, path, line] := \
-             *enrichment_diagnostic_contribution{\
-                 view: $view, owner: $owner, repository, code, severity, path, line, detail\
-             }, not incoming[repository, code, severity, path, line, detail]\n\
-         different[repository, code, severity, path, line] := \
-             incoming[repository, code, severity, path, line, detail], \
-             not *enrichment_diagnostic_contribution{\
-                 view: $view, owner: $owner, repository, code, severity, path, line, detail\
-             }\n\
-         ?[repository, code, severity, path, line] := \
-             different[repository, code, severity, path, line] :limit 1",
-        diagnostic_rows,
-        view,
-        owner,
-    )?)
-}
-
-fn owner_contributions_are_empty(
-    transaction: &MultiTransaction,
-    view: &str,
-    owner: &str,
-) -> Result<bool, Box<dyn Error>> {
-    let rows = transaction
-        .run_script(
-            "present[key] := *enrichment_entity_contribution{\
-             view: $view, owner: $owner, id: key\
-         }\n\
-         present[key] := *enrichment_observation_contribution{\
-             view: $view, owner: $owner, from: key\
-         }\n\
-         present[key] := *enrichment_override_contribution{\
-             view: $view, owner: $owner, from: key\
-         }\n\
-         present[key] := *enrichment_diagnostic_contribution{\
-             view: $view, owner: $owner, repository: key\
-         }\n\
-         ?[key] := present[key] :limit 1",
-            BTreeMap::from([("view".into(), view.into()), ("owner".into(), owner.into())]),
-        )
-        .map_err(|error| format!("failed to inspect owner contributions: {error}"))?;
-    Ok(rows.rows.is_empty())
-}
-
-fn incoming_contributions_are_effective(
-    transaction: &MultiTransaction,
-    view: &str,
-    entities: &[EntityFact],
-    observations: &[Observation],
-    overrides: &[DependencyOverride],
-    diagnostics: &[(String, AnalysisDiagnostic)],
-) -> Result<bool, Box<dyn Error>> {
-    let entity_rows = entities
-        .iter()
-        .map(|entity| {
-            DataValue::List(vec![
-                entity.id.as_str().into(),
-                entity_kind(entity.kind).into(),
-                entity_metadata(entity.metadata).into(),
-            ])
-        })
-        .collect();
-    if incoming_relation_is_missing(
-        transaction,
-        "incoming[id, kind, metadata] <- $rows\n\
-         effective[id, kind, metadata] := *analysis_revision{view: $view, revision}, \
-             *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
-         effective[id, kind, metadata] := *analysis_baseline_entity{\
-             view: $view, id, kind, metadata\
-         }\n\
-         effective[id, kind, metadata] := *analysis_fact_shard_selection{\
-             view: $view, producer, owner, version\
-         }, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
-         ?[id] := incoming[id, kind, metadata], not effective[id, kind, metadata] :limit 1",
-        entity_rows,
-        view,
-    )? {
-        return Ok(false);
-    }
-    let observation_rows = observations
-        .iter()
-        .map(|observation| {
-            DataValue::List(vec![
-                observation.from.as_str().into(),
-                observation.relation.as_str().into(),
-                observation.to.as_str().into(),
-                observation.evidence.as_str().into(),
-                observation.confidence.score().into(),
-                observation.provenance.as_str().into(),
-            ])
-        })
-        .collect();
-    if incoming_relation_is_missing(
-        transaction,
-        "incoming[from, relation, to, evidence, confidence, provenance] <- $rows\n\
-         effective[from, relation, to, evidence, confidence, provenance] := \
-             *analysis_revision{view: $view, revision}, *analysis_revision_observation{\
-                 view: $view, revision, from, relation, to, evidence, confidence, provenance\
-             }\n\
-         effective[from, relation, to, evidence, confidence, provenance] := \
-             *analysis_baseline_observation{\
-                 view: $view, from, relation, to, evidence, confidence, provenance\
-             }\n\
-         effective[from, relation, to, evidence, confidence, provenance] := \
-             *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
-             *analysis_fact_shard_observation{\
-                 producer, owner, version, from, relation, to, evidence, confidence, provenance\
-             }\n\
-         ?[from, relation, to, evidence] := \
-             incoming[from, relation, to, evidence, confidence, provenance], \
-             not effective[from, relation, to, evidence, confidence, provenance] :limit 1",
-        observation_rows,
-        view,
-    )? {
-        return Ok(false);
-    }
-    let override_rows = overrides
-        .iter()
-        .map(|override_| {
-            DataValue::List(vec![
-                override_.from.as_str().into(),
-                override_.relation.as_str().into(),
-                override_.unresolved_to.as_str().into(),
-                override_.resolved_to.as_str().into(),
-                override_.evidence.as_str().into(),
-                override_.confidence.score().into(),
-                override_.provenance.as_str().into(),
-            ])
-        })
-        .collect();
-    if incoming_relation_is_missing(
-        transaction,
-        "incoming[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] <- $rows\n\
-         effective[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
-             *analysis_revision{view: $view, revision}, *analysis_revision_dependency_override{\
-                 view: $view, revision, from, relation, unresolved_to, resolved_to, evidence\
-             }, *analysis_revision_dependency_override_metadata{\
-                 view: $view, revision, from, relation, unresolved_to, confidence, provenance\
-             }\n\
-         effective[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
-             *analysis_baseline_dependency_override{\
-                 view: $view, from, relation, unresolved_to, resolved_to, evidence, confidence, \
-                 provenance\
-             }\n\
-         ?[from, relation, unresolved_to] := incoming[\
-             from, relation, unresolved_to, resolved_to, evidence, confidence, provenance\
-         ], not effective[\
-             from, relation, unresolved_to, resolved_to, evidence, confidence, provenance\
-         ] :limit 1",
-        override_rows,
-        view,
-    )? {
-        return Ok(false);
-    }
-    let diagnostic_rows = diagnostics
-        .iter()
-        .map(|(repository, diagnostic)| {
-            DataValue::List(vec![
-                repository.as_str().into(),
-                diagnostic.code.as_str().into(),
-                diagnostic.severity.as_str().into(),
-                diagnostic.path.to_string_lossy().into_owned().into(),
-                i64::from(diagnostic.line.unwrap_or_default()).into(),
-                diagnostic.detail.as_deref().unwrap_or_default().into(),
-            ])
-        })
-        .collect();
-    Ok(!incoming_relation_is_missing(
-        transaction,
-        "incoming[repository, code, severity, path, line, detail] <- $rows\n\
-         effective[repository, code, severity, path, line, detail] := \
-             *analysis_revision{view: $view, revision}, *analysis_revision_diagnostic{\
-                 view: $view, revision, repository, code, severity, path, line, detail\
-             }\n\
-         effective[repository, code, severity, path, line, detail] := \
-             *analysis_baseline_diagnostic{\
-                 view: $view, repository, code, severity, path, line, detail\
-             }\n\
-         ?[repository, code, severity, path, line] := \
-             incoming[repository, code, severity, path, line, detail], \
-             not effective[repository, code, severity, path, line, detail] :limit 1",
-        diagnostic_rows,
-        view,
-    )?)
-}
-
-fn incoming_relation_is_missing(
-    transaction: &MultiTransaction,
-    script: &str,
-    rows: Vec<DataValue>,
-    view: &str,
-) -> Result<bool, Box<dyn Error>> {
-    Ok(!transaction
-        .run_script(
-            script,
-            BTreeMap::from([
-                ("view".into(), view.into()),
-                ("rows".into(), DataValue::List(rows)),
-            ]),
-        )
-        .map_err(|error| format!("failed to compare incoming effective contribution: {error}"))?
-        .rows
-        .is_empty())
-}
-
-fn relation_differs(
-    transaction: &MultiTransaction,
-    script: &str,
-    rows: Vec<DataValue>,
-    view: &str,
-    owner: &str,
-) -> Result<bool, Box<dyn Error>> {
-    let params = BTreeMap::from([
-        ("view".into(), view.into()),
-        ("owner".into(), owner.into()),
-        ("rows".into(), DataValue::List(rows)),
-    ]);
-    Ok(!transaction.run_script(script, params)?.rows.is_empty())
 }
 
 fn copy_revision(
@@ -2940,6 +2357,14 @@ fn copy_revision(
                  view: $view, revision: $previous, target, analyzer, context\
              }, view = $view, revision = $revision \
          :put analysis_revision_context {view, revision, target, analyzer, context}",
+        "?[view, revision, owner, repository, analyzer, version, input_fingerprint] := \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $previous, owner, repository, analyzer, version, \
+                 input_fingerprint\
+             }, view = $view, revision = $revision \
+         :put analysis_revision_repository_enrichment {\
+             view, revision, owner => repository, analyzer, version, input_fingerprint\
+         }",
         "?[view, revision, incomplete] := \
              *analysis_revision_metadata{view: $view, revision: $previous, incomplete}, \
              view = $view, revision = $revision \
@@ -2992,50 +2417,6 @@ fn copy_revision(
          :put analysis_revision_diagnostic {\
              view, revision, repository, code, severity, path, line => detail\
          }",
-    ] {
-        transaction.run_script(script, params.clone())?;
-    }
-    Ok(())
-}
-
-fn remove_owner_contribution_keys(
-    transaction: &MultiTransaction,
-    view: &str,
-    owner: &str,
-    revision: i64,
-) -> Result<(), Box<dyn Error>> {
-    let params = BTreeMap::from([
-        ("view".into(), view.into()),
-        ("owner".into(), owner.into()),
-        ("revision".into(), revision.into()),
-    ]);
-    for script in [
-        "?[view, revision, id] := *enrichment_entity_contribution{\
-             view: $view, owner: $owner, id\
-         }, view = $view, revision = $revision \
-         :rm analysis_revision_entity {view, revision, id}",
-        "?[view, revision, from, relation, to, evidence] := \
-             *enrichment_observation_contribution{\
-                 view: $view, owner: $owner, from, relation, to, evidence\
-             }, view = $view, revision = $revision \
-         :rm analysis_revision_observation {view, revision, from, relation, to, evidence}",
-        "?[view, revision, from, relation, unresolved_to] := \
-             *enrichment_override_contribution{\
-                 view: $view, owner: $owner, from, relation, unresolved_to\
-             }, view = $view, revision = $revision \
-         :rm analysis_revision_dependency_override {view, revision, from, relation, unresolved_to}",
-        "?[view, revision, from, relation, unresolved_to] := \
-             *enrichment_override_contribution{\
-                 view: $view, owner: $owner, from, relation, unresolved_to\
-             }, view = $view, revision = $revision \
-         :rm analysis_revision_dependency_override_metadata {\
-             view, revision, from, relation, unresolved_to\
-         }",
-        "?[view, revision, repository, code, severity, path, line] := \
-             *enrichment_diagnostic_contribution{\
-                 view: $view, owner: $owner, repository, code, severity, path, line\
-             }, view = $view, revision = $revision \
-         :rm analysis_revision_diagnostic {view, revision, repository, code, severity, path, line}",
     ] {
         transaction.run_script(script, params.clone())?;
     }
@@ -3172,120 +2553,6 @@ fn replace_enrichment_contributions(
                  view, owner, repository, code, severity, path, line => detail\
              }",
             BTreeMap::from([("rows".into(), DataValue::List(rows))]),
-        )?;
-    }
-    Ok(())
-}
-
-fn effective_revision_changed(
-    transaction: &MultiTransaction,
-    view: &str,
-    previous: i64,
-    revision: i64,
-) -> Result<bool, Box<dyn Error>> {
-    let params = BTreeMap::from([
-        ("view".into(), view.into()),
-        ("previous".into(), previous.into()),
-        ("revision".into(), revision.into()),
-    ]);
-    for query in [
-        "?[id] := *analysis_revision_entity{\
-             view: $view, revision: $revision, id, kind, metadata\
-         }, not *analysis_revision_entity{\
-             view: $view, revision: $previous, id, kind, metadata\
-         } :limit 1",
-        "?[from, relation, to, evidence] := *analysis_revision_observation{\
-             view: $view, revision: $revision, from, relation, to, evidence, confidence, provenance\
-         }, not *analysis_revision_observation{\
-             view: $view, revision: $previous, from, relation, to, evidence, confidence, provenance\
-         } :limit 1",
-        "?[repository, code, severity, path, line] := *analysis_revision_diagnostic{\
-             view: $view, revision: $revision, repository, code, severity, path, line, detail\
-         }, not *analysis_revision_diagnostic{\
-             view: $view, revision: $previous, repository, code, severity, path, line, detail\
-         } :limit 1",
-        "?[from, relation, unresolved_to] := *analysis_revision_dependency_override{\
-             view: $view, revision: $revision, from, relation, unresolved_to, resolved_to, evidence\
-         }, not *analysis_revision_dependency_override{\
-             view: $view, revision: $previous, from, relation, unresolved_to, resolved_to, evidence\
-         } :limit 1",
-        "?[from, relation, unresolved_to] := *analysis_revision_dependency_override_metadata{\
-             view: $view, revision: $revision, from, relation, unresolved_to, confidence, provenance\
-         }, not *analysis_revision_dependency_override_metadata{\
-             view: $view, revision: $previous, from, relation, unresolved_to, confidence, provenance\
-         } :limit 1",
-    ] {
-        if !transaction
-            .run_script(query, params.clone())?
-            .rows
-            .is_empty()
-        {
-            return Ok(true);
-        }
-        let reverse = query
-            .replace("revision: $revision", "revision: $swap")
-            .replace("revision: $previous", "revision: $revision")
-            .replace("revision: $swap", "revision: $previous");
-        if !transaction
-            .run_script(&reverse, params.clone())?
-            .rows
-            .is_empty()
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn remove_revision_candidate(
-    transaction: &MultiTransaction,
-    view: &str,
-    revision: i64,
-) -> Result<(), Box<dyn Error>> {
-    let params = BTreeMap::from([
-        ("view".into(), view.into()),
-        ("revision".into(), revision.into()),
-    ]);
-    for (relation, keys) in [
-        ("analysis_revision_state", "view, revision, repository"),
-        ("analysis_revision_input", "view, revision, repository"),
-        (
-            "analysis_revision_enrichment_input",
-            "view, revision, repository, analyzer",
-        ),
-        (
-            "analysis_revision_context",
-            "view, revision, target, analyzer, context",
-        ),
-        ("analysis_revision_metadata", "view, revision"),
-        (
-            "analysis_revision_grpc_diagnostic",
-            "view, revision, local_symbol, role, service, method, evidence",
-        ),
-        ("analysis_revision_entity", "view, revision, id"),
-        (
-            "analysis_revision_observation",
-            "view, revision, from, relation, to, evidence",
-        ),
-        (
-            "analysis_revision_diagnostic",
-            "view, revision, repository, code, severity, path, line",
-        ),
-        (
-            "analysis_revision_dependency_override",
-            "view, revision, from, relation, unresolved_to",
-        ),
-        (
-            "analysis_revision_dependency_override_metadata",
-            "view, revision, from, relation, unresolved_to",
-        ),
-    ] {
-        transaction.run_script(
-            &format!(
-                "?[{keys}] := *{relation}{{{keys}}}, view = $view, revision = $revision \
-                 :rm {relation} {{{keys}}}"
-            ),
-            params.clone(),
         )?;
     }
     Ok(())
@@ -3460,9 +2727,19 @@ fn claim_garbage_collection_once(db: &DbInstance) -> Result<u64, Box<dyn Error>>
 pub(super) fn garbage_collection_pending(db: &DbInstance) -> Result<bool, Box<dyn Error>> {
     Ok(!db
         .run_script(
-            "?[pending] := *garbage_collection_state{state}, pending = true\n\
-             ?[pending] := *analysis_revision{view, revision: current}, \
-                 *analysis_revision_metadata{view, revision}, revision < current, pending = true\n\
+            "pending[key] := *garbage_collection_state{state}, key = state\n\
+             pending[key] := *analysis_revision{view, revision: current}, \
+                 *analysis_revision_metadata{view, revision}, revision < current, key = view\n\
+             selected_snapshot[view, owner] := \
+                 *analysis_revision_repository_enrichment{view, owner}\n\
+             pending[key] := *enrichment_output{view, owner}, \
+                 not selected_snapshot[view, owner], key = owner\n\
+             pending[key] := *analysis_baseline_fingerprint{view}, key = view\n\
+             pending[key] := *analysis_baseline_entity{view}, key = view\n\
+             pending[key] := *analysis_baseline_observation{view}, key = view\n\
+             pending[key] := *analysis_baseline_dependency_override{view}, key = view\n\
+             pending[key] := *analysis_baseline_diagnostic{view}, key = view\n\
+             ?[key] := pending[key]\n\
              :limit 1",
             BTreeMap::new(),
             ScriptMutability::Immutable,
@@ -3511,6 +2788,7 @@ struct RelationCleanup<'a> {
     keys: &'a str,
     parameters: BTreeMap<String, DataValue>,
     guard_repository_state: bool,
+    guard_enrichment_snapshot: bool,
     stale_states: u32,
     repositories: u32,
     completed_steps: u32,
@@ -3566,6 +2844,7 @@ fn sweep_relation(
         }) {
             return Ok(false);
         }
+        thread::sleep(GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY);
     }
 }
 
@@ -3606,6 +2885,20 @@ fn remove_garbage_collection_batch_once(
         transaction.abort()?;
         return Ok(false);
     }
+    if cleanup.guard_enrichment_snapshot
+        && !transaction
+            .run_script(
+                "?[owner] := *analysis_revision_repository_enrichment{\
+                     view: $view, owner: $owner\
+                 }, owner = $owner :limit 1",
+                cleanup.parameters.clone(),
+            )?
+            .rows
+            .is_empty()
+    {
+        transaction.abort()?;
+        return Ok(false);
+    }
     transaction.run_script(
         &format!(
             "?[{}] <- $rows\n:rm {} {{{}}}",
@@ -3618,6 +2911,92 @@ fn remove_garbage_collection_batch_once(
     )?;
     transaction.commit()?;
     Ok(true)
+}
+
+fn sweep_unselected_enrichment_snapshots(
+    db: &DbInstance,
+    progress: &mut impl FnMut(GarbageCollectionProgress) -> bool,
+    stale_states: u32,
+    repositories: u32,
+) -> Result<bool, Box<dyn Error>> {
+    loop {
+        let snapshots = db.run_script(
+            "selected[view, owner] := *analysis_revision_repository_enrichment{view, owner}\n\
+             ?[view, owner] := *enrichment_output{view, owner}, not selected[view, owner] \
+             :limit 1",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )?;
+        let Some(row) = snapshots.rows.first() else {
+            return Ok(true);
+        };
+        let view = row[0]
+            .get_str()
+            .ok_or("enrichment snapshot has a non-string view")?;
+        let owner = row[1]
+            .get_str()
+            .ok_or("enrichment snapshot has a non-string owner")?;
+        let params = BTreeMap::from([("view".into(), view.into()), ("owner".into(), owner.into())]);
+        for (index, (relation, keys)) in [
+            ("enrichment_entity_contribution", "view, owner, id"),
+            (
+                "enrichment_observation_contribution",
+                "view, owner, from, relation, to, evidence",
+            ),
+            (
+                "enrichment_override_contribution",
+                "view, owner, from, relation, unresolved_to",
+            ),
+            (
+                "enrichment_diagnostic_contribution",
+                "view, owner, repository, code, severity, path, line",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !sweep_relation(
+                db,
+                progress,
+                RelationCleanup {
+                    step: format!("unselected enrichment snapshot {owner} from {view}"),
+                    select_script: format!(
+                        "?[{keys}] := *{relation}{{{keys}}}, view = $view, owner = $owner"
+                    ),
+                    relation,
+                    keys,
+                    parameters: params.clone(),
+                    guard_repository_state: false,
+                    guard_enrichment_snapshot: true,
+                    stale_states,
+                    repositories,
+                    completed_steps: index.try_into()?,
+                    total_steps: 4,
+                },
+            )? {
+                return Ok(false);
+            }
+        }
+        let transaction = db.multi_transaction(true);
+        if !transaction
+            .run_script(
+                "?[owner] := *analysis_revision_repository_enrichment{\
+                     view: $view, owner: $owner\
+                 }, owner = $owner :limit 1",
+                params.clone(),
+            )?
+            .rows
+            .is_empty()
+        {
+            transaction.abort()?;
+            continue;
+        }
+        transaction.run_script(
+            "?[view, owner] <- [[$view, $owner]] :rm enrichment_output {view, owner}",
+            params,
+        )?;
+        transaction.commit()?;
+    }
 }
 
 pub(super) fn sweep_garbage_collection(
@@ -3791,6 +3170,7 @@ pub(super) fn sweep_garbage_collection(
                     keys,
                     parameters: BTreeMap::from([("state".into(), state.into())]),
                     guard_repository_state: true,
+                    guard_enrichment_snapshot: false,
                     stale_states,
                     repositories,
                     completed_steps: states_resolved,
@@ -3843,6 +3223,7 @@ pub(super) fn sweep_garbage_collection(
                         ("current".into(), current.clone()),
                     ]),
                     guard_repository_state: false,
+                    guard_enrichment_snapshot: false,
                     stale_states,
                     repositories,
                     completed_steps,
@@ -3852,6 +3233,56 @@ pub(super) fn sweep_garbage_collection(
                 return Ok(states_resolved.into());
             }
         }
+    }
+    for (step, relation, keys) in [
+        (
+            "legacy materialized baseline entities",
+            "analysis_baseline_entity",
+            "view, id",
+        ),
+        (
+            "legacy materialized baseline observations",
+            "analysis_baseline_observation",
+            "view, from, relation, to, evidence",
+        ),
+        (
+            "legacy materialized baseline overrides",
+            "analysis_baseline_dependency_override",
+            "view, from, relation, unresolved_to",
+        ),
+        (
+            "legacy materialized baseline diagnostics",
+            "analysis_baseline_diagnostic",
+            "view, repository, code, severity, path, line",
+        ),
+        (
+            "legacy materialized baseline fingerprints",
+            "analysis_baseline_fingerprint",
+            "view",
+        ),
+    ] {
+        if !sweep_relation(
+            db,
+            progress,
+            RelationCleanup {
+                step: step.into(),
+                select_script: format!("?[{keys}] := *{relation}{{{keys}}}"),
+                relation,
+                keys,
+                parameters: BTreeMap::new(),
+                guard_repository_state: false,
+                guard_enrichment_snapshot: false,
+                stale_states,
+                repositories,
+                completed_steps: 0,
+                total_steps: 5,
+            },
+        )? {
+            return Ok(states_resolved.into());
+        }
+    }
+    if !sweep_unselected_enrichment_snapshots(db, progress, stale_states, repositories)? {
+        return Ok(states_resolved.into());
     }
     Ok(states_resolved.into())
 }
@@ -4729,7 +4160,7 @@ mod tests {
     }
 
     #[test]
-    fn carries_forward_only_unchanged_repository_enrichments() {
+    fn carries_forward_enrichment_selections_and_marks_changed_inputs_stale() {
         let store = SemanticStore::memory().unwrap();
         let state = |repository: &str, fingerprint: &str| RepositoryState {
             repository: LogicalRepository {
@@ -4855,7 +4286,20 @@ mod tests {
                 .enrichment_matches("incremental", "example/b", "rust", "1")
                 .unwrap()
         );
-        let current_entities = store
+        let requested = BTreeSet::from([
+            entity_a.id.as_str().to_owned(),
+            entity_b.id.as_str().to_owned(),
+        ]);
+        let current_entities =
+            crate::query::entity_facts(&store.db, "incremental", &requested).unwrap();
+        let current_entities = current_entities
+            .rows
+            .iter()
+            .filter_map(|row| row[0].get_str())
+            .collect::<BTreeSet<_>>();
+        assert!(current_entities.contains(entity_b.id.as_str()));
+        assert!(current_entities.contains(entity_a.id.as_str()));
+        let materialized = store
             .db
             .run_script(
                 "?[id] := *analysis_revision{view: 'incremental', revision}, \
@@ -4864,13 +4308,7 @@ mod tests {
                 ScriptMutability::Immutable,
             )
             .unwrap();
-        let current_entities = current_entities
-            .rows
-            .iter()
-            .filter_map(|row| row[0].get_str())
-            .collect::<BTreeSet<_>>();
-        assert!(current_entities.contains(entity_b.id.as_str()));
-        assert!(!current_entities.contains(entity_a.id.as_str()));
+        assert!(materialized.rows.is_empty());
     }
 
     #[test]
@@ -5300,6 +4738,11 @@ mod tests {
             context.edges[0].evidence[0].source_kind,
             beholder_dto::EvidenceKind::Compiler
         );
+        let incoming = store
+            .context("elixir-enriched", "elixir-call://External/run/0")
+            .unwrap();
+        assert_eq!(incoming.edges.len(), 1);
+        assert_eq!(incoming.edges[0].from, generated);
 
         assert!(
             store
@@ -5422,7 +4865,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(current_revision(&store, "baseline-collision"), 1);
+        assert_eq!(current_revision(&store, "baseline-collision"), 2);
 
         assert!(
             store
@@ -5438,7 +4881,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(current_revision(&store, "baseline-collision"), 1);
+        assert_eq!(current_revision(&store, "baseline-collision"), 3);
         let rows = store
             .db
             .run_script(
@@ -5482,7 +4925,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_contributions_keep_independent_owners_without_revision_churn() {
+    fn identical_contributions_keep_independent_immutable_selections() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -5537,7 +4980,7 @@ mod tests {
                     .unwrap()
             );
         }
-        assert_eq!(current_revision(&store, "multi-owner"), 2);
+        assert_eq!(current_revision(&store, "multi-owner"), 3);
         let contributions = store
             .db
             .run_script(
@@ -5552,7 +4995,7 @@ mod tests {
         drop(store);
 
         let store = SemanticStore::persistent(&database, false).unwrap();
-        assert_eq!(current_revision(&store, "multi-owner"), 2);
+        assert_eq!(current_revision(&store, "multi-owner"), 3);
         let invalid_diagnostic = AnalysisDiagnostic {
             code: "compiler.partial".into(),
             severity: AnalysisDiagnosticSeverity::KnownLimitation,
@@ -5580,7 +5023,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(current_revision(&store, "multi-owner"), 2);
+        assert_eq!(current_revision(&store, "multi-owner"), 3);
 
         let input_a =
             view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler-a");
@@ -5601,12 +5044,24 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(current_revision(&store, "multi-owner"), 2);
+        assert_eq!(current_revision(&store, "multi-owner"), 4);
         assert!(
             store
                 .enrichment_matches("multi-owner", "example/repo", "compiler-a", "2")
                 .unwrap()
         );
+        let snapshots = store
+            .db
+            .run_script(
+                "?[count(owner)] := *enrichment_output{\
+                     view: 'multi-owner', owner, repository: 'example/repo', \
+                     analyzer: 'compiler-a'\
+                 }",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(snapshots.rows[0][0].get_int(), Some(2));
         assert!(
             store
                 .publish_enrichment(
@@ -5621,7 +5076,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(current_revision(&store, "multi-owner"), 2);
+        assert_eq!(current_revision(&store, "multi-owner"), 5);
         assert_eq!(
             store
                 .context("multi-owner", entity.id.as_str())
@@ -5647,7 +5102,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert_eq!(current_revision(&store, "multi-owner"), 3);
+        assert_eq!(current_revision(&store, "multi-owner"), 6);
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }
@@ -5722,17 +5177,10 @@ mod tests {
             &["b"],
         );
         assert!(store.ensure_revision_inputs(&only_b).unwrap());
-        assert_eq!(current_revision(&store, "owner-removal"), 4);
+        assert_eq!(current_revision(&store, "owner-removal"), 5);
         let current_entity = |id: &str| {
-            !store
-                .db
-                .run_script(
-                    "?[id] := *analysis_revision{view: 'owner-removal', revision}, \
-                         *analysis_revision_entity{view: 'owner-removal', revision, id: $id}, \
-                         id = $id",
-                    BTreeMap::from([("id".into(), id.into())]),
-                    ScriptMutability::Immutable,
-                )
+            let requested = BTreeSet::from([id.to_owned()]);
+            !crate::query::entity_facts(&store.db, "owner-removal", &requested)
                 .unwrap()
                 .rows
                 .is_empty()
@@ -5740,27 +5188,28 @@ mod tests {
         assert!(current_entity(shared.id.as_str()));
         assert!(!current_entity(only_a.id.as_str()));
 
-        let removed_owners: Vec<DataValue> = states
-            .iter()
-            .map(|state| enrichment_owner_key("a", &state.repository.identity))
-            .map(|owner| DataValue::List(vec![owner.into()]))
-            .collect();
-        let removed_state = store
-            .db
-            .run_script(
-                "removed[owner] <- $owners\n\
-                 present[owner] := removed[owner], *enrichment_output{\
-                     view: 'owner-removal', owner\
-                 }\n\
-                 present[owner] := removed[owner], *enrichment_entity_contribution{\
-                     view: 'owner-removal', owner\
-                 }\n\
-                 ?[owner] := present[owner]",
-                BTreeMap::from([("owners".into(), DataValue::List(removed_owners))]),
-                ScriptMutability::Immutable,
-            )
-            .unwrap();
-        assert!(removed_state.rows.is_empty());
+        let snapshots_for = |repository: &str, analyzer: &str| {
+            store
+                .db
+                .run_script(
+                    "?[owner] := *enrichment_output{\
+                         view: 'owner-removal', owner, repository: $repository, \
+                         analyzer: $analyzer\
+                     }",
+                    BTreeMap::from([
+                        ("repository".into(), repository.into()),
+                        ("analyzer".into(), analyzer.into()),
+                    ]),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows
+        };
+        assert!(!snapshots_for("repo-a", "a").is_empty());
+        assert!(garbage_collection_pending(&store.db).unwrap());
+        sweep_garbage_collection(&store.db, &mut |_| true).unwrap();
+        assert!(snapshots_for("repo-a", "a").is_empty());
+        assert!(snapshots_for("repo-b", "a").is_empty());
 
         let repo_b_only = with_enrichment_analyzers(
             WorkspaceView::new("owner-removal", "syntax", vec![states[1].clone()]).unwrap(),
@@ -5782,25 +5231,9 @@ mod tests {
             )
             .unwrap();
         assert!(!current_entity(shared.id.as_str()));
-        let repo_a_owner = enrichment_owner_key("b", "repo-a");
-        assert!(
-            store
-                .db
-                .run_script(
-                    "present[owner] := *enrichment_output{\
-                         view: 'owner-removal', owner\
-                     }, owner = $owner\n\
-                     present[owner] := *enrichment_entity_contribution{\
-                         view: 'owner-removal', owner\
-                     }, owner = $owner\n\
-                     ?[owner] := present[owner]",
-                    BTreeMap::from([("owner".into(), repo_a_owner.into())]),
-                    ScriptMutability::Immutable,
-                )
-                .unwrap()
-                .rows
-                .is_empty()
-        );
+        assert!(!snapshots_for("repo-a", "b").is_empty());
+        sweep_garbage_collection(&store.db, &mut |_| true).unwrap();
+        assert!(snapshots_for("repo-a", "b").is_empty());
     }
 
     #[test]
@@ -5878,16 +5311,16 @@ mod tests {
         let selected = store
             .db
             .run_script(
-                "?[resolved_to, provenance] := *analysis_revision{\
-                     view: 'override-policy', revision\
-                 }, *analysis_revision_dependency_override{\
-                     view: 'override-policy', revision, from: $from, relation: 'calls', \
-                     unresolved_to: 'call://target', resolved_to\
-                 }, *analysis_revision_dependency_override_metadata{\
-                     view: 'override-policy', revision, from: $from, relation: 'calls', \
-                     unresolved_to: 'call://target', provenance\
-                 }",
-                BTreeMap::from([("from".into(), "repo://example/repo/caller".into())]),
+                &format!(
+                    "{DIRECT_RULES}\n\
+                     ?[resolved_to, provenance] := dependency_override[\
+                         $from, 'calls', 'call://target', resolved_to, _, _, provenance\
+                     ]"
+                ),
+                BTreeMap::from([
+                    ("view".into(), "override-policy".into()),
+                    ("from".into(), "repo://example/repo/caller".into()),
+                ]),
                 ScriptMutability::Immutable,
             )
             .unwrap();
