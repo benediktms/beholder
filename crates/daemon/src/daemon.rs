@@ -280,7 +280,7 @@ fn start_garbage_collector(
                             GarbageCollectionPhase::CheckpointingDatabase,
                         ));
                     }
-                    store.checkpoint()?;
+                    store.checkpoint_passive()?;
                     let pages = store.reclaimable_database_pages()?;
                     let mut reclaimed = 0;
                     while reclaimed < pages && !scheduler.is_stopping() {

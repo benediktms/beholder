@@ -47,6 +47,10 @@ pub(super) struct TonicGeneratedMethod {
 pub struct RustFunction {
     pub(super) name: String,
     pub(super) qualified_name: String,
+    #[serde(default)]
+    pub(super) interface_hash: [u8; 32],
+    #[serde(default)]
+    pub(super) body_hash: [u8; 32],
     pub(super) line: usize,
     #[serde(default)]
     pub(super) name_offset: usize,
@@ -60,6 +64,14 @@ impl RustFunction {
 
     pub fn qualified_name(&self) -> &str {
         &self.qualified_name
+    }
+
+    pub fn interface_hash(&self) -> [u8; 32] {
+        self.interface_hash
+    }
+
+    pub fn body_hash(&self) -> [u8; 32] {
+        self.body_hash
     }
 
     pub fn name_offset(&self) -> usize {

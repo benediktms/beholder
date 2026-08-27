@@ -65,7 +65,7 @@ uninstall:
 integration-test:
     moon run beholder:integration-test
 
-# Benchmark cold and warm-frontend indexing with a bounded worker count.
+# Benchmark cold and unchanged indexing with a bounded worker count.
 [group('manual')]
 index-bench workers repositories:
     moon run beholder:index-bench -- "{{workers}}" "{{repositories}}"

@@ -9,6 +9,7 @@ beholder-domain.workspace = true
 beholder-indexing.workspace = true
 rayon.workspace = true
 ra_ap_syntax = "0.0.348"
+salsa.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"

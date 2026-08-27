@@ -341,6 +341,64 @@ pub(super) const CREATE_BASELINE_DIAGNOSTIC_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_FACT_SHARD_SELECTION_SCHEMA: &str = r#"
+:create analysis_fact_shard_selection {
+    view: String,
+    producer: String,
+    repository: String,
+    owner: String,
+    =>
+    version: String,
+}
+"#;
+
+pub(super) const CREATE_FACT_SHARD_ENTITY_SCHEMA: &str = r#"
+:create analysis_fact_shard_entity {
+    producer: String,
+    owner: String,
+    version: String,
+    id: String,
+    =>
+    kind: String,
+    metadata: String,
+}
+"#;
+
+pub(super) const CREATE_FACT_SHARD_OBSERVATION_SCHEMA: &str = r#"
+:create analysis_fact_shard_observation {
+    producer: String,
+    owner: String,
+    version: String,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
+pub(super) const CREATE_FACT_SHARD_DEPENDENCY_SCHEMA: &str = r#"
+:create analysis_fact_shard_dependency_observation {
+    producer: String,
+    owner: String,
+    version: String,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+}
+"#;
+
+pub(super) const CREATE_BASELINE_FINGERPRINT_SCHEMA: &str = r#"
+:create analysis_baseline_fingerprint {
+    view: String,
+    =>
+    fingerprint: String,
+}
+"#;
+
 pub(super) const CREATE_SCHEMA_MIGRATION_SCHEMA: &str = r#"
 :create schema_migration {
     name: String,
@@ -502,6 +560,7 @@ pub(super) const SEED_STATES: &str = r#"
 pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
 pub(super) const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
 pub(super) const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
+#[allow(dead_code)]
 pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
          *analysis_revision{view: $view, revision}, \
          *analysis_revision_state{view: $view, revision, state}\n\

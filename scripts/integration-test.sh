@@ -300,7 +300,11 @@ if ! grep -Fq '"kind":"binds_contract"' <<<"$result" || ! grep -Fq '"stale":fals
 fi
 echo 'Checking run_daemon -> state_dir...' >&2
 echo 'Checking state_dir impact reaches run_daemon...' >&2
-result="$(target/debug/beholder impact --json --workspace main "$callee")"
+for _ in {1..600}; do
+    result="$(target/debug/beholder impact --json --max-hops 1 --workspace main "$callee")"
+    grep -Fq "$caller" <<<"$result" && break
+    sleep 0.1
+done
 if ! grep -Fq "$caller" <<<"$result"; then
     printf 'expected %s in impact result:\n%s\n' "$caller" "$result" >&2
     exit 1

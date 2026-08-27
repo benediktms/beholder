@@ -55,11 +55,13 @@ beholder-worker-rust = { path = "crates/worker-rust" }
 beholder-daemon-client = { path = "crates/daemon-client" }
 beholder-protocol = { path = "crates/protocol" }
 futures-util = "0.3.31"
+log = "0.4.28"
 opentelemetry = { version = "0.32.0", features = ["logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "logs", "reqwest-blocking-client", "reqwest-rustls", "trace"] }
 opentelemetry_sdk = { version = "0.32.0", features = ["logs", "trace"] }
 rayon = "1.10.0"
+salsa = "0.28.2"
 quick-xml = "0.38.3"
 reqwest = { version = "=0.13.1", default-features = false, features = ["blocking", "default-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }

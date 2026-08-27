@@ -1,5 +1,5 @@
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, EntityKind, Evidence,
+    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, EntityKind, Evidence, FactShard,
     GrpcBindingCandidate, Observation, RepositoryDependencyCandidate, RepositoryFacts,
     RepositoryState, SemanticRelation,
 };
@@ -282,6 +282,7 @@ pub struct RepositoryContribution {
     pub grpc_bindings: Vec<GrpcBindingCandidate>,
     pub observations: Vec<Observation>,
     pub diagnostics: Vec<AnalysisDiagnostic>,
+    pub fact_shards: Vec<FactShard>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,6 +329,8 @@ struct CanonicalRepositoryAnalysis {
 struct CanonicalAnalyzerAnalysis {
     entities: Vec<EntityFact>,
     observations: Vec<Observation>,
+    #[serde(default)]
+    fact_shards: Vec<FactShard>,
 }
 
 pub struct AnalyzedRepository {
@@ -342,6 +345,7 @@ pub struct WorkspaceAnalysis {
     pub diagnostics: Vec<(String, AnalysisDiagnostic)>,
     pub repository_dependencies: Vec<RepositoryDependencyCandidate>,
     pub cache: CacheStatistics,
+    pub fact_shards: Vec<FactShard>,
 }
 
 pub trait WorkspaceAnalyzer: Send + Sync {
@@ -572,6 +576,12 @@ impl AnalyzerPlan {
                 entities: &analysis.entities,
                 observations: &analysis.observations,
             })
+    }
+
+    pub fn cached_fact_shards(&self, identity: &str) -> Option<&[FactShard]> {
+        self.cached_repositories
+            .get(identity)
+            .map(|analysis| analysis.fact_shards.as_slice())
     }
 
     fn cache_repository(&mut self, identity: String, analysis: Arc<CanonicalAnalyzerAnalysis>) {
@@ -1351,7 +1361,7 @@ impl Indexer {
             graphql_resolvers.extend(contribution.graphql_resolvers);
             diagnostics.extend(contribution.diagnostics);
             let analyzer_id = contribution.metadata.id.clone();
-            for repository in contribution.repositories {
+            for mut repository in contribution.repositories {
                 let analysis = merged.get_mut(&repository.repository).ok_or_else(|| {
                     format!(
                         "analyzer returned unknown repository {}",
@@ -1360,6 +1370,23 @@ impl Indexer {
                 })?;
                 analysis.incomplete |= repository.completeness == AnalysisCompleteness::Incomplete;
                 let analyzer = analysis.analyzers.entry(analyzer_id.clone()).or_default();
+                let sharded_entities = repository
+                    .fact_shards
+                    .iter()
+                    .flat_map(|shard| shard.entities.iter())
+                    .collect::<HashSet<_>>();
+                let sharded_observations = repository
+                    .fact_shards
+                    .iter()
+                    .flat_map(|shard| shard.observations.iter())
+                    .collect::<HashSet<_>>();
+                repository
+                    .entities
+                    .retain(|entity| !sharded_entities.contains(entity));
+                repository
+                    .observations
+                    .retain(|observation| !sharded_observations.contains(observation));
+                analyzer.fact_shards.extend(repository.fact_shards);
                 extend_unique(&mut analyzer.entities, repository.entities.clone());
                 extend_unique(&mut analyzer.observations, repository.observations.clone());
                 extend_unique(&mut analysis.entities, repository.entities);
@@ -1369,11 +1396,18 @@ impl Indexer {
             }
         }
         let mut repositories = Vec::new();
+        let mut fact_shards = Vec::new();
         for repository in &snapshot.repositories {
             let identity = &repository.state.repository.identity;
             let analysis = merged
                 .remove(identity)
                 .ok_or_else(|| format!("missing analysis for repository {identity}"))?;
+            fact_shards.extend(
+                analysis
+                    .analyzers
+                    .values()
+                    .flat_map(|analyzer| analyzer.fact_shards.iter().cloned()),
+            );
             let analysis_identity = plan
                 .repository_identity(identity)
                 .ok_or_else(|| format!("missing analysis identity for repository {identity}"))?
@@ -1419,6 +1453,7 @@ impl Indexer {
             diagnostics,
             repository_dependencies,
             cache,
+            fact_shards,
         })
     }
 
@@ -1654,6 +1689,8 @@ mod tests {
         resolver: &'static str,
     }
 
+    struct ShardedAnalyzer;
+
     struct ScopedEnricher {
         environment: &'static [u8],
     }
@@ -1830,6 +1867,7 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
+                    fact_shards: Vec::new(),
                 })
                 .collect::<Vec<_>>();
             Ok(AnalyzerContribution {
@@ -1884,6 +1922,7 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
+                    fact_shards: Vec::new(),
                 })
                 .into_iter()
                 .collect();
@@ -1899,6 +1938,59 @@ mod tests {
                     resolver: self.resolver.into(),
                     evidence: "resolver evidence".into(),
                 }],
+                diagnostics: Vec::new(),
+                cache: CacheStatistics::default(),
+            })
+        }
+    }
+
+    impl WorkspaceAnalyzer for ShardedAnalyzer {
+        fn metadata(&self) -> AnalyzerMetadata {
+            AnalyzerMetadata {
+                id: "sharded".into(),
+                version: "1".into(),
+            }
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            path.extension()
+                .is_some_and(|extension| extension == "fake")
+        }
+
+        fn analyze_prepared(
+            &self,
+            snapshot: &WorkspaceSnapshot,
+            _: &AnalyzerPlan,
+        ) -> Result<AnalyzerContribution, AnalyzerError> {
+            let repository = snapshot.repositories[0].state.repository.identity.clone();
+            let owner = EntityFact::new("rust-function://run", EntityKind::Callable, None)?;
+            let observation = Observation::dependency(
+                owner.id.as_str(),
+                beholder_domain::DependencyRelation::Calls,
+                "rust-call://work",
+                "src/input.fake:1",
+            );
+            Ok(AnalyzerContribution {
+                metadata: self.metadata(),
+                active_repositories: vec![repository.clone()],
+                repositories: vec![RepositoryContribution {
+                    repository: repository.clone(),
+                    completeness: AnalysisCompleteness::Complete,
+                    entities: vec![owner.clone()],
+                    grpc_bindings: Vec::new(),
+                    observations: vec![observation.clone()],
+                    diagnostics: Vec::new(),
+                    fact_shards: vec![FactShard {
+                        repository,
+                        producer: "rust".into(),
+                        owner: owner.id.clone(),
+                        version: "body-1".into(),
+                        entities: vec![owner],
+                        observations: vec![observation],
+                    }],
+                }],
+                overrides: Vec::new(),
+                graphql_resolvers: Vec::new(),
                 diagnostics: Vec::new(),
                 cache: CacheStatistics::default(),
             })
@@ -1997,6 +2089,22 @@ mod tests {
             indexer.analyze(&snapshot()).unwrap().repositories[0].cache,
             CacheStatus::Memory
         );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn sharded_facts_are_not_duplicated_in_repository_snapshots() {
+        let cache_dir = cache_dir("sharded-facts");
+        let analysis = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(ShardedAnalyzer)
+            .build()
+            .unwrap()
+            .analyze(&snapshot())
+            .unwrap();
+
+        assert!(analysis.repositories[0].facts.entities.is_empty());
+        assert!(analysis.repositories[0].facts.observations.is_empty());
+        assert_eq!(analysis.fact_shards.len(), 1);
         let _ = fs::remove_dir_all(cache_dir);
     }
 

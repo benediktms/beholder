@@ -27,6 +27,7 @@ beholder-observability.workspace = true
 beholder-protocol.workspace = true
 beholder-worker-client.workspace = true
 futures-util.workspace = true
+log.workspace = true
 notify = "8.2.0"
 rayon.workspace = true
 serde.workspace = true

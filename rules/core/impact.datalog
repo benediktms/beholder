@@ -16,6 +16,31 @@ traversed_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
 
 traversed_edge[from, to, relation, evidence, confidence, provenance] :=
     reachable[to],
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_dependency_observation{
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        to,
+        evidence,
+    },
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not overridden[from, relation, to, evidence]
+
+traversed_edge[from, to, relation, evidence, confidence, provenance] :=
+    reachable[to],
     *analysis_revision{view: $view, revision},
     *analysis_revision_observation{
         view: $view,

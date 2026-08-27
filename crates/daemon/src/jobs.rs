@@ -395,6 +395,7 @@ impl JobQueue {
         }
 
         let pool = SqlitePoolOptions::new()
+            .acquire_slow_level(log::LevelFilter::Debug)
             .connect_with(
                 SqliteConnectOptions::new()
                     .filename(path)

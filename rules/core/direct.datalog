@@ -2,6 +2,9 @@ selected_state[state] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_state{view: $view, revision, state}
 
+selected_shard[producer, owner, version] :=
+    *analysis_fact_shard_selection{view: $view, producer, owner, version}
+
 dependency_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_dependency_override{
@@ -36,6 +39,21 @@ effective_observation[from, resolved_to, relation, evidence, confidence, provena
     dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
 
 effective_observation[from, to, relation, evidence, confidence, provenance] :=
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not overridden[from, relation, to, evidence]
+
+effective_observation[from, to, relation, evidence, confidence, provenance] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_observation{
         view: $view,
@@ -58,6 +76,30 @@ direct[from, resolved_to, relation, evidence, confidence, provenance] :=
     dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
 
 direct[from, to, relation, evidence, confidence, provenance] :=
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_dependency_observation{
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        to,
+        evidence,
+    },
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not overridden[from, relation, to, evidence]
+
+direct[from, to, relation, evidence, confidence, provenance] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_observation{
         view: $view,
@@ -77,6 +119,16 @@ direct_pair[from, to] :=
 
 direct_pair[from, resolved_to] :=
     dependency_override[from, _, _, resolved_to, _, _, _]
+
+direct_pair[from, to] :=
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_dependency_observation{
+        producer,
+        owner,
+        version,
+        from,
+        to,
+    }
 
 direct_pair[from, to] :=
     *analysis_revision{view: $view, revision},

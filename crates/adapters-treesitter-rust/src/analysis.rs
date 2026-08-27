@@ -9,9 +9,10 @@ use beholder_domain::{
 };
 use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
 use ra_ap_syntax::{
-    AstNode, Edition, SourceFile,
+    AstNode, Edition, SourceFile, SyntaxNode,
     ast::{self, HasName},
 };
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
@@ -110,6 +111,51 @@ fn collect_tree_sitter_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<Rust
     }
 }
 
+fn tree_sitter_semantic_hash<'tree>(
+    roots: impl IntoIterator<Item = Node<'tree>>,
+    source: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
+    stack.reverse();
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "line_comment" | "block_comment") {
+            continue;
+        }
+        if node.child_count() == 0 {
+            let text = &source[node.byte_range()];
+            digest.update((node.kind().len() as u64).to_le_bytes());
+            digest.update(node.kind().as_bytes());
+            digest.update((text.len() as u64).to_le_bytes());
+            digest.update(text);
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    digest.finalize().into()
+}
+
+fn rust_analyzer_semantic_hash(
+    node: &SyntaxNode,
+    include: impl Fn(ra_ap_syntax::TextRange) -> bool,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for token in node
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+    {
+        if token.kind().is_trivia() || !include(token.text_range()) {
+            continue;
+        }
+        let text = token.text();
+        digest.update((text.len() as u64).to_le_bytes());
+        digest.update(text.as_bytes());
+    }
+    digest.finalize().into()
+}
+
 fn analyze_tree_sitter(
     source: &str,
     tree: &tree_sitter::Tree,
@@ -132,9 +178,19 @@ fn analyze_tree_sitter(
             .map(|(name, qualified_name, function)| {
                 let mut calls = Vec::new();
                 collect_tree_sitter_calls(function, source_bytes, &mut calls);
+                let body = function.child_by_field_name("body");
+                let mut cursor = function.walk();
+                let interface = function
+                    .children(&mut cursor)
+                    .filter(|child| body != Some(*child))
+                    .collect::<Vec<_>>();
                 RustFunction {
                     name,
                     qualified_name,
+                    interface_hash: tree_sitter_semantic_hash(interface, source_bytes),
+                    body_hash: body.map_or([0; 32], |body| {
+                        tree_sitter_semantic_hash([body], source_bytes)
+                    }),
                     line: function.start_position().row + 1,
                     name_offset: function
                         .child_by_field_name("name")
@@ -172,6 +228,7 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
         })
         .filter_map(|function| {
             let name = function.name()?.text().to_string();
+            let body_range = function.body().map(|body| body.syntax().text_range());
             let mut scope = function
                 .syntax()
                 .ancestors()
@@ -228,12 +285,41 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
             Some(RustFunction {
                 name,
                 qualified_name,
+                interface_hash: rust_analyzer_semantic_hash(function.syntax(), |range| {
+                    !body_range.is_some_and(|body| body.contains_range(range))
+                }),
+                body_hash: body_range.map_or([0; 32], |body| {
+                    rust_analyzer_semantic_hash(function.syntax(), |range| {
+                        body.contains_range(range)
+                    })
+                }),
                 line: line_at(&lines, function.syntax().text_range().start()),
                 name_offset: usize::from(function.name()?.syntax().text_range().start()),
                 calls,
             })
         })
         .collect()
+}
+
+fn disambiguate_function_names(functions: &mut [RustFunction]) {
+    let totals = functions
+        .iter()
+        .fold(BTreeMap::new(), |mut totals, function| {
+            *totals
+                .entry(function.qualified_name.clone())
+                .or_insert(0usize) += 1;
+            totals
+        });
+    let mut seen = BTreeMap::new();
+    for function in functions {
+        if totals[&function.qualified_name] > 1 {
+            let ordinal = seen
+                .entry(function.qualified_name.clone())
+                .or_insert(0usize);
+            function.qualified_name = format!("{}#{ordinal}", function.qualified_name);
+            *ordinal += 1;
+        }
+    }
 }
 
 pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
@@ -271,6 +357,7 @@ pub(super) fn analyze_with_plugins(
             analyze_tree_sitter(source, &tree)?
         }
     };
+    disambiguate_function_names(&mut analysis.functions);
     plugins.recognize(
         SourceRecognitionInput {
             path,
@@ -452,5 +539,22 @@ mod recovery_tests {
         assert_eq!(calls[1].name, "Default::default");
         assert_eq!(calls[2].name, "run");
         assert!(calls[2].receiver_method);
+    }
+
+    #[test]
+    fn gives_cfg_alternatives_stable_distinct_names() {
+        let source = "#[cfg(unix)] fn path_bytes() {} #[cfg(windows)] fn path_bytes() {}";
+        let shifted = format!("// comment\n{source}");
+        let names = |source| {
+            analyze(source)
+                .unwrap()
+                .functions
+                .into_iter()
+                .map(|function| function.qualified_name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(source), vec!["path_bytes#0", "path_bytes#1"]);
+        assert_eq!(names(source), names(&shifted));
     }
 }
