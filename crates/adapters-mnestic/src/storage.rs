@@ -119,6 +119,10 @@ fn replace_fact_shards(
         )?;
     }
 
+    let mut entity_rows = Vec::new();
+    let mut observation_rows = Vec::new();
+    let mut dependency_rows = Vec::new();
+    let mut selection_rows = Vec::new();
     for shard in shards {
         let key = (
             shard.producer.clone(),
@@ -138,93 +142,89 @@ fn replace_fact_shards(
             shard.owner.as_str().into(),
             shard.version.as_str().into(),
         ];
-        let entities = shard
-            .entities
-            .iter()
-            .map(|entity| {
-                let mut row = scope.to_vec();
-                row.extend([
-                    entity.id.as_str().into(),
-                    entity_kind(entity.kind).into(),
-                    entity_metadata(entity.metadata).into(),
-                ]);
-                DataValue::List(row)
-            })
-            .collect::<Vec<_>>();
-        if !entities.is_empty() {
-            transaction.run_script(
-                "?[producer, owner, version, id, kind, metadata] <- $rows \
-                 :put analysis_fact_shard_entity {\
-                     producer, owner, version, id => kind, metadata\
-                 }",
-                BTreeMap::from([("rows".into(), DataValue::List(entities))]),
-            )?;
-        }
-        let observations = shard
-            .observations
-            .iter()
-            .map(|observation| {
-                let mut row = scope.to_vec();
-                row.extend([
-                    observation.from.as_str().into(),
-                    observation.relation.as_str().into(),
-                    observation.to.as_str().into(),
-                    observation.evidence.as_str().into(),
-                    observation.confidence.score().into(),
-                    observation.provenance.as_str().into(),
-                ]);
-                DataValue::List(row)
-            })
-            .collect::<Vec<_>>();
-        if !observations.is_empty() {
-            transaction.run_script(
-                "?[producer, owner, version, from, relation, to, evidence, confidence, provenance] \
-                     <- $rows \
-                 :put analysis_fact_shard_observation {\
-                     producer, owner, version, from, relation, to, evidence \
-                     => confidence, provenance\
-                 }",
-                BTreeMap::from([("rows".into(), DataValue::List(observations))]),
-            )?;
-        }
-        let dependencies = shard
-            .observations
-            .iter()
-            .filter(|observation| observation.relation.dependency().is_some())
-            .map(|observation| {
-                let mut row = scope.to_vec();
-                row.extend([
-                    observation.from.as_str().into(),
-                    observation.relation.as_str().into(),
-                    observation.to.as_str().into(),
-                    observation.evidence.as_str().into(),
-                ]);
-                DataValue::List(row)
-            })
-            .collect::<Vec<_>>();
-        if !dependencies.is_empty() {
-            transaction.run_script(
-                "?[producer, owner, version, from, relation, to, evidence] <- $rows \
-                 :put analysis_fact_shard_dependency_observation {\
-                     producer, owner, version, from, relation, to, evidence\
-                 }",
-                BTreeMap::from([("rows".into(), DataValue::List(dependencies))]),
-            )?;
-        }
-        transaction.run_script(
-            "?[view, producer, repository, owner, version] <- [[\
-                 $view, $producer, $repository, $owner, $version\
-             ]] :put analysis_fact_shard_selection {\
+        entity_rows.extend(shard.entities.iter().map(|entity| {
+            let mut row = scope.to_vec();
+            row.extend([
+                entity.id.as_str().into(),
+                entity_kind(entity.kind).into(),
+                entity_metadata(entity.metadata).into(),
+            ]);
+            DataValue::List(row)
+        }));
+        observation_rows.extend(shard.observations.iter().map(|observation| {
+            let mut row = scope.to_vec();
+            row.extend([
+                observation.from.as_str().into(),
+                observation.relation.as_str().into(),
+                observation.to.as_str().into(),
+                observation.evidence.as_str().into(),
+                observation.confidence.score().into(),
+                observation.provenance.as_str().into(),
+            ]);
+            DataValue::List(row)
+        }));
+        dependency_rows.extend(
+            shard
+                .observations
+                .iter()
+                .filter(|observation| observation.relation.dependency().is_some())
+                .map(|observation| {
+                    let mut row = scope.to_vec();
+                    row.extend([
+                        observation.from.as_str().into(),
+                        observation.relation.as_str().into(),
+                        observation.to.as_str().into(),
+                        observation.evidence.as_str().into(),
+                    ]);
+                    DataValue::List(row)
+                }),
+        );
+        selection_rows.push(DataValue::List(vec![
+            view.into(),
+            shard.producer.as_str().into(),
+            shard.repository.as_str().into(),
+            shard.owner.as_str().into(),
+            shard.version.as_str().into(),
+        ]));
+    }
+    for (script, rows) in [
+        (
+            "?[producer, owner, version, id, kind, metadata] <- $rows \
+             :put analysis_fact_shard_entity {\
+                 producer, owner, version, id => kind, metadata\
+             }",
+            entity_rows,
+        ),
+        (
+            "?[producer, owner, version, from, relation, to, evidence, confidence, provenance] \
+                 <- $rows \
+             :put analysis_fact_shard_observation {\
+                 producer, owner, version, from, relation, to, evidence \
+                 => confidence, provenance\
+             }",
+            observation_rows,
+        ),
+        (
+            "?[producer, owner, version, from, relation, to, evidence] <- $rows \
+             :put analysis_fact_shard_dependency_observation {\
+                 producer, owner, version, from, relation, to, evidence\
+             }",
+            dependency_rows,
+        ),
+        (
+            "?[view, producer, repository, owner, version] <- $rows \
+             :put analysis_fact_shard_selection {\
                  view, producer, repository, owner => version\
              }",
-            BTreeMap::from([
-                ("view".into(), view.into()),
-                ("producer".into(), shard.producer.as_str().into()),
-                ("repository".into(), shard.repository.as_str().into()),
-                ("owner".into(), shard.owner.as_str().into()),
-                ("version".into(), shard.version.as_str().into()),
-            ]),
-        )?;
+            selection_rows,
+        ),
+    ] {
+        for rows in rows.chunks(FACT_BATCH_SIZE) {
+            transaction.run_script(
+                script,
+                BTreeMap::from([("rows".into(), DataValue::List(rows.to_vec()))]),
+            )?;
+        }
     }
     Ok(changes)
 }
