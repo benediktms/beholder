@@ -2202,6 +2202,7 @@ fn index_workspace_through_port(
         })
         .sum::<usize>();
     let repository_analysis_started = Instant::now();
+    scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
     let analysis = tracing::info_span!(
         "index.analyze",
         workspace = %workspace.name,
@@ -2264,6 +2265,7 @@ fn index_workspace_through_port(
         .map(|facts| facts.observations.len())
         .sum();
     let publication_started = Instant::now();
+    scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
     let (current, verification_statistics) =
         refresh_workspace_snapshot(scheduler, workspace, dirty)?;
     if scheduler.is_stopping() && !drain_on_shutdown {
@@ -2279,6 +2281,7 @@ fn index_workspace_through_port(
             "workspace inputs changed during indexing; stale analysis was discarded".into(),
         );
     }
+    scheduler.ensure_generation_current(&workspace.name, indexed_generation)?;
     let changes = tracing::info_span!(
         "index.publish",
         workspace = %workspace.name,
