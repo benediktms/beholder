@@ -157,6 +157,15 @@ and fixed ambiguous Rust owners: duplicate qualified names now receive a stable
 file-local ordinal, and Mnestic reports the exact conflicting owners if uniqueness
 is violated again.
 
+The exact release binary was also installed over an existing 8.2 GiB semantic
+database. The first unbatched cutover was still publishing after more than four
+minutes. Batching immutable shard contents and selections in 10,000-row writes
+reduced the completed retry to 91 seconds: 194 ms inventory, 533 ms analysis, and
+approximately 90 seconds in the one-time legacy-baseline removal and initial shard
+transaction. A subsequent unchanged manual job was admitted while automatic
+garbage collection was sweeping older large-workspace states, so its durable elapsed
+time is not a valid unchanged-indexing measurement.
+
 This is the first executable slice, not the final performance target. Salsa state
 is process-local, compiler enrichment still uses its existing input identity, and
 non-Rust frontends still publish through repository facts. Cross-process query
