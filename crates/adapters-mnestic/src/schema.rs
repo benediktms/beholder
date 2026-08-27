@@ -391,6 +391,14 @@ pub(super) const CREATE_FACT_SHARD_DEPENDENCY_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_BASELINE_FINGERPRINT_SCHEMA: &str = r#"
+:create analysis_baseline_fingerprint {
+    view: String,
+    =>
+    fingerprint: String,
+}
+"#;
+
 pub(super) const CREATE_SCHEMA_MIGRATION_SCHEMA: &str = r#"
 :create schema_migration {
     name: String,
