@@ -204,7 +204,12 @@ check_grpc_path() {
     operation="grpc://phase5.v1.Bridge/$method"
     contract="proto-method://phase5.v1.Bridge/$method"
 
-    context="$(target/debug/beholder context --json --workspace main "$operation")"
+    context=''
+    for _ in {1..600}; do
+        context="$(target/debug/beholder context --json --workspace main "$operation" 2>/dev/null || true)"
+        grep -Fq '"stale":false' <<<"$context" && break
+        sleep 0.1
+    done
     for expected in "$client" "$server" "$contract" '"kind":"calls_rpc"' \
         '"kind":"implemented_by"' '"kind":"binds_contract"' '"confidence":1.0' \
         '"stale":false'; do
