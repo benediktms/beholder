@@ -315,6 +315,18 @@ impl SemanticStore {
         Ok(())
     }
 
+    pub fn checkpoint_passive(&self) -> Result<(), Box<dyn Error>> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| "semantic store engine lock poisoned")?;
+        #[cfg(feature = "sqlite")]
+        if let Some(path) = &self.database_path {
+            sqlite::open(path)?.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
+        }
+        Ok(())
+    }
+
     pub fn garbage_collect(&self) -> Result<GarbageCollection, Box<dyn Error>> {
         self.access(|| {
             Ok(GarbageCollection {
@@ -976,6 +988,25 @@ mod tests {
         assert_eq!(edge_count, 1);
         writer.abort().unwrap();
         reader_thread.join().unwrap();
+
+        let reader = store.read_db.multi_transaction(false);
+        reader
+            .run_script(
+                "?[revision] := *analysis_revision{view: 'main', revision}",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let (sent, received) = mpsc::channel();
+        let checkpoint = store.clone();
+        let checkpoint_thread =
+            thread::spawn(move || sent.send(checkpoint.checkpoint_passive().is_ok()).unwrap());
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("checkpoint blocked behind the active read snapshot")
+        );
+        reader.abort().unwrap();
+        checkpoint_thread.join().unwrap();
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }

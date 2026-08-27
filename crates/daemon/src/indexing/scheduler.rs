@@ -1181,7 +1181,7 @@ impl IndexScheduler {
             .spawn(move || {
                 let started = std::time::Instant::now();
                 let result = match scheduler.begin("checkpoint") {
-                    Ok(_active) => store.checkpoint(),
+                    Ok(_active) => store.checkpoint_passive(),
                     Err(error) => Err(Box::new(error) as Box<dyn Error>),
                 };
                 drop(store);
