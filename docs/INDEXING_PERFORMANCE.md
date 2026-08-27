@@ -166,6 +166,15 @@ transaction. A subsequent unchanged manual job was admitted while automatic
 garbage collection was sweeping older large-workspace states, so its durable elapsed
 time is not a valid unchanged-indexing measurement.
 
+Stage-level instrumentation on the same persistent database later isolated a
+one-file Rust edit: inventory took 71 ms, analysis 717 ms, and publication
+17.8 seconds. Baseline replacement did not run. Publication spent 1.46 seconds
+reading 25,570 effective observations, 50 ms replacing 1,966 shard selections,
+207 ms storing repository/revision metadata, 15.9 seconds carrying forward
+enrichment contributions, and 77 ms committing. The remaining hot path is
+therefore revision-local enrichment materialisation, not shard persistence,
+baseline replacement, or SQLite commit throughput.
+
 This is the first executable slice, not the final performance target. Salsa state
 is process-local, compiler enrichment still uses its existing input identity, and
 non-Rust frontends still publish through repository facts. Cross-process query

@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const FACT_BATCH_SIZE: usize = 10_000;
@@ -1394,6 +1394,7 @@ pub(super) fn publish_observations(
     fact_shards: &[FactShard],
     verification_fingerprint: Option<&str>,
 ) -> Result<FactChanges, Box<dyn Error>> {
+    let publication_started = Instant::now();
     if repositories
         .iter()
         .any(|facts| facts.analysis_identity.is_empty())
@@ -1408,13 +1409,22 @@ pub(super) fn publish_observations(
     {
         return Err("repository facts do not match the workspace view".into());
     }
+    let started = Instant::now();
     let resolution = resolve_grpc_bindings(repositories)?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "resolve_bindings",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        observations = resolution.observations.len(),
+        "Mnestic publication stage completed"
+    );
     let baseline_fingerprint = baseline_fingerprint(repositories, &resolution, overrides);
     let params = BTreeMap::from([
         ("view".into(), view.name.clone().into()),
         ("fingerprint".into(), view.fingerprint().into()),
     ]);
     let transaction = db.multi_transaction(true);
+    let started = Instant::now();
     let current = transaction.run_script(
         &format!(
             "{DIRECT_RULES}\n\
@@ -1436,6 +1446,13 @@ pub(super) fn publish_observations(
             Ok(((value(0)?, value(1)?, value(2)?), value(3)?))
         })
         .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "read_effective_observations",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        rows_read = current.len(),
+        "Mnestic publication stage completed"
+    );
     let override_targets = overrides
         .iter()
         .map(|override_| {
@@ -1450,6 +1467,7 @@ pub(super) fn publish_observations(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let started = Instant::now();
     let next = repositories
         .iter()
         .flat_map(|facts| &facts.observations)
@@ -1476,6 +1494,14 @@ pub(super) fn publish_observations(
             ((from, relation, to), evidence)
         })
         .collect::<BTreeMap<_, _>>();
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "build_next_observations",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        rows = next.len(),
+        "Mnestic publication stage completed"
+    );
+    let started = Instant::now();
     let mut changes = FactChanges::default();
     for (key, evidence) in &next {
         match current.get(key) {
@@ -1488,9 +1514,32 @@ pub(super) fn publish_observations(
         .keys()
         .filter(|key| !next.contains_key(*key))
         .count();
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "diff_effective_observations",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        rows_inserted = changes.inserted,
+        rows_updated = changes.updated,
+        rows_removed = changes.removed,
+        rows_unchanged = changes.unchanged,
+        "Mnestic publication stage completed"
+    );
 
-    replace_fact_shards(&transaction, &view.name, fact_shards)?;
+    let started = Instant::now();
+    let shard_changes = replace_fact_shards(&transaction, &view.name, fact_shards)?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "replace_fact_shards",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        shards = fact_shards.len(),
+        rows_inserted = shard_changes.inserted,
+        rows_updated = shard_changes.updated,
+        rows_removed = shard_changes.removed,
+        rows_unchanged = shard_changes.unchanged,
+        "Mnestic publication stage completed"
+    );
 
+    let started = Instant::now();
     let mut analyzed_states = Vec::with_capacity(repositories.len());
     for facts in repositories {
         let desired = analyzed_state(facts);
@@ -1506,6 +1555,14 @@ pub(super) fn publish_observations(
         };
         analyzed_states.push(state);
     }
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "store_repository_states",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        repositories = repositories.len(),
+        "Mnestic publication stage completed"
+    );
+    let started = Instant::now();
     transaction.run_script(
         "?[view, revision] := \
              *analysis_revision{view: $view, revision: previous}, \
@@ -1575,6 +1632,15 @@ pub(super) fn publish_observations(
             params,
         )?;
     }
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "store_revision_manifest",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        repositories = repositories.len(),
+        overrides = overrides.len(),
+        "Mnestic publication stage completed"
+    );
+    let started = Instant::now();
     let baseline_changed = transaction
         .run_script(
             "?[fingerprint] := *analysis_baseline_fingerprint{view: $view, fingerprint}",
@@ -1584,8 +1650,22 @@ pub(super) fn publish_observations(
         .first()
         .and_then(|row| row[0].get_str())
         != Some(baseline_fingerprint.as_str());
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "read_baseline_fingerprint",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        baseline_changed,
+        "Mnestic publication stage completed"
+    );
     if baseline_changed {
+        let started = Instant::now();
         replace_baseline_snapshot(&transaction, &view.name)?;
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "replace_baseline_snapshot",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Mnestic publication stage completed"
+        );
         transaction.run_script(
             "?[view, fingerprint] <- [[$view, $fingerprint]] \
              :put analysis_baseline_fingerprint {view => fingerprint}",
@@ -1595,10 +1675,46 @@ pub(super) fn publish_observations(
             ]),
         )?;
     }
+    let started = Instant::now();
     carry_forward_enrichments(&transaction, &view.name)?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "carry_forward_enrichments",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "Mnestic publication stage completed"
+    );
+    let started = Instant::now();
     let obsolete = obsolete_enrichment_owners(&transaction, &view.name)?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "find_obsolete_enrichments",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        obsolete_owners = obsolete.len(),
+        "Mnestic publication stage completed"
+    );
+    let started = Instant::now();
     remove_enrichment_state(&transaction, &view.name, &obsolete)?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "remove_obsolete_enrichments",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        obsolete_owners = obsolete.len(),
+        "Mnestic publication stage completed"
+    );
+    let started = Instant::now();
     transaction.commit()?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "transaction_commit",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "Mnestic publication stage completed"
+    );
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "total",
+        elapsed_ms = publication_started.elapsed().as_secs_f64() * 1000.0,
+        "Mnestic publication completed"
+    );
     Ok(changes)
 }
 
@@ -1607,31 +1723,56 @@ fn replace_baseline_snapshot(
     view: &str,
 ) -> Result<(), Box<dyn Error>> {
     let params = BTreeMap::from([("view".into(), view.into())]);
-    for script in [
-        "?[view, id] := *analysis_baseline_entity{view: $view, id}, view = $view \
+    for (relation, script) in [
+        (
+            "entities",
+            "?[view, id] := *analysis_baseline_entity{view: $view, id}, view = $view \
          :rm analysis_baseline_entity {view, id}",
-        "?[view, from, relation, to, evidence] := *analysis_baseline_observation{\
+        ),
+        (
+            "observations",
+            "?[view, from, relation, to, evidence] := *analysis_baseline_observation{\
              view: $view, from, relation, to, evidence\
          }, view = $view \
          :rm analysis_baseline_observation {view, from, relation, to, evidence}",
-        "?[view, from, relation, unresolved_to] := *analysis_baseline_dependency_override{\
+        ),
+        (
+            "overrides",
+            "?[view, from, relation, unresolved_to] := *analysis_baseline_dependency_override{\
              view: $view, from, relation, unresolved_to\
          }, view = $view \
          :rm analysis_baseline_dependency_override {view, from, relation, unresolved_to}",
-        "?[view, repository, code, severity, path, line] := *analysis_baseline_diagnostic{\
+        ),
+        (
+            "diagnostics",
+            "?[view, repository, code, severity, path, line] := *analysis_baseline_diagnostic{\
              view: $view, repository, code, severity, path, line\
          }, view = $view \
          :rm analysis_baseline_diagnostic {view, repository, code, severity, path, line}",
+        ),
     ] {
+        let started = Instant::now();
         transaction.run_script(script, params.clone())?;
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "replace_baseline.delete",
+            relation,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Mnestic publication stage completed"
+        );
     }
-    for script in [
-        "?[view, id, kind, metadata, revision_owned] := \
+    for (relation, script) in [
+        (
+            "state_entities",
+            "?[view, id, kind, metadata, revision_owned] := \
              *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view, revision, state}, \
              *state_entity{state, id, kind, metadata}, revision_owned = false \
          :put analysis_baseline_entity {view, id => kind, metadata, revision_owned}",
-        "?[view, from, relation, to, evidence, confidence, provenance, revision_owned] := \
+        ),
+        (
+            "state_observations",
+            "?[view, from, relation, to, evidence, confidence, provenance, revision_owned] := \
              *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view, revision, state}, \
              *state_observation{state, from, relation, to, evidence}, \
@@ -1640,19 +1781,28 @@ fn replace_baseline_snapshot(
          :put analysis_baseline_observation {\
              view, from, relation, to, evidence => confidence, provenance, revision_owned\
          }",
-        "?[view, id, kind, metadata, revision_owned] := \
+        ),
+        (
+            "revision_entities",
+            "?[view, id, kind, metadata, revision_owned] := \
              *analysis_revision{view: $view, revision}, \
              *analysis_revision_entity{view, revision, id, kind, metadata}, \
              revision_owned = true \
          :put analysis_baseline_entity {view, id => kind, metadata, revision_owned}",
-        "?[view, from, relation, to, evidence, confidence, provenance, revision_owned] := \
+        ),
+        (
+            "revision_observations",
+            "?[view, from, relation, to, evidence, confidence, provenance, revision_owned] := \
              *analysis_revision{view: $view, revision}, *analysis_revision_observation{\
                  view, revision, from, relation, to, evidence, confidence, provenance\
              }, revision_owned = true \
          :put analysis_baseline_observation {\
              view, from, relation, to, evidence => confidence, provenance, revision_owned\
          }",
-        "?[view, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
+        ),
+        (
+            "overrides",
+            "?[view, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
              *analysis_revision{view: $view, revision}, *analysis_revision_dependency_override{\
                  view, revision, from, relation, unresolved_to, resolved_to, evidence\
              }, *analysis_revision_dependency_override_metadata{\
@@ -1661,15 +1811,27 @@ fn replace_baseline_snapshot(
          :put analysis_baseline_dependency_override {\
              view, from, relation, unresolved_to => resolved_to, evidence, confidence, provenance\
          }",
-        "?[view, repository, code, severity, path, line, detail] := \
+        ),
+        (
+            "diagnostics",
+            "?[view, repository, code, severity, path, line, detail] := \
              *analysis_revision{view: $view, revision}, *analysis_revision_diagnostic{\
                  view, revision, repository, code, severity, path, line, detail\
              } \
          :put analysis_baseline_diagnostic {\
              view, repository, code, severity, path, line => detail\
          }",
+        ),
     ] {
+        let started = Instant::now();
         transaction.run_script(script, params.clone())?;
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "replace_baseline.populate",
+            relation,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Mnestic publication stage completed"
+        );
     }
     Ok(())
 }
@@ -1987,8 +2149,10 @@ fn materialize_enrichment_contributions(
     // enrichment publication only rematerializes keys removed from its candidate revision.
     let valid_owner = valid_enrichment_owner_rule();
     let scripts = [
-        format!(
-            "{valid_owner}\
+        (
+            "entities",
+            format!(
+                "{valid_owner}\
              state_baseline[id] := *analysis_baseline_entity{{\
                  view: $view, id, revision_owned: false\
              }}\n\
@@ -2009,9 +2173,12 @@ fn materialize_enrichment_contributions(
                  not *analysis_revision_entity{{view: $view, revision: $revision, id}}, \
                  view = $view, revision = $revision \
              :put analysis_revision_entity {{view, revision, id => kind, metadata}}"
+            ),
         ),
-        format!(
-            "{valid_owner}\
+        (
+            "observations",
+            format!(
+                "{valid_owner}\
              state_baseline[from, relation, to, evidence] := *analysis_baseline_observation{{\
                  view: $view, from, relation, to, evidence, revision_owned: false\
              }}\n\
@@ -2044,9 +2211,12 @@ fn materialize_enrichment_contributions(
              :put analysis_revision_observation {{\
                  view, revision, from, relation, to, evidence => confidence, provenance\
              }}"
+            ),
         ),
-        format!(
-            "{valid_owner}\
+        (
+            "overrides",
+            format!(
+                "{valid_owner}\
              candidate[from, relation, unresolved_to, cost, resolved_to, evidence, confidence, provenance] := \
                  *analysis_baseline_dependency_override{{\
                      view: $view, from, relation, unresolved_to, resolved_to, evidence, \
@@ -2071,9 +2241,12 @@ fn materialize_enrichment_contributions(
              :put analysis_revision_dependency_override {{\
                  view, revision, from, relation, unresolved_to => resolved_to, evidence\
              }}"
+            ),
         ),
-        format!(
-            "{valid_owner}\
+        (
+            "override_metadata",
+            format!(
+                "{valid_owner}\
              candidate[from, relation, unresolved_to, cost, confidence, provenance] := \
                  *analysis_baseline_dependency_override{{\
                      view: $view, from, relation, unresolved_to, confidence, provenance\
@@ -2096,9 +2269,12 @@ fn materialize_enrichment_contributions(
              :put analysis_revision_dependency_override_metadata {{\
                  view, revision, from, relation, unresolved_to => confidence, provenance\
              }}"
+            ),
         ),
-        format!(
-            "{valid_owner}\
+        (
+            "diagnostics",
+            format!(
+                "{valid_owner}\
              candidate[repository, code, severity, path, line, cost, detail] := \
                  *analysis_baseline_diagnostic{{\
                      view: $view, repository, code, severity, path, line, detail\
@@ -2119,18 +2295,27 @@ fn materialize_enrichment_contributions(
              :put analysis_revision_diagnostic {{\
                  view, revision, repository, code, severity, path, line => detail\
              }}"
+            ),
         ),
     ];
     let params = BTreeMap::from([
         ("view".into(), view.into()),
         ("revision".into(), revision.into()),
     ]);
-    for (index, script) in scripts.into_iter().enumerate() {
+    for (relation, script) in scripts {
+        let started = Instant::now();
         transaction
             .run_script(&script, params.clone())
             .map_err(|error| {
-                format!("failed to materialize enrichment relation {index}: {error}")
+                format!("failed to materialize enrichment relation {relation}: {error}")
             })?;
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "materialize_enrichment_contributions",
+            relation,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Mnestic publication stage completed"
+        );
     }
     Ok(())
 }

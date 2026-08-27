@@ -115,6 +115,12 @@ components remain Rust queries that can be cached against the completed graph
 revision. Module SCCs are recomputed when module dependency topology changes;
 they are not a second general-purpose invalidation scheduler.
 
+Publication cost must be proportional to changed semantic output, not the total
+selected graph size or historical database size. Publishing advances a revision
+manifest by selecting immutable repository states, fact shards, and enrichments;
+superseded data becomes unreachable and is reclaimed by asynchronous garbage
+collection rather than synchronous publication.
+
 ### Initial Rust slice
 
 The first executable slice must cover the whole hot path rather than proving
