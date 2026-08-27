@@ -100,6 +100,7 @@ impl WorkspaceAnalyzer for GraphqlAnalyzer {
                 grpc_bindings: Vec::new(),
                 observations: analysis.observations,
                 diagnostics: analysis.diagnostics,
+                fact_shards: Vec::new(),
             });
         }
         Ok(AnalyzerContribution {

@@ -294,6 +294,7 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
                 grpc_bindings: enrichment.grpc_bindings,
                 observations,
                 diagnostics,
+                fact_shards: Vec::new(),
             });
         }
 

@@ -375,6 +375,7 @@ impl Output {
                 grpc_bindings: Vec::new(),
                 observations: self.observations,
                 diagnostics: self.diagnostics,
+                fact_shards: Vec::new(),
             }],
             overrides: Vec::new(),
             graphql_resolvers: Vec::new(),

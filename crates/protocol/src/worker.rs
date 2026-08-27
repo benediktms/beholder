@@ -699,6 +699,7 @@ fn repository_from_wire(
             .into_iter()
             .map(entity_from_wire)
             .collect::<Result<_, _>>()?,
+        fact_shards: Vec::new(),
         grpc_bindings: repository
             .grpc_bindings
             .into_iter()
@@ -1206,6 +1207,7 @@ mod tests {
                     })
                     .collect(),
                 diagnostics: Vec::new(),
+                fact_shards: Vec::new(),
             }],
             overrides: (0..5_000)
                 .map(|index| DependencyOverride {
