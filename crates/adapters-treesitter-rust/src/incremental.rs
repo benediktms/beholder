@@ -230,13 +230,17 @@ impl IncrementalRust {
                     self.files.insert(id, source);
                     (source, status)
                 };
-                PreparedSource {
-                    db: self.db.clone(),
-                    path: (*path).to_owned(),
-                    source,
-                    status,
-                    cache_path,
-                }
+                ((*path).to_owned(), source, status, cache_path)
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepared
+            .into_iter()
+            .map(|(path, source, status, cache_path)| PreparedSource {
+                db: self.db.clone(),
+                path,
+                source,
+                status,
+                cache_path,
             })
             .collect::<Vec<_>>();
         prepared
@@ -363,5 +367,33 @@ mod tests {
             body_changed[0].interface_hash
         );
         assert_eq!(interface_changed[1], body_changed[1]);
+    }
+
+    #[test]
+    fn updates_after_an_unchanged_sibling() {
+        let cache = std::env::temp_dir().join(format!(
+            "beholder-rust-incremental-test-{}",
+            std::process::id()
+        ));
+        let mut incremental = IncrementalRust::new(cache.clone());
+        let active = ActivePlugins::default();
+        let first = Path::new("src/first.rs");
+        let second = Path::new("src/second.rs");
+        incremental.analyze_many(
+            "beholder",
+            &[(first, "fn first() {}"), (second, "fn before() {}")],
+            &active,
+            "",
+        );
+
+        let updated = incremental.analyze_many(
+            "beholder",
+            &[(first, "fn first() {}"), (second, "fn after() {}")],
+            &active,
+            "",
+        );
+
+        assert!(updated.into_iter().all(|(_, result)| result.is_ok()));
+        fs::remove_dir_all(cache).unwrap();
     }
 }
