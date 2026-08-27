@@ -74,3 +74,48 @@ another 1.5 seconds, and eight save only another 0.5 seconds.
 - Keep 10,000-row Mnestic publication batches.
 - Treat RocksDB or broader storage changes as separate work only if publication
   remains a measured bottleneck after incremental indexing is implemented.
+
+## Startup reconciliation follow-up
+
+Measurements on 2026-08-27 used the installed daemon and a Fresha workspace
+containing 27,146 accepted inputs (184,600,052 bytes). The persistent semantic
+database was 8.2 GiB.
+
+An unchanged startup reconciliation originally took about 275 seconds when an
+immediate garbage-collection sweep competed with indexing. A later changed
+publication took 1,016 seconds in the scheduler, including 896.6 seconds in
+Mnestic publication.
+
+After deferring periodic garbage collection until its first interval, serializing
+requested sweeps with other semantic-store mutations, avoiding a second read of
+already-hashed inventory blobs, and checking cheap gRPC activation evidence before
+parsing Elixir sources, an isolated unchanged workspace completed in 40.6 seconds:
+
+| Stage | Time |
+| --- | ---: |
+| Authoritative inventory | 25.1 s |
+| Prepare and current-view check | 15.5 s |
+| Total scheduler operation | 40.6 s |
+
+The exact final binary was then reinstalled and allowed to perform its normal startup
+sequence. A changed Beholder publication completed in 91.6 seconds, followed by an
+unchanged Fresha reconciliation in 50.6 seconds. The periodic garbage collector
+became eligible during Fresha indexing but waited behind indexing and checkpointing;
+it did not preempt either operation.
+
+While that collector later held the semantic-store mutation gate, a context query
+completed in 6.49 seconds and 1.08 seconds on immediate repetition. It did not
+wait for the writer to finish, confirming that semantic reads use the reserved read
+engine; the first-read latency remains observable rather than hidden.
+
+A manual unchanged Beholder job queued during that sweep. Once admitted, its
+scheduler operation took 8.31 seconds (220 ms inventory), returned `Unchanged`, and
+published nothing. The durable attempt took 242 seconds including its wait behind
+the already-running sweep, making garbage-collection latency visible without
+conflating it with indexing time.
+
+A separate attempt to incrementally replace the immutable repository-state baseline
+increased a real Beholder publication to 166.9 seconds, so it was rejected.
+Repository facts remain immutable. The next unchanged-path optimization target is
+the measured prepare/current-view path; changed publication remains a separate
+Mnestic bottleneck. Neither justifies a mutable graph or another cache layer.
