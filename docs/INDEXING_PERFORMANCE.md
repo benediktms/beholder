@@ -184,6 +184,18 @@ freshness explicit. Enrichment publication swaps one selection atomically, and
 background garbage collection removes superseded snapshots and the deprecated
 materialized baseline.
 
+The installed-daemon follow-up used the existing 11 GiB database. A changed Rust
+enrichment completed in about 2 seconds: worker analysis took 1.77 seconds and
+Mnestic publication took 59 ms. Within publication, storing 899 overrides and 543
+diagnostics took 12 ms, copying the revision manifest took 4 ms, refreshing the
+affected winner selections took 38 ms, and committing the SQLite transaction took
+4 ms. Removing an unconditional five-second wait for the completed one-shot worker
+made the durable job track the actual analysis time. These measurements do not
+support either a database per repository or a storage-engine migration: SQLite's
+single writer is not the limiting stage on the changed-enrichment path. Revisit
+that decision only if writer-wait instrumentation shows sustained publication
+contention after query plans and garbage-collection scheduling are bounded.
+
 This is the first executable slice, not the final performance target. Salsa state
 is process-local, compiler enrichment still uses its existing input identity, and
 non-Rust frontends still publish through repository facts. Cross-process query
