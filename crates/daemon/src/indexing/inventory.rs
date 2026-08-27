@@ -1,7 +1,9 @@
 use super::sources::accepted_files;
 use beholder_adapters_git::repository_state_from_content_hashes;
-use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind};
-use beholder_indexing::{Indexer, InputKind, RepositoryInput, RepositorySnapshot};
+use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
+use beholder_indexing::{
+    Indexer, InputKind, RepositoryInput, RepositorySnapshot, WorkspaceSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,6 +18,7 @@ use std::{
 };
 
 const INVENTORY_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 1;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) enum RefreshMode<'a> {
@@ -66,6 +69,27 @@ pub(super) struct InventoryStore {
     content: Mutex<BTreeMap<String, Arc<[u8]>>>,
 }
 
+pub(super) struct WorkspaceCheckpoint<'a> {
+    pub(super) workspace: &'a Workspace,
+    pub(super) snapshot: &'a WorkspaceSnapshot,
+    pub(super) indexer: &'a Indexer,
+    pub(super) verification_fingerprint: &'a str,
+}
+
+pub(super) struct CheckpointVerification {
+    pub(super) verification_fingerprint: String,
+    inventory_keys: Vec<String>,
+}
+
+struct ManifestVerification<'a> {
+    repository: &'a str,
+    base: &'a Path,
+    descriptors: &'a [PathBuf],
+    indexer: &'a Indexer,
+    key: &'a str,
+    expected_fingerprint: &'a str,
+}
+
 impl InventoryStore {
     pub(super) fn new(cache_dir: &Path) -> Self {
         let cache_dir = if cache_dir.as_os_str().is_empty() {
@@ -90,6 +114,185 @@ impl InventoryStore {
         if let Ok(mut content) = self.content.lock() {
             content.clear();
         }
+    }
+
+    pub(super) fn verify_checkpoint(
+        &self,
+        workspace: &Workspace,
+        indexer: &Indexer,
+    ) -> Result<Option<CheckpointVerification>, BeholderError> {
+        let path = self.checkpoint_path(&workspace.name);
+        let Some(checkpoint) = load_checkpoint(&path) else {
+            tracing::debug!(workspace = %workspace.name, "reconciliation checkpoint unavailable");
+            return Ok(None);
+        };
+        let reconciliation_identity = indexer.reconciliation_identity();
+        if checkpoint.reconciliation_identity != reconciliation_identity
+            || checkpoint.enabled_plugins != workspace.enabled_plugins
+            || checkpoint.repositories.len() != workspace.repositories.len()
+        {
+            tracing::debug!(
+                workspace = %workspace.name,
+                catalog_matches = checkpoint.reconciliation_identity == reconciliation_identity,
+                plugin_configuration_matches = checkpoint.enabled_plugins == workspace.enabled_plugins,
+                repository_count_matches = checkpoint.repositories.len() == workspace.repositories.len(),
+                "reconciliation checkpoint configuration changed"
+            );
+            return Ok(None);
+        }
+        let mut inventory_keys = Vec::with_capacity(workspace.repositories.len());
+        for (configured, persisted) in workspace.repositories.iter().zip(&checkpoint.repositories) {
+            let descriptors = workspace
+                .protobuf_descriptors
+                .iter()
+                .filter(|descriptor| descriptor.repository == configured.repository)
+                .map(|descriptor| descriptor.path.clone())
+                .collect::<Vec<_>>();
+            let canonical = configured
+                .base
+                .canonicalize()
+                .map_err(|error| input_error(&configured.base, error))?;
+            let key = inventory_key(&configured.repository.identity, &canonical, &descriptors);
+            let verified = self.verify_manifest(ManifestVerification {
+                repository: &configured.repository.identity,
+                base: &configured.base,
+                descriptors: &descriptors,
+                indexer,
+                key: &key,
+                expected_fingerprint: &persisted.fingerprint,
+            })?;
+            if persisted.identity != configured.repository.identity
+                || persisted.inventory_key != key
+                || !verified
+            {
+                tracing::debug!(
+                    workspace = %workspace.name,
+                    repository = %configured.repository.identity,
+                    identity_matches = persisted.identity == configured.repository.identity,
+                    inventory_matches = persisted.inventory_key == key,
+                    manifest_matches = verified,
+                    "reconciliation checkpoint repository changed"
+                );
+                return Ok(None);
+            }
+            inventory_keys.push(key);
+        }
+        Ok(Some(CheckpointVerification {
+            verification_fingerprint: checkpoint.verification_fingerprint,
+            inventory_keys,
+        }))
+    }
+
+    pub(super) fn accept_checkpoint(
+        &self,
+        checkpoint: &CheckpointVerification,
+        base: &Path,
+    ) -> Result<(), BeholderError> {
+        self.verified
+            .lock()
+            .map_err(|_| input_error(base, "inventory verification lock poisoned"))?
+            .extend(checkpoint.inventory_keys.iter().cloned());
+        Ok(())
+    }
+
+    pub(super) fn store_checkpoint(
+        &self,
+        checkpoint: WorkspaceCheckpoint<'_>,
+    ) -> Result<(), BeholderError> {
+        let repositories = checkpoint
+            .workspace
+            .repositories
+            .iter()
+            .zip(&checkpoint.snapshot.repositories)
+            .map(|(configured, snapshot)| {
+                let descriptors = checkpoint
+                    .workspace
+                    .protobuf_descriptors
+                    .iter()
+                    .filter(|descriptor| descriptor.repository == configured.repository)
+                    .map(|descriptor| descriptor.path.clone())
+                    .collect::<Vec<_>>();
+                let canonical = configured
+                    .base
+                    .canonicalize()
+                    .map_err(|error| input_error(&configured.base, error))?;
+                Ok(PersistedCheckpointRepository {
+                    identity: configured.repository.identity.clone(),
+                    inventory_key: inventory_key(
+                        &configured.repository.identity,
+                        &canonical,
+                        &descriptors,
+                    ),
+                    fingerprint: snapshot.state.fingerprint.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, BeholderError>>()?;
+        let persisted = PersistedWorkspaceCheckpoint {
+            version: CHECKPOINT_VERSION,
+            reconciliation_identity: checkpoint.indexer.reconciliation_identity(),
+            enabled_plugins: checkpoint.workspace.enabled_plugins.clone(),
+            verification_fingerprint: checkpoint.verification_fingerprint.to_owned(),
+            repositories,
+        };
+        let path = self.checkpoint_path(&checkpoint.workspace.name);
+        let parent = path.parent().expect("checkpoint path has a parent");
+        fs::create_dir_all(parent).map_err(|error| input_error(parent, error))?;
+        let bytes = serde_json::to_vec(&persisted)
+            .map_err(|error| input_error(&checkpoint.snapshot.repositories[0].base, error))?;
+        atomic_write(&path, &bytes).map_err(|error| input_error(&path, error))
+    }
+
+    fn verify_manifest(&self, input: ManifestVerification<'_>) -> Result<bool, BeholderError> {
+        let path = self
+            .root
+            .join("manifests")
+            .join(format!("{}.json", input.key));
+        let Some(manifest) = load_manifest(&path) else {
+            return Ok(false);
+        };
+        let fingerprint = manifest.repository_fingerprint.clone();
+        let previous = manifest
+            .entries
+            .into_iter()
+            .map(|entry| ((entry.path.clone(), entry.kind), entry))
+            .collect::<BTreeMap<_, _>>();
+        let candidates = inventory_candidates(input.base, input.descriptors, input.indexer)?;
+        if candidates.len() != previous.len() {
+            return Ok(false);
+        }
+        let mut inputs = Vec::with_capacity(candidates.len());
+        for (path, kind) in candidates {
+            let relative = path
+                .strip_prefix(input.base)
+                .map_err(|error| input_error(&path, error))?
+                .to_path_buf();
+            let Some(entry) = previous.get(&(StoredPath::from_path(&relative), kind)) else {
+                return Ok(false);
+            };
+            let Ok(metadata) = fs::metadata(&path) else {
+                return Ok(false);
+            };
+            if entry.metadata != MetadataHint::from(&metadata) {
+                return Ok(false);
+            }
+            inputs.push((relative, kind, entry.content_hash.as_str()));
+        }
+        let mut state = repository_state_from_content_hashes(
+            input.base,
+            inputs
+                .iter()
+                .map(|(path, kind, hash)| (path.as_path(), u8::from(*kind), *hash)),
+        )
+        .map_err(|error| input_error(input.base, error))?;
+        state.repository.identity = input.repository.to_owned();
+        Ok(fingerprint.as_deref() == Some(state.fingerprint.as_str())
+            && state.fingerprint == input.expected_fingerprint)
+    }
+
+    fn checkpoint_path(&self, workspace: &str) -> PathBuf {
+        self.root
+            .join("checkpoints")
+            .join(format!("{:x}.json", Sha256::digest(workspace.as_bytes())))
     }
 
     pub(super) fn refresh(
@@ -129,23 +332,7 @@ impl InventoryStore {
             .map(|entry| ((entry.path.clone(), entry.kind), entry))
             .collect::<BTreeMap<_, _>>();
 
-        let mut files = Vec::new();
-        accepted_files(base, indexer, &mut files).map_err(|error| input_error(base, error))?;
-        let mut candidates = files
-            .into_iter()
-            .map(|path| (path, StoredInputKind::Source))
-            .chain(
-                descriptors
-                    .iter()
-                    .cloned()
-                    .map(|path| (path, StoredInputKind::ProtobufDescriptor)),
-            )
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            let left = (left.0.strip_prefix(base).unwrap_or(&left.0), left.1);
-            let right = (right.0.strip_prefix(base).unwrap_or(&right.0), right.1);
-            left.cmp(&right)
-        });
+        let candidates = inventory_candidates(base, descriptors, indexer)?;
 
         let mut statistics = InventoryStatistics {
             discovered_inputs: candidates.len(),
@@ -293,9 +480,7 @@ impl InventoryStore {
     fn store_blob(&self, hash: &str, content: &[u8], base: &Path) -> Result<(), BeholderError> {
         let path = blob_path(&self.root, hash)
             .expect("new inventory content digests are valid SHA-256 values");
-        if let Ok(existing) = fs::read(&path)
-            && format!("{:x}", Sha256::digest(&existing)) == hash
-        {
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == content.len() as u64) {
             return Ok(());
         }
         let parent = path.parent().expect("blob path has a parent");
@@ -320,6 +505,22 @@ struct PersistedEntry {
     content_hash: String,
 }
 
+#[derive(Deserialize, Serialize)]
+struct PersistedWorkspaceCheckpoint {
+    version: u32,
+    reconciliation_identity: String,
+    enabled_plugins: BTreeSet<String>,
+    verification_fingerprint: String,
+    repositories: Vec<PersistedCheckpointRepository>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedCheckpointRepository {
+    identity: String,
+    inventory_key: String,
+    fingerprint: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct StoredPath(Vec<u8>);
 
@@ -333,6 +534,15 @@ impl StoredPath {
 enum StoredInputKind {
     Source,
     ProtobufDescriptor,
+}
+
+impl From<StoredInputKind> for u8 {
+    fn from(value: StoredInputKind) -> Self {
+        match value {
+            StoredInputKind::Source => 0,
+            StoredInputKind::ProtobufDescriptor => 1,
+        }
+    }
 }
 
 impl From<StoredInputKind> for InputKind {
@@ -395,6 +605,37 @@ fn load_manifest(path: &Path) -> Option<PersistedInventory> {
     let bytes = fs::read(path).ok()?;
     let manifest = serde_json::from_slice::<PersistedInventory>(&bytes).ok()?;
     (manifest.version == INVENTORY_VERSION).then_some(manifest)
+}
+
+fn inventory_candidates(
+    base: &Path,
+    descriptors: &[PathBuf],
+    indexer: &Indexer,
+) -> Result<Vec<(PathBuf, StoredInputKind)>, BeholderError> {
+    let mut files = Vec::new();
+    accepted_files(base, indexer, &mut files).map_err(|error| input_error(base, error))?;
+    let mut candidates = files
+        .into_iter()
+        .map(|path| (path, StoredInputKind::Source))
+        .chain(
+            descriptors
+                .iter()
+                .cloned()
+                .map(|path| (path, StoredInputKind::ProtobufDescriptor)),
+        )
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left = (left.0.strip_prefix(base).unwrap_or(&left.0), left.1);
+        let right = (right.0.strip_prefix(base).unwrap_or(&right.0), right.1);
+        left.cmp(&right)
+    });
+    Ok(candidates)
+}
+
+fn load_checkpoint(path: &Path) -> Option<PersistedWorkspaceCheckpoint> {
+    let bytes = fs::read(path).ok()?;
+    let checkpoint = serde_json::from_slice::<PersistedWorkspaceCheckpoint>(&bytes).ok()?;
+    (checkpoint.version == CHECKPOINT_VERSION).then_some(checkpoint)
 }
 
 fn store_manifest(

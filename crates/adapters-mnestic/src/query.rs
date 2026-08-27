@@ -215,6 +215,28 @@ pub(super) fn repository_revision(
     }))
 }
 
+pub(super) fn published_repository_head(
+    db: &impl QueryRunner,
+    view: &str,
+    repository: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let rows = query(
+        db,
+        view,
+        "?[head] := \
+             *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, repository: $repository, state}, \
+             *repository_state{fingerprint: state, repository: $repository, head}",
+        [("repository", repository.into())],
+    )?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row[0].get_str())
+        .filter(|head| !head.is_empty())
+        .map(str::to_owned))
+}
+
 pub(super) fn entity_facts(
     db: &impl QueryRunner,
     view: &str,

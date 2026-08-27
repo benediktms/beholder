@@ -1166,6 +1166,33 @@ impl Indexer {
         )
     }
 
+    pub fn reconciliation_identity(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"beholder-reconciliation-v1");
+        framed_digest(&mut digest, self.catalog_identity().as_bytes());
+        for analyzer in &self.analyzers {
+            let metadata = analyzer.metadata();
+            digest.update([0]);
+            framed_digest(&mut digest, metadata.id.as_bytes());
+            framed_digest(&mut digest, metadata.version.as_bytes());
+            framed_digest(
+                &mut digest,
+                analysis_inputs_identity(analyzer.identity_inputs()).as_bytes(),
+            );
+        }
+        for enricher in &self.enrichers {
+            let metadata = enricher.metadata();
+            digest.update([1]);
+            framed_digest(&mut digest, metadata.id.as_bytes());
+            framed_digest(&mut digest, metadata.version.as_bytes());
+            framed_digest(
+                &mut digest,
+                analysis_inputs_identity(enricher.identity_inputs()).as_bytes(),
+            );
+        }
+        format!("{:x}", digest.finalize())
+    }
+
     pub fn enricher_is_active(
         &self,
         id: &str,
