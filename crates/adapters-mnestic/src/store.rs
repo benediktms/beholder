@@ -129,7 +129,7 @@ impl SemanticStore {
     }
 
     pub fn view_matches(&self, view: &WorkspaceView) -> Result<bool, Box<dyn Error>> {
-        self.access(|| view_matches(&self.db, view))
+        view_matches(&self.read_db, view)
     }
 
     pub fn verification_matches(
@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_engine_reads_wait_for_the_active_operation() {
+    fn view_match_reads_use_the_reserved_read_engine() {
         let store = Arc::new(SemanticStore::memory().unwrap());
         let access = store.clone();
         let view = WorkspaceView::new(
@@ -872,15 +872,10 @@ mod tests {
             sent.send(result.is_ok()).unwrap();
         });
 
-        assert!(
-            received
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err()
-        );
-        drop(engine);
         received
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("engine access remained blocked after the active operation finished");
+            .expect("view match read blocked behind the primary engine");
+        drop(engine);
         access_thread.join().unwrap();
     }
 
