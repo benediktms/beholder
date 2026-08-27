@@ -1,21 +1,34 @@
-use super::{IndexScheduler, pipeline, refresh_workspace_snapshot};
+use super::{IndexScheduler, pipeline, refresh_workspace_snapshot, standalone_view_name};
 use crate::indexing::enrichment_publication::{
     EnrichmentContribution, EnrichmentPublication, EnrichmentPublicationRequest,
     EnrichmentSnapshotRead, EnrichmentTarget,
 };
 use crate::{
     jobs::{
-        EnrichmentJob as DurableEnrichmentJob, EnrichmentTarget as DurableEnrichmentTarget,
-        JobTrigger,
+        EnrichmentJob as DurableEnrichmentJob, EnrichmentOutcome,
+        EnrichmentTarget as DurableEnrichmentTarget, JobTrigger,
     },
     workspace_registry::WorkspaceRegistry,
 };
-use beholder_adapters_mnestic::SemanticStore;
-use beholder_domain::WorkspaceView;
+use beholder_adapters_mnestic::{EnrichmentPublishOutcome, SemanticStore};
+use beholder_domain::{Workspace, WorkspaceView};
 #[cfg(test)]
 use beholder_indexing::AnalyzerMetadata;
 use beholder_indexing::{AnalyzerContribution, EnrichmentSnapshot, WorkspaceSnapshot};
-use std::{collections::BTreeMap, error::Error, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    sync::Mutex,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManualEnrichmentTarget {
+    pub(crate) target: DurableEnrichmentTarget,
+    pub(crate) worker_id: String,
+    pub(crate) worker_version: String,
+    pub(crate) input_fingerprint: Option<String>,
+    pub(crate) current: bool,
+}
 
 impl IndexScheduler {
     pub(super) fn ensure_enrichment_inputs(
@@ -29,6 +42,134 @@ impl IndexScheduler {
 }
 
 impl IndexScheduler {
+    pub(crate) fn manual_enrichment_targets(
+        &self,
+        store: &SemanticStore,
+        workspaces: &Mutex<WorkspaceRegistry>,
+        repository: &str,
+        workspace_scope: Option<&str>,
+        requested_workers: &BTreeSet<String>,
+    ) -> Result<Vec<ManualEnrichmentTarget>, String> {
+        let catalog = self
+            .indexer
+            .enrichment_catalog()
+            .into_iter()
+            .map(|worker| (worker.id.clone(), worker))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(unknown) = requested_workers
+            .iter()
+            .find(|worker| !catalog.contains_key(*worker))
+        {
+            return Err(format!("unknown enrichment worker {unknown}"));
+        }
+        let selected = if requested_workers.is_empty() {
+            catalog.keys().cloned().collect::<BTreeSet<_>>()
+        } else {
+            requested_workers.clone()
+        };
+        let targets = {
+            let registry = workspaces
+                .lock()
+                .map_err(|_| "workspace registry lock poisoned")?;
+            let registered = registry
+                .repository(repository)
+                .cloned()
+                .ok_or_else(|| format!("repository is no longer registered: {repository}"))?;
+            let mut targets = if let Some(scope) = workspace_scope {
+                let workspace = registry
+                    .get(scope)
+                    .cloned()
+                    .ok_or_else(|| format!("workspace is no longer registered: {scope}"))?;
+                if !workspace
+                    .repositories
+                    .iter()
+                    .any(|candidate| candidate.repository.identity == repository)
+                {
+                    return Err(format!(
+                        "repository {repository} is not in workspace {scope}"
+                    ));
+                }
+                vec![(workspace, false)]
+            } else {
+                registry
+                    .workspaces_referencing_repository(repository)
+                    .into_iter()
+                    .map(|workspace| (workspace, false))
+                    .collect()
+            };
+            if targets.is_empty() {
+                let workspace =
+                    Workspace::new(standalone_view_name(repository), vec![registered.selection])
+                        .map_err(|error| error.to_string())?
+                        .with_enabled_plugins(selected.clone())
+                        .map_err(|error| error.to_string())?;
+                targets.push((workspace, true));
+            }
+            targets
+        };
+
+        let mut planned = Vec::new();
+        for (workspace, standalone) in targets {
+            let (snapshot, _) = refresh_workspace_snapshot(self, &workspace, None)
+                .map_err(|error| error.to_string())?;
+            let target_snapshot = snapshot
+                .repositories
+                .iter()
+                .find(|candidate| candidate.state.repository.identity == repository)
+                .ok_or_else(|| {
+                    format!(
+                        "repository is no longer in workspace {}: {repository}",
+                        workspace.name
+                    )
+                })?;
+            for worker_id in &selected {
+                let worker = catalog
+                    .get(worker_id)
+                    .expect("selected enrichment worker exists in catalog");
+                if !self.indexer.enricher_is_active(
+                    worker_id,
+                    &workspace.enabled_plugins,
+                    target_snapshot,
+                ) {
+                    continue;
+                }
+                let input_fingerprint = store
+                    .revision_enrichment_input_fingerprint(&workspace.name, repository, worker_id)
+                    .map_err(|error| error.to_string())?;
+                let target = if standalone {
+                    DurableEnrichmentTarget::StandaloneRepository {
+                        repository: repository.to_owned(),
+                    }
+                } else {
+                    DurableEnrichmentTarget::WorkspaceRepository {
+                        workspace: workspace.name.clone(),
+                        repository: repository.to_owned(),
+                    }
+                };
+                let current = if input_fingerprint.is_some() {
+                    store
+                        .enrichment_is_current(EnrichmentTarget {
+                            view: &workspace.name,
+                            repository,
+                            analyzer: worker_id,
+                            version: &worker.version,
+                        })
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                };
+                planned.push(ManualEnrichmentTarget {
+                    target,
+                    worker_id: worker_id.clone(),
+                    worker_version: worker.version.clone(),
+                    input_fingerprint,
+                    current,
+                });
+            }
+        }
+        Ok(planned)
+    }
+
     pub(crate) fn automatic_enrichment_jobs(
         &self,
         store: &SemanticStore,
@@ -68,7 +209,10 @@ impl IndexScheduler {
                     )
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| {
-                        "published repository enrichment input fingerprint is missing".to_owned()
+                        format!(
+                            "published {workspace_name}/{repository_id} enrichment input fingerprint is missing for {}",
+                            worker.id
+                        )
                     })?;
                 jobs.push(DurableEnrichmentJob {
                     target: DurableEnrichmentTarget::WorkspaceRepository {
@@ -91,24 +235,46 @@ impl IndexScheduler {
         store: &SemanticStore,
         workspaces: &Mutex<WorkspaceRegistry>,
         job: &DurableEnrichmentJob,
-    ) -> Result<bool, String> {
-        let DurableEnrichmentTarget::WorkspaceRepository {
-            workspace,
-            repository,
-        } = &job.target
-        else {
-            return Err("automatic enrichment jobs must target a workspace repository".into());
+    ) -> Result<EnrichmentOutcome, String> {
+        let (workspace_config, repository) = {
+            let registry = workspaces
+                .lock()
+                .map_err(|_| "workspace registry lock poisoned")?;
+            match &job.target {
+                DurableEnrichmentTarget::WorkspaceRepository {
+                    workspace,
+                    repository,
+                } => (
+                    registry
+                        .get(workspace)
+                        .cloned()
+                        .ok_or_else(|| format!("workspace is no longer registered: {workspace}"))?,
+                    repository.clone(),
+                ),
+                DurableEnrichmentTarget::StandaloneRepository { repository } => {
+                    let registered = registry.repository(repository).cloned().ok_or_else(|| {
+                        format!("repository is no longer registered: {repository}")
+                    })?;
+                    let enabled_plugins: BTreeSet<_> = self
+                        .indexer
+                        .enrichment_catalog()
+                        .into_iter()
+                        .map(|worker| worker.id)
+                        .collect();
+                    (
+                        Workspace::new(
+                            standalone_view_name(repository),
+                            vec![registered.selection],
+                        )
+                        .map_err(|error| error.to_string())?
+                        .with_enabled_plugins(enabled_plugins)
+                        .map_err(|error| error.to_string())?,
+                        repository.clone(),
+                    )
+                }
+            }
         };
-        let input_fingerprint = job
-            .input_fingerprint
-            .as_deref()
-            .ok_or("automatic enrichment job is missing its input fingerprint")?;
-        let workspace_config = workspaces
-            .lock()
-            .map_err(|_| "workspace registry lock poisoned")?
-            .get(workspace)
-            .cloned()
-            .ok_or_else(|| format!("workspace is no longer registered: {workspace}"))?;
+        let workspace = &workspace_config.name;
         let (snapshot, _) = refresh_workspace_snapshot(self, &workspace_config, None)
             .map_err(|error| error.to_string())?;
         let worker = self
@@ -118,12 +284,12 @@ impl IndexScheduler {
             .find(|worker| worker.id == job.worker_id);
         let Some(worker) = worker.filter(|worker| worker.version == job.expected_worker_version)
         else {
-            return Ok(false);
+            return Ok(EnrichmentOutcome::Superseded);
         };
         let target_snapshot = snapshot
             .repositories
             .iter()
-            .find(|candidate| candidate.state.repository.identity == *repository)
+            .find(|candidate| candidate.state.repository.identity == repository)
             .ok_or_else(|| {
                 format!("repository is no longer in workspace {workspace}: {repository}")
             })?;
@@ -134,31 +300,48 @@ impl IndexScheduler {
         );
         let target = EnrichmentTarget {
             view: workspace,
-            repository,
+            repository: &repository,
             analyzer: &worker.id,
             version: &worker.version,
+        };
+        let input_fingerprint = match job.input_fingerprint.clone() {
+            Some(fingerprint) => fingerprint,
+            None => store
+                .revision_enrichment_input_fingerprint(workspace, &repository, &worker.id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "no successful baseline exists for repository {repository} in {workspace}"
+                    )
+                })?,
         };
         let (entity_kinds, relations) = self.indexer.enrichment_semantic_inputs(&worker.id);
         let Some(state) = store
             .enrichment_snapshot(EnrichmentSnapshotRead {
                 target,
-                input_fingerprint,
+                input_fingerprint: &input_fingerprint,
                 entity_kinds: &entity_kinds,
                 relations: &relations,
             })
             .map_err(|error| error.to_string())?
         else {
-            return Ok(false);
+            return Ok(EnrichmentOutcome::Superseded);
         };
         if self.current_enrichment_input_fingerprint(
             &snapshot,
             workspace,
-            repository,
+            &repository,
             &worker.id,
             &state.contexts,
         )? != input_fingerprint
         {
-            return Ok(false);
+            return Ok(EnrichmentOutcome::Superseded);
+        }
+        if store
+            .enrichment_is_current(target)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(EnrichmentOutcome::AlreadyCurrent);
         }
         let contexts = state.contexts.clone();
         if !active {
@@ -166,10 +349,11 @@ impl IndexScheduler {
                 store,
                 EnrichmentPublicationRequest {
                     target,
-                    input_fingerprint,
+                    input_fingerprint: &input_fingerprint,
                     contribution: EnrichmentContribution::default(),
                 },
             )
+            .map(enrichment_outcome)
             .map_err(|error| error.to_string());
         }
         let contribution = self
@@ -202,7 +386,7 @@ impl IndexScheduler {
                 "worker contribution metadata does not match the scheduled analyzer".into(),
             );
         }
-        if contribution_escapes_target(&contribution, repository) {
+        if contribution_escapes_target(&contribution, &repository) {
             return Err("worker contribution escaped its target repository".into());
         }
         if self
@@ -213,15 +397,19 @@ impl IndexScheduler {
             .as_ref()
             != Some(&worker)
         {
-            return Ok(false);
+            return Ok(EnrichmentOutcome::Superseded);
         }
         let (current, _) = refresh_workspace_snapshot(self, &workspace_config, None)
             .map_err(|error| error.to_string())?;
         if self.current_enrichment_input_fingerprint(
-            &current, workspace, repository, &worker.id, &contexts,
+            &current,
+            workspace,
+            &repository,
+            &worker.id,
+            &contexts,
         )? != input_fingerprint
         {
-            return Ok(false);
+            return Ok(EnrichmentOutcome::Superseded);
         }
         let mut diagnostics = contribution.diagnostics;
         let mut entities = Vec::new();
@@ -241,7 +429,7 @@ impl IndexScheduler {
             store,
             EnrichmentPublicationRequest {
                 target,
-                input_fingerprint,
+                input_fingerprint: &input_fingerprint,
                 contribution: EnrichmentContribution {
                     entities: &entities,
                     observations: &observations,
@@ -250,6 +438,7 @@ impl IndexScheduler {
                 },
             },
         )
+        .map(enrichment_outcome)
         .map_err(|error| error.to_string())
     }
 
@@ -291,6 +480,14 @@ impl IndexScheduler {
                 format!("repository is no longer in workspace {workspace}: {repository}")
             })?;
         Ok(view.repository_enrichment_input_fingerprint(state, worker))
+    }
+}
+
+fn enrichment_outcome(outcome: EnrichmentPublishOutcome) -> EnrichmentOutcome {
+    match outcome {
+        EnrichmentPublishOutcome::Published => EnrichmentOutcome::Published,
+        EnrichmentPublishOutcome::Unchanged => EnrichmentOutcome::Unchanged,
+        EnrichmentPublishOutcome::Superseded => EnrichmentOutcome::Superseded,
     }
 }
 
@@ -495,11 +692,12 @@ mod tests {
             .pop()
             .unwrap();
 
-        assert!(
+        assert_eq!(
             scheduler
                 .run_enrichment_job(&store, &registry, &job)
                 .await
-                .unwrap()
+                .unwrap(),
+            EnrichmentOutcome::Published
         );
         assert!(
             store
@@ -507,11 +705,60 @@ mod tests {
                 .unwrap()
         );
         fs::write(source, "fn changed() {}").unwrap();
-        assert!(
-            !scheduler
+        assert_eq!(
+            scheduler
                 .run_enrichment_job(&store, &registry, &job)
                 .await
-                .unwrap()
+                .unwrap(),
+            EnrichmentOutcome::Superseded
+        );
+
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_job_does_not_run_without_a_successful_baseline() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-enrichment-no-baseline-{unique}"));
+        let repository = state.join("repo");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn source() {}").unwrap();
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register("main".into(), vec![repository], Vec::new())
+            .unwrap();
+        let repository = workspace.repositories[0].repository.identity.clone();
+        let scheduler = IndexScheduler::with_indexer(
+            IndexerBuilder::new(state.join("frontend-cache"), 1)
+                .add_enricher(FakeEnricher)
+                .build()
+                .unwrap(),
+        );
+
+        let error = scheduler
+            .run_enrichment_job(
+                &SemanticStore::memory().unwrap(),
+                &Mutex::new(registry),
+                &DurableEnrichmentJob {
+                    target: DurableEnrichmentTarget::WorkspaceRepository {
+                        workspace: "main".into(),
+                        repository: repository.clone(),
+                    },
+                    worker_id: "semantic".into(),
+                    expected_worker_version: "1".into(),
+                    trigger: JobTrigger::Manual,
+                    prerequisite_index_jobs: Vec::new(),
+                    input_fingerprint: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!("no successful baseline exists for repository {repository} in main")
         );
 
         fs::remove_dir_all(state).unwrap();

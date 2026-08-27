@@ -33,20 +33,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+start_daemon() {
+    target/debug/beholderd >>"$state/beholderd.log" 2>&1 &
+    daemon_pid=$!
+    for _ in {1..50}; do
+        target/debug/beholder daemon status >/dev/null 2>&1 && return
+        if ! kill -0 "$daemon_pid" 2>/dev/null; then
+            cat "$state/beholderd.log" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    target/debug/beholder daemon status >/dev/null
+}
+
 echo 'Building Beholder binaries...' >&2
 bash "$root/scripts/test-daemon-handover.sh"
 echo 'Starting isolated beholderd...' >&2
-target/debug/beholderd >"$state/beholderd.log" 2>&1 &
-daemon_pid=$!
-for _ in {1..50}; do
-    target/debug/beholder daemon status >/dev/null 2>&1 && break
-    if ! kill -0 "$daemon_pid" 2>/dev/null; then
-        cat "$state/beholderd.log" >&2
-        exit 1
-    fi
-    sleep 0.1
-done
-target/debug/beholder daemon status >/dev/null
+start_daemon
 [[ -S "$socket" ]] || { echo "daemon socket not found at $socket" >&2; exit 1; }
 mkdir -p "$state/contracts"
 xxd -r -p "$root/scripts/fixtures/pricing.descriptor.hex" "$state/contracts/pricing.descriptor.bin"
@@ -326,6 +330,39 @@ if ! grep -Fq '"main"' <<<"$revision"; then
     exit 1
 fi
 
+echo 'Checking manual enrichment and daemon-kill recovery...' >&2
+rust_repository='github.com/example/beholder-rust-smoke'
+printf '%s\n' 'fn manual_enrichment_recovery() {}' >"$state/rust/src/manual_enrichment.rs"
+index_submission="$(target/debug/beholder index "$rust_repository" --workspace main)"
+index_job="$(awk '$1 == "enqueued" { print $2; exit }' <<<"$index_submission")"
+enrichment_submission="$(target/debug/beholder enrich "$rust_repository" --workspace main --only rust)"
+enrichment_job="$(awk '$1 == "enqueued" { print $2; exit }' <<<"$enrichment_submission")"
+if [[ -z "$index_job" || -z "$enrichment_job" ]] || \
+    ! grep -Fq "prerequisite $index_job" <<<"$enrichment_submission"; then
+    printf 'manual enrichment did not expose its durable prerequisite and job:\n%s\n%s\n' \
+        "$index_submission" "$enrichment_submission" >&2
+    exit 1
+fi
+kill -KILL "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+daemon_pid=''
+start_daemon
+for _ in {1..600}; do
+    enrichment_result="$(target/debug/beholder job get "$enrichment_job" 2>&1 || true)"
+    grep -Fq 'status: Completed' <<<"$enrichment_result" && break
+    if grep -Fq 'status: Failed' <<<"$enrichment_result"; then
+        break
+    fi
+    sleep 0.1
+done
+if ! grep -Fq 'status: Completed' <<<"$enrichment_result" || \
+    ! grep -Fq '/worker:rust' <<<"$enrichment_result" || \
+    ! grep -Fq 'result:' <<<"$enrichment_result"; then
+    printf 'persisted enrichment did not recover after daemon kill:\n%s\n' \
+        "$enrichment_result" >&2
+    exit 1
+fi
+
 index_until_current() {
     local entity="$1"
     local context=''
@@ -412,6 +449,9 @@ unexpected_errors="$(grep -Fv \
     <<<"$unexpected_errors" || true)"
 unexpected_errors="$(grep -Fv \
     '"message":"index job attempt failed"' \
+    <<<"$unexpected_errors" || true)"
+unexpected_errors="$(grep -Fv \
+    '"message":"interrupted job recovered"' \
     <<<"$unexpected_errors" || true)"
 if [[ -n "$unexpected_errors" ]]; then
     echo 'daemon trace contains warnings or errors:' >&2

@@ -15,6 +15,7 @@ service Daemon {
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
   rpc SubmitIndex(SubmitIndexRequest) returns (SubmitIndexResponse);
+  rpc SubmitEnrichment(SubmitEnrichmentRequest) returns (SubmitEnrichmentResponse);
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
   rpc SetWorkspacePlugin(SetWorkspacePluginRequest) returns (SetWorkspacePluginResponse);
@@ -457,6 +458,30 @@ message SubmitIndexResponse {
   repeated JobSummary overlapping_jobs = 2;
 }
 
+message SubmitEnrichmentRequest {
+  string repository = 1;
+  optional string workspace_scope = 2;
+  repeated string worker_ids = 3;
+}
+
+enum EnrichmentSubmissionDisposition {
+  ENRICHMENT_SUBMISSION_DISPOSITION_UNSPECIFIED = 0;
+  ENRICHMENT_SUBMISSION_DISPOSITION_ENQUEUED = 1;
+  ENRICHMENT_SUBMISSION_DISPOSITION_IN_PROGRESS = 2;
+  ENRICHMENT_SUBMISSION_DISPOSITION_ALREADY_CURRENT = 3;
+}
+
+message EnrichmentSubmission {
+  JobTarget target = 1;
+  EnrichmentSubmissionDisposition disposition = 2;
+  optional JobSummary job = 3;
+}
+
+message SubmitEnrichmentResponse {
+  repeated EnrichmentSubmission results = 1;
+  repeated JobSummary prerequisite_jobs = 2;
+}
+
 enum JobStatus {
   JOB_STATUS_UNSPECIFIED = 0;
   JOB_STATUS_QUEUED = 1;
@@ -527,6 +552,21 @@ message IndexJobResult {
   repeated IndexDestinationResult destinations = 1;
 }
 
+enum EnrichmentJobOutcome {
+  ENRICHMENT_JOB_OUTCOME_UNSPECIFIED = 0;
+  ENRICHMENT_JOB_OUTCOME_PUBLISHED = 1;
+  ENRICHMENT_JOB_OUTCOME_UNCHANGED = 2;
+  ENRICHMENT_JOB_OUTCOME_ALREADY_CURRENT = 3;
+  ENRICHMENT_JOB_OUTCOME_SUPERSEDED = 4;
+}
+
+message EnrichmentJobResult {
+  JobTarget target = 1;
+  string expected_worker_version = 2;
+  EnrichmentJobOutcome outcome = 3;
+  repeated string failed_prerequisite_job_ids = 4;
+}
+
 message Job {
   JobSummary summary = 1;
   uint32 attempts = 2;
@@ -539,4 +579,5 @@ message Job {
   optional string last_error = 9;
   repeated string warnings = 10;
   optional IndexJobResult index_result = 11;
+  optional EnrichmentJobResult enrichment_result = 12;
 }

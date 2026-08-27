@@ -72,6 +72,13 @@ pub struct EnrichmentOwner<'a> {
     pub version: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnrichmentPublishOutcome {
+    Published,
+    Unchanged,
+    Superseded,
+}
+
 impl SemanticStore {
     pub fn memory() -> Result<Self, Box<dyn Error>> {
         let db = memory_database()?;
@@ -177,7 +184,15 @@ impl SemanticStore {
     }
 
     pub fn delete_repository_revision(&self, repository: &str) -> Result<u64, Box<dyn Error>> {
-        self.access(|| delete_repository_revision(&self.db, repository))
+        self.access(|| delete_repository_revision(&self.db, repository, None))
+    }
+
+    pub fn delete_standalone_repository_revision(
+        &self,
+        repository: &str,
+        view: &str,
+    ) -> Result<u64, Box<dyn Error>> {
+        self.access(|| delete_repository_revision(&self.db, repository, Some(view)))
     }
 
     pub fn publish_verified(
@@ -279,6 +294,20 @@ impl SemanticStore {
         owner: EnrichmentOwner<'_>,
         payload: EnrichmentPayload<'_>,
     ) -> Result<bool, Box<dyn Error>> {
+        Ok(
+            self.publish_enrichment_outcome(view, repository, input_fingerprint, owner, payload)?
+                != EnrichmentPublishOutcome::Superseded,
+        )
+    }
+
+    pub fn publish_enrichment_outcome(
+        &self,
+        view: &str,
+        repository: &str,
+        input_fingerprint: &str,
+        owner: EnrichmentOwner<'_>,
+        payload: EnrichmentPayload<'_>,
+    ) -> Result<EnrichmentPublishOutcome, Box<dyn Error>> {
         self.access(|| {
             publish_enrichment(
                 &self.db,
@@ -856,9 +885,12 @@ mod tests {
         );
 
         store.publish_repository(&repository).unwrap();
+        store
+            .publish(&view, std::slice::from_ref(&repository), &[])
+            .unwrap();
         assert_eq!(
             store
-                .delete_repository_revision("example/repository")
+                .delete_standalone_repository_revision("example/repository", "standalone")
                 .unwrap(),
             1
         );
@@ -869,6 +901,18 @@ mod tests {
                 .is_none()
         );
         assert_eq!(store.garbage_collection_queued().unwrap(), 1);
+        assert!(
+            store
+                .db
+                .run_script(
+                    "?[revision] := *analysis_revision_state{view: 'standalone', revision}",
+                    BTreeMap::new(),
+                    mnestic_engine::ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows
+                .is_empty()
+        );
     }
 
     #[test]

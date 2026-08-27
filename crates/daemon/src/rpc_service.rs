@@ -1,9 +1,10 @@
 use crate::daemon::{BeholderDaemon, collect_garbage, start_claimed_garbage_collector};
 use crate::jobs::{
-    self, IndexJob, IndexTarget, StoredJob, StoredJobKind, StoredJobStatus, StoredJobTarget,
+    self, EnrichmentJob, IndexJob, IndexJobId, IndexTarget, ManualEnrichmentSubmission, StoredJob,
+    StoredJobKind, StoredJobStatus, StoredJobTarget,
 };
 use crate::repository_registry::RegisteredRepository;
-use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind};
+use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
     DEFAULT_MAX_HOPS, GarbageCollectionPhase,
     GarbageCollectionProgress as DtoGarbageCollectProgress,
@@ -12,19 +13,20 @@ use beholder_dto::{
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
     ClearCacheRequest, ClearCacheResponse, ContextResponse, DeleteRepositoryRequest,
-    DeleteRepositoryResponse, DependenciesResponse, EntityRequest, GarbageCollectEvent,
-    GarbageCollectPhase, GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
+    DeleteRepositoryResponse, DependenciesResponse, EnrichmentJobOutcome, EnrichmentSubmission,
+    EnrichmentSubmissionDisposition, EntityRequest, GarbageCollectEvent, GarbageCollectPhase,
+    GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
     GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetJobRequest,
     GetJobResponse, GetRepositoryRequest, GetStatusRequest, GetStatusResponse, ImpactResponse,
     IndexJobOutcome, Job, JobStatus, JobSummary, JobTarget, JobTrigger, JobType, JobWaitReason,
     ListJobsRequest, ListJobsResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
     RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
     RepositoryResponse, SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest,
-    StopResponse, SubmitIndexRequest, SubmitIndexResponse, TraceResponse, TraversalEntityRequest,
-    WhyResponse, daemon_server::Daemon, garbage_collect_event, index_destination, job_target,
-    submit_index_request,
+    StopResponse, SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest,
+    SubmitIndexResponse, TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
+    garbage_collect_event, index_destination, job_target, submit_index_request,
 };
-use std::{error::Error, path::PathBuf, sync::atomic::Ordering};
+use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::atomic::Ordering};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Code, Request, Response, Status, metadata::MetadataValue};
@@ -286,7 +288,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 19,
+            protocol_version: 20,
             pid: std::process::id(),
         }))
     }
@@ -424,6 +426,182 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(SubmitIndexResponse {
             job: Some(job_summary(submitted)),
             overlapping_jobs: overlapping.into_iter().map(job_summary).collect(),
+        }))
+    }
+
+    #[tracing::instrument(name = "rpc.submit_enrichment", skip_all, err)]
+    async fn submit_enrichment(
+        &self,
+        request: Request<SubmitEnrichmentRequest>,
+    ) -> Result<Response<SubmitEnrichmentResponse>, Status> {
+        let request = request.into_inner();
+        if request.repository.trim().is_empty() {
+            return Err(Status::invalid_argument("repository is required"));
+        }
+        let requested_workers = request
+            .worker_ids
+            .into_iter()
+            .map(|worker| {
+                if worker.trim().is_empty() {
+                    Err(Status::invalid_argument("worker ID must not be empty"))
+                } else {
+                    Ok(worker)
+                }
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let workspaces = {
+            let registry = self
+                .workspaces
+                .lock()
+                .map_err(|_| repository_registry_unavailable())?;
+            if registry.repository(&request.repository).is_none() {
+                return Err(operation_status(BeholderError::new(
+                    BeholderErrorKind::NotFound,
+                    BeholderErrorCode::RepositoryNotRegistered,
+                    format!("repository not registered: {}", request.repository),
+                )));
+            }
+            if let Some(scope) = request.workspace_scope.as_deref() {
+                let workspace = registry.get(scope).ok_or_else(|| {
+                    operation_status(BeholderError::new(
+                        BeholderErrorKind::NotFound,
+                        BeholderErrorCode::WorkspaceNotRegistered,
+                        format!("workspace not registered: {scope}"),
+                    ))
+                })?;
+                if !workspace
+                    .repositories
+                    .iter()
+                    .any(|candidate| candidate.repository.identity == request.repository)
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "repository {} is not in workspace {scope}",
+                        request.repository
+                    )));
+                }
+            }
+            registry.list()
+        };
+        let target = IndexTarget::Repository {
+            repository: request.repository.clone(),
+            workspace_scope: request.workspace_scope.clone(),
+        };
+        let mut prerequisites = self
+            .jobs
+            .overlapping_index_jobs(&target, &workspaces)
+            .await
+            .map_err(queue_status)?;
+        let planned = self
+            .scheduler
+            .manual_enrichment_targets(
+                &self.store,
+                &self.workspaces,
+                &request.repository,
+                request.workspace_scope.as_deref(),
+                &requested_workers,
+            )
+            .map_err(|error| {
+                if error.starts_with("unknown enrichment worker ") {
+                    Status::invalid_argument(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?;
+        prerequisites.retain(|job| {
+            planned.iter().any(|candidate| {
+                index_job_covers_enrichment_target(job, &candidate.target, &workspaces)
+            })
+        });
+        if planned.iter().any(|candidate| {
+            candidate.input_fingerprint.is_none()
+                && !prerequisites.iter().any(|job| {
+                    index_job_covers_enrichment_target(job, &candidate.target, &workspaces)
+                })
+        }) {
+            let (id, _) = self
+                .jobs
+                .enqueue_manual_index(
+                    IndexJob {
+                        target,
+                        trigger: jobs::JobTrigger::Manual,
+                        prerequisite_index_jobs: Vec::new(),
+                        generation: None,
+                        repository_intents: Vec::new(),
+                    },
+                    &workspaces,
+                )
+                .await
+                .map_err(queue_status)?;
+            prerequisites.push(
+                self.jobs
+                    .get(&id.0)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .ok_or_else(|| Status::internal("submitted index prerequisite disappeared"))?,
+            );
+        }
+        prerequisites.sort_by(|left, right| left.id.cmp(&right.id));
+        prerequisites.dedup_by(|left, right| left.id == right.id);
+        let mut results = Vec::new();
+        for candidate in planned {
+            let prerequisite_ids = prerequisites
+                .iter()
+                .filter(|job| {
+                    index_job_covers_enrichment_target(job, &candidate.target, &workspaces)
+                })
+                .map(|job| IndexJobId(job.id.clone()))
+                .collect::<Vec<_>>();
+            let has_prerequisites = !prerequisite_ids.is_empty();
+            if !has_prerequisites && candidate.current {
+                results.push(EnrichmentSubmission {
+                    target: Some(enrichment_job_target(
+                        &candidate.target,
+                        &candidate.worker_id,
+                    )),
+                    disposition: EnrichmentSubmissionDisposition::AlreadyCurrent.into(),
+                    job: None,
+                });
+                continue;
+            }
+            let job = EnrichmentJob {
+                target: candidate.target,
+                worker_id: candidate.worker_id,
+                expected_worker_version: candidate.worker_version,
+                trigger: jobs::JobTrigger::Manual,
+                prerequisite_index_jobs: prerequisite_ids,
+                input_fingerprint: (!has_prerequisites)
+                    .then_some(candidate.input_fingerprint)
+                    .flatten(),
+            };
+            let (disposition, submitted) = match self
+                .jobs
+                .enqueue_manual_enrichment(job)
+                .await
+                .map_err(queue_status)?
+            {
+                ManualEnrichmentSubmission::Enqueued(id) => {
+                    let submitted = self
+                        .jobs
+                        .get(&id)
+                        .await
+                        .map_err(|error| Status::internal(error.to_string()))?
+                        .ok_or_else(|| Status::internal("submitted enrichment job disappeared"))?;
+                    (EnrichmentSubmissionDisposition::Enqueued, submitted)
+                }
+                ManualEnrichmentSubmission::InProgress(job) => {
+                    (EnrichmentSubmissionDisposition::InProgress, *job)
+                }
+            };
+            let summary = job_summary(submitted);
+            results.push(EnrichmentSubmission {
+                target: summary.target.clone(),
+                disposition: disposition.into(),
+                job: Some(summary),
+            });
+        }
+        Ok(Response::new(SubmitEnrichmentResponse {
+            results,
+            prerequisite_jobs: prerequisites.into_iter().map(job_summary).collect(),
         }))
     }
 
@@ -639,6 +817,44 @@ impl Daemon for BeholderDaemon {
     }
 }
 
+fn index_job_covers_enrichment_target(
+    job: &StoredJob,
+    target: &jobs::EnrichmentTarget,
+    workspaces: &[Workspace],
+) -> bool {
+    let (workspace, repository) = match target {
+        jobs::EnrichmentTarget::WorkspaceRepository {
+            workspace,
+            repository,
+        } => (Some(workspace.as_str()), repository),
+        jobs::EnrichmentTarget::StandaloneRepository { repository } => (None, repository),
+    };
+    match &job.target {
+        StoredJobTarget::Workspace(index_workspace) => {
+            workspace == Some(index_workspace.as_str())
+                && workspaces
+                    .iter()
+                    .find(|candidate| candidate.name == *index_workspace)
+                    .is_some_and(|candidate| {
+                        candidate
+                            .repositories
+                            .iter()
+                            .any(|candidate| candidate.repository.identity == *repository)
+                    })
+        }
+        StoredJobTarget::Repository {
+            repository: index_repository,
+            workspace_scope,
+            ..
+        } => {
+            index_repository == repository
+                && workspace_scope
+                    .as_deref()
+                    .is_none_or(|scope| workspace == Some(scope))
+        }
+    }
+}
+
 impl BeholderDaemon {
     fn registered_repository(&self, identity: &str) -> Result<RegisteredRepository, Status> {
         self.workspaces
@@ -739,6 +955,21 @@ fn job_summary(job: StoredJob) -> JobSummary {
     }
 }
 
+fn enrichment_job_target(target: &jobs::EnrichmentTarget, worker_id: &str) -> JobTarget {
+    let (repository, workspace_scope) = match target {
+        jobs::EnrichmentTarget::WorkspaceRepository {
+            workspace,
+            repository,
+        } => (repository.clone(), Some(workspace.clone())),
+        jobs::EnrichmentTarget::StandaloneRepository { repository } => (repository.clone(), None),
+    };
+    JobTarget {
+        target: Some(job_target::Target::Repository(repository)),
+        workspace_scope,
+        worker_id: Some(worker_id.into()),
+    }
+}
+
 fn job_detail(job: StoredJob) -> Job {
     let summary = job_summary(job.clone());
     let wait_reason = match job.status {
@@ -758,9 +989,9 @@ fn job_detail(job: StoredJob) -> Job {
         prerequisite_job_ids: job.prerequisites,
         wait_reason,
         last_error: job.last_error,
-        warnings: Vec::new(),
+        warnings: job.warnings,
         index_result: job
-            .result
+            .index_result
             .map(|result| beholder_protocol::v1::IndexJobResult {
                 destinations: result
                     .destinations
@@ -787,6 +1018,32 @@ fn job_detail(job: StoredJob) -> Job {
                     })
                     .collect(),
             }),
+        enrichment_result: job.enrichment_result.map(|result| {
+            beholder_protocol::v1::EnrichmentJobResult {
+                target: Some(enrichment_job_target(&result.target, &result.worker_id)),
+                expected_worker_version: result.expected_worker_version,
+                outcome: match result.outcome {
+                    jobs::EnrichmentOutcome::Published => EnrichmentJobOutcome::Published,
+                    jobs::EnrichmentOutcome::Unchanged => EnrichmentJobOutcome::Unchanged,
+                    jobs::EnrichmentOutcome::AlreadyCurrent => EnrichmentJobOutcome::AlreadyCurrent,
+                    jobs::EnrichmentOutcome::Superseded => EnrichmentJobOutcome::Superseded,
+                }
+                .into(),
+                failed_prerequisite_job_ids: result
+                    .failed_prerequisite_index_jobs
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect(),
+            }
+        }),
+    }
+}
+
+fn queue_status(error: Box<dyn Error + Send + Sync>) -> Status {
+    if error.to_string() == "job admission is closed" {
+        Status::unavailable("job admission is closed")
+    } else {
+        Status::internal(error.to_string())
     }
 }
 
@@ -843,6 +1100,406 @@ fn max_hops(value: Option<u32>) -> Result<u32, Status> {
             "max_hops must be greater than zero",
         )),
         value => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod manual_enrichment_tests {
+    use super::*;
+    use crate::{daemon, jobs, workspace_registry, workspace_registry::WorkspaceRegistry};
+    use beholder_adapters_mnestic::SemanticStore;
+    use beholder_indexing::{
+        AnalyzerContribution, AnalyzerMetadata, EnrichmentFuture, EnrichmentSnapshot,
+        IndexerBuilder, WorkspaceEnricher,
+    };
+    use std::{fs, path::Path, time::Duration};
+
+    struct EmptyEnricher {
+        id: &'static str,
+        requires_enablement: bool,
+    }
+
+    impl WorkspaceEnricher for EmptyEnricher {
+        fn metadata(&self) -> AnalyzerMetadata {
+            AnalyzerMetadata {
+                id: self.id.into(),
+                version: "1".into(),
+            }
+        }
+
+        fn accepts(&self, path: &Path) -> bool {
+            path.extension().is_some_and(|extension| extension == "rs")
+        }
+
+        fn requires_workspace_enablement(&self) -> bool {
+            self.requires_enablement
+        }
+
+        fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
+            Box::pin(async move {
+                Ok(AnalyzerContribution {
+                    metadata: self.metadata(),
+                    active_repositories: vec![snapshot.target_repository],
+                    repositories: Vec::new(),
+                    overrides: Vec::new(),
+                    graphql_resolvers: Vec::new(),
+                    diagnostics: Vec::new(),
+                    cache: Default::default(),
+                })
+            })
+        }
+    }
+
+    async fn wait_for_terminal(queue: &jobs::JobQueue, ids: &[String]) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut terminal = true;
+                for id in ids {
+                    terminal &= queue.get(id).await.unwrap().is_some_and(|job| {
+                        matches!(
+                            job.status,
+                            StoredJobStatus::Completed | StoredJobStatus::Failed
+                        )
+                    });
+                }
+                if terminal {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("manual enrichment jobs did not finish");
+    }
+
+    #[tokio::test]
+    async fn submit_enrichment_fans_out_reuses_and_becomes_current() {
+        let state =
+            std::env::temp_dir().join(format!("beholder-submit-enrichment-{}", ulid::Ulid::new()));
+        let repository = state.join("repository");
+        let standalone = state.join("standalone");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(standalone.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), "fn workspace() {}").unwrap();
+        fs::write(standalone.join("src/lib.rs"), "fn standalone() {}").unwrap();
+        let mut registry =
+            WorkspaceRegistry::open(workspace_registry::registry_path(&state)).unwrap();
+        let workspace = registry
+            .register_with_plugins(
+                "first".into(),
+                vec![repository.clone()],
+                Vec::new(),
+                vec!["plugin".into()],
+            )
+            .unwrap();
+        registry
+            .register("second".into(), vec![repository], Vec::new())
+            .unwrap();
+        let repository = workspace.repositories[0].repository.identity.clone();
+        let standalone = registry
+            .register_repository(standalone)
+            .unwrap()
+            .selection
+            .repository
+            .identity;
+        let registered_workspaces = registry.list();
+        let queue = jobs::JobQueue::open(&state.join("queue.sqlite"))
+            .await
+            .unwrap();
+        let (partial_prerequisite, _) = queue
+            .enqueue_manual_index(
+                jobs::IndexJob {
+                    target: jobs::IndexTarget::Repository {
+                        repository: repository.clone(),
+                        workspace_scope: Some("first".into()),
+                    },
+                    trigger: jobs::JobTrigger::Manual,
+                    prerequisite_index_jobs: Vec::new(),
+                    generation: None,
+                    repository_intents: Vec::new(),
+                },
+                &registered_workspaces,
+            )
+            .await
+            .unwrap();
+        let (service, _, scheduler) = daemon::build(
+            SemanticStore::memory().unwrap(),
+            registry,
+            IndexerBuilder::new(state.join("cache"), 1)
+                .add_enricher(EmptyEnricher {
+                    id: "semantic",
+                    requires_enablement: false,
+                })
+                .add_enricher(EmptyEnricher {
+                    id: "plugin",
+                    requires_enablement: true,
+                })
+                .build()
+                .unwrap(),
+            queue.clone(),
+        )
+        .unwrap();
+
+        let submit = |repository: String| SubmitEnrichmentRequest {
+            repository,
+            workspace_scope: None,
+            worker_ids: vec!["semantic".into()],
+        };
+        let first = Daemon::submit_enrichment(&service, Request::new(submit(repository.clone())))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.results.len(), 2);
+        assert_eq!(first.prerequisite_jobs.len(), 2);
+        assert!(
+            first
+                .prerequisite_jobs
+                .iter()
+                .any(|job| job.id == partial_prerequisite.0)
+        );
+        assert!(first.results.iter().all(|result| {
+            result.disposition == EnrichmentSubmissionDisposition::Enqueued as i32
+                && result.job.is_some()
+        }));
+        for result in &first.results {
+            let job = queue
+                .get(&result.job.as_ref().unwrap().id)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = usize::from(
+                result.target.as_ref().unwrap().workspace_scope.as_deref() == Some("first"),
+            ) + 1;
+            assert_eq!(job.prerequisites.len(), expected);
+        }
+        let repeated =
+            Daemon::submit_enrichment(&service, Request::new(submit(repository.clone())))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(
+            repeated
+                .prerequisite_jobs
+                .iter()
+                .map(|job| &job.id)
+                .collect::<Vec<_>>(),
+            first
+                .prerequisite_jobs
+                .iter()
+                .map(|job| &job.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(repeated.results.iter().all(|result| {
+            result.disposition == EnrichmentSubmissionDisposition::InProgress as i32
+        }));
+        let scoped = Daemon::submit_enrichment(
+            &service,
+            Request::new(SubmitEnrichmentRequest {
+                repository: repository.clone(),
+                workspace_scope: Some("first".into()),
+                worker_ids: vec!["semantic".into()],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(scoped.results.len(), 1);
+        assert!(
+            scoped.results[0]
+                .target
+                .as_ref()
+                .is_some_and(|target| target.workspace_scope.as_deref() == Some("first"))
+        );
+        let plugin = Daemon::submit_enrichment(
+            &service,
+            Request::new(SubmitEnrichmentRequest {
+                repository: repository.clone(),
+                workspace_scope: None,
+                worker_ids: vec!["plugin".into()],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(plugin.results.len(), 1);
+        assert!(
+            plugin.results[0]
+                .target
+                .as_ref()
+                .is_some_and(|target| target.worker_id.as_deref() == Some("plugin")
+                    && target.workspace_scope.as_deref() == Some("first"))
+        );
+        let all = Daemon::submit_enrichment(
+            &service,
+            Request::new(SubmitEnrichmentRequest {
+                repository: repository.clone(),
+                workspace_scope: None,
+                worker_ids: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(all.results.len(), 3);
+        let standalone_response =
+            Daemon::submit_enrichment(&service, Request::new(submit(standalone)))
+                .await
+                .unwrap()
+                .into_inner();
+        assert_eq!(standalone_response.results.len(), 1);
+        assert!(
+            standalone_response.results[0]
+                .target
+                .as_ref()
+                .is_some_and(|target| target.workspace_scope.is_none())
+        );
+        let unknown = Daemon::submit_enrichment(
+            &service,
+            Request::new(SubmitEnrichmentRequest {
+                repository: repository.clone(),
+                workspace_scope: None,
+                worker_ids: vec!["missing".into()],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown.code(), Code::InvalidArgument);
+
+        let index_worker = jobs::start_index_worker(
+            queue.clone(),
+            scheduler.clone(),
+            service.store.clone(),
+            service.workspaces.clone(),
+        );
+        let enrichment_worker = jobs::start_enrichment_worker(
+            queue.clone(),
+            scheduler.clone(),
+            service.store.clone(),
+            service.workspaces.clone(),
+        );
+        let ids = first
+            .prerequisite_jobs
+            .iter()
+            .chain(&standalone_response.prerequisite_jobs)
+            .map(|job| job.id.clone())
+            .chain(
+                first
+                    .results
+                    .iter()
+                    .chain(&plugin.results)
+                    .chain(&standalone_response.results)
+                    .filter_map(|result| result.job.as_ref().map(|job| job.id.clone())),
+            )
+            .collect::<Vec<_>>();
+        wait_for_terminal(&queue, &ids).await;
+        let fingerprints = ["first", "second"]
+            .into_iter()
+            .map(|workspace| {
+                (
+                    workspace,
+                    service
+                        .store
+                        .revision_enrichment_input_fingerprint(workspace, &repository, "semantic")
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for id in &ids {
+            let job = queue.get(id).await.unwrap().unwrap();
+            assert_eq!(
+                job.status,
+                StoredJobStatus::Completed,
+                "job {id} failed: {:?}; fingerprints={fingerprints:?}",
+                job.last_error,
+            );
+        }
+
+        let current = Daemon::submit_enrichment(&service, Request::new(submit(repository.clone())))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            current.prerequisite_jobs.is_empty(),
+            "unexpected prerequisites: {current:?}"
+        );
+        assert!(current.results.iter().all(|result| {
+            result.disposition == EnrichmentSubmissionDisposition::AlreadyCurrent as i32
+                && result.job.is_none()
+        }));
+
+        let failed_prerequisite = queue
+            .enqueue_automatic_index(jobs::IndexJob {
+                target: jobs::IndexTarget::Workspace {
+                    workspace: "missing".into(),
+                },
+                trigger: jobs::JobTrigger::Automatic,
+                prerequisite_index_jobs: Vec::new(),
+                generation: None,
+                repository_intents: Vec::new(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_terminal(&queue, std::slice::from_ref(&failed_prerequisite.0)).await;
+        let input_fingerprint = service
+            .store
+            .revision_enrichment_input_fingerprint("first", &repository, "semantic")
+            .unwrap();
+        let enrichment = match queue
+            .enqueue_manual_enrichment(jobs::EnrichmentJob {
+                target: jobs::EnrichmentTarget::WorkspaceRepository {
+                    workspace: "first".into(),
+                    repository,
+                },
+                worker_id: "semantic".into(),
+                expected_worker_version: "1".into(),
+                trigger: jobs::JobTrigger::Manual,
+                prerequisite_index_jobs: vec![failed_prerequisite.clone()],
+                input_fingerprint,
+            })
+            .await
+            .unwrap()
+        {
+            ManualEnrichmentSubmission::Enqueued(id) => id,
+            ManualEnrichmentSubmission::InProgress(_) => {
+                panic!("failed prerequisite submission reused unrelated work")
+            }
+        };
+        wait_for_terminal(&queue, std::slice::from_ref(&enrichment)).await;
+        let enrichment = queue.get(&enrichment).await.unwrap().unwrap();
+        assert_eq!(enrichment.status, StoredJobStatus::Completed);
+        assert_eq!(enrichment.warnings.len(), 1);
+        assert!(
+            enrichment.enrichment_result.is_some_and(|result| result
+                .failed_prerequisite_index_jobs
+                == [failed_prerequisite])
+        );
+        assert_eq!(
+            Daemon::get_job(&service, Request::new(GetJobRequest { id: "bad".into() }))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            Daemon::get_job(
+                &service,
+                Request::new(GetJobRequest {
+                    id: ulid::Ulid::new().to_string(),
+                })
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            Code::NotFound
+        );
+
+        scheduler.stop();
+        let _ = index_worker.context.stop();
+        let _ = enrichment_worker.context.stop();
+        let _ = index_worker.task.await;
+        let _ = enrichment_worker.task.await;
+        let _ = fs::remove_dir_all(state);
     }
 }
 

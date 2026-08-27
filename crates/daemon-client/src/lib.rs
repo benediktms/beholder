@@ -13,9 +13,9 @@ use beholder_protocol::{
         GetGarbageCollectionStatusRequest, GetJobRequest, GetJobResponse, GetRepositoryRequest,
         GetStatusRequest, GetStatusResponse, ListJobsRequest, ListJobsResponse,
         ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
-        RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest, SubmitIndexRequest,
-        SubmitIndexResponse, TraversalEntityRequest, daemon_client::DaemonClient,
-        garbage_collect_event, submit_index_request,
+        RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest, SubmitEnrichmentRequest,
+        SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse, TraversalEntityRequest,
+        daemon_client::DaemonClient, garbage_collect_event, submit_index_request,
     },
 };
 use std::{
@@ -118,6 +118,25 @@ pub async fn submit_index(
     Ok(operation_client()
         .await?
         .submit_index(request)
+        .await
+        .map_err(operation_error)?
+        .into_inner())
+}
+
+pub async fn submit_enrichment(
+    repository: String,
+    workspace_scope: Option<String>,
+    worker_ids: Vec<String>,
+) -> Result<SubmitEnrichmentResponse, Box<dyn std::error::Error>> {
+    let mut request = request(SubmitEnrichmentRequest {
+        repository,
+        workspace_scope,
+        worker_ids,
+    });
+    request.set_timeout(SUBMIT_INDEX_TIMEOUT);
+    Ok(operation_client()
+        .await?
+        .submit_enrichment(request)
         .await
         .map_err(operation_error)?
         .into_inner())

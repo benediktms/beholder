@@ -144,6 +144,11 @@ const MAX_PENDING_PATHS: usize = 1_024;
 const MAX_PENDING_EVENTS: usize = 4_096;
 #[cfg(test)]
 const CORE_RULE_PACK_VERSION: &str = "5";
+const STANDALONE_VIEW_PREFIX: &str = "beholder:standalone:";
+
+fn standalone_view_name(repository: &str) -> String {
+    format!("{STANDALONE_VIEW_PREFIX}{repository}")
+}
 
 fn structural_event(kind: &EventKind) -> bool {
     matches!(
@@ -755,7 +760,7 @@ impl IndexScheduler {
             return Err(scheduler_unavailable().into());
         }
         let snapshot = WorkspaceSnapshot {
-            name: repository.repository.identity.clone(),
+            name: standalone_view_name(&repository.repository.identity),
             repositories: vec![refresh.snapshot],
         };
         let plan = self.indexer.prepare(&snapshot);
@@ -776,6 +781,39 @@ impl IndexScheduler {
         if repositories.next().is_some() {
             return Err("repository analysis returned multiple repositories".into());
         }
+        let mut dependency_graph = RepositoryDependencyGraph::from_baseline(
+            std::slice::from_ref(&facts),
+            &analysis.overrides,
+        )?;
+        dependency_graph.add_candidates(analysis.repository_dependencies)?;
+        let mut view = WorkspaceView::new_scoped(
+            &snapshot.name,
+            plan.analysis_identity(),
+            vec![facts.state.clone()],
+            plan.repository_enrichment_identities(),
+        )?;
+        view = view
+            .with_repository_contexts(
+                self.indexer
+                    .enrichment_catalog()
+                    .into_iter()
+                    .map(|analyzer| {
+                        let contexts = dependency_graph.context_map_for(&analyzer.id);
+                        (
+                            analyzer.id.clone(),
+                            merge_declared_contexts(
+                                &self.indexer,
+                                &snapshot,
+                                &analyzer.id,
+                                contexts,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )?
+            .with_repository_enrichment_inputs(
+                self.indexer.enrichment_input_identities(&snapshot),
+            )?;
         let current = self.inventory.refresh(
             &repository.repository.identity,
             &repository.base,
@@ -784,7 +822,7 @@ impl IndexScheduler {
             RefreshMode::Authoritative,
         )?;
         let current = WorkspaceSnapshot {
-            name: repository.repository.identity.clone(),
+            name: standalone_view_name(&repository.repository.identity),
             repositories: vec![current.snapshot],
         };
         let current_plan = self.indexer.prepare(&current);
@@ -796,7 +834,18 @@ impl IndexScheduler {
             );
         }
         let observation_count = facts.observations.len();
-        let published = store.publish_repository(&facts)?;
+        let published_repository = store.publish_repository(&facts)?;
+        let published_view = !store.view_matches(&view)?;
+        store.publish_verified_sharded(
+            &view,
+            std::slice::from_ref(&facts),
+            &analysis.overrides,
+            &analysis.fact_shards,
+            &verification_fingerprint,
+        )?;
+        self.ensure_enrichment_inputs(store, &view)?;
+        pipeline::report_analysis_diagnostics(&snapshot.name, &analysis.diagnostics);
+        let published = published_repository || published_view;
         Ok((observation_count, published))
     }
 
@@ -824,7 +873,7 @@ impl IndexScheduler {
             ));
         }
         let queued = store
-            .delete_repository_revision(identity)
+            .delete_standalone_repository_revision(identity, &standalone_view_name(identity))
             .map_err(|source| {
                 BeholderError::new(
                     BeholderErrorKind::Internal,
@@ -2781,7 +2830,7 @@ mod tests {
     }
 
     #[test]
-    fn indexes_a_repository_without_publishing_a_workspace() {
+    fn indexes_a_repository_with_a_standalone_enrichment_baseline() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -2816,13 +2865,15 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(
+        assert_eq!(
             store
                 .inspect_revisions()
                 .unwrap()
                 .rows
                 .iter()
-                .all(|row| { row[0].as_str() != Some("example/repository") })
+                .filter(|row| { row[0].as_str() == Some("beholder:standalone:example/repository") })
+                .count(),
+            1
         );
         assert!(
             !scheduler
