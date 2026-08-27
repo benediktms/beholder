@@ -35,6 +35,8 @@ use beholder_domain::Workspace;
 
 const INDEX_QUEUE: &str = "index";
 const ENRICHMENT_QUEUE: &str = "enrichment";
+const AUTOMATIC_PRIORITY: i32 = 0;
+const MANUAL_PRIORITY: i32 = 1;
 pub const MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -625,11 +627,11 @@ impl JobQueue {
             } => (Some(workspace.clone()), repository.clone()),
             EnrichmentTarget::StandaloneRepository { repository } => (None, repository.clone()),
         };
-        let trigger = match job.trigger {
-            JobTrigger::Automatic => "automatic",
-            JobTrigger::Manual => "manual",
+        let (trigger, priority) = match job.trigger {
+            JobTrigger::Automatic => ("automatic", AUTOMATIC_PRIORITY),
+            JobTrigger::Manual => ("manual", MANUAL_PRIORITY),
         };
-        let (task, operation) = queued_task(job, id, ENRICHMENT_QUEUE, unix_millis()?);
+        let (task, operation) = queued_task(job, id, ENRICHMENT_QUEUE, unix_millis()?, priority);
         let mut storage = self.enrichment_jobs.clone();
         async move {
             async move {
@@ -664,9 +666,9 @@ impl JobQueue {
             IndexTarget::Workspace { workspace } => (Some(workspace.clone()), None),
             IndexTarget::Repository { repository, .. } => (None, Some(repository.clone())),
         };
-        let trigger = match job.trigger {
-            JobTrigger::Automatic => "automatic",
-            JobTrigger::Manual => "manual",
+        let (trigger, priority) = match job.trigger {
+            JobTrigger::Automatic => ("automatic", AUTOMATIC_PRIORITY),
+            JobTrigger::Manual => ("manual", MANUAL_PRIORITY),
         };
 
         let target = match &job.target {
@@ -674,7 +676,7 @@ impl JobQueue {
             IndexTarget::Repository { .. } => "repository",
         };
         let id = Ulid::new();
-        let (task, operation) = queued_task(job, id, INDEX_QUEUE, unix_millis()?);
+        let (task, operation) = queued_task(job, id, INDEX_QUEUE, unix_millis()?, priority);
         let mut storage = self.index_jobs.clone();
         async move {
             async move {
@@ -997,6 +999,7 @@ fn queued_task<Args: JobTelemetry>(
     id: Ulid,
     queue: &'static str,
     eligible_at_ms: i64,
+    priority: i32,
 ) -> (Task<Args, SqliteContext, Ulid>, tracing::Span) {
     let summary = args.summary();
     let operation = tracing::info_span!(
@@ -1015,6 +1018,7 @@ fn queued_task<Args: JobTelemetry>(
             args,
             id,
             eligible_at_ms,
+            priority,
             beholder_observability::current_w3c_trace_context(),
         )
     });
@@ -1025,11 +1029,13 @@ fn task_with_trace_context<Args>(
     args: Args,
     id: Ulid,
     eligible_at_ms: i64,
+    priority: i32,
     context: Option<beholder_observability::W3cTraceContext>,
 ) -> Task<Args, SqliteContext, Ulid> {
     TaskBuilder::new(args)
         .with_task_id(TaskId::new(id))
         .max_attempts(MAX_ATTEMPTS)
+        .priority(priority)
         .meta(task_tracing_context(context))
         .meta(EligibleAt {
             millis: eligible_at_ms,
@@ -1749,6 +1755,12 @@ mod durable_tests {
             ManualEnrichmentSubmission::Enqueued(id) => id,
             ManualEnrichmentSubmission::InProgress(_) => panic!("first job was not enqueued"),
         };
+        let manual_priority: i64 = sqlx::query_scalar("SELECT priority FROM Jobs WHERE id = ?")
+            .bind(&first)
+            .fetch_one(queue.enrichment_jobs.pool())
+            .await
+            .unwrap();
+        assert_eq!(manual_priority, i64::from(MANUAL_PRIORITY));
         match queue
             .enqueue_manual_enrichment(manual_enrichment(None))
             .await
@@ -1782,6 +1794,12 @@ mod durable_tests {
             .await
             .unwrap()
             .unwrap();
+        let automatic_priority: i64 = sqlx::query_scalar("SELECT priority FROM Jobs WHERE id = ?")
+            .bind(&automatic_id)
+            .fetch_one(queue.enrichment_jobs.pool())
+            .await
+            .unwrap();
+        assert_eq!(automatic_priority, i64::from(AUTOMATIC_PRIORITY));
         automatic.trigger = JobTrigger::Manual;
         match queue.enqueue_manual_enrichment(automatic).await.unwrap() {
             ManualEnrichmentSubmission::InProgress(job) => assert_eq!(job.id, automatic_id),
@@ -2431,7 +2449,13 @@ mod tests {
             trace_flags: 1,
             trace_state: Some("vendor=value".into()),
         };
-        let task = task_with_trace_context((), Ulid::new(), 42, Some(expected.clone()));
+        let task = task_with_trace_context(
+            (),
+            Ulid::new(),
+            42,
+            AUTOMATIC_PRIORITY,
+            Some(expected.clone()),
+        );
         let stored: TracingContext = task.parts.ctx.extract().unwrap();
 
         assert_eq!(stored.trace_id(), &Some(expected.trace_id));

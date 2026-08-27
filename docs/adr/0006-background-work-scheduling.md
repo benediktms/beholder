@@ -264,10 +264,13 @@ The daemon opens one SQLx pool at `state_dir().join("queue.sqlite")` and derives
 separate typed Apalis storage handles for the stable `index` and `enrichment`
 queues. There is no generic queue trait. Both job kinds initially run with global
 concurrency one and five total attempts, delayed by 250 ms, 500 ms, one second,
-and two seconds before attempts two through five. The deployed index worker polls
-at a fixed 100 ms interval: the pinned SQLite fetcher does not reset its default
-backoff after a successful fetch, so retaining that backoff would leave work idle
-for as long as 60 seconds after quiet periods.
+and two seconds before attempts two through five. Manual submissions use Apalis
+priority one and automatic work uses the default priority zero, so recovered or
+queued automatic work cannot starve an explicit request. Active work is not
+preempted. The deployed index worker polls at a fixed 100 ms interval: the pinned
+SQLite fetcher does not reset its default backoff after a successful fetch, so
+retaining that backoff would leave work idle for as long as 60 seconds after quiet
+periods.
 
 ### Queue lifecycle and failure policy
 
