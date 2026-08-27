@@ -3,18 +3,20 @@ use crate::{
     entities_from_analysis, observations_from_analysis, resolve_repository_calls,
 };
 use crate::{
-    incremental::{CacheStatus, IncrementalRust},
+    incremental::{CacheStatus, IncrementalRust, ShardFingerprint},
     model::RustRepository,
     plugin::{RustLanguage, built_in_plugins},
 };
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, SourceAnalysisError, UnsafeTreeRecovery,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, FactShard, SourceAnalysisError,
+    UnsafeTreeRecovery,
 };
 use beholder_indexing::{
     AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError, AnalyzerMetadata,
     AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution, RepositoryFactsView,
     WorkspaceAnalyzer, WorkspaceSnapshot,
 };
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -120,7 +122,12 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             }
             let active_plugins = &repository_plan.active_plugins;
             enum SourceResult {
-                Analyzed(PathBuf, Arc<RustAnalysis>, CacheStatus),
+                Analyzed(
+                    PathBuf,
+                    Arc<RustAnalysis>,
+                    CacheStatus,
+                    Vec<ShardFingerprint>,
+                ),
                 Skipped(PathBuf, String),
             }
             let results = self
@@ -135,7 +142,12 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 )
                 .into_iter()
                 .map(|(path, result)| match result {
-                    Ok(result) => Ok(SourceResult::Analyzed(path, result.analysis, result.status)),
+                    Ok(result) => Ok(SourceResult::Analyzed(
+                        path,
+                        result.analysis,
+                        result.status,
+                        result.shards,
+                    )),
                     Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => {
                         Ok(SourceResult::Skipped(path, error.to_string()))
                     }
@@ -148,8 +160,8 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             let mut analyzed = Vec::new();
             for result in results {
                 match result {
-                    SourceResult::Analyzed(path, analysis, status) => {
-                        analyzed.push((path, analysis, status));
+                    SourceResult::Analyzed(path, analysis, status, shards) => {
+                        analyzed.push((path, analysis, status, shards));
                     }
                     SourceResult::Skipped(path, detail) => diagnostics.push(AnalysisDiagnostic {
                         code: "rust.parse_recovery".into(),
@@ -160,7 +172,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                     }),
                 }
             }
-            for (path, analysis, status) in &analyzed {
+            for (path, analysis, status, _) in &analyzed {
                 match status {
                     CacheStatus::Memory => cache.memory_hits += 1,
                     CacheStatus::Disk => cache.disk_hits += 1,
@@ -182,7 +194,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 repository: repository.state.repository.identity.clone(),
                 sources: analyzed
                     .iter()
-                    .map(|(path, analysis, _)| (path.clone(), analysis.as_ref().clone()))
+                    .map(|(path, analysis, _, _)| (path.clone(), analysis.as_ref().clone()))
                     .collect(),
             };
             let enrichment = self.plugins.enrich(
@@ -197,6 +209,12 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             observations.extend(enrichment.observations);
             diagnostics.extend(enrichment.diagnostics);
             resolve_repository_calls(&mut observations);
+            let fact_shards = build_fact_shards(
+                &repository.state.repository.identity,
+                analyzed.iter().flat_map(|(_, _, _, shards)| shards),
+                &entities,
+                &observations,
+            );
             let completeness = if diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"))
@@ -212,6 +230,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 grpc_bindings: enrichment.grpc_bindings,
                 observations,
                 diagnostics,
+                fact_shards,
             });
         }
 
@@ -241,6 +260,65 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             IncrementalRust::new(self.cache_dir.clone());
         Ok(())
     }
+}
+
+fn build_fact_shards<'a>(
+    repository: &str,
+    fingerprints: impl IntoIterator<Item = &'a ShardFingerprint>,
+    entities: &[beholder_domain::EntityFact],
+    observations: &[beholder_domain::Observation],
+) -> Vec<FactShard> {
+    fingerprints
+        .into_iter()
+        .map(|fingerprint| {
+            let entities = entities
+                .iter()
+                .filter(|entity| entity.id.as_str() == fingerprint.owner)
+                .cloned()
+                .collect::<Vec<_>>();
+            let observations = observations
+                .iter()
+                .filter(|observation| observation.from.as_str() == fingerprint.owner)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut digest = Sha256::new();
+            for part in [
+                FRONTEND_VERSION.as_bytes(),
+                RESOLVER_VERSION.as_bytes(),
+                fingerprint.owner.as_bytes(),
+                &fingerprint.interface_hash,
+                &fingerprint.body_hash,
+            ] {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part);
+            }
+            for (call, receiver_method) in &fingerprint.calls {
+                digest.update((call.len() as u64).to_le_bytes());
+                digest.update(call.as_bytes());
+                digest.update([u8::from(*receiver_method)]);
+            }
+            for entity in &entities {
+                digest.update(entity.id.as_str().as_bytes());
+                digest.update(format!("{:?}", entity.kind).as_bytes());
+                digest.update(serde_json::to_vec(&entity.metadata).unwrap_or_default());
+            }
+            for observation in &observations {
+                digest.update(observation.from.as_str().as_bytes());
+                digest.update(observation.relation.as_str().as_bytes());
+                digest.update(observation.to.as_str().as_bytes());
+                digest.update(observation.confidence.score().to_le_bytes());
+                digest.update(observation.provenance.as_str().as_bytes());
+            }
+            FactShard {
+                repository: repository.to_owned(),
+                producer: "rust".into(),
+                owner: fingerprint.owner.clone().into(),
+                version: format!("{:x}", digest.finalize()),
+                entities,
+                observations,
+            }
+        })
+        .collect()
 }
 
 fn is_rust_source(path: &Path) -> bool {
@@ -292,6 +370,10 @@ mod tests {
         assert_eq!(repository.completeness, AnalysisCompleteness::Incomplete);
         assert!(repository.entities.iter().any(|entity| {
             entity.kind == EntityKind::Callable && entity.id.as_str().ends_with("/valid")
+        }));
+        assert!(repository.fact_shards.iter().any(|shard| {
+            shard.owner.as_str().ends_with("/valid")
+                && shard.entities.iter().any(|entity| entity.id == shard.owner)
         }));
         assert!(repository.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "rust.parse_recovery"

@@ -1,5 +1,5 @@
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, EntityKind, Evidence,
+    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, EntityKind, Evidence, FactShard,
     GrpcBindingCandidate, Observation, RepositoryDependencyCandidate, RepositoryFacts,
     RepositoryState, SemanticRelation,
 };
@@ -282,6 +282,7 @@ pub struct RepositoryContribution {
     pub grpc_bindings: Vec<GrpcBindingCandidate>,
     pub observations: Vec<Observation>,
     pub diagnostics: Vec<AnalysisDiagnostic>,
+    pub fact_shards: Vec<FactShard>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,6 +329,8 @@ struct CanonicalRepositoryAnalysis {
 struct CanonicalAnalyzerAnalysis {
     entities: Vec<EntityFact>,
     observations: Vec<Observation>,
+    #[serde(default)]
+    fact_shards: Vec<FactShard>,
 }
 
 pub struct AnalyzedRepository {
@@ -342,6 +345,7 @@ pub struct WorkspaceAnalysis {
     pub diagnostics: Vec<(String, AnalysisDiagnostic)>,
     pub repository_dependencies: Vec<RepositoryDependencyCandidate>,
     pub cache: CacheStatistics,
+    pub fact_shards: Vec<FactShard>,
 }
 
 pub trait WorkspaceAnalyzer: Send + Sync {
@@ -1360,6 +1364,7 @@ impl Indexer {
                 })?;
                 analysis.incomplete |= repository.completeness == AnalysisCompleteness::Incomplete;
                 let analyzer = analysis.analyzers.entry(analyzer_id.clone()).or_default();
+                analyzer.fact_shards.extend(repository.fact_shards);
                 extend_unique(&mut analyzer.entities, repository.entities.clone());
                 extend_unique(&mut analyzer.observations, repository.observations.clone());
                 extend_unique(&mut analysis.entities, repository.entities);
@@ -1369,11 +1374,18 @@ impl Indexer {
             }
         }
         let mut repositories = Vec::new();
+        let mut fact_shards = Vec::new();
         for repository in &snapshot.repositories {
             let identity = &repository.state.repository.identity;
             let analysis = merged
                 .remove(identity)
                 .ok_or_else(|| format!("missing analysis for repository {identity}"))?;
+            fact_shards.extend(
+                analysis
+                    .analyzers
+                    .values()
+                    .flat_map(|analyzer| analyzer.fact_shards.iter().cloned()),
+            );
             let analysis_identity = plan
                 .repository_identity(identity)
                 .ok_or_else(|| format!("missing analysis identity for repository {identity}"))?
@@ -1419,6 +1431,7 @@ impl Indexer {
             diagnostics,
             repository_dependencies,
             cache,
+            fact_shards,
         })
     }
 
@@ -1830,6 +1843,7 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
+                    fact_shards: Vec::new(),
                 })
                 .collect::<Vec<_>>();
             Ok(AnalyzerContribution {
@@ -1884,6 +1898,7 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
+                    fact_shards: Vec::new(),
                 })
                 .into_iter()
                 .collect();

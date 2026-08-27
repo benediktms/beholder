@@ -123,7 +123,7 @@ fn file_summary(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct FactShard {
+pub(super) struct ShardFingerprint {
     pub(super) owner: String,
     pub(super) interface_hash: [u8; 32],
     pub(super) body_hash: [u8; 32],
@@ -134,17 +134,28 @@ pub(super) struct FactShard {
 fn fact_shards(
     db: &dyn salsa::Database,
     source: SourceFile,
-) -> Result<Vec<FactShard>, AnalysisFailure> {
-    Ok(file_summary(db, source)?
-        .symbols
-        .into_iter()
-        .map(|symbol| FactShard {
-            owner: symbol.id,
-            interface_hash: symbol.interface_hash,
-            body_hash: symbol.body_hash,
-            calls: symbol.calls,
-        })
-        .collect())
+) -> Result<Vec<ShardFingerprint>, AnalysisFailure> {
+    let summary = file_summary(db, source)?;
+    let mut digest = Sha256::new();
+    digest.update([u8::from(summary.incomplete)]);
+    for symbol in &summary.symbols {
+        digest.update((symbol.id.len() as u64).to_le_bytes());
+        digest.update(symbol.id.as_bytes());
+        digest.update(symbol.interface_hash);
+    }
+    Ok(std::iter::once(ShardFingerprint {
+        owner: summary.source,
+        interface_hash: digest.finalize().into(),
+        body_hash: [0; 32],
+        calls: Vec::new(),
+    })
+    .chain(summary.symbols.into_iter().map(|symbol| ShardFingerprint {
+        owner: symbol.id,
+        interface_hash: symbol.interface_hash,
+        body_hash: symbol.body_hash,
+        calls: symbol.calls,
+    }))
+    .collect())
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +168,7 @@ pub(super) enum CacheStatus {
 pub(super) struct IncrementalAnalysis {
     pub(super) analysis: Arc<RustAnalysis>,
     pub(super) status: CacheStatus,
+    pub(super) shards: Vec<ShardFingerprint>,
 }
 
 pub(super) struct IncrementalRust {
@@ -251,7 +263,7 @@ impl IncrementalRust {
                         parse_file(&prepared.db, prepared.source)
                             .map_err(AnalysisFailure::into_error)?,
                     );
-                    let _ = fact_shards(&prepared.db, prepared.source)
+                    let shards = fact_shards(&prepared.db, prepared.source)
                         .map_err(AnalysisFailure::into_error)?;
                     if matches!(prepared.status, CacheStatus::Miss)
                         && let Some(parent) = prepared.cache_path.parent()
@@ -263,6 +275,7 @@ impl IncrementalRust {
                     Ok(IncrementalAnalysis {
                         analysis,
                         status: prepared.status,
+                        shards,
                     })
                 })();
                 (prepared.path, result)
@@ -354,19 +367,28 @@ mod tests {
             "pub fn run(value: u32) -> u32 { helper(value) + 1 }\nfn helper(value: u32) -> u32 { value }".into(),
         );
         let body_changed = fact_shards(&db, source).unwrap();
-        assert_eq!(body_changed[0].interface_hash, initial[0].interface_hash);
-        assert_ne!(body_changed[0].body_hash, initial[0].body_hash);
-        assert_eq!(body_changed[1], initial[1]);
+        let initial_run = initial
+            .iter()
+            .find(|shard| shard.owner.ends_with("/run"))
+            .unwrap();
+        let body_run = body_changed
+            .iter()
+            .find(|shard| shard.owner.ends_with("/run"))
+            .unwrap();
+        assert_eq!(body_run.interface_hash, initial_run.interface_hash);
+        assert_ne!(body_run.body_hash, initial_run.body_hash);
+        assert_eq!(body_changed[2], initial[2]);
 
         source.set_text(&mut db).to(
             "pub fn run(value: u64) -> u32 { helper(value as u32) + 1 }\nfn helper(value: u32) -> u32 { value }".into(),
         );
         let interface_changed = fact_shards(&db, source).unwrap();
-        assert_ne!(
-            interface_changed[0].interface_hash,
-            body_changed[0].interface_hash
-        );
-        assert_eq!(interface_changed[1], body_changed[1]);
+        let interface_run = interface_changed
+            .iter()
+            .find(|shard| shard.owner.ends_with("/run"))
+            .unwrap();
+        assert_ne!(interface_run.interface_hash, body_run.interface_hash);
+        assert_eq!(interface_changed[2], body_changed[2]);
     }
 
     #[test]

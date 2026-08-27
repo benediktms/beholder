@@ -208,6 +208,16 @@ pub struct RepositoryFacts {
     pub observations: Vec<Observation>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FactShard {
+    pub repository: String,
+    pub producer: String,
+    pub owner: EntityId,
+    pub version: String,
+    pub entities: Vec<EntityFact>,
+    pub observations: Vec<Observation>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct GrpcBindingCandidate {
     pub local_symbol: EntityId,
