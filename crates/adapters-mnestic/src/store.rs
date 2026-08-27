@@ -20,7 +20,7 @@ use super::{
 };
 use beholder_domain::{
     AnalysisDiagnostic, BeholderError, BeholderErrorCode, BeholderErrorKind, DependencyOverride,
-    EntityFact, EntityKind, FactChanges, Observation, RepositoryFacts, SemanticRelation,
+    EntityFact, EntityKind, FactChanges, FactShard, Observation, RepositoryFacts, SemanticRelation,
     WorkspaceView,
 };
 use beholder_dto::{
@@ -154,7 +154,7 @@ impl SemanticStore {
         repositories: &[RepositoryFacts],
         overrides: &[DependencyOverride],
     ) -> Result<FactChanges, Box<dyn Error>> {
-        self.access(|| publish_observations(&self.db, view, repositories, overrides, None))
+        self.access(|| publish_observations(&self.db, view, repositories, overrides, &[], None))
     }
 
     pub fn publish_repository(&self, facts: &RepositoryFacts) -> Result<bool, Box<dyn Error>> {
@@ -193,6 +193,27 @@ impl SemanticStore {
                 view,
                 repositories,
                 overrides,
+                &[],
+                Some(verification_fingerprint),
+            )
+        })
+    }
+
+    pub fn publish_verified_sharded(
+        &self,
+        view: &WorkspaceView,
+        repositories: &[RepositoryFacts],
+        overrides: &[DependencyOverride],
+        fact_shards: &[FactShard],
+        verification_fingerprint: &str,
+    ) -> Result<FactChanges, Box<dyn Error>> {
+        self.access(|| {
+            publish_observations(
+                &self.db,
+                view,
+                repositories,
+                overrides,
+                fact_shards,
                 Some(verification_fingerprint),
             )
         })
@@ -570,8 +591,8 @@ mod tests {
     use crate::SemanticStore;
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
-        DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
-        WorkspaceView,
+        DependencyRelation, EntityFact, EntityKind, FactShard, LogicalRepository, Observation,
+        RepositoryFacts, RepositoryState, WorkspaceView,
     };
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity as DtoSeverity};
     use std::{
@@ -592,6 +613,108 @@ mod tests {
             grpc_bindings: Vec::new(),
             observations,
         }
+    }
+
+    #[test]
+    fn fact_shard_selection_reuses_unchanged_versions_and_replaces_one_owner() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "incremental",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repository".into(),
+                },
+                head: None,
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let repository = facts(&view, Vec::new());
+        let owner = "repo://example/repository/rust/lib/run";
+        let shard = |version: &str, target: &str| FactShard {
+            repository: "example/repository".into(),
+            producer: "rust".into(),
+            owner: owner.into(),
+            version: version.into(),
+            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            observations: vec![Observation::dependency(
+                owner,
+                DependencyRelation::Calls,
+                target,
+                "src/lib.rs:1",
+            )],
+        };
+
+        let first = shard("body-1", "rust-call://first");
+        assert_eq!(
+            store
+                .publish_verified_sharded(
+                    &view,
+                    std::slice::from_ref(&repository),
+                    &[],
+                    std::slice::from_ref(&first),
+                    "verified-1",
+                )
+                .unwrap()
+                .inserted,
+            1
+        );
+        assert_eq!(
+            store.context("incremental", owner).unwrap().edges[0].to,
+            "rust-call://first"
+        );
+
+        assert_eq!(
+            store
+                .publish_verified_sharded(
+                    &view,
+                    std::slice::from_ref(&repository),
+                    &[],
+                    std::slice::from_ref(&first),
+                    "verified-1",
+                )
+                .unwrap()
+                .unchanged,
+            1
+        );
+
+        let second = shard("body-2", "rust-call://second");
+        let changes = store
+            .publish_verified_sharded(
+                &view,
+                std::slice::from_ref(&repository),
+                &[],
+                std::slice::from_ref(&second),
+                "verified-2",
+            )
+            .unwrap();
+        assert_eq!(changes.inserted, 1);
+        assert_eq!(changes.removed, 1);
+        let context = store.context("incremental", owner).unwrap();
+        assert_eq!(context.edges.len(), 1);
+        assert_eq!(context.edges[0].to, "rust-call://second");
+
+        assert_eq!(
+            store
+                .publish_verified_sharded(
+                    &view,
+                    std::slice::from_ref(&repository),
+                    &[],
+                    &[],
+                    "verified-3",
+                )
+                .unwrap()
+                .removed,
+            1
+        );
+        assert!(
+            store
+                .context("incremental", owner)
+                .unwrap()
+                .edges
+                .is_empty()
+        );
     }
 
     #[test]

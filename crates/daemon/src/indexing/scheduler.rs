@@ -2331,10 +2331,11 @@ fn index_workspace_through_port(
         observation_count
     )
     .in_scope(|| {
-        store.publish_verified(
+        store.publish_verified_sharded(
             &view,
             &repository_facts,
             &analysis.overrides,
+            &analysis.fact_shards,
             &verification_fingerprint,
         )
     })?;

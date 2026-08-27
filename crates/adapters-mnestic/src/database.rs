@@ -105,6 +105,10 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         CREATE_BASELINE_OBSERVATION_SCHEMA,
         CREATE_BASELINE_OVERRIDE_SCHEMA,
         CREATE_BASELINE_DIAGNOSTIC_SCHEMA,
+        CREATE_FACT_SHARD_SELECTION_SCHEMA,
+        CREATE_FACT_SHARD_ENTITY_SCHEMA,
+        CREATE_FACT_SHARD_OBSERVATION_SCHEMA,
+        CREATE_FACT_SHARD_DEPENDENCY_SCHEMA,
         CREATE_SCHEMA_MIGRATION_SCHEMA,
     ] {
         db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)?;
@@ -354,6 +358,22 @@ pub(super) fn persistent_database(
         (
             "analysis_baseline_diagnostic",
             CREATE_BASELINE_DIAGNOSTIC_SCHEMA,
+        ),
+        (
+            "analysis_fact_shard_selection",
+            CREATE_FACT_SHARD_SELECTION_SCHEMA,
+        ),
+        (
+            "analysis_fact_shard_entity",
+            CREATE_FACT_SHARD_ENTITY_SCHEMA,
+        ),
+        (
+            "analysis_fact_shard_observation",
+            CREATE_FACT_SHARD_OBSERVATION_SCHEMA,
+        ),
+        (
+            "analysis_fact_shard_dependency_observation",
+            CREATE_FACT_SHARD_DEPENDENCY_SCHEMA,
         ),
         ("schema_migration", CREATE_SCHEMA_MIGRATION_SCHEMA),
         ("repository_revision", CREATE_REPOSITORY_REVISION_SCHEMA),

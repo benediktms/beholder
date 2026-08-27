@@ -258,6 +258,9 @@ pub(super) fn entity_facts(
              *state_entity{state, id, kind, metadata}\n\
          ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
              *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
+         ?[id, kind, metadata] := requested[id], \
+             *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
          :order id",
         [("entities", entities)],
     )
@@ -317,7 +320,23 @@ pub(super) fn context(
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(db, view, CONTEXT_QUERY, [("entity", entity.into())])
+    query(
+        db,
+        view,
+        &format!(
+            "{DIRECT_RULES}\n\
+             ?[direction, relation, related, evidence, confidence, provenance] := \
+                 effective_observation[\
+                     $entity, related, relation, evidence, confidence, provenance\
+                 ], direction = 'outgoing'\n\
+             ?[direction, relation, related, evidence, confidence, provenance] := \
+                 effective_observation[\
+                     related, $entity, relation, evidence, confidence, provenance\
+                 ], direction = 'incoming'\n\
+             :order direction, relation, related"
+        ),
+        [("entity", entity.into())],
+    )
 }
 
 pub(super) fn trace(
