@@ -545,6 +545,7 @@ dependencies = [
  "beholder-protocol",
  "beholder-worker-client",
  "futures-util",
+ "log",
  "notify",
  "rayon",
  "serde",
