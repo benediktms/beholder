@@ -45,7 +45,27 @@ fn replace_fact_shards(
         })
         .collect::<BTreeMap<_, _>>();
     if incoming.len() != shards.len() {
-        return Err("fact shard owners must be unique within a publication".into());
+        let mut owners = BTreeMap::new();
+        for shard in shards {
+            *owners
+                .entry((
+                    shard.producer.as_str(),
+                    shard.repository.as_str(),
+                    shard.owner.as_str(),
+                ))
+                .or_insert(0usize) += 1;
+        }
+        let duplicates = owners
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|((producer, repository, owner), count)| {
+                format!("{producer}/{repository}/{owner} ({count})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(
+            format!("fact shard owners must be unique within a publication: {duplicates}").into(),
+        );
     }
 
     let current = transaction.run_script(

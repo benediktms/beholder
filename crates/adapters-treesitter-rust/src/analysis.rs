@@ -301,6 +301,27 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
         .collect()
 }
 
+fn disambiguate_function_names(functions: &mut [RustFunction]) {
+    let totals = functions
+        .iter()
+        .fold(BTreeMap::new(), |mut totals, function| {
+            *totals
+                .entry(function.qualified_name.clone())
+                .or_insert(0usize) += 1;
+            totals
+        });
+    let mut seen = BTreeMap::new();
+    for function in functions {
+        if totals[&function.qualified_name] > 1 {
+            let ordinal = seen
+                .entry(function.qualified_name.clone())
+                .or_insert(0usize);
+            function.qualified_name = format!("{}#{ordinal}", function.qualified_name);
+            *ordinal += 1;
+        }
+    }
+}
+
 pub fn analyze(source: &str) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
     let plugins = built_in_plugins()?;
     let active = plugins.activate_direct(Path::new("input.rs"));
@@ -336,6 +357,7 @@ pub(super) fn analyze_with_plugins(
             analyze_tree_sitter(source, &tree)?
         }
     };
+    disambiguate_function_names(&mut analysis.functions);
     plugins.recognize(
         SourceRecognitionInput {
             path,
@@ -517,5 +539,22 @@ mod recovery_tests {
         assert_eq!(calls[1].name, "Default::default");
         assert_eq!(calls[2].name, "run");
         assert!(calls[2].receiver_method);
+    }
+
+    #[test]
+    fn gives_cfg_alternatives_stable_distinct_names() {
+        let source = "#[cfg(unix)] fn path_bytes() {} #[cfg(windows)] fn path_bytes() {}";
+        let shifted = format!("// comment\n{source}");
+        let names = |source| {
+            analyze(source)
+                .unwrap()
+                .functions
+                .into_iter()
+                .map(|function| function.qualified_name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(source), vec!["path_bytes#0", "path_bytes#1"]);
+        assert_eq!(names(source), names(&shifted));
     }
 }
