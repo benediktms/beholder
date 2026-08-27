@@ -66,7 +66,7 @@ git -C "$state/elixir" add lib
 git -C "$state/elixir" commit -qm 'Add Elixir integration-test fixture'
 git -C "$state/elixir" remote add origin https://github.com/example/beholder-elixir-smoke.git
 mkdir -p "$state/rust/src"
-printf '[dependencies]\ntonic = "0.14"\n' >"$state/rust/Cargo.toml"
+printf '[package]\nname = "beholder-rust-smoke"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\ntonic = "0.14"\n' >"$state/rust/Cargo.toml"
 cp "$root/scripts/fixtures/integration-test/rust/protocol.rs.fixture" "$state/rust/src/protocol.rs"
 cp "$root/scripts/fixtures/integration-test/rust/generated.rs.fixture" "$state/rust/src/generated.rs"
 cp "$root/scripts/fixtures/integration-test/rust/client.rs.fixture" "$state/rust/src/client.rs"
