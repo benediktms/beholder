@@ -31,25 +31,34 @@ impl Plugin<ElixirLanguage> for GrpcElixirPlugin {
     }
 
     fn activate(&self, repository: &RepositorySnapshot) -> Option<PluginActivation> {
-        repository
+        let manifest = repository
             .inputs
             .iter()
+            .filter(|input| is_mix_manifest(&input.path))
             .filter_map(|input| {
                 let source = std::str::from_utf8(&input.content).ok()?;
-                let reason = if is_mix_manifest(&input.path) && manifest_declares_grpc(source) {
-                    "mix.exs declares :grpc dependency"
-                } else if is_elixir_source(&input.path) && grpc_source_evidence(source) {
-                    "Elixir source uses grpc-elixir"
-                } else {
-                    return None;
-                };
-                Some((input, reason))
+                manifest_declares_grpc(source).then_some(input)
             })
-            .min_by_key(|(input, _)| &input.path)
-            .map(|(input, reason)| PluginActivation {
+            .min_by_key(|input| &input.path)
+            .map(|input| PluginActivation {
                 path: input.path.clone(),
-                reason: reason.into(),
-            })
+                reason: "mix.exs declares :grpc dependency".into(),
+            });
+        manifest.or_else(|| {
+            repository
+                .inputs
+                .iter()
+                .filter(|input| is_elixir_source(&input.path))
+                .filter_map(|input| {
+                    let source = std::str::from_utf8(&input.content).ok()?;
+                    grpc_source_evidence(source).then_some(input)
+                })
+                .min_by_key(|input| &input.path)
+                .map(|input| PluginActivation {
+                    path: input.path.clone(),
+                    reason: "Elixir source uses grpc-elixir".into(),
+                })
+        })
     }
 
     fn install(&self, builder: &mut LanguageAnalyzerBuilder<ElixirLanguage>) {
@@ -114,6 +123,9 @@ fn syntax(source: &str) -> Option<tree_sitter::Tree> {
 }
 
 fn manifest_declares_grpc(source: &str) -> bool {
+    if !source.contains(":grpc") {
+        return false;
+    }
     syntax(source).is_some_and(|tree| {
         any_node(tree.root_node(), &mut |node| {
             node.kind() == "tuple"
@@ -126,6 +138,12 @@ fn manifest_declares_grpc(source: &str) -> bool {
 }
 
 fn grpc_source_evidence(source: &str) -> bool {
+    if !["GRPC.Service", "GRPC.Server", "GRPC.Stub"]
+        .iter()
+        .any(|marker| source.contains(marker))
+    {
+        return false;
+    }
     syntax(source).is_some_and(|tree| {
         any_node(tree.root_node(), &mut |node| {
             node.kind() == "call"
