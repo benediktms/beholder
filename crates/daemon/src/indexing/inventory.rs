@@ -293,9 +293,7 @@ impl InventoryStore {
     fn store_blob(&self, hash: &str, content: &[u8], base: &Path) -> Result<(), BeholderError> {
         let path = blob_path(&self.root, hash)
             .expect("new inventory content digests are valid SHA-256 values");
-        if let Ok(existing) = fs::read(&path)
-            && format!("{:x}", Sha256::digest(&existing)) == hash
-        {
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == content.len() as u64) {
             return Ok(());
         }
         let parent = path.parent().expect("blob path has a parent");
