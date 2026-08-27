@@ -344,7 +344,7 @@ impl SemanticStore {
         &self,
         mut progress: impl FnMut(GarbageCollectionProgress) -> bool,
     ) -> Result<u64, Box<dyn Error>> {
-        sweep_garbage_collection(&self.gc_db, &mut progress)
+        sweep_garbage_collection(&self.gc_db, &self.engine, &mut progress)
     }
 
     pub fn garbage_collection_pending(&self) -> Result<bool, Box<dyn Error>> {

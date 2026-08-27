@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -2797,6 +2798,7 @@ struct RelationCleanup<'a> {
 
 fn sweep_relation(
     db: &DbInstance,
+    writer: &Mutex<()>,
     progress: &mut impl FnMut(GarbageCollectionProgress) -> bool,
     cleanup: RelationCleanup<'_>,
 ) -> Result<bool, Box<dyn Error>> {
@@ -2827,7 +2829,7 @@ fn sweep_relation(
         if batch.is_empty() {
             return Ok(true);
         }
-        if !remove_garbage_collection_batch(db, &cleanup, &batch)? {
+        if !remove_garbage_collection_batch(db, writer, &cleanup, &batch)? {
             return Ok(true);
         }
         let batch_size: u64 = batch.len().try_into()?;
@@ -2850,11 +2852,18 @@ fn sweep_relation(
 
 fn remove_garbage_collection_batch(
     db: &DbInstance,
+    writer: &Mutex<()>,
     cleanup: &RelationCleanup<'_>,
     batch: &[Vec<DataValue>],
 ) -> Result<bool, Box<dyn Error>> {
     for attempt in 0..=GARBAGE_COLLECTION_TRANSACTION_RETRIES {
-        match remove_garbage_collection_batch_once(db, cleanup, batch) {
+        let result = {
+            let _writer = writer
+                .lock()
+                .map_err(|_| "semantic store engine lock poisoned")?;
+            remove_garbage_collection_batch_once(db, cleanup, batch)
+        };
+        match result {
             Ok(removed) => return Ok(removed),
             Err(_) if attempt < GARBAGE_COLLECTION_TRANSACTION_RETRIES => {
                 thread::sleep(GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY);
@@ -2915,6 +2924,7 @@ fn remove_garbage_collection_batch_once(
 
 fn sweep_unselected_enrichment_snapshots(
     db: &DbInstance,
+    writer: &Mutex<()>,
     progress: &mut impl FnMut(GarbageCollectionProgress) -> bool,
     stale_states: u32,
     repositories: u32,
@@ -2957,6 +2967,7 @@ fn sweep_unselected_enrichment_snapshots(
         {
             if !sweep_relation(
                 db,
+                writer,
                 progress,
                 RelationCleanup {
                     step: format!("unselected enrichment snapshot {owner} from {view}"),
@@ -2977,30 +2988,36 @@ fn sweep_unselected_enrichment_snapshots(
                 return Ok(false);
             }
         }
-        let transaction = db.multi_transaction(true);
-        if !transaction
-            .run_script(
-                "?[owner] := *analysis_revision_repository_enrichment{\
-                     view: $view, owner: $owner\
-                 }, owner = $owner :limit 1",
-                params.clone(),
-            )?
-            .rows
-            .is_empty()
         {
-            transaction.abort()?;
-            continue;
+            let _writer = writer
+                .lock()
+                .map_err(|_| "semantic store engine lock poisoned")?;
+            let transaction = db.multi_transaction(true);
+            if !transaction
+                .run_script(
+                    "?[owner] := *analysis_revision_repository_enrichment{\
+                         view: $view, owner: $owner\
+                     }, owner = $owner :limit 1",
+                    params.clone(),
+                )?
+                .rows
+                .is_empty()
+            {
+                transaction.abort()?;
+                continue;
+            }
+            transaction.run_script(
+                "?[view, owner] <- [[$view, $owner]] :rm enrichment_output {view, owner}",
+                params,
+            )?;
+            transaction.commit()?;
         }
-        transaction.run_script(
-            "?[view, owner] <- [[$view, $owner]] :rm enrichment_output {view, owner}",
-            params,
-        )?;
-        transaction.commit()?;
     }
 }
 
 pub(super) fn sweep_garbage_collection(
     db: &DbInstance,
+    writer: &Mutex<()>,
     progress: &mut impl FnMut(GarbageCollectionProgress) -> bool,
 ) -> Result<u64, Box<dyn Error>> {
     let queued = db.run_script(
@@ -3162,6 +3179,7 @@ pub(super) fn sweep_garbage_collection(
         for (step, select_script, relation, keys) in state_steps {
             if !sweep_relation(
                 db,
+                writer,
                 progress,
                 RelationCleanup {
                     step: format!("{step} from {repository} state {state}"),
@@ -3180,11 +3198,16 @@ pub(super) fn sweep_garbage_collection(
                 return Ok(states_resolved.into());
             }
         }
-        db.run_script(
-            "?[state] := state = $state\n:rm garbage_collection_state {state}",
-            BTreeMap::from([("state".into(), state.into())]),
-            ScriptMutability::Mutable,
-        )?;
+        {
+            let _writer = writer
+                .lock()
+                .map_err(|_| "semantic store engine lock poisoned")?;
+            db.run_script(
+                "?[state] := state = $state\n:rm garbage_collection_state {state}",
+                BTreeMap::from([("state".into(), state.into())]),
+                ScriptMutability::Mutable,
+            )?;
+        }
         states_resolved += 1;
     }
     let current_revisions = db.run_script(
@@ -3208,6 +3231,7 @@ pub(super) fn sweep_garbage_collection(
                 .ok_or("garbage collection revision step count overflow")?;
             if !sweep_relation(
                 db,
+                writer,
                 progress,
                 RelationCleanup {
                     step: format!("{step} from {view}"),
@@ -3263,6 +3287,7 @@ pub(super) fn sweep_garbage_collection(
     ] {
         if !sweep_relation(
             db,
+            writer,
             progress,
             RelationCleanup {
                 step: step.into(),
@@ -3281,7 +3306,7 @@ pub(super) fn sweep_garbage_collection(
             return Ok(states_resolved.into());
         }
     }
-    if !sweep_unselected_enrichment_snapshots(db, progress, stale_states, repositories)? {
+    if !sweep_unselected_enrichment_snapshots(db, writer, progress, stale_states, repositories)? {
         return Ok(states_resolved.into());
     }
     Ok(states_resolved.into())
@@ -5207,7 +5232,7 @@ mod tests {
         };
         assert!(!snapshots_for("repo-a", "a").is_empty());
         assert!(garbage_collection_pending(&store.db).unwrap());
-        sweep_garbage_collection(&store.db, &mut |_| true).unwrap();
+        store.sweep_garbage_collection(|_| true).unwrap();
         assert!(snapshots_for("repo-a", "a").is_empty());
         assert!(snapshots_for("repo-b", "a").is_empty());
 
@@ -5232,7 +5257,7 @@ mod tests {
             .unwrap();
         assert!(!current_entity(shared.id.as_str()));
         assert!(!snapshots_for("repo-a", "b").is_empty());
-        sweep_garbage_collection(&store.db, &mut |_| true).unwrap();
+        store.sweep_garbage_collection(|_| true).unwrap();
         assert!(snapshots_for("repo-a", "b").is_empty());
     }
 
