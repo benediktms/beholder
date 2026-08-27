@@ -664,6 +664,14 @@ mod tests {
             store.context("incremental", owner).unwrap().edges[0].to,
             "rust-call://first"
         );
+        assert!(
+            store
+                .impact("incremental", "rust-call://first", 1)
+                .unwrap()
+                .affected
+                .iter()
+                .any(|affected| affected.entity == owner)
+        );
 
         assert_eq!(
             store

@@ -301,7 +301,7 @@ fi
 echo 'Checking run_daemon -> state_dir...' >&2
 echo 'Checking state_dir impact reaches run_daemon...' >&2
 for _ in {1..600}; do
-    result="$(target/debug/beholder impact --json --workspace main "$callee")"
+    result="$(target/debug/beholder impact --json --max-hops 1 --workspace main "$callee")"
     grep -Fq "$caller" <<<"$result" && break
     sleep 0.1
 done
