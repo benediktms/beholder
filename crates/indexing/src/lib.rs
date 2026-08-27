@@ -1947,7 +1947,8 @@ mod tests {
         }
 
         fn accepts(&self, path: &Path) -> bool {
-            path.extension().is_some_and(|extension| extension == "fake")
+            path.extension()
+                .is_some_and(|extension| extension == "fake")
         }
 
         fn analyze_prepared(
