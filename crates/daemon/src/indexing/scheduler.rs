@@ -3680,23 +3680,12 @@ mod tests {
         );
 
         let warm_started = Instant::now();
-        let (warm_observations, _) = index_workspace_versioned(
-            &scheduler,
-            &store,
-            &workspace,
-            None,
-            AnalysisVersions {
-                rust_resolver: "benchmark",
-                elixir_resolver: "benchmark",
-                ..CURRENT_ANALYSIS_VERSIONS
-            },
-        )
-        .unwrap();
+        let (warm_observations, _) = index_workspace(&scheduler, &store, &workspace, None).unwrap();
         println!(
-            "workers={workers} mode=warm-frontend observations={warm_observations} elapsed_ms={:.3}",
+            "workers={workers} mode=unchanged observations={warm_observations} elapsed_ms={:.3}",
             warm_started.elapsed().as_secs_f64() * 1000.0
         );
-        assert_eq!(cold_observations, warm_observations);
+        assert_eq!(warm_observations, 0);
         drop(store);
         fs::remove_dir_all(state).unwrap();
     }

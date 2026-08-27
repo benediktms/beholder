@@ -7,8 +7,7 @@ https://github.com/benediktms/beholder/issues/6. Measurements were taken on
 ## Reproducing the benchmark
 
 The benchmark creates an isolated database and frontend cache, performs a cold
-index, then changes only the resolver identity to exercise warm frontend caches
-and repository-state reuse.
+index, then repeats the same request to measure unchanged checkpoint validation.
 
 ```sh
 just index-bench 4 "/path/to/repository-a:/path/to/repository-b"
@@ -77,9 +76,9 @@ another 1.5 seconds, and eight save only another 0.5 seconds.
 
 ## Startup reconciliation follow-up
 
-Measurements on 2026-08-27 used the installed daemon and a Fresha workspace
-containing 27,146 accepted inputs (184,600,052 bytes). The persistent semantic
-database was 8.2 GiB.
+Measurements on 2026-08-27 used the installed daemon and a large seven-repository
+workspace containing 27,146 accepted inputs (184,600,052 bytes). The persistent
+semantic database was 8.2 GiB.
 
 An unchanged startup reconciliation originally took about 275 seconds when an
 immediate garbage-collection sweep competed with indexing. A later changed
@@ -99,8 +98,8 @@ parsing Elixir sources, an isolated unchanged workspace completed in 40.6 second
 
 The exact final binary was then reinstalled and allowed to perform its normal startup
 sequence. A changed Beholder publication completed in 91.6 seconds, followed by an
-unchanged Fresha reconciliation in 50.6 seconds. The periodic garbage collector
-became eligible during Fresha indexing but waited behind indexing and checkpointing;
+unchanged large-workspace reconciliation in 50.6 seconds. The periodic garbage
+collector became eligible during indexing but waited behind indexing and checkpointing;
 it did not preempt either operation.
 
 While that collector later held the semantic-store mutation gate, a context query
@@ -129,8 +128,37 @@ With both checkpoints current, an exact release-binary restart produced:
 
 | Workspace | Checkpoint verification | Outcome |
 | --- | ---: | --- |
-| Fresha (7 repositories) | 724 ms | Unchanged, 0 observations, not published |
+| Large workspace (7 repositories) | 724 ms | Unchanged, 0 observations, not published |
 | Beholder (1 repository) | 20.5 ms | Unchanged, 0 observations, not published |
 
 Changed publication remains a separate Mnestic bottleneck. Neither optimization
 requires mutable repository facts or a generic cache layer.
+
+## Incremental Rust slice
+
+ADR 0007 replaces Rust repository-wide semantic publication with Salsa-backed
+file queries and immutable fact shards selected per stable semantic owner. A
+source edit propagates through parsing, file summary, and shard production only
+while each semantic output changes. Mnestic retains unchanged shard versions and
+rebuilds the remaining legacy baseline only when its semantic fingerprint changes.
+
+The 2026-08-27 self-index benchmark used four workers, 178 accepted inputs, and
+2,573,785 bytes:
+
+| Mode | Total | Analysis | Publication | Observations |
+| --- | ---: | ---: | ---: | ---: |
+| Cold migration | 1,455 ms | 300 ms | 1,082 ms | 1,320 |
+| Unchanged checkpoint | 15.8 ms | skipped | skipped | 0 |
+
+The focused Salsa test also verifies that inserting a comment reruns parsing and
+file summarization but backdates the unchanged shard output. Function-body and
+interface changes produce different shard fingerprints. The self-index run found
+and fixed ambiguous Rust owners: duplicate qualified names now receive a stable
+file-local ordinal, and Mnestic reports the exact conflicting owners if uniqueness
+is violated again.
+
+This is the first executable slice, not the final performance target. Salsa state
+is process-local, compiler enrichment still uses its existing input identity, and
+non-Rust frontends still publish through repository facts. Cross-process query
+persistence and other language frontends should be added only after changed-file
+installed-daemon measurements identify the next dominant stage.

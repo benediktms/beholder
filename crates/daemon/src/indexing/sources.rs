@@ -325,8 +325,13 @@ pub(super) fn repository_sources(
             Ok((relative_path, fs::read_to_string(path)?))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    let (elixir, rust): (ElixirSources, RustSources) =
-        sources.into_iter().partition(|(path, _)| {
+    let (elixir, rust): (ElixirSources, RustSources) = sources
+        .into_iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "ex" | "exs")))
+        })
+        .partition(|(path, _)| {
             path.extension()
                 .is_some_and(|extension| matches!(extension.to_str(), Some("ex" | "exs")))
         });
@@ -650,6 +655,11 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            repository.join("package-lock.json"),
+            r#"{"lockfileVersion":3}"#,
+        )
+        .unwrap();
+        fs::write(
             repository.join("tsconfig.json"),
             "{ // comment\n \"compilerOptions\": { \"paths\": {}, },\n}",
         )
@@ -669,6 +679,7 @@ mod tests {
         assert_eq!(sources.typescript_manifests.len(), 1);
         assert_eq!(sources.typescript_configs.len(), 1);
         assert_eq!(sources.graphql.len(), 2);
+        assert!(sources.rust.is_empty());
         assert!(
             sources
                 .typescript
