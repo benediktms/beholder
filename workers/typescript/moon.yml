@@ -1,0 +1,36 @@
+language: 'go'
+layer: 'application'
+
+fileGroups:
+  sources:
+    - '/mise.toml'
+    - 'go.mod'
+    - '**/*.go'
+
+tasks:
+  test:
+    command: 'mise exec -- go test ./...'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  lint:
+    command: 'mise exec -- go vet ./...'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  format-check:
+    command: 'bash -c ''test -z "$(gofmt -l .)"'''
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  format:
+    command: 'gofmt -w .'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false
