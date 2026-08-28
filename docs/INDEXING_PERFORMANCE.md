@@ -234,3 +234,32 @@ seconds. End-to-end worker analysis took 3.10 seconds, while base indexing took
 1.24 seconds and enrichment publication took 334 ms. The remaining compiler hot
 path is the repository-wide `goto_definition` sweep; safely narrowing it requires
 dependency-aware invalidation rather than a source-file-only result cache.
+
+The next slice made compiler currentness semantic and cached call-resolution
+outputs by stable symbol and call-site identity. Its 2026-08-28 isolated
+self-index run used 177 accepted inputs and 19,035 Rust call sites:
+
+| Edit | Compiler query stage | Resolution hits | Resolution misses | Outcome |
+| --- | ---: | ---: | ---: | --- |
+| Ordinary comment | skipped | — | — | Base index only; 27,187 shard rows unchanged |
+| Warm function body | 344 ms | 19,008 | 27 | 602 ms worker enrichment |
+| Function body after restart | 1.62 s | 19,008 | 27 | 2.40 s worker enrichment |
+
+The warm measurement satisfies the sub-500 ms compiler-query target; the worker
+total also includes snapshot validation, contribution handling, and cache
+scheduling. On restart, the 4.9 MB disposable cache loaded in 14.5 ms and retained
+the same 19,008 results. The remaining 1.57 seconds was cold rust-analyzer file
+extraction, which is intentionally process-local rather than persisted.
+
+The worker now consumes selected baseline call facts instead of running a second
+syntax analyzer. Baseline selection tolerates unresolved external endpoints and
+compiler overrides rebase onto the current baseline evidence, so a carried
+enrichment cannot preserve obsolete line evidence. Ordinary comments, whitespace,
+and pure formatting are enrichment no-ops; documentation, attributes, imports,
+interfaces, body tokens, macros, compiler configuration, and toolchain changes
+still invalidate the appropriate semantic boundary.
+
+This does not yet implement the module reverse-dependency graph. Until that next
+slice, interface and module-surface changes conservatively invalidate the current
+Cargo project; body changes invalidate only their owning symbol's cached call
+resolutions.
