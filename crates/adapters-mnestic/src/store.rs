@@ -166,7 +166,9 @@ impl SemanticStore {
         repositories: &[RepositoryFacts],
         overrides: &[DependencyOverride],
     ) -> Result<FactChanges, Box<dyn Error>> {
-        self.access(|| publish_observations(&self.db, view, repositories, overrides, &[], None))
+        self.access(|| {
+            publish_observations(&self.db, view, repositories, overrides, &[], None, false)
+        })
     }
 
     pub fn publish_repository(&self, facts: &RepositoryFacts) -> Result<bool, Box<dyn Error>> {
@@ -215,6 +217,7 @@ impl SemanticStore {
                 overrides,
                 &[],
                 Some(verification_fingerprint),
+                false,
             )
         })
     }
@@ -235,6 +238,7 @@ impl SemanticStore {
                 overrides,
                 fact_shards,
                 Some(verification_fingerprint),
+                true,
             )
         })
     }
@@ -743,8 +747,9 @@ mod tests {
                 "verified-2",
             )
             .unwrap();
-        assert_eq!(changes.inserted, 1);
-        assert_eq!(changes.removed, 1);
+        assert_eq!(changes.updated, 1);
+        assert_eq!(changes.inserted, 0);
+        assert_eq!(changes.removed, 0);
         let context = store.context("incremental", owner).unwrap();
         assert_eq!(context.edges.len(), 1);
         assert_eq!(context.edges[0].to, "rust-call://second");

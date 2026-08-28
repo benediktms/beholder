@@ -196,6 +196,17 @@ single writer is not the limiting stage on the changed-enrichment path. Revisit
 that decision only if writer-wait instrumentation shows sustained publication
 contention after query plans and garbage-collection scheduling are bounded.
 
+A later comment-only edit on the same persistent database isolated the remaining
+base-publication scan. Before removal, reading 18,203 effective observations took
+5.43 seconds cold and 2.22 seconds warm, making base publication take 6.38 and
+2.88 seconds even though all 27,041 shard rows were unchanged. Returning the shard
+replacement delta directly reduced a comparable Mnestic publication to 730 ms:
+221 ms replacing 1,987 shard selections, 426 ms storing repository state, 37 ms
+storing the revision manifest, and 43 ms committing. Scheduler publication was
+832 ms, reported zero changed facts and 27,038 unchanged rows, and did not execute
+the effective-observation read, rebuild, or diff. Legacy repository-snapshot
+publication retains the full effective diff because its public result requires it.
+
 This is the first executable slice, not the final performance target. Salsa state
 is process-local, compiler enrichment still uses its existing input identity, and
 non-Rust frontends still publish through repository facts. Cross-process query
