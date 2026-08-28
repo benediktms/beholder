@@ -2339,12 +2339,7 @@ pub(super) fn publish_enrichment(
         .is_empty();
     if !snapshot_exists {
         let started = Instant::now();
-        replace_enrichment_contributions(
-            &transaction,
-            view,
-            &owner,
-            &payload,
-        )?;
+        replace_enrichment_contributions(&transaction, view, &owner, &payload)?;
         complete_enrichment(
             &transaction,
             view,
