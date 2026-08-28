@@ -5,9 +5,11 @@ use super::{
 use beholder_adapters_treesitter::{ErrorDisposition, Recovery, RecoveryFailure, recover_with};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, Provenance, StructuralRelation, UnsafeTreeRecovery,
+    Observation, Provenance, SemanticCandidate, SourcePosition, SourceSpan, StructuralRelation,
+    UnsafeTreeRecovery,
 };
 use beholder_indexing::{LanguageAnalyzer, SourceRecognitionInput};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
@@ -52,25 +54,27 @@ fn collect_identifiers(node: Node<'_>, source: &[u8], identifiers: &mut Vec<Stri
 }
 
 fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
-    let (receiver, name, kind): (Option<String>, String, CallKind) = match target.kind() {
-        "identifier" => (None, text(target, source)?.into(), kind),
-        "member_expression" => (
-            target
-                .child_by_field_name("object")
-                .and_then(|node| text(node, source))
-                .map(str::to_owned),
-            target
-                .child_by_field_name("property")
-                .and_then(|node| text(node, source))?
-                .into(),
-            if kind == CallKind::Constructor {
-                CallKind::Constructor
-            } else {
-                CallKind::Member
-            },
-        ),
-        _ => return None,
-    };
+    let (receiver, name, kind, selection): (Option<String>, String, CallKind, Node<'_>) =
+        match target.kind() {
+            "identifier" => (None, text(target, source)?.into(), kind, target),
+            "member_expression" => {
+                let property = target.child_by_field_name("property")?;
+                (
+                    target
+                        .child_by_field_name("object")
+                        .and_then(|node| text(node, source))
+                        .map(str::to_owned),
+                    text(property, source)?.into(),
+                    if kind == CallKind::Constructor {
+                        CallKind::Constructor
+                    } else {
+                        CallKind::Member
+                    },
+                    property,
+                )
+            }
+            _ => return None,
+        };
     let preserve_all_arguments = matches!(
         name.as_str(),
         "GrpcMethod" | "GrpcStreamMethod" | "GrpcStreamCall" | "getService"
@@ -116,6 +120,10 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
             .flatten()
             .unwrap_or_default(),
         line: node.start_position().row + 1,
+        start_line: selection.start_position().row.try_into().ok()?,
+        start_character: selection.start_position().column.try_into().ok()?,
+        end_line: selection.end_position().row.try_into().ok()?,
+        end_character: selection.end_position().column.try_into().ok()?,
     })
 }
 
@@ -1131,9 +1139,18 @@ pub(super) fn source_stem(path: &Path) -> String {
 pub fn observations_from_analysis(
     repository: &str,
     analysis: &TypescriptAnalysis,
-    _source: &str,
+    source: &str,
     path: &Path,
 ) -> Vec<Observation> {
+    semantics_from_analysis(repository, analysis, source, path).0
+}
+
+pub(super) fn semantics_from_analysis(
+    repository: &str,
+    analysis: &TypescriptAnalysis,
+    _source: &str,
+    path: &Path,
+) -> (Vec<Observation>, Vec<SemanticCandidate>) {
     let language = analysis.language.id_segment();
     let module_id = format!("repo://{repository}/{language}/{}", source_stem(path));
     let source_id = format!("repo://{repository}/{language}-source/{}", path.display());
@@ -1143,6 +1160,7 @@ pub fn observations_from_analysis(
         module_id.clone(),
         path.display().to_string(),
     )];
+    let mut candidates = Vec::new();
     let ids = analysis
         .definitions
         .iter()
@@ -1154,12 +1172,16 @@ pub fn observations_from_analysis(
         })
         .collect::<BTreeMap<_, _>>();
     for call in &analysis.calls {
-        observations.push(Observation::dependency(
-            module_id.clone(),
-            DependencyRelation::Calls,
-            observation_target(analysis.language.id_segment(), &ids, "", call),
-            format!("{}:{}", path.display(), call.line),
-        ));
+        let (observation, candidate) = call_semantics(
+            repository,
+            language,
+            &module_id,
+            observation_target(language, &ids, "", call),
+            call,
+            path,
+        );
+        observations.push(observation);
+        candidates.extend(candidate);
     }
     for definition in &analysis.definitions {
         let id = &ids[&definition.qualified_name];
@@ -1182,12 +1204,10 @@ pub fn observations_from_analysis(
         let scope = parent_name.unwrap_or_default();
         for call in &definition.calls {
             let target = observation_target(language, &ids, scope, call);
-            observations.push(Observation::dependency(
-                id.clone(),
-                DependencyRelation::Calls,
-                target,
-                format!("{}:{}", path.display(), call.line),
-            ));
+            let (observation, candidate) =
+                call_semantics(repository, language, id, target, call, path);
+            observations.push(observation);
+            candidates.extend(candidate);
         }
     }
     if analysis.generated {
@@ -1195,7 +1215,65 @@ pub fn observations_from_analysis(
             observation.provenance = Provenance::Generated;
         }
     }
-    observations
+    (observations, candidates)
+}
+
+fn call_semantics(
+    repository: &str,
+    language: &str,
+    from: &str,
+    target: String,
+    call: &Call,
+    path: &Path,
+) -> (Observation, Option<SemanticCandidate>) {
+    let evidence = format!("{}:{}", path.display(), call.line);
+    let observation = Observation::dependency(
+        from,
+        DependencyRelation::Calls,
+        target.clone(),
+        evidence.clone(),
+    );
+    let unresolved = ["call", "method", "constructor"]
+        .into_iter()
+        .any(|kind| target.starts_with(&format!("{language}-{kind}://")));
+    let candidate = unresolved.then(|| {
+        let span = SourceSpan {
+            path: path.into(),
+            start: SourcePosition {
+                line: call.start_line,
+                character: call.start_character,
+            },
+            end: SourcePosition {
+                line: call.end_line,
+                character: call.end_character,
+            },
+        };
+        let mut digest = Sha256::new();
+        for part in [
+            repository.as_bytes(),
+            from.as_bytes(),
+            DependencyRelation::Calls.as_str().as_bytes(),
+            target.as_bytes(),
+            path.as_os_str().as_encoded_bytes(),
+            &call.start_line.to_le_bytes(),
+            &call.start_character.to_le_bytes(),
+            &call.end_line.to_le_bytes(),
+            &call.end_character.to_le_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+        SemanticCandidate {
+            id: format!("{:x}", digest.finalize()),
+            repository: repository.into(),
+            from: from.into(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: target.into(),
+            span,
+            evidence: evidence.into(),
+        }
+    });
+    (observation, candidate)
 }
 
 fn observation_target(
@@ -1324,6 +1402,32 @@ mod tests {
                 .iter()
                 .all(|observation| observation.confidence == Confidence::Exact)
         );
+    }
+
+    #[test]
+    fn emits_stable_compiler_candidates_for_unresolved_calls() {
+        let source = "function helper() {} function run() { helper(); api.send(); new Job(); }";
+        let path = Path::new("src/worker.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+
+        let (_, candidates) = semantics_from_analysis("example", &analysis, source, path);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.repository == "example")
+        );
+        let send = candidates
+            .iter()
+            .find(|candidate| candidate.unresolved_to.as_str() == "typescript-method://api/send")
+            .unwrap();
+        assert_eq!(send.span.path, path);
+        assert_eq!(
+            &source[send.span.start.character as usize..send.span.end.character as usize],
+            "send"
+        );
+        assert!(!send.id.is_empty());
     }
 
     #[test]

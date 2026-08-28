@@ -843,6 +843,7 @@ impl IndexScheduler {
             std::slice::from_ref(&facts),
             &analysis.overrides,
             &analysis.fact_shards,
+            &analysis.semantic_candidates,
             &verification_fingerprint,
         )?;
         self.ensure_enrichment_inputs(store, &view)?;
@@ -2385,6 +2386,7 @@ fn index_workspace_through_port(
             &repository_facts,
             &analysis.overrides,
             &analysis.fact_shards,
+            &analysis.semantic_candidates,
             &verification_fingerprint,
         )
     })?;
@@ -2807,6 +2809,7 @@ mod tests {
                     .collect(),
                 repositories: Vec::new(),
                 overrides: Vec::new(),
+                candidate_overrides: Vec::new(),
                 graphql_resolvers: Vec::new(),
                 diagnostics: Vec::new(),
                 cache: Default::default(),

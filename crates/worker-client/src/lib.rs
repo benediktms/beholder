@@ -477,7 +477,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     }
                     events.push(event);
                 }
-                let contribution = contribution_from_events(events)?;
+                let mut contribution = contribution_from_events(events)?;
                 if contribution.metadata != self.metadata {
                     return Err(format!(
                         "worker returned analyzer identity {}:{}; expected {}:{}",
@@ -488,6 +488,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     )
                     .into());
                 }
+                resolve_candidate_overrides(&baseline, &mut contribution)?;
                 if let Some(descriptor) = &self.plugin {
                     validate_plugin_contribution(descriptor, &baseline, &contribution)?;
                 }
@@ -524,6 +525,62 @@ impl WorkspaceEnricher for WorkerAnalyzer {
             .instrument(span),
         )
     }
+}
+
+fn resolve_candidate_overrides(
+    baseline: &beholder_indexing::SemanticSnapshot,
+    contribution: &mut beholder_indexing::AnalyzerContribution,
+) -> Result<(), AnalyzerError> {
+    let candidates = baseline
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    if candidates.len() != baseline.candidates.len() {
+        return Err("baseline semantic candidate IDs are not unique".into());
+    }
+    let known = baseline
+        .entities
+        .iter()
+        .map(|entity| entity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    for override_ in contribution.candidate_overrides.drain(..) {
+        if !seen.insert(override_.candidate_id.clone()) {
+            return Err(format!(
+                "worker returned semantic candidate {} more than once",
+                override_.candidate_id
+            )
+            .into());
+        }
+        let candidate = candidates
+            .get(override_.candidate_id.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "worker returned unknown semantic candidate {}",
+                    override_.candidate_id
+                )
+            })?;
+        if !known.contains(override_.resolved_to.as_str()) {
+            return Err(format!(
+                "worker resolved semantic candidate {} to unknown entity {}",
+                override_.candidate_id, override_.resolved_to
+            )
+            .into());
+        }
+        contribution
+            .overrides
+            .push(beholder_domain::DependencyOverride {
+                from: candidate.from.clone(),
+                relation: candidate.relation,
+                unresolved_to: candidate.unresolved_to.clone(),
+                resolved_to: override_.resolved_to,
+                evidence: override_.evidence,
+                confidence: beholder_domain::Confidence::Exact,
+                provenance: beholder_domain::Provenance::Compiler,
+            });
+    }
+    Ok(())
 }
 
 impl WorkerAnalyzer {
@@ -687,9 +744,13 @@ impl Drop for SocketFile {
 mod tests {
     use super::*;
     use beholder_domain::{
-        DependencyRelation, LogicalRepository, RepositoryState, SemanticRelation,
+        CandidateOverride, DependencyRelation, EntityFact, EntityKind, LogicalRepository,
+        RepositoryState, SemanticCandidate, SemanticRelation, SourcePosition, SourceSpan,
     };
-    use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot, WorkspaceSnapshot};
+    use beholder_indexing::{
+        AnalyzerContribution, AnalyzerMetadata, CacheStatistics, InputKind, RepositoryInput,
+        RepositorySnapshot, SemanticSnapshot, WorkspaceSnapshot,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -821,5 +882,68 @@ mod tests {
             declared.workspace.repositories[0].inputs[0].path,
             Path::new("src/lib.rs")
         );
+    }
+
+    #[test]
+    fn candidate_override_uses_the_immutable_baseline_edge() {
+        let target = EntityFact::new(
+            "repo://example/typescript/target/run",
+            EntityKind::Callable,
+            None,
+        )
+        .unwrap();
+        let baseline = SemanticSnapshot {
+            entities: vec![target.clone()],
+            observations: Vec::new(),
+            candidates: vec![SemanticCandidate {
+                id: "candidate".into(),
+                repository: "example".into(),
+                from: "repo://example/typescript/source/main".into(),
+                relation: DependencyRelation::Calls,
+                unresolved_to: "typescript-call://run".into(),
+                span: SourceSpan {
+                    path: "src/main.ts".into(),
+                    start: SourcePosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: SourcePosition {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                evidence: "src/main.ts:1".into(),
+            }],
+        };
+        let mut contribution = AnalyzerContribution {
+            metadata: AnalyzerMetadata {
+                id: "typescript".into(),
+                version: "1".into(),
+            },
+            active_repositories: vec!["example".into()],
+            repositories: Vec::new(),
+            overrides: Vec::new(),
+            candidate_overrides: vec![CandidateOverride {
+                candidate_id: "candidate".into(),
+                resolved_to: target.id,
+                evidence: "tsc definition".into(),
+            }],
+            graphql_resolvers: Vec::new(),
+            diagnostics: Vec::new(),
+            cache: CacheStatistics::default(),
+        };
+
+        resolve_candidate_overrides(&baseline, &mut contribution).unwrap();
+
+        assert!(contribution.candidate_overrides.is_empty());
+        assert_eq!(contribution.overrides.len(), 1);
+        let override_ = &contribution.overrides[0];
+        assert_eq!(
+            override_.from.as_str(),
+            "repo://example/typescript/source/main"
+        );
+        assert_eq!(override_.unresolved_to.as_str(), "typescript-call://run");
+        assert_eq!(override_.confidence, beholder_domain::Confidence::Exact);
+        assert_eq!(override_.provenance, beholder_domain::Provenance::Compiler);
     }
 }

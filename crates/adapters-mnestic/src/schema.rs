@@ -453,6 +453,24 @@ pub(super) const CREATE_BASELINE_FINGERPRINT_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_SEMANTIC_CANDIDATE_SCHEMA: &str = r#"
+:create analysis_semantic_candidate {
+    view: String,
+    id: String,
+    =>
+    repository: String,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    path: String,
+    start_line: Int,
+    start_character: Int,
+    end_line: Int,
+    end_character: Int,
+    evidence: String,
+}
+"#;
+
 pub(super) const CREATE_SCHEMA_MIGRATION_SCHEMA: &str = r#"
 :create schema_migration {
     name: String,

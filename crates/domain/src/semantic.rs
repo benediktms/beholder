@@ -197,6 +197,37 @@ pub struct Observation {
     pub provenance: Provenance,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct SourcePosition {
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct SourceSpan {
+    pub path: PathBuf,
+    pub start: SourcePosition,
+    pub end: SourcePosition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct SemanticCandidate {
+    pub id: String,
+    pub repository: String,
+    pub from: EntityId,
+    pub relation: DependencyRelation,
+    pub unresolved_to: EntityId,
+    pub span: SourceSpan,
+    pub evidence: Evidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateOverride {
+    pub candidate_id: String,
+    pub resolved_to: EntityId,
+    pub evidence: Evidence,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryFacts {
     pub state: RepositoryState,

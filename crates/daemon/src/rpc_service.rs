@@ -1142,6 +1142,7 @@ mod manual_enrichment_tests {
                     active_repositories: vec![snapshot.target_repository],
                     repositories: Vec::new(),
                     overrides: Vec::new(),
+                    candidate_overrides: Vec::new(),
                     graphql_resolvers: Vec::new(),
                     diagnostics: Vec::new(),
                     cache: Default::default(),

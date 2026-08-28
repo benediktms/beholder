@@ -2,11 +2,11 @@ use crate::{
     FRONTEND_VERSION, GraphqlFactInput, GraphqlResolverInput, GraphqlResolverSource,
     RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis, TypescriptRepository,
     collect_graphql_facts, collect_graphql_resolvers, diagnostics_from_analysis,
-    entities_from_analysis, observations_from_analysis, resolve_repository_calls,
-    resolve_workspace_calls, unresolved_call_diagnostics,
+    entities_from_analysis, resolve_repository_calls, resolve_workspace_calls,
+    unresolved_call_diagnostics,
 };
 use crate::{
-    analysis::{analyze_with_plugins, source_stem},
+    analysis::{analyze_with_plugins, semantics_from_analysis, source_stem},
     plugin::{TypescriptLanguage, built_in_plugins},
 };
 use beholder_adapters_graphql::GraphqlSource;
@@ -247,6 +247,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 })
                 .collect::<Vec<_>>();
             let mut observations = Vec::new();
+            let mut semantic_candidates = Vec::new();
             let mut entities = Vec::new();
             let mut diagnostics = Vec::new();
             let mut analyzed = Vec::new();
@@ -298,12 +299,14 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 continue;
             }
             for (path, source, analysis, _) in &analyzed {
-                observations.extend(observations_from_analysis(
+                let (source_observations, source_candidates) = semantics_from_analysis(
                     &repository.state.repository.identity,
                     analysis,
                     source,
                     path,
-                ));
+                );
+                observations.extend(source_observations);
+                semantic_candidates.extend(source_candidates);
                 entities.extend(entities_from_analysis(
                     &repository.state.repository.identity,
                     analysis,
@@ -387,6 +390,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 entities,
                 grpc_bindings: enrichment.grpc_bindings,
                 observations,
+                semantic_candidates,
                 diagnostics,
                 replaced_diagnostic_codes: Default::default(),
                 fact_shards,
@@ -405,6 +409,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             active_repositories,
             repositories,
             overrides,
+            candidate_overrides: Vec::new(),
             graphql_resolvers: Vec::new(),
             diagnostics: unresolved_call_diagnostics(&all_observations),
             cache,

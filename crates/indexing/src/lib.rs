@@ -1,7 +1,7 @@
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityId, EntityKind, Evidence, FactShard,
-    GrpcBindingCandidate, Observation, RepositoryDependencyCandidate, RepositoryFacts,
-    RepositoryState, SemanticRelation,
+    AnalysisDiagnostic, CandidateOverride, DependencyOverride, EntityFact, EntityId, EntityKind,
+    Evidence, FactShard, GrpcBindingCandidate, Observation, RepositoryDependencyCandidate,
+    RepositoryFacts, RepositoryState, SemanticCandidate, SemanticRelation,
 };
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,8 @@ pub struct SemanticSnapshot {
     pub entities: Vec<EntityFact>,
     /// Selected baseline relationships.
     pub observations: Vec<Observation>,
+    /// Precise baseline relationships eligible for deterministic enrichment.
+    pub candidates: Vec<SemanticCandidate>,
 }
 
 /// Whether an input selector applies to the enrichment target or its context.
@@ -281,6 +283,7 @@ pub struct RepositoryContribution {
     pub entities: Vec<EntityFact>,
     pub grpc_bindings: Vec<GrpcBindingCandidate>,
     pub observations: Vec<Observation>,
+    pub semantic_candidates: Vec<SemanticCandidate>,
     pub diagnostics: Vec<AnalysisDiagnostic>,
     pub replaced_diagnostic_codes: BTreeSet<String>,
     pub fact_shards: Vec<FactShard>,
@@ -301,6 +304,7 @@ pub struct AnalyzerContribution {
     pub active_repositories: Vec<String>,
     pub repositories: Vec<RepositoryContribution>,
     pub overrides: Vec<DependencyOverride>,
+    pub candidate_overrides: Vec<CandidateOverride>,
     pub graphql_resolvers: Vec<GraphqlResolverCandidate>,
     pub diagnostics: Vec<(String, AnalysisDiagnostic)>,
     pub cache: CacheStatistics,
@@ -321,6 +325,8 @@ struct CanonicalRepositoryAnalysis {
     #[serde(default)]
     grpc_bindings: Vec<GrpcBindingCandidate>,
     observations: Vec<Observation>,
+    #[serde(default)]
+    semantic_candidates: Vec<SemanticCandidate>,
     diagnostics: Vec<AnalysisDiagnostic>,
     #[serde(default)]
     analyzers: BTreeMap<String, CanonicalAnalyzerAnalysis>,
@@ -343,6 +349,7 @@ pub struct WorkspaceAnalysis {
     pub analysis_identity: String,
     pub repositories: Vec<AnalyzedRepository>,
     pub overrides: Vec<DependencyOverride>,
+    pub semantic_candidates: Vec<SemanticCandidate>,
     pub diagnostics: Vec<(String, AnalysisDiagnostic)>,
     pub repository_dependencies: Vec<RepositoryDependencyCandidate>,
     pub cache: CacheStatistics,
@@ -1420,6 +1427,7 @@ impl Indexer {
             })
             .collect::<BTreeMap<_, _>>();
         let mut overrides = Vec::new();
+        let mut semantic_candidates = Vec::new();
         let mut graphql_resolvers = Vec::new();
         let mut diagnostics = Vec::new();
         let repository_dependencies = self.repository_dependencies(snapshot)?;
@@ -1440,6 +1448,9 @@ impl Indexer {
             cache.disk_hits += contribution.cache.disk_hits;
             cache.misses += contribution.cache.misses;
             overrides.extend(contribution.overrides);
+            if !contribution.candidate_overrides.is_empty() {
+                return Err("baseline analyzer returned compiler candidate overrides".into());
+            }
             graphql_resolvers.extend(contribution.graphql_resolvers);
             diagnostics.extend(contribution.diagnostics);
             let analyzer_id = contribution.metadata.id.clone();
@@ -1474,6 +1485,10 @@ impl Indexer {
                 extend_unique(&mut analysis.entities, repository.entities);
                 extend_unique(&mut analysis.grpc_bindings, repository.grpc_bindings);
                 extend_unique(&mut analysis.observations, repository.observations);
+                extend_unique(
+                    &mut analysis.semantic_candidates,
+                    repository.semantic_candidates,
+                );
                 extend_unique(&mut analysis.diagnostics, repository.diagnostics);
             }
         }
@@ -1514,6 +1529,7 @@ impl Indexer {
                     .cloned()
                     .map(|diagnostic| (identity.clone(), diagnostic)),
             );
+            semantic_candidates.extend(analysis.semantic_candidates.iter().cloned());
             repositories.push(AnalyzedRepository {
                 facts: RepositoryFacts {
                     state: repository.state.clone(),
@@ -1532,6 +1548,7 @@ impl Indexer {
             analysis_identity: plan.analysis_identity.clone(),
             repositories,
             overrides,
+            semantic_candidates,
             diagnostics,
             repository_dependencies,
             cache,
@@ -1950,6 +1967,7 @@ mod tests {
                     }],
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
+                    semantic_candidates: Vec::new(),
                     diagnostics: Vec::new(),
                     replaced_diagnostic_codes: BTreeSet::new(),
                     fact_shards: Vec::new(),
@@ -1968,6 +1986,7 @@ mod tests {
                 },
                 repositories,
                 overrides: Vec::new(),
+                candidate_overrides: Vec::new(),
                 graphql_resolvers: Vec::new(),
                 diagnostics: Vec::new(),
             })
@@ -2006,6 +2025,7 @@ mod tests {
                     }],
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
+                    semantic_candidates: Vec::new(),
                     diagnostics: Vec::new(),
                     replaced_diagnostic_codes: BTreeSet::new(),
                     fact_shards: Vec::new(),
@@ -2017,6 +2037,7 @@ mod tests {
                 active_repositories: vec![identity.clone()],
                 repositories,
                 overrides: Vec::new(),
+                candidate_overrides: Vec::new(),
                 graphql_resolvers: vec![GraphqlResolverCandidate {
                     repository: identity,
                     field: "item".into(),
@@ -2065,6 +2086,7 @@ mod tests {
                     entities: vec![owner.clone()],
                     grpc_bindings: Vec::new(),
                     observations: vec![observation.clone()],
+                    semantic_candidates: Vec::new(),
                     diagnostics: Vec::new(),
                     replaced_diagnostic_codes: BTreeSet::new(),
                     fact_shards: vec![FactShard {
@@ -2077,6 +2099,7 @@ mod tests {
                     }],
                 }],
                 overrides: Vec::new(),
+                candidate_overrides: Vec::new(),
                 graphql_resolvers: Vec::new(),
                 diagnostics: Vec::new(),
                 cache: CacheStatistics::default(),
