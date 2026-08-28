@@ -191,12 +191,14 @@ Other language frontends adopt the boundary only after the Rust slice proves it.
 The shared contract will be extracted from at least two real frontends rather
 than predicting every language's symbol model in advance.
 
-The first delivered Rust slice implements file and symbol fingerprints,
-owner-scoped fact shards, semantic enrichment currentness, baseline-driven
-compiler enrichment, and in-memory plus disposable-disk call-resolution reuse.
-Module import/export queries, reverse module dependency propagation, and SCC
-invalidation remain the next slice; interface changes conservatively invalidate
-the current Cargo project until that dependency DAG exists.
+The delivered Rust slices implement file and symbol fingerprints, owner-scoped
+fact shards, semantic enrichment currentness, baseline-driven compiler
+enrichment, and in-memory plus disposable-disk call-resolution reuse. Rust
+source modules also record compiler-resolved import and out-of-line module
+dependencies. A module or symbol-interface change recomputes strongly connected
+components over the previous and current dependency topology, then invalidates
+only the changed component and its reverse dependants. Function-body changes
+still invalidate only their owning symbols, without recomputing module SCCs.
 
 ## Consequences
 

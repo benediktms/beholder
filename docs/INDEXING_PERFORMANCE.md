@@ -259,7 +259,11 @@ and pure formatting are enrichment no-ops; documentation, attributes, imports,
 interfaces, body tokens, macros, compiler configuration, and toolchain changes
 still invalidate the appropriate semantic boundary.
 
-This does not yet implement the module reverse-dependency graph. Until that next
-slice, interface and module-surface changes conservatively invalidate the current
-Cargo project; body changes invalidate only their owning symbol's cached call
-resolutions.
+Rust compiler summaries now retain compiler-resolved import and out-of-line
+module dependencies. Interface and module-surface changes invalidate the changed
+strongly connected component and its reverse dependants across both the old and
+new topology; unrelated modules keep their cached call resolutions. Body changes
+still invalidate only their owning symbol's cached resolutions. A worker
+integration fixture verifies that an interface edit reruns dependent calls while
+an unrelated module remains a cache hit; production-scale timing remains to be
+recorded with an installed binary.
