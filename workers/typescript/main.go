@@ -26,11 +26,8 @@ type position struct {
 }
 
 type location struct {
-	URI   string `json:"uri"`
-	Range struct {
-		Start position `json:"start"`
-		End   position `json:"end"`
-	} `json:"range"`
+	URI   string   `json:"uri"`
+	Range lspRange `json:"range"`
 }
 
 type rpcError struct {
@@ -55,11 +52,15 @@ type client struct {
 	command *exec.Cmd
 	stdin   io.WriteCloser
 	stdout  *bufio.Reader
+	stderr  *bytes.Buffer
 	replies chan reply
 	nextID  int
+	opened  map[string]bool
 }
 
 func main() {
+	socket := flag.String("socket", "", "worker gRPC Unix socket")
+	cacheDir := flag.String("cache-dir", "", "worker cache directory")
 	root := flag.String("root", ".", "TypeScript repository root")
 	file := flag.String("file", "", "repository-relative TypeScript source path")
 	line := flag.Int("line", 0, "one-based source line")
@@ -67,6 +68,13 @@ func main() {
 	timeout := flag.Duration("timeout", 15*time.Second, "compiler startup and request timeout")
 	flag.Parse()
 
+	if *socket != "" {
+		if err := serve(*socket, *cacheDir); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(*root, *file, *line, *column, *timeout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -107,14 +115,17 @@ func run(root, file string, line, column int, timeout time.Duration) error {
 	if err := c.initialize(ctx, root); err != nil {
 		return err
 	}
-	definition, err := c.definition(ctx, source, position{Line: line - 1, Character: column - 1})
+	definitions, err := c.definitions(ctx, source, position{Line: line - 1, Character: column - 1})
 	if err != nil {
 		return err
+	}
+	if len(definitions) != 1 {
+		return fmt.Errorf("definition is not deterministic: got %d locations", len(definitions))
 	}
 	return json.NewEncoder(os.Stdout).Encode(struct {
 		CompilerVersion string   `json:"compilerVersion"`
 		Definition      location `json:"definition"`
-	}{version, definition})
+	}{version, definitions[0]})
 }
 
 func repositoryPath(root, path string) (string, error) {
@@ -161,7 +172,8 @@ func typescriptVersion(ctx context.Context, executable, root string) (string, er
 func startClient(ctx context.Context, executable, root string, arguments ...string) (*client, error) {
 	command := exec.CommandContext(ctx, executable, arguments...)
 	command.Dir = root
-	command.Stderr = os.Stderr
+	stderr := &bytes.Buffer{}
+	command.Stderr = stderr
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("open compiler stdin: %w", err)
@@ -177,7 +189,9 @@ func startClient(ctx context.Context, executable, root string, arguments ...stri
 		command: command,
 		stdin:   stdin,
 		stdout:  bufio.NewReader(stdout),
+		stderr:  stderr,
 		replies: make(chan reply, 64),
+		opened:  make(map[string]bool),
 	}
 	go c.readLoop()
 	return c, nil
@@ -205,10 +219,20 @@ func (c *client) initialize(ctx context.Context, root string) error {
 	return c.notify("initialized", map[string]any{})
 }
 
-func (c *client) definition(ctx context.Context, path string, at position) (location, error) {
+func (c *client) open(path string) error {
+	if c.opened[path] {
+		return nil
+	}
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return location{}, fmt.Errorf("read source: %w", err)
+		return fmt.Errorf("read source: %w", err)
+	}
+	return c.openContent(path, content)
+}
+
+func (c *client) openContent(path string, content []byte) error {
+	if c.opened[path] {
+		return nil
 	}
 	uri := fileURI(path)
 	if err := c.notify("textDocument/didOpen", map[string]any{
@@ -216,24 +240,26 @@ func (c *client) definition(ctx context.Context, path string, at position) (loca
 			"uri": uri, "languageId": languageID(path), "version": 1, "text": string(content),
 		},
 	}); err != nil {
-		return location{}, err
+		return err
 	}
+	c.opened[path] = true
+	return nil
+}
+
+func (c *client) definitions(ctx context.Context, path string, at position) ([]location, error) {
+	if err := c.open(path); err != nil {
+		return nil, err
+	}
+	uri := fileURI(path)
 
 	var raw json.RawMessage
 	if err := c.request(ctx, "textDocument/definition", map[string]any{
 		"textDocument": map[string]string{"uri": uri},
 		"position":     at,
 	}, &raw); err != nil {
-		return location{}, fmt.Errorf("request definition: %w", err)
+		return nil, fmt.Errorf("request definition: %w", err)
 	}
-	definitions, err := decodeLocations(raw)
-	if err != nil {
-		return location{}, err
-	}
-	if len(definitions) != 1 {
-		return location{}, fmt.Errorf("definition is not deterministic: got %d locations", len(definitions))
-	}
-	return definitions[0], nil
+	return decodeLocations(raw)
 }
 
 func (c *client) request(ctx context.Context, method string, params, result any) error {
@@ -343,13 +369,17 @@ func (c *client) close() {
 	_ = c.notify("exit", nil)
 	done := make(chan error, 1)
 	go func() { done <- c.command.Wait() }()
+	var err error
 	select {
-	case <-done:
+	case err = <-done:
 	case <-ctx.Done():
 		_ = c.command.Process.Kill()
-		<-done
+		err = <-done
 	}
 	_ = c.stdin.Close()
+	if err != nil && !strings.Contains(c.stderr.String(), "context canceled") {
+		fmt.Fprintf(os.Stderr, "TypeScript language server exited: %v: %s\n", err, strings.TrimSpace(c.stderr.String()))
+	}
 }
 
 func decodeLocations(raw json.RawMessage) ([]location, error) {
@@ -361,11 +391,8 @@ func decodeLocations(raw json.RawMessage) ([]location, error) {
 	}
 	var values []struct {
 		location
-		TargetURI            string `json:"targetUri"`
-		TargetSelectionRange *struct {
-			Start position `json:"start"`
-			End   position `json:"end"`
-		} `json:"targetSelectionRange"`
+		TargetURI            string    `json:"targetUri"`
+		TargetSelectionRange *lspRange `json:"targetSelectionRange"`
 	}
 	if err := json.Unmarshal(raw, &values); err != nil {
 		return nil, fmt.Errorf("decode definition locations: %w", err)

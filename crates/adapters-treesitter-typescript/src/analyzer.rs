@@ -295,6 +295,12 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             );
             if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
                 cached_observations.extend_from_slice(cached.observations);
+                cached_observations.extend(
+                    plan.cached_fact_shards(&repository.state.repository.identity)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|shard| shard.observations.iter().cloned()),
+                );
                 typed_repositories.push(typed_repository);
                 continue;
             }

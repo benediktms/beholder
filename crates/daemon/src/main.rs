@@ -7,7 +7,7 @@ use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
 #[cfg(not(test))]
-use beholder_domain::{DependencyRelation, SemanticRelation};
+use beholder_domain::{DependencyRelation, EntityKind, SemanticRelation};
 #[cfg(not(test))]
 use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
@@ -15,7 +15,8 @@ use beholder_observability::LogOutput;
 use beholder_protocol::v1::daemon_server::DaemonServer;
 #[cfg(not(test))]
 use beholder_worker_client::{
-    ELIXIR_WORKER_ID, RUST_WORKER_ID, WorkerAnalyzerBuilder, worker_environment_variable,
+    ELIXIR_WORKER_ID, RUST_WORKER_ID, TYPESCRIPT_WORKER_ID, WorkerAnalyzerBuilder,
+    worker_environment_variable,
 };
 use beholder_worker_client::{PluginRegistry, plugin_analyzer};
 use std::error::Error;
@@ -320,6 +321,46 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         tracing::info!("Elixir analyzer worker not found; compiler enrichment disabled");
         builder
     };
+    #[cfg(not(test))]
+    let builder = if let Some(executable) = typescript_worker_executable()? {
+        let worker = WorkerAnalyzerBuilder::new(
+            executable,
+            cache_dir
+                .parent()
+                .unwrap_or(cache_dir.as_path())
+                .join("workers"),
+        )
+        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:1")
+        .semantic_shard_producer(TYPESCRIPT_WORKER_ID)
+        .semantic_entity(EntityKind::Callable)
+        .semantic_entity(EntityKind::Namespace)
+        .semantic_relation(SemanticRelation::Dependency(DependencyRelation::Calls))
+        .accept_extension("ts")
+        .accept_extension("tsx")
+        .accept_extension("js")
+        .accept_extension("jsx")
+        .accept_extension_as("json", AnalysisInputKind::Configuration)
+        .accept_file_name_as("package.json", AnalysisInputKind::Dependency)
+        .accept_file_name_as("package-lock.json", AnalysisInputKind::Dependency)
+        .accept_file_name_as("npm-shrinkwrap.json", AnalysisInputKind::Dependency)
+        .accept_file_name_as("yarn.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("pnpm-lock.yaml", AnalysisInputKind::Dependency)
+        .accept_file_name_as("pnpm-workspace.yaml", AnalysisInputKind::Dependency)
+        .accept_file_name_as("bun.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("bun.lockb", AnalysisInputKind::Dependency)
+        .accept_file_name_as("deno.lock", AnalysisInputKind::Dependency)
+        .repository_file_identity(
+            "$toolchain/typescript",
+            "node_modules/typescript/package.json",
+            AnalysisInputKind::Toolchain,
+        )
+        .build()
+        .map_err(|error| error.to_string())?;
+        builder.add_enricher(worker)
+    } else {
+        tracing::info!("TypeScript analyzer worker not found; compiler enrichment disabled");
+        builder
+    };
     let mut builder = builder
         .add_analyzer(ElixirAnalyzer::new(cache_dir.clone()))
         .add_analyzer(CsharpAnalyzer::new(cache_dir.clone()))
@@ -387,6 +428,26 @@ fn elixir_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Erro
     } else if configured.is_some() {
         Err(format!(
             "configured Elixir analyzer worker not found at {}",
+            executable.display()
+        )
+        .into())
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(test))]
+fn typescript_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    let configured = std::env::var_os(worker_environment_variable("typescript", "PATH"));
+    let executable = configured
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_exe()?.with_file_name("beholder-worker-typescript"));
+    if executable.is_file() {
+        Ok(Some(executable))
+    } else if configured.is_some() {
+        Err(format!(
+            "configured TypeScript analyzer worker not found at {}",
             executable.display()
         )
         .into())

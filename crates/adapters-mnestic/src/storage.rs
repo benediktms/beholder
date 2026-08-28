@@ -23,6 +23,9 @@ const GARBAGE_COLLECTION_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_TRANSACTION_RETRIES: usize = 50;
 const GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+pub(super) type SelectedBaselineSemantics =
+    (Vec<EntityFact>, Vec<Observation>, Vec<SemanticCandidate>);
+
 fn replace_fact_shards(
     transaction: &MultiTransaction,
     view: &str,
@@ -295,7 +298,7 @@ pub(super) fn selected_baseline_semantics(
     repository: &str,
     entity_kinds: &BTreeSet<EntityKind>,
     relations: &BTreeSet<SemanticRelation>,
-) -> Result<(Vec<EntityFact>, Vec<Observation>, Vec<SemanticCandidate>), Box<dyn Error>> {
+) -> Result<SelectedBaselineSemantics, Box<dyn Error>> {
     if entity_kinds.is_empty() && relations.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
@@ -409,7 +412,7 @@ pub(super) fn selected_baseline_semantics(
         let relation = parse_relation(stored_string(&row, 2, "semantic candidate relation")?)?
             .dependency()
             .ok_or("semantic candidate relation is not a dependency")?;
-        candidates.push(SemanticCandidate {
+        let candidate = SemanticCandidate {
             id: stored_string(&row, 0, "semantic candidate ID")?.into(),
             repository: repository.into(),
             from: stored_string(&row, 1, "semantic candidate source")?.into(),
@@ -421,7 +424,10 @@ pub(super) fn selected_baseline_semantics(
                 end: position(7, 8)?,
             },
             evidence: stored_string(&row, 9, "semantic candidate evidence")?.into(),
-        });
+        };
+        if relations.contains(&SemanticRelation::Dependency(candidate.relation)) {
+            candidates.push(candidate);
+        }
     }
     Ok((entities, observations, candidates))
 }
@@ -1493,6 +1499,7 @@ fn store_grpc_resolution(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn publish_observations(
     db: &DbInstance,
     view: &WorkspaceView,
@@ -4938,7 +4945,7 @@ mod tests {
             relation: DependencyRelation::Calls,
             unresolved_to: call.to,
             resolved_to: resolved.into(),
-            evidence: call.evidence,
+            evidence: "compiler definition src/lib.rs:3".into(),
             confidence: Confidence::Exact,
             provenance: Provenance::Compiler,
         };
@@ -4985,6 +4992,12 @@ mod tests {
             .iter()
             .find(|edge| edge.to == resolved)
             .unwrap();
+        assert!(
+            context
+                .edges
+                .iter()
+                .all(|edge| edge.to != "rust-call://helper")
+        );
         assert_eq!(edge.confidence, 1.0);
         assert_eq!(
             edge.evidence[0].source_kind,

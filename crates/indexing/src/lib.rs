@@ -451,6 +451,9 @@ pub trait WorkspaceEnricher: Send + Sync {
     fn identity_inputs(&self) -> Vec<AnalysisInput> {
         Vec::new()
     }
+    fn repository_identity_inputs(&self, _repository: &RepositorySnapshot) -> Vec<AnalysisInput> {
+        Vec::new()
+    }
     fn is_active(&self, repository: &RepositorySnapshot) -> bool {
         repository
             .inputs
@@ -1286,6 +1289,7 @@ impl Indexer {
                     .iter()
                     .map(|repository| {
                         let mut inputs = enricher.analysis_inputs(repository);
+                        inputs.extend(enricher.repository_identity_inputs(repository));
                         inputs.extend(shared.iter().cloned());
                         (
                             repository.state.repository.identity.clone(),
@@ -1349,6 +1353,7 @@ impl Indexer {
                     .into_iter()
                     .filter(|input| input.kind != AnalysisInputKind::Source)
                     .collect::<Vec<_>>();
+                inputs.extend(enricher.repository_identity_inputs(repository));
                 inputs.extend(shared.iter().cloned());
                 let mut digest = Sha256::new();
                 framed_digest(&mut digest, b"beholder-enrichment-semantic-input-v1");

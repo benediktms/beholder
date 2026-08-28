@@ -53,6 +53,30 @@ fn collect_identifiers(node: Node<'_>, source: &[u8], identifiers: &mut Vec<Stri
     }
 }
 
+fn lsp_position(node: Node<'_>, source: &[u8], end: bool) -> Option<SourcePosition> {
+    let point = if end {
+        node.end_position()
+    } else {
+        node.start_position()
+    };
+    let byte = if end {
+        node.end_byte()
+    } else {
+        node.start_byte()
+    };
+    let line_start = byte.checked_sub(point.column)?;
+    let character = std::str::from_utf8(source.get(line_start..byte)?)
+        .ok()?
+        .encode_utf16()
+        .count()
+        .try_into()
+        .ok()?;
+    Some(SourcePosition {
+        line: point.row.try_into().ok()?,
+        character,
+    })
+}
+
 fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     let (receiver, name, kind, selection): (Option<String>, String, CallKind, Node<'_>) =
         match target.kind() {
@@ -81,6 +105,8 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
     ) || (name == "request"
         && receiver.as_deref() == Some("this.rpc"));
     let preserve_type_arguments = name == "getService";
+    let start = lsp_position(selection, source, false)?;
+    let end = lsp_position(selection, source, true)?;
     Some(Call {
         kind,
         receiver,
@@ -120,10 +146,10 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
             .flatten()
             .unwrap_or_default(),
         line: node.start_position().row + 1,
-        start_line: selection.start_position().row.try_into().ok()?,
-        start_character: selection.start_position().column.try_into().ok()?,
-        end_line: selection.end_position().row.try_into().ok()?,
-        end_character: selection.end_position().column.try_into().ok()?,
+        start_line: start.line,
+        start_character: start.character,
+        end_line: end.line,
+        end_character: end.character,
     })
 }
 
@@ -1428,6 +1454,25 @@ mod tests {
             "send"
         );
         assert!(!send.id.is_empty());
+    }
+
+    #[test]
+    fn compiler_candidate_columns_use_utf16_units() {
+        let source = "function run() { '😀'; api.send(); }";
+        let path = Path::new("src/worker.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+
+        let (_, candidates) = semantics_from_analysis("example", &analysis, source, path);
+
+        let send = candidates
+            .iter()
+            .find(|candidate| candidate.unresolved_to.as_str() == "typescript-method://api/send")
+            .unwrap();
+        let byte = source.find("send").unwrap();
+        assert_eq!(
+            send.span.start.character as usize,
+            source[..byte].encode_utf16().count()
+        );
     }
 
     #[test]

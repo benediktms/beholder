@@ -1,3 +1,46 @@
+defmodule Beholder.Worker.V1.PluginEntityKind do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :PLUGIN_ENTITY_KIND_UNSPECIFIED, 0
+  field :PLUGIN_ENTITY_KIND_CALLABLE, 1
+  field :PLUGIN_ENTITY_KIND_GRAPHQL_ARGUMENT, 2
+  field :PLUGIN_ENTITY_KIND_GRAPHQL_ENUM_VALUE, 3
+  field :PLUGIN_ENTITY_KIND_GRAPHQL_FIELD, 4
+  field :PLUGIN_ENTITY_KIND_GRAPHQL_OPERATION, 5
+  field :PLUGIN_ENTITY_KIND_GRAPHQL_TYPE, 6
+  field :PLUGIN_ENTITY_KIND_GRPC_OPERATION, 7
+  field :PLUGIN_ENTITY_KIND_KAFKA_TOPIC, 8
+  field :PLUGIN_ENTITY_KIND_NAMESPACE, 9
+  field :PLUGIN_ENTITY_KIND_PROTO_FIELD, 10
+  field :PLUGIN_ENTITY_KIND_PROTO_METHOD, 11
+  field :PLUGIN_ENTITY_KIND_PROTO_SERVICE, 12
+  field :PLUGIN_ENTITY_KIND_PROTO_TYPE, 13
+  field :PLUGIN_ENTITY_KIND_SERVICE, 14
+  field :PLUGIN_ENTITY_KIND_UNITY_PREFAB, 15
+end
+
+defmodule Beholder.Worker.V1.PluginInputScope do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :PLUGIN_INPUT_SCOPE_UNSPECIFIED, 0
+  field :PLUGIN_INPUT_SCOPE_TARGET, 1
+  field :PLUGIN_INPUT_SCOPE_CONTEXT, 2
+end
+
+defmodule Beholder.Worker.V1.PluginInputKind do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :PLUGIN_INPUT_KIND_UNSPECIFIED, 0
+  field :PLUGIN_INPUT_KIND_SOURCE, 1
+  field :PLUGIN_INPUT_KIND_CONFIGURATION, 2
+  field :PLUGIN_INPUT_KIND_DEPENDENCY, 3
+  field :PLUGIN_INPUT_KIND_TOOLCHAIN, 4
+  field :PLUGIN_INPUT_KIND_ENVIRONMENT, 5
+end
+
 defmodule Beholder.Worker.V1.InputKind do
   @moduledoc false
   use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -55,6 +98,64 @@ defmodule Beholder.Worker.V1.Provenance do
   field :PROVENANCE_UNIQUE_NAME_HEURISTIC, 5
 end
 
+defmodule Beholder.Worker.V1.DescribeRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+end
+
+defmodule Beholder.Worker.V1.DescribeResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :descriptor, 1, type: Beholder.Worker.V1.PluginDescriptor
+end
+
+defmodule Beholder.Worker.V1.PluginDescriptor do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :id, 1, type: :string
+  field :api_version, 2, type: :uint32, json_name: "apiVersion"
+  field :inputs, 3, repeated: true, type: Beholder.Worker.V1.PluginInputSelector
+
+  field :semantic_entities, 4,
+    repeated: true,
+    type: Beholder.Worker.V1.PluginEntityKind,
+    json_name: "semanticEntities",
+    enum: true
+
+  field :semantic_relations, 5,
+    repeated: true,
+    type: Beholder.V1.RelationKind,
+    json_name: "semanticRelations",
+    enum: true
+
+  field :produces_entities, 6,
+    repeated: true,
+    type: Beholder.Worker.V1.PluginEntityKind,
+    json_name: "producesEntities",
+    enum: true
+
+  field :produces_relations, 7,
+    repeated: true,
+    type: Beholder.V1.RelationKind,
+    json_name: "producesRelations",
+    enum: true
+end
+
+defmodule Beholder.Worker.V1.PluginInputSelector do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  oneof :matcher, 0
+
+  field :scope, 1, type: Beholder.Worker.V1.PluginInputScope, enum: true
+  field :kind, 2, type: Beholder.Worker.V1.PluginInputKind, enum: true
+  field :extension, 3, type: :string, oneof: 0
+  field :file_name, 4, type: :string, json_name: "fileName", oneof: 0
+  field :path_suffix, 5, type: :string, json_name: "pathSuffix", oneof: 0
+end
+
 defmodule Beholder.Worker.V1.AnalyzeRequest do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -65,6 +166,21 @@ defmodule Beholder.Worker.V1.AnalyzeRequest do
   field :repository, 2, type: Beholder.Worker.V1.RepositoryStart, oneof: 0
   field :input, 3, type: Beholder.Worker.V1.RepositoryInput, oneof: 0
   field :finish, 4, type: Beholder.Worker.V1.AnalysisFinish, oneof: 0
+
+  field :baseline_entity, 5,
+    type: Beholder.Worker.V1.BaselineEntity,
+    json_name: "baselineEntity",
+    oneof: 0
+
+  field :baseline_observation, 6,
+    type: Beholder.Worker.V1.BaselineObservation,
+    json_name: "baselineObservation",
+    oneof: 0
+
+  field :baseline_candidate, 7,
+    type: Beholder.Worker.V1.BaselineCandidate,
+    json_name: "baselineCandidate",
+    oneof: 0
 end
 
 defmodule Beholder.Worker.V1.AnalysisStart do
@@ -98,6 +214,57 @@ end
 defmodule Beholder.Worker.V1.AnalysisFinish do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+end
+
+defmodule Beholder.Worker.V1.BaselineEntity do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :entity, 1, type: Beholder.Worker.V1.EntityFact
+end
+
+defmodule Beholder.Worker.V1.BaselineObservation do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :observation, 1, type: Beholder.Worker.V1.Observation
+end
+
+defmodule Beholder.Worker.V1.BaselineCandidate do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :candidate, 1, type: Beholder.Worker.V1.SemanticCandidate
+end
+
+defmodule Beholder.Worker.V1.SemanticCandidate do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :id, 1, type: :string
+  field :repository, 2, type: :string
+  field :from, 3, type: :string
+  field :relation, 4, type: Beholder.V1.RelationKind, enum: true
+  field :unresolved_to, 5, type: :string, json_name: "unresolvedTo"
+  field :span, 6, type: Beholder.Worker.V1.SourceSpan
+  field :evidence, 7, type: :string
+end
+
+defmodule Beholder.Worker.V1.SourceSpan do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :path, 1, type: :string
+  field :start, 2, type: Beholder.Worker.V1.SourcePosition
+  field :end, 3, type: Beholder.Worker.V1.SourcePosition
+end
+
+defmodule Beholder.Worker.V1.SourcePosition do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :line, 1, type: :uint32
+  field :character, 2, type: :uint32
 end
 
 defmodule Beholder.Worker.V1.AnalyzeEvent do
@@ -142,6 +309,20 @@ defmodule Beholder.Worker.V1.AnalysisContribution do
     json_name: "graphqlResolvers"
 
   field :diagnostics, 3, repeated: true, type: Beholder.Worker.V1.RepositoryDiagnostic
+
+  field :candidate_overrides, 4,
+    repeated: true,
+    type: Beholder.Worker.V1.CandidateOverride,
+    json_name: "candidateOverrides"
+end
+
+defmodule Beholder.Worker.V1.CandidateOverride do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :candidate_id, 1, type: :string, json_name: "candidateId"
+  field :resolved_to, 2, type: :string, json_name: "resolvedTo"
+  field :evidence, 3, type: :string
 end
 
 defmodule Beholder.Worker.V1.AnalysisFailure do
@@ -184,6 +365,11 @@ defmodule Beholder.Worker.V1.RepositoryContribution do
 
   field :observations, 5, repeated: true, type: Beholder.Worker.V1.Observation
   field :diagnostics, 6, repeated: true, type: Beholder.Worker.V1.AnalysisDiagnostic
+
+  field :replaced_diagnostic_codes, 7,
+    repeated: true,
+    type: :string,
+    json_name: "replacedDiagnosticCodes"
 end
 
 defmodule Beholder.Worker.V1.EntityFact do
@@ -279,4 +465,16 @@ end
 defmodule Beholder.Worker.V1.AnalyzerWorker.Stub do
   @moduledoc false
   use GRPC.Stub, service: Beholder.Worker.V1.AnalyzerWorker.Service
+end
+
+defmodule Beholder.Worker.V1.AnalyzerPlugin.Service do
+  @moduledoc false
+  use GRPC.Service, name: "beholder.worker.v1.AnalyzerPlugin", protoc_gen_elixir_version: "0.17.0"
+
+  rpc(:Describe, Beholder.Worker.V1.DescribeRequest, Beholder.Worker.V1.DescribeResponse, %{})
+end
+
+defmodule Beholder.Worker.V1.AnalyzerPlugin.Stub do
+  @moduledoc false
+  use GRPC.Stub, service: Beholder.Worker.V1.AnalyzerPlugin.Service
 end

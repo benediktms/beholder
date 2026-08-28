@@ -9,10 +9,10 @@ use super::{
         published_repository_head, repository_revision, trace,
     },
     storage::{
-        claim_garbage_collection, delete_repository_revision, enrichment_matches,
-        enrichments_current, ensure_revision_inputs, garbage_collection_candidates,
-        garbage_collection_pending, garbage_collection_queued, publish_enrichment,
-        publish_observations, publish_repository, repository_contexts,
+        SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
+        enrichment_matches, enrichments_current, ensure_revision_inputs,
+        garbage_collection_candidates, garbage_collection_pending, garbage_collection_queued,
+        publish_enrichment, publish_observations, publish_repository, repository_contexts,
         revision_enrichment_input_fingerprint, revision_input_fingerprints,
         selected_baseline_semantics, store_verification_fingerprint, sweep_garbage_collection,
         verification_matches, view_matches,
@@ -309,7 +309,7 @@ impl SemanticStore {
         repository: &str,
         entity_kinds: &BTreeSet<EntityKind>,
         relations: &BTreeSet<SemanticRelation>,
-    ) -> Result<(Vec<EntityFact>, Vec<Observation>, Vec<SemanticCandidate>), Box<dyn Error>> {
+    ) -> Result<SelectedBaselineSemantics, Box<dyn Error>> {
         self.access(|| {
             selected_baseline_semantics(&self.db, view, repository, entity_kinds, relations)
         })

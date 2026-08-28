@@ -4,7 +4,7 @@ mod plugin_registry;
 
 pub use plugin_registry::{InstalledPlugin, PluginRegistry, describe_plugin};
 
-use beholder_domain::SemanticRelation;
+use beholder_domain::{EntityKind, SemanticRelation};
 use beholder_indexing::{
     AnalysisInput, AnalysisInputKind, AnalyzerError, AnalyzerMetadata, EnrichmentFuture,
     EnrichmentSnapshot, EnrichmentSourceCurrentness, PluginDescriptor, PluginInputScope,
@@ -41,6 +41,7 @@ static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub const RUST_WORKER_ID: &str = "rust";
 pub const ELIXIR_WORKER_ID: &str = "elixir";
+pub const TYPESCRIPT_WORKER_ID: &str = "typescript";
 
 pub fn worker_environment_variable(worker: &str, setting: &str) -> String {
     let normalize = |value: &str| {
@@ -82,11 +83,19 @@ pub struct WorkerAnalyzerBuilder {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    repository_identity_files: Vec<RepositoryIdentityFile>,
+    semantic_entities: BTreeSet<EntityKind>,
     semantic_relations: BTreeSet<SemanticRelation>,
     semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
     timeout: Duration,
+}
+
+struct RepositoryIdentityFile {
+    path: PathBuf,
+    file: PathBuf,
+    kind: AnalysisInputKind,
 }
 
 impl WorkerAnalyzerBuilder {
@@ -104,6 +113,8 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: BTreeMap::new(),
             excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
+            repository_identity_files: Vec::new(),
+            semantic_entities: BTreeSet::new(),
             semantic_relations: BTreeSet::new(),
             semantic_shard_producers: BTreeSet::new(),
             plugin: None,
@@ -197,8 +208,27 @@ impl WorkerAnalyzerBuilder {
         self
     }
 
+    pub fn repository_file_identity(
+        mut self,
+        path: impl Into<PathBuf>,
+        file: impl Into<PathBuf>,
+        kind: AnalysisInputKind,
+    ) -> Self {
+        self.repository_identity_files.push(RepositoryIdentityFile {
+            path: path.into(),
+            file: file.into(),
+            kind,
+        });
+        self
+    }
+
     pub fn semantic_relation(mut self, relation: SemanticRelation) -> Self {
         self.semantic_relations.insert(relation);
+        self
+    }
+
+    pub fn semantic_entity(mut self, kind: EntityKind) -> Self {
+        self.semantic_entities.insert(kind);
         self
     }
 
@@ -228,6 +258,8 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: self.parent_suffixes,
             excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
+            repository_identity_files: self.repository_identity_files,
+            semantic_entities: self.semantic_entities,
             semantic_relations: self.semantic_relations,
             semantic_shard_producers: self.semantic_shard_producers,
             plugin: self.plugin,
@@ -248,6 +280,8 @@ pub struct WorkerAnalyzer {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    repository_identity_files: Vec<RepositoryIdentityFile>,
+    semantic_entities: BTreeSet<EntityKind>,
     semantic_relations: BTreeSet<SemanticRelation>,
     semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
@@ -282,6 +316,8 @@ pub fn plugin_analyzer(
         parent_suffixes: BTreeMap::new(),
         excluded_path_suffixes: Vec::new(),
         identity_inputs: Vec::new(),
+        repository_identity_files: Vec::new(),
+        semantic_entities: BTreeSet::new(),
         semantic_relations: BTreeSet::new(),
         semantic_shard_producers: BTreeSet::new(),
         plugin: Some(descriptor),
@@ -338,6 +374,25 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         self.identity_inputs.clone()
     }
 
+    fn repository_identity_inputs(
+        &self,
+        repository: &beholder_indexing::RepositorySnapshot,
+    ) -> Vec<AnalysisInput> {
+        self.repository_identity_files
+            .iter()
+            .map(|identity| {
+                let content = fs::read(repository.base.join(&identity.file))
+                    .ok()
+                    .unwrap_or_else(|| b"unavailable".to_vec());
+                AnalysisInput {
+                    path: identity.path.clone(),
+                    content: Arc::from(content),
+                    kind: identity.kind,
+                }
+            })
+            .collect()
+    }
+
     fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
         if let Some(plugin) = &self.plugin {
             return repository.inputs.iter().any(|input| {
@@ -349,7 +404,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         repository
             .inputs
             .iter()
-            .any(|input| self.analysis_input_kind(&input.path).is_some())
+            .any(|input| self.analysis_input_kind(&input.path) == Some(AnalysisInputKind::Source))
     }
 
     fn requires_workspace_enablement(&self) -> bool {
@@ -386,7 +441,12 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         BTreeSet<beholder_domain::SemanticRelation>,
     ) {
         self.plugin.as_ref().map_or_else(
-            || (BTreeSet::new(), self.semantic_relations.clone()),
+            || {
+                (
+                    self.semantic_entities.clone(),
+                    self.semantic_relations.clone(),
+                )
+            },
             |plugin| {
                 (
                     plugin.semantic_entities.clone(),
@@ -751,7 +811,7 @@ mod tests {
         AnalyzerContribution, AnalyzerMetadata, CacheStatistics, InputKind, RepositoryInput,
         RepositorySnapshot, SemanticSnapshot, WorkspaceSnapshot,
     };
-    use std::sync::Arc;
+    use std::{fs, sync::Arc, time::SystemTime};
 
     #[test]
     fn worker_environment_variables_have_one_consistent_shape() {
@@ -882,6 +942,50 @@ mod tests {
             declared.workspace.repositories[0].inputs[0].path,
             Path::new("src/lib.rs")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_compiler_package_participates_in_currentness() {
+        let root = std::env::temp_dir().join(format!(
+            "beholder-worker-identity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let compiler = root.join("node_modules/typescript/package.json");
+        fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        fs::write(&compiler, r#"{"version":"7.0.2"}"#).unwrap();
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("typescript", "1")
+            .accept_extension("ts")
+            .repository_file_identity(
+                "$toolchain/typescript",
+                "node_modules/typescript/package.json",
+                AnalysisInputKind::Toolchain,
+            )
+            .build()
+            .unwrap();
+        let repository = RepositorySnapshot {
+            base: root.clone(),
+            state: RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example".into(),
+                },
+                head: None,
+                fingerprint: "fingerprint".into(),
+            },
+            inputs: Vec::new(),
+        };
+
+        let identity = worker.repository_identity_inputs(&repository);
+
+        assert_eq!(identity[0].content.as_ref(), br#"{"version":"7.0.2"}"#);
+        fs::write(&compiler, r#"{"version":"7.0.3"}"#).unwrap();
+        assert_ne!(identity, worker.repository_identity_inputs(&repository));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -4,7 +4,9 @@ layer: 'application'
 fileGroups:
   sources:
     - '/mise.toml'
+    - '/proto/**/*.proto'
     - 'go.mod'
+    - 'go.sum'
     - '**/*.go'
 
 tasks:
@@ -30,6 +32,17 @@ tasks:
     command: 'gofmt -w .'
     inputs:
       - '@group(sources)'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false
+
+  release:
+    command: 'mise exec -- go build -trimpath -o beholder-worker-typescript .'
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - 'beholder-worker-typescript'
     toolchains: 'system'
     options:
       cache: false

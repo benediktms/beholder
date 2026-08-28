@@ -17,4 +17,5 @@ rm -f \
     "$install_dir/beholder" \
     "$install_dir/beholderd" \
     "$install_dir/beholder-worker-rust" \
-    "$install_dir/beholder-worker-elixir"
+    "$install_dir/beholder-worker-elixir" \
+    "$install_dir/beholder-worker-typescript"
