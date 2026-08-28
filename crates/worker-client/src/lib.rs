@@ -30,7 +30,6 @@ use tracing::Instrument;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ANALYSIS_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(600);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const WORKER_SETTINGS: [&str; 2] = ["MAX_OUTPUT_BYTES", "TIMEOUT_MS"];
 static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -497,11 +496,13 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                             .sum::<usize>(),
                     "worker analysis completed"
                 );
-                if tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait())
-                    .await
-                    .is_err()
-                {
+                drop(client);
+                if child.try_wait()?.is_none() {
                     child.kill().await?;
+                    tracing::debug!(
+                        worker = self.metadata.id,
+                        "worker process terminated after completed analysis"
+                    );
                 }
                 Ok(contribution)
             }

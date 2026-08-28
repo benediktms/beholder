@@ -54,6 +54,7 @@ fn relevant_entities(
 pub struct SemanticStore {
     pub(super) db: DbInstance,
     pub(super) read_db: DbInstance,
+    gc_db: DbInstance,
     pub(super) database_path: Option<PathBuf>,
     engine: Mutex<()>,
 }
@@ -84,6 +85,7 @@ impl SemanticStore {
         let db = memory_database()?;
         Ok(Self {
             read_db: db.clone(),
+            gc_db: db.clone(),
             db,
             database_path: None,
             engine: Mutex::new(()),
@@ -103,9 +105,11 @@ impl SemanticStore {
         }
         let db = persistent_database(path, initialize)?;
         let read_db = persistent_database(path, false)?;
+        let gc_db = persistent_database(path, false)?;
         Ok(Self {
             db,
             read_db,
+            gc_db,
             database_path: Some(path.into()),
             engine: Mutex::new(()),
         })
@@ -115,6 +119,7 @@ impl SemanticStore {
         let db = benchmark_database(storage, path)?;
         Ok(Self {
             read_db: db.clone(),
+            gc_db: db.clone(),
             db,
             database_path: (storage == "sqlite")
                 .then_some(path)
@@ -368,7 +373,7 @@ impl SemanticStore {
         &self,
         mut progress: impl FnMut(GarbageCollectionProgress) -> bool,
     ) -> Result<u64, Box<dyn Error>> {
-        self.access(|| sweep_garbage_collection(&self.db, &mut progress))
+        sweep_garbage_collection(&self.gc_db, &self.engine, &mut progress)
     }
 
     pub fn garbage_collection_pending(&self) -> Result<bool, Box<dyn Error>> {
@@ -1192,15 +1197,24 @@ mod tests {
             .unwrap();
 
         let mut progress = Vec::new();
+        let mut writer_interleaved = false;
         assert_eq!(
             store
                 .sweep_garbage_collection(|event| {
+                    if event.completed_rows == Some(10_000) && !writer_interleaved {
+                        store
+                            .store_verification_fingerprint("main", "during-gc")
+                            .unwrap();
+                        writer_interleaved = true;
+                    }
                     progress.push(event);
                     true
                 })
                 .unwrap(),
             3
         );
+        assert!(writer_interleaved);
+        assert!(store.verification_matches("main", "during-gc").unwrap());
         let observation_updates = progress
             .iter()
             .filter(|event| {

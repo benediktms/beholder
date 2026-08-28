@@ -140,7 +140,7 @@ ADR 0007 replaces Rust repository-wide semantic publication with Salsa-backed
 file queries and immutable fact shards selected per stable semantic owner. A
 source edit propagates through parsing, file summary, and shard production only
 while each semantic output changes. Mnestic retains unchanged shard versions and
-rebuilds the remaining legacy baseline only when its semantic fingerprint changes.
+advances a selection manifest without rebuilding a workspace baseline.
 
 The 2026-08-27 self-index benchmark used four workers, 178 accepted inputs, and
 2,573,785 bytes:
@@ -165,6 +165,36 @@ approximately 90 seconds in the one-time legacy-baseline removal and initial sha
 transaction. A subsequent unchanged manual job was admitted while automatic
 garbage collection was sweeping older large-workspace states, so its durable elapsed
 time is not a valid unchanged-indexing measurement.
+
+Stage-level instrumentation on the same persistent database later isolated a
+one-file Rust edit: inventory took 71 ms, analysis 717 ms, and publication
+17.8 seconds. Baseline replacement did not run. Publication spent 1.46 seconds
+reading 25,570 effective observations, 50 ms replacing 1,966 shard selections,
+207 ms storing repository/revision metadata, 15.9 seconds carrying forward
+enrichment contributions, and 77 ms committing. The remaining hot path is
+therefore revision-local enrichment materialisation, not shard persistence,
+baseline replacement, or SQLite commit throughput.
+
+Revision-local enrichment materialisation was subsequently removed. Enrichment
+payloads are content-addressed immutable snapshots, and an analysis revision now
+selects a snapshot per repository and analyzer. A base publication carries only
+those selection rows; it does not copy or re-resolve enrichment facts. Selected
+snapshots remain visible when stale, while their stored input fingerprint makes
+freshness explicit. Enrichment publication swaps one selection atomically, and
+background garbage collection removes superseded snapshots and the deprecated
+materialized baseline.
+
+The installed-daemon follow-up used the existing 11 GiB database. A changed Rust
+enrichment completed in about 2 seconds: worker analysis took 1.77 seconds and
+Mnestic publication took 59 ms. Within publication, storing 899 overrides and 543
+diagnostics took 12 ms, copying the revision manifest took 4 ms, refreshing the
+affected winner selections took 38 ms, and committing the SQLite transaction took
+4 ms. Removing an unconditional five-second wait for the completed one-shot worker
+made the durable job track the actual analysis time. These measurements do not
+support either a database per repository or a storage-engine migration: SQLite's
+single writer is not the limiting stage on the changed-enrichment path. Revisit
+that decision only if writer-wait instrumentation shows sustained publication
+contention after query plans and garbage-collection scheduling are bounded.
 
 This is the first executable slice, not the final performance target. Salsa state
 is process-local, compiler enrichment still uses its existing input identity, and

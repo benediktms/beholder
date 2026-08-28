@@ -107,11 +107,19 @@ pub(super) fn analysis_metadata(
     let rows = query(
         db,
         view,
-        "?[repository, code, severity, path, line, detail] := \
-             *analysis_revision_diagnostic{\
-                 view: $view, revision: $revision, repository, code, severity, path, line, detail\
-             }\n\
-         :order severity, repository, path, line, code",
+        &format!(
+            "{DIRECT_RULES}\n\
+             ?[repository, code, severity, path, line, detail] := \
+                 *analysis_revision_diagnostic{{\
+                     view: $view, revision: $revision, repository, code, severity, path, line, detail\
+                 }}\n\
+             ?[repository, code, severity, path, line, detail] := \
+                 enrichment_diagnostic[repository, code, severity, path, line, detail], \
+                 not *analysis_revision_diagnostic{{\
+                     view: $view, revision: $revision, repository, code, severity, path, line\
+                 }}\n\
+             :order severity, repository, path, line, code"
+        ),
         [("revision", i64::try_from(revision)?.into())],
     )?;
     let diagnostics = rows
@@ -251,9 +259,17 @@ pub(super) fn entity_facts(
     query(
         db,
         view,
-        "selected_state[state] := *analysis_revision{view: $view, revision}, \
+        "requested[id] <- $entities\n\
+         selected_state[state] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view: $view, revision, state}\n\
-         requested[id] <- $entities\n\
+         selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
+         baseline_id[id] := requested[id], selected_state[state], *state_entity{state, id}\n\
+         baseline_id[id] := requested[id], *analysis_revision{view: $view, revision}, \
+             *analysis_revision_entity{view: $view, revision, id}\n\
+         baseline_id[id] := requested[id], \
+             *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id}\n\
          ?[id, kind, metadata] := requested[id], selected_state[state], \
              *state_entity{state, id, kind, metadata}\n\
          ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
@@ -261,6 +277,11 @@ pub(super) fn entity_facts(
          ?[id, kind, metadata] := requested[id], \
              *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
              *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
+         ?[id, kind, metadata] := requested[id], \
+             *analysis_enrichment_entity_selection{view: $view, id, owner}, \
+             selected_enrichment[owner], \
+             *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, \
+             not baseline_id[id]\n\
          :order id",
         [("entities", entities)],
     )
@@ -320,23 +341,7 @@ pub(super) fn context(
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        &format!(
-            "{DIRECT_RULES}\n\
-             ?[direction, relation, related, evidence, confidence, provenance] := \
-                 effective_observation[\
-                     $entity, related, relation, evidence, confidence, provenance\
-                 ], direction = 'outgoing'\n\
-             ?[direction, relation, related, evidence, confidence, provenance] := \
-                 effective_observation[\
-                     related, $entity, relation, evidence, confidence, provenance\
-                 ], direction = 'incoming'\n\
-             :order direction, relation, related"
-        ),
-        [("entity", entity.into())],
-    )
+    query(db, view, CONTEXT_QUERY, [("entity", entity.into())])
 }
 
 pub(super) fn trace(

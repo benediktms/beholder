@@ -676,6 +676,7 @@ impl IndexScheduler {
             })
             .unwrap_or_default();
         let enriching_repositories = durable_enrichments.unwrap_or_default();
+        let stale = stale || !enriching_repositories.is_empty();
         let indexing = full_index_active
             || self
                 .automatic_jobs
@@ -4193,7 +4194,7 @@ mod tests {
             Default::default(),
             Some(vec!["repo".into()]),
         );
-        assert!(!enriching.freshness.stale);
+        assert!(enriching.freshness.stale);
         assert!(enriching.freshness.indexing);
         assert_eq!(enriching.freshness.enriching_repositories, ["repo"]);
         assert!(
