@@ -225,3 +225,12 @@ database therefore removes startup and workspace loading, but repository-wide
 override recomputation remains the dominant cost. The next optimization boundary
 is incremental compiler-result production, not worker lifecycle or SQLite commit
 throughput.
+
+Phase instrumentation then showed that a warm run spent 2.93 seconds rebuilding
+file-level call and definition positions and 1.82 seconds querying 19,019 call
+sites. Retaining those positions per compiler file and reparsing only changed
+files reduced warm extraction to 439 ms and total compiler enrichment to 2.56
+seconds. End-to-end worker analysis took 3.10 seconds, while base indexing took
+1.24 seconds and enrichment publication took 334 ms. The remaining compiler hot
+path is the repository-wide `goto_definition` sweep; safely narrowing it requires
+dependency-aware invalidation rather than a source-file-only result cache.

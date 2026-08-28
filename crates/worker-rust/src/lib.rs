@@ -29,6 +29,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
@@ -40,6 +41,8 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 static MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static COMPILER_LOADS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static COMPILER_EXTRACTIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct RustWorker {
@@ -111,12 +114,23 @@ impl AnalyzerWorker for RustWorker {
                     move || -> Result<Vec<AnalyzeEvent>, Box<dyn Error + Send + Sync>> {
                         analysis_span.in_scope(|| {
                             analysis_pool.install(|| {
+                                let syntax_started = Instant::now();
                                 let mut contribution = analyzer.analyze(&snapshot.workspace)?;
+                                tracing::info!(
+                                    elapsed_ms = syntax_started.elapsed().as_secs_f64() * 1_000.0,
+                                    "Rust syntax analysis completed"
+                                );
+                                let enrichment_started = Instant::now();
                                 enrich_semantics(
                                     &snapshot.workspace,
                                     &snapshot.target_repository,
                                     &mut contribution,
                                     &compiler,
+                                );
+                                tracing::info!(
+                                    elapsed_ms =
+                                        enrichment_started.elapsed().as_secs_f64() * 1_000.0,
+                                    "Rust compiler enrichment completed"
                                 );
                                 retain_semantic_enrichment(
                                     &mut contribution,
@@ -436,6 +450,8 @@ struct CompilerCargo {
     host: AnalysisHost,
     vfs: ra_ap_vfs::Vfs,
     sources: BTreeMap<FileId, Arc<[u8]>>,
+    dirty: BTreeSet<FileId>,
+    extractions: BTreeMap<FileId, Option<CompilerFileAnalysis>>,
 }
 
 impl CompilerCargo {
@@ -477,6 +493,8 @@ impl CompilerCargo {
             host: AnalysisHost::with_database(database),
             vfs,
             sources: BTreeMap::new(),
+            dirty: BTreeSet::new(),
+            extractions: BTreeMap::new(),
         };
         compiler.update(snapshot, materialized)?;
         Ok(compiler)
@@ -509,6 +527,7 @@ impl CompilerCargo {
                 let source = std::str::from_utf8(&input.content)?.to_owned();
                 change.change_file(file_id, Some(source));
                 self.sources.insert(file_id, Arc::clone(&input.content));
+                self.dirty.insert(file_id);
                 changed = true;
             }
         }
@@ -689,7 +708,10 @@ fn enrich_repository(
     compiler: &mut CompilerCargo,
     contribution: &mut AnalyzerContribution,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut snapshot_files = Vec::new();
+    let started = Instant::now();
+    let mut definitions = BTreeMap::new();
+    let mut call_sites = Vec::new();
+    let mut local_files = BTreeSet::new();
     for snapshot_repository in &snapshot.repositories {
         let Some(materialized_base) =
             materialized.repository(&snapshot_repository.state.repository.identity)
@@ -702,50 +724,70 @@ fn enrich_repository(
                 .extension()
                 .is_some_and(|extension| extension == "rs")
         }) {
-            let source = std::str::from_utf8(&input.content)?.to_owned();
             let absolute = materialized_base.join(&input.path);
             let path = VfsPath::new_real_path(absolute.to_string_lossy().into_owned());
             let Some((file_id, _)) = compiler.vfs.file_id(&path) else {
                 continue;
             };
-            snapshot_files.push((snapshot_repository, &input.path, file_id, source));
+            if compiler.dirty.contains(&file_id) || !compiler.extractions.contains_key(&file_id) {
+                #[cfg(test)]
+                COMPILER_EXTRACTIONS.fetch_add(1, Ordering::Relaxed);
+                let source = std::str::from_utf8(&input.content)?.to_owned();
+                let extraction = match analyze(&source) {
+                    Ok(syntax) => {
+                        let source_id = source_entity_id(
+                            &snapshot_repository.state.repository.identity,
+                            &input.path,
+                        );
+                        let mut file = CompilerFileAnalysis::default();
+                        for function in syntax.functions() {
+                            let function_id = format!("{source_id}/{}", function.qualified_name());
+                            file.definitions
+                                .push((text_size(function.name_offset())?, function_id.clone()));
+                            if snapshot_repository.state.repository == repository.state.repository {
+                                file.call_sites
+                                    .extend(function.calls().map(|call| CallSite {
+                                        file_id,
+                                        from: function_id.clone(),
+                                        unresolved: if call.receiver_method() {
+                                            format!("rust-method://{}", call.name())
+                                        } else {
+                                            format!("rust-call://{}", call.name())
+                                        },
+                                        evidence: format!(
+                                            "{}:{}",
+                                            input.path.display(),
+                                            line(&source, call.offset())
+                                        ),
+                                        offset: call.offset(),
+                                    }));
+                            }
+                        }
+                        Some(file)
+                    }
+                    Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => None,
+                    Err(error) => return Err(error),
+                };
+                compiler.extractions.insert(file_id, extraction);
+                compiler.dirty.remove(&file_id);
+            }
+            let Some(extraction) = compiler.extractions.get(&file_id).and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            definitions.extend(
+                extraction
+                    .definitions
+                    .iter()
+                    .map(|(offset, entity)| ((file_id, *offset), entity.clone())),
+            );
+            if snapshot_repository.state.repository == repository.state.repository {
+                local_files.insert(file_id);
+                call_sites.extend(extraction.call_sites.iter().cloned());
+            }
         }
     }
     let analysis = compiler.host.analysis();
-    let mut files = BTreeMap::<PathBuf, (FileId, String)>::new();
-    let mut definitions = BTreeMap::new();
-    let mut call_sites = Vec::new();
-    for (snapshot_repository, path, file_id, source) in snapshot_files {
-        let syntax = match analyze(&source) {
-            Ok(syntax) => syntax,
-            Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => continue,
-            Err(error) => return Err(error),
-        };
-        let source_id = source_entity_id(&snapshot_repository.state.repository.identity, path);
-        for function in syntax.functions() {
-            let function_id = format!("{source_id}/{}", function.qualified_name());
-            definitions.insert(
-                (file_id, text_size(function.name_offset())?),
-                function_id.clone(),
-            );
-            if snapshot_repository.state.repository == repository.state.repository {
-                call_sites.extend(function.calls().map(|call| CallSite {
-                    file_id,
-                    from: function_id.clone(),
-                    unresolved: if call.receiver_method() {
-                        format!("rust-method://{}", call.name())
-                    } else {
-                        format!("rust-call://{}", call.name())
-                    },
-                    evidence: format!("{}:{}", path.display(), line(&source, call.offset())),
-                    offset: call.offset(),
-                }));
-            }
-        }
-        if snapshot_repository.state.repository == repository.state.repository {
-            files.insert(path.clone(), (file_id, source));
-        }
-    }
     let config = GotoDefinitionConfig {
         ra_fixture: RaFixtureConfig {
             disable_ra_fixture: true,
@@ -774,20 +816,21 @@ fn enrich_repository(
         })
         .collect::<BTreeSet<_>>();
     call_sites.retain(|call| candidates.contains(&(call.from.clone(), call.evidence.clone())));
-    let local_files = files
-        .values()
-        .map(|(file_id, _)| *file_id)
-        .collect::<BTreeSet<_>>();
     let mut compiler_diagnostics = Vec::new();
+    let call_site_count = call_sites.len();
+    let extraction_elapsed = started.elapsed();
+    let mut goto_elapsed = Duration::ZERO;
     for call in call_sites {
-        let Some(targets) = analysis.goto_definition(
+        let goto_started = Instant::now();
+        let targets = analysis.goto_definition(
             FilePosition {
                 file_id: call.file_id,
                 offset: text_size(call.offset)?,
             },
             &config,
-        )?
-        else {
+        );
+        goto_elapsed += goto_started.elapsed();
+        let Some(targets) = targets? else {
             continue;
         };
         let mut local = targets.info.iter().filter_map(|target| {
@@ -910,6 +953,13 @@ fn enrich_repository(
     repository_contribution
         .diagnostics
         .extend(compiler_diagnostics);
+    tracing::info!(
+        call_site_count,
+        extraction_ms = extraction_elapsed.as_secs_f64() * 1_000.0,
+        goto_definition_ms = goto_elapsed.as_secs_f64() * 1_000.0,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "Rust compiler repository enrichment completed"
+    );
     Ok(())
 }
 
@@ -942,6 +992,13 @@ fn environment_enabled(name: &str) -> bool {
     })
 }
 
+#[derive(Default)]
+struct CompilerFileAnalysis {
+    definitions: Vec<(TextSize, String)>,
+    call_sites: Vec<CallSite>,
+}
+
+#[derive(Clone)]
 struct CallSite {
     file_id: FileId,
     from: String,
@@ -1240,6 +1297,7 @@ fn caller() {
                 })
         );
         let compiler_loads = COMPILER_LOADS.load(Ordering::Relaxed);
+        let compiler_extractions = COMPILER_EXTRACTIONS.load(Ordering::Relaxed);
         let source = format!("{source}\n// comment-only change\n");
         updated_snapshot.workspace.repositories[0]
             .inputs
@@ -1261,6 +1319,10 @@ fn caller() {
         let updated = contribution_from_events(events).unwrap();
         assert_eq!(updated.overrides, contribution.overrides);
         assert_eq!(COMPILER_LOADS.load(Ordering::Relaxed), compiler_loads);
+        assert_eq!(
+            COMPILER_EXTRACTIONS.load(Ordering::Relaxed),
+            compiler_extractions + 1
+        );
         server.abort();
         let _ = server.await;
         fs::remove_file(socket).unwrap();
