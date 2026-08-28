@@ -1402,6 +1402,7 @@ pub(super) fn publish_observations(
     overrides: &[DependencyOverride],
     fact_shards: &[FactShard],
     verification_fingerprint: Option<&str>,
+    report_shard_changes: bool,
 ) -> Result<FactChanges, Box<dyn Error>> {
     let publication_started = Instant::now();
     if repositories
@@ -1432,106 +1433,106 @@ pub(super) fn publish_observations(
         ("fingerprint".into(), view.fingerprint().into()),
     ]);
     let transaction = db.multi_transaction(true);
-    let started = Instant::now();
-    let current = transaction.run_script(
-        &format!(
-            "{BASE_DIRECT_RULES}\n\
-             ?[from, relation, to, evidence] := \
-                 base_effective_observation[from, to, relation, evidence, _, _]"
-        ),
-        BTreeMap::from([("view".into(), view.name.clone().into())]),
-    )?;
-    let current = current
-        .rows
-        .into_iter()
-        .map(|row| {
-            let value = |index: usize| {
-                row[index]
-                    .get_str()
-                    .map(str::to_owned)
-                    .ok_or("observation contains a non-string value")
-            };
-            Ok(((value(0)?, value(1)?, value(2)?), value(3)?))
-        })
-        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
-    tracing::info!(
-        target: "beholder::publication",
-        stage = "read_effective_observations",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        rows_read = current.len(),
-        "Mnestic publication stage completed"
-    );
-    let override_targets = overrides
-        .iter()
-        .map(|override_| {
-            (
+    let legacy_changes = if !report_shard_changes {
+        let started = Instant::now();
+        let current = transaction.run_script(
+            &format!(
+                "{BASE_DIRECT_RULES}\n\
+                 ?[from, relation, to, evidence] := \
+                     base_effective_observation[from, to, relation, evidence, _, _]"
+            ),
+            BTreeMap::from([("view".into(), view.name.clone().into())]),
+        )?;
+        let current = current
+            .rows
+            .into_iter()
+            .map(|row| {
+                let value = |index: usize| {
+                    row[index]
+                        .get_str()
+                        .map(str::to_owned)
+                        .ok_or("observation contains a non-string value")
+                };
+                Ok(((value(0)?, value(1)?, value(2)?), value(3)?))
+            })
+            .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "read_effective_observations",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            rows_read = current.len(),
+            "Mnestic publication stage completed"
+        );
+        let override_targets = overrides
+            .iter()
+            .map(|override_| {
                 (
-                    override_.from.as_str().to_owned(),
-                    override_.relation.as_str().to_owned(),
-                    override_.unresolved_to.as_str().to_owned(),
-                    override_.evidence.as_str().to_owned(),
-                ),
-                override_.resolved_to.as_str().to_owned(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let started = Instant::now();
-    let next = repositories
-        .iter()
-        .flat_map(|facts| &facts.observations)
-        .chain(&resolution.observations)
-        .chain(
-            fact_shards
-                .iter()
-                .flat_map(|shard| shard.observations.iter()),
-        )
-        .map(|observation| {
-            let from = observation.from.as_str().to_owned();
-            let relation = observation.relation.as_str().to_owned();
-            let unresolved_to = observation.to.as_str().to_owned();
-            let evidence = observation.evidence.as_str().to_owned();
-            let to = override_targets
-                .get(&(
-                    from.clone(),
-                    relation.clone(),
-                    unresolved_to.clone(),
-                    evidence.clone(),
-                ))
-                .cloned()
-                .unwrap_or(unresolved_to);
-            ((from, relation, to), evidence)
-        })
-        .collect::<BTreeMap<_, _>>();
-    tracing::info!(
-        target: "beholder::publication",
-        stage = "build_next_observations",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        rows = next.len(),
-        "Mnestic publication stage completed"
-    );
-    let started = Instant::now();
-    let mut changes = FactChanges::default();
-    for (key, evidence) in &next {
-        match current.get(key) {
-            None => changes.inserted += 1,
-            Some(current) if current == evidence => changes.unchanged += 1,
-            Some(_) => changes.updated += 1,
+                    (
+                        override_.from.as_str().to_owned(),
+                        override_.relation.as_str().to_owned(),
+                        override_.unresolved_to.as_str().to_owned(),
+                        override_.evidence.as_str().to_owned(),
+                    ),
+                    override_.resolved_to.as_str().to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let started = Instant::now();
+        let next = repositories
+            .iter()
+            .flat_map(|facts| &facts.observations)
+            .chain(&resolution.observations)
+            .map(|observation| {
+                let from = observation.from.as_str().to_owned();
+                let relation = observation.relation.as_str().to_owned();
+                let unresolved_to = observation.to.as_str().to_owned();
+                let evidence = observation.evidence.as_str().to_owned();
+                let to = override_targets
+                    .get(&(
+                        from.clone(),
+                        relation.clone(),
+                        unresolved_to.clone(),
+                        evidence.clone(),
+                    ))
+                    .cloned()
+                    .unwrap_or(unresolved_to);
+                ((from, relation, to), evidence)
+            })
+            .collect::<BTreeMap<_, _>>();
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "build_next_observations",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            rows = next.len(),
+            "Mnestic publication stage completed"
+        );
+        let started = Instant::now();
+        let mut changes = FactChanges::default();
+        for (key, evidence) in &next {
+            match current.get(key) {
+                None => changes.inserted += 1,
+                Some(current) if current == evidence => changes.unchanged += 1,
+                Some(_) => changes.updated += 1,
+            }
         }
-    }
-    changes.removed = current
-        .keys()
-        .filter(|key| !next.contains_key(*key))
-        .count();
-    tracing::info!(
-        target: "beholder::publication",
-        stage = "diff_effective_observations",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        rows_inserted = changes.inserted,
-        rows_updated = changes.updated,
-        rows_removed = changes.removed,
-        rows_unchanged = changes.unchanged,
-        "Mnestic publication stage completed"
-    );
+        changes.removed = current
+            .keys()
+            .filter(|key| !next.contains_key(*key))
+            .count();
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "diff_effective_observations",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            rows_inserted = changes.inserted,
+            rows_updated = changes.updated,
+            rows_removed = changes.removed,
+            rows_unchanged = changes.unchanged,
+            "Mnestic publication stage completed"
+        );
+        changes
+    } else {
+        FactChanges::default()
+    };
 
     let started = Instant::now();
     let shard_changes = replace_fact_shards(&transaction, &view.name, fact_shards)?;
@@ -1546,6 +1547,11 @@ pub(super) fn publish_observations(
         rows_unchanged = shard_changes.unchanged,
         "Mnestic publication stage completed"
     );
+    let changes = if report_shard_changes {
+        shard_changes
+    } else {
+        legacy_changes
+    };
 
     let started = Instant::now();
     let mut analyzed_states = Vec::with_capacity(repositories.len());

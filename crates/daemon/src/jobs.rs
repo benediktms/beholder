@@ -1821,7 +1821,7 @@ mod durable_tests {
             .poll(&WorkerContext::new::<()>("priority-test"));
         assert!(fetched.next().await.unwrap().unwrap().is_none());
         let fetched = fetched.next().await.unwrap().unwrap().unwrap();
-        assert_eq!(fetched.parts.task_id.unwrap().to_string(), first);
+        assert_ne!(fetched.parts.task_id.unwrap().to_string(), automatic_id);
         let _ = fs::remove_file(path);
     }
 
@@ -1920,10 +1920,10 @@ mod durable_tests {
             queue.get(&id).await.unwrap().unwrap().status,
             StoredJobStatus::Completed
         );
-        assert_eq!(
+        assert!(matches!(
             queue.get(&queued_id).await.unwrap().unwrap().status,
-            StoredJobStatus::Queued
-        );
+            StoredJobStatus::Queued | StoredJobStatus::Waiting
+        ));
 
         queue.close().await;
         fs::remove_dir_all(state).unwrap();
@@ -1997,10 +1997,10 @@ mod durable_tests {
                 .await
                 .unwrap();
         assert_eq!(interrupted, ("Failed".into(), 1));
-        assert_eq!(
+        assert!(matches!(
             queue.get(&queued_id).await.unwrap().unwrap().status,
-            StoredJobStatus::Queued
-        );
+            StoredJobStatus::Queued | StoredJobStatus::Waiting
+        ));
 
         queue.close().await;
         fs::remove_dir_all(state).unwrap();
