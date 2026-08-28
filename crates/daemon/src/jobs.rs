@@ -35,6 +35,8 @@ use beholder_domain::Workspace;
 
 const INDEX_QUEUE: &str = "index";
 const ENRICHMENT_QUEUE: &str = "enrichment";
+const AUTOMATIC_PRIORITY: i32 = 0;
+const MANUAL_PRIORITY: i32 = 1;
 pub const MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,6 +133,24 @@ pub struct EnrichmentJob {
     pub trigger: JobTrigger,
     pub prerequisite_index_jobs: Vec<IndexJobId>,
     pub input_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichmentOutcome {
+    Published,
+    Unchanged,
+    AlreadyCurrent,
+    Superseded,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnrichmentJobResult {
+    pub target: EnrichmentTarget,
+    pub worker_id: String,
+    pub expected_worker_version: String,
+    pub outcome: EnrichmentOutcome,
+    pub failed_prerequisite_index_jobs: Vec<IndexJobId>,
 }
 
 trait JobTelemetry {
@@ -366,7 +386,9 @@ pub struct StoredJob {
     pub done_at: Option<i64>,
     pub last_error: Option<String>,
     pub prerequisites: Vec<String>,
-    pub result: Option<IndexJobResult>,
+    pub warnings: Vec<String>,
+    pub index_result: Option<IndexJobResult>,
+    pub enrichment_result: Option<EnrichmentJobResult>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -385,6 +407,12 @@ pub struct IndexWorker {
 pub struct EnrichmentWorker {
     pub context: WorkerContext,
     pub task: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ManualEnrichmentSubmission {
+    Enqueued(String),
+    InProgress(Box<StoredJob>),
 }
 
 impl JobQueue {
@@ -413,19 +441,23 @@ impl JobQueue {
         Ok(Self {
             index_jobs: SqliteStorage::new_with_config(
                 &pool,
-                &Config::new(INDEX_QUEUE).with_poll_interval(
-                    StrategyBuilder::new()
-                        .apply(IntervalStrategy::new(Duration::from_millis(100)))
-                        .build(),
-                ),
+                &Config::new(INDEX_QUEUE)
+                    .set_buffer_size(1)
+                    .with_poll_interval(
+                        StrategyBuilder::new()
+                            .apply(IntervalStrategy::new(Duration::from_millis(100)))
+                            .build(),
+                    ),
             ),
             enrichment_jobs: SqliteStorage::new_with_config(
                 &pool,
-                &Config::new(ENRICHMENT_QUEUE).with_poll_interval(
-                    StrategyBuilder::new()
-                        .apply(IntervalStrategy::new(Duration::from_millis(100)))
-                        .build(),
-                ),
+                &Config::new(ENRICHMENT_QUEUE)
+                    .set_buffer_size(1)
+                    .with_poll_interval(
+                        StrategyBuilder::new()
+                            .apply(IntervalStrategy::new(Duration::from_millis(100)))
+                            .build(),
+                    ),
             ),
             admission: Arc::new(Mutex::new(true)),
         })
@@ -465,7 +497,17 @@ impl JobQueue {
         if job.trigger != JobTrigger::Manual {
             return Err("manual index submission requires a manual trigger".into());
         }
-        let requested = index_target_pairs(&job.target, workspaces);
+        let overlaps = self.overlapping_index_jobs(&job.target, workspaces).await?;
+        let id = self.push_index_job(job).await?;
+        Ok((id, overlaps))
+    }
+
+    pub async fn overlapping_index_jobs(
+        &self,
+        target: &IndexTarget,
+        workspaces: &[Workspace],
+    ) -> Result<Vec<StoredJob>, Box<dyn Error + Send + Sync>> {
+        let requested = index_target_pairs(target, workspaces);
         let rows = sqlx::query(
             "SELECT * FROM Jobs WHERE job_type = ? AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts)) ORDER BY id",
         )
@@ -482,8 +524,38 @@ impl JobQueue {
                     .flatten()
             })
             .collect();
-        let id = self.push_index_job(job).await?;
-        Ok((id, overlaps))
+        Ok(overlaps)
+    }
+
+    pub async fn enqueue_manual_enrichment(
+        &self,
+        job: EnrichmentJob,
+    ) -> Result<ManualEnrichmentSubmission, Box<dyn Error + Send + Sync>> {
+        let admitted = self.admission.lock().await;
+        if !*admitted {
+            return Err("job admission is closed".into());
+        }
+        if job.trigger != JobTrigger::Manual {
+            return Err("manual enrichment submission requires a manual trigger".into());
+        }
+        let rows = sqlx::query(
+            "SELECT * FROM Jobs WHERE job_type = ? AND (status IN ('Pending', 'Queued', 'Running') OR (status = 'Failed' AND attempts < max_attempts)) ORDER BY id",
+        )
+        .bind(ENRICHMENT_QUEUE)
+        .fetch_all(self.enrichment_jobs.pool())
+        .await?;
+        for row in rows {
+            let payload = row.get::<Vec<u8>, _>("job");
+            if serde_json::from_slice::<EnrichmentJob>(&payload)
+                .is_ok_and(|active| enrichment_jobs_are_equivalent(&active, &job))
+                && let Some(active) = decode_row(row)
+            {
+                return Ok(ManualEnrichmentSubmission::InProgress(Box::new(active)));
+            }
+        }
+        Ok(ManualEnrichmentSubmission::Enqueued(
+            self.push_enrichment_job(job).await?,
+        ))
     }
 
     pub async fn enqueue_automatic_enrichment(
@@ -514,22 +586,43 @@ impl JobQueue {
             if active.target != job.target || active.worker_id != job.worker_id {
                 continue;
             }
+            let pending_manual_covers_prerequisite = active.trigger == JobTrigger::Manual
+                && active.input_fingerprint.is_none()
+                && job
+                    .prerequisite_index_jobs
+                    .iter()
+                    .all(|prerequisite| active.prerequisite_index_jobs.contains(prerequisite));
             if active.expected_worker_version == job.expected_worker_version
-                && active.input_fingerprint == job.input_fingerprint
+                && (active.input_fingerprint == job.input_fingerprint
+                    || pending_manual_covers_prerequisite)
             {
                 return Ok(None);
             }
             if row.get::<&str, _>("status") != "Running" {
-                obsolete.push(row.get::<String, _>("id"));
+                obsolete.push((row.get::<String, _>("id"), active));
             }
         }
-        for id in obsolete {
+        for (id, job) in obsolete {
+            let result = EnrichmentJobResult {
+                target: job.target,
+                worker_id: job.worker_id,
+                expected_worker_version: job.expected_worker_version,
+                outcome: EnrichmentOutcome::Superseded,
+                failed_prerequisite_index_jobs: Vec::new(),
+            };
             sqlx::query("UPDATE Jobs SET status = 'Done', done_at = strftime('%s', 'now'), last_result = ? WHERE id = ?")
-                .bind(r#"{"Ok":null}"#)
+                .bind(serde_json::to_string(&serde_json::json!({ "Ok": result }))?)
                 .bind(id)
                 .execute(self.enrichment_jobs.pool())
                 .await?;
         }
+        Ok(Some(self.push_enrichment_job(job).await?))
+    }
+
+    async fn push_enrichment_job(
+        &self,
+        job: EnrichmentJob,
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
         let id = Ulid::new();
         let (workspace, repository) = match &job.target {
             EnrichmentTarget::WorkspaceRepository {
@@ -538,7 +631,11 @@ impl JobQueue {
             } => (Some(workspace.clone()), repository.clone()),
             EnrichmentTarget::StandaloneRepository { repository } => (None, repository.clone()),
         };
-        let (task, operation) = queued_task(job, id, ENRICHMENT_QUEUE, unix_millis()?);
+        let (trigger, priority) = match job.trigger {
+            JobTrigger::Automatic => ("automatic", AUTOMATIC_PRIORITY),
+            JobTrigger::Manual => ("manual", MANUAL_PRIORITY),
+        };
+        let (task, operation) = queued_task(job, id, ENRICHMENT_QUEUE, unix_millis()?, priority);
         let mut storage = self.enrichment_jobs.clone();
         async move {
             async move {
@@ -548,7 +645,7 @@ impl JobQueue {
             }
             .instrument(tracing::info_span!(
                 "job.enqueue",
-                job.trigger = "automatic",
+                job.trigger = trigger,
                 job.target = "repository",
                 job.workspace = workspace.as_deref(),
                 job.repository = repository,
@@ -562,7 +659,7 @@ impl JobQueue {
         }
         .instrument(operation)
         .await?;
-        Ok(Some(id.to_string()))
+        Ok(id.to_string())
     }
 
     async fn push_index_job(
@@ -573,9 +670,9 @@ impl JobQueue {
             IndexTarget::Workspace { workspace } => (Some(workspace.clone()), None),
             IndexTarget::Repository { repository, .. } => (None, Some(repository.clone())),
         };
-        let trigger = match job.trigger {
-            JobTrigger::Automatic => "automatic",
-            JobTrigger::Manual => "manual",
+        let (trigger, priority) = match job.trigger {
+            JobTrigger::Automatic => ("automatic", AUTOMATIC_PRIORITY),
+            JobTrigger::Manual => ("manual", MANUAL_PRIORITY),
         };
 
         let target = match &job.target {
@@ -583,7 +680,7 @@ impl JobQueue {
             IndexTarget::Repository { .. } => "repository",
         };
         let id = Ulid::new();
-        let (task, operation) = queued_task(job, id, INDEX_QUEUE, unix_millis()?);
+        let (task, operation) = queued_task(job, id, INDEX_QUEUE, unix_millis()?, priority);
         let mut storage = self.index_jobs.clone();
         async move {
             async move {
@@ -747,15 +844,16 @@ impl JobQueue {
         Ok(())
     }
 
-    async fn prerequisites_succeeded(
+    async fn await_prerequisites(
         &self,
         prerequisites: &[IndexJobId],
         scheduler: &IndexScheduler,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<Option<Vec<IndexJobId>>, sqlx::Error> {
+        let mut failed = Vec::new();
         for prerequisite in prerequisites {
             loop {
                 if scheduler.is_stopping() {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let status = sqlx::query_as::<_, (String, i64, i64)>(
                     "SELECT status, attempts, max_attempts FROM Jobs WHERE id = ?",
@@ -765,23 +863,30 @@ impl JobQueue {
                 .await?;
                 match status.as_ref() {
                     Some((status, _, _)) if status == "Done" => break,
-                    Some((status, _, _)) if status == "Killed" => return Ok(false),
+                    Some((status, _, _)) if status == "Killed" => {
+                        failed.push(prerequisite.clone());
+                        break;
+                    }
                     Some((status, attempts, max_attempts))
                         if status == "Failed" && attempts >= max_attempts =>
                     {
-                        return Ok(false);
+                        failed.push(prerequisite.clone());
+                        break;
                     }
-                    None => return Ok(false),
+                    None => {
+                        failed.push(prerequisite.clone());
+                        break;
+                    }
                     _ => {
                         tokio::select! {
-                            () = scheduler.wait_for_stop() => return Ok(false),
+                            () = scheduler.wait_for_stop() => return Ok(None),
                             () = tokio::time::sleep(Duration::from_millis(50)) => {}
                         }
                     }
                 }
             }
         }
-        Ok(!scheduler.is_stopping())
+        Ok((!scheduler.is_stopping()).then_some(failed))
     }
 
     pub async fn list(
@@ -856,6 +961,14 @@ impl JobQueue {
     }
 }
 
+fn enrichment_jobs_are_equivalent(left: &EnrichmentJob, right: &EnrichmentJob) -> bool {
+    left.target == right.target
+        && left.worker_id == right.worker_id
+        && left.expected_worker_version == right.expected_worker_version
+        && left.prerequisite_index_jobs == right.prerequisite_index_jobs
+        && left.input_fingerprint == right.input_fingerprint
+}
+
 fn retry_delay_ms(attempt: usize) -> i64 {
     250_i64.saturating_mul(1_i64 << attempt.saturating_sub(1))
 }
@@ -890,6 +1003,7 @@ fn queued_task<Args: JobTelemetry>(
     id: Ulid,
     queue: &'static str,
     eligible_at_ms: i64,
+    priority: i32,
 ) -> (Task<Args, SqliteContext, Ulid>, tracing::Span) {
     let summary = args.summary();
     let operation = tracing::info_span!(
@@ -908,6 +1022,7 @@ fn queued_task<Args: JobTelemetry>(
             args,
             id,
             eligible_at_ms,
+            priority,
             beholder_observability::current_w3c_trace_context(),
         )
     });
@@ -918,11 +1033,13 @@ fn task_with_trace_context<Args>(
     args: Args,
     id: Ulid,
     eligible_at_ms: i64,
+    priority: i32,
     context: Option<beholder_observability::W3cTraceContext>,
 ) -> Task<Args, SqliteContext, Ulid> {
     TaskBuilder::new(args)
         .with_task_id(TaskId::new(id))
         .max_attempts(MAX_ATTEMPTS)
+        .priority(priority)
         .meta(task_tracing_context(context))
         .meta(EligibleAt {
             millis: eligible_at_ms,
@@ -1200,7 +1317,7 @@ async fn run_enrichment_job(
     queue: Data<JobQueue>,
     id: TaskId<Ulid>,
     enrichment_attempt: EnrichmentAttempt,
-) -> Result<(), BoxDynError> {
+) -> Result<EnrichmentJobResult, BoxDynError> {
     let EnrichmentAttempt(IndexAttempt { attempt, context }) = enrichment_attempt;
     let (workspace, repository) = match &job.target {
         EnrichmentTarget::WorkspaceRepository {
@@ -1215,11 +1332,15 @@ async fn run_enrichment_job(
         eligible.map_or(attempt_started_at_ms, |eligible| eligible.millis),
         attempt_started_at_ms,
     );
+    let trigger = match job.trigger {
+        JobTrigger::Automatic => "automatic",
+        JobTrigger::Manual => "manual",
+    };
     let span = tracing::info_span!(
         "job.attempt",
         job.id = %id,
         job.kind = "enrichment",
-        job.trigger = "automatic",
+        job.trigger = trigger,
         job.queue = ENRICHMENT_QUEUE,
         job.workspace = workspace.as_deref(),
         job.repository = repository,
@@ -1236,13 +1357,19 @@ async fn run_enrichment_job(
     );
     continue_task_trace(&span, &context);
     async move {
-        if !queue
-            .prerequisites_succeeded(&job.prerequisite_index_jobs, &scheduler)
+        let Some(failed_prerequisites) = queue
+            .await_prerequisites(&job.prerequisite_index_jobs, &scheduler)
             .await?
-        {
+        else {
             tracing::Span::current().record("job.outcome", "superseded");
-            return Ok(());
-        }
+            return Ok(EnrichmentJobResult {
+                target: job.target,
+                worker_id: job.worker_id,
+                expected_worker_version: job.expected_worker_version,
+                outcome: EnrichmentOutcome::Superseded,
+                failed_prerequisite_index_jobs: Vec::new(),
+            });
+        };
         let result = tokio::select! {
             biased;
             result = scheduler.run_enrichment_job(&store, &workspaces, &job) => result,
@@ -1255,13 +1382,24 @@ async fn run_enrichment_job(
             }
         };
         match result {
-            Ok(published) => {
-                let outcome = if published { "published" } else { "superseded" };
-                tracing::Span::current().record("job.outcome", outcome);
-                if published {
+            Ok(outcome) => {
+                let outcome_name = match outcome {
+                    EnrichmentOutcome::Published => "published",
+                    EnrichmentOutcome::Unchanged => "unchanged",
+                    EnrichmentOutcome::AlreadyCurrent => "already_current",
+                    EnrichmentOutcome::Superseded => "superseded",
+                };
+                tracing::Span::current().record("job.outcome", outcome_name);
+                if outcome == EnrichmentOutcome::Published {
                     scheduler.schedule_checkpoint(Arc::clone(&store));
                 }
-                Ok(())
+                Ok(EnrichmentJobResult {
+                    target: job.target,
+                    worker_id: job.worker_id,
+                    expected_worker_version: job.expected_worker_version,
+                    outcome,
+                    failed_prerequisite_index_jobs: failed_prerequisites,
+                })
             }
             Err(error) => {
                 if attempt.current() >= MAX_ATTEMPTS as usize {
@@ -1372,13 +1510,32 @@ fn decode_row(row: sqlx::sqlite::SqliteRow) -> Option<StoredJob> {
             .as_str()
             .map(str::to_owned)
     });
-    let result = last_result.as_deref().and_then(|result| {
+    let successful_result = last_result.as_deref().and_then(|result| {
         serde_json::from_str::<serde_json::Value>(result)
             .ok()?
             .get("Ok")
             .cloned()
-            .and_then(decode_index_result)
     });
+    let index_result = (kind == StoredJobKind::Index)
+        .then(|| successful_result.clone().and_then(decode_index_result))
+        .flatten();
+    let enrichment_result = (kind == StoredJobKind::Enrichment)
+        .then(|| {
+            successful_result
+                .and_then(|result| serde_json::from_value::<EnrichmentJobResult>(result).ok())
+        })
+        .flatten();
+    let warnings = enrichment_result
+        .as_ref()
+        .into_iter()
+        .flat_map(|result| &result.failed_prerequisite_index_jobs)
+        .map(|id| {
+            format!(
+                "index prerequisite {} failed; used the latest successful baseline",
+                id.0
+            )
+        })
+        .collect();
     Some(StoredJob {
         submitted_at_ms: Ulid::from_string(&id).ok()?.timestamp_ms() as i64,
         id,
@@ -1395,7 +1552,9 @@ fn decode_row(row: sqlx::sqlite::SqliteRow) -> Option<StoredJob> {
         done_at,
         last_error,
         prerequisites,
-        result,
+        warnings,
+        index_result,
+        enrichment_result,
     })
 }
 
@@ -1513,6 +1672,20 @@ mod durable_tests {
         }
     }
 
+    fn manual_enrichment(fingerprint: Option<&str>) -> EnrichmentJob {
+        EnrichmentJob {
+            target: EnrichmentTarget::WorkspaceRepository {
+                workspace: "main".into(),
+                repository: "repo".into(),
+            },
+            worker_id: "semantic".into(),
+            expected_worker_version: "1".into(),
+            trigger: JobTrigger::Manual,
+            prerequisite_index_jobs: vec![IndexJobId("01J00000000000000000000000".into())],
+            input_fingerprint: fingerprint.map(str::to_owned),
+        }
+    }
+
     fn queue_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "beholder-jobs-{name}-{}-{}.sqlite",
@@ -1543,6 +1716,8 @@ mod durable_tests {
     async fn automatic_jobs_coalesce_and_remain_inspectable() {
         let path = queue_path("inspect");
         let queue = JobQueue::open(&path).await.unwrap();
+        assert_eq!(queue.index_jobs.config().buffer_size(), 1);
+        assert_eq!(queue.enrichment_jobs.config().buffer_size(), 1);
         let id = queue
             .enqueue_automatic_index(automatic_job("main"))
             .await
@@ -1572,6 +1747,82 @@ mod durable_tests {
         );
         queue.close().await;
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_enrichment_reuses_only_equivalent_non_terminal_work() {
+        let path = queue_path("manual-enrichment-reuse");
+        let queue = JobQueue::open(&path).await.unwrap();
+        let first = match queue
+            .enqueue_manual_enrichment(manual_enrichment(None))
+            .await
+            .unwrap()
+        {
+            ManualEnrichmentSubmission::Enqueued(id) => id,
+            ManualEnrichmentSubmission::InProgress(_) => panic!("first job was not enqueued"),
+        };
+        let manual_priority: i64 = sqlx::query_scalar("SELECT priority FROM Jobs WHERE id = ?")
+            .bind(&first)
+            .fetch_one(queue.enrichment_jobs.pool())
+            .await
+            .unwrap();
+        assert_eq!(manual_priority, i64::from(MANUAL_PRIORITY));
+        match queue
+            .enqueue_manual_enrichment(manual_enrichment(None))
+            .await
+            .unwrap()
+        {
+            ManualEnrichmentSubmission::InProgress(job) => assert_eq!(job.id, first),
+            ManualEnrichmentSubmission::Enqueued(_) => panic!("equivalent job was duplicated"),
+        }
+        assert!(
+            queue
+                .enqueue_automatic_enrichment(automatic_enrichment("new"))
+                .await
+                .unwrap()
+                .is_none(),
+            "automatic work duplicated a manual job waiting for the same index"
+        );
+        assert!(matches!(
+            queue
+                .enqueue_manual_enrichment(manual_enrichment(Some("new")))
+                .await
+                .unwrap(),
+            ManualEnrichmentSubmission::Enqueued(_)
+        ));
+        let mut automatic = automatic_enrichment("automatic");
+        automatic.target = EnrichmentTarget::WorkspaceRepository {
+            workspace: "main".into(),
+            repository: "automatic-repo".into(),
+        };
+        let automatic_id = queue
+            .enqueue_automatic_enrichment(automatic.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let automatic_priority: i64 = sqlx::query_scalar("SELECT priority FROM Jobs WHERE id = ?")
+            .bind(&automatic_id)
+            .fetch_one(queue.enrichment_jobs.pool())
+            .await
+            .unwrap();
+        assert_eq!(automatic_priority, i64::from(AUTOMATIC_PRIORITY));
+        automatic.trigger = JobTrigger::Manual;
+        match queue.enqueue_manual_enrichment(automatic).await.unwrap() {
+            ManualEnrichmentSubmission::InProgress(job) => assert_eq!(job.id, automatic_id),
+            ManualEnrichmentSubmission::Enqueued(_) => {
+                panic!("equivalent automatic job was duplicated")
+            }
+        }
+        let (jobs, _) = queue.list(None).await.unwrap();
+        assert_eq!(jobs.len(), 3);
+        let mut fetched = queue
+            .enrichment_jobs
+            .clone()
+            .poll(&WorkerContext::new::<()>("priority-test"));
+        assert!(fetched.next().await.unwrap().unwrap().is_none());
+        let fetched = fetched.next().await.unwrap().unwrap().unwrap();
+        assert_eq!(fetched.parts.task_id.unwrap().to_string(), first);
+        let _ = fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -2211,7 +2462,13 @@ mod tests {
             trace_flags: 1,
             trace_state: Some("vendor=value".into()),
         };
-        let task = task_with_trace_context((), Ulid::new(), 42, Some(expected.clone()));
+        let task = task_with_trace_context(
+            (),
+            Ulid::new(),
+            42,
+            AUTOMATIC_PRIORITY,
+            Some(expected.clone()),
+        );
         let stored: TracingContext = task.parts.ctx.extract().unwrap();
 
         assert_eq!(stored.trace_id(), &Some(expected.trace_id));

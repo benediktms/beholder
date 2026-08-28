@@ -1,5 +1,5 @@
 use super::schema::*;
-use super::store::{EnrichmentOwner, EnrichmentPayload};
+use super::store::{EnrichmentOwner, EnrichmentPayload, EnrichmentPublishOutcome};
 use beholder_domain::{
     Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata,
     FactChanges, FactShard, GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate,
@@ -877,8 +877,12 @@ pub(super) fn publish_repository(
 pub(super) fn delete_repository_revision(
     db: &DbInstance,
     repository: &str,
+    standalone_view: Option<&str>,
 ) -> Result<u64, Box<dyn Error>> {
     let transaction = db.multi_transaction(true);
+    if let Some(view) = standalone_view {
+        delete_analysis_view(&transaction, view)?;
+    }
     let params = BTreeMap::from([("repository".into(), repository.into())]);
     let revision = transaction.run_script(
         "?[repository, analyzed_state] := \
@@ -936,6 +940,116 @@ pub(super) fn delete_repository_revision(
     };
     transaction.commit()?;
     Ok(queued)
+}
+
+fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<(), Box<dyn Error>> {
+    replace_fact_shards(transaction, view, &[])?;
+    let params = BTreeMap::from([("view".into(), view.into())]);
+    for (relation, keys) in [
+        ("analysis_revision_state", "view, revision, repository"),
+        ("analysis_revision_input", "view, revision, repository"),
+        (
+            "analysis_revision_enrichment_input",
+            "view, revision, repository, analyzer",
+        ),
+        (
+            "analysis_revision_context",
+            "view, revision, target, analyzer, context",
+        ),
+        ("analysis_revision_metadata", "view, revision"),
+        (
+            "analysis_revision_grpc_diagnostic",
+            "view, revision, local_symbol, role, service, method, evidence",
+        ),
+        ("analysis_revision_entity", "view, revision, id"),
+        (
+            "analysis_revision_observation",
+            "view, revision, from, relation, to, evidence",
+        ),
+        (
+            "analysis_revision_diagnostic",
+            "view, revision, repository, code, severity, path, line",
+        ),
+        ("analysis_revision_enrichment", "view, revision, analyzer"),
+        (
+            "analysis_revision_repository_enrichment",
+            "view, revision, owner",
+        ),
+        (
+            "analysis_revision_enrichment_override_owner",
+            "view, revision, from, relation, unresolved_to",
+        ),
+        (
+            "analysis_revision_enrichment_diagnostic_owner",
+            "view, revision, repository, code, severity, path, line",
+        ),
+        (
+            "analysis_revision_enrichment_entity_owner",
+            "view, revision, id",
+        ),
+        (
+            "analysis_revision_enrichment_observation_owner",
+            "view, revision, from, relation, to, evidence",
+        ),
+        (
+            "analysis_revision_dependency_override",
+            "view, revision, from, relation, unresolved_to",
+        ),
+        (
+            "analysis_revision_dependency_override_metadata",
+            "view, revision, from, relation, unresolved_to",
+        ),
+        ("analysis_enrichment_entity_selection", "view, id"),
+        (
+            "analysis_enrichment_observation_selection",
+            "view, from, relation, to, evidence",
+        ),
+        (
+            "analysis_enrichment_override_selection",
+            "view, from, relation, unresolved_to",
+        ),
+        (
+            "analysis_enrichment_diagnostic_selection",
+            "view, repository, code, severity, path, line",
+        ),
+        ("enrichment_entity_contribution", "view, owner, id"),
+        (
+            "enrichment_observation_contribution",
+            "view, owner, from, relation, to, evidence",
+        ),
+        (
+            "enrichment_override_contribution",
+            "view, owner, from, relation, unresolved_to",
+        ),
+        (
+            "enrichment_diagnostic_contribution",
+            "view, owner, repository, code, severity, path, line",
+        ),
+        ("enrichment_output", "view, owner"),
+        ("analysis_baseline_entity", "view, id"),
+        (
+            "analysis_baseline_observation",
+            "view, from, relation, to, evidence",
+        ),
+        (
+            "analysis_baseline_dependency_override",
+            "view, from, relation, unresolved_to",
+        ),
+        (
+            "analysis_baseline_diagnostic",
+            "view, repository, code, severity, path, line",
+        ),
+        ("analysis_baseline_fingerprint", "view"),
+        ("analysis_fingerprint", "view"),
+        ("analysis_verification_fingerprint", "view"),
+        ("analysis_revision", "view"),
+    ] {
+        transaction.run_script(
+            &format!("?[{keys}] := *{relation}{{{keys}}}, view = $view :rm {relation} {{{keys}}}"),
+            params.clone(),
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn reusable_current_state(
@@ -1656,14 +1770,16 @@ pub(super) fn ensure_revision_inputs(
     transaction.run_script(
         "?[view, revision, repository, analyzer] := \
              *analysis_revision{view: $view, revision}, \
-             *analysis_revision_enrichment_input{view, revision, repository, analyzer} \
+             *analysis_revision_enrichment_input{view, revision, repository, analyzer}, \
+             view = $view \
          :rm analysis_revision_enrichment_input {view, revision, repository, analyzer}",
         BTreeMap::from([("view".into(), view.name.clone().into())]),
     )?;
     transaction.run_script(
         "?[view, revision, target, analyzer, context] := \
              *analysis_revision{view: $view, revision}, \
-             *analysis_revision_context{view, revision, target, analyzer, context} \
+             *analysis_revision_context{view, revision, target, analyzer, context}, \
+             view = $view \
          :rm analysis_revision_context {view, revision, target, analyzer, context}",
         BTreeMap::from([("view".into(), view.name.clone().into())]),
     )?;
@@ -2095,7 +2211,7 @@ pub(super) fn publish_enrichment(
     input_fingerprint: &str,
     owner: EnrichmentOwner<'_>,
     payload: EnrichmentPayload<'_>,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<EnrichmentPublishOutcome, Box<dyn Error>> {
     let publication_started = Instant::now();
     if payload
         .diagnostics
@@ -2132,7 +2248,7 @@ pub(super) fn publish_enrichment(
     };
     if row[1].get_str() != Some(input_fingerprint) {
         transaction.abort()?;
-        return Ok(false);
+        return Ok(EnrichmentPublishOutcome::Superseded);
     }
     let output_is_current = !transaction
         .run_script(
@@ -2155,7 +2271,7 @@ pub(super) fn publish_enrichment(
         .is_empty();
     if output_is_current {
         transaction.abort()?;
-        return Ok(true);
+        return Ok(EnrichmentPublishOutcome::Unchanged);
     }
     let snapshot_exists = !transaction
         .run_script(
@@ -2295,7 +2411,7 @@ pub(super) fn publish_enrichment(
         snapshot_exists,
         "Mnestic enrichment publication completed"
     );
-    Ok(true)
+    Ok(EnrichmentPublishOutcome::Published)
 }
 
 fn complete_enrichment(
@@ -3856,9 +3972,11 @@ mod tests {
             "src/lib.rs:1",
         );
         for (name, analysis_identity) in [("first", "analysis-v1"), ("second", "analysis-v2")] {
-            let view =
+            let view = with_enrichment_analyzers(
                 WorkspaceView::new(name, format!("workspace-rules:{name}"), vec![state.clone()])
-                    .unwrap();
+                    .unwrap(),
+                &["semantic"],
+            );
             store
                 .publish(
                     &view,
@@ -3874,7 +3992,18 @@ mod tests {
                     &[],
                 )
                 .unwrap();
+            store.ensure_revision_inputs(&view).unwrap();
             assert_eq!(store.context(name, "repo/source").unwrap().edges.len(), 1);
+        }
+
+        for name in ["first", "second"] {
+            assert!(
+                store
+                    .revision_enrichment_input_fingerprint(name, "repo", "semantic")
+                    .unwrap()
+                    .is_some(),
+                "{name} enrichment input was removed by another view"
+            );
         }
 
         assert_eq!(store.inspect_observations(None).unwrap().rows.len(), 1);

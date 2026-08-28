@@ -1,6 +1,6 @@
 use beholder_adapters_mnestic::{
     EnrichmentOwner as MnesticEnrichmentOwner, EnrichmentPayload as MnesticEnrichmentPayload,
-    SemanticStore,
+    EnrichmentPublishOutcome, SemanticStore,
 };
 use beholder_domain::{
     AnalysisDiagnostic, DependencyOverride, EntityFact, EntityKind, Observation, SemanticRelation,
@@ -53,7 +53,7 @@ pub(crate) trait EnrichmentPublication {
     fn publish_enrichment(
         &self,
         request: EnrichmentPublicationRequest<'_>,
-    ) -> Result<bool, Box<dyn Error>>;
+    ) -> Result<EnrichmentPublishOutcome, Box<dyn Error>>;
 }
 
 impl EnrichmentPublication for SemanticStore {
@@ -97,9 +97,9 @@ impl EnrichmentPublication for SemanticStore {
     fn publish_enrichment(
         &self,
         request: EnrichmentPublicationRequest<'_>,
-    ) -> Result<bool, Box<dyn Error>> {
+    ) -> Result<EnrichmentPublishOutcome, Box<dyn Error>> {
         let target = request.target;
-        SemanticStore::publish_enrichment(
+        SemanticStore::publish_enrichment_outcome(
             self,
             target.view,
             target.repository,

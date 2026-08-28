@@ -263,9 +263,12 @@ available.
 The daemon opens one SQLx pool at `state_dir().join("queue.sqlite")` and derives
 separate typed Apalis storage handles for the stable `index` and `enrichment`
 queues. There is no generic queue trait. Both job kinds initially run with global
-concurrency one and five total attempts, delayed by 250 ms, 500 ms, one second,
-and two seconds before attempts two through five. The deployed index worker polls
-at a fixed 100 ms interval: the pinned SQLite fetcher does not reset its default
+concurrency one and a matching fetch buffer of one. Five total attempts are
+delayed by 250 ms, 500 ms, one second, and two seconds before attempts two through
+five. Manual submissions use Apalis priority one and automatic work uses the
+default priority zero, so recovered or queued automatic work cannot starve an
+explicit request. Active work is not preempted. The deployed index worker polls at
+a fixed 100 ms interval: the pinned SQLite fetcher does not reset its default
 backoff after a successful fetch, so retaining that backoff would leave work idle
 for as long as 60 seconds after quiet periods.
 
@@ -292,7 +295,7 @@ acknowledgement failure may replay and is made safe by currentness guards.
 
 ### Public API and operability
 
-The asynchronous API remains on `beholder.v1.Daemon`; protocol version 19 exposes
+The asynchronous API remains on `beholder.v1.Daemon`; protocol version 20 exposes
 `SubmitIndex`, `SubmitEnrichment`, `ListJobs`, and `GetJob`. Public IDs are opaque
 Apalis ULIDs and public statuses are queued, waiting, running, completed, and
 failed. `beholder job list` orders active work first and returns terminal history
@@ -307,6 +310,15 @@ workspace contains it. Manual enrichment creates or reuses one job per selected
 workspace-worker or standalone-worker target and reuses index prerequisites. The
 synchronous indexing RPCs and commands are deleted in the same slice that adds
 their asynchronous replacement; no fallback executor is retained.
+
+`SubmitEnrichment` accepts an exact repository, optional workspace scope, and
+exact worker IDs; an empty selection means every applicable built-in and enabled
+plugin. A missing baseline creates or reuses an index prerequisite.
+Already-current targets return `ALREADY_CURRENT` without a job, equivalent
+non-terminal work returns `IN_PROGRESS`, and new work returns `ENQUEUED`. If a
+prerequisite fails, a worker may use the latest successful baseline and records
+the failed prerequisite IDs in its typed terminal result and warnings. Without a
+successful baseline, the job fails before invoking the worker.
 
 The jobs API is the lifecycle authority. Existing OpenTelemetry traces and
 structured logs carry a bounded job contract and W3C enqueue context; each attempt
@@ -335,10 +347,10 @@ parallel with indexing work.
 | 1. Inert queue foundation and ADR | Complete | Exact dependency pins, shared SQLite linkage, typed payload and storage handles, read-only quick check, create/open, startup migrations, fail-fast startup, and integration-test terminology. The foundation itself registered no producer or worker. |
 | 2. Automatic indexing and inspection | Complete | Filesystem intent is durably coalesced into automatic `IndexJob` rows and executed by one monitored Apalis worker through the existing guarded publication seam. Startup recovery, five-attempt retry state, admission and one fixed ten-second shutdown deadline are active. `ListJobs`, `GetJob`, `beholder job list`, and `beholder job get` expose bounded typed lifecycle state. The superseded direct automatic executor, retry timers, and periodic reconciliation loop are removed. |
 | 3. Manual indexing | Complete | Protocol version 19 adds `SubmitIndex` and `beholder index`. Exact workspace and repository targets create new manual `IndexJob` rows, report overlapping non-terminal work, and execute workspace fan-out, explicit workspace scope, or standalone publication through the deployed worker. Typed terminal results cover every destination. The synchronous `IndexRepository` and `ReindexWorkspace` RPCs and their CLI commands are removed. |
-| 4. Enrichment publication boundary | Planned | Current Mnestic enrichment operations remain unchanged. |
-| 5. Worker-ID namespace | Planned | Current built-in and plugin worker registration remains unchanged. |
-| 6. Automatic enrichment | Planned | The existing in-memory enrichment executor and Mnestic lifecycle state remain active. |
-| 7. Manual enrichment and evidence | Planned | No submit API or manual enrichment command exists. |
+| 4. Enrichment publication boundary | Complete | Currentness reads and guarded atomic contribution publication are backend-neutral ports. Mnestic owns semantic state only and no longer stores execution lifecycle rows. |
+| 5. Worker-ID namespace | Complete | Built-in and installed-plugin worker IDs share one validated namespace, with collisions rejected before daemon readiness. |
+| 6. Automatic enrichment | Complete | Baseline publication emits typed `EnrichmentJob` rows. Apalis owns retries, recovery, coalescing, supersession, tracing, and typed terminal results; the in-memory executor and Mnestic lifecycle state are removed. |
+| 7. Manual enrichment and evidence | Complete | Protocol version 20 adds `SubmitEnrichment`; `beholder enrich` supports exact workspace and worker selection, fan-out and standalone targets, prerequisite reuse and fallback warnings, current no-ops, and in-progress reuse. The integration harness covers submit/list/get/enrich lifecycle and persisted daemon-kill recovery. Release benchmark and manual otel-gui evidence are recorded on issue 125. |
 
 This table is updated in the same change that lands each slice so accepted target
 behavior is never presented as implemented current behavior.

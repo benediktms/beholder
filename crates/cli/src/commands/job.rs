@@ -1,7 +1,7 @@
 use super::JobCommand;
 use beholder_protocol::v1::{
-    IndexJobOutcome, JobStatus, JobSummary, JobTrigger, JobType, JobWaitReason, index_destination,
-    job_target,
+    EnrichmentJobOutcome, IndexJobOutcome, JobStatus, JobSummary, JobTrigger, JobType,
+    JobWaitReason, index_destination, job_target,
 };
 use std::{error::Error, fmt::Debug};
 
@@ -64,6 +64,9 @@ async fn get(id: String) -> Result<(), Box<dyn Error>> {
     if let Some(error) = job.last_error {
         println!("error: {error}");
     }
+    for warning in job.warnings {
+        println!("warning: {warning}");
+    }
     if let Some(result) = job.index_result {
         for result in result.destinations {
             let destination = result
@@ -85,6 +88,28 @@ async fn get(id: String) -> Result<(), Box<dyn Error>> {
                 enum_name::<IndexJobOutcome>(result.outcome),
                 result.observation_count,
                 result.published,
+            );
+        }
+    }
+    if let Some(result) = job.enrichment_result {
+        let target_name = result.target.map_or_else(
+            || "unknown".into(),
+            |value| {
+                target(&JobSummary {
+                    target: Some(value),
+                    ..Default::default()
+                })
+            },
+        );
+        println!(
+            "result: {target_name} {} (worker_version={})",
+            enum_name::<EnrichmentJobOutcome>(result.outcome),
+            result.expected_worker_version,
+        );
+        if !result.failed_prerequisite_job_ids.is_empty() {
+            println!(
+                "failed prerequisites: {}",
+                result.failed_prerequisite_job_ids.join(", ")
             );
         }
     }

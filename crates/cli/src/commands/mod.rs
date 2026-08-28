@@ -5,6 +5,7 @@ use std::{error::Error, path::PathBuf};
 
 mod admin;
 mod daemon;
+mod enrich;
 mod index;
 mod job;
 mod query;
@@ -48,6 +49,17 @@ enum Command {
         /// Restrict a repository target to one exact workspace.
         #[arg(short, long)]
         workspace: Option<String>,
+    },
+    /// Enqueue durable enrichment for a registered repository.
+    Enrich {
+        /// Exact registered repository identity.
+        repository: String,
+        /// Restrict the repository target to one exact workspace.
+        #[arg(short, long)]
+        workspace: Option<String>,
+        /// Run only these exact worker IDs.
+        #[arg(short, long, value_delimiter = ',')]
+        only: Vec<String>,
     },
     /// Manage registered workspaces.
     Workspace {
@@ -332,6 +344,11 @@ pub(super) async fn run() -> Result<(), Box<dyn Error>> {
             index::print_result(index::rust(&source, &database)?)?;
         }
         Some(Command::Index { target, workspace }) => index::submit(target, workspace).await?,
+        Some(Command::Enrich {
+            repository,
+            workspace,
+            only,
+        }) => enrich::submit(repository, workspace, only).await?,
         Some(Command::Workspace { command }) => admin::workspace(command).await?,
         Some(Command::Plugin { command }) => admin::plugin(command).await?,
         Some(Command::Repository { command }) => admin::repository(command).await?,
@@ -494,6 +511,23 @@ mod tests {
                 .command,
             Some(Command::Index { target, workspace: Some(workspace) })
                 if target == "github.com/example/repo" && workspace == "main"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "beholder",
+                "enrich",
+                "github.com/example/repo",
+                "-w",
+                "main",
+                "-o",
+                "rust,plugin"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Enrich { repository, workspace: Some(workspace), only })
+                if repository == "github.com/example/repo"
+                    && workspace == "main"
+                    && only == ["rust", "plugin"]
         ));
         assert!(Cli::try_parse_from(["beholder", "repository", "index", "repo"]).is_err());
         assert!(Cli::try_parse_from(["beholder", "repository", "refresh", "repo"]).is_err());
