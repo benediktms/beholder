@@ -164,6 +164,28 @@ fn tree_sitter_module_hash(root: Node<'_>, source: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn tree_sitter_module_reference_offsets(root: Node<'_>) -> Vec<usize> {
+    let mut references = Vec::new();
+    let mut stack = vec![(root, false)];
+    while let Some((node, in_use)) = stack.pop() {
+        let in_use = in_use || node.kind() == "use_declaration";
+        if in_use && matches!(node.kind(), "identifier" | "crate" | "self" | "super") {
+            references.push(node.start_byte());
+        }
+        if node.kind() == "mod_item"
+            && node.child_by_field_name("body").is_none()
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            references.push(name.start_byte());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor).map(|child| (child, in_use)));
+    }
+    references.sort_unstable();
+    references.dedup();
+    references
+}
+
 fn rust_analyzer_semantic_hash(
     node: &SyntaxNode,
     include: impl Fn(ra_ap_syntax::TextRange) -> bool,
@@ -210,6 +232,7 @@ fn analyze_tree_sitter(
     }
     Ok(RustAnalysis {
         module_hash: tree_sitter_module_hash(root, source_bytes),
+        module_reference_offsets: tree_sitter_module_reference_offsets(root),
         functions: functions
             .into_iter()
             .map(|(name, qualified_name, function)| {
@@ -352,6 +375,30 @@ fn rust_analyzer_module_hash(file: &SourceFile) -> [u8; 32] {
     })
 }
 
+fn rust_analyzer_module_reference_offsets(file: &SourceFile) -> Vec<usize> {
+    let mut references = file
+        .syntax()
+        .descendants()
+        .filter(|node| {
+            node.ancestors()
+                .any(|ancestor| ast::Use::cast(ancestor).is_some())
+        })
+        .filter_map(ast::NameRef::cast)
+        .map(|name| usize::from(name.syntax().text_range().start()))
+        .collect::<Vec<_>>();
+    references.extend(
+        file.syntax()
+            .descendants()
+            .filter_map(ast::Module::cast)
+            .filter(|module| module.item_list().is_none())
+            .filter_map(|module| module.name())
+            .map(|name| usize::from(name.syntax().text_range().start())),
+    );
+    references.sort_unstable();
+    references.dedup();
+    references
+}
+
 fn disambiguate_function_names(functions: &mut [RustFunction]) {
     let totals = functions
         .iter()
@@ -401,6 +448,7 @@ pub(super) fn analyze_with_plugins(
         if parsed.errors().is_empty() {
             RustAnalysis {
                 module_hash: rust_analyzer_module_hash(&parsed.tree()),
+                module_reference_offsets: rust_analyzer_module_reference_offsets(&parsed.tree()),
                 functions: rust_analyzer_functions(source, &parsed.tree()),
                 tonic: Default::default(),
                 parse_error_lines: Vec::new(),
@@ -608,5 +656,23 @@ mod recovery_tests {
 
         assert_eq!(names(source), vec!["path_bytes#0", "path_bytes#1"]);
         assert_eq!(names(source), names(&shifted));
+    }
+
+    #[test]
+    fn records_module_import_and_declaration_references() {
+        let source = "mod local; use crate::{local::Thing, other}; fn run() {}";
+        let analysis = analyze(source).unwrap();
+        let references = analysis
+            .module_reference_offsets()
+            .map(|offset| {
+                &source[offset
+                    ..offset
+                        + source[offset..]
+                            .find(|c: char| !c.is_alphanumeric() && c != '_')
+                            .unwrap_or(source.len() - offset)]
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(references, ["local", "crate", "local", "Thing", "other"]);
     }
 }

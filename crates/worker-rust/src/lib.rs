@@ -42,9 +42,9 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-9";
+const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-10";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-const RESOLUTION_CACHE_VERSION: u32 = 1;
+const RESOLUTION_CACHE_VERSION: u32 = 2;
 static MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static COMPILER_LOADS: AtomicU64 = AtomicU64::new(0);
@@ -481,6 +481,8 @@ struct PersistedFileAnalysis {
     analyzable: bool,
     module_hash: [u8; 32],
     symbols: BTreeMap<String, SymbolHashes>,
+    #[serde(default)]
+    dependencies: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -551,6 +553,118 @@ impl CompilerWorkspaceShape {
 fn hash_part(digest: &mut Sha256, value: &[u8]) {
     digest.update((value.len() as u64).to_le_bytes());
     digest.update(value);
+}
+
+fn symbol_interfaces_changed(
+    before: &BTreeMap<String, SymbolHashes>,
+    after: &BTreeMap<String, SymbolHashes>,
+) -> bool {
+    before.len() != after.len()
+        || before.iter().any(|(symbol, hashes)| {
+            after
+                .get(symbol)
+                .is_none_or(|current| current.interface != hashes.interface)
+        })
+}
+
+fn affected_modules(
+    files: &BTreeMap<String, PersistedFileAnalysis>,
+    changed: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let graph = files
+        .iter()
+        .map(|(file, analysis)| (file.clone(), analysis.dependencies.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut visited = BTreeSet::new();
+    let mut order = Vec::new();
+    for start in graph.keys() {
+        if visited.contains(start) {
+            continue;
+        }
+        let mut stack = vec![(start.clone(), false)];
+        while let Some((node, exiting)) = stack.pop() {
+            if exiting {
+                order.push(node);
+            } else if visited.insert(node.clone()) {
+                stack.push((node.clone(), true));
+                stack.extend(
+                    graph
+                        .get(&node)
+                        .into_iter()
+                        .flatten()
+                        .filter(|dependency| graph.contains_key(*dependency))
+                        .map(|dependency| (dependency.clone(), false)),
+                );
+            }
+        }
+    }
+
+    let mut reverse = graph
+        .keys()
+        .map(|node| (node.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for (from, dependencies) in &graph {
+        for dependency in dependencies {
+            if let Some(dependents) = reverse.get_mut(dependency) {
+                dependents.insert(from.clone());
+            }
+        }
+    }
+    let mut components = BTreeMap::new();
+    while let Some(start) = order.pop() {
+        if components.contains_key(&start) {
+            continue;
+        }
+        let component = components.len();
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if components.contains_key(&node) {
+                continue;
+            }
+            components.insert(node.clone(), component);
+            stack.extend(
+                reverse
+                    .get(&node)
+                    .into_iter()
+                    .flatten()
+                    .filter(|dependent| !components.contains_key(*dependent))
+                    .cloned(),
+            );
+        }
+    }
+
+    let mut reverse_components = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for (from, dependencies) in &graph {
+        for dependency in dependencies {
+            let (Some(&from), Some(&dependency)) =
+                (components.get(from), components.get(dependency))
+            else {
+                continue;
+            };
+            if from != dependency {
+                reverse_components
+                    .entry(dependency)
+                    .or_default()
+                    .insert(from);
+            }
+        }
+    }
+    let mut affected_components = changed
+        .iter()
+        .filter_map(|file| components.get(file).copied())
+        .collect::<BTreeSet<_>>();
+    let mut pending = affected_components.iter().copied().collect::<Vec<_>>();
+    while let Some(component) = pending.pop() {
+        for dependent in reverse_components.get(&component).into_iter().flatten() {
+            if affected_components.insert(*dependent) {
+                pending.push(*dependent);
+            }
+        }
+    }
+    components
+        .into_iter()
+        .filter_map(|(file, component)| affected_components.contains(&component).then_some(file))
+        .collect()
 }
 
 fn is_rust_source(path: &Path) -> bool {
@@ -745,64 +859,81 @@ impl CompilerCargo {
         }
     }
 
-    fn update_file_analysis(&mut self, file: String, analysis: &CompilerFileAnalysis) {
-        let current = PersistedFileAnalysis {
-            analyzable: true,
-            module_hash: analysis.module_hash,
-            symbols: analysis.symbols.clone(),
-        };
-        let previous = self.persisted_files.insert(file, current.clone());
-        if previous.as_ref() == Some(&current) {
+    fn update_file_analyses(&mut self, analyses: Vec<(String, PersistedFileAnalysis)>) {
+        if analyses.is_empty() {
+            return;
+        }
+        let previous = self.persisted_files.clone();
+        let updated_files = analyses
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<BTreeSet<_>>();
+        for (file, analysis) in analyses {
+            self.persisted_files.insert(file, analysis);
+        }
+        if self.persisted_files == previous {
             return;
         }
         self.cache_dirty = true;
-        let Some(previous) = previous else {
-            self.resolutions.clear();
-            return;
-        };
-        if !previous.analyzable || previous.module_hash != current.module_hash {
-            self.resolutions.clear();
-            return;
-        }
-        let interface_changed = previous.symbols.iter().any(|(symbol, hashes)| {
-            current
-                .symbols
-                .get(symbol)
-                .is_none_or(|current| current.interface != hashes.interface)
-        }) || current
-            .symbols
-            .keys()
-            .any(|symbol| !previous.symbols.contains_key(symbol));
-        if interface_changed {
+        if previous.is_empty()
+            || updated_files.iter().any(|file| {
+                previous
+                    .get(file)
+                    .is_none_or(|analysis| !analysis.analyzable)
+                    || !self.persisted_files[file].analyzable
+            })
+        {
             self.resolutions.clear();
             return;
         }
-        let changed = previous
-            .symbols
+
+        let changed_modules = previous
             .iter()
-            .filter_map(|(symbol, hashes)| {
-                current
-                    .symbols
-                    .get(symbol)
-                    .is_some_and(|current| current.body != hashes.body)
-                    .then_some(symbol.as_str())
+            .filter_map(|(file, before)| {
+                let after = self.persisted_files.get(file)?;
+                (before.module_hash != after.module_hash
+                    || symbol_interfaces_changed(&before.symbols, &after.symbols))
+                .then_some(file.clone())
             })
             .collect::<BTreeSet<_>>();
-        self.resolutions
-            .retain(|key, _| !changed.contains(key.symbol.as_str()));
-    }
-
-    fn update_unanalyzable_file(&mut self, file: String, source: &str) {
-        let current = PersistedFileAnalysis {
-            analyzable: false,
-            module_hash: Sha256::digest(source.as_bytes()).into(),
-            symbols: BTreeMap::new(),
-        };
-        if self.persisted_files.insert(file, current.clone()).as_ref() == Some(&current) {
+        if previous
+            .keys()
+            .any(|file| !self.persisted_files.contains_key(file))
+        {
+            self.resolutions.clear();
             return;
         }
-        self.resolutions.clear();
-        self.cache_dirty = true;
+
+        let mut invalidated_symbols = previous
+            .iter()
+            .flat_map(|(file, before)| {
+                let after = &self.persisted_files[file];
+                before.symbols.iter().filter_map(|(symbol, hashes)| {
+                    after
+                        .symbols
+                        .get(symbol)
+                        .is_some_and(|current| current.body != hashes.body)
+                        .then_some(symbol.clone())
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let affected = if changed_modules.is_empty() {
+            BTreeSet::new()
+        } else {
+            affected_modules(&previous, &changed_modules)
+                .into_iter()
+                .chain(affected_modules(&self.persisted_files, &changed_modules))
+                .collect()
+        };
+        invalidated_symbols.extend(affected.iter().flat_map(|file| {
+            previous
+                .get(file)
+                .into_iter()
+                .chain(self.persisted_files.get(file))
+                .flat_map(|analysis| analysis.symbols.keys().cloned())
+        }));
+        self.resolutions
+            .retain(|key, _| !invalidated_symbols.contains(&key.symbol));
     }
 
     fn update(
@@ -1028,6 +1159,8 @@ fn enrich_repository(
     let mut definitions = BTreeMap::new();
     let mut call_sites = Vec::new();
     let mut local_files = BTreeSet::new();
+    let mut semantic_files = BTreeMap::new();
+    let mut changed_files = Vec::new();
     for snapshot_repository in &snapshot.repositories {
         let Some(materialized_base) =
             materialized.repository(&snapshot_repository.state.repository.identity)
@@ -1050,6 +1183,7 @@ fn enrich_repository(
             let Some((file_id, _)) = compiler.vfs.file_id(&path) else {
                 continue;
             };
+            semantic_files.insert(file_id, semantic_file.clone());
             if compiler.dirty.contains(&file_id) || !compiler.extractions.contains_key(&file_id) {
                 #[cfg(test)]
                 COMPILER_EXTRACTIONS.fetch_add(1, Ordering::Relaxed);
@@ -1099,16 +1233,20 @@ fn enrich_repository(
                             }
                         }
                         file.module_hash = syntax.module_hash();
+                        file.module_reference_offsets = syntax
+                            .module_reference_offsets()
+                            .map(text_size)
+                            .collect::<Result<_, _>>()?;
                         Some(file)
                     }
                     Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => None,
                     Err(error) => return Err(error),
                 };
-                if let Some(extraction) = &extraction {
-                    compiler.update_file_analysis(semantic_file.clone(), extraction);
-                } else {
-                    compiler.update_unanalyzable_file(semantic_file, &source);
-                }
+                changed_files.push((
+                    semantic_file,
+                    file_id,
+                    Sha256::digest(source.as_bytes()).into(),
+                ));
                 compiler.extractions.insert(file_id, extraction);
                 compiler.dirty.remove(&file_id);
             }
@@ -1135,6 +1273,39 @@ fn enrich_repository(
             ..RaFixtureConfig::default()
         },
     };
+    let changed_analyses = changed_files
+        .into_iter()
+        .map(|(semantic_file, file_id, source_hash)| {
+            let Some(extraction) = compiler.extractions.get(&file_id).and_then(Option::as_ref)
+            else {
+                return Ok((
+                    semantic_file,
+                    PersistedFileAnalysis {
+                        analyzable: false,
+                        module_hash: source_hash,
+                        symbols: BTreeMap::new(),
+                        dependencies: BTreeSet::new(),
+                    },
+                ));
+            };
+            Ok((
+                semantic_file,
+                PersistedFileAnalysis {
+                    analyzable: true,
+                    module_hash: extraction.module_hash,
+                    symbols: extraction.symbols.clone(),
+                    dependencies: resolve_module_dependencies(
+                        &analysis,
+                        &config,
+                        file_id,
+                        &extraction.module_reference_offsets,
+                        &semantic_files,
+                    )?,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
+    compiler.update_file_analyses(changed_analyses);
     let repository_contribution = contribution
         .repositories
         .iter_mut()
@@ -1341,6 +1512,39 @@ fn resolve_call(
     })
 }
 
+fn resolve_module_dependencies(
+    analysis: &Analysis,
+    config: &GotoDefinitionConfig,
+    file_id: FileId,
+    references: &[TextSize],
+    semantic_files: &BTreeMap<FileId, String>,
+) -> Result<BTreeSet<String>, Box<dyn Error + Send + Sync>> {
+    let mut dependencies = BTreeSet::new();
+    for offset in references {
+        let Some(targets) = analysis.goto_definition(
+            FilePosition {
+                file_id,
+                offset: *offset,
+            },
+            config,
+        )?
+        else {
+            continue;
+        };
+        dependencies.extend(
+            targets
+                .info
+                .iter()
+                .filter_map(|target| semantic_files.get(&target.file_id))
+                .cloned(),
+        );
+    }
+    if let Some(file) = semantic_files.get(&file_id) {
+        dependencies.remove(file);
+    }
+    Ok(dependencies)
+}
+
 fn cargo_features(
     selected: Option<&str>,
     all_features: bool,
@@ -1374,6 +1578,7 @@ fn environment_enabled(name: &str) -> bool {
 struct CompilerFileAnalysis {
     module_hash: [u8; 32],
     symbols: BTreeMap<String, SymbolHashes>,
+    module_reference_offsets: Vec<TextSize>,
     definitions: Vec<(TextSize, String)>,
     call_sites: Vec<CallSite>,
 }
@@ -1451,6 +1656,7 @@ mod tests {
         let source = r#"
 mod broken;
 mod inner;
+mod unrelated;
 mod api { pub use crate::inner::renamed; }
 use api::renamed as call_me;
 use context::external;
@@ -1473,6 +1679,7 @@ fn caller() {
 }
 "#;
         let inner = "pub fn renamed() {}\n";
+        let unrelated = "trait Other { fn other(&self); } struct Value; impl Other for Value { fn other(&self) {} } pub fn untouched() { Value.other(); }\n";
         let broken = "fn broken( {\n";
         fs::write(base.join("Cargo.toml"), "not the snapshot manifest").unwrap();
         fs::write(base.join("Cargo.lock"), "not the snapshot lockfile").unwrap();
@@ -1487,6 +1694,7 @@ fn caller() {
         )
         .unwrap();
         fs::write(base.join("src/inner.rs"), "pub fn stale_inner() {}").unwrap();
+        fs::write(base.join("src/unrelated.rs"), "pub fn stale_unrelated() {}").unwrap();
         fs::write(base.join("src/broken.rs"), "pub fn stale_broken() {}").unwrap();
         fs::write(base.join("dependency/Cargo.toml"), dependency_manifest).unwrap();
         fs::write(
@@ -1532,6 +1740,11 @@ fn caller() {
                             RepositoryInput {
                                 path: "src/inner.rs".into(),
                                 content: Arc::from(inner.as_bytes()),
+                                kind: InputKind::Source,
+                            },
+                            RepositoryInput {
+                                path: "src/unrelated.rs".into(),
+                                content: Arc::from(unrelated.as_bytes()),
                                 kind: InputKind::Source,
                             },
                             RepositoryInput {
@@ -1764,11 +1977,53 @@ fn caller() {
         while let Some(event) = stream.message().await.unwrap() {
             events.push(event);
         }
-        let body_updated = contribution_from_events(events).unwrap();
+        contribution_from_events(events).unwrap();
         let body_queries = COMPILER_RESOLUTIONS.load(Ordering::Relaxed) - resolutions_before_body;
         let initial_queries = compiler_resolutions - resolutions_before_initial;
         assert!(body_queries > 0);
         assert!(body_queries < initial_queries);
+
+        let interface_inner = "pub fn renamed(_value: u32) {}\n";
+        updated_snapshot.workspace.repositories[0]
+            .inputs
+            .iter_mut()
+            .find(|input| input.path == Path::new("src/inner.rs"))
+            .unwrap()
+            .content = Arc::from(interface_inner.as_bytes());
+        let baseline = RustAnalyzer::new(base.join("interface-syntax-cache"))
+            .analyze(&updated_snapshot.workspace)
+            .unwrap()
+            .repositories
+            .into_iter()
+            .find(|repository| repository.repository == updated_snapshot.target_repository)
+            .unwrap();
+        updated_snapshot.baseline = SemanticSnapshot {
+            entities: baseline.entities,
+            observations: baseline.observations,
+        };
+        let resolutions_before_interface = COMPILER_RESOLUTIONS.load(Ordering::Relaxed);
+        let mut stream = client
+            .analyze(tokio_stream::iter(
+                analyze_requests(updated_snapshot.clone()).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut events = Vec::new();
+        while let Some(event) = stream.message().await.unwrap() {
+            events.push(event);
+        }
+        let interface_updated = contribution_from_events(events).unwrap();
+        let interface_queries =
+            COMPILER_RESOLUTIONS.load(Ordering::Relaxed) - resolutions_before_interface;
+        assert!(
+            interface_queries > body_queries,
+            "interface={interface_queries}, body={body_queries}, initial={initial_queries}"
+        );
+        assert!(
+            interface_queries < initial_queries,
+            "interface={interface_queries}, body={body_queries}, initial={initial_queries}"
+        );
 
         let persisted = cache.join("rust-compiler-resolution-v1");
         let expected_body = analyze(&body_source)
@@ -1839,7 +2094,7 @@ fn caller() {
             events.push(event);
         }
         let restarted = contribution_from_events(events).unwrap();
-        assert_eq!(restarted.overrides, body_updated.overrides);
+        assert_eq!(restarted.overrides, interface_updated.overrides);
         assert_eq!(
             COMPILER_RESOLUTIONS.load(Ordering::Relaxed),
             resolutions_before_restart
@@ -1915,6 +2170,7 @@ fn caller() {
                                     body: [3; 32],
                                 },
                             )]),
+                            dependencies: BTreeSet::new(),
                         },
                     )]),
                     resolutions: vec![PersistedResolution {
@@ -1935,6 +2191,31 @@ fn caller() {
             PersistedWorkspaceCache::default()
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn module_invalidation_crosses_cycles_and_reverse_dependents_only() {
+        let file = |dependencies: &[&str]| PersistedFileAnalysis {
+            analyzable: true,
+            module_hash: [0; 32],
+            symbols: BTreeMap::new(),
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_owned())
+                .collect(),
+        };
+        let files = BTreeMap::from([
+            ("a".into(), file(&["b"])),
+            ("b".into(), file(&["a"])),
+            ("c".into(), file(&["a"])),
+            ("d".into(), file(&["c"])),
+            ("unrelated".into(), file(&[])),
+        ]);
+
+        assert_eq!(
+            affected_modules(&files, &BTreeSet::from(["b".into()])),
+            BTreeSet::from(["a".into(), "b".into(), "c".into(), "d".into()])
+        );
     }
 
     #[test]
