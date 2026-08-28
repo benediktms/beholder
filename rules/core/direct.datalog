@@ -326,3 +326,12 @@ enrichment_diagnostic[repository, code, severity, path, line, detail] :=
         line,
         detail,
     }
+
+selected_diagnostic_replacement[repository, code] :=
+    selected_enrichment[owner, repository, _, _, _],
+    *enrichment_diagnostic_replacement{
+        view: $view,
+        owner,
+        repository,
+        code,
+    }

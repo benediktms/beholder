@@ -282,6 +282,7 @@ pub struct RepositoryContribution {
     pub grpc_bindings: Vec<GrpcBindingCandidate>,
     pub observations: Vec<Observation>,
     pub diagnostics: Vec<AnalysisDiagnostic>,
+    pub replaced_diagnostic_codes: BTreeSet<String>,
     pub fact_shards: Vec<FactShard>,
 }
 
@@ -412,6 +413,15 @@ pub trait WorkspaceAnalyzer: Send + Sync {
 pub type EnrichmentFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AnalyzerContribution, AnalyzerError>> + Send + 'a>>;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum EnrichmentSourceCurrentness {
+    #[default]
+    RawInputs,
+    SemanticShards {
+        producers: BTreeSet<String>,
+    },
+}
+
 pub trait WorkspaceEnricher: Send + Sync {
     fn metadata(&self) -> AnalyzerMetadata;
     fn accepts(&self, path: &Path) -> bool;
@@ -448,6 +458,9 @@ pub trait WorkspaceEnricher: Send + Sync {
     }
     fn semantic_inputs(&self) -> (BTreeSet<EntityKind>, BTreeSet<SemanticRelation>) {
         (BTreeSet::new(), BTreeSet::new())
+    }
+    fn source_currentness(&self) -> EnrichmentSourceCurrentness {
+        EnrichmentSourceCurrentness::RawInputs
     }
     fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a>;
     fn clear_cache(&self) -> Result<(), AnalyzerError> {
@@ -1280,58 +1293,69 @@ impl Indexer {
 
     /// Enrichment identities after semantic analysis has completed.
     ///
-    /// Rust compiler enrichment consumes Rust fact shards, so trivia-only source
-    /// changes can retain the previous compiler result. Raw repository inputs
-    /// remain the independent publication/supersession guard.
+    /// Enrichers may consume selected semantic shards instead of raw source so
+    /// trivia-only source changes can retain the previous result. Raw repository
+    /// inputs remain the independent publication/supersession guard.
     pub fn analyzed_enrichment_input_identities(
         &self,
         snapshot: &WorkspaceSnapshot,
         analysis: &WorkspaceAnalysis,
     ) -> BTreeMap<String, BTreeMap<String, String>> {
         let mut identities = self.enrichment_input_identities(snapshot);
-        let Some(rust) = self
-            .enrichers
-            .iter()
-            .find(|enricher| enricher.metadata().id == "rust")
-        else {
-            return identities;
-        };
-        let shared = rust.identity_inputs();
-        let Some(rust_identities) = identities.get_mut("rust") else {
-            return identities;
-        };
-        for repository in &snapshot.repositories {
-            let mut shards = analysis
-                .fact_shards
-                .iter()
-                .filter(|shard| {
-                    shard.producer == "rust"
-                        && shard.repository == repository.state.repository.identity
-                })
-                .collect::<Vec<_>>();
-            if shards.is_empty() {
+        for enricher in &self.enrichers {
+            let EnrichmentSourceCurrentness::SemanticShards { producers } =
+                enricher.source_currentness()
+            else {
+                continue;
+            };
+            if producers.is_empty() {
                 continue;
             }
-            shards.sort_by(|left, right| {
-                (&left.owner, &left.version).cmp(&(&right.owner, &right.version))
-            });
-            let mut inputs = rust
-                .analysis_inputs(repository)
-                .into_iter()
-                .filter(|input| input.kind != AnalysisInputKind::Source)
-                .collect::<Vec<_>>();
-            inputs.extend(shared.iter().cloned());
-            let mut digest = Sha256::new();
-            framed_digest(&mut digest, b"beholder-rust-enrichment-input-v1");
-            framed_digest(&mut digest, analysis_inputs_identity(inputs).as_bytes());
-            for shard in shards {
-                framed_digest(&mut digest, shard.owner.as_str().as_bytes());
-                framed_digest(&mut digest, shard.version.as_bytes());
+            let metadata = enricher.metadata();
+            let shared = enricher.identity_inputs();
+            let Some(enricher_identities) = identities.get_mut(&metadata.id) else {
+                continue;
+            };
+            for repository in &snapshot.repositories {
+                let mut shards = analysis
+                    .fact_shards
+                    .iter()
+                    .filter(|shard| {
+                        producers.contains(&shard.producer)
+                            && shard.repository == repository.state.repository.identity
+                    })
+                    .map(|shard| {
+                        (
+                            shard.producer.as_str(),
+                            shard.owner.as_str(),
+                            shard.version.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if shards.is_empty() {
+                    continue;
+                }
+                shards.sort_unstable();
+                shards.dedup();
+                let mut inputs = enricher
+                    .analysis_inputs(repository)
+                    .into_iter()
+                    .filter(|input| input.kind != AnalysisInputKind::Source)
+                    .collect::<Vec<_>>();
+                inputs.extend(shared.iter().cloned());
+                let mut digest = Sha256::new();
+                framed_digest(&mut digest, b"beholder-enrichment-semantic-input-v1");
+                framed_digest(&mut digest, analysis_inputs_identity(inputs).as_bytes());
+                for (producer, owner, version) in shards {
+                    framed_digest(&mut digest, producer.as_bytes());
+                    framed_digest(&mut digest, owner.as_bytes());
+                    framed_digest(&mut digest, version.as_bytes());
+                }
+                enricher_identities.insert(
+                    repository.state.repository.identity.clone(),
+                    format!("{:x}", digest.finalize()),
+                );
             }
-            rust_identities.insert(
-                repository.state.repository.identity.clone(),
-                format!("{:x}", digest.finalize()),
-            );
         }
         identities
     }
@@ -1752,6 +1776,7 @@ mod tests {
     struct ScopedEnricher {
         id: &'static str,
         environment: &'static [u8],
+        semantic_producer: Option<&'static str>,
     }
 
     struct FakeLanguage;
@@ -1926,6 +1951,7 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
+                    replaced_diagnostic_codes: BTreeSet::new(),
                     fact_shards: Vec::new(),
                 })
                 .collect::<Vec<_>>();
@@ -1981,6 +2007,7 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
+                    replaced_diagnostic_codes: BTreeSet::new(),
                     fact_shards: Vec::new(),
                 })
                 .into_iter()
@@ -2039,6 +2066,7 @@ mod tests {
                     grpc_bindings: Vec::new(),
                     observations: vec![observation.clone()],
                     diagnostics: Vec::new(),
+                    replaced_diagnostic_codes: BTreeSet::new(),
                     fact_shards: vec![FactShard {
                         repository,
                         producer: "rust".into(),
@@ -2099,6 +2127,15 @@ mod tests {
                 content: Arc::from(self.environment),
                 kind: AnalysisInputKind::Environment,
             }]
+        }
+
+        fn source_currentness(&self) -> EnrichmentSourceCurrentness {
+            self.semantic_producer
+                .map_or(EnrichmentSourceCurrentness::RawInputs, |producer| {
+                    EnrichmentSourceCurrentness::SemanticShards {
+                        producers: BTreeSet::from([producer.into()]),
+                    }
+                })
         }
 
         fn enrich<'a>(&'a self, _: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
@@ -2168,13 +2205,14 @@ mod tests {
     }
 
     #[test]
-    fn rust_enrichment_currentness_uses_semantic_shards_not_source_formatting() {
-        let cache_dir = cache_dir("rust-semantic-enrichment-inputs");
+    fn declared_enrichment_currentness_uses_semantic_shards_not_source_formatting() {
+        let cache_dir = cache_dir("declared-semantic-enrichment-inputs");
         let indexer = IndexerBuilder::new(cache_dir.clone(), 1)
             .add_analyzer(ShardedAnalyzer)
             .add_enricher(ScopedEnricher {
-                id: "rust",
+                id: "compiler",
                 environment: b"one",
+                semantic_producer: Some("rust"),
             })
             .build()
             .unwrap();
@@ -2223,6 +2261,7 @@ mod tests {
             .add_enricher(ScopedEnricher {
                 id: "scoped",
                 environment: b"one",
+                semantic_producer: None,
             })
             .build()
             .unwrap();
@@ -2259,6 +2298,7 @@ mod tests {
             .add_enricher(ScopedEnricher {
                 id: "scoped",
                 environment: b"two",
+                semantic_producer: None,
             })
             .build()
             .unwrap();

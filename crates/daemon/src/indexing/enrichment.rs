@@ -433,9 +433,16 @@ impl IndexScheduler {
             return Ok(EnrichmentOutcome::Superseded);
         }
         let mut diagnostics = contribution.diagnostics;
+        let mut diagnostic_replacements = Vec::new();
         let mut entities = Vec::new();
         let mut observations = Vec::new();
         for contribution in contribution.repositories {
+            diagnostic_replacements.extend(
+                contribution
+                    .replaced_diagnostic_codes
+                    .into_iter()
+                    .map(|code| (contribution.repository.clone(), code)),
+            );
             entities.extend(contribution.entities);
             observations.extend(contribution.observations);
             diagnostics.extend(
@@ -456,6 +463,7 @@ impl IndexScheduler {
                     observations: &observations,
                     overrides: &contribution.overrides,
                     diagnostics: &diagnostics,
+                    diagnostic_replacements: &diagnostic_replacements,
                 },
             },
         )
@@ -592,6 +600,7 @@ mod tests {
                         grpc_bindings: Vec::new(),
                         observations: Vec::new(),
                         diagnostics: Vec::new(),
+                        replaced_diagnostic_codes: BTreeSet::new(),
                         fact_shards: Vec::new(),
                     }],
                     overrides: Vec::new(),
@@ -624,6 +633,7 @@ mod tests {
                 grpc_bindings: Vec::new(),
                 observations: Vec::new(),
                 diagnostics: Vec::new(),
+                replaced_diagnostic_codes: BTreeSet::new(),
                 fact_shards: Vec::new(),
             }],
             overrides: Vec::new(),

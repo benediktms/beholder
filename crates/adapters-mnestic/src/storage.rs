@@ -1021,6 +1021,10 @@ fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<()
             "enrichment_diagnostic_contribution",
             "view, owner, repository, code, severity, path, line",
         ),
+        (
+            "enrichment_diagnostic_replacement",
+            "view, owner, repository, code",
+        ),
         ("enrichment_output", "view, owner"),
         ("analysis_baseline_entity", "view, id"),
         (
@@ -2217,6 +2221,18 @@ fn enrichment_snapshot_id(
             diagnostic.detail.clone().unwrap_or_default(),
         ]
     }));
+    rows.extend(
+        payload
+            .diagnostic_replacements
+            .iter()
+            .map(|(repository, code)| {
+                vec![
+                    "diagnostic-replacement".to_owned(),
+                    repository.clone(),
+                    code.clone(),
+                ]
+            }),
+    );
     let logical_owner = enrichment_owner_key(owner.analyzer, repository);
     let mut hash = Sha256::new();
     for value in [&logical_owner, owner.version, input_fingerprint] {
@@ -2246,6 +2262,17 @@ pub(super) fn publish_enrichment(
     {
         return Err("enrichment diagnostic belongs to a different target repository".into());
     }
+    if payload
+        .diagnostic_replacements
+        .iter()
+        .any(|(replacement_repository, code)| {
+            replacement_repository != repository || code.trim().is_empty()
+        })
+    {
+        return Err(
+            "enrichment diagnostic replacement is invalid for the target repository".into(),
+        );
+    }
 
     let snapshot = enrichment_snapshot_id(repository, input_fingerprint, &owner, &payload);
     let EnrichmentOwner { analyzer, version } = owner;
@@ -2254,6 +2281,7 @@ pub(super) fn publish_enrichment(
         observations,
         overrides,
         diagnostics,
+        diagnostic_replacements,
     } = payload;
     let owner = snapshot;
     let transaction = db.multi_transaction(true);
@@ -2326,6 +2354,7 @@ pub(super) fn publish_enrichment(
             observations,
             overrides,
             diagnostics,
+            diagnostic_replacements,
         )?;
         complete_enrichment(
             &transaction,
@@ -2344,6 +2373,7 @@ pub(super) fn publish_enrichment(
             observations = observations.len(),
             overrides = overrides.len(),
             diagnostics = diagnostics.len(),
+            diagnostic_replacements = diagnostic_replacements.len(),
             "Mnestic enrichment publication stage completed"
         );
     }
@@ -2574,6 +2604,7 @@ fn replace_enrichment_contributions(
     observations: &[Observation],
     overrides: &[DependencyOverride],
     diagnostics: &[(String, beholder_domain::AnalysisDiagnostic)],
+    diagnostic_replacements: &[(String, String)],
 ) -> Result<(), Box<dyn Error>> {
     let params = BTreeMap::from([("view".into(), view.into()), ("owner".into(), owner.into())]);
     for script in [
@@ -2602,6 +2633,10 @@ fn replace_enrichment_contributions(
              :rm enrichment_diagnostic_contribution {\
                  view, owner, repository, code, severity, path, line\
              }",
+        "?[view, owner, repository, code] := *enrichment_diagnostic_replacement{\
+             view: $view, owner, repository, code\
+         }, view = $view, owner = $owner \
+         :rm enrichment_diagnostic_replacement {view, owner, repository, code}",
     ] {
         transaction.run_script(script, params.clone())?;
     }
@@ -2695,6 +2730,24 @@ fn replace_enrichment_contributions(
              :put enrichment_diagnostic_contribution {\
                  view, owner, repository, code, severity, path, line => detail\
              }",
+            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
+        )?;
+    }
+    for replacements in diagnostic_replacements.chunks(FACT_BATCH_SIZE) {
+        let rows = replacements
+            .iter()
+            .map(|(repository, code)| {
+                DataValue::List(vec![
+                    view.into(),
+                    owner.into(),
+                    repository.as_str().into(),
+                    code.as_str().into(),
+                ])
+            })
+            .collect::<Vec<_>>();
+        transaction.run_script(
+            "?[view, owner, repository, code] <- $rows \
+             :put enrichment_diagnostic_replacement {view, owner, repository, code}",
             BTreeMap::from([("rows".into(), DataValue::List(rows))]),
         )?;
     }
@@ -3102,6 +3155,10 @@ fn sweep_unselected_enrichment_snapshots(
             (
                 "enrichment_diagnostic_contribution",
                 "view, owner, repository, code, severity, path, line",
+            ),
+            (
+                "enrichment_diagnostic_replacement",
+                "view, owner, repository, code",
             ),
         ]
         .into_iter()
@@ -4740,7 +4797,7 @@ mod tests {
             detail: None,
         });
         baseline.diagnostics.push(AnalysisDiagnostic {
-            code: "rust.receiver_method_resolution_unavailable".into(),
+            code: "syntax.receiver_resolution_unavailable".into(),
             severity: AnalysisDiagnosticSeverity::KnownLimitation,
             path: "src/lib.rs".into(),
             line: Some(2),
@@ -4787,6 +4844,10 @@ mod tests {
                     EnrichmentPayload {
                         overrides: &[override_],
                         diagnostics: &[("example/repo".into(), compiler_diagnostic)],
+                        diagnostic_replacements: &[(
+                            "example/repo".into(),
+                            "syntax.receiver_resolution_unavailable".into(),
+                        )],
                         ..EnrichmentPayload::default()
                     },
                 )
@@ -4816,9 +4877,11 @@ mod tests {
             .analysis
             .diagnostics;
         assert_eq!(diagnostics.len(), 2);
-        assert!(diagnostics.iter().all(|diagnostic| {
-            diagnostic.code != "rust.receiver_method_resolution_unavailable"
-        }));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| { diagnostic.code != "syntax.receiver_resolution_unavailable" })
+        );
         assert!(
             store
                 .publish_enrichment(
@@ -4848,8 +4911,12 @@ mod tests {
             .unwrap()
             .analysis
             .diagnostics;
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "rust.syntax_recovered");
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "syntax.receiver_resolution_unavailable" })
+        );
 
         let stale = with_enrichment_analyzers(
             WorkspaceView::new(
@@ -5065,6 +5132,7 @@ mod tests {
                         observations: &[analyzer_observation],
                         overrides: &[analyzer_override],
                         diagnostics: &[("example/repo".into(), analyzer_diagnostic)],
+                        diagnostic_replacements: &[],
                     },
                 )
                 .unwrap()

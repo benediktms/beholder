@@ -42,7 +42,7 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-10";
+const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-11";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const RESOLUTION_CACHE_VERSION: u32 = 2;
 static MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -275,6 +275,7 @@ fn baseline_contribution(snapshot: &beholder_indexing::EnrichmentSnapshot) -> An
             grpc_bindings: Vec::new(),
             observations: snapshot.baseline.observations.clone(),
             diagnostics: Vec::new(),
+            replaced_diagnostic_codes: BTreeSet::new(),
             fact_shards: Vec::new(),
         }],
         overrides: Vec::new(),
@@ -1091,6 +1092,15 @@ fn enrich_semantics(
             },
         ));
     } else {
+        if let Some(repository) = enriched
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.repository == target_repository)
+        {
+            repository
+                .replaced_diagnostic_codes
+                .insert("rust.receiver_method_resolution_unavailable".into());
+        }
         *contribution = enriched;
     }
 }
@@ -1888,6 +1898,10 @@ fn caller() {
             contribution.repositories[0].diagnostics
         );
         assert!(contribution.repositories[0].observations.is_empty());
+        assert_eq!(
+            contribution.repositories[0].replaced_diagnostic_codes,
+            BTreeSet::from(["rust.receiver_method_resolution_unavailable".into()])
+        );
         assert!(
             contribution.diagnostics.iter().all(|(_, diagnostic)| {
                 diagnostic.code != "rust.semantic_resolution_unavailable"

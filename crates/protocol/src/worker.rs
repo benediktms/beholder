@@ -477,6 +477,9 @@ pub fn contribution_from_events(
                     repository.grpc_bindings.append(&mut chunk.grpc_bindings);
                     repository.observations.append(&mut chunk.observations);
                     repository.diagnostics.append(&mut chunk.diagnostics);
+                    repository
+                        .replaced_diagnostic_codes
+                        .append(&mut chunk.replaced_diagnostic_codes);
                 } else {
                     repositories.push(chunk);
                 }
@@ -614,6 +617,7 @@ fn repository_events(
     let mut grpc_bindings = repository.grpc_bindings.into_iter().peekable();
     let mut observations = repository.observations.into_iter().peekable();
     let mut diagnostics = repository.diagnostics.into_iter().peekable();
+    let mut replaced_diagnostic_codes = repository.replaced_diagnostic_codes.into_iter().peekable();
     let mut events = Vec::new();
     loop {
         events.push(wire::AnalyzeEvent {
@@ -634,6 +638,10 @@ fn repository_events(
                         .by_ref()
                         .take(CONTRIBUTION_CHUNK_ITEMS)
                         .collect(),
+                    replaced_diagnostic_codes: replaced_diagnostic_codes
+                        .by_ref()
+                        .take(CONTRIBUTION_CHUNK_ITEMS)
+                        .collect(),
                 },
             )),
         });
@@ -641,6 +649,7 @@ fn repository_events(
             && grpc_bindings.peek().is_none()
             && observations.peek().is_none()
             && diagnostics.peek().is_none()
+            && replaced_diagnostic_codes.peek().is_none()
         {
             break;
         }
@@ -677,6 +686,7 @@ fn repository_to_wire(
             .into_iter()
             .map(diagnostic_to_wire)
             .collect(),
+        replaced_diagnostic_codes: repository.replaced_diagnostic_codes.into_iter().collect(),
     })
 }
 
@@ -715,6 +725,7 @@ fn repository_from_wire(
             .into_iter()
             .map(diagnostic_from_wire)
             .collect::<Result<_, _>>()?,
+        replaced_diagnostic_codes: repository.replaced_diagnostic_codes.into_iter().collect(),
     })
 }
 
@@ -1207,6 +1218,7 @@ mod tests {
                     })
                     .collect(),
                 diagnostics: Vec::new(),
+                replaced_diagnostic_codes: BTreeSet::from(["syntax.unresolved".into()]),
                 fact_shards: Vec::new(),
             }],
             overrides: (0..5_000)

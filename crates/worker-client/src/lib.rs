@@ -7,7 +7,8 @@ pub use plugin_registry::{InstalledPlugin, PluginRegistry, describe_plugin};
 use beholder_domain::SemanticRelation;
 use beholder_indexing::{
     AnalysisInput, AnalysisInputKind, AnalyzerError, AnalyzerMetadata, EnrichmentFuture,
-    EnrichmentSnapshot, PluginDescriptor, PluginInputScope, WorkspaceEnricher,
+    EnrichmentSnapshot, EnrichmentSourceCurrentness, PluginDescriptor, PluginInputScope,
+    WorkspaceEnricher,
 };
 use beholder_protocol::{
     analyze_requests, contribution_from_events,
@@ -82,6 +83,7 @@ pub struct WorkerAnalyzerBuilder {
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     semantic_relations: BTreeSet<SemanticRelation>,
+    semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
     timeout: Duration,
@@ -103,6 +105,7 @@ impl WorkerAnalyzerBuilder {
             excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
             semantic_relations: BTreeSet::new(),
+            semantic_shard_producers: BTreeSet::new(),
             plugin: None,
             persistent: false,
             timeout: ANALYSIS_INACTIVITY_TIMEOUT,
@@ -199,6 +202,11 @@ impl WorkerAnalyzerBuilder {
         self
     }
 
+    pub fn semantic_shard_producer(mut self, producer: impl Into<String>) -> Self {
+        self.semantic_shard_producers.insert(producer.into());
+        self
+    }
+
     pub fn build(self) -> Result<WorkerAnalyzer, AnalyzerError> {
         if self.metadata.id.is_empty() {
             return Err("worker analyzer identity must not be empty".into());
@@ -221,6 +229,7 @@ impl WorkerAnalyzerBuilder {
             excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
             semantic_relations: self.semantic_relations,
+            semantic_shard_producers: self.semantic_shard_producers,
             plugin: self.plugin,
             persistent: self.persistent,
             session: Mutex::new(None),
@@ -240,6 +249,7 @@ pub struct WorkerAnalyzer {
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     semantic_relations: BTreeSet<SemanticRelation>,
+    semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
     session: Mutex<Option<WorkerSession>>,
@@ -273,6 +283,7 @@ pub fn plugin_analyzer(
         excluded_path_suffixes: Vec::new(),
         identity_inputs: Vec::new(),
         semantic_relations: BTreeSet::new(),
+        semantic_shard_producers: BTreeSet::new(),
         plugin: Some(descriptor),
         persistent: false,
         session: Mutex::new(None),
@@ -383,6 +394,16 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 )
             },
         )
+    }
+
+    fn source_currentness(&self) -> EnrichmentSourceCurrentness {
+        if self.semantic_shard_producers.is_empty() {
+            EnrichmentSourceCurrentness::RawInputs
+        } else {
+            EnrichmentSourceCurrentness::SemanticShards {
+                producers: self.semantic_shard_producers.clone(),
+            }
+        }
     }
 
     fn enrich<'a>(&'a self, snapshot: EnrichmentSnapshot) -> EnrichmentFuture<'a> {
