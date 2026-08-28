@@ -109,15 +109,19 @@ pub(super) fn analysis_metadata(
         view,
         &format!(
             "{DIRECT_RULES}\n\
-             ?[repository, code, severity, path, line, detail] := \
+             superseded_baseline_diagnostic[repository, code] := \
+                 selected_enrichment[_, repository, 'rust', _, _], \
+                 code = 'rust.receiver_method_resolution_unavailable'\n\
+             baseline_diagnostic[repository, code, severity, path, line, detail] := \
                  *analysis_revision_diagnostic{{\
                      view: $view, revision: $revision, repository, code, severity, path, line, detail\
-                 }}\n\
+                 }}, \
+                 not superseded_baseline_diagnostic[repository, code]\n\
+             ?[repository, code, severity, path, line, detail] := \
+                 baseline_diagnostic[repository, code, severity, path, line, detail]\n\
              ?[repository, code, severity, path, line, detail] := \
                  enrichment_diagnostic[repository, code, severity, path, line, detail], \
-                 not *analysis_revision_diagnostic{{\
-                     view: $view, revision: $revision, repository, code, severity, path, line\
-                 }}\n\
+                 not baseline_diagnostic[repository, code, severity, path, line, _]\n\
              :order severity, repository, path, line, code"
         ),
         [("revision", i64::try_from(revision)?.into())],

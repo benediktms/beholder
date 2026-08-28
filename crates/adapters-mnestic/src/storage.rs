@@ -4739,7 +4739,23 @@ mod tests {
             line: Some(1),
             detail: None,
         });
+        baseline.diagnostics.push(AnalysisDiagnostic {
+            code: "rust.receiver_method_resolution_unavailable".into(),
+            severity: AnalysisDiagnosticSeverity::KnownLimitation,
+            path: "src/lib.rs".into(),
+            line: Some(2),
+            detail: Some("receiver method call requires compiler analysis".into()),
+        });
         store.publish(&view, &[baseline], &[]).unwrap();
+        assert_eq!(
+            store
+                .context_snapshot("enriched", "missing")
+                .unwrap()
+                .analysis
+                .diagnostics
+                .len(),
+            2
+        );
         let resolved = "repo://example/repo/rust/lib/helper";
         let override_ = DependencyOverride {
             from: call.from,
@@ -4794,15 +4810,15 @@ mod tests {
             edge.evidence[0].source_kind,
             beholder_dto::EvidenceKind::Compiler
         );
-        assert_eq!(
-            store
-                .context_snapshot("enriched", "missing")
-                .unwrap()
-                .analysis
-                .diagnostics
-                .len(),
-            2
-        );
+        let diagnostics = store
+            .context_snapshot("enriched", "missing")
+            .unwrap()
+            .analysis
+            .diagnostics;
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != "rust.receiver_method_resolution_unavailable"
+        }));
         assert!(
             store
                 .publish_enrichment(
