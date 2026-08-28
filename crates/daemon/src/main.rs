@@ -7,6 +7,8 @@ use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
 #[cfg(not(test))]
+use beholder_domain::{DependencyRelation, SemanticRelation};
+#[cfg(not(test))]
 use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
 use beholder_observability::LogOutput;
@@ -209,9 +211,10 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         )
         .identity(
             RUST_WORKER_ID,
-            "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-8",
+            "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-9",
         )
         .persistent()
+        .semantic_relation(SemanticRelation::Dependency(DependencyRelation::Calls))
         .accept_extension("rs")
         .accept_file_name_as("Cargo.toml", AnalysisInputKind::Dependency)
         .accept_file_name_as("Cargo.lock", AnalysisInputKind::Dependency)

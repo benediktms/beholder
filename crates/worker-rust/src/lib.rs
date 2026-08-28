@@ -1,11 +1,14 @@
 use beholder_adapters_treesitter_rust::{
-    RustAnalyzer, analyze, source_entity_id, validate_immutable_rust_inputs,
+    analyze, source_entity_id, validate_immutable_rust_inputs,
 };
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
     DependencyRelation, Provenance, SemanticRelation, UnsafeTreeRecovery,
 };
-use beholder_indexing::{AnalyzerContribution, WorkspaceAnalyzer, WorkspaceSnapshot};
+use beholder_indexing::{
+    AnalysisCompleteness, AnalyzerContribution, AnalyzerMetadata, CacheStatistics,
+    RepositoryContribution, WorkspaceSnapshot,
+};
 use beholder_protocol::{
     WorkspaceSnapshotBuilder, analyze_events,
     worker_v1::{
@@ -14,21 +17,24 @@ use beholder_protocol::{
     },
 };
 use ra_ap_ide::{
-    AnalysisHost, FileId, FilePosition, GotoDefinitionConfig, RaFixtureConfig, TextSize,
+    Analysis, AnalysisHost, FileId, FilePosition, GotoDefinitionConfig, RaFixtureConfig, TextSize,
 };
 use ra_ap_ide_db::ChangeWithProcMacros;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use ra_ap_project_model::{CargoConfig, CargoFeatures};
 use ra_ap_vfs::VfsPath;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 use tokio::net::UnixListener;
@@ -36,19 +42,106 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-8";
+const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-9";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const RESOLUTION_CACHE_VERSION: u32 = 1;
 static MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static COMPILER_LOADS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static COMPILER_EXTRACTIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static COMPILER_RESOLUTIONS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct RustWorker {
-    analyzer: Arc<RustAnalyzer>,
     analysis_pool: Arc<rayon::ThreadPool>,
     compiler: Arc<Mutex<Option<CompilerWorkspace>>>,
+    cache_dir: Arc<PathBuf>,
+    cache_writer: CacheWriter,
+}
+
+#[derive(Clone)]
+struct CacheWriter {
+    pending: Arc<(Mutex<Option<PersistRequest>>, Condvar)>,
+}
+
+struct PersistRequest {
+    path: PathBuf,
+    cache: PersistedWorkspaceCache,
+}
+
+impl CacheWriter {
+    fn new() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let pending = Arc::new((Mutex::new(None::<PersistRequest>), Condvar::new()));
+        let worker = Arc::clone(&pending);
+        thread::Builder::new()
+            .name("beholder-rust-cache".into())
+            .spawn(move || {
+                loop {
+                    let request = {
+                        let (lock, ready) = &*worker;
+                        let mut request = lock.lock().expect("Rust cache writer lock poisoned");
+                        while request.is_none() {
+                            request = ready
+                                .wait(request)
+                                .expect("Rust cache writer lock poisoned");
+                        }
+                        request.take().expect("Rust cache request exists")
+                    };
+                    let started = Instant::now();
+                    match persist_resolution_cache(&request.path, &request.cache) {
+                        Ok(bytes) => tracing::info!(
+                            path = %request.path.display(),
+                            bytes,
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                            "Rust compiler resolution cache persisted"
+                        ),
+                        Err(error) => tracing::warn!(
+                            path = %request.path.display(),
+                            error = %error,
+                            "Rust compiler resolution cache persistence failed"
+                        ),
+                    }
+                }
+            })?;
+        Ok(Self { pending })
+    }
+
+    fn schedule(&self, request: PersistRequest) {
+        let (pending, ready) = &*self.pending;
+        *pending.lock().expect("Rust cache writer lock poisoned") = Some(request);
+        ready.notify_one();
+    }
+}
+
+fn load_resolution_cache(path: &Path) -> PersistedWorkspaceCache {
+    let started = Instant::now();
+    let result = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PersistedWorkspaceCache>(&bytes).ok())
+        .filter(|cache| cache.version == RESOLUTION_CACHE_VERSION);
+    tracing::info!(
+        path = %path.display(),
+        hit = result.is_some(),
+        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "Rust compiler resolution cache loaded"
+    );
+    result.unwrap_or_default()
+}
+
+fn persist_resolution_cache(
+    path: &Path,
+    cache: &PersistedWorkspaceCache,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let bytes = serde_json::to_vec(cache)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, &bytes)?;
+    fs::rename(temporary, path)?;
+    Ok(bytes.len())
 }
 
 #[tonic::async_trait]
@@ -68,9 +161,10 @@ impl AnalyzerWorker for RustWorker {
         );
         beholder_observability::set_parent_from_metadata(&span, request.metadata());
         let mut stream = request.into_inner();
-        let analyzer = self.analyzer.clone();
         let analysis_pool = self.analysis_pool.clone();
         let compiler = self.compiler.clone();
+        let cache_dir = self.cache_dir.clone();
+        let cache_writer = self.cache_writer.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         tokio::spawn(
             async move {
@@ -114,18 +208,15 @@ impl AnalyzerWorker for RustWorker {
                     move || -> Result<Vec<AnalyzeEvent>, Box<dyn Error + Send + Sync>> {
                         analysis_span.in_scope(|| {
                             analysis_pool.install(|| {
-                                let syntax_started = Instant::now();
-                                let mut contribution = analyzer.analyze(&snapshot.workspace)?;
-                                tracing::info!(
-                                    elapsed_ms = syntax_started.elapsed().as_secs_f64() * 1_000.0,
-                                    "Rust syntax analysis completed"
-                                );
+                                let mut contribution = baseline_contribution(&snapshot);
                                 let enrichment_started = Instant::now();
                                 enrich_semantics(
                                     &snapshot.workspace,
                                     &snapshot.target_repository,
                                     &mut contribution,
                                     &compiler,
+                                    &cache_dir,
+                                    &cache_writer,
                                 );
                                 tracing::info!(
                                     elapsed_ms =
@@ -167,6 +258,29 @@ impl AnalyzerWorker for RustWorker {
             .instrument(span),
         );
         Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+}
+
+fn baseline_contribution(snapshot: &beholder_indexing::EnrichmentSnapshot) -> AnalyzerContribution {
+    AnalyzerContribution {
+        metadata: AnalyzerMetadata {
+            id: "rust".into(),
+            version: ANALYZER_VERSION.into(),
+        },
+        active_repositories: vec![snapshot.target_repository.clone()],
+        repositories: vec![RepositoryContribution {
+            repository: snapshot.target_repository.clone(),
+            completeness: AnalysisCompleteness::Complete,
+            entities: snapshot.baseline.entities.clone(),
+            grpc_bindings: Vec::new(),
+            observations: snapshot.baseline.observations.clone(),
+            diagnostics: Vec::new(),
+            fact_shards: Vec::new(),
+        }],
+        overrides: Vec::new(),
+        graphql_resolvers: Vec::new(),
+        diagnostics: Vec::new(),
+        cache: CacheStatistics::default(),
     }
 }
 
@@ -344,6 +458,51 @@ struct CompilerInputShape {
     configuration: Option<Arc<[u8]>>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+struct PersistedWorkspaceCache {
+    version: u32,
+    cargo: BTreeMap<String, PersistedCargoCache>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+struct PersistedCargoCache {
+    files: BTreeMap<String, PersistedFileAnalysis>,
+    resolutions: Vec<PersistedResolution>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct PersistedResolution {
+    key: ResolutionKey,
+    resolution: CompilerResolution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct PersistedFileAnalysis {
+    analyzable: bool,
+    module_hash: [u8; 32],
+    symbols: BTreeMap<String, SymbolHashes>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct SymbolHashes {
+    interface: [u8; 32],
+    body: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+struct ResolutionKey {
+    symbol: String,
+    ordinal: u32,
+    unresolved: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+enum CompilerResolution {
+    Resolved(String),
+    Unrepresented,
+    Unresolved,
+}
+
 impl CompilerWorkspaceShape {
     fn new(snapshot: &WorkspaceSnapshot, target_repository: &str) -> Self {
         Self {
@@ -369,6 +528,29 @@ impl CompilerWorkspaceShape {
                 .collect(),
         }
     }
+
+    fn cache_key(&self) -> String {
+        let mut digest = Sha256::new();
+        hash_part(&mut digest, self.workspace.as_bytes());
+        hash_part(&mut digest, self.target_repository.as_bytes());
+        for repository in &self.repositories {
+            hash_part(&mut digest, repository.identity.as_bytes());
+            hash_part(&mut digest, repository.base.as_os_str().as_encoded_bytes());
+            for input in &repository.inputs {
+                hash_part(&mut digest, input.path.as_os_str().as_encoded_bytes());
+                hash_part(&mut digest, format!("{:?}", input.kind).as_bytes());
+                if let Some(configuration) = &input.configuration {
+                    hash_part(&mut digest, configuration);
+                }
+            }
+        }
+        format!("{:x}", digest.finalize())
+    }
+}
+
+fn hash_part(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
 }
 
 fn is_rust_source(path: &Path) -> bool {
@@ -405,15 +587,21 @@ fn absolute_lexical(path: &Path) -> PathBuf {
 struct CompilerWorkspace {
     shape: CompilerWorkspaceShape,
     materialized: MaterializedWorkspace,
-    cargo: BTreeMap<PathBuf, CompilerCargo>,
+    cargo: BTreeMap<String, CompilerCargo>,
+    cache_path: PathBuf,
 }
 
 impl CompilerWorkspace {
     fn new(
         snapshot: &WorkspaceSnapshot,
         target_repository: &str,
+        cache_dir: &Path,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let shape = CompilerWorkspaceShape::new(snapshot, target_repository);
+        let cache_path = cache_dir
+            .join("rust-compiler-resolution-v1")
+            .join(format!("{}.json", shape.cache_key()));
+        let mut persisted = load_resolution_cache(&cache_path);
         let materialized = MaterializedWorkspace::new(snapshot)?;
         let repository = snapshot
             .repositories
@@ -425,15 +613,26 @@ impl CompilerWorkspace {
             .ok_or("materialized Rust target repository is missing")?;
         let mut cargo = BTreeMap::new();
         for root in cargo_roots(repository, materialized_target) {
+            let key = root
+                .strip_prefix(materialized_target)
+                .unwrap_or(&root)
+                .to_string_lossy()
+                .into_owned();
             cargo.insert(
-                root.clone(),
-                CompilerCargo::load(snapshot, &materialized, &root)?,
+                key.clone(),
+                CompilerCargo::load(
+                    snapshot,
+                    &materialized,
+                    &root,
+                    persisted.cargo.remove(&key).unwrap_or_default(),
+                )?,
             );
         }
         Ok(Self {
             shape,
             materialized,
             cargo,
+            cache_path,
         })
     }
 
@@ -444,6 +643,27 @@ impl CompilerWorkspace {
         }
         Ok(())
     }
+
+    fn persist_request(&mut self) -> Option<PersistRequest> {
+        if !self.cargo.values().any(|cargo| cargo.cache_dirty) {
+            return None;
+        }
+        let cargo = self
+            .cargo
+            .iter_mut()
+            .map(|(key, compiler)| {
+                compiler.cache_dirty = false;
+                (key.clone(), compiler.persisted_cache())
+            })
+            .collect();
+        Some(PersistRequest {
+            path: self.cache_path.clone(),
+            cache: PersistedWorkspaceCache {
+                version: RESOLUTION_CACHE_VERSION,
+                cargo,
+            },
+        })
+    }
 }
 
 struct CompilerCargo {
@@ -452,6 +672,9 @@ struct CompilerCargo {
     sources: BTreeMap<FileId, Arc<[u8]>>,
     dirty: BTreeSet<FileId>,
     extractions: BTreeMap<FileId, Option<CompilerFileAnalysis>>,
+    persisted_files: BTreeMap<String, PersistedFileAnalysis>,
+    resolutions: BTreeMap<ResolutionKey, CompilerResolution>,
+    cache_dirty: bool,
 }
 
 impl CompilerCargo {
@@ -459,6 +682,7 @@ impl CompilerCargo {
         snapshot: &WorkspaceSnapshot,
         materialized: &MaterializedWorkspace,
         cargo_root: &Path,
+        persisted: PersistedCargoCache,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         #[cfg(test)]
         COMPILER_LOADS.fetch_add(1, Ordering::Relaxed);
@@ -495,9 +719,90 @@ impl CompilerCargo {
             sources: BTreeMap::new(),
             dirty: BTreeSet::new(),
             extractions: BTreeMap::new(),
+            persisted_files: persisted.files,
+            resolutions: persisted
+                .resolutions
+                .into_iter()
+                .map(|entry| (entry.key, entry.resolution))
+                .collect(),
+            cache_dirty: false,
         };
         compiler.update(snapshot, materialized)?;
         Ok(compiler)
+    }
+
+    fn persisted_cache(&self) -> PersistedCargoCache {
+        PersistedCargoCache {
+            files: self.persisted_files.clone(),
+            resolutions: self
+                .resolutions
+                .iter()
+                .map(|(key, resolution)| PersistedResolution {
+                    key: key.clone(),
+                    resolution: resolution.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn update_file_analysis(&mut self, file: String, analysis: &CompilerFileAnalysis) {
+        let current = PersistedFileAnalysis {
+            analyzable: true,
+            module_hash: analysis.module_hash,
+            symbols: analysis.symbols.clone(),
+        };
+        let previous = self.persisted_files.insert(file, current.clone());
+        if previous.as_ref() == Some(&current) {
+            return;
+        }
+        self.cache_dirty = true;
+        let Some(previous) = previous else {
+            self.resolutions.clear();
+            return;
+        };
+        if !previous.analyzable || previous.module_hash != current.module_hash {
+            self.resolutions.clear();
+            return;
+        }
+        let interface_changed = previous.symbols.iter().any(|(symbol, hashes)| {
+            current
+                .symbols
+                .get(symbol)
+                .is_none_or(|current| current.interface != hashes.interface)
+        }) || current
+            .symbols
+            .keys()
+            .any(|symbol| !previous.symbols.contains_key(symbol));
+        if interface_changed {
+            self.resolutions.clear();
+            return;
+        }
+        let changed = previous
+            .symbols
+            .iter()
+            .filter_map(|(symbol, hashes)| {
+                current
+                    .symbols
+                    .get(symbol)
+                    .is_some_and(|current| current.body != hashes.body)
+                    .then_some(symbol.as_str())
+            })
+            .collect::<BTreeSet<_>>();
+        self.resolutions
+            .retain(|key, _| !changed.contains(key.symbol.as_str()));
+    }
+
+    fn update_unanalyzable_file(&mut self, file: String, source: &str) {
+        let current = PersistedFileAnalysis {
+            analyzable: false,
+            module_hash: Sha256::digest(source.as_bytes()).into(),
+            symbols: BTreeMap::new(),
+        };
+        if self.persisted_files.insert(file, current.clone()).as_ref() == Some(&current) {
+            return;
+        }
+        self.resolutions.clear();
+        self.cache_dirty = true;
     }
 
     fn update(
@@ -554,6 +859,7 @@ pub async fn serve(socket: &Path, cache_dir: PathBuf) -> Result<(), Box<dyn Erro
             .stack_size(16 * 1024 * 1024)
             .build()?,
     );
+    let cache_writer = CacheWriter::new()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -562,9 +868,10 @@ pub async fn serve(socket: &Path, cache_dir: PathBuf) -> Result<(), Box<dyn Erro
     tonic::transport::Server::builder()
         .add_service(
             AnalyzerWorkerServer::new(RustWorker {
-                analyzer: Arc::new(RustAnalyzer::new(cache_dir)),
                 analysis_pool,
                 compiler: Arc::new(Mutex::new(None)),
+                cache_dir: Arc::new(cache_dir),
+                cache_writer,
             })
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES),
@@ -579,6 +886,8 @@ fn enrich_semantics(
     target_repository: &str,
     contribution: &mut AnalyzerContribution,
     compiler: &Mutex<Option<CompilerWorkspace>>,
+    cache_dir: &Path,
+    cache_writer: &CacheWriter,
 ) {
     let Some(repository) = snapshot
         .repositories
@@ -611,7 +920,11 @@ fn enrich_semantics(
                 .expect("matching compiler workspace exists")
                 .update(snapshot)?;
         } else {
-            *cached = Some(CompilerWorkspace::new(snapshot, target_repository)?);
+            *cached = Some(CompilerWorkspace::new(
+                snapshot,
+                target_repository,
+                cache_dir,
+            )?);
         }
         tracing::info!(
             reused,
@@ -630,6 +943,9 @@ fn enrich_semantics(
             enrich_repository(snapshot, materialized, repository, compiler, &mut enriched)?;
         }
         materialized.verify(snapshot)?;
+        if let Some(request) = workspace.persist_request() {
+            cache_writer.schedule(request);
+        }
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     })();
     if let Err(error) = result {
@@ -725,6 +1041,11 @@ fn enrich_repository(
                 .is_some_and(|extension| extension == "rs")
         }) {
             let absolute = materialized_base.join(&input.path);
+            let semantic_file = format!(
+                "{}/{}",
+                snapshot_repository.state.repository.identity,
+                input.path.display()
+            );
             let path = VfsPath::new_real_path(absolute.to_string_lossy().into_owned());
             let Some((file_id, _)) = compiler.vfs.file_id(&path) else {
                 continue;
@@ -742,32 +1063,52 @@ fn enrich_repository(
                         let mut file = CompilerFileAnalysis::default();
                         for function in syntax.functions() {
                             let function_id = format!("{source_id}/{}", function.qualified_name());
+                            file.symbols.insert(
+                                function_id.clone(),
+                                SymbolHashes {
+                                    interface: function.interface_hash(),
+                                    body: function.body_hash(),
+                                },
+                            );
                             file.definitions
                                 .push((text_size(function.name_offset())?, function_id.clone()));
                             if snapshot_repository.state.repository == repository.state.repository {
-                                file.call_sites
-                                    .extend(function.calls().map(|call| CallSite {
+                                for (ordinal, call) in function.calls().enumerate() {
+                                    let unresolved = if call.receiver_method() {
+                                        format!("rust-method://{}", call.name())
+                                    } else {
+                                        format!("rust-call://{}", call.name())
+                                    };
+                                    file.call_sites.push(CallSite {
                                         file_id,
                                         from: function_id.clone(),
-                                        unresolved: if call.receiver_method() {
-                                            format!("rust-method://{}", call.name())
-                                        } else {
-                                            format!("rust-call://{}", call.name())
+                                        key: ResolutionKey {
+                                            symbol: function_id.clone(),
+                                            ordinal: u32::try_from(ordinal)?,
+                                            unresolved: unresolved.clone(),
                                         },
+                                        unresolved,
                                         evidence: format!(
                                             "{}:{}",
                                             input.path.display(),
                                             line(&source, call.offset())
                                         ),
                                         offset: call.offset(),
-                                    }));
+                                    });
+                                }
                             }
                         }
+                        file.module_hash = syntax.module_hash();
                         Some(file)
                     }
                     Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => None,
                     Err(error) => return Err(error),
                 };
+                if let Some(extraction) = &extraction {
+                    compiler.update_file_analysis(semantic_file.clone(), extraction);
+                } else {
+                    compiler.update_unanalyzable_file(semantic_file, &source);
+                }
                 compiler.extractions.insert(file_id, extraction);
                 compiler.dirty.remove(&file_id);
             }
@@ -820,53 +1161,43 @@ fn enrich_repository(
     let call_site_count = call_sites.len();
     let extraction_elapsed = started.elapsed();
     let mut goto_elapsed = Duration::ZERO;
+    let mut resolution_hits = 0usize;
+    let mut resolution_misses = 0usize;
     for call in call_sites {
-        let goto_started = Instant::now();
-        let targets = analysis.goto_definition(
-            FilePosition {
-                file_id: call.file_id,
-                offset: text_size(call.offset)?,
-            },
-            &config,
-        );
-        goto_elapsed += goto_started.elapsed();
-        let Some(targets) = targets? else {
-            continue;
+        let resolution = if let Some(resolution) = compiler.resolutions.get(&call.key) {
+            resolution_hits += 1;
+            resolution.clone()
+        } else {
+            resolution_misses += 1;
+            #[cfg(test)]
+            COMPILER_RESOLUTIONS.fetch_add(1, Ordering::Relaxed);
+            let goto_started = Instant::now();
+            let resolution = resolve_call(&analysis, &config, &call, &definitions, &local_files)?;
+            goto_elapsed += goto_started.elapsed();
+            compiler
+                .resolutions
+                .insert(call.key.clone(), resolution.clone());
+            compiler.cache_dirty = true;
+            resolution
         };
-        let mut local = targets.info.iter().filter_map(|target| {
-            definitions
-                .get(&(target.file_id, target.focus_or_full_range().start()))
-                .or_else(|| {
-                    definitions.iter().find_map(|((file_id, offset), entity)| {
-                        (*file_id == target.file_id && target.full_range.contains(*offset))
-                            .then_some(entity)
-                    })
-                })
-                .cloned()
-        });
-        let Some(target) = local.next() else {
-            if targets
-                .info
-                .iter()
-                .any(|target| local_files.contains(&target.file_id))
-            {
-                let (path, line) = evidence_location(&call.evidence);
+        let target = match resolution {
+            CompilerResolution::Resolved(target) => target,
+            CompilerResolution::Unrepresented => {
+                let (path, _) = evidence_location(&call.evidence);
                 compiler_diagnostics.push(AnalysisDiagnostic {
                     code: "rust.compiler_target_unrepresented".into(),
                     severity: AnalysisDiagnosticSeverity::KnownLimitation,
                     path,
-                    line,
+                    line: None,
                     detail: Some(format!(
                         "compiler resolved {} to a local definition absent from syntax facts",
                         call.unresolved
                     )),
                 });
+                continue;
             }
-            continue;
+            CompilerResolution::Unresolved => continue,
         };
-        if local.next().is_some() {
-            continue;
-        }
         let Some(observation) =
             repository_contribution
                 .observations
@@ -922,29 +1253,26 @@ fn enrich_repository(
     repository_contribution
         .diagnostics
         .retain(|diagnostic| diagnostic.code != "rust.receiver_method_resolution_unavailable");
-    let mut unresolved_by_path = BTreeMap::<PathBuf, (usize, Option<u32>)>::new();
+    let mut unresolved_by_path = BTreeMap::<PathBuf, usize>::new();
     for observation in repository_contribution
         .observations
         .iter()
         .filter(|observation| observation.to.as_str().starts_with("rust-method://"))
     {
-        let (path, line) = evidence_location(observation.evidence.as_str());
+        let (path, _) = evidence_location(observation.evidence.as_str());
         unresolved_by_path
             .entry(path)
-            .and_modify(|(count, first_line)| {
-                *count += 1;
-                *first_line = (*first_line).min(line);
-            })
-            .or_insert((1, line));
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
     }
-    for (path, (count, line)) in unresolved_by_path {
+    for (path, count) in unresolved_by_path {
         repository_contribution
             .diagnostics
             .push(AnalysisDiagnostic {
                 code: "rust.receiver_method_resolution_unavailable".into(),
                 severity: AnalysisDiagnosticSeverity::KnownLimitation,
                 path,
-                line,
+                line: None,
                 detail: Some(format!(
                     "{count} receiver method calls remain unresolved after compiler analysis"
                 )),
@@ -955,12 +1283,62 @@ fn enrich_repository(
         .extend(compiler_diagnostics);
     tracing::info!(
         call_site_count,
+        resolution_hits,
+        resolution_misses,
         extraction_ms = extraction_elapsed.as_secs_f64() * 1_000.0,
         goto_definition_ms = goto_elapsed.as_secs_f64() * 1_000.0,
         elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
         "Rust compiler repository enrichment completed"
     );
     Ok(())
+}
+
+fn resolve_call(
+    analysis: &Analysis,
+    config: &GotoDefinitionConfig,
+    call: &CallSite,
+    definitions: &BTreeMap<(FileId, TextSize), String>,
+    local_files: &BTreeSet<FileId>,
+) -> Result<CompilerResolution, Box<dyn Error + Send + Sync>> {
+    let Some(targets) = analysis.goto_definition(
+        FilePosition {
+            file_id: call.file_id,
+            offset: text_size(call.offset)?,
+        },
+        config,
+    )?
+    else {
+        return Ok(CompilerResolution::Unresolved);
+    };
+    let mut local = targets.info.iter().filter_map(|target| {
+        definitions
+            .get(&(target.file_id, target.focus_or_full_range().start()))
+            .or_else(|| {
+                definitions.iter().find_map(|((file_id, offset), entity)| {
+                    (*file_id == target.file_id && target.full_range.contains(*offset))
+                        .then_some(entity)
+                })
+            })
+            .cloned()
+    });
+    let Some(target) = local.next() else {
+        return Ok(
+            if targets
+                .info
+                .iter()
+                .any(|target| local_files.contains(&target.file_id))
+            {
+                CompilerResolution::Unrepresented
+            } else {
+                CompilerResolution::Unresolved
+            },
+        );
+    };
+    Ok(if local.next().is_some() {
+        CompilerResolution::Unresolved
+    } else {
+        CompilerResolution::Resolved(target)
+    })
 }
 
 fn cargo_features(
@@ -994,6 +1372,8 @@ fn environment_enabled(name: &str) -> bool {
 
 #[derive(Default)]
 struct CompilerFileAnalysis {
+    module_hash: [u8; 32],
+    symbols: BTreeMap<String, SymbolHashes>,
     definitions: Vec<(TextSize, String)>,
     call_sites: Vec<CallSite>,
 }
@@ -1002,6 +1382,7 @@ struct CompilerFileAnalysis {
 struct CallSite {
     file_id: FileId,
     from: String,
+    key: ResolutionKey,
     unresolved: String,
     evidence: String,
     offset: usize,
@@ -1031,8 +1412,12 @@ fn text_size(offset: usize) -> Result<TextSize, Box<dyn Error + Send + Sync>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beholder_adapters_treesitter_rust::RustAnalyzer;
     use beholder_domain::{LogicalRepository, RepositoryState};
-    use beholder_indexing::{EnrichmentSnapshot, InputKind, RepositoryInput, RepositorySnapshot};
+    use beholder_indexing::{
+        EnrichmentSnapshot, InputKind, RepositoryInput, RepositorySnapshot, SemanticSnapshot,
+        WorkspaceAnalyzer,
+    };
     use beholder_protocol::{
         analyze_requests, contribution_from_events,
         worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
@@ -1109,7 +1494,7 @@ fn caller() {
             "pub fn stale_external() {}",
         )
         .unwrap();
-        let snapshot = EnrichmentSnapshot {
+        let mut snapshot = EnrichmentSnapshot {
             target_repository: "example/repo".into(),
             workspace: WorkspaceSnapshot {
                 name: "test".into(),
@@ -1182,6 +1567,17 @@ fn caller() {
             },
             baseline: Default::default(),
         };
+        let baseline = RustAnalyzer::new(base.join("syntax-cache"))
+            .analyze(&snapshot.workspace)
+            .unwrap()
+            .repositories
+            .into_iter()
+            .find(|repository| repository.repository == snapshot.target_repository)
+            .unwrap();
+        snapshot.baseline = SemanticSnapshot {
+            entities: baseline.entities,
+            observations: baseline.observations,
+        };
         let socket = PathBuf::from(format!(
             "/tmp/beholder-worker-{}-{}.sock",
             std::process::id(),
@@ -1190,14 +1586,21 @@ fn caller() {
                 .unwrap()
                 .as_nanos()
         ));
-        let server = tokio::spawn({
+        let cache = base.join("cache");
+        let mut server = tokio::spawn({
             let socket = socket.clone();
-            let cache = base.join("cache");
+            let cache = cache.clone();
             async move { serve(&socket, cache).await }
         });
         let endpoint = format!("unix:{}", socket.display());
         let mut client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
+                if server.is_finished() {
+                    panic!(
+                        "Rust worker server stopped before accepting: {:?}",
+                        (&mut server).await
+                    );
+                }
                 match AnalyzerWorkerClient::connect(endpoint.clone()).await {
                     Ok(client) => break client,
                     Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
@@ -1206,6 +1609,7 @@ fn caller() {
         })
         .await
         .unwrap();
+        let resolutions_before_initial = COMPILER_RESOLUTIONS.load(Ordering::Relaxed);
         let mut updated_snapshot = snapshot.clone();
         let mut stream = client
             .analyze(tokio_stream::iter(analyze_requests(snapshot).unwrap()))
@@ -1283,7 +1687,7 @@ fn caller() {
                 .any(|diagnostic| {
                     diagnostic.code == "rust.compiler_target_unrepresented"
                         && diagnostic.path == Path::new("src/lib.rs")
-                        && diagnostic.line.is_some()
+                        && diagnostic.line.is_none()
                 })
         );
         assert!(
@@ -1293,11 +1697,12 @@ fn caller() {
                 .any(|diagnostic| {
                     diagnostic.code == "rust.receiver_method_resolution_unavailable"
                         && diagnostic.path == Path::new("src/lib.rs")
-                        && diagnostic.line.is_some()
+                        && diagnostic.line.is_none()
                 })
         );
         let compiler_loads = COMPILER_LOADS.load(Ordering::Relaxed);
         let compiler_extractions = COMPILER_EXTRACTIONS.load(Ordering::Relaxed);
+        let compiler_resolutions = COMPILER_RESOLUTIONS.load(Ordering::Relaxed);
         let source = format!("{source}\n// comment-only change\n");
         updated_snapshot.workspace.repositories[0]
             .inputs
@@ -1307,7 +1712,7 @@ fn caller() {
             .content = Arc::from(source.as_bytes());
         let mut stream = client
             .analyze(tokio_stream::iter(
-                analyze_requests(updated_snapshot).unwrap(),
+                analyze_requests(updated_snapshot.clone()).unwrap(),
             ))
             .await
             .unwrap()
@@ -1320,12 +1725,129 @@ fn caller() {
         assert_eq!(updated.overrides, contribution.overrides);
         assert_eq!(COMPILER_LOADS.load(Ordering::Relaxed), compiler_loads);
         assert_eq!(
+            COMPILER_RESOLUTIONS.load(Ordering::Relaxed),
+            compiler_resolutions
+        );
+        assert_eq!(
             COMPILER_EXTRACTIONS.load(Ordering::Relaxed),
             compiler_extractions + 1
         );
+
+        let body_source =
+            source.replace("    external();", "    let _marker = 1;\n    external();");
+        updated_snapshot.workspace.repositories[0]
+            .inputs
+            .iter_mut()
+            .find(|input| input.path == Path::new("src/lib.rs"))
+            .unwrap()
+            .content = Arc::from(body_source.as_bytes());
+        let baseline = RustAnalyzer::new(base.join("body-syntax-cache"))
+            .analyze(&updated_snapshot.workspace)
+            .unwrap()
+            .repositories
+            .into_iter()
+            .find(|repository| repository.repository == updated_snapshot.target_repository)
+            .unwrap();
+        updated_snapshot.baseline = SemanticSnapshot {
+            entities: baseline.entities,
+            observations: baseline.observations,
+        };
+        let resolutions_before_body = COMPILER_RESOLUTIONS.load(Ordering::Relaxed);
+        let mut stream = client
+            .analyze(tokio_stream::iter(
+                analyze_requests(updated_snapshot.clone()).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut events = Vec::new();
+        while let Some(event) = stream.message().await.unwrap() {
+            events.push(event);
+        }
+        let body_updated = contribution_from_events(events).unwrap();
+        let body_queries = COMPILER_RESOLUTIONS.load(Ordering::Relaxed) - resolutions_before_body;
+        let initial_queries = compiler_resolutions - resolutions_before_initial;
+        assert!(body_queries > 0);
+        assert!(body_queries < initial_queries);
+
+        let persisted = cache.join("rust-compiler-resolution-v1");
+        let expected_body = analyze(&body_source)
+            .unwrap()
+            .functions()
+            .find(|function| function.qualified_name() == "caller")
+            .unwrap()
+            .body_hash();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = fs::read_dir(&persisted).ok().and_then(|files| {
+                    files.filter_map(Result::ok).find_map(|file| {
+                        let cache = load_resolution_cache(&file.path());
+                        cache.cargo.values().find_map(|cargo| {
+                            cargo.files.values().find_map(|file| {
+                                file.symbols
+                                    .iter()
+                                    .find(|(symbol, _)| symbol.ends_with("/caller"))
+                                    .map(|(_, hashes)| hashes.body)
+                            })
+                        })
+                    })
+                });
+                if current == Some(expected_body) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         server.abort();
         let _ = server.await;
-        fs::remove_file(socket).unwrap();
+        let _ = fs::remove_file(&socket);
+
+        let mut restarted_server = tokio::spawn({
+            let socket = socket.clone();
+            let cache = cache.clone();
+            async move { serve(&socket, cache).await }
+        });
+        let endpoint = format!("unix:{}", socket.display());
+        let mut restarted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if restarted_server.is_finished() {
+                    panic!(
+                        "restarted Rust worker stopped before accepting: {:?}",
+                        (&mut restarted_server).await
+                    );
+                }
+                match AnalyzerWorkerClient::connect(endpoint.clone()).await {
+                    Ok(client) => break client,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let resolutions_before_restart = COMPILER_RESOLUTIONS.load(Ordering::Relaxed);
+        let mut stream = restarted
+            .analyze(tokio_stream::iter(
+                analyze_requests(updated_snapshot).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut events = Vec::new();
+        while let Some(event) = stream.message().await.unwrap() {
+            events.push(event);
+        }
+        let restarted = contribution_from_events(events).unwrap();
+        assert_eq!(restarted.overrides, body_updated.overrides);
+        assert_eq!(
+            COMPILER_RESOLUTIONS.load(Ordering::Relaxed),
+            resolutions_before_restart
+        );
+        assert_eq!(COMPILER_LOADS.load(Ordering::Relaxed), compiler_loads + 1);
+        restarted_server.abort();
+        let _ = restarted_server.await;
+        let _ = fs::remove_file(socket);
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -1361,6 +1883,58 @@ fn caller() {
                 PathBuf::from("repo/tools/two")
             ]
         );
+    }
+
+    #[test]
+    fn resolution_cache_round_trips_and_corruption_is_a_miss() {
+        let directory = std::env::temp_dir().join(format!(
+            "beholder-rust-resolution-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let path = directory.join("cache.json");
+        let key = ResolutionKey {
+            symbol: "repo://example/repo/rust/lib/run".into(),
+            ordinal: 0,
+            unresolved: "rust-call://work".into(),
+        };
+        let cache = PersistedWorkspaceCache {
+            version: RESOLUTION_CACHE_VERSION,
+            cargo: BTreeMap::from([(
+                String::new(),
+                PersistedCargoCache {
+                    files: BTreeMap::from([(
+                        "example/repo/src/lib.rs".into(),
+                        PersistedFileAnalysis {
+                            analyzable: true,
+                            module_hash: [1; 32],
+                            symbols: BTreeMap::from([(
+                                key.symbol.clone(),
+                                SymbolHashes {
+                                    interface: [2; 32],
+                                    body: [3; 32],
+                                },
+                            )]),
+                        },
+                    )]),
+                    resolutions: vec![PersistedResolution {
+                        key,
+                        resolution: CompilerResolution::Resolved(
+                            "repo://example/repo/rust/lib/work".into(),
+                        ),
+                    }],
+                },
+            )]),
+        };
+        persist_resolution_cache(&path, &cache).unwrap();
+        assert_eq!(load_resolution_cache(&path), cache);
+
+        fs::write(&path, b"not json").unwrap();
+        assert_eq!(
+            load_resolution_cache(&path),
+            PersistedWorkspaceCache::default()
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

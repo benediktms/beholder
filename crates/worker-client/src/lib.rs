@@ -4,6 +4,7 @@ mod plugin_registry;
 
 pub use plugin_registry::{InstalledPlugin, PluginRegistry, describe_plugin};
 
+use beholder_domain::SemanticRelation;
 use beholder_indexing::{
     AnalysisInput, AnalysisInputKind, AnalyzerError, AnalyzerMetadata, EnrichmentFuture,
     EnrichmentSnapshot, PluginDescriptor, PluginInputScope, WorkspaceEnricher,
@@ -80,6 +81,7 @@ pub struct WorkerAnalyzerBuilder {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    semantic_relations: BTreeSet<SemanticRelation>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
     timeout: Duration,
@@ -100,6 +102,7 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: BTreeMap::new(),
             excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
+            semantic_relations: BTreeSet::new(),
             plugin: None,
             persistent: false,
             timeout: ANALYSIS_INACTIVITY_TIMEOUT,
@@ -191,6 +194,11 @@ impl WorkerAnalyzerBuilder {
         self
     }
 
+    pub fn semantic_relation(mut self, relation: SemanticRelation) -> Self {
+        self.semantic_relations.insert(relation);
+        self
+    }
+
     pub fn build(self) -> Result<WorkerAnalyzer, AnalyzerError> {
         if self.metadata.id.is_empty() {
             return Err("worker analyzer identity must not be empty".into());
@@ -212,6 +220,7 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: self.parent_suffixes,
             excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
+            semantic_relations: self.semantic_relations,
             plugin: self.plugin,
             persistent: self.persistent,
             session: Mutex::new(None),
@@ -230,6 +239,7 @@ pub struct WorkerAnalyzer {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    semantic_relations: BTreeSet<SemanticRelation>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
     session: Mutex<Option<WorkerSession>>,
@@ -262,6 +272,7 @@ pub fn plugin_analyzer(
         parent_suffixes: BTreeMap::new(),
         excluded_path_suffixes: Vec::new(),
         identity_inputs: Vec::new(),
+        semantic_relations: BTreeSet::new(),
         plugin: Some(descriptor),
         persistent: false,
         session: Mutex::new(None),
@@ -364,7 +375,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         BTreeSet<beholder_domain::SemanticRelation>,
     ) {
         self.plugin.as_ref().map_or_else(
-            || (BTreeSet::new(), BTreeSet::new()),
+            || (BTreeSet::new(), self.semantic_relations.clone()),
             |plugin| {
                 (
                     plugin.semantic_entities.clone(),
@@ -654,7 +665,9 @@ impl Drop for SocketFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::{LogicalRepository, RepositoryState};
+    use beholder_domain::{
+        DependencyRelation, LogicalRepository, RepositoryState, SemanticRelation,
+    };
     use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot, WorkspaceSnapshot};
     use std::sync::Arc;
 
@@ -690,6 +703,7 @@ mod tests {
     fn worker_inputs_preserve_semantic_roles_and_shared_identity() {
         let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
             .identity("rust", "1")
+            .semantic_relation(SemanticRelation::Dependency(DependencyRelation::Calls))
             .accept_extension("rs")
             .accept_file_name_as("Cargo.lock", AnalysisInputKind::Dependency)
             .accept_path_suffix_as(".cargo/config.toml", AnalysisInputKind::Configuration)
@@ -734,6 +748,10 @@ mod tests {
             None
         );
         assert_eq!(worker.identity_inputs().len(), 1);
+        assert_eq!(
+            worker.semantic_inputs().1,
+            BTreeSet::from([SemanticRelation::Dependency(DependencyRelation::Calls)])
+        );
         assert_eq!(
             worker.analysis_input_kind(Path::new("target/generated.rs")),
             None
