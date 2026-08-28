@@ -3166,7 +3166,7 @@ fn sweep_unselected_enrichment_snapshots(
                     stale_states,
                     repositories,
                     completed_steps: index.try_into()?,
-                    total_steps: 4,
+                    total_steps: 5,
                 },
             )? {
                 return Ok(false);
