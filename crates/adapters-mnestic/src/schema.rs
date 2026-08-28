@@ -289,6 +289,15 @@ pub(super) const CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ENRICHMENT_DIAGNOSTIC_REPLACEMENT_SCHEMA: &str = r#"
+:create enrichment_diagnostic_replacement {
+    view: String,
+    owner: String,
+    repository: String,
+    code: String,
+}
+"#;
+
 pub(super) const CREATE_ENRICHMENT_ENTITY_SELECTION_SCHEMA: &str = r#"
 :create analysis_enrichment_entity_selection {
     view: String,

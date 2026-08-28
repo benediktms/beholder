@@ -152,6 +152,7 @@ impl WorkspaceAnalyzer for ProtobufAnalyzer {
                 grpc_bindings: Vec::new(),
                 observations,
                 diagnostics,
+                replaced_diagnostic_codes: Default::default(),
                 fact_shards: Vec::new(),
             });
         }

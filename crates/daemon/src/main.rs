@@ -211,9 +211,10 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         )
         .identity(
             RUST_WORKER_ID,
-            "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-10",
+            "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-11",
         )
         .persistent()
+        .semantic_shard_producer(RUST_WORKER_ID)
         .semantic_relation(SemanticRelation::Dependency(DependencyRelation::Calls))
         .accept_extension("rs")
         .accept_file_name_as("Cargo.toml", AnalysisInputKind::Dependency)

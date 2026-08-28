@@ -141,12 +141,19 @@ matches the revision's expected enrichment fingerprint, so query freshness is
 reported as stale for the affected repository until a replacement snapshot is
 selected.
 
-Rust enrichment currentness is derived from selected Rust semantic shard
-versions plus dependency, configuration, toolchain, and environment inputs.
-Raw repository fingerprints remain a separate immutable-generation guard before
-and after worker execution. An unsafe Rust file contributes its own conservative
-raw shard, so it cannot force unrelated valid files back to repository-wide raw
-currentness.
+Enrichers declare whether currentness is derived from raw source inputs or from
+selected semantic shard producers. Semantic-shard currentness also includes the
+enricher's dependency, configuration, toolchain, and environment inputs. Raw
+repository fingerprints remain a separate immutable-generation guard before and
+after worker execution. Rust is the first adopter; an unsafe Rust file contributes
+its own conservative raw shard, so it cannot force unrelated valid files back to
+repository-wide raw currentness.
+
+An enrichment snapshot may also claim exact baseline diagnostic codes that it
+replaces while selected. These claims are analyzer output carried through the
+shared worker protocol and publication model; query storage does not encode
+language or analyzer identities. Removing or replacing the selected snapshot
+therefore restores the baseline diagnostic without analyzer-specific query logic.
 
 Queries join the selected snapshots and resolve only their logical collisions:
 base facts win, while competing analyzer facts use confidence and stable analyzer

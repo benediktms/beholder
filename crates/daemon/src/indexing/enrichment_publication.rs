@@ -38,6 +38,7 @@ pub(crate) struct EnrichmentContribution<'a> {
     pub(crate) observations: &'a [Observation],
     pub(crate) overrides: &'a [DependencyOverride],
     pub(crate) diagnostics: &'a [(String, AnalysisDiagnostic)],
+    pub(crate) diagnostic_replacements: &'a [(String, String)],
 }
 
 pub(crate) struct EnrichmentPublicationRequest<'a> {
@@ -118,6 +119,7 @@ impl EnrichmentPublication for SemanticStore {
                 observations: request.contribution.observations,
                 overrides: request.contribution.overrides,
                 diagnostics: request.contribution.diagnostics,
+                diagnostic_replacements: request.contribution.diagnostic_replacements,
             },
         )
     }

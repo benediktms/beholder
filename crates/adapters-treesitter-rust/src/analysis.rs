@@ -119,6 +119,9 @@ fn tree_sitter_semantic_hash<'tree>(
     let mut stack = roots.into_iter().collect::<Vec<_>>();
     stack.reverse();
     while let Some(node) = stack.pop() {
+        if is_optional_trailing_comma(node) {
+            continue;
+        }
         if matches!(node.kind(), "line_comment" | "block_comment")
             && !is_doc_comment(&source[node.byte_range()])
         {
@@ -139,10 +142,41 @@ fn tree_sitter_semantic_hash<'tree>(
     digest.finalize().into()
 }
 
+fn is_optional_trailing_comma(node: Node<'_>) -> bool {
+    node.kind() == ","
+        && node
+            .next_sibling()
+            .is_some_and(|next| matches!(next.kind(), ")" | "]" | "}"))
+        && node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "arguments"
+                    | "array_expression"
+                    | "closure_parameters"
+                    | "enum_variant_list"
+                    | "field_declaration_list"
+                    | "field_initializer_list"
+                    | "match_block"
+                    | "ordered_field_declaration_list"
+                    | "parameters"
+                    | "scoped_use_list"
+                    | "slice_pattern"
+                    | "struct_pattern"
+                    | "tuple_struct_pattern"
+                    | "type_arguments"
+                    | "type_parameters"
+                    | "use_list"
+            )
+        })
+}
+
 fn tree_sitter_module_hash(root: Node<'_>, source: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if is_optional_trailing_comma(node) {
+            continue;
+        }
         if node.kind() == "function_item"
             || matches!(node.kind(), "line_comment" | "block_comment")
                 && !is_doc_comment(&source[node.byte_range()])

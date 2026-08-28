@@ -68,7 +68,7 @@ use beholder_protocol::{
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     path::{Path, PathBuf},
@@ -278,6 +278,7 @@ pub struct Output {
     entities: Vec<EntityFact>,
     observations: Vec<Observation>,
     diagnostics: Vec<AnalysisDiagnostic>,
+    replaced_diagnostic_codes: BTreeSet<String>,
     incomplete: bool,
 }
 
@@ -352,6 +353,11 @@ impl Output {
         });
     }
 
+    /// Replaces one baseline diagnostic code while this contribution is selected.
+    pub fn replace_diagnostic_code(&mut self, code: impl Into<String>) {
+        self.replaced_diagnostic_codes.insert(code.into());
+    }
+
     /// Marks the target contribution incomplete while preserving valid facts.
     pub fn mark_incomplete(&mut self) {
         self.incomplete = true;
@@ -375,6 +381,7 @@ impl Output {
                 grpc_bindings: Vec::new(),
                 observations: self.observations,
                 diagnostics: self.diagnostics,
+                replaced_diagnostic_codes: self.replaced_diagnostic_codes,
                 fact_shards: Vec::new(),
             }],
             overrides: Vec::new(),
@@ -502,6 +509,7 @@ impl<A: Analyzer> AnalyzerWorker for PluginService<A> {
                     entities: Vec::new(),
                     observations: Vec::new(),
                     diagnostics: Vec::new(),
+                    replaced_diagnostic_codes: BTreeSet::new(),
                     incomplete: false,
                 };
                 let digest = std::env::var("BEHOLDER_PLUGIN_DIGEST")

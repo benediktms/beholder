@@ -65,6 +65,7 @@ pub struct EnrichmentPayload<'a> {
     pub observations: &'a [Observation],
     pub overrides: &'a [DependencyOverride],
     pub diagnostics: &'a [(String, AnalysisDiagnostic)],
+    pub diagnostic_replacements: &'a [(String, String)],
 }
 
 #[derive(Clone, Copy)]

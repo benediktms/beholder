@@ -101,6 +101,7 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         CREATE_ENRICHMENT_OBSERVATION_CONTRIBUTION_SCHEMA,
         CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_SCHEMA,
         CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA,
+        CREATE_ENRICHMENT_DIAGNOSTIC_REPLACEMENT_SCHEMA,
         CREATE_ENRICHMENT_ENTITY_SELECTION_SCHEMA,
         CREATE_ENRICHMENT_OBSERVATION_SELECTION_SCHEMA,
         CREATE_ENRICHMENT_OVERRIDE_SELECTION_SCHEMA,
@@ -355,6 +356,10 @@ pub(super) fn persistent_database(
         (
             "enrichment_diagnostic_contribution",
             CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA,
+        ),
+        (
+            "enrichment_diagnostic_replacement",
+            CREATE_ENRICHMENT_DIAGNOSTIC_REPLACEMENT_SCHEMA,
         ),
         (
             "analysis_enrichment_entity_selection",

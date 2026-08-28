@@ -250,6 +250,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                 grpc_bindings: enrichment.grpc_bindings,
                 observations,
                 diagnostics,
+                replaced_diagnostic_codes: Default::default(),
                 fact_shards,
             });
         }
@@ -372,6 +373,7 @@ mod tests {
     use super::*;
     use beholder_domain::{EntityKind, LogicalRepository, RepositoryState};
     use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot};
+    use std::collections::BTreeMap;
     use std::fs;
 
     #[test]
@@ -426,6 +428,62 @@ mod tests {
             diagnostic.code == "rust.parse_recovery"
                 && diagnostic.path == Path::new("tests/ui/invalid.rs")
         }));
+        fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn rustfmt_changes_do_not_change_fact_shard_versions() {
+        let cache = std::env::temp_dir().join(format!(
+            "beholder-rust-shard-version-test-{}",
+            std::process::id()
+        ));
+        let analyzer = RustAnalyzer::new(cache.clone());
+        let analyze = |fingerprint: &str, source: &str| {
+            analyzer
+                .analyze(&WorkspaceSnapshot {
+                    name: "test".into(),
+                    repositories: vec![RepositorySnapshot {
+                        base: PathBuf::from("repo"),
+                        state: RepositoryState {
+                            repository: LogicalRepository {
+                                identity: "example/repo".into(),
+                            },
+                            head: None,
+                            fingerprint: fingerprint.into(),
+                        },
+                        inputs: vec![RepositoryInput {
+                            path: "src/main.rs".into(),
+                            content: Arc::from(source.as_bytes()),
+                            kind: InputKind::Source,
+                        }],
+                    }],
+                })
+                .unwrap()
+                .repositories
+                .remove(0)
+                .fact_shards
+                .into_iter()
+                .map(|shard| (shard.owner.clone(), shard))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let compact = analyze(
+            "compact",
+            "struct Greeter; impl Greeter { fn message(&self) -> &'static str { \"hello\" } } fn main() { let greeter = Greeter; println!(\"{}\", greeter.message()); }",
+        );
+        let formatted = analyze(
+            "formatted",
+            "struct Greeter;\n\nimpl Greeter {\n    fn message(\n        &self,\n    ) -> &'static str {\n        \"hello\"\n    }\n}\n\nfn main() {\n    let greeter = Greeter;\n    println!(\"{}\", greeter.message());\n}\n",
+        );
+
+        assert_eq!(
+            compact.keys().collect::<Vec<_>>(),
+            formatted.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            compact
+                .iter()
+                .all(|(owner, shard)| { shard.version == formatted[owner].version })
+        );
         fs::remove_dir_all(cache).unwrap();
     }
 }
