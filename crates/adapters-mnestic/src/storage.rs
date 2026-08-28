@@ -2276,13 +2276,6 @@ pub(super) fn publish_enrichment(
 
     let snapshot = enrichment_snapshot_id(repository, input_fingerprint, &owner, &payload);
     let EnrichmentOwner { analyzer, version } = owner;
-    let EnrichmentPayload {
-        entities,
-        observations,
-        overrides,
-        diagnostics,
-        diagnostic_replacements,
-    } = payload;
     let owner = snapshot;
     let transaction = db.multi_transaction(true);
     let current = transaction.run_script(
@@ -2350,11 +2343,7 @@ pub(super) fn publish_enrichment(
             &transaction,
             view,
             &owner,
-            entities,
-            observations,
-            overrides,
-            diagnostics,
-            diagnostic_replacements,
+            &payload,
         )?;
         complete_enrichment(
             &transaction,
@@ -2369,11 +2358,11 @@ pub(super) fn publish_enrichment(
             target: "beholder::publication",
             stage = "enrichment_store_snapshot",
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            entities = entities.len(),
-            observations = observations.len(),
-            overrides = overrides.len(),
-            diagnostics = diagnostics.len(),
-            diagnostic_replacements = diagnostic_replacements.len(),
+            entities = payload.entities.len(),
+            observations = payload.observations.len(),
+            overrides = payload.overrides.len(),
+            diagnostics = payload.diagnostics.len(),
+            diagnostic_replacements = payload.diagnostic_replacements.len(),
             "Mnestic enrichment publication stage completed"
         );
     }
@@ -2600,11 +2589,7 @@ fn replace_enrichment_contributions(
     transaction: &MultiTransaction,
     view: &str,
     owner: &str,
-    entities: &[EntityFact],
-    observations: &[Observation],
-    overrides: &[DependencyOverride],
-    diagnostics: &[(String, beholder_domain::AnalysisDiagnostic)],
-    diagnostic_replacements: &[(String, String)],
+    payload: &EnrichmentPayload<'_>,
 ) -> Result<(), Box<dyn Error>> {
     let params = BTreeMap::from([("view".into(), view.into()), ("owner".into(), owner.into())]);
     for script in [
@@ -2640,7 +2625,7 @@ fn replace_enrichment_contributions(
     ] {
         transaction.run_script(script, params.clone())?;
     }
-    for entities in entities.chunks(FACT_BATCH_SIZE) {
+    for entities in payload.entities.chunks(FACT_BATCH_SIZE) {
         let rows = entities
             .iter()
             .map(|entity| {
@@ -2659,7 +2644,7 @@ fn replace_enrichment_contributions(
             BTreeMap::from([("rows".into(), DataValue::List(rows))]),
         )?;
     }
-    for observations in observations.chunks(FACT_BATCH_SIZE) {
+    for observations in payload.observations.chunks(FACT_BATCH_SIZE) {
         let rows = observations
             .iter()
             .map(|observation| {
@@ -2683,7 +2668,7 @@ fn replace_enrichment_contributions(
             BTreeMap::from([("rows".into(), DataValue::List(rows))]),
         )?;
     }
-    for overrides in overrides.chunks(FACT_BATCH_SIZE) {
+    for overrides in payload.overrides.chunks(FACT_BATCH_SIZE) {
         let rows = overrides
             .iter()
             .map(|override_| {
@@ -2709,7 +2694,7 @@ fn replace_enrichment_contributions(
             BTreeMap::from([("rows".into(), DataValue::List(rows))]),
         )?;
     }
-    for diagnostics in diagnostics.chunks(FACT_BATCH_SIZE) {
+    for diagnostics in payload.diagnostics.chunks(FACT_BATCH_SIZE) {
         let rows = diagnostics
             .iter()
             .map(|(repository, diagnostic)| {
@@ -2733,7 +2718,7 @@ fn replace_enrichment_contributions(
             BTreeMap::from([("rows".into(), DataValue::List(rows))]),
         )?;
     }
-    for replacements in diagnostic_replacements.chunks(FACT_BATCH_SIZE) {
+    for replacements in payload.diagnostic_replacements.chunks(FACT_BATCH_SIZE) {
         let rows = replacements
             .iter()
             .map(|(repository, code)| {
