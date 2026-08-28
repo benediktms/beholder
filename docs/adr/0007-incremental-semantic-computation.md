@@ -52,6 +52,13 @@ outgoing facts while leaving its interface and callers unchanged. An interface
 change propagates through reverse analysis dependencies until recomputed outputs
 compare equal.
 
+Rust semantic fingerprints ignore ordinary comments, whitespace, and pure
+`rustfmt` reflow, including formatting that changes a function body's source
+layout. Documentation comments, attributes, imports, signatures, body tokens,
+macros, analyzer configuration, and toolchain identity remain semantic inputs.
+Files containing position-sensitive `line!` or `column!` macros retain raw source
+identity because otherwise moving the macro would incorrectly appear unchanged.
+
 ### Identities and fingerprints
 
 The Rust slice introduces stable identities for files, modules, and externally
@@ -94,9 +101,13 @@ serialization operations.
 
 Salsa's durability levels are validation hints for inputs with different change
 frequencies. They are not durable storage. Mnestic remains the durable authority
-for semantic facts and completed revisions. Cross-process persistence of the
-Salsa database is not required for the initial Rust slice and will be evaluated
-only after warm-process incrementality is measured.
+for semantic facts and completed revisions. The Salsa database and rust-analyzer
+database remain process-local. Rust compiler call-resolution results use a
+two-tier rebuildable cache: the warm worker owns the authoritative in-memory
+copy, while one versioned file per compiler project shape is written by a
+coalescing background thread for reuse after restart. Cache writes do not share
+Mnestic's writer, block enrichment completion or graceful shutdown, and cache
+absence, corruption, or version mismatch is a normal miss.
 
 ### Fact ownership and revisions
 
@@ -129,6 +140,13 @@ input changes, the newest selected snapshot remains queryable but no longer
 matches the revision's expected enrichment fingerprint, so query freshness is
 reported as stale for the affected repository until a replacement snapshot is
 selected.
+
+Rust enrichment currentness is derived from selected Rust semantic shard
+versions plus dependency, configuration, toolchain, and environment inputs.
+Raw repository fingerprints remain a separate immutable-generation guard before
+and after worker execution. An unsafe Rust file contributes its own conservative
+raw shard, so it cannot force unrelated valid files back to repository-wide raw
+currentness.
 
 Queries join the selected snapshots and resolve only their logical collisions:
 base facts win, while competing analyzer facts use confidence and stable analyzer
@@ -173,6 +191,15 @@ Other language frontends adopt the boundary only after the Rust slice proves it.
 The shared contract will be extracted from at least two real frontends rather
 than predicting every language's symbol model in advance.
 
+The delivered Rust slices implement file and symbol fingerprints, owner-scoped
+fact shards, semantic enrichment currentness, baseline-driven compiler
+enrichment, and in-memory plus disposable-disk call-resolution reuse. Rust
+source modules also record compiler-resolved import and out-of-line module
+dependencies. A module or symbol-interface change recomputes strongly connected
+components over the previous and current dependency topology, then invalidates
+only the changed component and its reverse dependants. Function-body changes
+still invalidate only their owning symbols, without recomputing module SCCs.
+
 ## Consequences
 
 - Ordinary edits no longer imply repository-wide semantic recomputation or
@@ -182,13 +209,14 @@ than predicting every language's symbol model in advance.
   the incremental engine.
 - The existing semantic graph remains the query result and cross-repository
   semantic model; it does not decide what source analysis must run.
-- Compiler-backed enrichment may remain repository-scoped initially. Its outputs
-  can later become tracked coarse inputs without moving subprocess side effects
-  into Salsa.
+- Compiler-backed enrichment remains repository-scoped, but the Rust worker is a
+  persistent incremental consumer: it applies source changes to one warm
+  rust-analyzer database and rebuilds only when project structure or compiler
+  configuration changes. Compiler subprocess side effects remain outside Salsa.
 - Mnestic delta publication is part of the first usable implementation because
   full baseline replacement is already a measured bottleneck.
-- Cache eviction, cross-process query persistence, incremental Tree-sitter edits,
-  and dynamic SCC maintenance are deferred until profiling shows they are needed.
+- Cache eviction, Salsa query persistence, incremental Tree-sitter edits, and
+  dynamic SCC maintenance are deferred until profiling shows they are needed.
 
 ## References
 

@@ -119,7 +119,9 @@ fn tree_sitter_semantic_hash<'tree>(
     let mut stack = roots.into_iter().collect::<Vec<_>>();
     stack.reverse();
     while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "line_comment" | "block_comment") {
+        if matches!(node.kind(), "line_comment" | "block_comment")
+            && !is_doc_comment(&source[node.byte_range()])
+        {
             continue;
         }
         if node.child_count() == 0 {
@@ -137,6 +139,53 @@ fn tree_sitter_semantic_hash<'tree>(
     digest.finalize().into()
 }
 
+fn tree_sitter_module_hash(root: Node<'_>, source: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_item"
+            || matches!(node.kind(), "line_comment" | "block_comment")
+                && !is_doc_comment(&source[node.byte_range()])
+        {
+            continue;
+        }
+        if node.child_count() == 0 {
+            let text = &source[node.byte_range()];
+            digest.update((node.kind().len() as u64).to_le_bytes());
+            digest.update(node.kind().as_bytes());
+            digest.update((text.len() as u64).to_le_bytes());
+            digest.update(text);
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    digest.finalize().into()
+}
+
+fn tree_sitter_module_reference_offsets(root: Node<'_>) -> Vec<usize> {
+    let mut references = Vec::new();
+    let mut stack = vec![(root, false)];
+    while let Some((node, in_use)) = stack.pop() {
+        let in_use = in_use || node.kind() == "use_declaration";
+        if in_use && matches!(node.kind(), "identifier" | "crate" | "self" | "super") {
+            references.push(node.start_byte());
+        }
+        if node.kind() == "mod_item"
+            && node.child_by_field_name("body").is_none()
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            references.push(name.start_byte());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor).map(|child| (child, in_use)));
+    }
+    references.sort_unstable();
+    references.dedup();
+    references
+}
+
 fn rust_analyzer_semantic_hash(
     node: &SyntaxNode,
     include: impl Fn(ra_ap_syntax::TextRange) -> bool,
@@ -146,7 +195,9 @@ fn rust_analyzer_semantic_hash(
         .descendants_with_tokens()
         .filter_map(|element| element.into_token())
     {
-        if token.kind().is_trivia() || !include(token.text_range()) {
+        if token.kind().is_trivia() && !is_doc_comment(token.text().as_bytes())
+            || !include(token.text_range())
+        {
             continue;
         }
         let text = token.text();
@@ -154,6 +205,13 @@ fn rust_analyzer_semantic_hash(
         digest.update(text.as_bytes());
     }
     digest.finalize().into()
+}
+
+fn is_doc_comment(text: &[u8]) -> bool {
+    text.starts_with(b"///")
+        || text.starts_with(b"//!")
+        || text.starts_with(b"/**")
+        || text.starts_with(b"/*!")
 }
 
 fn analyze_tree_sitter(
@@ -173,6 +231,8 @@ fn analyze_tree_sitter(
         return Err(UnsafeTreeRecovery::new("Rust", "no unaffected definitions remain").into());
     }
     Ok(RustAnalysis {
+        module_hash: tree_sitter_module_hash(root, source_bytes),
+        module_reference_offsets: tree_sitter_module_reference_offsets(root),
         functions: functions
             .into_iter()
             .map(|(name, qualified_name, function)| {
@@ -301,6 +361,44 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
         .collect()
 }
 
+fn rust_analyzer_module_hash(file: &SourceFile) -> [u8; 32] {
+    let functions = file
+        .syntax()
+        .descendants()
+        .filter_map(ast::Fn::cast)
+        .map(|function| function.syntax().text_range())
+        .collect::<Vec<_>>();
+    rust_analyzer_semantic_hash(file.syntax(), |range| {
+        !functions
+            .iter()
+            .any(|function| function.contains_range(range))
+    })
+}
+
+fn rust_analyzer_module_reference_offsets(file: &SourceFile) -> Vec<usize> {
+    let mut references = file
+        .syntax()
+        .descendants()
+        .filter(|node| {
+            node.ancestors()
+                .any(|ancestor| ast::Use::cast(ancestor).is_some())
+        })
+        .filter_map(ast::NameRef::cast)
+        .map(|name| usize::from(name.syntax().text_range().start()))
+        .collect::<Vec<_>>();
+    references.extend(
+        file.syntax()
+            .descendants()
+            .filter_map(ast::Module::cast)
+            .filter(|module| module.item_list().is_none())
+            .filter_map(|module| module.name())
+            .map(|name| usize::from(name.syntax().text_range().start())),
+    );
+    references.sort_unstable();
+    references.dedup();
+    references
+}
+
 fn disambiguate_function_names(functions: &mut [RustFunction]) {
     let totals = functions
         .iter()
@@ -349,6 +447,8 @@ pub(super) fn analyze_with_plugins(
         let parsed = SourceFile::parse(source, Edition::CURRENT);
         if parsed.errors().is_empty() {
             RustAnalysis {
+                module_hash: rust_analyzer_module_hash(&parsed.tree()),
+                module_reference_offsets: rust_analyzer_module_reference_offsets(&parsed.tree()),
                 functions: rust_analyzer_functions(source, &parsed.tree()),
                 tonic: Default::default(),
                 parse_error_lines: Vec::new(),
@@ -556,5 +656,23 @@ mod recovery_tests {
 
         assert_eq!(names(source), vec!["path_bytes#0", "path_bytes#1"]);
         assert_eq!(names(source), names(&shifted));
+    }
+
+    #[test]
+    fn records_module_import_and_declaration_references() {
+        let source = "mod local; use crate::{local::Thing, other}; fn run() {}";
+        let analysis = analyze(source).unwrap();
+        let references = analysis
+            .module_reference_offsets()
+            .map(|offset| {
+                &source[offset
+                    ..offset
+                        + source[offset..]
+                            .find(|c: char| !c.is_alphanumeric() && c != '_')
+                            .unwrap_or(source.len() - offset)]
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(references, ["local", "crate", "local", "Thing", "other"]);
     }
 }

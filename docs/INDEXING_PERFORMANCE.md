@@ -207,8 +207,63 @@ storing the revision manifest, and 43 ms committing. Scheduler publication was
 the effective-observation read, rebuild, or diff. Legacy repository-snapshot
 publication retains the full effective diff because its public result requires it.
 
-This is the first executable slice, not the final performance target. Salsa state
-is process-local, compiler enrichment still uses its existing input identity, and
-non-Rust frontends still publish through repository facts. Cross-process query
-persistence and other language frontends should be added only after changed-file
-installed-daemon measurements identify the next dominant stage.
+This is the first executable slice, not the final performance target. The next
+installed-daemon measurement identified repository-wide compiler enrichment as
+the dominant stage: a comment-only Rust edit spent 9.96 seconds in the worker,
+versus 1.89 seconds for inventory, incremental syntax analysis, and base
+publication together. The Rust worker now remains alive and retains one bounded
+rust-analyzer database. Source changes are applied to that database; project
+structure and compiler-configuration changes rebuild it. Other language
+frontends still publish through repository facts and should migrate only after
+their own changed-file measurements justify it.
+
+Two comment-only edits against the installed persistent worker kept the same
+worker process and reduced compiler analysis from 9.14 seconds to 6.00 and 6.92
+seconds. The corresponding base indexing operations took 2.50 and 1.43 seconds;
+enrichment publication took 1.27 seconds and 474 ms. Retaining the compiler
+database therefore removes startup and workspace loading, but repository-wide
+override recomputation remains the dominant cost. The next optimization boundary
+is incremental compiler-result production, not worker lifecycle or SQLite commit
+throughput.
+
+Phase instrumentation then showed that a warm run spent 2.93 seconds rebuilding
+file-level call and definition positions and 1.82 seconds querying 19,019 call
+sites. Retaining those positions per compiler file and reparsing only changed
+files reduced warm extraction to 439 ms and total compiler enrichment to 2.56
+seconds. End-to-end worker analysis took 3.10 seconds, while base indexing took
+1.24 seconds and enrichment publication took 334 ms. The remaining compiler hot
+path is the repository-wide `goto_definition` sweep; safely narrowing it requires
+dependency-aware invalidation rather than a source-file-only result cache.
+
+The next slice made compiler currentness semantic and cached call-resolution
+outputs by stable symbol and call-site identity. Its 2026-08-28 isolated
+self-index run used 177 accepted inputs and 19,035 Rust call sites:
+
+| Edit | Compiler query stage | Resolution hits | Resolution misses | Outcome |
+| --- | ---: | ---: | ---: | --- |
+| Ordinary comment | skipped | — | — | Base index only; 27,187 shard rows unchanged |
+| Warm function body | 344 ms | 19,008 | 27 | 602 ms worker enrichment |
+| Function body after restart | 1.62 s | 19,008 | 27 | 2.40 s worker enrichment |
+
+The warm measurement satisfies the sub-500 ms compiler-query target; the worker
+total also includes snapshot validation, contribution handling, and cache
+scheduling. On restart, the 4.9 MB disposable cache loaded in 14.5 ms and retained
+the same 19,008 results. The remaining 1.57 seconds was cold rust-analyzer file
+extraction, which is intentionally process-local rather than persisted.
+
+The worker now consumes selected baseline call facts instead of running a second
+syntax analyzer. Baseline selection tolerates unresolved external endpoints and
+compiler overrides rebase onto the current baseline evidence, so a carried
+enrichment cannot preserve obsolete line evidence. Ordinary comments, whitespace,
+and pure formatting are enrichment no-ops; documentation, attributes, imports,
+interfaces, body tokens, macros, compiler configuration, and toolchain changes
+still invalidate the appropriate semantic boundary.
+
+Rust compiler summaries now retain compiler-resolved import and out-of-line
+module dependencies. Interface and module-surface changes invalidate the changed
+strongly connected component and its reverse dependants across both the old and
+new topology; unrelated modules keep their cached call resolutions. Body changes
+still invalidate only their owning symbol's cached resolutions. A worker
+integration fixture verifies that an interface edit reruns dependent calls while
+an unrelated module remains a cache hit; production-scale timing remains to be
+recorded with an installed binary.

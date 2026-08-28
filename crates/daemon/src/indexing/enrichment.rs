@@ -39,6 +39,27 @@ impl IndexScheduler {
         store.ensure_revision_inputs(view)?;
         Ok(())
     }
+
+    pub(super) fn enrichment_inputs_complete(
+        &self,
+        store: &SemanticStore,
+        view: &WorkspaceView,
+    ) -> Result<bool, Box<dyn Error>> {
+        for analyzer in view.enrichment_analyzers() {
+            for state in &view.repository_states {
+                let repository = &state.repository.identity;
+                if store
+                    .revision_enrichment_input_fingerprint(&view.name, repository, analyzer)?
+                    .is_none()
+                    || store.repository_contexts(&view.name, repository, analyzer)?
+                        != view.repository_contexts(repository, analyzer)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
 }
 
 impl IndexScheduler {
@@ -329,14 +350,13 @@ impl IndexScheduler {
         else {
             return Ok(EnrichmentOutcome::Superseded);
         };
-        if self.current_enrichment_input_fingerprint(
+        if !self.current_revision_inputs_match(
             &snapshot,
             workspace,
             &repository,
-            &worker.id,
             &state.contexts,
-        )? != input_fingerprint
-        {
+            &state.revision_inputs,
+        )? {
             return Ok(EnrichmentOutcome::Superseded);
         }
         if store
@@ -403,14 +423,13 @@ impl IndexScheduler {
         }
         let (current, _) = refresh_workspace_snapshot(self, &workspace_config, None)
             .map_err(|error| error.to_string())?;
-        if self.current_enrichment_input_fingerprint(
+        if !self.current_revision_inputs_match(
             &current,
             workspace,
             &repository,
-            &worker.id,
             &contexts,
-        )? != input_fingerprint
-        {
+            &state.revision_inputs,
+        )? {
             return Ok(EnrichmentOutcome::Superseded);
         }
         let mut diagnostics = contribution.diagnostics;
@@ -444,14 +463,14 @@ impl IndexScheduler {
         .map_err(|error| error.to_string())
     }
 
-    fn current_enrichment_input_fingerprint(
+    fn current_revision_inputs_match(
         &self,
         snapshot: &WorkspaceSnapshot,
         workspace: &str,
         repository: &str,
-        worker: &str,
         contexts: &[String],
-    ) -> Result<String, String> {
+        expected: &BTreeMap<String, String>,
+    ) -> Result<bool, String> {
         let plan = self.indexer.prepare(snapshot);
         let view = WorkspaceView::new_scoped(
             workspace,
@@ -462,26 +481,18 @@ impl IndexScheduler {
                 .map(|repository| repository.state.clone())
                 .collect(),
             plan.repository_enrichment_identities(),
-        )?
-        .with_repository_contexts(BTreeMap::from([(
-            worker.to_owned(),
-            BTreeMap::from([(repository.to_owned(), contexts.to_vec())]),
-        )]))?
-        .with_repository_enrichment_inputs(BTreeMap::from([(
-            worker.to_owned(),
-            self.indexer
-                .enrichment_input_identities(snapshot)
-                .remove(worker)
-                .ok_or_else(|| format!("unknown enrichment worker {worker}"))?,
-        )]))?;
-        let state = view
-            .repository_states
-            .iter()
-            .find(|state| state.repository.identity == repository)
-            .ok_or_else(|| {
-                format!("repository is no longer in workspace {workspace}: {repository}")
-            })?;
-        Ok(view.repository_enrichment_input_fingerprint(state, worker))
+        )?;
+        Ok(std::iter::once(repository)
+            .chain(contexts.iter().map(String::as_str))
+            .all(|identity| {
+                view.repository_states
+                    .iter()
+                    .find(|state| state.repository.identity == identity)
+                    .zip(expected.get(identity))
+                    .is_some_and(|(state, expected)| {
+                        view.repository_input_fingerprint(state) == *expected
+                    })
+            }))
     }
 }
 

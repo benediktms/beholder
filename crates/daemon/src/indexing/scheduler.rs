@@ -771,6 +771,9 @@ impl IndexScheduler {
             .indexer
             .analyze_prepared(&snapshot, &plan)
             .map_err(erase_error)?;
+        let enrichment_input_identities = self
+            .indexer
+            .analyzed_enrichment_input_identities(&snapshot, &analysis);
         if self.is_stopping() {
             return Err(scheduler_unavailable().into());
         }
@@ -812,9 +815,7 @@ impl IndexScheduler {
                     })
                     .collect(),
             )?
-            .with_repository_enrichment_inputs(
-                self.indexer.enrichment_input_identities(&snapshot),
-            )?;
+            .with_repository_enrichment_inputs(enrichment_input_identities)?;
         let current = self.inventory.refresh(
             &repository.repository.identity,
             &repository.base,
@@ -2219,51 +2220,48 @@ fn index_workspace_through_port(
         analysis_plan.repository_enrichment_identities(),
     )?;
     if store.view_matches(&view)? {
-        view = view
-            .with_repository_contexts(
-                scheduler
-                    .indexer
-                    .enrichment_catalog()
-                    .into_iter()
-                    .map(|analyzer| {
-                        let contexts = snapshot
-                            .repositories
-                            .iter()
-                            .map(|repository| {
-                                let target = &repository.state.repository.identity;
-                                Ok((
-                                    target.clone(),
-                                    store.repository_contexts(
-                                        &workspace.name,
-                                        target,
-                                        &analyzer.id,
-                                    )?,
-                                ))
-                            })
-                            .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
-                        Ok((
-                            analyzer.id.clone(),
-                            merge_declared_contexts(
-                                &scheduler.indexer,
-                                &snapshot,
-                                &analyzer.id,
-                                contexts,
-                            ),
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
-            )?
-            .with_repository_enrichment_inputs(
-                scheduler.indexer.enrichment_input_identities(&snapshot),
-            )?;
-        if scheduler.is_stopping() && !drain_on_shutdown {
+        view = view.with_repository_contexts(
+            scheduler
+                .indexer
+                .enrichment_catalog()
+                .into_iter()
+                .map(|analyzer| {
+                    let contexts = snapshot
+                        .repositories
+                        .iter()
+                        .map(|repository| {
+                            let target = &repository.state.repository.identity;
+                            Ok((
+                                target.clone(),
+                                store.repository_contexts(&workspace.name, target, &analyzer.id)?,
+                            ))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+                    Ok((
+                        analyzer.id.clone(),
+                        merge_declared_contexts(
+                            &scheduler.indexer,
+                            &snapshot,
+                            &analyzer.id,
+                            contexts,
+                        ),
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?,
+        )?;
+        if scheduler.enrichment_inputs_complete(store, &view)? {
+            if scheduler.is_stopping() && !drain_on_shutdown {
+                return Ok((0, false));
+            }
+            store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
+            scheduler.store_checkpoint(workspace, &snapshot, &verification_fingerprint);
+            tracing::info!(workspace = %workspace.name, "workspace unchanged");
             return Ok((0, false));
         }
-        store.store_verification_fingerprint(&workspace.name, &verification_fingerprint)?;
-        scheduler.ensure_enrichment_inputs(store, &view)?;
-        scheduler.store_checkpoint(workspace, &snapshot, &verification_fingerprint);
-        tracing::info!(workspace = %workspace.name, "workspace unchanged");
-        return Ok((0, false));
+        tracing::info!(
+            workspace = %workspace.name,
+            "workspace enrichment inputs require semantic reconstruction"
+        );
     }
 
     let dirty_source_units = snapshot
@@ -2307,6 +2305,9 @@ fn index_workspace_through_port(
             .analyze_prepared(&snapshot, &analysis_plan)
             .map_err(erase_error)
     })?;
+    let enrichment_input_identities = scheduler
+        .indexer
+        .analyzed_enrichment_input_identities(&snapshot, &analysis);
     if scheduler.is_stopping() && !drain_on_shutdown {
         return Ok((0, false));
     }
@@ -2350,9 +2351,7 @@ fn index_workspace_through_port(
                 })
                 .collect(),
         )?
-        .with_repository_enrichment_inputs(
-            scheduler.indexer.enrichment_input_identities(&snapshot),
-        )?;
+        .with_repository_enrichment_inputs(enrichment_input_identities)?;
     let observation_count = repository_facts
         .iter()
         .map(|facts| facts.observations.len())

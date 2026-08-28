@@ -36,6 +36,12 @@ The Rust worker is the first implementation. It reuses the existing syntax
 adapter to establish source identities and uses rust-analyzer to replace
 heuristic call targets with exact compiler-backed targets. A compiler failure
 leaves the published syntax graph intact and emits a typed non-fatal diagnostic.
+After the first analysis, the daemon keeps this worker process alive and the
+worker retains one rust-analyzer database. Source-only changes update that
+database in place; Cargo configuration, accepted-file membership, target, or
+workspace changes rebuild it. Rust enrichment requests are serialized so the
+cached compiler state has one writer. Other workers remain one-shot unless they
+independently opt into persistence.
 
 ## Consequences
 
@@ -47,8 +53,9 @@ leaves the published syntax graph intact and emits a typed non-fatal diagnostic.
   enriched revision.
 - Worker gRPC is awaited asynchronously. Only the synchronous semantic-store
   publication transaction uses Tokio's blocking pool.
-- Process startup and compiler loading add cold-index cost; measure that cost
-  before introducing persistent worker processes or shared compiler caches.
+- The Rust worker pays process startup and compiler loading once per warm target.
+  Its single-entry compiler cache bounds retained memory; switching targets
+  evicts the prior database rather than accumulating compiler workspaces.
 
 The prototype measurement on the Beholder checkout reduced repository analysis
 from 91.4 seconds with dependency source loaded to 9.05 seconds with

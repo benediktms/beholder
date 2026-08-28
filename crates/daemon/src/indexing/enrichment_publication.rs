@@ -6,7 +6,10 @@ use beholder_domain::{
     AnalysisDiagnostic, DependencyOverride, EntityFact, EntityKind, Observation, SemanticRelation,
 };
 use beholder_indexing::SemanticSnapshot;
-use std::{collections::BTreeSet, error::Error};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct EnrichmentTarget<'a> {
@@ -26,6 +29,7 @@ pub(crate) struct EnrichmentSnapshotRead<'a> {
 pub(crate) struct EnrichmentSnapshotState {
     pub(crate) contexts: Vec<String>,
     pub(crate) baseline: SemanticSnapshot,
+    pub(crate) revision_inputs: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -87,6 +91,7 @@ impl EnrichmentPublication for SemanticStore {
         )?;
         Ok(Some(EnrichmentSnapshotState {
             contexts,
+            revision_inputs: self.revision_input_fingerprints(target.view)?,
             baseline: SemanticSnapshot {
                 entities,
                 observations,
