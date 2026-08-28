@@ -45,7 +45,9 @@ impl IndexScheduler {
         let (snapshot, _) = refresh_workspace_snapshot(self, &workspace, None)
             .map_err(|error| error.to_string())?;
         let mut jobs = Vec::new();
-        for repository in &snapshot.repositories {
+        let mut repositories = snapshot.repositories.iter().collect::<Vec<_>>();
+        repositories.sort_by_key(|repository| repository.inputs.len());
+        for repository in repositories {
             let repository_id = &repository.state.repository.identity;
             for worker in self.indexer.enrichment_catalog() {
                 let target = EnrichmentTarget {

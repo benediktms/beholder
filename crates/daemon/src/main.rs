@@ -165,6 +165,7 @@ async fn run_daemon() -> Result<(), Box<dyn Error>> {
     };
     if tokio::time::timeout_at(deadline, drain).await.is_err() {
         tracing::error!("daemon shutdown deadline expired; terminating remaining work");
+        std::process::exit(0);
     }
     tracing::info!("daemon stopped");
     fatal.map_or(Ok(()), |error| Err(error.into()))

@@ -408,6 +408,7 @@ dependencies = [
  "mnestic",
  "sha2",
  "sqlite",
+ "tracing",
 ]
 
 [[package]]

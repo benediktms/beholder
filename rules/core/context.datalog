@@ -1,0 +1,280 @@
+selected_state[state] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_state{view: $view, revision, state}
+
+selected_shard[producer, owner, version] :=
+    *analysis_fact_shard_selection{view: $view, producer, owner, version}
+
+selected_enrichment[owner] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_repository_enrichment{view: $view, revision, owner}
+
+context_baseline_observation[from, relation, to, evidence] :=
+    selected_state[state],
+    *state_observation{state, from: $entity, relation, to, evidence},
+    from = $entity
+
+context_baseline_observation[from, relation, to, evidence] :=
+    selected_state[state],
+    *state_observation:by_to{state, from, relation, to: $entity, evidence},
+    to = $entity
+
+context_baseline_observation[from, relation, to, evidence] :=
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from: $entity,
+        relation,
+        to,
+        evidence,
+    },
+    from = $entity
+
+context_baseline_observation[from, relation, to, evidence] :=
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        to: $entity,
+        evidence,
+    },
+    to = $entity
+
+context_baseline_observation[from, relation, to, evidence] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from: $entity,
+        relation,
+        to,
+        evidence,
+    },
+    from = $entity
+
+context_baseline_observation[from, relation, to, evidence] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation:by_to{
+        view: $view,
+        revision,
+        from,
+        relation,
+        to: $entity,
+        evidence,
+    },
+    to = $entity
+
+base_override[
+    from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence,
+    },
+    *analysis_revision_dependency_override_metadata{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        confidence,
+        provenance,
+    }
+
+enrichment_override[
+    from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    *analysis_enrichment_override_selection{
+        view: $view,
+        from,
+        relation,
+        unresolved_to,
+        owner,
+    },
+    selected_enrichment[owner],
+    *enrichment_override_contribution{
+        view: $view,
+        owner,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence,
+        confidence,
+        provenance,
+    }
+
+context_override[
+    from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    base_override[
+        from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+    ]
+
+context_override[
+    from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    enrichment_override[
+        from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+    ],
+    not base_override[from, relation, unresolved_to, _, _, _, _]
+
+overridden[from, relation, unresolved_to, evidence] :=
+    context_override[from, relation, unresolved_to, _, evidence, _, _]
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    selected_state[state],
+    *state_observation{state, from: $entity, relation, to: related, evidence},
+    *state_observation_metadata{
+        state,
+        from: $entity,
+        relation,
+        to: related,
+        confidence,
+        provenance,
+    },
+    not overridden[$entity, relation, related, evidence],
+    direction = 'outgoing'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    selected_state[state],
+    *state_observation:by_to{state, from: related, relation, to: $entity, evidence},
+    *state_observation_metadata:by_to{
+        state,
+        from: related,
+        relation,
+        to: $entity,
+        confidence,
+        provenance,
+    },
+    not overridden[related, relation, $entity, evidence],
+    direction = 'incoming'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from: $entity,
+        relation,
+        to: related,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not overridden[$entity, relation, related, evidence],
+    direction = 'outgoing'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    selected_shard[producer, owner, version],
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from: related,
+        relation,
+        to: $entity,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not overridden[related, relation, $entity, evidence],
+    direction = 'incoming'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from: $entity,
+        relation,
+        to: related,
+        evidence,
+        confidence,
+        provenance,
+    },
+    direction = 'outgoing'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation:by_to{
+        view: $view,
+        revision,
+        from: related,
+        relation,
+        to: $entity,
+        evidence,
+        confidence,
+        provenance,
+    },
+    direction = 'incoming'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_enrichment_observation_selection{
+        view: $view,
+        from: $entity,
+        relation,
+        to: related,
+        evidence,
+        owner,
+    },
+    selected_enrichment[owner],
+    *enrichment_observation_contribution{
+        view: $view,
+        owner,
+        from: $entity,
+        relation,
+        to: related,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not context_baseline_observation[$entity, relation, related, evidence],
+    not overridden[$entity, relation, related, evidence],
+    direction = 'outgoing'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_enrichment_observation_selection:by_to{
+        view: $view,
+        from: related,
+        relation,
+        to: $entity,
+        evidence,
+        owner,
+    },
+    selected_enrichment[owner],
+    *enrichment_observation_contribution{
+        view: $view,
+        owner,
+        from: related,
+        relation,
+        to: $entity,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not context_baseline_observation[related, relation, $entity, evidence],
+    not overridden[related, relation, $entity, evidence],
+    direction = 'incoming'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    context_override[$entity, relation, _, related, evidence, confidence, provenance],
+    direction = 'outgoing'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    context_override[related, relation, _, $entity, evidence, confidence, provenance],
+    direction = 'incoming'
+
+:order direction, relation, related

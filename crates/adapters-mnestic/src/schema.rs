@@ -289,6 +289,51 @@ pub(super) const CREATE_ENRICHMENT_DIAGNOSTIC_CONTRIBUTION_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_ENRICHMENT_ENTITY_SELECTION_SCHEMA: &str = r#"
+:create analysis_enrichment_entity_selection {
+    view: String,
+    id: String,
+    =>
+    owner: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_OBSERVATION_SELECTION_SCHEMA: &str = r#"
+:create analysis_enrichment_observation_selection {
+    view: String,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    owner: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_OVERRIDE_SELECTION_SCHEMA: &str = r#"
+:create analysis_enrichment_override_selection {
+    view: String,
+    from: String,
+    relation: String,
+    unresolved_to: String,
+    =>
+    owner: String,
+}
+"#;
+
+pub(super) const CREATE_ENRICHMENT_DIAGNOSTIC_SELECTION_SCHEMA: &str = r#"
+:create analysis_enrichment_diagnostic_selection {
+    view: String,
+    repository: String,
+    code: String,
+    severity: String,
+    path: String,
+    line: Int,
+    =>
+    owner: String,
+}
+"#;
+
 pub(super) const CREATE_BASELINE_ENTITY_SCHEMA: &str = r#"
 :create analysis_baseline_entity {
     view: String,
@@ -413,6 +458,8 @@ pub(super) const CREATE_METADATA_TO_INDEX: &str = "::index create state_observat
      {to, state, from, relation, confidence, provenance}";
 pub(super) const CREATE_REVISION_OBSERVATION_TO_INDEX: &str = "::index create analysis_revision_observation:by_to \
      {view, revision, to, from, relation, evidence, confidence, provenance}";
+pub(super) const CREATE_ENRICHMENT_OBSERVATION_SELECTION_TO_INDEX: &str = "::index create analysis_enrichment_observation_selection:by_to \
+     {view, to, from, relation, evidence, owner}";
 
 pub(super) const CREATE_OVERRIDE_SCHEMA: &str = r#"
 :create analysis_revision_dependency_override {
@@ -558,62 +605,7 @@ pub(super) const SEED_STATES: &str = r#"
 "#;
 
 pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
+pub(super) const BASE_DIRECT_RULES: &str = include_str!("../../../rules/core/base_direct.datalog");
 pub(super) const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
 pub(super) const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
-#[allow(dead_code)]
-pub(super) const CONTEXT_QUERY: &str = "selected_state[state] := \
-         *analysis_revision{view: $view, revision}, \
-         *analysis_revision_state{view: $view, revision, state}\n\
-     context_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := \
-         *analysis_revision{view: $view, revision}, \
-         *analysis_revision_dependency_override{\
-             view: $view, revision, from, relation, unresolved_to, resolved_to, evidence\
-         }, \
-         *analysis_revision_dependency_override_metadata{\
-             view: $view, revision, from, relation, unresolved_to, confidence, provenance\
-         }\n\
-     overridden[from, relation, unresolved_to, evidence] := \
-         context_override[from, relation, unresolved_to, _, evidence, _, _]\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         selected_state[state], \
-         *state_observation{state, from: $entity, relation, to: related, evidence}, \
-         *state_observation_metadata{\
-             state, from: $entity, relation, to: related, confidence, provenance\
-         }, \
-         not overridden[$entity, relation, related, evidence], \
-         direction = 'outgoing'\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         context_override[\
-             $entity, relation, _, related, evidence, confidence, provenance\
-         ], \
-         direction = 'outgoing'\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         selected_state[state], \
-         *state_observation:by_to{\
-             state, from: related, relation, to: $entity, evidence\
-         }, \
-         *state_observation_metadata:by_to{\
-             state, from: related, relation, to: $entity, confidence, provenance\
-         }, \
-         not overridden[related, relation, $entity, evidence], \
-         direction = 'incoming'\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         context_override[\
-             related, relation, _, $entity, evidence, confidence, provenance\
-         ], \
-         direction = 'incoming'\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         *analysis_revision{view: $view, revision}, \
-         *analysis_revision_observation{\
-             view: $view, revision, from: $entity, relation, to: related, evidence, \
-             confidence, provenance\
-         }, \
-         direction = 'outgoing'\n\
-     ?[direction, relation, related, evidence, confidence, provenance] := \
-         *analysis_revision{view: $view, revision}, \
-         *analysis_revision_observation:by_to{\
-             view: $view, revision, from: related, relation, to: $entity, evidence, \
-             confidence, provenance\
-         }, \
-         direction = 'incoming'\n\
-     :order direction, relation, related";
+pub(super) const CONTEXT_QUERY: &str = include_str!("../../../rules/core/context.datalog");

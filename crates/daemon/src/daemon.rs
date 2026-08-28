@@ -144,7 +144,13 @@ pub(super) fn collect_garbage(
     let collectible = store.garbage_collection_candidates()?;
     let queued = store.garbage_collection_queued()?;
     let reclaimable = store.reclaimable_database_pages()?;
-    if trigger == "automatic_recovery" && collectible == 0 && queued == 0 && reclaimable == 0 {
+    let pending = store.garbage_collection_pending()?;
+    if trigger == "automatic_recovery"
+        && collectible == 0
+        && queued == 0
+        && reclaimable == 0
+        && !pending
+    {
         return Ok(GarbageCollection {
             repository_states_queued: 0,
         });
@@ -251,26 +257,23 @@ fn start_garbage_collector(
                                 GarbageCollectionPhase::SweepingObsoleteStates,
                             ));
                         }
-                        states_resolved =
-                            scheduler.run_exclusive("garbage collection sweep", || {
-                                store.sweep_garbage_collection(|update| {
-                                    if let Ok(mut current) = progress.lock() {
-                                        *current = Some(update.clone());
-                                    }
-                                    tracing::info!(
-                                        phase = ?update.phase,
-                                        step = update.step,
-                                        completed_rows = update.completed_rows,
-                                        rows = update.rows,
-                                        stale_states = update.stale_states,
-                                        repositories = update.repositories,
-                                        completed_steps = update.completed_steps,
-                                        total_steps = update.total_steps,
-                                        "semantic store garbage collection progress"
-                                    );
-                                    !scheduler.is_stopping()
-                                })
-                            })?;
+                        states_resolved = store.sweep_garbage_collection(|update| {
+                            if let Ok(mut current) = progress.lock() {
+                                *current = Some(update.clone());
+                            }
+                            tracing::info!(
+                                phase = ?update.phase,
+                                step = update.step,
+                                completed_rows = update.completed_rows,
+                                rows = update.rows,
+                                stale_states = update.stale_states,
+                                repositories = update.repositories,
+                                completed_steps = update.completed_steps,
+                                total_steps = update.total_steps,
+                                "semantic store garbage collection progress"
+                            );
+                            !scheduler.is_stopping()
+                        })?;
                     }
                     if scheduler.is_stopping() {
                         return Ok(states_resolved);
@@ -282,35 +285,32 @@ fn start_garbage_collector(
                     }
                     store.checkpoint_passive()?;
                     let pages = store.reclaimable_database_pages()?;
-                    let mut reclaimed = 0;
-                    while reclaimed < pages && !scheduler.is_stopping() {
+                    let reclaimed = if pages > 0 && !scheduler.is_stopping() {
                         if let Ok(mut current) = progress.lock() {
                             *current = Some(GarbageCollectionProgress {
                                 phase: GarbageCollectionPhase::ReclaimingDatabaseSpace,
                                 step: None,
                                 rows: Some(pages),
-                                completed_rows: Some(reclaimed),
+                                completed_rows: Some(0),
                                 stale_states: None,
                                 repositories: None,
                                 completed_steps: 0,
                                 total_steps: 1,
                             });
                         }
-                        let reclaimed_batch = scheduler
+                        let reclaimed = scheduler
                             .run_exclusive("garbage collection compaction", || {
                                 store.reclaim_database_pages(GARBAGE_COLLECTION_VACUUM_PAGES)
                             })?;
-                        if reclaimed_batch == 0 {
-                            break;
-                        }
-                        reclaimed += reclaimed_batch;
                         tracing::info!(
                             reclaimed_pages = reclaimed,
                             reclaimable_pages = pages,
                             "semantic store database space reclaimed"
                         );
-                        std::thread::sleep(GARBAGE_COLLECTION_YIELD);
-                    }
+                        reclaimed
+                    } else {
+                        0
+                    };
                     tracing::Span::current().record("gc.pages_reclaimed", reclaimed);
                     Ok(states_resolved)
                 })();
@@ -622,15 +622,17 @@ mod tests {
         scheduler.request_garbage_collection();
         tokio::time::timeout(Duration::from_secs(10), async {
             while !running.load(Ordering::Acquire)
-                || store.garbage_collection_queued().unwrap() == 0
+                || store.garbage_collection_candidates().unwrap() > 0
+                || store.garbage_collection_queued().unwrap() > 0
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("garbage collection did not queue while indexing was active");
+        .expect("garbage collection did not sweep while indexing was active");
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(store.garbage_collection_queued().unwrap(), 1);
+        assert_eq!(store.garbage_collection_candidates().unwrap(), 0);
+        assert_eq!(store.garbage_collection_queued().unwrap(), 0);
         drop(indexing);
         tokio::time::timeout(Duration::from_secs(10), async {
             while running.load(Ordering::Acquire)
