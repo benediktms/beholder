@@ -182,9 +182,10 @@ than predicting every language's symbol model in advance.
   the incremental engine.
 - The existing semantic graph remains the query result and cross-repository
   semantic model; it does not decide what source analysis must run.
-- Compiler-backed enrichment may remain repository-scoped initially. Its outputs
-  can later become tracked coarse inputs without moving subprocess side effects
-  into Salsa.
+- Compiler-backed enrichment remains repository-scoped, but the Rust worker is a
+  persistent incremental consumer: it applies source changes to one warm
+  rust-analyzer database and rebuilds only when project structure or compiler
+  configuration changes. Compiler subprocess side effects remain outside Salsa.
 - Mnestic delta publication is part of the first usable implementation because
   full baseline replacement is already a measured bottleneck.
 - Cache eviction, cross-process query persistence, incremental Tree-sitter edits,

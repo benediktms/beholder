@@ -24,8 +24,11 @@ use std::{
     },
     time::Duration,
 };
-use tokio::process::Command;
-use tonic::Request;
+use tokio::{
+    process::{Child, Command},
+    sync::Mutex,
+};
+use tonic::{Request, transport::Channel};
 use tracing::Instrument;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,6 +81,7 @@ pub struct WorkerAnalyzerBuilder {
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     plugin: Option<PluginDescriptor>,
+    persistent: bool,
     timeout: Duration,
 }
 
@@ -97,6 +101,7 @@ impl WorkerAnalyzerBuilder {
             excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
             plugin: None,
+            persistent: false,
             timeout: ANALYSIS_INACTIVITY_TIMEOUT,
         }
     }
@@ -111,6 +116,11 @@ impl WorkerAnalyzerBuilder {
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn persistent(mut self) -> Self {
+        self.persistent = true;
         self
     }
 
@@ -203,6 +213,8 @@ impl WorkerAnalyzerBuilder {
             excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
             plugin: self.plugin,
+            persistent: self.persistent,
+            session: Mutex::new(None),
             timeout: self.timeout,
         })
     }
@@ -219,7 +231,15 @@ pub struct WorkerAnalyzer {
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     plugin: Option<PluginDescriptor>,
+    persistent: bool,
+    session: Mutex<Option<WorkerSession>>,
     timeout: Duration,
+}
+
+struct WorkerSession {
+    child: Child,
+    client: AnalyzerWorkerClient<Channel>,
+    _socket: SocketFile,
 }
 
 pub fn plugin_analyzer(
@@ -243,6 +263,8 @@ pub fn plugin_analyzer(
         excluded_path_suffixes: Vec::new(),
         identity_inputs: Vec::new(),
         plugin: Some(descriptor),
+        persistent: false,
+        session: Mutex::new(None),
         timeout: ANALYSIS_INACTIVITY_TIMEOUT,
     })
 }
@@ -365,74 +387,33 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         );
         Box::pin(
             async move {
-                fs::create_dir_all(&self.socket_dir)?;
-                #[cfg(unix)]
+                let analysis_inactivity_timeout = self.analysis_inactivity_timeout();
+                let mut session = self.session.lock().await;
+                if let Some(worker) = session.as_mut()
+                    && worker.child.try_wait()?.is_some()
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&self.socket_dir, fs::Permissions::from_mode(0o700))?;
+                    session.take();
                 }
-                let socket = self.socket_dir.join(format!(
-                    "w-{}-{}.sock",
-                    std::process::id(),
-                    WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-                ));
-                let _socket_file = SocketFile(socket.clone());
-                let mut worker_environment = configured_worker_environment(&self.metadata.id);
-                let analysis_inactivity_timeout = worker_environment
-                    .get("BEHOLDER_WORKER_TIMEOUT_MS")
-                    .and_then(|value| value.to_str())
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|value| *value > 0)
-                    .map(Duration::from_millis)
-                    .unwrap_or(self.timeout);
-                worker_environment.insert(
-                    "BEHOLDER_WORKER_TIMEOUT_MS".into(),
-                    analysis_inactivity_timeout.as_millis().to_string().into(),
-                );
-                let mut command = Command::new(&self.executable);
-                command
-                    .arg("--socket")
-                    .arg(&socket)
-                    .arg("--cache-dir")
-                    .arg(self.socket_dir.join("cache"))
-                    .stdin(Stdio::null())
-                    .env("OTEL_SERVICE_NAME", worker_service_name(&self.metadata.id))
-                    .env("BEHOLDER_PLUGIN_DIGEST", &self.metadata.version)
-                    .kill_on_drop(true);
-                command.envs(worker_environment);
-                let mut child = command.spawn()?;
+                if session.is_none() {
+                    *session = Some(self.start_session(analysis_inactivity_timeout).await?);
+                }
                 let analysis_started = tokio::time::Instant::now();
                 let workspace = snapshot.workspace.name.clone();
-                let endpoint = format!("unix:{}", socket.display());
-                let started = tokio::time::Instant::now();
-                let mut client = loop {
-                    match AnalyzerWorkerClient::connect(endpoint.clone()).await {
-                        Ok(client) => break client,
-                        Err(_) if started.elapsed() < CONNECT_TIMEOUT => {
-                            if let Some(status) = child.try_wait()? {
-                                return Err(
-                                    format!("worker exited before readiness: {status}").into()
-                                );
-                            }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                .max_encoding_message_size(MAX_MESSAGE_BYTES)
-                .max_decoding_message_size(MAX_MESSAGE_BYTES);
                 let baseline = snapshot.baseline.clone();
                 let mut request = Request::new(tokio_stream::iter(analyze_requests(snapshot)?));
                 beholder_observability::inject_current_context(request.metadata_mut());
-                let response =
-                    tokio::time::timeout(analysis_inactivity_timeout, client.analyze(request))
-                        .await
-                        .map_err(|_| {
-                            format!(
-                                "worker analysis timed out after {}ms without progress",
-                                analysis_inactivity_timeout.as_millis()
-                            )
-                        })??;
+                let worker = session.as_mut().expect("worker session was started");
+                let response = tokio::time::timeout(
+                    analysis_inactivity_timeout,
+                    worker.client.analyze(request),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "worker analysis timed out after {}ms without progress",
+                        analysis_inactivity_timeout.as_millis()
+                    )
+                })??;
                 let mut stream = response.into_inner();
                 let mut events = Vec::new();
                 loop {
@@ -496,9 +477,11 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                             .sum::<usize>(),
                     "worker analysis completed"
                 );
-                drop(client);
-                if child.try_wait()?.is_none() {
-                    child.kill().await?;
+                if !self.persistent
+                    && let Some(mut worker) = session.take()
+                    && worker.child.try_wait()?.is_none()
+                {
+                    worker.child.kill().await?;
                     tracing::debug!(
                         worker = self.metadata.id,
                         "worker process terminated after completed analysis"
@@ -512,6 +495,72 @@ impl WorkspaceEnricher for WorkerAnalyzer {
 }
 
 impl WorkerAnalyzer {
+    fn analysis_inactivity_timeout(&self) -> Duration {
+        configured_worker_environment(&self.metadata.id)
+            .get("BEHOLDER_WORKER_TIMEOUT_MS")
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout)
+    }
+
+    async fn start_session(
+        &self,
+        analysis_inactivity_timeout: Duration,
+    ) -> Result<WorkerSession, AnalyzerError> {
+        fs::create_dir_all(&self.socket_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.socket_dir, fs::Permissions::from_mode(0o700))?;
+        }
+        let socket = self.socket_dir.join(format!(
+            "w-{}-{}.sock",
+            std::process::id(),
+            WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let socket_file = SocketFile(socket.clone());
+        let mut worker_environment = configured_worker_environment(&self.metadata.id);
+        worker_environment.insert(
+            "BEHOLDER_WORKER_TIMEOUT_MS".into(),
+            analysis_inactivity_timeout.as_millis().to_string().into(),
+        );
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--cache-dir")
+            .arg(self.socket_dir.join("cache"))
+            .stdin(Stdio::null())
+            .env("OTEL_SERVICE_NAME", worker_service_name(&self.metadata.id))
+            .env("BEHOLDER_PLUGIN_DIGEST", &self.metadata.version)
+            .kill_on_drop(true)
+            .envs(worker_environment);
+        let mut child = command.spawn()?;
+        let endpoint = format!("unix:{}", socket.display());
+        let started = tokio::time::Instant::now();
+        let client = loop {
+            match AnalyzerWorkerClient::connect(endpoint.clone()).await {
+                Ok(client) => break client,
+                Err(_) if started.elapsed() < CONNECT_TIMEOUT => {
+                    if let Some(status) = child.try_wait()? {
+                        return Err(format!("worker exited before readiness: {status}").into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        Ok(WorkerSession {
+            child,
+            client,
+            _socket: socket_file,
+        })
+    }
+
     fn declared_snapshot(&self, mut snapshot: EnrichmentSnapshot) -> EnrichmentSnapshot {
         if let Some(plugin) = &self.plugin {
             for repository in &mut snapshot.workspace.repositories {

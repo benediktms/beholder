@@ -26,7 +26,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -35,14 +35,17 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-7";
+const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-8";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 static MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static COMPILER_LOADS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct RustWorker {
     analyzer: Arc<RustAnalyzer>,
     analysis_pool: Arc<rayon::ThreadPool>,
+    compiler: Arc<Mutex<Option<CompilerWorkspace>>>,
 }
 
 #[tonic::async_trait]
@@ -64,6 +67,7 @@ impl AnalyzerWorker for RustWorker {
         let mut stream = request.into_inner();
         let analyzer = self.analyzer.clone();
         let analysis_pool = self.analysis_pool.clone();
+        let compiler = self.compiler.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         tokio::spawn(
             async move {
@@ -112,6 +116,7 @@ impl AnalyzerWorker for RustWorker {
                                     &snapshot.workspace,
                                     &snapshot.target_repository,
                                     &mut contribution,
+                                    &compiler,
                                 );
                                 retain_semantic_enrichment(
                                     &mut contribution,
@@ -169,6 +174,7 @@ async fn send_progress(
 struct MaterializedWorkspace {
     root: PathBuf,
     repositories: BTreeMap<String, PathBuf>,
+    contents: BTreeMap<PathBuf, Arc<[u8]>>,
 }
 
 impl MaterializedWorkspace {
@@ -195,6 +201,7 @@ impl MaterializedWorkspace {
         fs::create_dir(&root)?;
         let result = (|| {
             let mut repositories = BTreeMap::new();
+            let mut contents = BTreeMap::new();
             for (repository, base) in snapshot.repositories.iter().zip(bases) {
                 let relative = base.strip_prefix(&common)?;
                 let materialized_base = root.join(relative);
@@ -233,12 +240,20 @@ impl MaterializedWorkspace {
                         fs::create_dir_all(parent)?;
                     }
                     fs::write(destination, input.content.as_ref())?;
+                    contents.insert(
+                        PathBuf::from(&repository.state.repository.identity).join(&input.path),
+                        Arc::clone(&input.content),
+                    );
                 }
             }
-            Ok::<_, Box<dyn Error + Send + Sync>>(repositories)
+            Ok::<_, Box<dyn Error + Send + Sync>>((repositories, contents))
         })();
         match result {
-            Ok(repositories) => Ok(Self { root, repositories }),
+            Ok((repositories, contents)) => Ok(Self {
+                root,
+                repositories,
+                contents,
+            }),
             Err(error) => {
                 let _ = fs::remove_dir_all(&root);
                 Err(error)
@@ -248,6 +263,31 @@ impl MaterializedWorkspace {
 
     fn repository(&self, identity: &str) -> Option<&Path> {
         self.repositories.get(identity).map(PathBuf::as_path)
+    }
+
+    fn update_sources(
+        &mut self,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for repository in &snapshot.repositories {
+            let base = self
+                .repositories
+                .get(&repository.state.repository.identity)
+                .ok_or("materialized Rust repository is missing")?;
+            for input in repository
+                .inputs
+                .iter()
+                .filter(|input| is_rust_source(&input.path))
+            {
+                let key = PathBuf::from(&repository.state.repository.identity).join(&input.path);
+                if self.contents.get(&key) == Some(&input.content) {
+                    continue;
+                }
+                fs::write(base.join(&input.path), input.content.as_ref())?;
+                self.contents.insert(key, Arc::clone(&input.content));
+            }
+        }
+        Ok(())
     }
 
     fn verify(&self, snapshot: &WorkspaceSnapshot) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -267,6 +307,58 @@ impl MaterializedWorkspace {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompilerWorkspaceShape {
+    workspace: String,
+    target_repository: String,
+    repositories: Vec<CompilerRepositoryShape>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompilerRepositoryShape {
+    identity: String,
+    base: PathBuf,
+    inputs: Vec<CompilerInputShape>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompilerInputShape {
+    path: PathBuf,
+    kind: beholder_indexing::InputKind,
+    configuration: Option<Arc<[u8]>>,
+}
+
+impl CompilerWorkspaceShape {
+    fn new(snapshot: &WorkspaceSnapshot, target_repository: &str) -> Self {
+        Self {
+            workspace: snapshot.name.clone(),
+            target_repository: target_repository.to_owned(),
+            repositories: snapshot
+                .repositories
+                .iter()
+                .map(|repository| CompilerRepositoryShape {
+                    identity: repository.state.repository.identity.clone(),
+                    base: repository.base.clone(),
+                    inputs: repository
+                        .inputs
+                        .iter()
+                        .map(|input| CompilerInputShape {
+                            path: input.path.clone(),
+                            kind: input.kind,
+                            configuration: (!is_rust_source(&input.path))
+                                .then(|| Arc::clone(&input.content)),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn is_rust_source(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rs")
 }
 
 impl Drop for MaterializedWorkspace {
@@ -296,6 +388,137 @@ fn absolute_lexical(path: &Path) -> PathBuf {
     normalized
 }
 
+struct CompilerWorkspace {
+    shape: CompilerWorkspaceShape,
+    materialized: MaterializedWorkspace,
+    cargo: BTreeMap<PathBuf, CompilerCargo>,
+}
+
+impl CompilerWorkspace {
+    fn new(
+        snapshot: &WorkspaceSnapshot,
+        target_repository: &str,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let shape = CompilerWorkspaceShape::new(snapshot, target_repository);
+        let materialized = MaterializedWorkspace::new(snapshot)?;
+        let repository = snapshot
+            .repositories
+            .iter()
+            .find(|repository| repository.state.repository.identity == target_repository)
+            .ok_or("Rust enrichment target repository is missing")?;
+        let materialized_target = materialized
+            .repository(target_repository)
+            .ok_or("materialized Rust target repository is missing")?;
+        let mut cargo = BTreeMap::new();
+        for root in cargo_roots(repository, materialized_target) {
+            cargo.insert(
+                root.clone(),
+                CompilerCargo::load(snapshot, &materialized, &root)?,
+            );
+        }
+        Ok(Self {
+            shape,
+            materialized,
+            cargo,
+        })
+    }
+
+    fn update(&mut self, snapshot: &WorkspaceSnapshot) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.materialized.update_sources(snapshot)?;
+        for cargo in self.cargo.values_mut() {
+            cargo.update(snapshot, &self.materialized)?;
+        }
+        Ok(())
+    }
+}
+
+struct CompilerCargo {
+    host: AnalysisHost,
+    vfs: ra_ap_vfs::Vfs,
+    sources: BTreeMap<FileId, Arc<[u8]>>,
+}
+
+impl CompilerCargo {
+    fn load(
+        snapshot: &WorkspaceSnapshot,
+        materialized: &MaterializedWorkspace,
+        cargo_root: &Path,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        #[cfg(test)]
+        COMPILER_LOADS.fetch_add(1, Ordering::Relaxed);
+        let mut cargo = CargoConfig {
+            features: cargo_features(
+                std::env::var("BEHOLDER_RUST_FEATURES").ok().as_deref(),
+                environment_enabled("BEHOLDER_RUST_ALL_FEATURES"),
+                environment_enabled("BEHOLDER_RUST_NO_DEFAULT_FEATURES"),
+            ),
+            target: std::env::var("CARGO_BUILD_TARGET")
+                .ok()
+                .filter(|target| !target.trim().is_empty()),
+            set_test: true,
+            no_deps: snapshot.repositories.len() == 1,
+            ..CargoConfig::default()
+        };
+        let cargo_home = materialized.root.join(".cargo-home");
+        fs::create_dir_all(&cargo_home)?;
+        cargo.extra_env.insert(
+            "CARGO_HOME".into(),
+            Some(cargo_home.to_string_lossy().into_owned()),
+        );
+        let load = LoadCargoConfig {
+            load_out_dirs_from_check: false,
+            with_proc_macro_server: ProcMacroServerChoice::None,
+            prefill_caches: false,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
+        };
+        let (database, vfs, _) = load_workspace_at(cargo_root, &cargo, &load, &|_| {})?;
+        let mut compiler = Self {
+            host: AnalysisHost::with_database(database),
+            vfs,
+            sources: BTreeMap::new(),
+        };
+        compiler.update(snapshot, materialized)?;
+        Ok(compiler)
+    }
+
+    fn update(
+        &mut self,
+        snapshot: &WorkspaceSnapshot,
+        materialized: &MaterializedWorkspace,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut change = ChangeWithProcMacros::default();
+        let mut changed = false;
+        for repository in &snapshot.repositories {
+            let Some(base) = materialized.repository(&repository.state.repository.identity) else {
+                continue;
+            };
+            for input in repository
+                .inputs
+                .iter()
+                .filter(|input| is_rust_source(&input.path))
+            {
+                let path =
+                    VfsPath::new_real_path(base.join(&input.path).to_string_lossy().into_owned());
+                let Some((file_id, _)) = self.vfs.file_id(&path) else {
+                    continue;
+                };
+                if self.sources.get(&file_id) == Some(&input.content) {
+                    continue;
+                }
+                let source = std::str::from_utf8(&input.content)?.to_owned();
+                change.change_file(file_id, Some(source));
+                self.sources.insert(file_id, Arc::clone(&input.content));
+                changed = true;
+            }
+        }
+        if changed {
+            self.host.apply_change(change);
+        }
+        Ok(())
+    }
+}
+
 pub async fn serve(socket: &Path, cache_dir: PathBuf) -> Result<(), Box<dyn Error + Send + Sync>> {
     match fs::remove_file(socket) {
         Ok(()) => {}
@@ -322,6 +545,7 @@ pub async fn serve(socket: &Path, cache_dir: PathBuf) -> Result<(), Box<dyn Erro
             AnalyzerWorkerServer::new(RustWorker {
                 analyzer: Arc::new(RustAnalyzer::new(cache_dir)),
                 analysis_pool,
+                compiler: Arc::new(Mutex::new(None)),
             })
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES),
@@ -335,6 +559,7 @@ fn enrich_semantics(
     snapshot: &WorkspaceSnapshot,
     target_repository: &str,
     contribution: &mut AnalyzerContribution,
+    compiler: &Mutex<Option<CompilerWorkspace>>,
 ) {
     let Some(repository) = snapshot
         .repositories
@@ -343,40 +568,47 @@ fn enrich_semantics(
     else {
         return;
     };
-    let materialized = match MaterializedWorkspace::new(snapshot) {
-        Ok(materialized) => materialized,
-        Err(error) => {
-            contribution.diagnostics.push((
-                target_repository.into(),
-                AnalysisDiagnostic {
-                    code: "rust.semantic_resolution_unavailable".into(),
-                    severity: AnalysisDiagnosticSeverity::KnownLimitation,
-                    path: PathBuf::from("Cargo.toml"),
-                    line: None,
-                    detail: Some(error.to_string()),
-                },
-            ));
-            return;
-        }
-    };
-    let Some(materialized_target) = materialized.repository(target_repository) else {
-        return;
-    };
-    let cargo_roots = cargo_roots(repository, materialized_target);
-    if cargo_roots.is_empty() {
+    if !repository.inputs.iter().any(|input| {
+        input
+            .path
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml")
+    }) {
         return;
     }
     let mut enriched = contribution.clone();
     let result = (|| {
         validate_immutable_rust_inputs(snapshot)?;
-        for cargo_root in cargo_roots {
-            enrich_repository(
-                snapshot,
-                &materialized,
-                repository,
-                &cargo_root,
-                &mut enriched,
-            )?;
+        let shape = CompilerWorkspaceShape::new(snapshot, target_repository);
+        let mut cached = compiler
+            .lock()
+            .map_err(|_| "Rust compiler workspace lock poisoned")?;
+        let reused = cached
+            .as_ref()
+            .is_some_and(|workspace| workspace.shape == shape);
+        if reused {
+            cached
+                .as_mut()
+                .expect("matching compiler workspace exists")
+                .update(snapshot)?;
+        } else {
+            *cached = Some(CompilerWorkspace::new(snapshot, target_repository)?);
+        }
+        tracing::info!(
+            reused,
+            target_repository,
+            "Rust compiler workspace prepared"
+        );
+        let workspace = cached
+            .as_mut()
+            .expect("Rust compiler workspace was prepared");
+        let CompilerWorkspace {
+            materialized,
+            cargo,
+            ..
+        } = workspace;
+        for compiler in cargo.values_mut() {
+            enrich_repository(snapshot, materialized, repository, compiler, &mut enriched)?;
         }
         materialized.verify(snapshot)?;
         Ok::<_, Box<dyn Error + Send + Sync>>(())
@@ -454,37 +686,9 @@ fn enrich_repository(
     snapshot: &WorkspaceSnapshot,
     materialized: &MaterializedWorkspace,
     repository: &beholder_indexing::RepositorySnapshot,
-    cargo_root: &Path,
+    compiler: &mut CompilerCargo,
     contribution: &mut AnalyzerContribution,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut cargo = CargoConfig {
-        features: cargo_features(
-            std::env::var("BEHOLDER_RUST_FEATURES").ok().as_deref(),
-            environment_enabled("BEHOLDER_RUST_ALL_FEATURES"),
-            environment_enabled("BEHOLDER_RUST_NO_DEFAULT_FEATURES"),
-        ),
-        target: std::env::var("CARGO_BUILD_TARGET")
-            .ok()
-            .filter(|target| !target.trim().is_empty()),
-        set_test: true,
-        no_deps: snapshot.repositories.len() == 1,
-        ..CargoConfig::default()
-    };
-    let cargo_home = materialized.root.join(".cargo-home");
-    fs::create_dir_all(&cargo_home)?;
-    cargo.extra_env.insert(
-        "CARGO_HOME".into(),
-        Some(cargo_home.to_string_lossy().into_owned()),
-    );
-    let load = LoadCargoConfig {
-        load_out_dirs_from_check: false,
-        with_proc_macro_server: ProcMacroServerChoice::None,
-        prefill_caches: false,
-        num_worker_threads: 1,
-        proc_macro_processes: 1,
-    };
-    let (mut database, vfs, _) = load_workspace_at(cargo_root, &cargo, &load, &|_| {})?;
-    let mut change = ChangeWithProcMacros::default();
     let mut snapshot_files = Vec::new();
     for snapshot_repository in &snapshot.repositories {
         let Some(materialized_base) =
@@ -501,15 +705,13 @@ fn enrich_repository(
             let source = std::str::from_utf8(&input.content)?.to_owned();
             let absolute = materialized_base.join(&input.path);
             let path = VfsPath::new_real_path(absolute.to_string_lossy().into_owned());
-            let Some((file_id, _)) = vfs.file_id(&path) else {
+            let Some((file_id, _)) = compiler.vfs.file_id(&path) else {
                 continue;
             };
-            change.change_file(file_id, Some(source.clone()));
             snapshot_files.push((snapshot_repository, &input.path, file_id, source));
         }
     }
-    database.apply_change(change);
-    let analysis = AnalysisHost::with_database(database).analysis();
+    let analysis = compiler.host.analysis();
     let mut files = BTreeMap::<PathBuf, (FileId, String)>::new();
     let mut definitions = BTreeMap::new();
     let mut call_sites = Vec::new();
@@ -947,6 +1149,7 @@ fn caller() {
         })
         .await
         .unwrap();
+        let mut updated_snapshot = snapshot.clone();
         let mut stream = client
             .analyze(tokio_stream::iter(analyze_requests(snapshot).unwrap()))
             .await
@@ -1036,6 +1239,28 @@ fn caller() {
                         && diagnostic.line.is_some()
                 })
         );
+        let compiler_loads = COMPILER_LOADS.load(Ordering::Relaxed);
+        let source = format!("{source}\n// comment-only change\n");
+        updated_snapshot.workspace.repositories[0]
+            .inputs
+            .iter_mut()
+            .find(|input| input.path == Path::new("src/lib.rs"))
+            .unwrap()
+            .content = Arc::from(source.as_bytes());
+        let mut stream = client
+            .analyze(tokio_stream::iter(
+                analyze_requests(updated_snapshot).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut events = Vec::new();
+        while let Some(event) = stream.message().await.unwrap() {
+            events.push(event);
+        }
+        let updated = contribution_from_events(events).unwrap();
+        assert_eq!(updated.overrides, contribution.overrides);
+        assert_eq!(COMPILER_LOADS.load(Ordering::Relaxed), compiler_loads);
         server.abort();
         let _ = server.await;
         fs::remove_file(socket).unwrap();

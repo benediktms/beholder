@@ -207,8 +207,21 @@ storing the revision manifest, and 43 ms committing. Scheduler publication was
 the effective-observation read, rebuild, or diff. Legacy repository-snapshot
 publication retains the full effective diff because its public result requires it.
 
-This is the first executable slice, not the final performance target. Salsa state
-is process-local, compiler enrichment still uses its existing input identity, and
-non-Rust frontends still publish through repository facts. Cross-process query
-persistence and other language frontends should be added only after changed-file
-installed-daemon measurements identify the next dominant stage.
+This is the first executable slice, not the final performance target. The next
+installed-daemon measurement identified repository-wide compiler enrichment as
+the dominant stage: a comment-only Rust edit spent 9.96 seconds in the worker,
+versus 1.89 seconds for inventory, incremental syntax analysis, and base
+publication together. The Rust worker now remains alive and retains one bounded
+rust-analyzer database. Source changes are applied to that database; project
+structure and compiler-configuration changes rebuild it. Other language
+frontends still publish through repository facts and should migrate only after
+their own changed-file measurements justify it.
+
+Two comment-only edits against the installed persistent worker kept the same
+worker process and reduced compiler analysis from 9.14 seconds to 6.00 and 6.92
+seconds. The corresponding base indexing operations took 2.50 and 1.43 seconds;
+enrichment publication took 1.27 seconds and 474 ms. Retaining the compiler
+database therefore removes startup and workspace loading, but repository-wide
+override recomputation remains the dominant cost. The next optimization boundary
+is incremental compiler-result production, not worker lifecycle or SQLite commit
+throughput.

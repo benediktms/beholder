@@ -11,7 +11,7 @@ beholder-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"
-tokio = { workspace = true, features = ["process", "time"] }
+tokio = { workspace = true, features = ["process", "sync", "time"] }
 tokio-stream.workspace = true
 tonic.workspace = true
 tracing = "0.1.44"
