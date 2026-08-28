@@ -324,12 +324,8 @@ pub(super) fn selected_baseline_semantics(
     }
     let entities = selected_ids
         .into_iter()
-        .map(|id| {
-            entities.remove(&id).ok_or_else(|| {
-                format!("baseline relationship references missing entity {id}").into()
-            })
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        .filter_map(|id| entities.remove(&id))
+        .collect();
     Ok((entities, observations))
 }
 
@@ -1818,6 +1814,30 @@ pub(super) fn revision_enrichment_input_fingerprint(
         .first()
         .and_then(|row| row[0].get_str())
         .map(str::to_owned))
+}
+
+pub(super) fn revision_input_fingerprints(
+    db: &DbInstance,
+    view: &str,
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[repository, fingerprint] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_input{view: $view, revision, repository, fingerprint}",
+        BTreeMap::from([("view".into(), view.into())]),
+        ScriptMutability::Immutable,
+    )?;
+    rows.rows
+        .into_iter()
+        .map(|row| {
+            let repository = row[0]
+                .get_str()
+                .ok_or("revision input repository is not a string")?;
+            let fingerprint = row[1]
+                .get_str()
+                .ok_or("revision input fingerprint is not a string")?;
+            Ok((repository.to_owned(), fingerprint.to_owned()))
+        })
+        .collect()
 }
 
 pub(super) fn repository_contexts(
@@ -3615,12 +3635,20 @@ mod tests {
         .unwrap();
         let mut facts = facts(
             &view,
-            vec![Observation::dependency(
-                "repo://app/elixir/Producer.publish/1",
-                DependencyRelation::Publishes,
-                "kafka-topic://events",
-                "lib/producer.ex:3",
-            )],
+            vec![
+                Observation::dependency(
+                    "repo://app/elixir/Producer.publish/1",
+                    DependencyRelation::Publishes,
+                    "kafka-topic://events",
+                    "lib/producer.ex:3",
+                ),
+                Observation::dependency(
+                    "repo://app/elixir/Producer.publish/1",
+                    DependencyRelation::Publishes,
+                    "kafka-topic://external",
+                    "lib/producer.ex:4",
+                ),
+            ],
         );
         facts.entities = vec![
             EntityFact::new(
@@ -3651,7 +3679,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(entities.len(), 3);
-        assert_eq!(observations.len(), 1);
+        assert_eq!(observations.len(), 2);
         assert_eq!(observations[0].relation.as_str(), "publishes");
     }
 
@@ -5514,6 +5542,101 @@ mod tests {
                 .iter()
                 .any(|edge| edge.to == "repo://example/repo/target-b")
         );
+    }
+
+    #[test]
+    fn carried_enrichment_uses_current_baseline_evidence() {
+        let store = SemanticStore::memory().unwrap();
+        let view = |fingerprint: &str| {
+            WorkspaceView::new(
+                "evidence-rebase",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: fingerprint.into(),
+                }],
+            )
+            .unwrap()
+            .with_repository_contexts(BTreeMap::from([("rust".into(), BTreeMap::new())]))
+            .unwrap()
+            .with_repository_enrichment_inputs(BTreeMap::from([(
+                "rust".into(),
+                BTreeMap::from([("example/repo".into(), "semantic".into())]),
+            )]))
+            .unwrap()
+        };
+        let first = view("source-1");
+        let call = Observation::dependency(
+            "repo://example/repo/rust/lib/caller",
+            DependencyRelation::Calls,
+            "rust-call://helper",
+            "src/lib.rs:2",
+        );
+        store
+            .publish(&first, &[facts(&first, vec![call.clone()])], &[])
+            .unwrap();
+        let input =
+            first.repository_enrichment_input_fingerprint(&first.repository_states[0], "rust");
+        store
+            .publish_enrichment(
+                &first.name,
+                "example/repo",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "rust",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    overrides: &[DependencyOverride {
+                        from: call.from.clone(),
+                        relation: DependencyRelation::Calls,
+                        unresolved_to: call.to.clone(),
+                        resolved_to: "repo://example/repo/rust/lib/helper".into(),
+                        evidence: call.evidence.clone(),
+                        confidence: Confidence::Exact,
+                        provenance: Provenance::Compiler,
+                    }],
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let second = view("source-2");
+        let moved = Observation::dependency(
+            call.from.clone(),
+            DependencyRelation::Calls,
+            call.to.clone(),
+            "src/lib.rs:20",
+        );
+        store
+            .publish(&second, &[facts(&second, vec![moved])], &[])
+            .unwrap();
+
+        let rows = store
+            .db
+            .run_script(
+                &format!(
+                    "{DIRECT_RULES}\n\
+                     ?[to, evidence] := effective_observation[\
+                         $from, to, 'calls', evidence, _, _\
+                     ]"
+                ),
+                BTreeMap::from([
+                    ("view".into(), "evidence-rebase".into()),
+                    ("from".into(), call.from.as_str().into()),
+                ]),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(
+            rows.rows[0][0].get_str(),
+            Some("repo://example/repo/rust/lib/helper")
+        );
+        assert_eq!(rows.rows[0][1].get_str(), Some("src/lib.rs:20"));
     }
 
     #[test]

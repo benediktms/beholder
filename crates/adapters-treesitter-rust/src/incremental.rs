@@ -93,8 +93,10 @@ pub(super) struct SymbolSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FileSummary {
     pub(super) source: String,
+    pub(super) module_hash: [u8; 32],
     pub(super) symbols: Vec<SymbolSummary>,
     pub(super) incomplete: bool,
+    pub(super) position_sensitive: bool,
 }
 
 #[salsa::tracked(returns(clone))]
@@ -106,6 +108,7 @@ fn file_summary(
     let source_id = source_entity_id(source.repository(db), source.path(db));
     Ok(FileSummary {
         source: source_id.clone(),
+        module_hash: analysis.module_hash(),
         symbols: analysis
             .functions()
             .map(|function| SymbolSummary {
@@ -119,6 +122,7 @@ fn file_summary(
             })
             .collect(),
         incomplete: !analysis.parse_error_lines.is_empty(),
+        position_sensitive: position_sensitive_source(source.text(db)),
     })
 }
 
@@ -138,6 +142,7 @@ fn fact_shards(
     let summary = file_summary(db, source)?;
     let mut digest = Sha256::new();
     digest.update([u8::from(summary.incomplete)]);
+    digest.update(summary.module_hash);
     for symbol in &summary.symbols {
         digest.update((symbol.id.len() as u64).to_le_bytes());
         digest.update(symbol.id.as_bytes());
@@ -146,7 +151,11 @@ fn fact_shards(
     Ok(std::iter::once(ShardFingerprint {
         owner: summary.source,
         interface_hash: digest.finalize().into(),
-        body_hash: [0; 32],
+        body_hash: if summary.position_sensitive {
+            Sha256::digest(source.text(db).as_bytes()).into()
+        } else {
+            [0; 32]
+        },
         calls: Vec::new(),
     })
     .chain(summary.symbols.into_iter().map(|symbol| ShardFingerprint {
@@ -156,6 +165,17 @@ fn fact_shards(
         calls: symbol.calls,
     }))
     .collect())
+}
+
+fn position_sensitive_source(source: &str) -> bool {
+    ["line", "column"].into_iter().any(|name| {
+        source.match_indices(name).any(|(offset, _)| {
+            let before = source[..offset].chars().next_back();
+            let after = source[offset + name.len()..].trim_start();
+            before.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+                && after.starts_with('!')
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -417,5 +437,73 @@ mod tests {
 
         assert!(updated.into_iter().all(|(_, result)| result.is_ok()));
         fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn formatting_is_semantically_stable_unless_positions_are_observable() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-rust-formatting-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&cache_dir);
+        let mut incremental = IncrementalRust::new(cache_dir.clone());
+        let plugins = ActivePlugins::default();
+        let compact = "fn run(){called();}\n";
+        let formatted = "fn run() {\n    called();\n}\n";
+        let first = incremental.analyze_many(
+            "example/repo",
+            &[(Path::new("src/lib.rs"), compact)],
+            &plugins,
+            "plugins",
+        );
+        let second = incremental.analyze_many(
+            "example/repo",
+            &[(Path::new("src/lib.rs"), formatted)],
+            &plugins,
+            "plugins",
+        );
+        assert_eq!(
+            first[0].1.as_ref().unwrap().shards,
+            second[0].1.as_ref().unwrap().shards
+        );
+
+        let documented = "/// first\nfn run() { called(); }\n";
+        let changed_documentation = "/// second\nfn run() { called(); }\n";
+        let first = incremental.analyze_many(
+            "example/repo",
+            &[(Path::new("src/lib.rs"), documented)],
+            &plugins,
+            "plugins",
+        );
+        let second = incremental.analyze_many(
+            "example/repo",
+            &[(Path::new("src/lib.rs"), changed_documentation)],
+            &plugins,
+            "plugins",
+        );
+        assert_ne!(
+            first[0].1.as_ref().unwrap().shards,
+            second[0].1.as_ref().unwrap().shards
+        );
+
+        let positioned = "fn run() { let _ = line!(); }\n";
+        let shifted = "// shifted\nfn run() { let _ = line!(); }\n";
+        let first = incremental.analyze_many(
+            "example/repo",
+            &[(Path::new("src/lib.rs"), positioned)],
+            &plugins,
+            "plugins",
+        );
+        let second = incremental.analyze_many(
+            "example/repo",
+            &[(Path::new("src/lib.rs"), shifted)],
+            &plugins,
+            "plugins",
+        );
+        assert_ne!(
+            first[0].1.as_ref().unwrap().shards[0].body_hash,
+            second[0].1.as_ref().unwrap().shards[0].body_hash
+        );
+        let _ = fs::remove_dir_all(cache_dir);
     }
 }

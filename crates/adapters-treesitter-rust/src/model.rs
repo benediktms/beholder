@@ -4,6 +4,8 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
     pub(super) functions: Vec<RustFunction>,
+    #[serde(default)]
+    pub(super) module_hash: [u8; 32],
     pub(super) tonic: TonicAnalysis,
     pub(super) parse_error_lines: Vec<usize>,
 }
@@ -11,6 +13,10 @@ pub struct RustAnalysis {
 impl RustAnalysis {
     pub fn functions(&self) -> impl Iterator<Item = &RustFunction> {
         self.functions.iter()
+    }
+
+    pub fn module_hash(&self) -> [u8; 32] {
+        self.module_hash
     }
 }
 

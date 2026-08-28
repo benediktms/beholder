@@ -129,10 +129,12 @@ dependency_override[from, relation, unresolved_to, resolved_to, evidence, confid
     not base_dependency_override[from, relation, unresolved_to, _, _, _, _]
 
 overridden[from, relation, unresolved_to, evidence] :=
-    dependency_override[from, relation, unresolved_to, _, evidence, _, _]
+    baseline_observation[from, relation, unresolved_to, evidence],
+    dependency_override[from, relation, unresolved_to, _, _, _, _]
 
 base_overridden[from, relation, unresolved_to, evidence] :=
-    base_dependency_override[from, relation, unresolved_to, _, evidence, _, _]
+    baseline_observation[from, relation, unresolved_to, evidence],
+    base_dependency_override[from, relation, unresolved_to, _, _, _, _]
 
 base_effective_observation[from, to, relation, evidence, confidence, provenance] :=
     selected_state[state],
@@ -180,7 +182,10 @@ effective_observation[from, to, relation, evidence, confidence, provenance] :=
     not overridden[from, relation, to, evidence]
 
 effective_observation[from, resolved_to, relation, evidence, confidence, provenance] :=
-    dependency_override[from, relation, _, resolved_to, evidence, confidence, provenance]
+    baseline_observation[from, relation, unresolved_to, evidence],
+    dependency_override[
+        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
+    ]
 
 effective_observation[from, to, relation, evidence, confidence, provenance] :=
     selected_shard[producer, owner, version],
@@ -259,8 +264,9 @@ direct[from, to, relation, evidence, confidence, provenance] :=
     base_direct[from, to, relation, evidence, confidence, provenance]
 
 direct[from, resolved_to, relation, evidence, confidence, provenance] :=
+    baseline_observation[from, relation, unresolved_to, evidence],
     enrichment_dependency_override[
-        from, relation, _, resolved_to, evidence, confidence, provenance,
+        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
     ],
     not base_dependency_override[from, relation, _, _, _, _, _]
 
@@ -288,7 +294,10 @@ base_direct_pair[from, to] :=
 direct_pair[from, to] := base_direct_pair[from, to]
 
 direct_pair[from, resolved_to] :=
-    enrichment_dependency_override[from, _, _, resolved_to, _, _, _],
+    baseline_observation[from, relation, unresolved_to, _],
+    enrichment_dependency_override[
+        from, relation, unresolved_to, resolved_to, _, _, _,
+    ],
     not base_dependency_override[from, _, _, _, _, _, _]
 
 direct_pair[from, to] :=

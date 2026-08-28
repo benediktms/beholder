@@ -13,9 +13,9 @@ use super::{
         enrichments_current, ensure_revision_inputs, garbage_collection_candidates,
         garbage_collection_pending, garbage_collection_queued, publish_enrichment,
         publish_observations, publish_repository, repository_contexts,
-        revision_enrichment_input_fingerprint, selected_baseline_semantics,
-        store_verification_fingerprint, sweep_garbage_collection, verification_matches,
-        view_matches,
+        revision_enrichment_input_fingerprint, revision_input_fingerprints,
+        selected_baseline_semantics, store_verification_fingerprint, sweep_garbage_collection,
+        verification_matches, view_matches,
     },
 };
 use beholder_domain::{
@@ -29,7 +29,7 @@ use beholder_dto::{
 };
 use mnestic_engine::{DbInstance, MultiTransaction, NamedRows};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -272,6 +272,13 @@ impl SemanticStore {
         analyzer: &str,
     ) -> Result<Option<String>, Box<dyn Error>> {
         self.access(|| revision_enrichment_input_fingerprint(&self.db, view, repository, analyzer))
+    }
+
+    pub fn revision_input_fingerprints(
+        &self,
+        view: &str,
+    ) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+        self.access(|| revision_input_fingerprints(&self.db, view))
     }
 
     pub fn repository_contexts(

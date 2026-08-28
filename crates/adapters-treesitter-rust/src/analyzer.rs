@@ -134,7 +134,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                     CacheStatus,
                     Vec<ShardFingerprint>,
                 ),
-                Skipped(PathBuf, String),
+                Skipped(PathBuf, String, [u8; 32]),
             }
             let results = self
                 .incremental
@@ -155,7 +155,12 @@ impl WorkspaceAnalyzer for RustAnalyzer {
                         result.shards,
                     )),
                     Err(error) if error.downcast_ref::<UnsafeTreeRecovery>().is_some() => {
-                        Ok(SourceResult::Skipped(path, error.to_string()))
+                        let content_hash = sources
+                            .iter()
+                            .find(|(source_path, _)| *source_path == path)
+                            .map(|(_, source)| Sha256::digest(source.as_bytes()).into())
+                            .expect("analyzed Rust source should still be present");
+                        Ok(SourceResult::Skipped(path, error.to_string(), content_hash))
                     }
                     Err(error) => Err(SourceAnalysisError::from_source(&path, error)),
                 })
@@ -164,18 +169,26 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             let mut entities = Vec::new();
             let mut diagnostics = Vec::new();
             let mut analyzed = Vec::new();
+            let mut skipped_shards = Vec::new();
             for result in results {
                 match result {
                     SourceResult::Analyzed(path, analysis, status, shards) => {
                         analyzed.push((path, analysis, status, shards));
                     }
-                    SourceResult::Skipped(path, detail) => diagnostics.push(AnalysisDiagnostic {
-                        code: "rust.parse_recovery".into(),
-                        severity: AnalysisDiagnosticSeverity::Warning,
-                        path,
-                        line: None,
-                        detail: Some(detail),
-                    }),
+                    SourceResult::Skipped(path, detail, content_hash) => {
+                        skipped_shards.push(skipped_fact_shard(
+                            &repository.state.repository.identity,
+                            &path,
+                            content_hash,
+                        ));
+                        diagnostics.push(AnalysisDiagnostic {
+                            code: "rust.parse_recovery".into(),
+                            severity: AnalysisDiagnosticSeverity::Warning,
+                            path,
+                            line: None,
+                            detail: Some(detail),
+                        });
+                    }
                 }
             }
             for (path, analysis, status, _) in &analyzed {
@@ -215,12 +228,13 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             observations.extend(enrichment.observations);
             diagnostics.extend(enrichment.diagnostics);
             resolve_repository_calls(&mut observations);
-            let fact_shards = build_fact_shards(
+            let mut fact_shards = build_fact_shards(
                 &repository.state.repository.identity,
                 analyzed.iter().flat_map(|(_, _, _, shards)| shards),
                 &entities,
                 &observations,
             );
+            fact_shards.extend(skipped_shards);
             let completeness = if diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"))
@@ -265,6 +279,28 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             .map_err(|_| "Rust frontend cache lock poisoned")? =
             IncrementalRust::new(self.cache_dir.clone());
         Ok(())
+    }
+}
+
+fn skipped_fact_shard(repository: &str, path: &Path, content_hash: [u8; 32]) -> FactShard {
+    let owner = crate::source_entity_id(repository, path);
+    let mut digest = Sha256::new();
+    for part in [
+        FRONTEND_VERSION.as_bytes(),
+        RESOLVER_VERSION.as_bytes(),
+        owner.as_bytes(),
+        &content_hash,
+    ] {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part);
+    }
+    FactShard {
+        repository: repository.to_owned(),
+        producer: "rust".into(),
+        owner: owner.into(),
+        version: format!("{:x}", digest.finalize()),
+        entities: Vec::new(),
+        observations: Vec::new(),
     }
 }
 
@@ -380,6 +416,11 @@ mod tests {
         assert!(repository.fact_shards.iter().any(|shard| {
             shard.owner.as_str().ends_with("/valid")
                 && shard.entities.iter().any(|entity| entity.id == shard.owner)
+        }));
+        assert!(repository.fact_shards.iter().any(|shard| {
+            shard.owner.as_str().ends_with("/tests/ui/invalid")
+                && shard.entities.is_empty()
+                && shard.observations.is_empty()
         }));
         assert!(repository.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "rust.parse_recovery"

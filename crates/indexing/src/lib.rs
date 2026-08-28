@@ -1278,6 +1278,64 @@ impl Indexer {
             .collect()
     }
 
+    /// Enrichment identities after semantic analysis has completed.
+    ///
+    /// Rust compiler enrichment consumes Rust fact shards, so trivia-only source
+    /// changes can retain the previous compiler result. Raw repository inputs
+    /// remain the independent publication/supersession guard.
+    pub fn analyzed_enrichment_input_identities(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        analysis: &WorkspaceAnalysis,
+    ) -> BTreeMap<String, BTreeMap<String, String>> {
+        let mut identities = self.enrichment_input_identities(snapshot);
+        let Some(rust) = self
+            .enrichers
+            .iter()
+            .find(|enricher| enricher.metadata().id == "rust")
+        else {
+            return identities;
+        };
+        let shared = rust.identity_inputs();
+        let Some(rust_identities) = identities.get_mut("rust") else {
+            return identities;
+        };
+        for repository in &snapshot.repositories {
+            let mut shards = analysis
+                .fact_shards
+                .iter()
+                .filter(|shard| {
+                    shard.producer == "rust"
+                        && shard.repository == repository.state.repository.identity
+                })
+                .collect::<Vec<_>>();
+            if shards.is_empty() {
+                continue;
+            }
+            shards.sort_by(|left, right| {
+                (&left.owner, &left.version).cmp(&(&right.owner, &right.version))
+            });
+            let mut inputs = rust
+                .analysis_inputs(repository)
+                .into_iter()
+                .filter(|input| input.kind != AnalysisInputKind::Source)
+                .collect::<Vec<_>>();
+            inputs.extend(shared.iter().cloned());
+            let mut digest = Sha256::new();
+            framed_digest(&mut digest, b"beholder-rust-enrichment-input-v1");
+            framed_digest(&mut digest, analysis_inputs_identity(inputs).as_bytes());
+            for shard in shards {
+                framed_digest(&mut digest, shard.owner.as_str().as_bytes());
+                framed_digest(&mut digest, shard.version.as_bytes());
+            }
+            rust_identities.insert(
+                repository.state.repository.identity.clone(),
+                format!("{:x}", digest.finalize()),
+            );
+        }
+        identities
+    }
+
     /// Collects normalized, analyzer-owned dependency evidence without running
     /// source analysis. The same path feeds workspace analysis and scheduling.
     pub fn repository_dependencies(
@@ -1692,6 +1750,7 @@ mod tests {
     struct ShardedAnalyzer;
 
     struct ScopedEnricher {
+        id: &'static str,
         environment: &'static [u8],
     }
 
@@ -2014,7 +2073,7 @@ mod tests {
     impl WorkspaceEnricher for ScopedEnricher {
         fn metadata(&self) -> AnalyzerMetadata {
             AnalyzerMetadata {
-                id: "scoped".into(),
+                id: self.id.into(),
                 version: "1".into(),
             }
         }
@@ -2109,9 +2168,60 @@ mod tests {
     }
 
     #[test]
+    fn rust_enrichment_currentness_uses_semantic_shards_not_source_formatting() {
+        let cache_dir = cache_dir("rust-semantic-enrichment-inputs");
+        let indexer = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(ShardedAnalyzer)
+            .add_enricher(ScopedEnricher {
+                id: "rust",
+                environment: b"one",
+            })
+            .build()
+            .unwrap();
+        let mut first_snapshot = snapshot();
+        first_snapshot.repositories[0].inputs.push(RepositoryInput {
+            path: "compiler.config".into(),
+            content: Arc::from(&b"configuration-one"[..]),
+            kind: InputKind::Source,
+        });
+        let first = indexer.analyze(&first_snapshot).unwrap();
+        let mut formatted_snapshot = first_snapshot.clone();
+        formatted_snapshot.repositories[0].state.fingerprint = "formatted".into();
+        formatted_snapshot.repositories[0].inputs[0].content = Arc::from(&b"  input\n"[..]);
+        let mut formatted = indexer.analyze(&formatted_snapshot).unwrap();
+        formatted.repositories[0].facts.incomplete = true;
+
+        assert_ne!(
+            indexer.enrichment_input_identities(&first_snapshot),
+            indexer.enrichment_input_identities(&formatted_snapshot)
+        );
+        assert_eq!(
+            indexer.analyzed_enrichment_input_identities(&first_snapshot, &first),
+            indexer.analyzed_enrichment_input_identities(&formatted_snapshot, &formatted)
+        );
+
+        let mut configured_snapshot = formatted_snapshot.clone();
+        configured_snapshot.repositories[0].state.fingerprint = "configured".into();
+        configured_snapshot.repositories[0].inputs[1].content =
+            Arc::from(&b"configuration-two"[..]);
+        let configured = indexer.analyze(&configured_snapshot).unwrap();
+        assert_ne!(
+            indexer.analyzed_enrichment_input_identities(&formatted_snapshot, &formatted),
+            indexer.analyzed_enrichment_input_identities(&configured_snapshot, &configured)
+        );
+        formatted.fact_shards[0].version = "body-2".into();
+        assert_ne!(
+            indexer.analyzed_enrichment_input_identities(&first_snapshot, &first),
+            indexer.analyzed_enrichment_input_identities(&formatted_snapshot, &formatted)
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
     fn enrichment_input_identity_uses_only_declared_semantic_inputs() {
         let indexer = IndexerBuilder::new(cache_dir("scoped-enrichment-inputs"), 1)
             .add_enricher(ScopedEnricher {
+                id: "scoped",
                 environment: b"one",
             })
             .build()
@@ -2147,6 +2257,7 @@ mod tests {
 
         let changed_environment = IndexerBuilder::new(cache_dir("changed-environment"), 1)
             .add_enricher(ScopedEnricher {
+                id: "scoped",
                 environment: b"two",
             })
             .build()
