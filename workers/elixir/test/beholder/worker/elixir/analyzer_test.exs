@@ -34,6 +34,6 @@ defmodule Beholder.Worker.Elixir.AnalyzerTest do
   end
 
   test "analyzer code identity is independent of declared runtime inputs" do
-    assert Analyzer.metadata_version({"1.20.3", "29"}) == "19:10:elixir-compiler:15"
+    assert Analyzer.metadata_version({"1.20.3", "29"}) == "20:10:elixir-compiler:15"
   end
 end

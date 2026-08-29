@@ -367,6 +367,11 @@ fn build_fact_shards(
         }
         for module in &analysis.modules {
             let module_owner = format!("repo://{repository}/elixir/{}", module.name);
+            fingerprints
+                .entry(module_owner.clone())
+                .or_default()
+                .body
+                .push(module.semantic_hash);
             for function in &module.functions {
                 fingerprints
                     .entry(module_owner.clone())
@@ -474,11 +479,9 @@ fn build_fact_shards(
 }
 
 fn position_sensitive_source(source: &str) -> bool {
-    ["__ENV__", "__CALLER__"].into_iter().any(|context| {
-        ["line", "column", "file"]
-            .into_iter()
-            .any(|field| source.contains(&format!("{context}.{field}")))
-    })
+    ["__ENV__", "__CALLER__"]
+        .into_iter()
+        .any(|context| source.contains(context))
 }
 
 fn hex(key: [u8; 32]) -> String {
@@ -594,6 +597,71 @@ mod tests {
     }
 
     #[test]
+    fn module_semantics_change_the_owning_module_shard() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-module-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  @callee Foo\n  def run, do: @callee.work()\nend\n",
+        );
+        let changed = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  @callee Bar\n  def run, do: @callee.work()\nend\n",
+        );
+        let module = "repo://example/repo/elixir/Example";
+        let function = "repo://example/repo/elixir/Example/run/0";
+
+        assert_ne!(changed[module], initial[module]);
+        assert_eq!(changed[function], initial[function]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn quoted_definition_semantics_change_the_owning_module_shard() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-quoted-definition-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  defmacro __using__(_) do\n    quote do\n      def generated, do: [Foo]\n    end\n  end\nend\n",
+        );
+        let changed = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  defmacro __using__(_) do\n    quote do\n      def generated, do: {Foo}\n    end\n  end\nend\n",
+        );
+        let module = "repo://example/repo/elixir/Example";
+
+        assert_ne!(changed[module], initial[module]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn body_hashes_preserve_semantic_collection_shapes() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-structure-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let list = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run, do: expand([Foo])\nend\n",
+        );
+        let tuple = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run, do: expand({Foo})\nend\n",
+        );
+        let function = "repo://example/repo/elixir/Example/run/0";
+
+        assert_ne!(tuple[function], list[function]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
     fn position_observing_sources_change_when_their_lines_move() {
         let cache_dir = std::env::temp_dir().join(format!(
             "beholder-elixir-semantic-position-{}",
@@ -602,11 +670,11 @@ mod tests {
         let analyzer = ElixirAnalyzer::new(cache_dir.clone());
         let initial = shard_versions(
             &analyzer,
-            "defmodule Example do\n  def line, do: __ENV__.line\nend\n",
+            "defmodule Example do\n  def route, do: Router.route(__ENV__)\nend\n",
         );
         let shifted = shard_versions(
             &analyzer,
-            "# shifted\ndefmodule Example do\n  def line, do: __ENV__.line\nend\n",
+            "# shifted\ndefmodule Example do\n  def route, do: Router.route(__ENV__)\nend\n",
         );
         let source = "repo://example/repo/elixir-source/lib/example.ex";
 

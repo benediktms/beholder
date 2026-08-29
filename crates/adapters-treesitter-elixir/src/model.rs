@@ -19,6 +19,8 @@ pub struct ElixirRepository {
 pub(super) struct ElixirModule {
     pub(super) name: String,
     pub(super) enclosing_module: Option<String>,
+    #[serde(default)]
+    pub(super) semantic_hash: [u8; 32],
     pub(super) line: usize,
     pub(super) functions: Vec<ElixirFunction>,
     pub(super) callbacks: Vec<ElixirFunction>,
