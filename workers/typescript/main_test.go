@@ -29,6 +29,8 @@ func TestDefinitionUsesStandardLSP(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("BEHOLDER_TYPESCRIPT_LSP_HELPER", "1")
+	t.Setenv("BEHOLDER_TYPESCRIPT_EXPECT_MEMORY_LIMIT", "4GiB")
+	t.Setenv("GOMEMLIMIT", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, err := startClient(ctx, os.Args[0], root, "-test.run=TestDefinitionUsesStandardLSP")
@@ -56,8 +58,11 @@ func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 	root := t.TempDir()
 	caller := "const counter = new Counter(); counter.value();\n"
 	target := "export class Counter { value() {} }\n"
+	unrelated := "export const unused = true;\n"
 	writeTestFile(t, root, "src/caller.ts", caller, 0o644)
 	writeTestFile(t, root, "src/target.ts", target, 0o644)
+	writeTestFile(t, root, "src/unrelated.ts", unrelated, 0o644)
+	t.Setenv("BEHOLDER_TYPESCRIPT_FORBIDDEN_URI", fileURI(filepath.Join(root, "src", "unrelated.ts")))
 	helpTarget := fileURI(filepath.Join(root, "src", "target.ts"))
 	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 7.0.2'; else BEHOLDER_TYPESCRIPT_LSP_HELPER=1 BEHOLDER_TYPESCRIPT_TARGET_URI='%s' exec '%s' -test.run=TestDefinitionUsesStandardLSP; fi\n", helpTarget, strings.ReplaceAll(os.Args[0], "'", "'\\''"))
 	writeTestFile(t, root, "node_modules/.bin/tsc", script, 0o755)
@@ -66,7 +71,7 @@ func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 		workspace: "test",
 		repositories: map[string]*repositorySnapshot{"example": {
 			identity: "example", base: root, target: true,
-			inputs: map[string][]byte{"src/caller.ts": []byte(caller), "src/target.ts": []byte(target)},
+			inputs: map[string][]byte{"src/caller.ts": []byte(caller), "src/target.ts": []byte(target), "src/unrelated.ts": []byte(unrelated)},
 		}},
 		entities: map[string]bool{"repo://example/typescript/src/target/Counter/value": true},
 		candidates: []*workerv1.SemanticCandidate{{
@@ -181,6 +186,9 @@ func writeTestFile(t *testing.T, root, path, content string, mode os.FileMode) {
 }
 
 func runLSPHelper() {
+	if expected := os.Getenv("BEHOLDER_TYPESCRIPT_EXPECT_MEMORY_LIMIT"); expected != "" && os.Getenv("GOMEMLIMIT") != expected {
+		return
+	}
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		message, err := readHelperMessage(reader)
@@ -213,6 +221,15 @@ func runLSPHelper() {
 					},
 				}},
 			})
+		case "textDocument/didOpen":
+			var params struct {
+				TextDocument struct {
+					URI string `json:"uri"`
+				} `json:"textDocument"`
+			}
+			if json.Unmarshal(message.Params, &params) != nil || params.TextDocument.URI == os.Getenv("BEHOLDER_TYPESCRIPT_FORBIDDEN_URI") {
+				return
+			}
 		case "textDocument/documentSymbol":
 			writeHelperMessage(map[string]any{
 				"jsonrpc": "2.0", "id": message.ID,

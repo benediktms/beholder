@@ -319,20 +319,6 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 	if err := c.initialize(ctx, target.base); err != nil {
 		return failedCompilerRequest(ctx, err)
 	}
-	for _, repository := range snapshot.repositories {
-		for path, content := range repository.inputs {
-			if !isTypeScriptSource(path) {
-				continue
-			}
-			resolved, err := repositoryPath(repository.base, path)
-			if err != nil {
-				return failedAnalysis("typescript.compiler.snapshot_invalid", err)
-			}
-			if err := c.openContent(resolved, content); err != nil {
-				return failedAnalysis("typescript.compiler.request_failed", err)
-			}
-		}
-	}
 	result := analysisResult{compilerVersion: version}
 	seen := make(map[string]bool)
 	for _, candidate := range snapshot.candidates {

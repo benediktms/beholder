@@ -172,6 +172,9 @@ func typescriptVersion(ctx context.Context, executable, root string) (string, er
 func startClient(ctx context.Context, executable, root string, arguments ...string) (*client, error) {
 	command := exec.CommandContext(ctx, executable, arguments...)
 	command.Dir = root
+	if os.Getenv("GOMEMLIMIT") == "" {
+		command.Env = append(os.Environ(), "GOMEMLIMIT=4GiB")
+	}
 	stderr := &bytes.Buffer{}
 	command.Stderr = stderr
 	stdin, err := command.StdinPipe()
