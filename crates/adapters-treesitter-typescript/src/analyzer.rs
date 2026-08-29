@@ -19,7 +19,7 @@ use beholder_indexing::{
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -410,6 +410,9 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 .flat_map(|repository| repository.observations.iter().cloned()),
         );
         let overrides = resolve_workspace_calls(&mut all_observations, &typed_repositories);
+        for repository in &mut repositories {
+            retain_unresolved_candidates(&mut repository.semantic_candidates, &all_observations);
+        }
         Ok(AnalyzerContribution {
             metadata: self.metadata(),
             active_repositories,
@@ -429,6 +432,35 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             .clear();
         Ok(())
     }
+}
+
+fn retain_unresolved_candidates(
+    candidates: &mut Vec<beholder_domain::SemanticCandidate>,
+    observations: &[Observation],
+) {
+    let unresolved = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation
+                == beholder_domain::SemanticRelation::Dependency(
+                    beholder_domain::DependencyRelation::Calls,
+                )
+        })
+        .map(|observation| {
+            (
+                observation.from.as_str(),
+                observation.to.as_str(),
+                observation.evidence.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    candidates.retain(|candidate| {
+        unresolved.contains(&(
+            candidate.from.as_str(),
+            candidate.unresolved_to.as_str(),
+            candidate.evidence.as_str(),
+        ))
+    });
 }
 
 fn hex(key: [u8; 32]) -> String {
@@ -553,6 +585,34 @@ mod tests {
 
         assert_eq!(initial, formatted);
         assert_ne!(initial, changed);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn compiler_candidates_exclude_calls_resolved_by_the_syntax_frontend() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-typescript-candidates-{}",
+            std::process::id()
+        ));
+        let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
+        let mut snapshot = snapshot(
+            b"import { helper } from './helper'; export function run(api: Api) { helper(); api.send(); }",
+            "state",
+        );
+        snapshot.repositories[0].inputs.push(RepositoryInput {
+            path: PathBuf::from("src/helper.ts"),
+            content: Arc::from(&b"export function helper() {}"[..]),
+            kind: InputKind::Source,
+        });
+
+        let contribution = analyzer.analyze(&snapshot).unwrap();
+        let candidates = &contribution.repositories[0].semantic_candidates;
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].unresolved_to.as_str(),
+            "typescript-method://api/send"
+        );
         let _ = fs::remove_dir_all(cache_dir);
     }
 

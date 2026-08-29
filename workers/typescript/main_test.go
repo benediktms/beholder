@@ -80,7 +80,7 @@ func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 		}},
 	}
 
-	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"])
+	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"], nil)
 
 	if len(result.diagnostics) != 0 || len(result.overrides) != 1 {
 		t.Fatalf("unexpected result: %+v", result)
@@ -109,7 +109,7 @@ func TestAnalyzeSnapshotReportsCompilerFailureWithoutContribution(t *testing.T) 
 		}},
 	}
 
-	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"])
+	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"], nil)
 
 	if result.failureCode != "typescript.compiler.unavailable" || len(result.overrides) != 0 {
 		t.Fatalf("unexpected failure result: %+v", result)
@@ -139,7 +139,7 @@ func TestAnalyzeSnapshotMapsDefinitionIntoContextRepository(t *testing.T) {
 		}},
 	}
 
-	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["consumer"])
+	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["consumer"], nil)
 
 	if len(result.overrides) != 1 || result.overrides[0].GetResolvedTo() != "repo://library/typescript/src/target/Counter/value" {
 		t.Fatalf("unexpected context override: %+v", result)
@@ -167,10 +167,23 @@ func TestAnalyzeSnapshotTreatsCompilerCrashAsFailure(t *testing.T) {
 		}},
 	}
 
-	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"])
+	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"], nil)
 
 	if result.failureCode != "typescript.compiler.request_failed" || len(result.overrides) != 0 {
 		t.Fatalf("unexpected crash result: %+v", result)
+	}
+}
+
+func TestCompilerCandidateLimitIsDeterministic(t *testing.T) {
+	candidates := make([]*workerv1.SemanticCandidate, maxCompilerCandidates+1)
+	for index := range candidates {
+		candidates[index] = &workerv1.SemanticCandidate{Id: fmt.Sprintf("%04d", maxCompilerCandidates-index)}
+	}
+
+	candidates, skipped := boundedCandidates(candidates)
+
+	if skipped != 1 || candidates[0].GetId() != "0000" || candidates[len(candidates)-1].GetId() != "0499" {
+		t.Fatalf("unexpected bounded candidates: %s..%s", candidates[0].GetId(), candidates[len(candidates)-1].GetId())
 	}
 }
 

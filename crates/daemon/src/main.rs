@@ -330,7 +330,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:1")
+        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:2")
         .timeout(std::time::Duration::from_secs(60))
         .semantic_shard_producer(TYPESCRIPT_WORKER_ID)
         .semantic_entity(EntityKind::Callable)

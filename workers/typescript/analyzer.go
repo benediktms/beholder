@@ -25,7 +25,12 @@ import (
 	"google.golang.org/grpc"
 )
 
-const analyzerVersion = "1:typescript-compiler:1"
+const (
+	analyzerVersion = "1:typescript-compiler:2"
+	// ponytail: bound exhaustive LSP fan-out; replace with persisted batching when partial enrichment can merge.
+	maxCompilerCandidates = 500
+	maxAnalysisDuration   = 5 * time.Minute
+)
 
 type analyzerServer struct {
 	workerv1.UnimplementedAnalyzerWorkerServer
@@ -122,7 +127,12 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 			attribute.Int("candidate.count", len(snapshot.candidates)),
 		),
 	)
-	result := analyzeSnapshot(ctx, snapshot, target)
+	result := analyzeSnapshot(ctx, snapshot, target, func(completed, total int) error {
+		return stream.Send(progressEvent(
+			workerv1.AnalysisPhase_ANALYSIS_PHASE_ANALYZING,
+			fmt.Sprintf("queried %d/%d compiler candidates", completed, total),
+		))
+	})
 	elapsed := time.Since(started).Seconds() * 1_000
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
@@ -156,6 +166,7 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 		slog.Error("TypeScript compiler enrichment failed",
 			"workspace", snapshot.workspace,
 			"repository", target.identity,
+			"candidate.count", len(snapshot.candidates),
 			"code", result.failureCode,
 			"error", result.failureMessage,
 			"elapsed_ms", int64(elapsed),
@@ -291,37 +302,63 @@ func (snapshot *analysisSnapshot) target() (*repositorySnapshot, error) {
 	return target, nil
 }
 
-func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target *repositorySnapshot) analysisResult {
+func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target *repositorySnapshot, progress func(int, int) error) analysisResult {
 	if err := verifySnapshot(snapshot); err != nil {
 		return failedAnalysis("typescript.compiler.snapshot_changed", err)
 	}
 	if len(snapshot.candidates) == 0 {
 		return analysisResult{}
 	}
+	parent, cancelAnalysis := context.WithTimeout(parent, maxAnalysisDuration)
+	defer cancelAnalysis()
 	executable, err := typescriptExecutable(target.base)
 	if err != nil {
 		return failedAnalysis("typescript.compiler.unavailable", err)
 	}
 	ctx, cancel := context.WithTimeout(parent, workerTimeout())
-	defer cancel()
 	version, err := typescriptVersion(ctx, executable, target.base)
 	if err != nil {
 		if ctx.Err() != nil {
-			return failedCompilerRequest(ctx, err)
+			failure := failedCompilerRequest(ctx, err)
+			cancel()
+			return failure
 		}
+		cancel()
 		return failedAnalysis("typescript.compiler.unavailable", err)
 	}
-	c, err := startClient(ctx, executable, target.base, "--lsp", "--stdio")
+	cancel()
+	processCtx, stop := context.WithCancel(parent)
+	defer stop()
+	c, err := startClient(processCtx, executable, target.base, "--lsp", "--stdio")
 	if err != nil {
 		return failedAnalysis("typescript.compiler.unavailable", err)
 	}
 	defer c.close()
-	if err := c.initialize(ctx, target.base); err != nil {
-		return failedCompilerRequest(ctx, err)
+	ctx, cancel = context.WithTimeout(parent, workerTimeout())
+	err = c.initialize(ctx, target.base)
+	if err != nil {
+		failure := failedCompilerRequest(ctx, err)
+		cancel()
+		return failure
 	}
+	cancel()
 	result := analysisResult{compilerVersion: version}
+	candidates, skipped := boundedCandidates(snapshot.candidates)
+	if skipped > 0 {
+		result.diagnostics = append(result.diagnostics, diagnostic(
+			"typescript.compiler.candidate_limit",
+			"",
+			0,
+			fmt.Errorf("deferred %d compiler candidates after the deterministic %d-candidate limit", skipped, maxCompilerCandidates),
+		))
+	}
 	seen := make(map[string]bool)
-	for _, candidate := range snapshot.candidates {
+	for index, candidate := range candidates {
+		if progress != nil && index > 0 && index%100 == 0 {
+			if err := progress(index, len(candidates)); err != nil {
+				return failedAnalysis("typescript.compiler.cancelled", err)
+			}
+		}
 		if candidate.GetRepository() != target.identity || seen[candidate.GetId()] {
 			result.diagnostics = append(result.diagnostics, candidateDiagnostic("typescript.compiler.candidate_invalid", candidate, errors.New("candidate ownership or ID is invalid")))
 			continue
@@ -332,11 +369,15 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 			result.diagnostics = append(result.diagnostics, candidateDiagnostic("typescript.compiler.candidate_invalid", candidate, err))
 			continue
 		}
+		ctx, cancel = context.WithTimeout(parent, workerTimeout())
 		definitions, err := c.definitions(ctx, path, position{Line: int(candidate.GetSpan().GetStart().GetLine()), Character: int(candidate.GetSpan().GetStart().GetCharacter())})
 		if err != nil {
-			return failedCompilerRequest(ctx, err)
+			failure := failedCompilerRequest(ctx, err)
+			cancel()
+			return failure
 		}
 		if len(definitions) != 1 {
+			cancel()
 			code := "typescript.compiler.definition_missing"
 			if len(definitions) > 1 {
 				code = "typescript.compiler.definition_ambiguous"
@@ -348,17 +389,35 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 		if err != nil {
 			var requestError compilerRequestError
 			if errors.As(err, &requestError) {
-				return failedCompilerRequest(ctx, requestError.error)
+				failure := failedCompilerRequest(ctx, requestError.error)
+				cancel()
+				return failure
 			}
+			cancel()
 			result.diagnostics = append(result.diagnostics, candidateDiagnostic("typescript.compiler.definition_unmapped", candidate, err))
 			continue
 		}
+		cancel()
 		result.overrides = append(result.overrides, &workerv1.CandidateOverride{CandidateId: candidate.GetId(), ResolvedTo: resolved, Evidence: fmt.Sprintf("TypeScript %s definition %s", version, evidence)})
+	}
+	if progress != nil {
+		if err := progress(len(candidates), len(candidates)); err != nil {
+			return failedAnalysis("typescript.compiler.cancelled", err)
+		}
 	}
 	if err := verifySnapshot(snapshot); err != nil {
 		return failedAnalysis("typescript.compiler.snapshot_changed", err)
 	}
 	return result
+}
+
+func boundedCandidates(input []*workerv1.SemanticCandidate) ([]*workerv1.SemanticCandidate, int) {
+	candidates := append([]*workerv1.SemanticCandidate(nil), input...)
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].GetId() < candidates[j].GetId() })
+	if len(candidates) <= maxCompilerCandidates {
+		return candidates, 0
+	}
+	return candidates[:maxCompilerCandidates], len(candidates) - maxCompilerCandidates
 }
 
 func failedCompilerRequest(ctx context.Context, err error) analysisResult {
