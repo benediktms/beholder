@@ -129,6 +129,7 @@ fn compiler_indexer(rust_environment: &[u8], elixir_environment: &[u8]) -> Index
         .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
         .accept_file_name_as("mix.lock", AnalysisInputKind::Dependency)
         .accept_parent_suffix_as("config", AnalysisInputKind::Configuration)
+        .accept_parent_suffix_as("priv", AnalysisInputKind::Configuration)
         .exclude_path_suffix("config/runtime.exs")
         .identity_input(
             "$environment/BEHOLDER_ELIXIR_MIX_ENV",

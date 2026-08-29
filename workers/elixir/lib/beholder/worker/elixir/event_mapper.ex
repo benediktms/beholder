@@ -23,6 +23,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
   def contribution(repository, result) do
     source_paths = source_paths(repository)
     definitions = definitions(repository, result.events, source_paths)
+    complete = complete?(result)
 
     observations =
       result.events
@@ -33,12 +34,22 @@ defmodule Beholder.Worker.Elixir.EventMapper do
 
     %RepositoryContribution{
       repository: repository.identity,
-      completeness: completeness(result.status),
+      completeness:
+        if(complete,
+          do: :ANALYSIS_COMPLETENESS_COMPLETE,
+          else: :ANALYSIS_COMPLETENESS_INCOMPLETE
+        ),
       entities: entities(repository, definitions),
       grpc_bindings: [],
       observations: observations,
-      diagnostics: diagnostics(repository, result)
+      diagnostics: diagnostics(repository, result),
+      replaced_diagnostic_codes: if(complete, do: ["elixir.macro_expansion_incomplete"], else: [])
     }
+  end
+
+  defp complete?(result) do
+    result.status == :ok and
+      Enum.all?(result.diagnostics, &(&1.severity not in [:error, "error"]))
   end
 
   defp definitions(repository, events, source_paths) do
@@ -162,9 +173,8 @@ defmodule Beholder.Worker.Elixir.EventMapper do
 
   defp evidence(repository, event, source_paths) do
     with path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
-      location = if event.line in [nil, 0], do: path, else: "#{path}:#{event.line}"
       suffix = if event.from_macro, do: " via macro expansion", else: ""
-      "#{location} (compiler #{event.kind}#{suffix})"
+      "#{path} (compiler #{event.kind}#{suffix})"
     end
   end
 
@@ -221,9 +231,6 @@ defmodule Beholder.Worker.Elixir.EventMapper do
   defp diagnostic_line({line, _column}) when is_integer(line) and line > 0, do: line
   defp diagnostic_line(line) when is_integer(line) and line > 0, do: line
   defp diagnostic_line(_position), do: nil
-
-  defp completeness(:ok), do: :ANALYSIS_COMPLETENESS_COMPLETE
-  defp completeness(:error), do: :ANALYSIS_COMPLETENESS_INCOMPLETE
 
   defp relative_path(repository, path) when is_binary(path) do
     expanded = Path.expand(path, repository.base)

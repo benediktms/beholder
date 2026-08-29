@@ -150,7 +150,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              |> length()
   end
 
-  test "reports an unavailable dependency without fetching it" do
+  test "fetches and compiles an unavailable dependency into the persistent cache" do
     root = temp_dir("dependency-project")
     dependency = temp_dir("dependency-source")
     cache = temp_dir("dependency-cache")
@@ -218,9 +218,14 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     }
 
     assert {:ok, result} = Compiler.run(repository, cache)
-    assert result.status == :error
-    assert Enum.any?(result.diagnostics, &(&1.message =~ "errors on dependencies"))
-    assert File.ls!(Path.join([cache, "elixir", "Zml4dHVyZQ", "deps"])) == []
+    assert result.status == :ok, inspect(result)
+
+    assert Enum.any?(
+             result.events,
+             &(&1.kind == :remote_function and &1.target == "CompilerDependency")
+           )
+
+    assert File.dir?(Path.join([cache, "elixir", "Zml4dHVyZQ", "deps", "compiler_dependency"]))
   end
 
   test "materializes snapshot bytes instead of reading a changed checkout" do

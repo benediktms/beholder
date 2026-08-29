@@ -1,4 +1,4 @@
-pub const FRONTEND_VERSION: &str = "18";
+pub const FRONTEND_VERSION: &str = "19";
 pub const RESOLVER_VERSION: &str = "10";
 
 mod absinthe;

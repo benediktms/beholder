@@ -259,6 +259,19 @@ and pure formatting are enrichment no-ops; documentation, attributes, imports,
 interfaces, body tokens, macros, compiler configuration, and toolchain changes
 still invalidate the appropriate semantic boundary.
 
+The first large Elixir umbrella smoke exposed two compiler-snapshot gaps before
+it produced useful facts: the isolated dependency directory was never populated,
+and standard Mix `priv/` resources were omitted. The worker now lets Mix fill and
+reuse its repository-scoped dependency cache, includes `priv/` in the immutable
+snapshot, and replaces baseline macro-expansion diagnostics only after a run with
+no compiler errors. The successful retry produced 254,364 compiler observations;
+worker analysis took 349 seconds while repairing the previously incomplete build,
+and Mnestic publication took 18.5 seconds. A subsequent unchanged checkpoint took
+90 ms, published nothing, and scheduled no compiler enrichment. The incremental
+currentness boundary is therefore effective, while the next Elixir optimization
+target is the changed-input path through compilation, trace-cache merging, and
+repository-wide event mapping—not unchanged indexing.
+
 Rust compiler summaries now retain compiler-resolved import and out-of-line
 module dependencies. Interface and module-surface changes invalidate the changed
 strongly connected component and its reverse dependants across both the old and
@@ -267,3 +280,28 @@ still invalidate only their owning symbol's cached resolutions. A worker
 integration fixture verifies that an interface edit reruns dependent calls while
 an unrelated module remains a cache hit; production-scale timing remains to be
 recorded with an installed binary.
+
+## Incremental Elixir slice
+
+The Elixir frontend now publishes immutable source, module, and function shards.
+Function versions include separate interface and body fingerprints; evidence
+locations do not affect identity. The compiler worker derives source currentness
+from those shards while continuing to use Mix compilation and its existing
+per-file trace cache for dependency-aware recomputation.
+
+An isolated 2026-08-28 smoke test used the exact release daemon, CLI, and Elixir
+worker against a temporary Mix repository:
+
+| Edit | Base index | Elixir enrichment | Query state |
+| --- | --- | --- | --- |
+| Cold registration | Published | Published | Fresh |
+| Comment and whitespace only | Published, zero changed observations | Not scheduled | Fresh |
+| Function body | Published | Published | Fresh with the changed call |
+| Public arity | Published | Published | Fresh with the replacement symbol |
+| Daemon restart without semantic change | Published | Not scheduled | Fresh |
+
+The smoke test also verified that selected compiler observations retain stable
+path evidence across source movement and that successful compiler enrichment
+uses the shared diagnostic-replacement protocol. The fixture is intentionally
+too small for performance claims; production-scale Elixir timings remain to be
+recorded before declaring the language migration complete.

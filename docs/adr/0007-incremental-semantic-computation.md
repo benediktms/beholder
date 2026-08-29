@@ -207,6 +207,28 @@ components over the previous and current dependency topology, then invalidates
 only the changed component and its reverse dependants. Function-body changes
 still invalidate only their owning symbols, without recomputing module SCCs.
 
+### Elixir adoption
+
+The Elixir frontend adopts the same owner-shard and enrichment-currentness
+contracts without adding a second Salsa database. Its existing content-addressed
+file cache already bounds parsing to changed files, while Mix and the compiler
+trace cache retain their native incremental dependency handling. Elixir function
+fingerprints distinguish interface and body tokens; module shards include their
+function interfaces. Comments, whitespace, delimiter-only formatter changes,
+and source movement do not change shard identity. Files that observe
+`__ENV__` or `__CALLER__` line, column, or file values conservatively retain raw
+source identity.
+
+The Elixir compiler worker consumes selected Elixir shards plus dependency,
+configuration, standard Mix `priv/` resources, toolchain, and environment inputs.
+A no-op source edit therefore keeps the selected compiler snapshot current
+without starting the worker. A successful compiler snapshot with no error
+diagnostics replaces the baseline
+`elixir.macro_expansion_incomplete` diagnostic through the shared replacement
+contract; an unavailable or stale compiler snapshot does not. Compiler evidence
+is path-stable because exact line movement remains baseline evidence rather than
+part of reusable compiler identity.
+
 ## Consequences
 
 - Ordinary edits no longer imply repository-wide semantic recomputation or

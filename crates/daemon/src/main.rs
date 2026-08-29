@@ -273,13 +273,15 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "18:10:elixir-compiler:12")
+        .identity(ELIXIR_WORKER_ID, "19:10:elixir-compiler:15")
+        .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
         .accept_extension("ex")
         .accept_extension("exs")
         .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
         .accept_file_name_as("mix.lock", AnalysisInputKind::Dependency)
         .accept_parent_suffix_as("config", AnalysisInputKind::Configuration)
+        .accept_parent_suffix_as("priv", AnalysisInputKind::Configuration)
         .exclude_path_suffix("config/runtime.exs")
         .identity_input(
             "$toolchain/elixir",

@@ -20,7 +20,8 @@ defmodule Beholder.Worker.Elixir.AnalyzerTest do
     contribution = %RepositoryContribution{
       repository: "example",
       completeness: :ANALYSIS_COMPLETENESS_COMPLETE,
-      observations: observations
+      observations: observations,
+      replaced_diagnostic_codes: ["elixir.macro_expansion_incomplete"]
     }
 
     assert [first, second] = Analyzer.contribution_chunks(contribution)
@@ -28,9 +29,11 @@ defmodule Beholder.Worker.Elixir.AnalyzerTest do
     assert length(second.observations) == 1
     assert first.repository == second.repository
     assert first.completeness == second.completeness
+    assert first.replaced_diagnostic_codes == ["elixir.macro_expansion_incomplete"]
+    assert second.replaced_diagnostic_codes == []
   end
 
   test "analyzer code identity is independent of declared runtime inputs" do
-    assert Analyzer.metadata_version({"1.20.3", "29"}) == "18:10:elixir-compiler:12"
+    assert Analyzer.metadata_version({"1.20.3", "29"}) == "19:10:elixir-compiler:15"
   end
 end

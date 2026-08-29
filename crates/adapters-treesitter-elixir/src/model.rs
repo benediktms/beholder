@@ -55,6 +55,10 @@ pub(super) struct AbsintheFieldImport {
 pub(super) struct ElixirFunction {
     pub(super) name: String,
     pub(super) arity: usize,
+    #[serde(default)]
+    pub(super) interface_hash: [u8; 32],
+    #[serde(default)]
+    pub(super) body_hash: [u8; 32],
     pub(super) line: usize,
     pub(super) calls: Vec<ElixirCall>,
     pub(super) struct_uses: Vec<ElixirStructUse>,
