@@ -24,6 +24,7 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     contribution = EventMapper.contribution(repository, result)
 
     assert contribution.completeness == :ANALYSIS_COMPLETENESS_COMPLETE
+    assert contribution.replaced_diagnostic_codes == ["elixir.macro_expansion_incomplete"]
 
     assert Enum.any?(contribution.observations, fn observation ->
              observation.from == "repo://example/elixir/Example/call/1" and
@@ -33,6 +34,11 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
 
     assert Enum.any?(contribution.observations, fn observation ->
              observation.to == "elixir-call://Enum/map/2"
+           end)
+
+    assert Enum.all?(contribution.observations, fn observation ->
+             observation.evidence =~ "lib/example.ex (compiler" and
+               not String.contains?(observation.evidence, "lib/example.ex:2")
            end)
   end
 
@@ -61,6 +67,20 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
 
     assert contribution.entities == []
     assert contribution.observations == []
+  end
+
+  test "keeps baseline incompleteness diagnostics when compilation reports an error" do
+    repository = %Repository{identity: "example", base: "/tmp/example", inputs: []}
+
+    contribution =
+      EventMapper.contribution(repository, %{
+        status: :ok,
+        diagnostics: [%{message: "failed", severity: "error", file: nil, position: nil}],
+        events: []
+      })
+
+    assert contribution.completeness == :ANALYSIS_COMPLETENESS_INCOMPLETE
+    assert contribution.replaced_diagnostic_codes == []
   end
 
   test "marks macro-expanded observations as inferred" do

@@ -184,6 +184,11 @@ defmodule Beholder.Worker.V1.RepositoryContribution do
 
   field :observations, 5, repeated: true, type: Beholder.Worker.V1.Observation
   field :diagnostics, 6, repeated: true, type: Beholder.Worker.V1.AnalysisDiagnostic
+
+  field :replaced_diagnostic_codes, 7,
+    repeated: true,
+    type: :string,
+    json_name: "replacedDiagnosticCodes"
 end
 
 defmodule Beholder.Worker.V1.EntityFact do

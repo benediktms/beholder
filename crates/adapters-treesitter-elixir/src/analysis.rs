@@ -3,6 +3,7 @@ use super::plugin::{ElixirLanguage, built_in_plugins};
 use beholder_adapters_treesitter::recover;
 use beholder_domain::{DependencyRelation, Observation, Provenance, UnsafeTreeRecovery};
 use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
@@ -46,6 +47,93 @@ fn function_head<'a>(node: Node<'a>, source: &'a [u8]) -> Option<(&'a str, usize
         "binary_operator" => function_head(node.child_by_field_name("left")?, source),
         _ => None,
     }
+}
+
+fn semantic_hash_excluding<'tree>(
+    roots: impl IntoIterator<Item = Node<'tree>>,
+    source: &[u8],
+    mut exclude: impl FnMut(Node<'tree>) -> bool,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
+    stack.reverse();
+    while let Some(node) = stack.pop() {
+        if exclude(node)
+            || node.kind() == "comment"
+            || matches!(node.kind(), "," | ";" | "(" | ")" | "[" | "]" | "{" | "}")
+        {
+            continue;
+        }
+        if node.is_named()
+            && node.child_count() != 0
+            && !matches!(node.kind(), "source" | "block" | "arguments" | "do_block")
+        {
+            digest.update([1]);
+            digest.update((node.kind().len() as u64).to_le_bytes());
+            digest.update(node.kind().as_bytes());
+        }
+        if node.child_count() == 0 {
+            let text = &source[node.byte_range()];
+            digest.update([0]);
+            digest.update((node.kind().len() as u64).to_le_bytes());
+            digest.update(node.kind().as_bytes());
+            digest.update((text.len() as u64).to_le_bytes());
+            digest.update(text);
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    digest.finalize().into()
+}
+
+fn semantic_hash<'tree>(roots: impl IntoIterator<Item = Node<'tree>>, source: &[u8]) -> [u8; 32] {
+    semantic_hash_excluding(roots, source, |_| false)
+}
+
+fn direct_module_function_definition(node: Node<'_>, module: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "call"
+        || !matches!(
+            call_target(node, source),
+            Some("def" | "defp" | "defdelegate")
+        )
+    {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    while let Some(candidate) = ancestor {
+        if candidate == module {
+            return true;
+        }
+        if candidate.kind() == "call" {
+            return false;
+        }
+        ancestor = candidate.parent();
+    }
+    false
+}
+
+fn module_semantic_hash(node: Node<'_>, source: &[u8]) -> [u8; 32] {
+    semantic_hash_excluding([node], source, |candidate| {
+        candidate != node && direct_module_function_definition(candidate, node, source)
+    })
+}
+
+fn function_interface_hash(kind: &str, name: &str, arity: usize) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for part in [kind.as_bytes(), name.as_bytes(), &arity.to_le_bytes()] {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part);
+    }
+    digest.finalize().into()
+}
+
+fn append_hash(current: [u8; 32], next: [u8; 32]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(current);
+    digest.update(next);
+    digest.finalize().into()
 }
 
 fn has_do_block(node: Node<'_>) -> bool {
@@ -321,6 +409,7 @@ fn push_function(
     references: &[ElixirModuleReference],
     current_module: &str,
 ) {
+    let kind = call_target(node, source).unwrap_or("def");
     let Some((name, min_arity, max_arity)) = arguments(node)
         .and_then(|arguments| arguments.named_child(0))
         .and_then(|head| function_head(head, source))
@@ -349,6 +438,8 @@ fn push_function(
         }
     }
     for arity in min_arity..=max_arity {
+        let interface_hash = function_interface_hash(kind, name, arity);
+        let body_hash = semantic_hash([node], source);
         let mut calls = delegate.as_ref().map_or_else(
             || function_calls(node, source),
             |(module, name)| {
@@ -376,6 +467,7 @@ fn push_function(
             .position(|function| function.name == name && function.arity == arity)
         {
             let function = &mut functions[index];
+            function.body_hash = append_hash(function.body_hash, body_hash);
             for call in calls {
                 if !function.calls.iter().any(|existing| {
                     existing.module == call.module
@@ -404,6 +496,8 @@ fn push_function(
         functions.push(ElixirFunction {
             name: name.into(),
             arity,
+            interface_hash,
+            body_hash,
             line: node.start_position().row + 1,
             calls,
             struct_uses,
@@ -630,6 +724,8 @@ fn callback_definition(node: Node<'_>, source: &[u8]) -> Option<ElixirFunction> 
     (min_arity == max_arity).then(|| ElixirFunction {
         name: name.into(),
         arity: max_arity,
+        interface_hash: function_interface_hash("callback", name, max_arity),
+        body_hash: [0; 32],
         line: node.start_position().row + 1,
         calls: Vec::new(),
         struct_uses: Vec::new(),
@@ -662,11 +758,13 @@ fn push_module(
     name: String,
     line: usize,
     inherited_aliases: Vec<ElixirAlias>,
+    semantic_hash: [u8; 32],
 ) -> usize {
     let module = modules.len();
     modules.push(ElixirModule {
         name,
         enclosing_module: None,
+        semantic_hash,
         line,
         functions: Vec::new(),
         callbacks: Vec::new(),
@@ -745,6 +843,7 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                         name,
                         node.start_position().row + 1,
                         inherited_aliases,
+                        module_semantic_hash(node, source),
                     );
                     let mut cursor = node.walk();
                     for child in node.named_children(&mut cursor) {
@@ -782,6 +881,7 @@ fn collect(node: Node<'_>, source: &[u8], module: Option<usize>, modules: &mut V
                         format!("{protocol}.{type}"),
                         node.start_position().row + 1,
                         aliases.clone(),
+                        module_semantic_hash(node, source),
                     );
                     modules[implementation].enclosing_module = enclosing_module;
                     modules[implementation]
@@ -1146,6 +1246,8 @@ fn absinthe_resolver(
         Some(ElixirFunction {
             name: function,
             arity,
+            interface_hash: [0; 32],
+            body_hash: [0; 32],
             line,
             calls,
             struct_uses,

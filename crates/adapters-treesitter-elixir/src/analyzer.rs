@@ -8,7 +8,7 @@ use crate::{
     analysis::analyze_with_plugins,
     plugin::{ElixirLanguage, built_in_plugins},
 };
-use beholder_domain::SourceAnalysisError;
+use beholder_domain::{FactShard, SourceAnalysisError};
 use beholder_indexing::{
     ActivePlugins, AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError,
     AnalyzerMetadata, AnalyzerPlan, CacheStatistics, GraphqlResolverCandidate, LanguageAnalyzer,
@@ -225,6 +225,12 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
             );
             if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
                 cached_observations.extend_from_slice(cached.observations);
+                cached_observations.extend(
+                    plan.cached_fact_shards(&repository.state.repository.identity)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|shard| shard.observations.iter().cloned()),
+                );
                 continue;
             }
             let mut observations = Vec::new();
@@ -279,6 +285,12 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);
             diagnostics.extend(enrichment.diagnostics);
+            let fact_shards = build_fact_shards(
+                &repository.state.repository.identity,
+                &analyzed,
+                &entities,
+                &observations,
+            );
             let completeness = if diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code.ends_with(".parse_recovery"))
@@ -295,7 +307,7 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
                 observations,
                 diagnostics,
                 replaced_diagnostic_codes: Default::default(),
-                fact_shards: Vec::new(),
+                fact_shards,
             });
         }
 
@@ -325,6 +337,153 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
     }
 }
 
+#[derive(Default)]
+struct ShardFingerprint {
+    interface: Vec<[u8; 32]>,
+    body: Vec<[u8; 32]>,
+}
+
+fn build_fact_shards(
+    repository: &str,
+    analyzed: &[(&Path, &str, Arc<ElixirAnalysis>, CacheStatus)],
+    entities: &[beholder_domain::EntityFact],
+    observations: &[beholder_domain::Observation],
+) -> Vec<FactShard> {
+    let mut fingerprints = BTreeMap::<String, ShardFingerprint>::new();
+    for (path, source, analysis, _) in analyzed {
+        let source_owner = format!(
+            "repo://{repository}/elixir-source/{}",
+            path.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        );
+        let source_fingerprint = fingerprints.entry(source_owner).or_default();
+        source_fingerprint
+            .interface
+            .push(Sha256::digest([u8::from(!analysis.parse_error_lines.is_empty())]).into());
+        if position_sensitive_source(source) {
+            source_fingerprint
+                .body
+                .push(Sha256::digest(source.as_bytes()).into());
+        }
+        for module in &analysis.modules {
+            let module_owner = format!("repo://{repository}/elixir/{}", module.name);
+            fingerprints
+                .entry(module_owner.clone())
+                .or_default()
+                .body
+                .push(module.semantic_hash);
+            for function in &module.functions {
+                fingerprints
+                    .entry(module_owner.clone())
+                    .or_default()
+                    .interface
+                    .push(function.interface_hash);
+                let fingerprint = fingerprints
+                    .entry(format!(
+                        "{module_owner}/{}/{}",
+                        function.name, function.arity
+                    ))
+                    .or_default();
+                fingerprint.interface.push(function.interface_hash);
+                fingerprint.body.push(function.body_hash);
+            }
+            for callback in &module.callbacks {
+                fingerprints
+                    .entry(module_owner.clone())
+                    .or_default()
+                    .interface
+                    .push(callback.interface_hash);
+                let fingerprint = fingerprints
+                    .entry(format!(
+                        "{module_owner}/callback/{}/{}",
+                        callback.name, callback.arity
+                    ))
+                    .or_default();
+                fingerprint.interface.push(callback.interface_hash);
+                fingerprint.body.push(callback.body_hash);
+            }
+        }
+    }
+    for entity in entities {
+        fingerprints
+            .entry(entity.id.as_str().to_owned())
+            .or_default();
+    }
+    for observation in observations {
+        fingerprints
+            .entry(observation.from.as_str().to_owned())
+            .or_default();
+    }
+
+    fingerprints
+        .into_iter()
+        .map(|(owner, mut fingerprint)| {
+            fingerprint.interface.sort_unstable();
+            let mut shard_entities = entities
+                .iter()
+                .filter(|entity| entity.id.as_str() == owner)
+                .cloned()
+                .collect::<Vec<_>>();
+            shard_entities.sort_by(|left, right| {
+                left.id
+                    .as_str()
+                    .cmp(right.id.as_str())
+                    .then(left.kind.cmp(&right.kind))
+            });
+            let mut shard_observations = observations
+                .iter()
+                .filter(|observation| observation.from.as_str() == owner)
+                .cloned()
+                .collect::<Vec<_>>();
+            shard_observations.sort_by(|left, right| {
+                left.relation
+                    .as_str()
+                    .cmp(right.relation.as_str())
+                    .then(left.to.as_str().cmp(right.to.as_str()))
+                    .then(left.provenance.as_str().cmp(right.provenance.as_str()))
+            });
+            let mut digest = Sha256::new();
+            for part in [
+                FRONTEND_VERSION.as_bytes(),
+                RESOLVER_VERSION.as_bytes(),
+                owner.as_bytes(),
+            ] {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part);
+            }
+            for hash in fingerprint.interface.into_iter().chain(fingerprint.body) {
+                digest.update(hash);
+            }
+            for entity in &shard_entities {
+                digest.update(entity.id.as_str().as_bytes());
+                digest.update(format!("{:?}", entity.kind).as_bytes());
+                digest.update(serde_json::to_vec(&entity.metadata).unwrap_or_default());
+            }
+            for observation in &shard_observations {
+                digest.update(observation.from.as_str().as_bytes());
+                digest.update(observation.relation.as_str().as_bytes());
+                digest.update(observation.to.as_str().as_bytes());
+                digest.update(observation.confidence.score().to_le_bytes());
+                digest.update(observation.provenance.as_str().as_bytes());
+            }
+            FactShard {
+                repository: repository.to_owned(),
+                producer: "elixir".into(),
+                owner: owner.into(),
+                version: format!("{:x}", digest.finalize()),
+                entities: shard_entities,
+                observations: shard_observations,
+            }
+        })
+        .collect()
+}
+
+fn position_sensitive_source(source: &str) -> bool {
+    ["__ENV__", "__CALLER__"]
+        .into_iter()
+        .any(|context| source.contains(context))
+}
+
 fn hex(key: [u8; 32]) -> String {
     key.into_iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -334,6 +493,7 @@ mod tests {
     use super::*;
     use beholder_domain::{LogicalRepository, RepositoryState};
     use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot};
+    use std::collections::BTreeMap;
 
     fn snapshot(inputs: &[(&str, &str)]) -> WorkspaceSnapshot {
         WorkspaceSnapshot {
@@ -357,6 +517,169 @@ mod tests {
                     .collect(),
             }],
         }
+    }
+
+    fn shard_versions(analyzer: &ElixirAnalyzer, source: &str) -> BTreeMap<String, String> {
+        analyzer
+            .analyze(&snapshot(&[("lib/example.ex", source)]))
+            .unwrap()
+            .repositories
+            .remove(0)
+            .fact_shards
+            .into_iter()
+            .map(|shard| (shard.owner.to_string(), shard.version))
+            .collect()
+    }
+
+    #[test]
+    fn semantic_shards_ignore_comments_and_formatting() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-formatting-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run(value) do\n    value + 1\n  end\nend\n",
+        );
+        let formatted = shard_versions(
+            &analyzer,
+            "# heading\n\ndefmodule Example do\n  # implementation\n  def run(value) do\n      (value + 1)\n  end\nend\n",
+        );
+
+        assert_eq!(formatted, initial);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn body_changes_only_the_function_shard() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-body-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run(value), do: value + 1\nend\n",
+        );
+        let changed = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run(value), do: value + 2\nend\n",
+        );
+        let owner = "repo://example/repo/elixir/Example/run/1";
+
+        assert_ne!(changed[owner], initial[owner]);
+        assert!(initial.iter().all(|(candidate, version)| {
+            candidate == owner || changed.get(candidate) == Some(version)
+        }));
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn interface_changes_the_owning_module_shard() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-interface-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run(value), do: value\nend\n",
+        );
+        let changed = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run(value, context), do: {value, context}\nend\n",
+        );
+        let module = "repo://example/repo/elixir/Example";
+
+        assert_ne!(changed[module], initial[module]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn module_semantics_change_the_owning_module_shard() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-module-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  @callee Foo\n  def run, do: @callee.work()\nend\n",
+        );
+        let changed = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  @callee Bar\n  def run, do: @callee.work()\nend\n",
+        );
+        let module = "repo://example/repo/elixir/Example";
+        let function = "repo://example/repo/elixir/Example/run/0";
+
+        assert_ne!(changed[module], initial[module]);
+        assert_eq!(changed[function], initial[function]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn quoted_definition_semantics_change_the_owning_module_shard() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-quoted-definition-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  defmacro __using__(_) do\n    quote do\n      def generated, do: [Foo]\n    end\n  end\nend\n",
+        );
+        let changed = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  defmacro __using__(_) do\n    quote do\n      def generated, do: {Foo}\n    end\n  end\nend\n",
+        );
+        let module = "repo://example/repo/elixir/Example";
+
+        assert_ne!(changed[module], initial[module]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn body_hashes_preserve_semantic_collection_shapes() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-structure-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let list = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run, do: expand([Foo])\nend\n",
+        );
+        let tuple = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run, do: expand({Foo})\nend\n",
+        );
+        let function = "repo://example/repo/elixir/Example/run/0";
+
+        assert_ne!(tuple[function], list[function]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn position_observing_sources_change_when_their_lines_move() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-position-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def route, do: Router.route(__ENV__)\nend\n",
+        );
+        let shifted = shard_versions(
+            &analyzer,
+            "# shifted\ndefmodule Example do\n  def route, do: Router.route(__ENV__)\nend\n",
+        );
+        let source = "repo://example/repo/elixir-source/lib/example.ex";
+
+        assert_ne!(shifted[source], initial[source]);
+        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]

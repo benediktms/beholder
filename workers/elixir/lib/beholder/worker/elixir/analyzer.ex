@@ -13,7 +13,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
     RepositoryContribution
   }
 
-  @analyzer_version "18:10:elixir-compiler:12"
+  @analyzer_version "20:10:elixir-compiler:15"
   @contribution_chunk_items 2_048
 
   @spec analyze(Snapshot.t(), String.t()) :: {:ok, [AnalyzeEvent.t()]} | {:error, String.t()}
@@ -109,6 +109,7 @@ defmodule Beholder.Worker.Elixir.Analyzer do
         length(contribution.grpc_bindings),
         length(contribution.observations),
         length(contribution.diagnostics),
+        length(contribution.replaced_diagnostic_codes),
         1
       ]
       |> Enum.max()
@@ -123,7 +124,13 @@ defmodule Beholder.Worker.Elixir.Analyzer do
           grpc_bindings:
             Enum.slice(contribution.grpc_bindings, offset, @contribution_chunk_items),
           observations: Enum.slice(contribution.observations, offset, @contribution_chunk_items),
-          diagnostics: Enum.slice(contribution.diagnostics, offset, @contribution_chunk_items)
+          diagnostics: Enum.slice(contribution.diagnostics, offset, @contribution_chunk_items),
+          replaced_diagnostic_codes:
+            Enum.slice(
+              contribution.replaced_diagnostic_codes,
+              offset,
+              @contribution_chunk_items
+            )
       }
     end
   end

@@ -39,6 +39,7 @@ defmodule Mix.Tasks.Beholder.Compile do
   defp prepare_dependencies do
     try do
       IO.puts("BEHOLDER_PROGRESS dependency_preparation")
+      Mix.Task.run("deps.get")
       Mix.Task.run("deps.loadpaths")
       :ok
     rescue
