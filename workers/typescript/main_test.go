@@ -175,15 +175,32 @@ func TestAnalyzeSnapshotTreatsCompilerCrashAsFailure(t *testing.T) {
 }
 
 func TestCompilerCandidateLimitIsDeterministic(t *testing.T) {
-	candidates := make([]*workerv1.SemanticCandidate, maxCompilerCandidates+1)
+	candidates := make([]*workerv1.SemanticCandidate, maxCompilerCandidates+5)
 	for index := range candidates {
-		candidates[index] = &workerv1.SemanticCandidate{Id: fmt.Sprintf("%04d", maxCompilerCandidates-index)}
+		candidates[index] = &workerv1.SemanticCandidate{
+			Id:           fmt.Sprintf("%04d", maxCompilerCandidates-index),
+			UnresolvedTo: "typescript-constructor://Example",
+		}
+	}
+	candidates[0] = &workerv1.SemanticCandidate{Id: "method", UnresolvedTo: "typescript-method://value/get"}
+	candidates[1] = &workerv1.SemanticCandidate{Id: "z-direct", UnresolvedTo: "typescript-call://later"}
+	candidates[2] = &workerv1.SemanticCandidate{Id: "a-direct", UnresolvedTo: "typescript-call://first"}
+	candidates[3] = &workerv1.SemanticCandidate{Id: "javascript", UnresolvedTo: "javascript-call://best"}
+	candidates[4] = &workerv1.SemanticCandidate{
+		Id:           "storybook",
+		UnresolvedTo: "javascript-call://noise",
+		Span:         &workerv1.SourceSpan{Path: ".storybook/preview.js"},
 	}
 
 	candidates, skipped := boundedCandidates(candidates)
 
-	if skipped != 1 || candidates[0].GetId() != "0000" || candidates[len(candidates)-1].GetId() != "0499" {
+	if skipped != 5 || candidates[0].GetId() != "javascript" || candidates[1].GetId() != "a-direct" || candidates[2].GetId() != "z-direct" || candidates[3].GetId() != "method" {
 		t.Fatalf("unexpected bounded candidates: %s..%s", candidates[0].GetId(), candidates[len(candidates)-1].GetId())
+	}
+	for _, candidate := range candidates {
+		if candidate.GetId() == "storybook" {
+			t.Fatal("Storybook candidate displaced a production candidate")
+		}
 	}
 }
 
