@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	analyzerVersion = "1:typescript-compiler:2"
+	analyzerVersion = "1:typescript-compiler:3"
 	// ponytail: bound exhaustive LSP fan-out; replace with persisted batching when partial enrichment can merge.
 	maxCompilerCandidates = 500
 	maxAnalysisDuration   = 5 * time.Minute
@@ -413,11 +413,44 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 
 func boundedCandidates(input []*workerv1.SemanticCandidate) ([]*workerv1.SemanticCandidate, int) {
 	candidates := append([]*workerv1.SemanticCandidate(nil), input...)
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].GetId() < candidates[j].GetId() })
+	sort.Slice(candidates, func(i, j int) bool {
+		leftStorybook, rightStorybook := isStorybookCandidate(candidates[i]), isStorybookCandidate(candidates[j])
+		if leftStorybook != rightStorybook {
+			return !leftStorybook
+		}
+		left, right := candidatePriority(candidates[i]), candidatePriority(candidates[j])
+		if left != right {
+			return left < right
+		}
+		return candidates[i].GetId() < candidates[j].GetId()
+	})
 	if len(candidates) <= maxCompilerCandidates {
 		return candidates, 0
 	}
 	return candidates[:maxCompilerCandidates], len(candidates) - maxCompilerCandidates
+}
+
+func candidatePriority(candidate *workerv1.SemanticCandidate) int {
+	target := candidate.GetUnresolvedTo()
+	switch {
+	case strings.HasPrefix(target, "javascript-call://"):
+		return 0
+	case strings.HasPrefix(target, "typescript-call://"):
+		return 1
+	case strings.HasPrefix(target, "typescript-method://"):
+		return 2
+	default:
+		return 3
+	}
+}
+
+func isStorybookCandidate(candidate *workerv1.SemanticCandidate) bool {
+	path := "/" + filepath.ToSlash(candidate.GetSpan().GetPath())
+	name := filepath.Base(path)
+	return strings.Contains(path, "/.storybook/") ||
+		strings.Contains(path, "/__stories__/") ||
+		strings.Contains(name, ".stories.") ||
+		strings.Contains(name, ".story.")
 }
 
 func failedCompilerRequest(ctx context.Context, err error) analysisResult {
