@@ -182,12 +182,14 @@ simulation.
 
 ### Traversal semantics
 
-Selecting a raw entity re-roots the projection. The client traverses every
-non-structural edge in both directions:
+Selecting a raw entity re-roots the projection. The client mirrors the
+backend's relation-aware traversal rules for non-structural edges:
 
 - **Downstream** follows `from` to `to` and answers what the entity depends on.
-- **Upstream** follows incoming edges and answers what may be affected by the
-  entity.
+- **Upstream** normally follows incoming edges. When it reaches a `grpc://`
+  operation, it also follows that operation's `implemented_by` edge forward to
+  the concrete server implementation. This preserves the existing `impact`
+  contract that a Protobuf contract reaches both clients and servers.
 - A node or edge reachable in both directions uses a combined visual state.
 
 The traversal has no semantic hop limit. Render guards may omit distant visible
