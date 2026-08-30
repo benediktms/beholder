@@ -11,7 +11,7 @@ use beholder_indexing::{
     WorkspaceEnricher,
 };
 use beholder_protocol::{
-    analyze_requests, contribution_from_events,
+    ContributionAccumulator, analyze_requests,
     worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
 };
 use std::{
@@ -507,7 +507,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     )
                 })??;
                 let mut stream = response.into_inner();
-                let mut events = Vec::new();
+                let mut contribution = ContributionAccumulator::default();
                 loop {
                     let event = tokio::time::timeout(analysis_inactivity_timeout, stream.message())
                         .await
@@ -535,9 +535,9 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                             "worker analysis progress"
                         );
                     }
-                    events.push(event);
+                    contribution.push(event)?;
                 }
-                let mut contribution = contribution_from_events(events)?;
+                let mut contribution = contribution.finish()?;
                 if contribution.metadata != self.metadata {
                     return Err(format!(
                         "worker returned analyzer identity {}:{}; expected {}:{}",

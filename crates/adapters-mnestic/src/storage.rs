@@ -19,6 +19,8 @@ use std::{
 };
 
 const FACT_BATCH_SIZE: usize = 10_000;
+// ponytail: fixed crossover keeps mass migrations linear; profile before making it configurable.
+const ENRICHMENT_BULK_REFRESH_OWNER_THRESHOLD: usize = 256;
 const GARBAGE_COLLECTION_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_TRANSACTION_RETRIES: usize = 50;
 const GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -2060,6 +2062,9 @@ fn refresh_enrichment_fact_selections(
     if changed_owners.is_empty() {
         return Ok(());
     }
+    if changed_owners.len() >= ENRICHMENT_BULK_REFRESH_OWNER_THRESHOLD {
+        return rebuild_enrichment_fact_selections(transaction, view, revision);
+    }
     let params = BTreeMap::from([
         ("view".into(), view.into()),
         ("revision".into(), revision.into()),
@@ -2187,6 +2192,92 @@ fn refresh_enrichment_fact_selections(
     Ok(())
 }
 
+fn rebuild_enrichment_fact_selections(
+    transaction: &MultiTransaction,
+    view: &str,
+    revision: i64,
+) -> Result<(), Box<dyn Error>> {
+    let params = BTreeMap::from([
+        ("view".into(), view.into()),
+        ("revision".into(), revision.into()),
+    ]);
+    for script in [
+        "?[view, id] := *analysis_enrichment_entity_selection{view: $view, id}, view = $view \
+         :rm analysis_enrichment_entity_selection {view, id}",
+        "candidate[id, cost, owner] := \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_entity_contribution{view: $view, owner, id}, \
+             cost = [analyzer, repository]\n\
+         winner[id, smallest_by(owner_pair)] := candidate[id, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, id, owner] := winner[id, owner], view = $view \
+         :put analysis_enrichment_entity_selection {view, id => owner}",
+        "?[view, from, relation, to, evidence] := \
+             *analysis_enrichment_observation_selection{\
+                 view: $view, from, relation, to, evidence\
+             }, view = $view \
+         :rm analysis_enrichment_observation_selection {view, from, relation, to, evidence}",
+        "candidate[from, relation, to, evidence, cost, owner] := \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_observation_contribution{\
+                 view: $view, owner, from, relation, to, evidence, confidence\
+             }, cost = [-confidence, analyzer, repository]\n\
+         winner[from, relation, to, evidence, smallest_by(owner_pair)] := \
+             candidate[from, relation, to, evidence, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, from, relation, to, evidence, owner] := \
+             winner[from, relation, to, evidence, owner], view = $view \
+         :put analysis_enrichment_observation_selection {\
+             view, from, relation, to, evidence => owner\
+         }",
+        "?[view, from, relation, unresolved_to] := \
+             *analysis_enrichment_override_selection{\
+                 view: $view, from, relation, unresolved_to\
+             }, view = $view \
+         :rm analysis_enrichment_override_selection {view, from, relation, unresolved_to}",
+        "candidate[from, relation, unresolved_to, cost, owner] := \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_override_contribution{\
+                 view: $view, owner, from, relation, unresolved_to, confidence\
+             }, cost = [-confidence, analyzer, repository]\n\
+         winner[from, relation, unresolved_to, smallest_by(owner_pair)] := \
+             candidate[from, relation, unresolved_to, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, from, relation, unresolved_to, owner] := \
+             winner[from, relation, unresolved_to, owner], view = $view \
+         :put analysis_enrichment_override_selection {\
+             view, from, relation, unresolved_to => owner\
+         }",
+        "?[view, repository, code, severity, path, line] := \
+             *analysis_enrichment_diagnostic_selection{\
+                 view: $view, repository, code, severity, path, line\
+             }, view = $view \
+         :rm analysis_enrichment_diagnostic_selection {\
+             view, repository, code, severity, path, line\
+         }",
+        "candidate[repository, code, severity, path, line, cost, owner] := \
+             *analysis_revision_repository_enrichment{\
+                 view: $view, revision: $revision, owner, repository, analyzer\
+             }, *enrichment_diagnostic_contribution{\
+                 view: $view, owner, repository, code, severity, path, line\
+             }, cost = [analyzer, repository]\n\
+         winner[repository, code, severity, path, line, smallest_by(owner_pair)] := \
+             candidate[repository, code, severity, path, line, cost, owner], \
+             owner_pair = [owner, cost]\n\
+         ?[view, repository, code, severity, path, line, owner] := \
+             winner[repository, code, severity, path, line, owner], view = $view \
+         :put analysis_enrichment_diagnostic_selection {\
+             view, repository, code, severity, path, line => owner\
+         }",
+    ] {
+        transaction.run_script(script, params.clone())?;
+    }
+    Ok(())
+}
+
 fn reconcile_obsolete_enrichments(
     transaction: &MultiTransaction,
     view: &str,
@@ -2234,13 +2325,15 @@ pub(super) fn enrichment_matches(
     version: &str,
 ) -> Result<bool, Box<dyn Error>> {
     let rows = db.run_script(
-        "?[version] := *analysis_revision{view: $view, revision}, \
+        "?[selected_version, input_fingerprint, expected_fingerprint] := \
+             *analysis_revision{view: $view, revision}, \
              *analysis_revision_enrichment_input{\
-                 view: $view, revision, repository: $repository, analyzer: $analyzer, fingerprint\
+                 view: $view, revision, repository: $repository, analyzer: $analyzer, \
+                 fingerprint: expected_fingerprint\
              }, \
              *analysis_revision_repository_enrichment{\
                  view: $view, revision, repository: $repository, analyzer: $analyzer, \
-                 version, input_fingerprint: fingerprint\
+                 version: selected_version, input_fingerprint\
              }",
         BTreeMap::from([
             ("view".into(), view.into()),
@@ -2249,7 +2342,12 @@ pub(super) fn enrichment_matches(
         ]),
         ScriptMutability::Immutable,
     )?;
-    Ok(rows.rows.first().and_then(|row| row[0].get_str()) == Some(version))
+    Ok(!rows.rows.is_empty()
+        && rows.rows.iter().all(|row| {
+            row[0].get_str() == Some(version)
+                && row[1].get_str().is_some()
+                && row[1].get_str() == row[2].get_str()
+        }))
 }
 
 pub(super) fn enrichments_current(
@@ -2262,19 +2360,27 @@ pub(super) fn enrichments_current(
     }
     for (analyzer, version) in catalog {
         let missing = db.run_script(
-            "matching[repository] := \
+            "selected[repository, owner, selected_version, input_fingerprint] := \
+                 *analysis_revision{view: $view, revision}, \
+                 *analysis_revision_repository_enrichment{\
+                     view: $view, revision, repository, analyzer: $analyzer, owner, \
+                     version: selected_version, input_fingerprint\
+                 }\n\
+             matching[repository, owner] := \
                  *analysis_revision{view: $view, revision}, \
                  *analysis_revision_enrichment_input{\
                      view: $view, revision, repository, analyzer: $analyzer, fingerprint\
                  }, \
-                 *analysis_revision_repository_enrichment{\
-                     view: $view, revision, repository, analyzer: $analyzer, version: $version, \
-                     input_fingerprint: fingerprint\
-                 }\n\
-             ?[repository] := \
+                 selected[repository, owner, $version, fingerprint]\n\
+             selected_repository[repository] := selected[repository, _, _, _]\n\
+             stale[repository] := selected[repository, owner, _, _], \
+                 not matching[repository, owner]\n\
+             missing[repository] := \
                  *analysis_revision{view: $view, revision}, \
                  *analysis_revision_state{view: $view, revision, repository}, \
-                 not matching[repository]",
+                 not selected_repository[repository]\n\
+             ?[repository] := missing[repository]\n\
+             ?[repository] := stale[repository]",
             BTreeMap::from([
                 ("view".into(), view.into()),
                 ("analyzer".into(), analyzer.as_str().into()),
@@ -2291,7 +2397,7 @@ pub(super) fn enrichments_current(
 
 fn enrichment_snapshot_id(
     repository: &str,
-    input_fingerprint: &str,
+    unit: Option<&str>,
     owner: &EnrichmentOwner<'_>,
     payload: &EnrichmentPayload<'_>,
 ) -> String {
@@ -2352,8 +2458,12 @@ fn enrichment_snapshot_id(
     );
     let logical_owner = enrichment_owner_key(owner.analyzer, repository);
     let mut hash = Sha256::new();
-    for value in [&logical_owner, owner.version, input_fingerprint] {
+    for value in [&logical_owner, owner.version] {
         hash_string(&mut hash, value);
+    }
+    if let Some(unit) = unit {
+        hash_string(&mut hash, "fact-shard");
+        hash_string(&mut hash, unit);
     }
     for row in rows {
         for value in row {
@@ -2361,6 +2471,39 @@ fn enrichment_snapshot_id(
         }
     }
     format!("{logical_owner}@{:x}", hash.finalize())
+}
+
+struct EnrichmentOutput<'a> {
+    owner: String,
+    payload: EnrichmentPayload<'a>,
+}
+
+fn enrichment_outputs<'a>(
+    repository: &str,
+    owner: &EnrichmentOwner<'_>,
+    payload: &EnrichmentPayload<'a>,
+) -> Vec<EnrichmentOutput<'a>> {
+    let repository_payload = EnrichmentPayload {
+        fact_shards: &[],
+        ..*payload
+    };
+    let mut outputs = vec![EnrichmentOutput {
+        owner: enrichment_snapshot_id(repository, None, owner, &repository_payload),
+        payload: repository_payload,
+    }];
+    outputs.extend(payload.fact_shards.iter().map(|shard| {
+        let payload = EnrichmentPayload {
+            entities: &shard.entities,
+            observations: &shard.observations,
+            ..EnrichmentPayload::default()
+        };
+        EnrichmentOutput {
+            owner: enrichment_snapshot_id(repository, Some(shard.owner.as_str()), owner, &payload),
+            payload,
+        }
+    }));
+    outputs.sort_by(|left, right| left.owner.cmp(&right.owner));
+    outputs
 }
 
 pub(super) fn publish_enrichment(
@@ -2390,10 +2533,28 @@ pub(super) fn publish_enrichment(
             "enrichment diagnostic replacement is invalid for the target repository".into(),
         );
     }
+    if payload.fact_shards.iter().any(|shard| {
+        shard.repository != repository
+            || shard.producer != owner.analyzer
+            || shard.version.is_empty()
+    }) {
+        return Err("enrichment fact shard has an invalid publication scope or version".into());
+    }
+    let shard_owners = payload
+        .fact_shards
+        .iter()
+        .map(|shard| shard.owner.as_str())
+        .collect::<BTreeSet<_>>();
+    if shard_owners.len() != payload.fact_shards.len() {
+        return Err("enrichment fact shard owners must be unique within a publication".into());
+    }
 
-    let snapshot = enrichment_snapshot_id(repository, input_fingerprint, &owner, &payload);
+    let outputs = enrichment_outputs(repository, &owner, &payload);
+    let incoming_owners = outputs
+        .iter()
+        .map(|output| output.owner.clone())
+        .collect::<BTreeSet<_>>();
     let EnrichmentOwner { analyzer, version } = owner;
-    let owner = snapshot;
     let transaction = db.multi_transaction(true);
     let current = transaction.run_script(
         "?[revision, fingerprint] := *analysis_revision{view: $view, revision}, \
@@ -2414,67 +2575,100 @@ pub(super) fn publish_enrichment(
         transaction.abort()?;
         return Ok(EnrichmentPublishOutcome::Superseded);
     }
-    let output_is_current = !transaction
+    let current_selections = transaction
         .run_script(
-            "?[owner] := *analysis_revision{view: $view, revision}, \
+            "?[owner, version, input_fingerprint] := \
+                 *analysis_revision{view: $view, revision}, \
                  *analysis_revision_repository_enrichment{\
-                     view: $view, revision, owner: $owner, repository: $repository, \
-                     analyzer: $analyzer, version: $version, \
-                     input_fingerprint: $input_fingerprint\
-                 }, owner = $owner",
+                     view: $view, revision, owner, repository: $repository, \
+                     analyzer: $analyzer, version, input_fingerprint\
+                 }",
             BTreeMap::from([
                 ("view".into(), view.into()),
-                ("owner".into(), owner.as_str().into()),
                 ("repository".into(), repository.into()),
                 ("analyzer".into(), analyzer.into()),
-                ("version".into(), version.into()),
-                ("input_fingerprint".into(), input_fingerprint.into()),
             ]),
         )?
         .rows
-        .is_empty();
+        .into_iter()
+        .map(|row| {
+            let string = |index: usize, field: &str| {
+                row[index]
+                    .get_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("enrichment selection {field} is not a string"))
+            };
+            Ok((
+                string(0, "owner")?,
+                (string(1, "version")?, string(2, "input fingerprint")?),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+    let output_is_current = current_selections.len() == incoming_owners.len()
+        && current_selections.iter().all(|(selected, metadata)| {
+            incoming_owners.contains(selected)
+                && metadata.0 == version
+                && metadata.1 == input_fingerprint
+        });
     if output_is_current {
         transaction.abort()?;
         return Ok(EnrichmentPublishOutcome::Unchanged);
     }
-    let snapshot_exists = !transaction
+    let existing = transaction
         .run_script(
-            "?[owner] := *enrichment_output{\
-                 view: $view, owner: $owner, repository: $repository, analyzer: $analyzer, \
-                 version: $version, input_fingerprint: $input_fingerprint\
-             }, owner = $owner",
+            "incoming[owner] <- $owners\n\
+             ?[owner] := incoming[owner], *enrichment_output{\
+                 view: $view, owner, repository: $repository, analyzer: $analyzer, \
+                 version: $version\
+             }",
             BTreeMap::from([
                 ("view".into(), view.into()),
-                ("owner".into(), owner.as_str().into()),
                 ("repository".into(), repository.into()),
                 ("analyzer".into(), analyzer.into()),
                 ("version".into(), version.into()),
-                ("input_fingerprint".into(), input_fingerprint.into()),
+                (
+                    "owners".into(),
+                    DataValue::List(
+                        incoming_owners
+                            .iter()
+                            .map(|owner| DataValue::List(vec![owner.as_str().into()]))
+                            .collect(),
+                    ),
+                ),
             ]),
         )?
         .rows
-        .is_empty();
-    if !snapshot_exists {
+        .into_iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let missing = outputs
+        .iter()
+        .filter(|output| !existing.contains(&output.owner))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
         let started = Instant::now();
-        replace_enrichment_contributions(&transaction, view, &owner, &payload)?;
-        complete_enrichment(
+        store_enrichment_outputs(
             &transaction,
             view,
-            &owner,
             repository,
             analyzer,
             version,
             input_fingerprint,
+            &missing,
         )?;
         tracing::info!(
             target: "beholder::publication",
             stage = "enrichment_store_snapshot",
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            entities = payload.entities.len(),
-            observations = payload.observations.len(),
-            overrides = payload.overrides.len(),
-            diagnostics = payload.diagnostics.len(),
-            diagnostic_replacements = payload.diagnostic_replacements.len(),
+            snapshots = missing.len(),
+            entities = missing.iter().map(|output| output.payload.entities.len()).sum::<usize>(),
+            observations = missing.iter().map(|output| output.payload.observations.len()).sum::<usize>(),
+            overrides = missing.iter().map(|output| output.payload.overrides.len()).sum::<usize>(),
+            diagnostics = missing.iter().map(|output| output.payload.diagnostics.len()).sum::<usize>(),
+            diagnostic_replacements = missing
+                .iter()
+                .map(|output| output.payload.diagnostic_replacements.len())
+                .sum::<usize>(),
             "Mnestic enrichment publication stage completed"
         );
     }
@@ -2485,32 +2679,16 @@ pub(super) fn publish_enrichment(
         .ok_or("published analysis revision is invalid")?;
     let revision = previous + 1;
     copy_revision(&transaction, view, previous, revision)?;
-    let mut changed_owners = transaction
-        .run_script(
-            "?[owner] := *analysis_revision_repository_enrichment{\
-                 view: $view, revision: $revision, owner, repository: $repository, \
-                 analyzer: $analyzer\
-             }",
-            BTreeMap::from([
-                ("view".into(), view.into()),
-                ("revision".into(), revision.into()),
-                ("repository".into(), repository.into()),
-                ("analyzer".into(), analyzer.into()),
-            ]),
-        )?
-        .rows
-        .into_iter()
-        .filter_map(|row| row[0].get_str().map(str::to_owned))
+    let previous_owners = current_selections.keys().cloned().collect::<BTreeSet<_>>();
+    let changed_owners = previous_owners
+        .symmetric_difference(&incoming_owners)
+        .cloned()
         .collect::<BTreeSet<_>>();
-    changed_owners.insert(owner.clone());
     let params = BTreeMap::from([
         ("view".into(), view.into()),
         ("revision".into(), revision.into()),
-        ("owner".into(), owner.as_str().into()),
         ("repository".into(), repository.into()),
         ("analyzer".into(), analyzer.into()),
-        ("version".into(), version.into()),
-        ("input_fingerprint".into(), input_fingerprint.into()),
     ]);
     transaction.run_script(
         "?[view, revision, owner] := *analysis_revision_repository_enrichment{\
@@ -2520,15 +2698,29 @@ pub(super) fn publish_enrichment(
          :rm analysis_revision_repository_enrichment {view, revision, owner}",
         params.clone(),
     )?;
-    transaction.run_script(
-        "?[view, revision, owner, repository, analyzer, version, input_fingerprint] <- \
-             [[$view, $revision, $owner, $repository, $analyzer, $version, \
-               $input_fingerprint]] \
-         :put analysis_revision_repository_enrichment {\
-             view, revision, owner => repository, analyzer, version, input_fingerprint\
-         }",
-        params.clone(),
-    )?;
+    let selection_rows = incoming_owners
+        .iter()
+        .map(|owner| {
+            DataValue::List(vec![
+                view.into(),
+                revision.into(),
+                owner.as_str().into(),
+                repository.into(),
+                analyzer.into(),
+                version.into(),
+                input_fingerprint.into(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    for rows in selection_rows.chunks(FACT_BATCH_SIZE) {
+        transaction.run_script(
+            "?[view, revision, owner, repository, analyzer, version, input_fingerprint] <- $rows \
+             :put analysis_revision_repository_enrichment {\
+                 view, revision, owner => repository, analyzer, version, input_fingerprint\
+             }",
+            BTreeMap::from([("rows".into(), DataValue::List(rows.to_vec()))]),
+        )?;
+    }
     tracing::info!(
         target: "beholder::publication",
         stage = "enrichment_copy_revision_manifest",
@@ -2565,38 +2757,11 @@ pub(super) fn publish_enrichment(
         repository,
         analyzer,
         revision,
-        snapshot_exists,
+        snapshots = outputs.len(),
+        missing_snapshots = missing.len(),
         "Mnestic enrichment publication completed"
     );
     Ok(EnrichmentPublishOutcome::Published)
-}
-
-fn complete_enrichment(
-    transaction: &MultiTransaction,
-    view: &str,
-    owner: &str,
-    repository: &str,
-    analyzer: &str,
-    version: &str,
-    input_fingerprint: &str,
-) -> Result<(), Box<dyn Error>> {
-    let params = BTreeMap::from([
-        ("view".into(), view.into()),
-        ("owner".into(), owner.into()),
-        ("repository".into(), repository.into()),
-        ("analyzer".into(), analyzer.into()),
-        ("version".into(), version.into()),
-        ("input_fingerprint".into(), input_fingerprint.into()),
-    ]);
-    transaction.run_script(
-        "?[view, owner, repository, analyzer, version, input_fingerprint] <- \
-             [[$view, $owner, $repository, $analyzer, $version, $input_fingerprint]] \
-         :put enrichment_output {\
-             view, owner => repository, analyzer, version, input_fingerprint\
-         }",
-        params,
-    )?;
-    Ok(())
 }
 
 fn copy_revision(
@@ -2697,156 +2862,136 @@ fn copy_revision(
     Ok(())
 }
 
-fn replace_enrichment_contributions(
+fn store_enrichment_outputs(
     transaction: &MultiTransaction,
     view: &str,
-    owner: &str,
-    payload: &EnrichmentPayload<'_>,
+    repository: &str,
+    analyzer: &str,
+    version: &str,
+    input_fingerprint: &str,
+    outputs: &[&EnrichmentOutput<'_>],
 ) -> Result<(), Box<dyn Error>> {
-    let params = BTreeMap::from([("view".into(), view.into()), ("owner".into(), owner.into())]);
-    for script in [
-        "?[view, owner, id] := *enrichment_entity_contribution{\
-             view: $view, owner, id\
-         }, view = $view, owner = $owner \
-         :rm enrichment_entity_contribution {view, owner, id}",
-        "?[view, owner, from, relation, to, evidence] := \
-             *enrichment_observation_contribution{\
-                 view: $view, owner, from, relation, to, evidence\
-             }, view = $view, owner = $owner \
-             :rm enrichment_observation_contribution {\
-                 view, owner, from, relation, to, evidence\
-             }",
-        "?[view, owner, from, relation, unresolved_to] := \
-             *enrichment_override_contribution{\
-                 view: $view, owner, from, relation, unresolved_to\
-             }, view = $view, owner = $owner \
-             :rm enrichment_override_contribution {\
-                 view, owner, from, relation, unresolved_to\
-             }",
-        "?[view, owner, repository, code, severity, path, line] := \
-             *enrichment_diagnostic_contribution{\
-                 view: $view, owner, repository, code, severity, path, line\
-             }, view = $view, owner = $owner \
-             :rm enrichment_diagnostic_contribution {\
-                 view, owner, repository, code, severity, path, line\
-             }",
-        "?[view, owner, repository, code] := *enrichment_diagnostic_replacement{\
-             view: $view, owner, repository, code\
-         }, view = $view, owner = $owner \
-         :rm enrichment_diagnostic_replacement {view, owner, repository, code}",
-    ] {
-        transaction.run_script(script, params.clone())?;
-    }
-    for entities in payload.entities.chunks(FACT_BATCH_SIZE) {
-        let rows = entities
-            .iter()
-            .map(|entity| {
-                DataValue::List(vec![
-                    view.into(),
-                    owner.into(),
-                    entity.id.as_str().into(),
-                    entity_kind(entity.kind).into(),
-                    entity_metadata(entity.metadata).into(),
-                ])
-            })
-            .collect::<Vec<_>>();
-        transaction.run_script(
-            "?[view, owner, id, kind, metadata] <- $rows \
-             :put enrichment_entity_contribution {view, owner, id => kind, metadata}",
-            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
-        )?;
-    }
-    for observations in payload.observations.chunks(FACT_BATCH_SIZE) {
-        let rows = observations
-            .iter()
-            .map(|observation| {
-                DataValue::List(vec![
-                    view.into(),
-                    owner.into(),
-                    observation.from.as_str().into(),
-                    observation.relation.as_str().into(),
-                    observation.to.as_str().into(),
-                    observation.evidence.as_str().into(),
-                    observation.confidence.score().into(),
-                    observation.provenance.as_str().into(),
-                ])
-            })
-            .collect::<Vec<_>>();
-        transaction.run_script(
-            "?[view, owner, from, relation, to, evidence, confidence, provenance] <- $rows \
-             :put enrichment_observation_contribution {\
-                 view, owner, from, relation, to, evidence => confidence, provenance\
-             }",
-            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
-        )?;
-    }
-    for overrides in payload.overrides.chunks(FACT_BATCH_SIZE) {
-        let rows = overrides
-            .iter()
-            .map(|override_| {
-                DataValue::List(vec![
-                    view.into(),
-                    owner.into(),
-                    override_.from.as_str().into(),
-                    override_.relation.as_str().into(),
-                    override_.unresolved_to.as_str().into(),
-                    override_.resolved_to.as_str().into(),
-                    override_.evidence.as_str().into(),
-                    override_.confidence.score().into(),
-                    override_.provenance.as_str().into(),
-                ])
-            })
-            .collect::<Vec<_>>();
-        transaction.run_script(
-            "?[view, owner, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] <- $rows \
-             :put enrichment_override_contribution {\
-                 view, owner, from, relation, unresolved_to => resolved_to, evidence, confidence, \
-                 provenance\
-             }",
-            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
-        )?;
-    }
-    for diagnostics in payload.diagnostics.chunks(FACT_BATCH_SIZE) {
-        let rows = diagnostics
-            .iter()
-            .map(|(repository, diagnostic)| {
-                DataValue::List(vec![
-                    view.into(),
-                    owner.into(),
-                    repository.as_str().into(),
-                    diagnostic.code.as_str().into(),
-                    diagnostic.severity.as_str().into(),
-                    diagnostic.path.to_string_lossy().into_owned().into(),
-                    i64::from(diagnostic.line.unwrap_or_default()).into(),
-                    diagnostic.detail.as_deref().unwrap_or_default().into(),
-                ])
-            })
-            .collect::<Vec<_>>();
-        transaction.run_script(
-            "?[view, owner, repository, code, severity, path, line, detail] <- $rows \
-             :put enrichment_diagnostic_contribution {\
-                 view, owner, repository, code, severity, path, line => detail\
-             }",
-            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
-        )?;
-    }
-    for replacements in payload.diagnostic_replacements.chunks(FACT_BATCH_SIZE) {
-        let rows = replacements
-            .iter()
-            .map(|(repository, code)| {
+    let mut entity_rows = Vec::new();
+    let mut observation_rows = Vec::new();
+    let mut override_rows = Vec::new();
+    let mut diagnostic_rows = Vec::new();
+    let mut replacement_rows = Vec::new();
+    let mut output_rows = Vec::new();
+    for output in outputs {
+        let owner = output.owner.as_str();
+        let payload = &output.payload;
+        entity_rows.extend(payload.entities.iter().map(|entity| {
+            DataValue::List(vec![
+                view.into(),
+                owner.into(),
+                entity.id.as_str().into(),
+                entity_kind(entity.kind).into(),
+                entity_metadata(entity.metadata).into(),
+            ])
+        }));
+        observation_rows.extend(payload.observations.iter().map(|observation| {
+            DataValue::List(vec![
+                view.into(),
+                owner.into(),
+                observation.from.as_str().into(),
+                observation.relation.as_str().into(),
+                observation.to.as_str().into(),
+                observation.evidence.as_str().into(),
+                observation.confidence.score().into(),
+                observation.provenance.as_str().into(),
+            ])
+        }));
+        override_rows.extend(payload.overrides.iter().map(|override_| {
+            DataValue::List(vec![
+                view.into(),
+                owner.into(),
+                override_.from.as_str().into(),
+                override_.relation.as_str().into(),
+                override_.unresolved_to.as_str().into(),
+                override_.resolved_to.as_str().into(),
+                override_.evidence.as_str().into(),
+                override_.confidence.score().into(),
+                override_.provenance.as_str().into(),
+            ])
+        }));
+        diagnostic_rows.extend(payload.diagnostics.iter().map(|(repository, diagnostic)| {
+            DataValue::List(vec![
+                view.into(),
+                owner.into(),
+                repository.as_str().into(),
+                diagnostic.code.as_str().into(),
+                diagnostic.severity.as_str().into(),
+                diagnostic.path.to_string_lossy().into_owned().into(),
+                i64::from(diagnostic.line.unwrap_or_default()).into(),
+                diagnostic.detail.as_deref().unwrap_or_default().into(),
+            ])
+        }));
+        replacement_rows.extend(payload.diagnostic_replacements.iter().map(
+            |(repository, code)| {
                 DataValue::List(vec![
                     view.into(),
                     owner.into(),
                     repository.as_str().into(),
                     code.as_str().into(),
                 ])
-            })
-            .collect::<Vec<_>>();
-        transaction.run_script(
+            },
+        ));
+        output_rows.push(DataValue::List(vec![
+            view.into(),
+            owner.into(),
+            repository.into(),
+            analyzer.into(),
+            version.into(),
+            input_fingerprint.into(),
+        ]));
+    }
+    for (script, rows) in [
+        (
+            "?[view, owner, id, kind, metadata] <- $rows \
+             :put enrichment_entity_contribution {view, owner, id => kind, metadata}",
+            entity_rows,
+        ),
+        (
+            "?[view, owner, from, relation, to, evidence, confidence, provenance] <- $rows \
+             :put enrichment_observation_contribution {\
+                 view, owner, from, relation, to, evidence => confidence, provenance\
+             }",
+            observation_rows,
+        ),
+        (
+            "?[view, owner, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] <- $rows \
+             :put enrichment_override_contribution {\
+                 view, owner, from, relation, unresolved_to => resolved_to, evidence, confidence, \
+                 provenance\
+             }",
+            override_rows,
+        ),
+        (
+            "?[view, owner, repository, code, severity, path, line, detail] <- $rows \
+             :put enrichment_diagnostic_contribution {\
+                 view, owner, repository, code, severity, path, line => detail\
+             }",
+            diagnostic_rows,
+        ),
+        (
             "?[view, owner, repository, code] <- $rows \
              :put enrichment_diagnostic_replacement {view, owner, repository, code}",
-            BTreeMap::from([("rows".into(), DataValue::List(rows))]),
-        )?;
+            replacement_rows,
+        ),
+        (
+            "?[view, owner, repository, analyzer, version, input_fingerprint] <- $rows \
+             :put enrichment_output {\
+                 view, owner => repository, analyzer, version, input_fingerprint\
+             }",
+            output_rows,
+        ),
+    ] {
+        for rows in rows.chunks(FACT_BATCH_SIZE) {
+            transaction.run_script(
+                script,
+                BTreeMap::from([("rows".into(), DataValue::List(rows.to_vec()))]),
+            )?;
+        }
     }
     Ok(())
 }
@@ -3614,7 +3759,7 @@ mod tests {
     use crate::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-        DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
+        DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges, FactShard,
         GrpcBindingCandidate, GrpcBindingRole, LogicalRepository, Observation, ProtoTypeKind,
         Provenance, RepositoryFacts, RepositoryState, RpcCardinality, SemanticCandidate,
         SourcePosition, SourceSpan, StructuralRelation, WorkspaceView,
@@ -4531,7 +4676,7 @@ mod tests {
     }
 
     #[test]
-    fn carries_forward_enrichment_selections_and_marks_changed_inputs_stale() {
+    fn carries_forward_enrichment_selections_and_backdates_identical_output() {
         let store = SemanticStore::memory().unwrap();
         let state = |repository: &str, fingerprint: &str| RepositoryState {
             repository: LogicalRepository {
@@ -4670,6 +4815,42 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(current_entities.contains(entity_b.id.as_str()));
         assert!(current_entities.contains(entity_a.id.as_str()));
+
+        let updated_input =
+            updated.repository_enrichment_input_fingerprint(&updated.repository_states[0], "rust");
+        assert!(
+            store
+                .publish_enrichment(
+                    &updated.name,
+                    "example/a",
+                    &updated_input,
+                    EnrichmentOwner {
+                        analyzer: "rust",
+                        version: "1",
+                    },
+                    EnrichmentPayload {
+                        entities: std::slice::from_ref(&entity_a),
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .enrichment_matches("incremental", "example/a", "rust", "1")
+                .unwrap()
+        );
+        let snapshots = store
+            .db
+            .run_script(
+                "?[count(owner)] := *enrichment_output{\
+                     view: 'incremental', owner, repository: 'example/a', analyzer: 'rust'\
+                 }",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(snapshots.rows[0][0].get_int(), Some(1));
         let materialized = store
             .db
             .run_script(
@@ -4680,6 +4861,229 @@ mod tests {
             )
             .unwrap();
         assert!(materialized.rows.is_empty());
+    }
+
+    #[test]
+    fn replaces_only_changed_enrichment_fact_shards() {
+        let store = SemanticStore::memory().unwrap();
+        let state = |fingerprint: &str| RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/repo".into(),
+            },
+            head: None,
+            fingerprint: fingerprint.into(),
+        };
+        let view = |fingerprint: &str| {
+            with_enrichment_analyzers(
+                WorkspaceView::new("sharded", "syntax", vec![state(fingerprint)]).unwrap(),
+                &["elixir"],
+            )
+        };
+        let shard = |owner: &str, version: &str, target: &str| FactShard {
+            repository: "example/repo".into(),
+            producer: "elixir".into(),
+            owner: owner.into(),
+            version: version.into(),
+            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            observations: vec![Observation::dependency(
+                owner,
+                DependencyRelation::Calls,
+                target,
+                "lib/example.ex:1",
+            )],
+        };
+        let initial = view("state-1");
+        store
+            .publish(&initial, &[facts(&initial, Vec::new())], &[])
+            .unwrap();
+        let owner_a = "repo://example/repo/elixir-source/lib/a.ex";
+        let owner_b = "repo://example/repo/elixir-source/lib/b.ex";
+        let initial_shards = [
+            shard(owner_a, "a-1", "elixir-call://first"),
+            shard(owner_b, "b-1", "elixir-call://stable"),
+        ];
+        store
+            .publish_enrichment(
+                &initial.name,
+                "example/repo",
+                &initial.repository_enrichment_input_fingerprint(
+                    &initial.repository_states[0],
+                    "elixir",
+                ),
+                EnrichmentOwner {
+                    analyzer: "elixir",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    fact_shards: &initial_shards,
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let updated = view("state-2");
+        store
+            .publish(&updated, &[facts(&updated, Vec::new())], &[])
+            .unwrap();
+        let updated_shards = [
+            shard(owner_a, "a-2", "elixir-call://second"),
+            initial_shards[1].clone(),
+        ];
+        store
+            .publish_enrichment(
+                &updated.name,
+                "example/repo",
+                &updated.repository_enrichment_input_fingerprint(
+                    &updated.repository_states[0],
+                    "elixir",
+                ),
+                EnrichmentOwner {
+                    analyzer: "elixir",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    fact_shards: &updated_shards,
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .enrichment_matches("sharded", "example/repo", "elixir", "1")
+                .unwrap()
+        );
+        assert_eq!(
+            store.context("sharded", owner_a).unwrap().edges[0].to,
+            "elixir-call://second"
+        );
+        assert_eq!(
+            store.context("sharded", owner_b).unwrap().edges[0].to,
+            "elixir-call://stable"
+        );
+        let output_count = || {
+            store
+                .db
+                .run_script(
+                    "?[count(owner)] := *enrichment_output{\
+                         view: 'sharded', owner, repository: 'example/repo', analyzer: 'elixir'\
+                     }",
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows[0][0]
+                .get_int()
+        };
+        assert_eq!(output_count(), Some(4));
+        store.sweep_garbage_collection(|_| true).unwrap();
+        assert_eq!(output_count(), Some(3));
+    }
+
+    #[test]
+    fn bulk_rebuilds_enrichment_selections_for_mass_shard_migrations() {
+        let store = SemanticStore::memory().unwrap();
+        let view = |fingerprint: &str| {
+            with_enrichment_analyzers(
+                WorkspaceView::new(
+                    "bulk-sharded",
+                    "syntax",
+                    vec![RepositoryState {
+                        repository: LogicalRepository {
+                            identity: "example/repo".into(),
+                        },
+                        head: None,
+                        fingerprint: fingerprint.into(),
+                    }],
+                )
+                .unwrap(),
+                &["elixir"],
+            )
+        };
+        let initial = view("state-1");
+        store
+            .publish(&initial, &[facts(&initial, Vec::new())], &[])
+            .unwrap();
+        let legacy = EntityFact::new(
+            "repo://example/repo/elixir/Legacy",
+            EntityKind::Namespace,
+            None,
+        )
+        .unwrap();
+        store
+            .publish_enrichment(
+                &initial.name,
+                "example/repo",
+                &initial.repository_enrichment_input_fingerprint(
+                    &initial.repository_states[0],
+                    "elixir",
+                ),
+                EnrichmentOwner {
+                    analyzer: "elixir",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    entities: std::slice::from_ref(&legacy),
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let updated = view("state-2");
+        store
+            .publish(&updated, &[facts(&updated, Vec::new())], &[])
+            .unwrap();
+        let shards = (0..ENRICHMENT_BULK_REFRESH_OWNER_THRESHOLD)
+            .map(|index| {
+                let owner = format!("repo://example/repo/elixir-source/lib/{index}.ex");
+                FactShard {
+                    repository: "example/repo".into(),
+                    producer: "elixir".into(),
+                    owner: owner.clone().into(),
+                    version: "1".into(),
+                    entities: vec![EntityFact::new(owner, EntityKind::Namespace, None).unwrap()],
+                    observations: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        store
+            .publish_enrichment(
+                &updated.name,
+                "example/repo",
+                &updated.repository_enrichment_input_fingerprint(
+                    &updated.repository_states[0],
+                    "elixir",
+                ),
+                EnrichmentOwner {
+                    analyzer: "elixir",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    fact_shards: &shards,
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .context("bulk-sharded", shards[0].owner.as_str())
+                .unwrap()
+                .root
+                .id,
+            shards[0].owner.as_str()
+        );
+        let legacy_selection = store
+            .db
+            .run_script(
+                "?[owner] := *analysis_enrichment_entity_selection{\
+                     view: 'bulk-sharded', id: $id, owner\
+                 }",
+                BTreeMap::from([("id".into(), legacy.id.as_str().into())]),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert!(legacy_selection.rows.is_empty());
     }
 
     #[test]
@@ -5265,6 +5669,7 @@ mod tests {
                         overrides: &[analyzer_override],
                         diagnostics: &[("example/repo".into(), analyzer_diagnostic)],
                         diagnostic_replacements: &[],
+                        fact_shards: &[],
                     },
                 )
                 .unwrap()

@@ -5,7 +5,7 @@ defmodule Beholder.Worker.Elixir.Compiler.Tracer do
 
   @spec trace(term(), Macro.Env.t()) :: :ok
   def trace(:start, env), do: record(:source_start, [], %{}, env)
-  def trace(:stop, env), do: record(:source_stop, [], %{}, env)
+  def trace(:stop, _env), do: :ok
 
   def trace({:alias, meta, target, as, _options}, env),
     do: record(:alias, meta, %{target: module_name(target), as: module_name(as)}, env)

@@ -436,6 +436,7 @@ impl IndexScheduler {
         let mut diagnostic_replacements = Vec::new();
         let mut entities = Vec::new();
         let mut observations = Vec::new();
+        let mut fact_shards = Vec::new();
         for contribution in contribution.repositories {
             diagnostic_replacements.extend(
                 contribution
@@ -445,6 +446,7 @@ impl IndexScheduler {
             );
             entities.extend(contribution.entities);
             observations.extend(contribution.observations);
+            fact_shards.extend(contribution.fact_shards);
             diagnostics.extend(
                 contribution
                     .diagnostics
@@ -464,6 +466,7 @@ impl IndexScheduler {
                     overrides: &contribution.overrides,
                     diagnostics: &diagnostics,
                     diagnostic_replacements: &diagnostic_replacements,
+                    fact_shards: &fact_shards,
                 },
             },
         )
@@ -527,6 +530,19 @@ fn contribution_escapes_target(contribution: &AnalyzerContribution, target: &str
                 .observations
                 .iter()
                 .any(|observation| entity_escapes_target(observation.from.as_str(), target))
+            || repository.fact_shards.iter().any(|shard| {
+                shard.repository != target
+                    || shard.producer != contribution.metadata.id
+                    || !entity_belongs_to_target(shard.owner.as_str(), target)
+                    || shard
+                        .entities
+                        .iter()
+                        .any(|entity| entity_escapes_target(entity.id.as_str(), target))
+                    || shard
+                        .observations
+                        .iter()
+                        .any(|observation| entity_escapes_target(observation.from.as_str(), target))
+            })
     }) || contribution
         .active_repositories
         .iter()
@@ -557,7 +573,8 @@ fn entity_escapes_target(entity: &str, target: &str) -> bool {
 mod tests {
     use super::*;
     use beholder_domain::{
-        Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, Provenance,
+        Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, FactShard,
+        Provenance,
     };
     use beholder_indexing::{
         AnalysisCompleteness, CacheStatistics, EnrichmentFuture, IndexerBuilder,
@@ -675,6 +692,17 @@ mod tests {
             &override_escape,
             "example/target"
         ));
+
+        let mut shard_escape = contribution();
+        shard_escape.repositories[0].fact_shards.push(FactShard {
+            repository: "example/context".into(),
+            producer: "rust".into(),
+            owner: "repo://example/context/rust-source/src/lib.rs".into(),
+            version: "1".into(),
+            entities: Vec::new(),
+            observations: Vec::new(),
+        });
+        assert!(contribution_escapes_target(&shard_escape, "example/target"));
 
         assert!(!contribution_escapes_target(
             &contribution(),

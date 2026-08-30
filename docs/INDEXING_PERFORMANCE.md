@@ -303,5 +303,34 @@ worker against a temporary Mix repository:
 The smoke test also verified that selected compiler observations retain stable
 path evidence across source movement and that successful compiler enrichment
 uses the shared diagnostic-replacement protocol. The fixture is intentionally
-too small for performance claims; production-scale Elixir timings remain to be
-recorded before declaring the language migration complete.
+too small for performance claims.
+
+A production-scale 2026-08-29 smoke used a large Elixir umbrella containing
+roughly 288,000 compiler events and 1,627 source-owned fact shards. Before the
+trace-cache change, a one-function warm edit took 33 seconds: about 22.5 seconds
+were spent reconstructing and recompressing the repository-wide trace term,
+while Mnestic published the single changed shard in about 0.5 seconds.
+
+The worker now owns compressed per-source trace shards, persists them as an
+8.2 MB restart cache, and uses inventory-provided input hashes to maintain its
+isolated compiler snapshot. The same one-function edit then completed in about
+11 seconds under concurrent CPU load:
+
+| Stage | Elapsed |
+| --- | ---: |
+| Snapshot materialization | 0.54 s |
+| Dependency preparation | 0.31 s |
+| Incremental Mix compilation | 5.14 s |
+| Result validation | 0.31 s |
+| Trace-shard update and persistence | 1.63 s |
+| Semantic mapping and response streaming | 2.40 s |
+| Mnestic delta publication | 0.58 s |
+
+Only one semantic snapshot was new. A comment-only edit completed as index-only
+work and did not enqueue compiler enrichment. Another daemon continuously used
+about 96% of one CPU core during the warm measurement, so these figures are a
+conservative end-to-end smoke result rather than an isolated compiler benchmark.
+Cold helper or dependency rebuilds remain proportional to the underlying Mix
+compilation and are intentionally kept off the ordinary warm-edit path. Cold
+trace reconstruction forces only the Elixir compiler and skips protocol
+consolidation; populating an empty dependency cache remains the dominant cost.

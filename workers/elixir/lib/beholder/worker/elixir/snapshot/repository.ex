@@ -3,7 +3,12 @@ defmodule Beholder.Worker.Elixir.Snapshot.Repository do
 
   defstruct [:identity, :base, :head, :fingerprint, inputs: []]
 
-  @type input :: %{path: String.t(), content: binary(), kind: atom()}
+  @type input :: %{
+          path: String.t(),
+          content: binary(),
+          content_hash: binary(),
+          kind: atom()
+        }
   @type t :: %__MODULE__{
           identity: String.t(),
           base: String.t(),

@@ -644,6 +644,7 @@ dependencies = [
  "beholder-dto",
  "beholder-indexing",
  "prost",
+ "sha2",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

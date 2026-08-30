@@ -3,7 +3,8 @@ use beholder_adapters_mnestic::{
     EnrichmentPublishOutcome, SemanticStore,
 };
 use beholder_domain::{
-    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityKind, Observation, SemanticRelation,
+    AnalysisDiagnostic, DependencyOverride, EntityFact, EntityKind, FactShard, Observation,
+    SemanticRelation,
 };
 use beholder_indexing::SemanticSnapshot;
 use std::{
@@ -39,6 +40,7 @@ pub(crate) struct EnrichmentContribution<'a> {
     pub(crate) overrides: &'a [DependencyOverride],
     pub(crate) diagnostics: &'a [(String, AnalysisDiagnostic)],
     pub(crate) diagnostic_replacements: &'a [(String, String)],
+    pub(crate) fact_shards: &'a [FactShard],
 }
 
 pub(crate) struct EnrichmentPublicationRequest<'a> {
@@ -138,6 +140,7 @@ impl EnrichmentPublication for SemanticStore {
                 overrides: request.contribution.overrides,
                 diagnostics: request.contribution.diagnostics,
                 diagnostic_replacements: request.contribution.diagnostic_replacements,
+                fact_shards: request.contribution.fact_shards,
             },
         )
     }

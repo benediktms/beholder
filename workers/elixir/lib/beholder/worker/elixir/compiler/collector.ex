@@ -16,7 +16,7 @@ defmodule Beholder.Worker.Elixir.Compiler.Collector do
         :ok
 
       table ->
-        true = :ets.insert(table, {System.unique_integer([:monotonic, :positive]), event})
+        true = :ets.insert(table, {event_key(event), event})
         :ok
     end
   end
@@ -30,7 +30,7 @@ defmodule Beholder.Worker.Elixir.Compiler.Collector do
   def init([]) do
     :ets.new(@table, [
       :named_table,
-      :ordered_set,
+      :set,
       :public,
       read_concurrency: true,
       write_concurrency: true
@@ -45,4 +45,33 @@ defmodule Beholder.Worker.Elixir.Compiler.Collector do
     :ets.delete_all_objects(@table)
     {:reply, events, state}
   end
+
+  defp event_key(%{kind: kind, file: file}) when kind in [:source_start, :source_stop],
+    do: {kind, file}
+
+  defp event_key(%{kind: :module, file: file, target: target}),
+    do: {:module, file, target}
+
+  defp event_key(
+         %{
+           kind: kind,
+           file: file,
+           caller_module: caller_module,
+           caller_function: caller_function,
+           from_macro: from_macro
+         } = event
+       ) do
+    {
+      kind,
+      file,
+      caller_module,
+      caller_function,
+      from_macro,
+      Map.get(event, :target),
+      Map.get(event, :name),
+      Map.get(event, :arity)
+    }
+  end
+
+  defp event_key(event), do: {:event, event}
 end

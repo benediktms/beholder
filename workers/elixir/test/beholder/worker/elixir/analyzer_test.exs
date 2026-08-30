@@ -2,7 +2,7 @@ defmodule Beholder.Worker.Elixir.AnalyzerTest do
   use ExUnit.Case, async: true
 
   alias Beholder.Worker.Elixir.Analyzer
-  alias Beholder.Worker.V1.{Observation, RepositoryContribution}
+  alias Beholder.Worker.V1.{FactShard, Observation, RepositoryContribution}
 
   test "chunks large repository contributions at the protocol boundary" do
     observations =
@@ -20,13 +20,23 @@ defmodule Beholder.Worker.Elixir.AnalyzerTest do
     contribution = %RepositoryContribution{
       repository: "example",
       completeness: :ANALYSIS_COMPLETENESS_COMPLETE,
-      observations: observations,
+      fact_shards: [
+        %FactShard{
+          repository: "example",
+          producer: "elixir",
+          owner: "repo://example/elixir-source/lib/example.ex",
+          version: "semantic-1",
+          observations: observations
+        }
+      ],
       replaced_diagnostic_codes: ["elixir.macro_expansion_incomplete"]
     }
 
-    assert [first, second] = Analyzer.contribution_chunks(contribution)
-    assert length(first.observations) == 2_048
-    assert length(second.observations) == 1
+    assert [first, second] = contribution |> Analyzer.contribution_chunks() |> Enum.to_list()
+    assert [%{observations: first_observations}] = first.fact_shards
+    assert [%{observations: second_observations}] = second.fact_shards
+    assert length(first_observations) == 2_048
+    assert length(second_observations) == 1
     assert first.repository == second.repository
     assert first.completeness == second.completeness
     assert first.replaced_diagnostic_codes == ["elixir.macro_expansion_incomplete"]
@@ -34,6 +44,6 @@ defmodule Beholder.Worker.Elixir.AnalyzerTest do
   end
 
   test "analyzer code identity is independent of declared runtime inputs" do
-    assert Analyzer.metadata_version({"1.20.3", "29"}) == "20:10:elixir-compiler:15"
+    assert Analyzer.metadata_version({"1.20.3", "29"}) == "20:10:elixir-compiler:17"
   end
 end
