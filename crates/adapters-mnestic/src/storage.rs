@@ -1079,12 +1079,15 @@ fn refresh_semantic_noop(
                 ),
             ]),
         )?;
-        let state = selected
+        if selected
             .rows
             .first()
             .and_then(|row| row[0].get_str())
-            .ok_or("published repository state is missing")?;
-        store_repository_state(&transaction, facts, state)?;
+            .is_none()
+        {
+            return Err("published repository state is missing".into());
+        }
+        store_revision_repository_head(&transaction, &view.name, facts)?;
     }
     let params = BTreeMap::from([("view".into(), view.name.clone().into())]);
     for (relation, keys) in [
@@ -1170,8 +1173,8 @@ pub(super) fn publish_repository(
         store_observations(&transaction, &analyzed_state, &facts.observations)?;
         store_entities(&transaction, &analyzed_state, &facts.entities)?;
         store_grpc_bindings(&transaction, &analyzed_state, &facts.grpc_bindings)?;
+        store_repository_state(&transaction, facts, &analyzed_state)?;
     }
-    store_repository_state(&transaction, facts, &analyzed_state)?;
     transaction.run_script(
         "?[repository, code, severity, path, line] := \
              *repository_revision_diagnostic{repository: $repository, code, severity, path, line}, \
@@ -1281,6 +1284,10 @@ fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<()
     let params = BTreeMap::from([("view".into(), view.into())]);
     for (relation, keys) in [
         ("analysis_revision_state", "view, revision, repository"),
+        (
+            "analysis_revision_repository_head",
+            "view, revision, repository",
+        ),
         ("analysis_revision_input", "view, revision, repository"),
         (
             "analysis_revision_enrichment_input",
@@ -3065,6 +3072,11 @@ fn copy_revision(
              *analysis_revision_state{view: $view, revision: $previous, repository, state}, \
              view = $view, revision = $revision \
          :put analysis_revision_state {view, revision, repository => state}",
+        "?[view, revision, repository, head] := \
+             *analysis_revision_repository_head{\
+                 view: $view, revision: $previous, repository, head\
+             }, view = $view, revision = $revision \
+         :put analysis_revision_repository_head {view, revision, repository => head}",
         "?[view, revision, repository, fingerprint] := \
              *analysis_revision_input{view: $view, revision: $previous, repository, fingerprint}, \
              view = $view, revision = $revision \
@@ -3346,7 +3358,9 @@ pub(super) fn store_repository_states(
     analyzed_states: &[String],
 ) -> Result<(), Box<dyn Error>> {
     for (facts, analyzed_state) in repositories.iter().zip(analyzed_states) {
-        store_repository_state(transaction, facts, analyzed_state)?;
+        if !state_exists(transaction, analyzed_state)? {
+            store_repository_state(transaction, facts, analyzed_state)?;
+        }
         let params = BTreeMap::from([
             ("view".into(), view.name.clone().into()),
             (
@@ -3362,7 +3376,33 @@ pub(super) fn store_repository_states(
              :put analysis_revision_state {view, revision, repository => state}",
             params,
         )?;
+        store_revision_repository_head(transaction, &view.name, facts)?;
     }
+    Ok(())
+}
+
+fn store_revision_repository_head(
+    transaction: &MultiTransaction,
+    view: &str,
+    facts: &RepositoryFacts,
+) -> Result<(), Box<dyn Error>> {
+    transaction.run_script(
+        "?[view, revision, repository, head] := \
+             *analysis_revision{view: $view, revision}, \
+             view = $view, repository = $repository, head = $head\n\
+         :put analysis_revision_repository_head {view, revision, repository => head}",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            (
+                "repository".into(),
+                facts.state.repository.identity.clone().into(),
+            ),
+            (
+                "head".into(),
+                facts.state.head.clone().unwrap_or_default().into(),
+            ),
+        ]),
+    )?;
     Ok(())
 }
 
@@ -3810,6 +3850,11 @@ pub(super) fn sweep_garbage_collection(
         (
             "superseded revision repository states",
             "analysis_revision_state",
+            "view, revision, repository",
+        ),
+        (
+            "superseded revision repository heads",
+            "analysis_revision_repository_head",
             "view, revision, repository",
         ),
         (

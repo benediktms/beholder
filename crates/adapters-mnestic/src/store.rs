@@ -804,9 +804,9 @@ mod tests {
     #[test]
     fn semantic_noop_refreshes_inputs_without_advancing_the_graph_revision() {
         let store = SemanticStore::memory().unwrap();
-        let view = |fingerprint: &str, head: &str| {
+        let view = |name: &str, fingerprint: &str, head: &str| {
             WorkspaceView::new(
-                "semantic-noop",
+                name,
                 "analysis",
                 vec![RepositoryState {
                     repository: LogicalRepository {
@@ -818,7 +818,7 @@ mod tests {
             )
             .unwrap()
         };
-        let initial = view("source-1", "head-1");
+        let initial = view("semantic-noop", "source-1", "head-1");
         let owner = "repo://example/repository/typescript/run";
         let shard = FactShard {
             repository: "example/repository".into(),
@@ -843,7 +843,18 @@ mod tests {
                 "verified-1",
             )
             .unwrap();
-        let updated = view("source-2", "head-2");
+        let other = view("semantic-noop-other", "source-1", "head-1");
+        store
+            .publish_verified_sharded(
+                &other,
+                &[facts(&other, Vec::new())],
+                &[],
+                std::slice::from_ref(&shard),
+                &[],
+                "verified-other",
+            )
+            .unwrap();
+        let updated = view("semantic-noop", "source-2", "head-2");
 
         let changes = store
             .publish_verified_sharded(
@@ -882,6 +893,13 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("head-2")
+        );
+        assert_eq!(
+            store
+                .published_repository_head("semantic-noop-other", "example/repository")
+                .unwrap()
+                .as_deref(),
+            Some("head-1")
         );
         assert_eq!(
             store.revision_input_fingerprints("semantic-noop").unwrap()["example/repository"],
