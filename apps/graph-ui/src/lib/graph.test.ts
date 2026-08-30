@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  EXTERNAL_REPOSITORY,
   ORIGINS,
   projectGraph,
   type EntityRef,
@@ -76,22 +77,74 @@ test('re-rooting keeps every upstream and downstream reachable entity', () => {
   assert.equal(graph.links.find((link) => link.rawEdgeIds.includes('e3'))?.direction, 'downstream');
 });
 
-test('structural containment reconnects projections without widening dependency reachability', () => {
-  const parent = entity('parent', 'repo-b');
+test('upstream gRPC traversal reaches both clients and server implementations', () => {
+  const grpcNodes = [
+    entity('contract', 'contracts'),
+    entity('grpc://example.Service/Call', 'contracts'),
+    entity('client', 'client'),
+    entity('server', 'server')
+  ];
   const graph = projectGraph(
     {
       ...snapshot,
-      nodes: [...snapshot.nodes, parent],
-      edges: [...snapshot.edges, { ...edge('e4', 'parent', 'b'), kind: 'defines' }]
+      nodes: grpcNodes,
+      edges: [
+        { ...edge('binds', 'grpc://example.Service/Call', 'contract'), kind: 'binds_contract' },
+        { ...edge('calls', 'client', 'grpc://example.Service/Call'), kind: 'calls_rpc' },
+        { ...edge('server', 'grpc://example.Service/Call', 'server'), kind: 'implemented_by' }
+      ]
     },
     {
       ...options,
       band: 'entity',
-      relationKinds: ['calls', 'defines'],
+      relationKinds: ['binds_contract', 'calls_rpc', 'implemented_by'],
+      rootId: 'contract'
+    }
+  );
+  assert.deepEqual(
+    Object.fromEntries(graph.nodes.map((node) => [node.id, node.direction])),
+    {
+      contract: 'both',
+      'grpc://example.Service/Call': 'upstream',
+      client: 'upstream',
+      server: 'upstream'
+    }
+  );
+});
+
+test('structural containment reconnects projections without widening dependency reachability', () => {
+  const parent = entity('parent', 'repo-b');
+  const defines = {
+    ...edge('e4', 'parent', 'b'),
+    kind: 'defines' as const,
+    evidence: [
+      { source: 'test', repository: 'repo-b', path: 'src/b.ts', line: 1, detail: null }
+    ]
+  };
+  const graph = projectGraph(
+    {
+      ...snapshot,
+      nodes: [...snapshot.nodes, parent],
+      edges: [...snapshot.edges, defines]
+    },
+    {
+      ...options,
+      band: 'file',
+      relationKinds: ['calls'],
       rootId: 'b'
     }
   );
-  assert.equal(graph.nodes.some((node) => node.id === 'parent'), false);
+  assert.equal(graph.nodes.some((node) => node.rawEntityIds.includes('parent')), false);
+  assert.equal(graph.nodes.some((node) => node.id === 'ui:file:repo-b:src/b.ts'), true);
+});
+
+test('external repository filtering remains distinct from the workspace view', () => {
+  const external = { ...entity('external', 'unused'), repository: null };
+  const graph = projectGraph(
+    { ...snapshot, nodes: [...snapshot.nodes, external] },
+    { ...options, band: 'entity', repository: EXTERNAL_REPOSITORY }
+  );
+  assert.deepEqual(graph.nodes.map((node) => node.id), ['external']);
 });
 
 test('visible guards keep the nearest topology and report omissions', () => {

@@ -22,6 +22,7 @@ export const ORIGINS = ['source', 'generated', 'external_dependency'] as const;
 export const MAX_VISIBLE_NODES = 10_000;
 export const MAX_VISIBLE_LINKS = 25_000;
 export const MAX_ANIMATED_LINKS = 250;
+export const EXTERNAL_REPOSITORY = 'external/contracts';
 
 export type RelationKind = (typeof RELATION_KINDS)[number];
 export type EntityOrigin = (typeof ORIGINS)[number];
@@ -170,7 +171,9 @@ export function projectGraph(
   const allowedNodes = snapshot.nodes.filter(
     (node) =>
       node.id === root?.id ||
-      ((options.repository === null || node.repository === options.repository) &&
+      ((options.repository === null ||
+        node.repository === options.repository ||
+        (options.repository === EXTERNAL_REPOSITORY && node.repository === null)) &&
         (options.includeTests || !node.test) &&
         options.origins.includes(node.origin))
   );
@@ -197,7 +200,7 @@ export function projectGraph(
   const rawEdges = filteredEdges.filter(
     (edge) => rawIds.has(edge.from) && rawIds.has(edge.to)
   );
-  const fileByEntity = containmentFiles(rawNodes, rawEdges);
+  const fileByEntity = containmentFiles(rawNodes, snapshot.edges);
   const displayNames = new Map(
     snapshot.workspace.repositories.map((repository) => [
       repository.identity,
@@ -330,8 +333,17 @@ export function projectGraph(
 function reachable(rootId: string, edges: SemanticEdge[]) {
   const outgoing = adjacency(edges, 'from');
   const incoming = adjacency(edges, 'to');
+  for (const edge of edges) {
+    if (edge.kind !== 'implemented_by' || !edge.from.startsWith('grpc://')) continue;
+    const values = incoming.get(edge.from) ?? [];
+    values.push(edge);
+    values.sort((left, right) => left.id.localeCompare(right.id));
+    incoming.set(edge.from, values);
+  }
   const downstream = walk(rootId, outgoing, (edge) => edge.to);
-  const upstream = walk(rootId, incoming, (edge) => edge.from);
+  const upstream = walk(rootId, incoming, (edge, current) =>
+    edge.from === current ? edge.to : edge.from
+  );
   return {
     nodeIds: new Set([...downstream.nodes.keys(), ...upstream.nodes.keys()]),
     upstreamNodes: upstream.nodes,
@@ -355,7 +367,7 @@ function adjacency(edges: SemanticEdge[], endpoint: 'from' | 'to') {
 function walk(
   rootId: string,
   adjacent: Map<string, SemanticEdge[]>,
-  next: (edge: SemanticEdge) => string
+  next: (edge: SemanticEdge, current: string) => string
 ) {
   const nodes = new Map([[rootId, 0]]);
   const traversedEdges = new Set<string>();
@@ -365,7 +377,7 @@ function walk(
     const hops = nodes.get(id) ?? 0;
     for (const edge of adjacent.get(id) ?? []) {
       traversedEdges.add(edge.id);
-      const neighbor = next(edge);
+      const neighbor = next(edge, id);
       if (!nodes.has(neighbor)) {
         nodes.set(neighbor, hops + 1);
         queue.push(neighbor);
@@ -414,7 +426,7 @@ function groupFor(
   files: Map<string, string>,
   displayNames: Map<string, string>
 ): Omit<GraphNode, 'rawEntityIds' | 'count' | 'internalEdges' | 'direction' | 'hops' | 'selected'> {
-  const repository = entity.repository ?? 'external/contracts';
+  const repository = entity.repository ?? EXTERNAL_REPOSITORY;
   if (band === 'repository') {
     return {
       id: `ui:repository:${repository}`,

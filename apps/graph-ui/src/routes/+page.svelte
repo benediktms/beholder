@@ -7,6 +7,7 @@
   import {
     MAX_VISIBLE_LINKS,
     MAX_VISIBLE_NODES,
+    EXTERNAL_REPOSITORY,
     ORIGINS,
     RELATION_KINDS,
     projectGraph,
@@ -100,7 +101,7 @@
     selectedId = node.id;
     if (node.level === 'repository') {
       const raw = snapshot?.nodes.find((entity) => node.rawEntityIds.includes(entity.id));
-      repository = raw?.repository ?? '';
+      repository = raw?.repository ?? EXTERNAL_REPOSITORY;
       rootId = null;
       band = 'module';
     } else if (node.level === 'entity' && node.rawEntityIds.length === 1) {
@@ -186,6 +187,9 @@
           {#each snapshot?.workspace.repositories ?? [] as item}
             <option value={item.identity}>{item.displayName}</option>
           {/each}
+          {#if snapshot?.nodes.some((node) => node.repository === null)}
+            <option value={EXTERNAL_REPOSITORY}>External contracts</option>
+          {/if}
         </select>
       </label>
 
