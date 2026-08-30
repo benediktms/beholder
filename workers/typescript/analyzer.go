@@ -444,15 +444,6 @@ func candidatePriority(candidate *workerv1.SemanticCandidate) int {
 	}
 }
 
-func isStorybookCandidate(candidate *workerv1.SemanticCandidate) bool {
-	path := "/" + filepath.ToSlash(candidate.GetSpan().GetPath())
-	name := filepath.Base(path)
-	return strings.Contains(path, "/.storybook/") ||
-		strings.Contains(path, "/__stories__/") ||
-		strings.Contains(name, ".stories.") ||
-		strings.Contains(name, ".story.")
-}
-
 func failedCompilerRequest(ctx context.Context, err error) analysisResult {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return failedAnalysis("typescript.compiler.timeout", err)
