@@ -74,7 +74,7 @@ defmodule Mix.Tasks.Beholder.Compile do
     try do
       arguments =
         if System.get_env("BEHOLDER_ELIXIR_FORCE_COMPILE") == "true",
-          do: ["--return-errors", "--force"],
+          do: ["--return-errors", "--force-elixir", "--no-protocol-consolidation"],
           else: ["--return-errors"]
 
       case Mix.Task.run("compile", arguments) do

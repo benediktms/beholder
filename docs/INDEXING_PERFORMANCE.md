@@ -331,4 +331,6 @@ work and did not enqueue compiler enrichment. Another daemon continuously used
 about 96% of one CPU core during the warm measurement, so these figures are a
 conservative end-to-end smoke result rather than an isolated compiler benchmark.
 Cold helper or dependency rebuilds remain proportional to the underlying Mix
-compilation and are intentionally kept off the ordinary warm-edit path.
+compilation and are intentionally kept off the ordinary warm-edit path. Cold
+trace reconstruction forces only the Elixir compiler and skips protocol
+consolidation; populating an empty dependency cache remains the dominant cost.
