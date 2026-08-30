@@ -4,7 +4,8 @@ use beholder_domain::{
     Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata,
     FactChanges, FactShard, GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate,
     GrpcBindingRole, Observation, ProtoTypeKind, Provenance, RepositoryFacts, RpcCardinality,
-    SemanticRelation, StructuralRelation, WorkspaceView,
+    SemanticCandidate, SemanticRelation, SourcePosition, SourceSpan, StructuralRelation,
+    WorkspaceView,
 };
 use beholder_dto::{GarbageCollectionPhase, GarbageCollectionProgress};
 use mnestic_engine::{DataValue, DbInstance, MultiTransaction, ScriptMutability};
@@ -21,6 +22,9 @@ const FACT_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_BATCH_SIZE: usize = 10_000;
 const GARBAGE_COLLECTION_TRANSACTION_RETRIES: usize = 50;
 const GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+pub(super) type SelectedBaselineSemantics =
+    (Vec<EntityFact>, Vec<Observation>, Vec<SemanticCandidate>);
 
 fn replace_fact_shards(
     transaction: &MultiTransaction,
@@ -234,15 +238,69 @@ fn enrichment_owner_key(analyzer: &str, repository: &str) -> String {
     format!("{}:{analyzer}{repository}", analyzer.len())
 }
 
+fn replace_semantic_candidates(
+    transaction: &MultiTransaction,
+    view: &str,
+    candidates: &[SemanticCandidate],
+) -> Result<(), Box<dyn Error>> {
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if ids.len() != candidates.len() || ids.contains("") {
+        return Err("semantic candidate IDs must be non-empty and unique".into());
+    }
+    transaction.run_script(
+        "?[view, id] := *analysis_semantic_candidate{view, id}, view = $view \
+         :rm analysis_semantic_candidate {view, id}",
+        BTreeMap::from([("view".into(), view.into())]),
+    )?;
+    let rows = candidates
+        .iter()
+        .map(|candidate| {
+            let path = candidate
+                .span
+                .path
+                .to_str()
+                .ok_or("semantic candidate path is not UTF-8")?;
+            Ok(DataValue::List(vec![
+                view.into(),
+                candidate.id.as_str().into(),
+                candidate.repository.as_str().into(),
+                candidate.from.as_str().into(),
+                candidate.relation.as_str().into(),
+                candidate.unresolved_to.as_str().into(),
+                path.into(),
+                i64::from(candidate.span.start.line).into(),
+                i64::from(candidate.span.start.character).into(),
+                i64::from(candidate.span.end.line).into(),
+                i64::from(candidate.span.end.character).into(),
+                candidate.evidence.as_str().into(),
+            ]))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    for rows in rows.chunks(FACT_BATCH_SIZE) {
+        transaction.run_script(
+            "?[view, id, repository, from, relation, unresolved_to, path, start_line, \
+                 start_character, end_line, end_character, evidence] <- $rows \
+             :put analysis_semantic_candidate {view, id => repository, from, relation, \
+                 unresolved_to, path, start_line, start_character, end_line, end_character, \
+                 evidence}",
+            BTreeMap::from([("rows".into(), DataValue::List(rows.to_vec()))]),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn selected_baseline_semantics(
     db: &DbInstance,
     view: &str,
     repository: &str,
     entity_kinds: &BTreeSet<EntityKind>,
     relations: &BTreeSet<SemanticRelation>,
-) -> Result<(Vec<EntityFact>, Vec<Observation>), Box<dyn Error>> {
+) -> Result<SelectedBaselineSemantics, Box<dyn Error>> {
     if entity_kinds.is_empty() && relations.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     let state = db.run_script(
         "?[state] := *analysis_revision{view: $view, revision}, \
@@ -254,7 +312,7 @@ pub(super) fn selected_baseline_semantics(
         ScriptMutability::Immutable,
     )?;
     let Some(state) = state.rows.first().and_then(|row| row[0].get_str()) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     };
     let params = BTreeMap::from([
         ("state".into(), state.into()),
@@ -326,7 +384,52 @@ pub(super) fn selected_baseline_semantics(
         .into_iter()
         .filter_map(|id| entities.remove(&id))
         .collect();
-    Ok((entities, observations))
+    let stored_candidates = db.run_script(
+        "?[id, from, relation, unresolved_to, path, start_line, start_character, end_line, \
+             end_character, evidence] := *analysis_semantic_candidate{view: $view, id, \
+             repository: $repository, from, relation, unresolved_to, path, start_line, \
+             start_character, end_line, end_character, evidence}",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("repository".into(), repository.into()),
+        ]),
+        ScriptMutability::Immutable,
+    )?;
+    let mut candidates = Vec::with_capacity(stored_candidates.rows.len());
+    for row in stored_candidates.rows {
+        let position = |line: usize, character: usize| -> Result<SourcePosition, Box<dyn Error>> {
+            Ok(SourcePosition {
+                line: row[line]
+                    .get_int()
+                    .ok_or("semantic candidate line is not an integer")?
+                    .try_into()?,
+                character: row[character]
+                    .get_int()
+                    .ok_or("semantic candidate character is not an integer")?
+                    .try_into()?,
+            })
+        };
+        let relation = parse_relation(stored_string(&row, 2, "semantic candidate relation")?)?
+            .dependency()
+            .ok_or("semantic candidate relation is not a dependency")?;
+        let candidate = SemanticCandidate {
+            id: stored_string(&row, 0, "semantic candidate ID")?.into(),
+            repository: repository.into(),
+            from: stored_string(&row, 1, "semantic candidate source")?.into(),
+            relation,
+            unresolved_to: stored_string(&row, 3, "semantic candidate destination")?.into(),
+            span: SourceSpan {
+                path: stored_string(&row, 4, "semantic candidate path")?.into(),
+                start: position(5, 6)?,
+                end: position(7, 8)?,
+            },
+            evidence: stored_string(&row, 9, "semantic candidate evidence")?.into(),
+        };
+        if relations.contains(&SemanticRelation::Dependency(candidate.relation)) {
+            candidates.push(candidate);
+        }
+    }
+    Ok((entities, observations, candidates))
 }
 
 fn stored_string<'a>(
@@ -1040,6 +1143,7 @@ fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<()
             "view, repository, code, severity, path, line",
         ),
         ("analysis_baseline_fingerprint", "view"),
+        ("analysis_semantic_candidate", "view, id"),
         ("analysis_fingerprint", "view"),
         ("analysis_verification_fingerprint", "view"),
         ("analysis_revision", "view"),
@@ -1395,12 +1499,14 @@ fn store_grpc_resolution(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn publish_observations(
     db: &DbInstance,
     view: &WorkspaceView,
     repositories: &[RepositoryFacts],
     overrides: &[DependencyOverride],
     fact_shards: &[FactShard],
+    semantic_candidates: &[SemanticCandidate],
     verification_fingerprint: Option<&str>,
     report_shard_changes: bool,
 ) -> Result<FactChanges, Box<dyn Error>> {
@@ -1433,6 +1539,17 @@ pub(super) fn publish_observations(
         ("fingerprint".into(), view.fingerprint().into()),
     ]);
     let transaction = db.multi_transaction(true);
+    let repository_ids = repositories
+        .iter()
+        .map(|facts| facts.state.repository.identity.as_str())
+        .collect::<BTreeSet<_>>();
+    if semantic_candidates
+        .iter()
+        .any(|candidate| !repository_ids.contains(candidate.repository.as_str()))
+    {
+        return Err("semantic candidate belongs to a repository outside the workspace view".into());
+    }
+    replace_semantic_candidates(&transaction, &view.name, semantic_candidates)?;
     let legacy_changes = if !report_shard_changes {
         let started = Instant::now();
         let current = transaction.run_script(
@@ -3499,8 +3616,8 @@ mod tests {
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
         DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges,
         GrpcBindingCandidate, GrpcBindingRole, LogicalRepository, Observation, ProtoTypeKind,
-        Provenance, RepositoryFacts, RepositoryState, RpcCardinality, StructuralRelation,
-        WorkspaceView,
+        Provenance, RepositoryFacts, RepositoryState, RpcCardinality, SemanticCandidate,
+        SourcePosition, SourceSpan, StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
     use std::{
@@ -3704,9 +3821,37 @@ mod tests {
             )
             .unwrap(),
         ];
-        store.publish(&view, &[facts], &[]).unwrap();
+        let candidate = SemanticCandidate {
+            id: "candidate".into(),
+            repository: "app".into(),
+            from: "repo://app/elixir/Producer.publish/1".into(),
+            relation: DependencyRelation::Publishes,
+            unresolved_to: "kafka-topic://external".into(),
+            span: SourceSpan {
+                path: "lib/producer.ex".into(),
+                start: SourcePosition {
+                    line: 3,
+                    character: 0,
+                },
+                end: SourcePosition {
+                    line: 3,
+                    character: 7,
+                },
+            },
+            evidence: "lib/producer.ex:4".into(),
+        };
+        store
+            .publish_verified_sharded(
+                &view,
+                std::slice::from_ref(&facts),
+                &[],
+                &[],
+                std::slice::from_ref(&candidate),
+                "verified",
+            )
+            .unwrap();
 
-        let (entities, observations) = store
+        let (entities, observations, candidates) = store
             .selected_baseline_semantics(
                 "main",
                 "app",
@@ -3717,6 +3862,7 @@ mod tests {
 
         assert_eq!(entities.len(), 3);
         assert_eq!(observations.len(), 2);
+        assert_eq!(candidates, vec![candidate]);
         assert_eq!(observations[0].relation.as_str(), "publishes");
     }
 
@@ -4799,7 +4945,7 @@ mod tests {
             relation: DependencyRelation::Calls,
             unresolved_to: call.to,
             resolved_to: resolved.into(),
-            evidence: call.evidence,
+            evidence: "compiler definition src/lib.rs:3".into(),
             confidence: Confidence::Exact,
             provenance: Provenance::Compiler,
         };
@@ -4846,6 +4992,12 @@ mod tests {
             .iter()
             .find(|edge| edge.to == resolved)
             .unwrap();
+        assert!(
+            context
+                .edges
+                .iter()
+                .all(|edge| edge.to != "rust-call://helper")
+        );
         assert_eq!(edge.confidence, 1.0);
         assert_eq!(
             edge.evidence[0].source_kind,

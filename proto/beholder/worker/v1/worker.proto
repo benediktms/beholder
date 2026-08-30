@@ -80,6 +80,7 @@ message AnalyzeRequest {
     AnalysisFinish finish = 4;
     BaselineEntity baseline_entity = 5;
     BaselineObservation baseline_observation = 6;
+    BaselineCandidate baseline_candidate = 7;
   }
 }
 
@@ -110,6 +111,31 @@ message BaselineEntity {
 
 message BaselineObservation {
   Observation observation = 1;
+}
+
+message BaselineCandidate {
+  SemanticCandidate candidate = 1;
+}
+
+message SemanticCandidate {
+  string id = 1;
+  string repository = 2;
+  string from = 3;
+  beholder.v1.RelationKind relation = 4;
+  string unresolved_to = 5;
+  SourceSpan span = 6;
+  string evidence = 7;
+}
+
+message SourceSpan {
+  string path = 1;
+  SourcePosition start = 2;
+  SourcePosition end = 3;
+}
+
+message SourcePosition {
+  uint32 line = 1;
+  uint32 character = 2;
 }
 
 enum InputKind {
@@ -149,6 +175,13 @@ message AnalysisContribution {
   repeated DependencyOverride overrides = 1;
   repeated GraphqlResolverCandidate graphql_resolvers = 2;
   repeated RepositoryDiagnostic diagnostics = 3;
+  repeated CandidateOverride candidate_overrides = 4;
+}
+
+message CandidateOverride {
+  string candidate_id = 1;
+  string resolved_to = 2;
+  string evidence = 3;
 }
 
 message AnalysisFailure {

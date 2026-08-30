@@ -140,6 +140,16 @@ defmodule Beholder.V1.RelationKind do
   field :RELATION_KIND_CALLS_GRAPHQL, 17
 end
 
+defmodule Beholder.V1.EnrichmentSubmissionDisposition do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :ENRICHMENT_SUBMISSION_DISPOSITION_UNSPECIFIED, 0
+  field :ENRICHMENT_SUBMISSION_DISPOSITION_ENQUEUED, 1
+  field :ENRICHMENT_SUBMISSION_DISPOSITION_IN_PROGRESS, 2
+  field :ENRICHMENT_SUBMISSION_DISPOSITION_ALREADY_CURRENT, 3
+end
+
 defmodule Beholder.V1.JobStatus do
   @moduledoc false
   use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -187,6 +197,17 @@ defmodule Beholder.V1.IndexJobOutcome do
   field :INDEX_JOB_OUTCOME_PUBLISHED, 1
   field :INDEX_JOB_OUTCOME_UNCHANGED, 2
   field :INDEX_JOB_OUTCOME_SUPERSEDED, 3
+end
+
+defmodule Beholder.V1.EnrichmentJobOutcome do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :ENRICHMENT_JOB_OUTCOME_UNSPECIFIED, 0
+  field :ENRICHMENT_JOB_OUTCOME_PUBLISHED, 1
+  field :ENRICHMENT_JOB_OUTCOME_UNCHANGED, 2
+  field :ENRICHMENT_JOB_OUTCOME_ALREADY_CURRENT, 3
+  field :ENRICHMENT_JOB_OUTCOME_SUPERSEDED, 4
 end
 
 defmodule Beholder.V1.ClearCacheRequest do
@@ -718,6 +739,36 @@ defmodule Beholder.V1.SubmitIndexResponse do
     json_name: "overlappingJobs"
 end
 
+defmodule Beholder.V1.SubmitEnrichmentRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :repository, 1, type: :string
+  field :workspace_scope, 2, proto3_optional: true, type: :string, json_name: "workspaceScope"
+  field :worker_ids, 3, repeated: true, type: :string, json_name: "workerIds"
+end
+
+defmodule Beholder.V1.EnrichmentSubmission do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :target, 1, type: Beholder.V1.JobTarget
+  field :disposition, 2, type: Beholder.V1.EnrichmentSubmissionDisposition, enum: true
+  field :job, 3, proto3_optional: true, type: Beholder.V1.JobSummary
+end
+
+defmodule Beholder.V1.SubmitEnrichmentResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :results, 1, repeated: true, type: Beholder.V1.EnrichmentSubmission
+
+  field :prerequisite_jobs, 2,
+    repeated: true,
+    type: Beholder.V1.JobSummary,
+    json_name: "prerequisiteJobs"
+end
+
 defmodule Beholder.V1.JobTarget do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -769,6 +820,20 @@ defmodule Beholder.V1.IndexJobResult do
   field :destinations, 1, repeated: true, type: Beholder.V1.IndexDestinationResult
 end
 
+defmodule Beholder.V1.EnrichmentJobResult do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :target, 1, type: Beholder.V1.JobTarget
+  field :expected_worker_version, 2, type: :string, json_name: "expectedWorkerVersion"
+  field :outcome, 3, type: Beholder.V1.EnrichmentJobOutcome, enum: true
+
+  field :failed_prerequisite_job_ids, 4,
+    repeated: true,
+    type: :string,
+    json_name: "failedPrerequisiteJobIds"
+end
+
 defmodule Beholder.V1.Job do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -794,6 +859,11 @@ defmodule Beholder.V1.Job do
     proto3_optional: true,
     type: Beholder.V1.IndexJobResult,
     json_name: "indexResult"
+
+  field :enrichment_result, 12,
+    proto3_optional: true,
+    type: Beholder.V1.EnrichmentJobResult,
+    json_name: "enrichmentResult"
 end
 
 defmodule Beholder.V1.Daemon.Service do
@@ -838,6 +908,13 @@ defmodule Beholder.V1.Daemon.Service do
   rpc(:GetJob, Beholder.V1.GetJobRequest, Beholder.V1.GetJobResponse, %{})
 
   rpc(:SubmitIndex, Beholder.V1.SubmitIndexRequest, Beholder.V1.SubmitIndexResponse, %{})
+
+  rpc(
+    :SubmitEnrichment,
+    Beholder.V1.SubmitEnrichmentRequest,
+    Beholder.V1.SubmitEnrichmentResponse,
+    %{}
+  )
 
   rpc(:ListWorkspaces, Beholder.V1.ListWorkspacesRequest, Beholder.V1.ListWorkspacesResponse, %{})
 

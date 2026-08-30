@@ -84,18 +84,36 @@ impl EnrichmentPublication for SemanticStore {
             return Ok(None);
         }
         let contexts = self.repository_contexts(target.view, target.repository, target.analyzer)?;
-        let (entities, observations) = self.selected_baseline_semantics(
+        let (entities, observations, candidates) = self.selected_baseline_semantics(
             target.view,
             target.repository,
             read.entity_kinds,
             read.relations,
         )?;
+        let mut entities = entities
+            .into_iter()
+            .map(|entity| (entity.id.clone(), entity))
+            .collect::<BTreeMap<_, _>>();
+        for context in &contexts {
+            let (context_entities, _, _) = self.selected_baseline_semantics(
+                target.view,
+                context,
+                read.entity_kinds,
+                &BTreeSet::new(),
+            )?;
+            entities.extend(
+                context_entities
+                    .into_iter()
+                    .map(|entity| (entity.id.clone(), entity)),
+            );
+        }
         Ok(Some(EnrichmentSnapshotState {
             contexts,
             revision_inputs: self.revision_input_fingerprints(target.view)?,
             baseline: SemanticSnapshot {
-                entities,
+                entities: entities.into_values().collect(),
                 observations,
+                candidates,
             },
         }))
     }

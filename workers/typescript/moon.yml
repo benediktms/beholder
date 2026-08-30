@@ -1,0 +1,49 @@
+language: 'go'
+layer: 'application'
+
+fileGroups:
+  sources:
+    - '/mise.toml'
+    - '/proto/**/*.proto'
+    - 'go.mod'
+    - 'go.sum'
+    - '**/*.go'
+
+tasks:
+  test:
+    command: 'mise exec -- go test ./...'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  lint:
+    command: 'mise exec -- go vet ./...'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  format-check:
+    command: 'bash -c ''test -z "$(gofmt -l .)"'''
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+
+  format:
+    command: 'gofmt -w .'
+    inputs:
+      - '@group(sources)'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false
+
+  release:
+    command: 'mise exec -- go build -trimpath -o beholder-worker-typescript .'
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - 'beholder-worker-typescript'
+    toolchains: 'system'
+    options:
+      cache: false
+      runInCI: false

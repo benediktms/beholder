@@ -1,10 +1,10 @@
 use crate::{v1, worker_v1 as wire};
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-    DependencyRelation, EntityFact, EntityKind, EntityMetadata, GraphqlOperationKind,
-    GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole, LogicalRepository, Observation,
-    ProtoTypeKind, Provenance, RepositoryState, RpcCardinality, SemanticRelation,
-    StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, CandidateOverride, Confidence,
+    DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata,
+    GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole,
+    LogicalRepository, Observation, ProtoTypeKind, Provenance, RepositoryState, RpcCardinality,
+    SemanticCandidate, SemanticRelation, SourcePosition, SourceSpan, StructuralRelation,
 };
 use beholder_indexing::{
     AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerMetadata,
@@ -90,6 +90,19 @@ pub fn analyze_requests(snapshot: EnrichmentSnapshot) -> Result<Vec<wire::Analyz
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let baseline_candidates = baseline
+        .candidates
+        .into_iter()
+        .map(|candidate| {
+            Ok(wire::AnalyzeRequest {
+                request: Some(wire::analyze_request::Request::BaselineCandidate(
+                    wire::BaselineCandidate {
+                        candidate: Some(candidate_to_wire(candidate)?),
+                    },
+                )),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let finish = wire::AnalyzeRequest {
         request: Some(wire::analyze_request::Request::Finish(
             wire::AnalysisFinish {},
@@ -99,6 +112,7 @@ pub fn analyze_requests(snapshot: EnrichmentSnapshot) -> Result<Vec<wire::Analyz
         .chain(repositories)
         .chain(baseline_entities)
         .chain(baseline_observations)
+        .chain(baseline_candidates)
         .chain(std::iter::once(finish))
         .collect())
 }
@@ -189,6 +203,13 @@ impl WorkspaceSnapshotBuilder {
                     observation
                         .observation
                         .ok_or("worker baseline observation is missing")?,
+                )?);
+            }
+            wire::analyze_request::Request::BaselineCandidate(candidate) => {
+                self.baseline.candidates.push(candidate_from_wire(
+                    candidate
+                        .candidate
+                        .ok_or("worker baseline candidate is missing")?,
                 )?);
             }
             wire::analyze_request::Request::Finish(_) => self.finished = true,
@@ -403,6 +424,7 @@ pub fn analyze_events(
         active_repositories,
         repositories,
         overrides,
+        candidate_overrides,
         graphql_resolvers,
         diagnostics,
         cache,
@@ -413,6 +435,7 @@ pub fn analyze_events(
     }
     events.extend(analysis_contribution_events(
         overrides,
+        candidate_overrides,
         graphql_resolvers,
         diagnostics,
     )?);
@@ -446,6 +469,7 @@ pub fn contribution_from_events(
 ) -> Result<AnalyzerContribution, String> {
     let mut repositories = Vec::<RepositoryContribution>::new();
     let mut overrides = Vec::new();
+    let mut candidate_overrides = Vec::new();
     let mut graphql_resolvers = Vec::new();
     let mut diagnostics = Vec::new();
     let mut completed = None;
@@ -500,6 +524,13 @@ pub fn contribution_from_events(
                         .map(override_from_wire)
                         .collect::<Result<Vec<_>, _>>()?,
                 );
+                candidate_overrides.extend(contribution.candidate_overrides.into_iter().map(
+                    |override_| CandidateOverride {
+                        candidate_id: override_.candidate_id,
+                        resolved_to: override_.resolved_to.into(),
+                        evidence: override_.evidence.into(),
+                    },
+                ));
                 graphql_resolvers.extend(contribution.graphql_resolvers.into_iter().map(
                     |resolver| GraphqlResolverCandidate {
                         repository: resolver.repository,
@@ -541,6 +572,7 @@ pub fn contribution_from_events(
         active_repositories: completed.active_repositories,
         repositories,
         overrides,
+        candidate_overrides,
         graphql_resolvers,
         diagnostics,
         cache: CacheStatistics {
@@ -559,6 +591,7 @@ pub fn contribution_from_events(
 
 fn analysis_contribution_events(
     overrides: Vec<DependencyOverride>,
+    candidate_overrides: Vec<CandidateOverride>,
     graphql_resolvers: Vec<GraphqlResolverCandidate>,
     diagnostics: Vec<(String, AnalysisDiagnostic)>,
 ) -> Result<Vec<wire::AnalyzeEvent>, String> {
@@ -568,6 +601,7 @@ fn analysis_contribution_events(
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .peekable();
+    let mut candidate_overrides = candidate_overrides.into_iter().peekable();
     let mut graphql_resolvers = graphql_resolvers
         .into_iter()
         .map(|resolver| wire::GraphqlResolverCandidate {
@@ -587,6 +621,7 @@ fn analysis_contribution_events(
         .peekable();
     let mut events = Vec::new();
     while overrides.peek().is_some()
+        || candidate_overrides.peek().is_some()
         || graphql_resolvers.peek().is_some()
         || diagnostics.peek().is_some()
     {
@@ -594,6 +629,15 @@ fn analysis_contribution_events(
             event: Some(wire::analyze_event::Event::Contribution(
                 wire::AnalysisContribution {
                     overrides: overrides.by_ref().take(CONTRIBUTION_CHUNK_ITEMS).collect(),
+                    candidate_overrides: candidate_overrides
+                        .by_ref()
+                        .take(CONTRIBUTION_CHUNK_ITEMS)
+                        .map(|override_| wire::CandidateOverride {
+                            candidate_id: override_.candidate_id,
+                            resolved_to: override_.resolved_to.to_string(),
+                            evidence: override_.evidence.as_str().into(),
+                        })
+                        .collect(),
                     graphql_resolvers: graphql_resolvers
                         .by_ref()
                         .take(CONTRIBUTION_CHUNK_ITEMS)
@@ -720,12 +764,67 @@ fn repository_from_wire(
             .into_iter()
             .map(observation_from_wire)
             .collect::<Result<_, _>>()?,
+        semantic_candidates: Vec::new(),
         diagnostics: repository
             .diagnostics
             .into_iter()
             .map(diagnostic_from_wire)
             .collect::<Result<_, _>>()?,
         replaced_diagnostic_codes: repository.replaced_diagnostic_codes.into_iter().collect(),
+    })
+}
+
+fn candidate_to_wire(value: SemanticCandidate) -> Result<wire::SemanticCandidate, String> {
+    Ok(wire::SemanticCandidate {
+        id: value.id,
+        repository: value.repository,
+        from: value.from.to_string(),
+        relation: relation_to_wire(SemanticRelation::Dependency(value.relation)) as i32,
+        unresolved_to: value.unresolved_to.to_string(),
+        span: Some(wire::SourceSpan {
+            path: value.span.path.to_string_lossy().into_owned(),
+            start: Some(wire::SourcePosition {
+                line: value.span.start.line,
+                character: value.span.start.character,
+            }),
+            end: Some(wire::SourcePosition {
+                line: value.span.end.line,
+                character: value.span.end.character,
+            }),
+        }),
+        evidence: value.evidence.as_str().into(),
+    })
+}
+
+fn candidate_from_wire(value: wire::SemanticCandidate) -> Result<SemanticCandidate, String> {
+    let relation = relation_from_wire(value.relation)?
+        .dependency()
+        .ok_or("worker semantic candidate used a structural relation")?;
+    let span = value
+        .span
+        .ok_or("worker semantic candidate span is missing")?;
+    let start = span
+        .start
+        .ok_or("worker semantic candidate start is missing")?;
+    let end = span.end.ok_or("worker semantic candidate end is missing")?;
+    Ok(SemanticCandidate {
+        id: value.id,
+        repository: value.repository,
+        from: value.from.into(),
+        relation,
+        unresolved_to: value.unresolved_to.into(),
+        span: SourceSpan {
+            path: span.path.into(),
+            start: SourcePosition {
+                line: start.line,
+                character: start.character,
+            },
+            end: SourcePosition {
+                line: end.line,
+                character: end.character,
+            },
+        },
+        evidence: value.evidence.into(),
     })
 }
 
@@ -1217,6 +1316,7 @@ mod tests {
                         )
                     })
                     .collect(),
+                semantic_candidates: Vec::new(),
                 diagnostics: Vec::new(),
                 replaced_diagnostic_codes: BTreeSet::from(["syntax.unresolved".into()]),
                 fact_shards: Vec::new(),
@@ -1232,6 +1332,7 @@ mod tests {
                     provenance: Provenance::UniqueNameHeuristic,
                 })
                 .collect(),
+            candidate_overrides: Vec::new(),
             graphql_resolvers: Vec::new(),
             diagnostics: Vec::new(),
             cache: CacheStatistics::default(),
@@ -1273,6 +1374,7 @@ mod tests {
             active_repositories: Vec::new(),
             repositories: Vec::new(),
             overrides: Vec::new(),
+            candidate_overrides: Vec::new(),
             graphql_resolvers: Vec::new(),
             diagnostics: Vec::new(),
             cache: CacheStatistics::default(),

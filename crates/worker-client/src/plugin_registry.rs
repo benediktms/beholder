@@ -1,4 +1,4 @@
-use crate::{ELIXIR_WORKER_ID, RUST_WORKER_ID};
+use crate::{ELIXIR_WORKER_ID, RUST_WORKER_ID, TYPESCRIPT_WORKER_ID};
 use beholder_indexing::PluginDescriptor;
 use beholder_protocol::{
     descriptor_from_wire,
@@ -95,7 +95,9 @@ impl PluginRegistry {
         replace: bool,
     ) -> Result<InstalledPlugin, Box<dyn Error>> {
         descriptor.validate()?;
-        if [RUST_WORKER_ID, ELIXIR_WORKER_ID].contains(&descriptor.id.as_str()) {
+        if [RUST_WORKER_ID, ELIXIR_WORKER_ID, TYPESCRIPT_WORKER_ID]
+            .contains(&descriptor.id.as_str())
+        {
             return Err(format!(
                 "plugin ID {} is reserved for a built-in worker",
                 descriptor.id
@@ -286,7 +288,7 @@ mod tests {
         fs::write(&executable, b"one").unwrap();
 
         let mut registry = PluginRegistry::open(&state).unwrap();
-        for id in [RUST_WORKER_ID, ELIXIR_WORKER_ID] {
+        for id in [RUST_WORKER_ID, ELIXIR_WORKER_ID, TYPESCRIPT_WORKER_ID] {
             let error = registry
                 .install(&executable, descriptor(id), false)
                 .unwrap_err();

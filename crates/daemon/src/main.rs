@@ -7,7 +7,7 @@ use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
 #[cfg(not(test))]
-use beholder_domain::{DependencyRelation, SemanticRelation};
+use beholder_domain::{DependencyRelation, EntityKind, SemanticRelation};
 #[cfg(not(test))]
 use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
@@ -15,7 +15,8 @@ use beholder_observability::LogOutput;
 use beholder_protocol::v1::daemon_server::DaemonServer;
 #[cfg(not(test))]
 use beholder_worker_client::{
-    ELIXIR_WORKER_ID, RUST_WORKER_ID, WorkerAnalyzerBuilder, worker_environment_variable,
+    ELIXIR_WORKER_ID, RUST_WORKER_ID, TYPESCRIPT_WORKER_ID, WorkerAnalyzerBuilder,
+    worker_environment_variable,
 };
 use beholder_worker_client::{PluginRegistry, plugin_analyzer};
 use std::error::Error;
@@ -322,6 +323,47 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         tracing::info!("Elixir analyzer worker not found; compiler enrichment disabled");
         builder
     };
+    #[cfg(not(test))]
+    let builder = if let Some(executable) = typescript_worker_executable()? {
+        let worker = WorkerAnalyzerBuilder::new(
+            executable,
+            cache_dir
+                .parent()
+                .unwrap_or(cache_dir.as_path())
+                .join("workers"),
+        )
+        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:2")
+        .timeout(std::time::Duration::from_secs(60))
+        .semantic_shard_producer(TYPESCRIPT_WORKER_ID)
+        .semantic_entity(EntityKind::Callable)
+        .semantic_entity(EntityKind::Namespace)
+        .semantic_relation(SemanticRelation::Dependency(DependencyRelation::Calls))
+        .accept_extension("ts")
+        .accept_extension("tsx")
+        .accept_extension("js")
+        .accept_extension("jsx")
+        .accept_extension_as("json", AnalysisInputKind::Configuration)
+        .accept_file_name_as("package.json", AnalysisInputKind::Dependency)
+        .accept_file_name_as("package-lock.json", AnalysisInputKind::Dependency)
+        .accept_file_name_as("npm-shrinkwrap.json", AnalysisInputKind::Dependency)
+        .accept_file_name_as("yarn.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("pnpm-lock.yaml", AnalysisInputKind::Dependency)
+        .accept_file_name_as("pnpm-workspace.yaml", AnalysisInputKind::Dependency)
+        .accept_file_name_as("bun.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("bun.lockb", AnalysisInputKind::Dependency)
+        .accept_file_name_as("deno.lock", AnalysisInputKind::Dependency)
+        .repository_file_identity(
+            "$toolchain/typescript",
+            "node_modules/typescript/package.json",
+            AnalysisInputKind::Toolchain,
+        )
+        .build()
+        .map_err(|error| error.to_string())?;
+        builder.add_enricher(worker)
+    } else {
+        tracing::info!("TypeScript analyzer worker not configured; compiler enrichment disabled");
+        builder
+    };
     let mut builder = builder
         .add_analyzer(ElixirAnalyzer::new(cache_dir.clone()))
         .add_analyzer(CsharpAnalyzer::new(cache_dir.clone()))
@@ -397,6 +439,30 @@ fn elixir_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Erro
     }
 }
 
+#[cfg(not(test))]
+fn typescript_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    configured_typescript_worker_executable(
+        std::env::var_os(worker_environment_variable("typescript", "PATH"))
+            .map(std::path::PathBuf::from),
+    )
+}
+
+fn configured_typescript_worker_executable(
+    executable: Option<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    let Some(executable) = executable else {
+        return Ok(None);
+    };
+    if !executable.is_file() {
+        return Err(format!(
+            "configured TypeScript analyzer worker not found at {}",
+            executable.display()
+        )
+        .into());
+    }
+    Ok(Some(executable))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +480,28 @@ mod tests {
         },
     };
     use std::{env, fs, path::Path, time::Duration};
+
+    #[test]
+    fn typescript_worker_requires_an_explicit_path() {
+        assert_eq!(configured_typescript_worker_executable(None).unwrap(), None);
+
+        let executable = env::temp_dir().join(format!(
+            "beholder-worker-typescript-path-{}",
+            std::process::id()
+        ));
+        fs::write(&executable, "worker").unwrap();
+        assert_eq!(
+            configured_typescript_worker_executable(Some(executable.clone())).unwrap(),
+            Some(executable.clone())
+        );
+        fs::remove_file(&executable).unwrap();
+        assert!(
+            configured_typescript_worker_executable(Some(executable))
+                .unwrap_err()
+                .to_string()
+                .contains("configured TypeScript analyzer worker not found")
+        );
+    }
 
     async fn wait_for_job(
         client: &mut DaemonClient<tonic::transport::Channel>,

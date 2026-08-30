@@ -49,6 +49,7 @@ tasks:
     deps:
       - 'release'
       - 'worker-elixir:release'
+      - 'worker-typescript:release'
     toolchains: 'system'
     options:
       cache: false

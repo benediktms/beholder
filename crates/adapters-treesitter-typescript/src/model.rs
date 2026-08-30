@@ -54,6 +54,39 @@ pub struct TypescriptAnalysis {
     pub(super) parse_error_lines: Vec<usize>,
 }
 
+impl TypescriptAnalysis {
+    pub(super) fn semantic_shape(&self) -> Self {
+        let mut analysis = self.clone();
+        for call in &mut analysis.calls {
+            call.clear_position();
+        }
+        for definition in &mut analysis.definitions {
+            definition.line = 0;
+            for call in &mut definition.calls {
+                call.clear_position();
+            }
+        }
+        for document in &mut analysis.graphql_documents {
+            document.line = 0;
+        }
+        analysis.parse_error_lines = (!analysis.parse_error_lines.is_empty())
+            .then_some(0)
+            .into_iter()
+            .collect();
+        analysis
+    }
+}
+
+impl Call {
+    fn clear_position(&mut self) {
+        self.line = 0;
+        self.start_line = 0;
+        self.start_character = 0;
+        self.end_line = 0;
+        self.end_character = 0;
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct GraphqlDocument {
     pub(super) binding: String,
@@ -180,6 +213,14 @@ pub(super) struct Call {
     pub(super) arguments: Vec<String>,
     pub(super) type_arguments: Vec<String>,
     pub(super) line: usize,
+    #[serde(default)]
+    pub(super) start_line: u32,
+    #[serde(default)]
+    pub(super) start_character: u32,
+    #[serde(default)]
+    pub(super) end_line: u32,
+    #[serde(default)]
+    pub(super) end_character: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

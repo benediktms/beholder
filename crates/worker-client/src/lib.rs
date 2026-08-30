@@ -4,7 +4,7 @@ mod plugin_registry;
 
 pub use plugin_registry::{InstalledPlugin, PluginRegistry, describe_plugin};
 
-use beholder_domain::SemanticRelation;
+use beholder_domain::{EntityKind, SemanticRelation};
 use beholder_indexing::{
     AnalysisInput, AnalysisInputKind, AnalyzerError, AnalyzerMetadata, EnrichmentFuture,
     EnrichmentSnapshot, EnrichmentSourceCurrentness, PluginDescriptor, PluginInputScope,
@@ -41,6 +41,7 @@ static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub const RUST_WORKER_ID: &str = "rust";
 pub const ELIXIR_WORKER_ID: &str = "elixir";
+pub const TYPESCRIPT_WORKER_ID: &str = "typescript";
 
 pub fn worker_environment_variable(worker: &str, setting: &str) -> String {
     let normalize = |value: &str| {
@@ -82,11 +83,19 @@ pub struct WorkerAnalyzerBuilder {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    repository_identity_files: Vec<RepositoryIdentityFile>,
+    semantic_entities: BTreeSet<EntityKind>,
     semantic_relations: BTreeSet<SemanticRelation>,
     semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
     timeout: Duration,
+}
+
+struct RepositoryIdentityFile {
+    path: PathBuf,
+    file: PathBuf,
+    kind: AnalysisInputKind,
 }
 
 impl WorkerAnalyzerBuilder {
@@ -104,6 +113,8 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: BTreeMap::new(),
             excluded_path_suffixes: Vec::new(),
             identity_inputs: Vec::new(),
+            repository_identity_files: Vec::new(),
+            semantic_entities: BTreeSet::new(),
             semantic_relations: BTreeSet::new(),
             semantic_shard_producers: BTreeSet::new(),
             plugin: None,
@@ -197,8 +208,27 @@ impl WorkerAnalyzerBuilder {
         self
     }
 
+    pub fn repository_file_identity(
+        mut self,
+        path: impl Into<PathBuf>,
+        file: impl Into<PathBuf>,
+        kind: AnalysisInputKind,
+    ) -> Self {
+        self.repository_identity_files.push(RepositoryIdentityFile {
+            path: path.into(),
+            file: file.into(),
+            kind,
+        });
+        self
+    }
+
     pub fn semantic_relation(mut self, relation: SemanticRelation) -> Self {
         self.semantic_relations.insert(relation);
+        self
+    }
+
+    pub fn semantic_entity(mut self, kind: EntityKind) -> Self {
+        self.semantic_entities.insert(kind);
         self
     }
 
@@ -228,6 +258,8 @@ impl WorkerAnalyzerBuilder {
             parent_suffixes: self.parent_suffixes,
             excluded_path_suffixes: self.excluded_path_suffixes,
             identity_inputs: self.identity_inputs,
+            repository_identity_files: self.repository_identity_files,
+            semantic_entities: self.semantic_entities,
             semantic_relations: self.semantic_relations,
             semantic_shard_producers: self.semantic_shard_producers,
             plugin: self.plugin,
@@ -248,6 +280,8 @@ pub struct WorkerAnalyzer {
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
+    repository_identity_files: Vec<RepositoryIdentityFile>,
+    semantic_entities: BTreeSet<EntityKind>,
     semantic_relations: BTreeSet<SemanticRelation>,
     semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
@@ -282,6 +316,8 @@ pub fn plugin_analyzer(
         parent_suffixes: BTreeMap::new(),
         excluded_path_suffixes: Vec::new(),
         identity_inputs: Vec::new(),
+        repository_identity_files: Vec::new(),
+        semantic_entities: BTreeSet::new(),
         semantic_relations: BTreeSet::new(),
         semantic_shard_producers: BTreeSet::new(),
         plugin: Some(descriptor),
@@ -338,6 +374,25 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         self.identity_inputs.clone()
     }
 
+    fn repository_identity_inputs(
+        &self,
+        repository: &beholder_indexing::RepositorySnapshot,
+    ) -> Vec<AnalysisInput> {
+        self.repository_identity_files
+            .iter()
+            .map(|identity| {
+                let content = fs::read(repository.base.join(&identity.file))
+                    .ok()
+                    .unwrap_or_else(|| b"unavailable".to_vec());
+                AnalysisInput {
+                    path: identity.path.clone(),
+                    content: Arc::from(content),
+                    kind: identity.kind,
+                }
+            })
+            .collect()
+    }
+
     fn is_active(&self, repository: &beholder_indexing::RepositorySnapshot) -> bool {
         if let Some(plugin) = &self.plugin {
             return repository.inputs.iter().any(|input| {
@@ -349,7 +404,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         repository
             .inputs
             .iter()
-            .any(|input| self.analysis_input_kind(&input.path).is_some())
+            .any(|input| self.analysis_input_kind(&input.path) == Some(AnalysisInputKind::Source))
     }
 
     fn requires_workspace_enablement(&self) -> bool {
@@ -386,7 +441,12 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         BTreeSet<beholder_domain::SemanticRelation>,
     ) {
         self.plugin.as_ref().map_or_else(
-            || (BTreeSet::new(), self.semantic_relations.clone()),
+            || {
+                (
+                    self.semantic_entities.clone(),
+                    self.semantic_relations.clone(),
+                )
+            },
             |plugin| {
                 (
                     plugin.semantic_entities.clone(),
@@ -477,7 +537,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     }
                     events.push(event);
                 }
-                let contribution = contribution_from_events(events)?;
+                let mut contribution = contribution_from_events(events)?;
                 if contribution.metadata != self.metadata {
                     return Err(format!(
                         "worker returned analyzer identity {}:{}; expected {}:{}",
@@ -488,6 +548,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     )
                     .into());
                 }
+                resolve_candidate_overrides(&baseline, &mut contribution)?;
                 if let Some(descriptor) = &self.plugin {
                     validate_plugin_contribution(descriptor, &baseline, &contribution)?;
                 }
@@ -524,6 +585,62 @@ impl WorkspaceEnricher for WorkerAnalyzer {
             .instrument(span),
         )
     }
+}
+
+fn resolve_candidate_overrides(
+    baseline: &beholder_indexing::SemanticSnapshot,
+    contribution: &mut beholder_indexing::AnalyzerContribution,
+) -> Result<(), AnalyzerError> {
+    let candidates = baseline
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    if candidates.len() != baseline.candidates.len() {
+        return Err("baseline semantic candidate IDs are not unique".into());
+    }
+    let known = baseline
+        .entities
+        .iter()
+        .map(|entity| entity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    for override_ in contribution.candidate_overrides.drain(..) {
+        if !seen.insert(override_.candidate_id.clone()) {
+            return Err(format!(
+                "worker returned semantic candidate {} more than once",
+                override_.candidate_id
+            )
+            .into());
+        }
+        let candidate = candidates
+            .get(override_.candidate_id.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "worker returned unknown semantic candidate {}",
+                    override_.candidate_id
+                )
+            })?;
+        if !known.contains(override_.resolved_to.as_str()) {
+            return Err(format!(
+                "worker resolved semantic candidate {} to unknown entity {}",
+                override_.candidate_id, override_.resolved_to
+            )
+            .into());
+        }
+        contribution
+            .overrides
+            .push(beholder_domain::DependencyOverride {
+                from: candidate.from.clone(),
+                relation: candidate.relation,
+                unresolved_to: candidate.unresolved_to.clone(),
+                resolved_to: override_.resolved_to,
+                evidence: override_.evidence,
+                confidence: beholder_domain::Confidence::Exact,
+                provenance: beholder_domain::Provenance::Compiler,
+            });
+    }
+    Ok(())
 }
 
 impl WorkerAnalyzer {
@@ -687,10 +804,14 @@ impl Drop for SocketFile {
 mod tests {
     use super::*;
     use beholder_domain::{
-        DependencyRelation, LogicalRepository, RepositoryState, SemanticRelation,
+        CandidateOverride, DependencyRelation, EntityFact, EntityKind, LogicalRepository,
+        RepositoryState, SemanticCandidate, SemanticRelation, SourcePosition, SourceSpan,
     };
-    use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot, WorkspaceSnapshot};
-    use std::sync::Arc;
+    use beholder_indexing::{
+        AnalyzerContribution, AnalyzerMetadata, CacheStatistics, InputKind, RepositoryInput,
+        RepositorySnapshot, SemanticSnapshot, WorkspaceSnapshot,
+    };
+    use std::{fs, sync::Arc, time::SystemTime};
 
     #[test]
     fn worker_environment_variables_have_one_consistent_shape() {
@@ -821,5 +942,112 @@ mod tests {
             declared.workspace.repositories[0].inputs[0].path,
             Path::new("src/lib.rs")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_compiler_package_participates_in_currentness() {
+        let root = std::env::temp_dir().join(format!(
+            "beholder-worker-identity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let compiler = root.join("node_modules/typescript/package.json");
+        fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        fs::write(&compiler, r#"{"version":"7.0.2"}"#).unwrap();
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("typescript", "1")
+            .accept_extension("ts")
+            .repository_file_identity(
+                "$toolchain/typescript",
+                "node_modules/typescript/package.json",
+                AnalysisInputKind::Toolchain,
+            )
+            .build()
+            .unwrap();
+        let repository = RepositorySnapshot {
+            base: root.clone(),
+            state: RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example".into(),
+                },
+                head: None,
+                fingerprint: "fingerprint".into(),
+            },
+            inputs: Vec::new(),
+        };
+
+        let identity = worker.repository_identity_inputs(&repository);
+
+        assert_eq!(identity[0].content.as_ref(), br#"{"version":"7.0.2"}"#);
+        fs::write(&compiler, r#"{"version":"7.0.3"}"#).unwrap();
+        assert_ne!(identity, worker.repository_identity_inputs(&repository));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candidate_override_uses_the_immutable_baseline_edge() {
+        let target = EntityFact::new(
+            "repo://example/typescript/target/run",
+            EntityKind::Callable,
+            None,
+        )
+        .unwrap();
+        let baseline = SemanticSnapshot {
+            entities: vec![target.clone()],
+            observations: Vec::new(),
+            candidates: vec![SemanticCandidate {
+                id: "candidate".into(),
+                repository: "example".into(),
+                from: "repo://example/typescript/source/main".into(),
+                relation: DependencyRelation::Calls,
+                unresolved_to: "typescript-call://run".into(),
+                span: SourceSpan {
+                    path: "src/main.ts".into(),
+                    start: SourcePosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: SourcePosition {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+                evidence: "src/main.ts:1".into(),
+            }],
+        };
+        let mut contribution = AnalyzerContribution {
+            metadata: AnalyzerMetadata {
+                id: "typescript".into(),
+                version: "1".into(),
+            },
+            active_repositories: vec!["example".into()],
+            repositories: Vec::new(),
+            overrides: Vec::new(),
+            candidate_overrides: vec![CandidateOverride {
+                candidate_id: "candidate".into(),
+                resolved_to: target.id,
+                evidence: "tsc definition".into(),
+            }],
+            graphql_resolvers: Vec::new(),
+            diagnostics: Vec::new(),
+            cache: CacheStatistics::default(),
+        };
+
+        resolve_candidate_overrides(&baseline, &mut contribution).unwrap();
+
+        assert!(contribution.candidate_overrides.is_empty());
+        assert_eq!(contribution.overrides.len(), 1);
+        let override_ = &contribution.overrides[0];
+        assert_eq!(
+            override_.from.as_str(),
+            "repo://example/typescript/source/main"
+        );
+        assert_eq!(override_.unresolved_to.as_str(), "typescript-call://run");
+        assert_eq!(override_.confidence, beholder_domain::Confidence::Exact);
+        assert_eq!(override_.provenance, beholder_domain::Provenance::Compiler);
     }
 }

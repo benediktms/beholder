@@ -1,6 +1,7 @@
 projects:
   beholder: '.'
   worker-elixir: 'workers/elixir'
+  worker-typescript: 'workers/typescript'
 
 versionConstraint: '>=2.4.6'
 

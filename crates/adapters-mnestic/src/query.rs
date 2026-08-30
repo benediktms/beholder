@@ -300,12 +300,16 @@ pub(super) fn inspect_observations(
         None => ("", BTreeMap::new()),
     };
     Ok(db.run_script(
-        &format!(
-            "?[state, from, relation, to, evidence, confidence, provenance] := \
+		&format!(
+			"observation[state, from, relation, to, evidence, confidence, provenance] := \
                  *state_observation{{state, from, relation, to, evidence}}, \
-                 *state_observation_metadata{{state, from, relation, to, confidence, provenance}}{filter}\n\
+			     *state_observation_metadata{{state, from, relation, to, confidence, provenance}}\n\
+			 observation[state, from, relation, to, evidence, confidence, provenance] := \
+			     *analysis_fact_shard_observation{{version: state, from, relation, to, evidence, confidence, provenance}}\n\
+			 ?[state, from, relation, to, evidence, confidence, provenance] := \
+			     observation[state, from, relation, to, evidence, confidence, provenance]{filter}\n\
              :order relation, from, to"
-        ),
+		),
         params,
         ScriptMutability::Immutable,
     )?)

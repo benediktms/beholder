@@ -131,7 +131,8 @@ context_override[
     not base_override[from, relation, unresolved_to, _, _, _, _]
 
 overridden[from, relation, unresolved_to, evidence] :=
-    context_override[from, relation, unresolved_to, _, evidence, _, _]
+    context_baseline_observation[from, relation, unresolved_to, evidence],
+    context_override[from, relation, unresolved_to, _, _, _, _]
 
 ?[direction, relation, related, evidence, confidence, provenance] :=
     selected_state[state],

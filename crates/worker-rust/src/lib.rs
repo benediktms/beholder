@@ -274,11 +274,13 @@ fn baseline_contribution(snapshot: &beholder_indexing::EnrichmentSnapshot) -> An
             entities: snapshot.baseline.entities.clone(),
             grpc_bindings: Vec::new(),
             observations: snapshot.baseline.observations.clone(),
+            semantic_candidates: snapshot.baseline.candidates.clone(),
             diagnostics: Vec::new(),
             replaced_diagnostic_codes: BTreeSet::new(),
             fact_shards: Vec::new(),
         }],
         overrides: Vec::new(),
+        candidate_overrides: Vec::new(),
         graphql_resolvers: Vec::new(),
         diagnostics: Vec::new(),
         cache: CacheStatistics::default(),
@@ -1800,6 +1802,7 @@ fn caller() {
         snapshot.baseline = SemanticSnapshot {
             entities: baseline.entities,
             observations: baseline.observations,
+            candidates: baseline.semantic_candidates,
         };
         let socket = PathBuf::from(format!(
             "/tmp/beholder-worker-{}-{}.sock",
@@ -1978,6 +1981,7 @@ fn caller() {
         updated_snapshot.baseline = SemanticSnapshot {
             entities: baseline.entities,
             observations: baseline.observations,
+            candidates: baseline.semantic_candidates,
         };
         let resolutions_before_body = COMPILER_RESOLUTIONS.load(Ordering::Relaxed);
         let mut stream = client
@@ -2014,6 +2018,7 @@ fn caller() {
         updated_snapshot.baseline = SemanticSnapshot {
             entities: baseline.entities,
             observations: baseline.observations,
+            candidates: baseline.semantic_candidates,
         };
         let resolutions_before_interface = COMPILER_RESOLUTIONS.load(Ordering::Relaxed);
         let mut stream = client
