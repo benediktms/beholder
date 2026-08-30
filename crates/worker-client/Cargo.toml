@@ -15,3 +15,6 @@ tokio = { workspace = true, features = ["process", "sync", "time"] }
 tokio-stream.workspace = true
 tonic.workspace = true
 tracing = "0.1.44"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"

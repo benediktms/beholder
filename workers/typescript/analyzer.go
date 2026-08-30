@@ -45,7 +45,7 @@ type workerTelemetry struct {
 	diagnostics         metric.Int64Counter
 	requests            metric.Int64Counter
 	duration            metric.Float64Histogram
-	processMemory       metric.Int64Histogram
+	runtimeMemory       metric.Int64Histogram
 }
 
 type repositorySnapshot struct {
@@ -155,7 +155,7 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 	s.telemetry.diagnostics.Add(ctx, int64(len(result.diagnostics)), metricAttributes)
 	s.telemetry.requests.Add(ctx, 1, metricAttributes)
 	s.telemetry.duration.Record(ctx, elapsed, metricAttributes)
-	s.telemetry.processMemory.Record(ctx, int64(memory.Sys), metricAttributes)
+	s.telemetry.runtimeMemory.Record(ctx, int64(memory.Sys), metricAttributes)
 	span.SetAttributes(
 		attribute.String("compiler.version", result.compilerVersion),
 		attribute.Int("override.count", len(result.overrides)),
@@ -170,7 +170,7 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 			"code", result.failureCode,
 			"error", result.failureMessage,
 			"elapsed_ms", int64(elapsed),
-			"process_memory_bytes", memory.Sys,
+			"runtime_memory_bytes", memory.Sys,
 		)
 		return stream.Send(&workerv1.AnalyzeEvent{Event: &workerv1.AnalyzeEvent_Failure{Failure: &workerv1.AnalysisFailure{
 			Code: result.failureCode, Message: result.failureMessage,
@@ -203,7 +203,7 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 		"override.count", len(result.overrides),
 		"diagnostic.count", len(result.diagnostics),
 		"elapsed_ms", int64(elapsed),
-		"process_memory_bytes", memory.Sys,
+		"runtime_memory_bytes", memory.Sys,
 	)
 	return stream.Send(&workerv1.AnalyzeEvent{Event: &workerv1.AnalyzeEvent_Completed{Completed: &workerv1.AnalysisCompleted{
 		Metadata:           &workerv1.AnalyzerMetadata{Id: "typescript", Version: analyzerVersion},
@@ -220,7 +220,7 @@ func newWorkerTelemetry() workerTelemetry {
 	diagnostics, _ := meter.Int64Counter("beholder.typescript.diagnostics")
 	requests, _ := meter.Int64Counter("beholder.typescript.requests")
 	duration, _ := meter.Float64Histogram("beholder.typescript.enrichment.duration", metric.WithUnit("ms"))
-	processMemory, _ := meter.Int64Histogram("beholder.typescript.process.memory", metric.WithUnit("By"))
+	runtimeMemory, _ := meter.Int64Histogram("beholder.typescript.runtime.memory", metric.WithUnit("By"))
 	return workerTelemetry{
 		tracer:              otel.Tracer("beholder.worker.typescript"),
 		compilerInvocations: compilerInvocations,
@@ -229,7 +229,7 @@ func newWorkerTelemetry() workerTelemetry {
 		diagnostics:         diagnostics,
 		requests:            requests,
 		duration:            duration,
-		processMemory:       processMemory,
+		runtimeMemory:       runtimeMemory,
 	}
 }
 

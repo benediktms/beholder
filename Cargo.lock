@@ -658,6 +658,7 @@ dependencies = [
  "beholder-indexing",
  "beholder-observability",
  "beholder-protocol",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -9,7 +9,8 @@ use std::{
 
 const LABEL: &str = "dev.beholder.daemon";
 const UNIT: &str = "beholder.service";
-const SERVICE_ENVIRONMENT_VARIABLES: [&str; 8] = [
+const SERVICE_ENVIRONMENT_VARIABLES: [&str; 9] = [
+    "BEHOLDER_TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES",
     "BEHOLDER_TYPESCRIPT_WORKER_PATH",
     "MIX_HOME",
     "OTEL_EXPORTER_OTLP_ENDPOINT",

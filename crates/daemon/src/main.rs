@@ -38,6 +38,9 @@ mod workspace_registry;
 
 use workspace_registry::WorkspaceRegistry;
 
+#[cfg(not(test))]
+const TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(not(unix))]
     return Err("beholderd local IPC is supported on Unix platforms".into());
@@ -335,6 +338,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         )
         .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:3")
         .timeout(std::time::Duration::from_secs(60))
+        .memory_limit(TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES)
         .semantic_shard_producer(TYPESCRIPT_WORKER_ID)
         .semantic_entity(EntityKind::Callable)
         .semantic_entity(EntityKind::Namespace)
