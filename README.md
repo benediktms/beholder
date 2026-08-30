@@ -207,13 +207,13 @@ Deletion is rejected while a workspace references the repository. It never delet
 
 Re-run `just install` after rebuilding Beholder. `just uninstall` removes the installed binaries and service.
 
-TypeScript compiler enrichment remains opt-in. Enabled workers enforce a 4 GiB
+TypeScript compiler enrichment remains opt-in. Enabled workers enforce a 6 GiB
 aggregate RSS ceiling across the worker and compiler process tree. Override it
 for an installed service when local capacity requires it:
 
 ```bash
 export BEHOLDER_TYPESCRIPT_WORKER_PATH="$HOME/.local/bin/beholder-worker-typescript"
-export BEHOLDER_TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES=6442450944
+export BEHOLDER_TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES=8589934592
 just install
 ```
 

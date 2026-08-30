@@ -39,7 +39,7 @@ mod workspace_registry;
 use workspace_registry::WorkspaceRegistry;
 
 #[cfg(not(test))]
-const TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(not(unix))]
