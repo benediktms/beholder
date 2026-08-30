@@ -28,11 +28,7 @@ const GARBAGE_COLLECTION_TRANSACTION_RETRY_DELAY: Duration = Duration::from_mill
 pub(super) type SelectedBaselineSemantics =
     (Vec<EntityFact>, Vec<Observation>, Vec<SemanticCandidate>);
 
-fn replace_fact_shards(
-    transaction: &MultiTransaction,
-    view: &str,
-    shards: &[FactShard],
-) -> Result<FactChanges, Box<dyn Error>> {
+fn validate_fact_shards(shards: &[FactShard]) -> Result<(), Box<dyn Error>> {
     if shards.iter().any(|shard| {
         shard.producer.is_empty() || shard.repository.is_empty() || shard.version.is_empty()
     }) {
@@ -74,6 +70,28 @@ fn replace_fact_shards(
             format!("fact shard owners must be unique within a publication: {duplicates}").into(),
         );
     }
+    Ok(())
+}
+
+fn replace_fact_shards(
+    transaction: &MultiTransaction,
+    view: &str,
+    shards: &[FactShard],
+) -> Result<FactChanges, Box<dyn Error>> {
+    validate_fact_shards(shards)?;
+    let incoming = shards
+        .iter()
+        .map(|shard| {
+            (
+                (
+                    shard.producer.as_str(),
+                    shard.repository.as_str(),
+                    shard.owner.as_str(),
+                ),
+                shard,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let current = transaction.run_script(
         "?[producer, repository, owner, version] := *analysis_fact_shard_selection{\
@@ -240,11 +258,7 @@ fn enrichment_owner_key(analyzer: &str, repository: &str) -> String {
     format!("{}:{analyzer}{repository}", analyzer.len())
 }
 
-fn replace_semantic_candidates(
-    transaction: &MultiTransaction,
-    view: &str,
-    candidates: &[SemanticCandidate],
-) -> Result<(), Box<dyn Error>> {
+fn validate_semantic_candidates(candidates: &[SemanticCandidate]) -> Result<(), Box<dyn Error>> {
     let ids = candidates
         .iter()
         .map(|candidate| candidate.id.as_str())
@@ -252,6 +266,15 @@ fn replace_semantic_candidates(
     if ids.len() != candidates.len() || ids.contains("") {
         return Err("semantic candidate IDs must be non-empty and unique".into());
     }
+    Ok(())
+}
+
+fn replace_semantic_candidates(
+    transaction: &MultiTransaction,
+    view: &str,
+    candidates: &[SemanticCandidate],
+) -> Result<(), Box<dyn Error>> {
+    validate_semantic_candidates(candidates)?;
     transaction.run_script(
         "?[view, id] := *analysis_semantic_candidate{view, id}, view = $view \
          :rm analysis_semantic_candidate {view, id}",
@@ -879,6 +902,216 @@ pub(super) fn analyzed_state(facts: &RepositoryFacts) -> String {
     format!("{}:{:x}", facts.state.fingerprint, hash.finalize())
 }
 
+fn semantic_publication_fingerprint(
+    view: &WorkspaceView,
+    repositories: &[RepositoryFacts],
+    overrides: &[DependencyOverride],
+    fact_shards: &[FactShard],
+    semantic_candidates: &[SemanticCandidate],
+) -> String {
+    let mut hash = Sha256::new();
+    hash_string(&mut hash, "beholder-semantic-publication-v1");
+    hash_string(&mut hash, &view.analysis_identity);
+    let mut repositories = repositories.iter().collect::<Vec<_>>();
+    repositories.sort_by_key(|facts| &facts.state.repository.identity);
+    for facts in repositories {
+        hash_string(&mut hash, &facts.state.repository.identity);
+        hash_string(&mut hash, &facts.analysis_identity);
+        hash.update([u8::from(facts.incomplete)]);
+        for ((from, relation, to), (evidence, confidence, provenance)) in
+            normalized_observations(facts)
+        {
+            for value in [from, relation, to, evidence, provenance] {
+                hash_string(&mut hash, &value);
+            }
+            hash.update(confidence.to_le_bytes());
+        }
+        for (id, (kind, metadata)) in normalized_entities(facts) {
+            for value in [id, kind, metadata] {
+                hash_string(&mut hash, &value);
+            }
+        }
+        for ((local, role, service, method, evidence), (cardinality, confidence, provenance)) in
+            normalized_grpc_bindings(facts)
+        {
+            for value in [
+                local,
+                role,
+                service,
+                method,
+                evidence,
+                cardinality,
+                provenance,
+            ] {
+                hash_string(&mut hash, &value);
+            }
+            hash.update(confidence.to_le_bytes());
+        }
+        let mut diagnostics = facts.diagnostics.iter().collect::<Vec<_>>();
+        diagnostics.sort_by(|left, right| {
+            (
+                &left.code,
+                left.severity.as_str(),
+                &left.path,
+                left.line,
+                &left.detail,
+            )
+                .cmp(&(
+                    &right.code,
+                    right.severity.as_str(),
+                    &right.path,
+                    right.line,
+                    &right.detail,
+                ))
+        });
+        for diagnostic in diagnostics {
+            hash_string(&mut hash, &diagnostic.code);
+            hash_string(&mut hash, diagnostic.severity.as_str());
+            hash_string(&mut hash, &diagnostic.path.to_string_lossy());
+            hash.update(diagnostic.line.unwrap_or_default().to_le_bytes());
+            hash_string(&mut hash, diagnostic.detail.as_deref().unwrap_or_default());
+        }
+    }
+    let mut shards = fact_shards.iter().collect::<Vec<_>>();
+    shards.sort_by_key(|shard| (&shard.producer, &shard.repository, shard.owner.as_str()));
+    for shard in shards {
+        for value in [
+            shard.producer.as_str(),
+            shard.repository.as_str(),
+            shard.owner.as_str(),
+            shard.version.as_str(),
+        ] {
+            hash_string(&mut hash, value);
+        }
+    }
+    let mut overrides = overrides.iter().collect::<Vec<_>>();
+    overrides.sort_by_key(|override_| {
+        (
+            override_.from.as_str(),
+            override_.relation.as_str(),
+            override_.unresolved_to.as_str(),
+            override_.resolved_to.as_str(),
+            override_.evidence.as_str(),
+        )
+    });
+    for override_ in overrides {
+        for value in [
+            override_.from.as_str(),
+            override_.relation.as_str(),
+            override_.unresolved_to.as_str(),
+            override_.resolved_to.as_str(),
+            override_.evidence.as_str(),
+            override_.provenance.as_str(),
+        ] {
+            hash_string(&mut hash, value);
+        }
+        hash.update(override_.confidence.score().to_bits().to_le_bytes());
+    }
+    let mut candidates = semantic_candidates.iter().collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| &candidate.id);
+    for candidate in candidates {
+        let path = candidate.span.path.to_string_lossy();
+        for value in [
+            candidate.id.as_str(),
+            candidate.repository.as_str(),
+            candidate.from.as_str(),
+            candidate.relation.as_str(),
+            candidate.unresolved_to.as_str(),
+            path.as_ref(),
+            candidate.evidence.as_str(),
+        ] {
+            hash_string(&mut hash, value);
+        }
+        for value in [
+            candidate.span.start.line,
+            candidate.span.start.character,
+            candidate.span.end.line,
+            candidate.span.end.character,
+        ] {
+            hash.update(value.to_le_bytes());
+        }
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn refresh_semantic_noop(
+    db: &DbInstance,
+    view: &WorkspaceView,
+    repositories: &[RepositoryFacts],
+    semantic_fingerprint: &str,
+    verification_fingerprint: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    let current = transaction.run_script(
+        "?[fingerprint] := *analysis_semantic_fingerprint{view: $view, fingerprint}",
+        BTreeMap::from([("view".into(), view.name.clone().into())]),
+    )?;
+    if current.rows.first().and_then(|row| row[0].get_str()) != Some(semantic_fingerprint) {
+        transaction.abort()?;
+        return Ok(false);
+    }
+    let params = BTreeMap::from([
+        ("view".into(), view.name.clone().into()),
+        ("fingerprint".into(), view.fingerprint().into()),
+    ]);
+    transaction.run_script(
+        "?[view, fingerprint] <- [[$view, $fingerprint]] \
+         :put analysis_fingerprint {view => fingerprint}",
+        params,
+    )?;
+    transaction.run_script(
+        "?[view, fingerprint] <- [[$view, $fingerprint]] \
+         :put analysis_verification_fingerprint {view => fingerprint}",
+        BTreeMap::from([
+            ("view".into(), view.name.clone().into()),
+            ("fingerprint".into(), verification_fingerprint.into()),
+        ]),
+    )?;
+    for facts in repositories {
+        let selected = transaction.run_script(
+            "?[state] := *analysis_revision{view: $view, revision}, \
+                 *analysis_revision_state{view: $view, revision, repository: $repository, state}",
+            BTreeMap::from([
+                ("view".into(), view.name.clone().into()),
+                (
+                    "repository".into(),
+                    facts.state.repository.identity.clone().into(),
+                ),
+            ]),
+        )?;
+        let state = selected
+            .rows
+            .first()
+            .and_then(|row| row[0].get_str())
+            .ok_or("published repository state is missing")?;
+        store_repository_state(&transaction, facts, state)?;
+    }
+    let params = BTreeMap::from([("view".into(), view.name.clone().into())]);
+    for (relation, keys) in [
+        ("analysis_revision_input", "view, revision, repository"),
+        (
+            "analysis_revision_enrichment_input",
+            "view, revision, repository, analyzer",
+        ),
+        (
+            "analysis_revision_context",
+            "view, revision, target, analyzer, context",
+        ),
+    ] {
+        transaction.run_script(
+            &format!(
+                "?[{keys}] := *analysis_revision{{view: $view, revision}}, \
+                 *{relation}{{{keys}}}, view = $view :rm {relation} {{{keys}}}"
+            ),
+            params.clone(),
+        )?;
+    }
+    store_revision_inputs(&transaction, view)?;
+    reconcile_obsolete_enrichments(&transaction, &view.name)?;
+    transaction.commit()?;
+    Ok(true)
+}
+
 pub(super) fn state_exists(
     transaction: &MultiTransaction,
     state: &str,
@@ -1146,6 +1379,7 @@ fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<()
         ),
         ("analysis_baseline_fingerprint", "view"),
         ("analysis_semantic_candidate", "view, id"),
+        ("analysis_semantic_fingerprint", "view"),
         ("analysis_fingerprint", "view"),
         ("analysis_verification_fingerprint", "view"),
         ("analysis_revision", "view"),
@@ -1527,6 +1761,52 @@ pub(super) fn publish_observations(
     {
         return Err("repository facts do not match the workspace view".into());
     }
+    let repository_ids = repositories
+        .iter()
+        .map(|facts| facts.state.repository.identity.as_str())
+        .collect::<BTreeSet<_>>();
+    if semantic_candidates
+        .iter()
+        .any(|candidate| !repository_ids.contains(candidate.repository.as_str()))
+    {
+        return Err("semantic candidate belongs to a repository outside the workspace view".into());
+    }
+    validate_fact_shards(fact_shards)?;
+    validate_semantic_candidates(semantic_candidates)?;
+    let semantic_fingerprint = report_shard_changes.then(|| {
+        semantic_publication_fingerprint(
+            view,
+            repositories,
+            overrides,
+            fact_shards,
+            semantic_candidates,
+        )
+    });
+    if let (Some(semantic_fingerprint), Some(verification_fingerprint)) =
+        (&semantic_fingerprint, verification_fingerprint)
+        && refresh_semantic_noop(
+            db,
+            view,
+            repositories,
+            semantic_fingerprint,
+            verification_fingerprint,
+        )?
+    {
+        let unchanged = fact_shards
+            .iter()
+            .map(|shard| shard.observations.len())
+            .sum();
+        tracing::info!(
+            target: "beholder::publication",
+            stage = "semantic_noop",
+            elapsed_ms = publication_started.elapsed().as_secs_f64() * 1000.0,
+            "Mnestic publication reused the selected semantic manifest"
+        );
+        return Ok(FactChanges {
+            unchanged,
+            ..FactChanges::default()
+        });
+    }
     let started = Instant::now();
     let resolution = resolve_grpc_bindings(repositories)?;
     tracing::info!(
@@ -1541,16 +1821,6 @@ pub(super) fn publish_observations(
         ("fingerprint".into(), view.fingerprint().into()),
     ]);
     let transaction = db.multi_transaction(true);
-    let repository_ids = repositories
-        .iter()
-        .map(|facts| facts.state.repository.identity.as_str())
-        .collect::<BTreeSet<_>>();
-    if semantic_candidates
-        .iter()
-        .any(|candidate| !repository_ids.contains(candidate.repository.as_str()))
-    {
-        return Err("semantic candidate belongs to a repository outside the workspace view".into());
-    }
     replace_semantic_candidates(&transaction, &view.name, semantic_candidates)?;
     let legacy_changes = if !report_shard_changes {
         let started = Instant::now();
@@ -1722,6 +1992,21 @@ pub(super) fn publish_observations(
     } else {
         transaction.run_script(
             "?[view] <- [[$view]] :rm analysis_verification_fingerprint {view}",
+            BTreeMap::from([("view".into(), view.name.clone().into())]),
+        )?;
+    }
+    if let Some(fingerprint) = semantic_fingerprint {
+        transaction.run_script(
+            "?[view, fingerprint] <- [[$view, $fingerprint]] \
+             :put analysis_semantic_fingerprint {view => fingerprint}",
+            BTreeMap::from([
+                ("view".into(), view.name.clone().into()),
+                ("fingerprint".into(), fingerprint.into()),
+            ]),
+        )?;
+    } else {
+        transaction.run_script(
+            "?[view] <- [[$view]] :rm analysis_semantic_fingerprint {view}",
             BTreeMap::from([("view".into(), view.name.clone().into())]),
         )?;
     }
