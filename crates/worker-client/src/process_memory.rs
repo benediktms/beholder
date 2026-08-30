@@ -96,6 +96,10 @@ impl ProcessMemoryGuard {
         }
     }
 
+    pub(crate) fn event_if_ready(&self) -> Option<MemoryGuardEvent> {
+        self.events.borrow().clone()
+    }
+
     pub(crate) fn peak_bytes(&self) -> u64 {
         self.peak_bytes.load(Ordering::Relaxed)
     }
@@ -214,6 +218,10 @@ mod tests {
         let event = tokio::time::timeout(Duration::from_secs(2), guard.event())
             .await
             .unwrap();
+        assert!(matches!(
+            guard.event_if_ready(),
+            Some(MemoryGuardEvent::Exceeded { .. })
+        ));
         terminate_process_group(process_group, &mut child)
             .await
             .unwrap();

@@ -527,6 +527,10 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                         .as_ref()
                         .map(ProcessMemoryGuard::process_group);
                     tokio::select! {
+                        biased;
+                        event = memory_guard_event(worker.memory_guard.as_mut()) => {
+                            return Err(terminate_for_memory_event(&mut worker.child, process_group, event).await);
+                        }
                         response = tokio::time::timeout(
                             analysis_inactivity_timeout,
                             worker.client.analyze(request),
@@ -537,9 +541,6 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                                     analysis_inactivity_timeout.as_millis()
                                 )
                             })??,
-                        event = memory_guard_event(worker.memory_guard.as_mut()) => {
-                            return Err(terminate_for_memory_event(&mut worker.child, process_group, event).await);
-                        }
                     }
                 };
                 #[cfg(not(unix))]
@@ -564,6 +565,10 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                             .as_ref()
                             .map(ProcessMemoryGuard::process_group);
                         tokio::select! {
+                            biased;
+                            event = memory_guard_event(worker.memory_guard.as_mut()) => {
+                                return Err(terminate_for_memory_event(&mut worker.child, process_group, event).await);
+                            }
                             event = tokio::time::timeout(analysis_inactivity_timeout, stream.message()) => event
                                 .map_err(|_| {
                                     format!(
@@ -571,9 +576,6 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                                         analysis_inactivity_timeout.as_millis()
                                     )
                                 })??,
-                            event = memory_guard_event(worker.memory_guard.as_mut()) => {
-                                return Err(terminate_for_memory_event(&mut worker.child, process_group, event).await);
-                            }
                         }
                     };
                     #[cfg(not(unix))]
@@ -586,6 +588,23 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                             )
                         })??;
                     let Some(event) = event else {
+                        #[cfg(unix)]
+                        if let Some(memory_event) = worker
+                            .memory_guard
+                            .as_ref()
+                            .and_then(ProcessMemoryGuard::event_if_ready)
+                        {
+                            let process_group = worker
+                                .memory_guard
+                                .as_ref()
+                                .map(ProcessMemoryGuard::process_group);
+                            return Err(terminate_for_memory_event(
+                                &mut worker.child,
+                                process_group,
+                                memory_event,
+                            )
+                            .await);
+                        }
                         break;
                     };
                     if let Some(analyze_event::Event::Progress(progress)) = &event.event {
