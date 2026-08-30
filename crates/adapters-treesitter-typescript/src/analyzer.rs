@@ -7,9 +7,10 @@ use crate::{
 };
 use crate::{
     analysis::{analyze_with_plugins, semantics_from_analysis, source_stem},
+    graphql::collect_grats_resolvers,
     plugin::{TypescriptLanguage, built_in_plugins},
 };
-use beholder_adapters_graphql::GraphqlSource;
+use beholder_adapters_graphql::{GraphqlFacts, GraphqlSource};
 use beholder_domain::{EntityFact, FactShard, Observation, SourceAnalysisError};
 use beholder_indexing::{
     ActivePlugins, AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError,
@@ -387,6 +388,20 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
                     .collect(),
             );
+            let resolver_sources = analyzed
+                .iter()
+                .map(|(path, source, analysis, _, _)| GraphqlResolverSource {
+                    path,
+                    analysis,
+                    source,
+                })
+                .collect::<Vec<_>>();
+            let resolver_input = GraphqlResolverInput {
+                repository: &repository.state.repository.identity,
+                sources: &resolver_sources,
+                manifests: &manifests,
+            };
+            let grats_resolvers = collect_grats_resolvers(&resolver_input);
             let semantic_key = repository_semantic_key(
                 repository_plan,
                 &analyzed,
@@ -394,6 +409,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 &configs,
                 &schemas,
                 &diagnostics,
+                &grats_resolvers,
             );
             if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
                 cached_observations.extend_from_slice(cached.observations);
@@ -433,19 +449,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 .iter()
                 .map(|(path, _, analysis, _, _)| (*path, analysis.as_ref()))
                 .collect::<Vec<_>>();
-            let resolver_sources = analyzed
-                .iter()
-                .map(|(path, source, analysis, _, _)| GraphqlResolverSource {
-                    path,
-                    analysis,
-                    source,
-                })
-                .collect::<Vec<_>>();
-            let graphql_resolvers = collect_graphql_resolvers(GraphqlResolverInput {
-                repository: &repository.state.repository.identity,
-                sources: &resolver_sources,
-                manifests: &manifests,
-            });
+            let graphql_resolvers = collect_graphql_resolvers(resolver_input);
             observations.extend(graphql_resolvers.observations);
             entities.extend(graphql_resolvers.entities);
             diagnostics.extend(graphql_resolvers.diagnostics);
@@ -560,10 +564,11 @@ fn repository_semantic_key(
     configs: &[(&Path, &str)],
     schemas: &[(&Path, &str)],
     diagnostics: &[beholder_domain::AnalysisDiagnostic],
+    grats_resolvers: &GraphqlFacts,
 ) -> CacheKey {
     let mut digest = Sha256::new();
     for part in [
-        b"beholder-typescript-repository-v1".as_slice(),
+        b"beholder-typescript-repository-v2".as_slice(),
         repository_plan.repository.as_bytes(),
         repository_plan.analysis.version.as_bytes(),
         repository_plan.source_plugins.as_bytes(),
@@ -603,7 +608,41 @@ fn repository_semantic_key(
         }
         digest.update(diagnostic.line.unwrap_or_default().to_le_bytes());
     }
+    hash_graphql_resolvers(&mut digest, grats_resolvers);
     CacheKey(digest.finalize().into())
+}
+
+fn hash_graphql_resolvers(digest: &mut Sha256, facts: &GraphqlFacts) {
+    let mut semantic_facts = facts
+        .entities
+        .iter()
+        .map(|entity| serde_json::to_vec(&("entity", &entity.id, entity.kind, entity.metadata)))
+        .chain(facts.observations.iter().map(|observation| {
+            serde_json::to_vec(&(
+                "observation",
+                &observation.from,
+                observation.relation,
+                &observation.to,
+                observation.confidence,
+                observation.provenance,
+            ))
+        }))
+        .chain(facts.diagnostics.iter().map(|diagnostic| {
+            serde_json::to_vec(&(
+                "diagnostic",
+                &diagnostic.code,
+                diagnostic.severity,
+                &diagnostic.path,
+                &diagnostic.detail,
+            ))
+        }))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("GraphQL resolver semantics should serialize");
+    semantic_facts.sort();
+    for fact in semantic_facts {
+        digest.update((fact.len() as u64).to_le_bytes());
+        digest.update(fact);
+    }
 }
 
 fn retain_unresolved_candidates(
@@ -800,6 +839,57 @@ mod tests {
         assert_eq!(
             restarted.repository_cache.lock().unwrap()["example/repo"].0,
             key
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn repository_semantics_include_comment_derived_graphql_resolvers() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-typescript-graphql-cache-{}",
+            std::process::id()
+        ));
+        let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
+        let analyze = |source: &[u8], fingerprint: &str| {
+            let mut snapshot = snapshot(source, fingerprint);
+            snapshot.repositories[0].inputs.push(RepositoryInput {
+                path: PathBuf::from("package.json"),
+                content: Arc::from(&br#"{"dependencies":{"grats":"0.0.34"}}"#[..]),
+                kind: InputKind::Source,
+            });
+            analyzer.analyze(&snapshot).unwrap()
+        };
+
+        let initial = analyze(
+            b"/** @gqlQueryField first */\nexport function run() { return 1; }",
+            "initial",
+        );
+        let initial_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
+        let formatted = analyze(
+            b"/**\n * @gqlQueryField first\n */\nexport function run() {\n  return 1;\n}",
+            "formatted",
+        );
+        let formatted_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
+        let changed = analyze(
+            b"/** @gqlQueryField second */\nexport function run() { return 1; }",
+            "changed",
+        );
+        let changed_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
+
+        assert_eq!(initial.repositories, formatted.repositories);
+        assert_eq!(initial_key, formatted_key);
+        assert_ne!(initial_key, changed_key);
+        assert!(
+            changed.repositories[0]
+                .entities
+                .iter()
+                .any(|entity| { entity.id.as_str() == "graphql-field://Query/second" })
         );
         let _ = fs::remove_dir_all(cache_dir);
     }

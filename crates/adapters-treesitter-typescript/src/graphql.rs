@@ -49,8 +49,23 @@ fn extend(facts: &mut GraphqlFacts, source: GraphqlFacts) {
 }
 
 pub fn collect_graphql_resolvers(input: GraphqlResolverInput<'_>) -> GraphqlFacts {
+    let mut facts = collect_grats_resolvers(&input);
+    if has_package(input.manifests, "@nestjs/graphql") {
+        for source in input.sources {
+            extend(&mut facts, nestjs_graphql::facts(input.repository, source));
+        }
+    }
+    facts
+}
+
+pub(crate) fn collect_grats_resolvers(input: &GraphqlResolverInput<'_>) -> GraphqlFacts {
     let mut facts = GraphqlFacts::default();
-    if has_package(input.manifests, "grats") {
+    if input
+        .sources
+        .iter()
+        .any(|source| source.source.contains("@gql"))
+        && has_package(input.manifests, "grats")
+    {
         let types = input
             .sources
             .iter()
@@ -65,11 +80,6 @@ pub fn collect_graphql_resolvers(input: GraphqlResolverInput<'_>) -> GraphqlFact
                     types: &types,
                 }),
             );
-        }
-    }
-    if has_package(input.manifests, "@nestjs/graphql") {
-        for source in input.sources {
-            extend(&mut facts, nestjs_graphql::facts(input.repository, source));
         }
     }
     facts
