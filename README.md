@@ -207,6 +207,14 @@ Deletion is rejected while a workspace references the repository. It never delet
 
 Re-run `just install` after rebuilding Beholder. `just uninstall` removes the installed binaries and service.
 
+TypeScript compiler enrichment remains opt-in until the worker has a hard
+process-memory limit. To enable it explicitly for an installed service:
+
+```bash
+export BEHOLDER_TYPESCRIPT_WORKER_PATH="$HOME/.local/bin/beholder-worker-typescript"
+just install
+```
+
 ### Shell and daemon environment
 
 Beholder's native analyzers need their language toolchains on `PATH`. With a standard mise installation, expose the shims rather than the `installs` directory, whose immediate children are not executables:

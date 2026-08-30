@@ -359,7 +359,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .map_err(|error| error.to_string())?;
         builder.add_enricher(worker)
     } else {
-        tracing::info!("TypeScript analyzer worker not found; compiler enrichment disabled");
+        tracing::info!("TypeScript analyzer worker not configured; compiler enrichment disabled");
         builder
     };
     let mut builder = builder
@@ -439,22 +439,26 @@ fn elixir_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Erro
 
 #[cfg(not(test))]
 fn typescript_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
-    let configured = std::env::var_os(worker_environment_variable("typescript", "PATH"));
-    let executable = configured
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or(std::env::current_exe()?.with_file_name("beholder-worker-typescript"));
-    if executable.is_file() {
-        Ok(Some(executable))
-    } else if configured.is_some() {
-        Err(format!(
+    configured_typescript_worker_executable(
+        std::env::var_os(worker_environment_variable("typescript", "PATH"))
+            .map(std::path::PathBuf::from),
+    )
+}
+
+fn configured_typescript_worker_executable(
+    executable: Option<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    let Some(executable) = executable else {
+        return Ok(None);
+    };
+    if !executable.is_file() {
+        return Err(format!(
             "configured TypeScript analyzer worker not found at {}",
             executable.display()
         )
-        .into())
-    } else {
-        Ok(None)
+        .into());
     }
+    Ok(Some(executable))
 }
 
 #[cfg(test)]
@@ -474,6 +478,28 @@ mod tests {
         },
     };
     use std::{env, fs, path::Path, time::Duration};
+
+    #[test]
+    fn typescript_worker_requires_an_explicit_path() {
+        assert_eq!(configured_typescript_worker_executable(None).unwrap(), None);
+
+        let executable = env::temp_dir().join(format!(
+            "beholder-worker-typescript-path-{}",
+            std::process::id()
+        ));
+        fs::write(&executable, "worker").unwrap();
+        assert_eq!(
+            configured_typescript_worker_executable(Some(executable.clone())).unwrap(),
+            Some(executable.clone())
+        );
+        fs::remove_file(&executable).unwrap();
+        assert!(
+            configured_typescript_worker_executable(Some(executable))
+                .unwrap_err()
+                .to_string()
+                .contains("configured TypeScript analyzer worker not found")
+        );
+    }
 
     async fn wait_for_job(
         client: &mut DaemonClient<tonic::transport::Channel>,
