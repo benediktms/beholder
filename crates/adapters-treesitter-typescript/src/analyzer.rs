@@ -7,14 +7,15 @@ use crate::{
 };
 use crate::{
     analysis::{analyze_with_plugins, semantics_from_analysis, source_stem},
+    graphql::collect_grats_resolvers,
     plugin::{TypescriptLanguage, built_in_plugins},
 };
-use beholder_adapters_graphql::GraphqlSource;
+use beholder_adapters_graphql::{GraphqlFacts, GraphqlSource};
 use beholder_domain::{EntityFact, FactShard, Observation, SourceAnalysisError};
 use beholder_indexing::{
     ActivePlugins, AnalysisCompleteness, AnalysisInputKind, AnalyzerContribution, AnalyzerError,
-    AnalyzerMetadata, AnalyzerPlan, CacheStatistics, LanguageAnalyzer, RepositoryContribution,
-    RepositoryFactsView, WorkspaceAnalyzer, WorkspaceSnapshot,
+    AnalyzerMetadata, AnalyzerPlan, AnalyzerRepositoryPlan, CacheStatistics, LanguageAnalyzer,
+    RepositoryContribution, RepositoryFactsView, WorkspaceAnalyzer, WorkspaceSnapshot,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -28,6 +29,12 @@ use std::{
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CacheKey([u8; 32]);
 
+#[derive(Clone)]
+struct CachedAnalysis {
+    analysis: Arc<TypescriptAnalysis>,
+    semantic_shape: Arc<[u8]>,
+}
+
 #[derive(Clone, Copy)]
 enum CacheStatus {
     Memory,
@@ -35,9 +42,19 @@ enum CacheStatus {
     Miss,
 }
 
+type CachedSource = (Arc<TypescriptAnalysis>, Arc<[u8]>, CacheStatus);
+type AnalyzedSource<'a> = (
+    &'a Path,
+    &'a str,
+    Arc<TypescriptAnalysis>,
+    Arc<[u8]>,
+    CacheStatus,
+);
+
 pub struct TypescriptAnalyzer {
     cache_dir: PathBuf,
-    cache: Mutex<BTreeMap<CacheKey, Arc<TypescriptAnalysis>>>,
+    cache: Mutex<BTreeMap<CacheKey, CachedAnalysis>>,
+    repository_cache: Mutex<BTreeMap<String, (CacheKey, RepositoryContribution)>>,
     plugins: LanguageAnalyzer<TypescriptLanguage>,
 }
 
@@ -46,6 +63,7 @@ impl TypescriptAnalyzer {
         Self {
             cache_dir: cache_dir.join("typescript"),
             cache: Mutex::new(BTreeMap::new()),
+            repository_cache: Mutex::new(BTreeMap::new()),
             plugins: built_in_plugins().expect("built-in TypeScript plugins should compose"),
         }
     }
@@ -57,7 +75,7 @@ impl TypescriptAnalyzer {
         language: SourceLanguage,
         active_plugins: &ActivePlugins,
         source_plugins: &str,
-    ) -> Result<(Arc<TypescriptAnalysis>, CacheStatus), AnalyzerError> {
+    ) -> Result<CachedSource, AnalyzerError> {
         let mut digest = Sha256::new();
         for part in [
             FRONTEND_VERSION.as_bytes(),
@@ -70,25 +88,32 @@ impl TypescriptAnalyzer {
             digest.update(part);
         }
         let key = CacheKey(digest.finalize().into());
-        if let Some(analysis) = self
+        if let Some(cached) = self
             .cache
             .lock()
             .map_err(|_| "TypeScript frontend cache lock poisoned")?
             .get(&key)
             .cloned()
         {
-            return Ok((analysis, CacheStatus::Memory));
+            return Ok((cached.analysis, cached.semantic_shape, CacheStatus::Memory));
         }
         let cache_path = self.cache_dir.join(format!("{}.json", hex(key.0)));
         if let Ok(bytes) = fs::read(&cache_path)
             && let Ok(analysis) = serde_json::from_slice::<TypescriptAnalysis>(&bytes)
         {
             let analysis = Arc::new(analysis);
+            let semantic_shape = semantic_analysis_shape(&analysis);
             self.cache
                 .lock()
                 .map_err(|_| "TypeScript frontend cache lock poisoned")?
-                .insert(key, analysis.clone());
-            return Ok((analysis, CacheStatus::Disk));
+                .insert(
+                    key,
+                    CachedAnalysis {
+                        analysis: analysis.clone(),
+                        semantic_shape: semantic_shape.clone(),
+                    },
+                );
+            return Ok((analysis, semantic_shape, CacheStatus::Disk));
         }
         let analysis = Arc::new(analyze_with_plugins(
             source,
@@ -97,6 +122,7 @@ impl TypescriptAnalyzer {
             &self.plugins,
             active_plugins,
         )?);
+        let semantic_shape = semantic_analysis_shape(&analysis);
         if let Some(parent) = cache_path.parent()
             && fs::create_dir_all(parent).is_ok()
             && let Ok(bytes) = serde_json::to_vec(analysis.as_ref())
@@ -106,9 +132,78 @@ impl TypescriptAnalyzer {
         self.cache
             .lock()
             .map_err(|_| "TypeScript frontend cache lock poisoned")?
-            .insert(key, analysis.clone());
-        Ok((analysis, CacheStatus::Miss))
+            .insert(
+                key,
+                CachedAnalysis {
+                    analysis: analysis.clone(),
+                    semantic_shape: semantic_shape.clone(),
+                },
+            );
+        Ok((analysis, semantic_shape, CacheStatus::Miss))
     }
+
+    fn repository_cache_path(&self, key: &CacheKey) -> PathBuf {
+        self.cache_dir
+            .join("repository")
+            .join(format!("{}.json", hex(key.0)))
+    }
+
+    fn cached_repository(
+        &self,
+        repository: &str,
+        key: &CacheKey,
+    ) -> Result<Option<RepositoryContribution>, AnalyzerError> {
+        if let Some(contribution) = self
+            .repository_cache
+            .lock()
+            .map_err(|_| "TypeScript repository cache lock poisoned")?
+            .get(repository)
+            .filter(|(cached_key, _)| cached_key == key)
+            .map(|(_, contribution)| contribution.clone())
+        {
+            return Ok(Some(contribution));
+        }
+        let Ok(bytes) = fs::read(self.repository_cache_path(key)) else {
+            return Ok(None);
+        };
+        let Ok(contribution) = serde_json::from_slice::<RepositoryContribution>(&bytes) else {
+            return Ok(None);
+        };
+        if contribution.repository != repository {
+            return Ok(None);
+        }
+        self.repository_cache
+            .lock()
+            .map_err(|_| "TypeScript repository cache lock poisoned")?
+            .insert(repository.into(), (key.clone(), contribution.clone()));
+        Ok(Some(contribution))
+    }
+
+    fn store_repository(
+        &self,
+        repository: &str,
+        key: CacheKey,
+        contribution: &RepositoryContribution,
+    ) -> Result<(), AnalyzerError> {
+        let path = self.repository_cache_path(&key);
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_ok()
+            && let Ok(bytes) = serde_json::to_vec(contribution)
+        {
+            let _ = fs::write(path, bytes);
+        }
+        self.repository_cache
+            .lock()
+            .map_err(|_| "TypeScript repository cache lock poisoned")?
+            .insert(repository.into(), (key, contribution.clone()));
+        Ok(())
+    }
+}
+
+fn semantic_analysis_shape(analysis: &TypescriptAnalysis) -> Arc<[u8]> {
+    serde_json::to_vec(&analysis.semantic_shape())
+        .expect("TypeScript semantic shape should serialize")
+        .into()
 }
 
 impl WorkspaceAnalyzer for TypescriptAnalyzer {
@@ -253,7 +348,9 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             let mut analyzed = Vec::new();
             for (path, source, result) in analyzed_results {
                 match result {
-                    Ok((analysis, status)) => analyzed.push((path, source, analysis, status)),
+                    Ok((analysis, semantic_shape, status)) => {
+                        analyzed.push((path, source, analysis, semantic_shape, status));
+                    }
                     Err(error) if error.is_unsafe_recovery() => {
                         diagnostics.push(beholder_domain::AnalysisDiagnostic {
                             code: "typescript.parse_recovery".into(),
@@ -269,7 +366,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     Err(error) => return Err(error.into()),
                 }
             }
-            for (_, _, _, status) in &analyzed {
+            for (_, _, _, _, status) in &analyzed {
                 match status {
                     CacheStatus::Memory => cache.memory_hits += 1,
                     CacheStatus::Disk => cache.disk_hits += 1,
@@ -280,9 +377,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 repository.state.repository.identity.clone(),
                 analyzed
                     .iter()
-                    .map(|(path, _, analysis, _)| {
-                        ((*path).to_path_buf(), analysis.as_ref().clone())
-                    })
+                    .map(|(path, _, analysis, _, _)| ((*path).to_path_buf(), analysis.clone()))
                     .collect(),
                 manifests
                     .iter()
@@ -292,6 +387,29 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                     .iter()
                     .map(|(path, source)| ((*path).to_path_buf(), (*source).to_owned()))
                     .collect(),
+            );
+            let resolver_sources = analyzed
+                .iter()
+                .map(|(path, source, analysis, _, _)| GraphqlResolverSource {
+                    path,
+                    analysis,
+                    source,
+                })
+                .collect::<Vec<_>>();
+            let resolver_input = GraphqlResolverInput {
+                repository: &repository.state.repository.identity,
+                sources: &resolver_sources,
+                manifests: &manifests,
+            };
+            let grats_resolvers = collect_grats_resolvers(&resolver_input);
+            let semantic_key = repository_semantic_key(
+                repository_plan,
+                &analyzed,
+                &manifests,
+                &configs,
+                &schemas,
+                &diagnostics,
+                &grats_resolvers,
             );
             if let Some(cached) = plan.cached_repository(&repository.state.repository.identity) {
                 cached_observations.extend_from_slice(cached.observations);
@@ -304,7 +422,14 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 typed_repositories.push(typed_repository);
                 continue;
             }
-            for (path, source, analysis, _) in &analyzed {
+            if let Some(cached) =
+                self.cached_repository(&repository.state.repository.identity, &semantic_key)?
+            {
+                typed_repositories.push(typed_repository);
+                repositories.push(cached);
+                continue;
+            }
+            for (path, source, analysis, _, _) in &analyzed {
                 let (source_observations, source_candidates) = semantics_from_analysis(
                     &repository.state.repository.identity,
                     analysis,
@@ -322,21 +447,9 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             }
             let source_refs = analyzed
                 .iter()
-                .map(|(path, _, analysis, _)| (*path, analysis.as_ref()))
+                .map(|(path, _, analysis, _, _)| (*path, analysis.as_ref()))
                 .collect::<Vec<_>>();
-            let resolver_sources = analyzed
-                .iter()
-                .map(|(path, source, analysis, _)| GraphqlResolverSource {
-                    path,
-                    analysis,
-                    source,
-                })
-                .collect::<Vec<_>>();
-            let graphql_resolvers = collect_graphql_resolvers(GraphqlResolverInput {
-                repository: &repository.state.repository.identity,
-                sources: &resolver_sources,
-                manifests: &manifests,
-            });
+            let graphql_resolvers = collect_graphql_resolvers(resolver_input);
             observations.extend(graphql_resolvers.observations);
             entities.extend(graphql_resolvers.entities);
             diagnostics.extend(graphql_resolvers.diagnostics);
@@ -390,7 +503,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             } else {
                 AnalysisCompleteness::Complete
             };
-            repositories.push(RepositoryContribution {
+            let contribution = RepositoryContribution {
                 repository: repository.state.repository.identity.clone(),
                 completeness,
                 entities,
@@ -400,7 +513,13 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
                 diagnostics,
                 replaced_diagnostic_codes: Default::default(),
                 fact_shards,
-            });
+            };
+            self.store_repository(
+                &repository.state.repository.identity,
+                semantic_key,
+                &contribution,
+            )?;
+            repositories.push(contribution);
         }
 
         let mut all_observations = cached_observations;
@@ -430,7 +549,99 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             .lock()
             .map_err(|_| "TypeScript frontend cache lock poisoned")?
             .clear();
+        self.repository_cache
+            .lock()
+            .map_err(|_| "TypeScript repository cache lock poisoned")?
+            .clear();
         Ok(())
+    }
+}
+
+fn repository_semantic_key(
+    repository_plan: &AnalyzerRepositoryPlan,
+    analyzed: &[AnalyzedSource<'_>],
+    manifests: &[(&Path, &str)],
+    configs: &[(&Path, &str)],
+    schemas: &[(&Path, &str)],
+    diagnostics: &[beholder_domain::AnalysisDiagnostic],
+    grats_resolvers: &GraphqlFacts,
+) -> CacheKey {
+    let mut digest = Sha256::new();
+    for part in [
+        b"beholder-typescript-repository-v2".as_slice(),
+        repository_plan.repository.as_bytes(),
+        repository_plan.analysis.version.as_bytes(),
+        repository_plan.source_plugins.as_bytes(),
+    ] {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part);
+    }
+    for (path, _, _, semantic_shape, _) in analyzed {
+        for part in [path.as_os_str().as_encoded_bytes(), semantic_shape.as_ref()] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+    }
+    for (kind, inputs) in [
+        (b"manifests".as_slice(), manifests),
+        (b"configs".as_slice(), configs),
+        (b"schemas".as_slice(), schemas),
+    ] {
+        digest.update((kind.len() as u64).to_le_bytes());
+        digest.update(kind);
+        for (path, source) in inputs {
+            for part in [path.as_os_str().as_encoded_bytes(), source.as_bytes()] {
+                digest.update((part.len() as u64).to_le_bytes());
+                digest.update(part);
+            }
+        }
+    }
+    for diagnostic in diagnostics {
+        for part in [
+            diagnostic.code.as_bytes(),
+            diagnostic.severity.as_str().as_bytes(),
+            diagnostic.path.as_os_str().as_encoded_bytes(),
+            diagnostic.detail.as_deref().unwrap_or_default().as_bytes(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+        digest.update(diagnostic.line.unwrap_or_default().to_le_bytes());
+    }
+    hash_graphql_resolvers(&mut digest, grats_resolvers);
+    CacheKey(digest.finalize().into())
+}
+
+fn hash_graphql_resolvers(digest: &mut Sha256, facts: &GraphqlFacts) {
+    let mut semantic_facts = facts
+        .entities
+        .iter()
+        .map(|entity| serde_json::to_vec(&("entity", &entity.id, entity.kind, entity.metadata)))
+        .chain(facts.observations.iter().map(|observation| {
+            serde_json::to_vec(&(
+                "observation",
+                &observation.from,
+                observation.relation,
+                &observation.to,
+                observation.confidence,
+                observation.provenance,
+            ))
+        }))
+        .chain(facts.diagnostics.iter().map(|diagnostic| {
+            serde_json::to_vec(&(
+                "diagnostic",
+                &diagnostic.code,
+                diagnostic.severity,
+                &diagnostic.path,
+                &diagnostic.detail,
+            ))
+        }))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("GraphQL resolver semantics should serialize");
+    semantic_facts.sort();
+    for fact in semantic_facts {
+        digest.update((fact.len() as u64).to_le_bytes());
+        digest.update(fact);
     }
 }
 
@@ -470,13 +681,13 @@ fn hex(key: [u8; 32]) -> String {
 fn build_fact_shards(
     repository: &str,
     analyzer_version: &str,
-    analyzed: &[(&Path, &str, Arc<TypescriptAnalysis>, CacheStatus)],
+    analyzed: &[AnalyzedSource<'_>],
     entities: &[EntityFact],
     observations: &[Observation],
 ) -> Vec<FactShard> {
     analyzed
         .iter()
-        .map(|(path, _, analysis, _)| {
+        .map(|(path, _, analysis, semantic_shape, _)| {
             let owner = format!(
                 "repo://{repository}/{}/{}",
                 analysis.language.id_segment(),
@@ -494,13 +705,11 @@ fn build_fact_shards(
                 .filter(|observation| owned(observation.from.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            let shape = serde_json::to_vec(&analysis.semantic_shape())
-                .expect("TypeScript semantic shape should serialize");
             let mut digest = Sha256::new();
             for part in [
                 analyzer_version.as_bytes(),
                 owner.as_bytes(),
-                shape.as_slice(),
+                semantic_shape.as_ref(),
             ] {
                 digest.update((part.len() as u64).to_le_bytes());
                 digest.update(part);
@@ -577,14 +786,111 @@ mod tests {
         };
 
         let initial = version(b"export function run() { return first(); }", "initial");
+        let initial_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
         let formatted = version(
             b"// comment\n\nexport function run() {\n  return first();\n}\n",
             "formatted",
         );
+        let formatted_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
         let changed = version(b"export function run() { return second(); }", "changed");
+        let changed_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
 
         assert_eq!(initial, formatted);
+        assert_eq!(initial_key, formatted_key);
         assert_ne!(initial, changed);
+        assert_ne!(initial_key, changed_key);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn repository_semantics_are_reused_after_restart() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-typescript-repository-cache-{}",
+            std::process::id()
+        ));
+        let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
+        let initial = analyzer
+            .analyze(&snapshot(
+                b"export function run() { return first(); }",
+                "initial",
+            ))
+            .unwrap();
+        let key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
+        assert!(analyzer.repository_cache_path(&key).is_file());
+        drop(analyzer);
+
+        let restarted = TypescriptAnalyzer::new(cache_dir.clone());
+        let formatted = restarted
+            .analyze(&snapshot(
+                b"// comment\nexport function run() {\n  return first();\n}",
+                "formatted",
+            ))
+            .unwrap();
+
+        assert_eq!(initial.repositories, formatted.repositories);
+        assert_eq!(
+            restarted.repository_cache.lock().unwrap()["example/repo"].0,
+            key
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn repository_semantics_include_comment_derived_graphql_resolvers() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-typescript-graphql-cache-{}",
+            std::process::id()
+        ));
+        let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
+        let analyze = |source: &[u8], fingerprint: &str| {
+            let mut snapshot = snapshot(source, fingerprint);
+            snapshot.repositories[0].inputs.push(RepositoryInput {
+                path: PathBuf::from("package.json"),
+                content: Arc::from(&br#"{"dependencies":{"grats":"0.0.34"}}"#[..]),
+                kind: InputKind::Source,
+            });
+            analyzer.analyze(&snapshot).unwrap()
+        };
+
+        let initial = analyze(
+            b"/** @gqlQueryField first */\nexport function run() { return 1; }",
+            "initial",
+        );
+        let initial_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
+        let formatted = analyze(
+            b"/**\n * @gqlQueryField first\n */\nexport function run() {\n  return 1;\n}",
+            "formatted",
+        );
+        let formatted_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
+        let changed = analyze(
+            b"/** @gqlQueryField second */\nexport function run() { return 1; }",
+            "changed",
+        );
+        let changed_key = analyzer.repository_cache.lock().unwrap()["example/repo"]
+            .0
+            .clone();
+
+        assert_eq!(initial.repositories, formatted.repositories);
+        assert_eq!(initial_key, formatted_key);
+        assert_ne!(initial_key, changed_key);
+        assert!(
+            changed.repositories[0]
+                .entities
+                .iter()
+                .any(|entity| { entity.id.as_str() == "graphql-field://Query/second" })
+        );
         let _ = fs::remove_dir_all(cache_dir);
     }
 
@@ -661,6 +967,18 @@ mod tests {
                 .any(|diagnostic| diagnostic.path == Path::new("src/broken.ts"))
         );
         assert!(!contribution.repositories[0].entities.is_empty());
+
+        let mut moved = snapshot;
+        moved.repositories[0].state.fingerprint = "moved".into();
+        moved.repositories[0].inputs[1].path = PathBuf::from("src/moved-broken.ts");
+        let contribution = analyzer.analyze(&moved).unwrap();
+
+        assert!(
+            contribution.repositories[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == Path::new("src/moved-broken.ts"))
+        );
         let _ = fs::remove_dir_all(cache_dir);
     }
 }

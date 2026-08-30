@@ -269,14 +269,14 @@ pub struct CacheStatistics {
     pub misses: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AnalysisCompleteness {
     #[default]
     Complete,
     Incomplete,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RepositoryContribution {
     pub repository: String,
     pub completeness: AnalysisCompleteness,
@@ -1053,16 +1053,23 @@ impl IndexerBuilder {
             cache_dir: self.cache_dir,
             pool,
             repository_cache: Mutex::new(BTreeMap::new()),
+            latest_repository_cache: Mutex::new(BTreeMap::new()),
         })
     }
 }
+
+type RepositoryCacheKey = (String, String);
+type RepositoryCache = BTreeMap<RepositoryCacheKey, Arc<CanonicalRepositoryAnalysis>>;
+type LatestRepositoryCache =
+    BTreeMap<RepositoryCacheKey, (String, Arc<CanonicalRepositoryAnalysis>)>;
 
 pub struct Indexer {
     analyzers: Vec<Box<dyn WorkspaceAnalyzer>>,
     enrichers: Vec<Box<dyn WorkspaceEnricher>>,
     cache_dir: PathBuf,
     pool: ThreadPool,
-    repository_cache: Mutex<BTreeMap<(String, String), Arc<CanonicalRepositoryAnalysis>>>,
+    repository_cache: Mutex<RepositoryCache>,
+    latest_repository_cache: Mutex<LatestRepositoryCache>,
 }
 
 impl Indexer {
@@ -1126,7 +1133,7 @@ impl Indexer {
             .filter_map(|repository| {
                 let identity = &repository.state.repository.identity;
                 let analysis_identity = repository_identities.get(identity)?;
-                self.lookup_repository(&repository.state.fingerprint, analysis_identity)
+                self.lookup_repository(identity, &repository.state.fingerprint, analysis_identity)
                     .map(|cached| (identity.clone(), cached))
             })
             .collect::<BTreeMap<_, _>>();
@@ -1518,13 +1525,11 @@ impl Indexer {
                 if let Some((analysis, status)) = plan.cached_repositories.get(identity) {
                     (Arc::clone(analysis), *status)
                 } else {
-                    (
-                        self.store_repository(
-                            &repository.state.fingerprint,
-                            &analysis_identity,
-                            analysis,
-                        ),
-                        CacheStatus::Miss,
+                    self.store_repository(
+                        identity,
+                        &repository.state.fingerprint,
+                        &analysis_identity,
+                        analysis,
                     )
                 };
             diagnostics.extend(
@@ -1572,11 +1577,13 @@ impl Indexer {
             fs::remove_dir_all(&self.cache_dir)?;
         }
         self.repository_cache.lock().unwrap().clear();
+        self.latest_repository_cache.lock().unwrap().clear();
         Ok(())
     }
 
     fn lookup_repository(
         &self,
+        repository: &str,
         fingerprint: &str,
         analysis_identity: &str,
     ) -> Option<(Arc<CanonicalRepositoryAnalysis>, CacheStatus)> {
@@ -1592,31 +1599,61 @@ impl Indexer {
             .lock()
             .unwrap()
             .insert(key, Arc::clone(&analysis));
+        self.latest_repository_cache.lock().unwrap().insert(
+            (repository.to_owned(), analysis_identity.to_owned()),
+            (fingerprint.to_owned(), Arc::clone(&analysis)),
+        );
         Some((analysis, CacheStatus::Disk))
     }
 
     fn store_repository(
         &self,
+        repository: &str,
         fingerprint: &str,
         analysis_identity: &str,
         analysis: CanonicalRepositoryAnalysis,
-    ) -> Arc<CanonicalRepositoryAnalysis> {
+    ) -> (Arc<CanonicalRepositoryAnalysis>, CacheStatus) {
         let key = (fingerprint.to_owned(), analysis_identity.to_owned());
         let path = self.repository_cache_path(fingerprint, analysis_identity);
-        let analysis = Arc::new(analysis);
-        if let Some(parent) = path.parent()
-            && fs::create_dir_all(parent).is_ok()
-            && let Ok(file) = File::create(path)
+        let latest_key = (repository.to_owned(), analysis_identity.to_owned());
+        let latest = self
+            .latest_repository_cache
+            .lock()
+            .unwrap()
+            .get(&latest_key)
+            .cloned();
+        if let Some((previous_fingerprint, previous)) = latest
+            && previous.as_ref() == &analysis
         {
-            let mut writer = BufWriter::new(file);
-            let _ = serde_json::to_writer(&mut writer, analysis.as_ref());
-            let _ = writer.flush();
+            let previous_path =
+                self.repository_cache_path(&previous_fingerprint, analysis_identity);
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::hard_link(previous_path, &path).is_err() {
+                persist_repository_analysis(&path, previous.as_ref());
+            }
+            self.repository_cache
+                .lock()
+                .unwrap()
+                .insert(key, Arc::clone(&previous));
+            self.latest_repository_cache
+                .lock()
+                .unwrap()
+                .insert(latest_key, (fingerprint.to_owned(), Arc::clone(&previous)));
+            return (previous, CacheStatus::Memory);
         }
+        let analysis = Arc::new(analysis);
+        persist_repository_analysis(&path, analysis.as_ref());
         self.repository_cache
             .lock()
             .unwrap()
             .insert(key, Arc::clone(&analysis));
-        analysis
+        self.latest_repository_cache
+            .lock()
+            .unwrap()
+            .insert(latest_key, (fingerprint.to_owned(), Arc::clone(&analysis)));
+        (analysis, CacheStatus::Miss)
     }
 
     fn repository_cache_path(&self, fingerprint: &str, analysis_identity: &str) -> PathBuf {
@@ -1630,6 +1667,17 @@ impl Indexer {
             .join("semantic")
             .join(encoded_identity)
             .join(format!("{fingerprint}.json"))
+    }
+}
+
+fn persist_repository_analysis(path: &Path, analysis: &CanonicalRepositoryAnalysis) {
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_ok()
+        && let Ok(file) = File::create(path)
+    {
+        let mut writer = BufWriter::new(file);
+        let _ = serde_json::to_writer(&mut writer, analysis);
+        let _ = writer.flush();
     }
 }
 
@@ -2411,6 +2459,36 @@ mod tests {
             .unwrap();
         assert_eq!(
             restarted.analyze(&snapshot()).unwrap().repositories[0].cache,
+            CacheStatus::Disk
+        );
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn unchanged_semantics_alias_a_new_source_fingerprint() {
+        let cache_dir = cache_dir("semantic-alias");
+        let indexer = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "fake" })
+            .build()
+            .unwrap();
+        let original = snapshot();
+        indexer.analyze(&original).unwrap();
+        let mut formatted = original;
+        formatted.repositories[0].state.fingerprint = "formatted".into();
+        formatted.repositories[0].inputs[0].content = Arc::from(&b"  input\n"[..]);
+
+        assert_eq!(
+            indexer.analyze(&formatted).unwrap().repositories[0].cache,
+            CacheStatus::Memory
+        );
+        drop(indexer);
+
+        let restarted = IndexerBuilder::new(cache_dir.clone(), 1)
+            .add_analyzer(FakeAnalyzer { id: "fake" })
+            .build()
+            .unwrap();
+        assert_eq!(
+            restarted.analyze(&formatted).unwrap().repositories[0].cache,
             CacheStatus::Disk
         );
         let _ = fs::remove_dir_all(cache_dir);

@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,21 +100,27 @@ pub(super) struct GraphqlDocument {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TypescriptRepository {
     pub(super) repository: String,
-    pub(super) sources: Vec<(PathBuf, TypescriptAnalysis)>,
+    pub(super) sources: Vec<(PathBuf, Arc<TypescriptAnalysis>)>,
     pub(super) manifests: Vec<(PathBuf, String)>,
     pub(super) configs: Vec<(PathBuf, String)>,
 }
 
 impl TypescriptRepository {
-    pub fn new(
+    pub fn new<A>(
         repository: impl Into<String>,
-        sources: Vec<(PathBuf, TypescriptAnalysis)>,
+        sources: Vec<(PathBuf, A)>,
         manifests: Vec<(PathBuf, String)>,
         configs: Vec<(PathBuf, String)>,
-    ) -> Self {
+    ) -> Self
+    where
+        A: Into<Arc<TypescriptAnalysis>>,
+    {
         Self {
             repository: repository.into(),
-            sources,
+            sources: sources
+                .into_iter()
+                .map(|(path, analysis)| (path, analysis.into()))
+                .collect(),
             manifests,
             configs,
         }
@@ -227,4 +236,24 @@ pub(super) struct Call {
 pub(super) struct StringConstant {
     pub(super) name: String,
     pub(super) value: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_retains_shared_source_analysis() {
+        let analysis = Arc::new(
+            crate::analyze("export function run() {}", SourceLanguage::TypeScript).unwrap(),
+        );
+        let repository = TypescriptRepository::new(
+            "example",
+            vec![(PathBuf::from("src/index.ts"), analysis.clone())],
+            vec![],
+            vec![],
+        );
+
+        assert!(Arc::ptr_eq(&analysis, &repository.sources[0].1));
+    }
 }

@@ -538,6 +538,14 @@ pub(super) const CREATE_VERIFICATION_FINGERPRINT_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_SEMANTIC_FINGERPRINT_SCHEMA: &str = r#"
+:create analysis_semantic_fingerprint {
+    view: String,
+    =>
+    fingerprint: String,
+}
+"#;
+
 pub(super) const CREATE_REPOSITORY_STATE_SCHEMA: &str = r#"
 :create repository_state {
     fingerprint: String,
@@ -587,6 +595,16 @@ pub(super) const CREATE_REVISION_STATE_SCHEMA: &str = r#"
     repository: String,
     =>
     state: String,
+}
+"#;
+
+pub(super) const CREATE_REVISION_REPOSITORY_HEAD_SCHEMA: &str = r#"
+:create analysis_revision_repository_head {
+    view: String,
+    revision: Int,
+    repository: String,
+    =>
+    head: String,
 }
 "#;
 

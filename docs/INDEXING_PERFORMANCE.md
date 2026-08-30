@@ -334,3 +334,44 @@ Cold helper or dependency rebuilds remain proportional to the underlying Mix
 compilation and are intentionally kept off the ordinary warm-edit path. Cold
 trace reconstruction forces only the Elixir compiler and skips protocol
 consolidation; populating an empty dependency cache remains the dominant cost.
+
+## Incremental TypeScript slice
+
+A 2026-08-30 installed-daemon smoke used a temporary copy-on-write clone of a
+large TypeScript SPA with 7,639 source-owned shards and 65,285 observations. The
+cold base index took 96 seconds: 79.5 seconds in analysis and 10.1 seconds in
+Mnestic publication. TypeScript compiler enrichment then took 94 seconds for its
+bounded set of 500 prioritized candidates; publication took 80 ms.
+
+Before repository-level semantic reuse, a comment-only edit still spent 68.4
+seconds reconstructing repository resolution and 8.0 seconds publishing, despite
+all 85,600 shard rows being unchanged. Sharing cached per-file analyses removed a
+repository-sized deep clone. A bounded repository cache now keys resolution output
+by position-free file semantics plus manifest, configuration, schema, analyzer,
+and plugin inputs, with the contribution persisted for restart reuse.
+
+The generic repository cache aliases equal canonical output across raw source
+fingerprints instead of serializing it again. Mnestic records a semantic
+publication fingerprint and performs only a metadata/currentness transaction when
+the selected semantic manifest is unchanged. An installed-daemon formatting edit
+after restart completed in 4.38 seconds; the next reverse formatting edit completed
+in 2.73 seconds:
+
+| Stage | Before | Restart reuse | Warm reuse |
+| --- | ---: | ---: | ---: |
+| Source loading | 0.56 s | 0.42 s | 0.41 s |
+| Analysis | 68.4 s | 1.02 s | 0.98 s |
+| Mnestic publication | 7.97 s | 0.97 s | 1.13 s |
+| Semantic no-op transaction | n/a | 0.52 s | 0.50 s |
+| Total job | 78 s | 4.38 s | 2.73 s |
+
+Both runs read and verified only the changed file, retained all 85,601 selected
+fact rows, and scheduled no TypeScript compiler enrichment. The final smoke ran
+with the installed worker active. A compiler-relevant receiver-call edit changed
+the declared semantic input, queued exactly one TypeScript enrichment, and
+completed successfully.
+
+Genuine TypeScript semantic changes still invalidate repository-wide call
+resolution. The no-op path is therefore at the Rust worker standard, while
+file/module-level propagation for changed semantics remains a separate incremental
+frontend improvement.

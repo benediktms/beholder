@@ -57,11 +57,17 @@ pub(super) fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Er
 
 pub(super) fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
     Ok(db.run_script(
-        "?[view, revision, fingerprint, repository, head, state] := \
+        "revision_head[view, revision, repository, head] := \
+             *analysis_revision_repository_head{view, revision, repository, head}\n\
+         revision_head[view, revision, repository, head] := \
+             *analysis_revision_state{view, revision, repository, state}, \
+             *repository_state{fingerprint: state, repository, head}, \
+             not *analysis_revision_repository_head{view, revision, repository}\n\
+         ?[view, revision, fingerprint, repository, head, state] := \
              *analysis_revision{view, revision}, \
              *analysis_fingerprint{view, fingerprint}, \
              *analysis_revision_state{view, revision, repository, state}, \
-             *repository_state{fingerprint: state, repository, head}\n\
+             revision_head[view, revision, repository, head]\n\
          :order view, repository",
         BTreeMap::new(),
         ScriptMutability::Immutable,
@@ -232,10 +238,19 @@ pub(super) fn published_repository_head(
     let rows = query(
         db,
         view,
-        "?[head] := \
+        "selected_head[head] := \
+             *analysis_revision{view: $view, revision}, \
+             *analysis_revision_repository_head{\
+                 view: $view, revision, repository: $repository, head\
+             }\n\
+         selected_head[head] := \
              *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view: $view, revision, repository: $repository, state}, \
-             *repository_state{fingerprint: state, repository: $repository, head}",
+             *repository_state{fingerprint: state, repository: $repository, head}, \
+             not *analysis_revision_repository_head{\
+                 view: $view, revision, repository: $repository\
+             }\n\
+         ?[head] := selected_head[head]",
         [("repository", repository.into())],
     )?;
     Ok(rows

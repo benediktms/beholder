@@ -161,12 +161,22 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_REVISION_REPOSITORY_HEAD_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_FINGERPRINT_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
     db.run_script(
         CREATE_VERIFICATION_FINGERPRINT_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_SEMANTIC_FINGERPRINT_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
@@ -414,6 +424,14 @@ pub(super) fn persistent_database(
         (
             "analysis_semantic_candidate",
             CREATE_SEMANTIC_CANDIDATE_SCHEMA,
+        ),
+        (
+            "analysis_semantic_fingerprint",
+            CREATE_SEMANTIC_FINGERPRINT_SCHEMA,
+        ),
+        (
+            "analysis_revision_repository_head",
+            CREATE_REVISION_REPOSITORY_HEAD_SCHEMA,
         ),
         ("schema_migration", CREATE_SCHEMA_MIGRATION_SCHEMA),
         ("repository_revision", CREATE_REPOSITORY_REVISION_SCHEMA),
