@@ -65,6 +65,12 @@ uninstall:
 integration-test:
     moon run beholder:integration-test
 
+# Install locked dependencies and launch the desktop graph prototype.
+[group('manual')]
+graph-ui:
+    mise exec -- pnpm --dir apps/graph-ui install --frozen-lockfile
+    mise exec -- pnpm --dir apps/graph-ui tauri dev
+
 # Benchmark cold and unchanged indexing with a bounded worker count.
 [group('manual')]
 index-bench workers repositories:
