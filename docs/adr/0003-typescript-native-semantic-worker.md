@@ -254,9 +254,11 @@ The worker does not install dependencies, run package-manager commands, execute
 package lifecycle scripts, emit JavaScript, load language-service plugins, or
 load custom compiler transforms. It consumes dependencies already present on
 disk. Missing dependencies reduce coverage but do not fail baseline indexing.
-Automatic activation is allowed once repository-scoped scheduling, executable
-discovery, timeouts, and memory limits are in place because this restricted
-analysis does not intentionally execute repository application or build code.
+The packaged worker is activated automatically once discovered beside the
+daemon. Each enrichment runs in an isolated process group with a configurable
+aggregate RSS limit; exceeding the limit terminates the worker and compiler
+before publication. This restricted analysis does not intentionally execute
+repository application or build code.
 
 ### Identity and observability
 

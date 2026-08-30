@@ -1,6 +1,8 @@
 //! Builder facade for native analyzer workers.
 
 mod plugin_registry;
+#[cfg(unix)]
+mod process_memory;
 
 pub use plugin_registry::{InstalledPlugin, PluginRegistry, describe_plugin};
 
@@ -33,10 +35,15 @@ use tokio::{
 use tonic::{Request, transport::Channel};
 use tracing::Instrument;
 
+#[cfg(unix)]
+use process_memory::{
+    MemoryGuardEvent, ProcessMemoryGuard, isolate_process_group, terminate_process_group,
+};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const ANALYSIS_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-const WORKER_SETTINGS: [&str; 2] = ["MAX_OUTPUT_BYTES", "TIMEOUT_MS"];
+const WORKER_SETTINGS: [&str; 3] = ["MAX_OUTPUT_BYTES", "MEMORY_LIMIT_BYTES", "TIMEOUT_MS"];
 static WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub const RUST_WORKER_ID: &str = "rust";
@@ -89,6 +96,7 @@ pub struct WorkerAnalyzerBuilder {
     semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
+    memory_limit_bytes: Option<u64>,
     timeout: Duration,
 }
 
@@ -119,6 +127,7 @@ impl WorkerAnalyzerBuilder {
             semantic_shard_producers: BTreeSet::new(),
             plugin: None,
             persistent: false,
+            memory_limit_bytes: None,
             timeout: ANALYSIS_INACTIVITY_TIMEOUT,
         }
     }
@@ -133,6 +142,11 @@ impl WorkerAnalyzerBuilder {
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn memory_limit(mut self, bytes: u64) -> Self {
+        self.memory_limit_bytes = Some(bytes);
         self
     }
 
@@ -264,6 +278,7 @@ impl WorkerAnalyzerBuilder {
             semantic_shard_producers: self.semantic_shard_producers,
             plugin: self.plugin,
             persistent: self.persistent,
+            memory_limit_bytes: self.memory_limit_bytes,
             session: Mutex::new(None),
             timeout: self.timeout,
         })
@@ -286,6 +301,7 @@ pub struct WorkerAnalyzer {
     semantic_shard_producers: BTreeSet<String>,
     plugin: Option<PluginDescriptor>,
     persistent: bool,
+    memory_limit_bytes: Option<u64>,
     session: Mutex<Option<WorkerSession>>,
     timeout: Duration,
 }
@@ -293,6 +309,8 @@ pub struct WorkerAnalyzer {
 struct WorkerSession {
     child: Child,
     client: AnalyzerWorkerClient<Channel>,
+    #[cfg(unix)]
+    memory_guard: Option<ProcessMemoryGuard>,
     _socket: SocketFile,
 }
 
@@ -322,6 +340,7 @@ pub fn plugin_analyzer(
         semantic_shard_producers: BTreeSet::new(),
         plugin: Some(descriptor),
         persistent: false,
+        memory_limit_bytes: None,
         session: Mutex::new(None),
         timeout: ANALYSIS_INACTIVITY_TIMEOUT,
     })
@@ -473,6 +492,8 @@ impl WorkspaceEnricher for WorkerAnalyzer {
             worker = self.metadata.id,
             workspace = snapshot.workspace.name,
             target_repository = snapshot.target_repository,
+            memory_limit_bytes = self.memory_limit_bytes().unwrap_or_default(),
+            peak_process_tree_rss_bytes = tracing::field::Empty,
             rpc.system = "grpc",
             rpc.service = "beholder.worker.v1.AnalyzerWorker",
             rpc.method = "Analyze"
@@ -480,6 +501,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         Box::pin(
             async move {
                 let analysis_inactivity_timeout = self.analysis_inactivity_timeout();
+                let memory_limit_bytes = self.memory_limit_bytes();
                 let mut session = self.session.lock().await;
                 if let Some(worker) = session.as_mut()
                     && worker.child.try_wait()?.is_some()
@@ -487,7 +509,10 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     session.take();
                 }
                 if session.is_none() {
-                    *session = Some(self.start_session(analysis_inactivity_timeout).await?);
+                    *session = Some(
+                        self.start_session(analysis_inactivity_timeout, memory_limit_bytes)
+                            .await?,
+                    );
                 }
                 let analysis_started = tokio::time::Instant::now();
                 let workspace = snapshot.workspace.name.clone();
@@ -495,6 +520,30 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 let mut request = Request::new(tokio_stream::iter(analyze_requests(snapshot)?));
                 beholder_observability::inject_current_context(request.metadata_mut());
                 let worker = session.as_mut().expect("worker session was started");
+                #[cfg(unix)]
+                let response = {
+                    let process_group = worker
+                        .memory_guard
+                        .as_ref()
+                        .map(ProcessMemoryGuard::process_group);
+                    tokio::select! {
+                        biased;
+                        event = memory_guard_event(worker.memory_guard.as_mut()) => {
+                            return Err(terminate_for_memory_event(&mut worker.child, process_group, event).await);
+                        }
+                        response = tokio::time::timeout(
+                            analysis_inactivity_timeout,
+                            worker.client.analyze(request),
+                        ) => response
+                            .map_err(|_| {
+                                format!(
+                                    "worker analysis timed out after {}ms without progress",
+                                    analysis_inactivity_timeout.as_millis()
+                                )
+                            })??,
+                    }
+                };
+                #[cfg(not(unix))]
                 let response = tokio::time::timeout(
                     analysis_inactivity_timeout,
                     worker.client.analyze(request),
@@ -509,6 +558,27 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 let mut stream = response.into_inner();
                 let mut contribution = ContributionAccumulator::default();
                 loop {
+                    #[cfg(unix)]
+                    let event = {
+                        let process_group = worker
+                            .memory_guard
+                            .as_ref()
+                            .map(ProcessMemoryGuard::process_group);
+                        tokio::select! {
+                            biased;
+                            event = memory_guard_event(worker.memory_guard.as_mut()) => {
+                                return Err(terminate_for_memory_event(&mut worker.child, process_group, event).await);
+                            }
+                            event = tokio::time::timeout(analysis_inactivity_timeout, stream.message()) => event
+                                .map_err(|_| {
+                                    format!(
+                                        "worker analysis timed out after {}ms without progress",
+                                        analysis_inactivity_timeout.as_millis()
+                                    )
+                                })??,
+                        }
+                    };
+                    #[cfg(not(unix))]
                     let event = tokio::time::timeout(analysis_inactivity_timeout, stream.message())
                         .await
                         .map_err(|_| {
@@ -518,6 +588,23 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                             )
                         })??;
                     let Some(event) = event else {
+                        #[cfg(unix)]
+                        if let Some(memory_event) = worker
+                            .memory_guard
+                            .as_ref()
+                            .and_then(ProcessMemoryGuard::event_if_ready)
+                        {
+                            let process_group = worker
+                                .memory_guard
+                                .as_ref()
+                                .map(ProcessMemoryGuard::process_group);
+                            return Err(terminate_for_memory_event(
+                                &mut worker.child,
+                                process_group,
+                                memory_event,
+                            )
+                            .await);
+                        }
                         break;
                     };
                     if let Some(analyze_event::Event::Progress(progress)) = &event.event {
@@ -552,10 +639,23 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                 if let Some(descriptor) = &self.plugin {
                     validate_plugin_contribution(descriptor, &baseline, &contribution)?;
                 }
+                #[cfg(unix)]
+                let peak_process_tree_rss_bytes = worker
+                    .memory_guard
+                    .as_ref()
+                    .map(ProcessMemoryGuard::peak_bytes)
+                    .unwrap_or_default();
+                #[cfg(not(unix))]
+                let peak_process_tree_rss_bytes = 0;
+                tracing::Span::current().record(
+                    "peak_process_tree_rss_bytes",
+                    peak_process_tree_rss_bytes,
+                );
                 tracing::info!(
                     worker = self.metadata.id,
                     workspace,
                     elapsed_ms = analysis_started.elapsed().as_secs_f64() * 1_000.0,
+                    peak_process_tree_rss_bytes,
                     override_count = contribution.overrides.len(),
                     observation_count = contribution
                         .repositories
@@ -574,6 +674,17 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     && let Some(mut worker) = session.take()
                     && worker.child.try_wait()?.is_none()
                 {
+                    #[cfg(unix)]
+                    if let Some(memory_guard) = worker.memory_guard.as_ref() {
+                        terminate_process_group(
+                            memory_guard.process_group(),
+                            &mut worker.child,
+                        )
+                        .await?;
+                    } else {
+                        worker.child.kill().await?;
+                    }
+                    #[cfg(not(unix))]
                     worker.child.kill().await?;
                     tracing::debug!(
                         worker = self.metadata.id,
@@ -654,9 +765,20 @@ impl WorkerAnalyzer {
             .unwrap_or(self.timeout)
     }
 
+    fn memory_limit_bytes(&self) -> Option<u64> {
+        std::env::var_os(worker_environment_variable(
+            &self.metadata.id,
+            "MEMORY_LIMIT_BYTES",
+        ))
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+        .filter(|value| *value > 0)
+        .or(self.memory_limit_bytes)
+    }
+
     async fn start_session(
         &self,
         analysis_inactivity_timeout: Duration,
+        memory_limit_bytes: Option<u64>,
     ) -> Result<WorkerSession, AnalyzerError> {
         fs::create_dir_all(&self.socket_dir)?;
         #[cfg(unix)]
@@ -675,6 +797,12 @@ impl WorkerAnalyzer {
             "BEHOLDER_WORKER_TIMEOUT_MS".into(),
             analysis_inactivity_timeout.as_millis().to_string().into(),
         );
+        if let Some(limit) = memory_limit_bytes {
+            worker_environment.insert(
+                "BEHOLDER_WORKER_MEMORY_LIMIT_BYTES".into(),
+                limit.to_string().into(),
+            );
+        }
         let mut command = Command::new(&self.executable);
         command
             .arg("--socket")
@@ -686,11 +814,45 @@ impl WorkerAnalyzer {
             .env("BEHOLDER_PLUGIN_DIGEST", &self.metadata.version)
             .kill_on_drop(true)
             .envs(worker_environment);
+        if let Some(limit) = memory_limit_bytes
+            && std::env::var_os("GOMEMLIMIT").is_none()
+        {
+            command.env("GOMEMLIMIT", format!("{}B", soft_memory_limit_bytes(limit)));
+        }
+        #[cfg(unix)]
+        if memory_limit_bytes.is_some() {
+            isolate_process_group(&mut command);
+        }
         let mut child = command.spawn()?;
+        #[cfg(unix)]
+        let mut memory_guard = if let Some(limit) = memory_limit_bytes {
+            let process_group = child.id().ok_or("worker process ID is unavailable")? as i32;
+            match ProcessMemoryGuard::start(process_group, limit).await {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    let _ = terminate_process_group(process_group, &mut child).await;
+                    return Err(format!("start worker memory guard: {error}").into());
+                }
+            }
+        } else {
+            None
+        };
         let endpoint = format!("unix:{}", socket.display());
         let started = tokio::time::Instant::now();
         let client = loop {
-            match AnalyzerWorkerClient::connect(endpoint.clone()).await {
+            #[cfg(unix)]
+            let connection = tokio::select! {
+                connection = AnalyzerWorkerClient::connect(endpoint.clone()) => connection,
+                event = memory_guard_event(memory_guard.as_mut()) => {
+                    let process_group = memory_guard
+                        .as_ref()
+                        .map(ProcessMemoryGuard::process_group);
+                    return Err(terminate_for_memory_event(&mut child, process_group, event).await);
+                }
+            };
+            #[cfg(not(unix))]
+            let connection = AnalyzerWorkerClient::connect(endpoint.clone()).await;
+            match connection {
                 Ok(client) => break client,
                 Err(_) if started.elapsed() < CONNECT_TIMEOUT => {
                     if let Some(status) = child.try_wait()? {
@@ -706,6 +868,8 @@ impl WorkerAnalyzer {
         Ok(WorkerSession {
             child,
             client,
+            #[cfg(unix)]
+            memory_guard,
             _socket: socket_file,
         })
     }
@@ -792,6 +956,37 @@ fn worker_service_name(worker: &str) -> String {
     }
 }
 
+fn soft_memory_limit_bytes(hard_limit_bytes: u64) -> u64 {
+    hard_limit_bytes - hard_limit_bytes / 8
+}
+
+#[cfg(unix)]
+async fn memory_guard_event(guard: Option<&mut ProcessMemoryGuard>) -> MemoryGuardEvent {
+    match guard {
+        Some(guard) => guard.event().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_for_memory_event(
+    child: &mut Child,
+    process_group: Option<i32>,
+    event: MemoryGuardEvent,
+) -> AnalyzerError {
+    let message = event.to_string();
+    tracing::error!(
+        error = message,
+        "worker memory guard terminated process tree"
+    );
+    if let Some(process_group) = process_group
+        && let Err(error) = terminate_process_group(process_group, child).await
+    {
+        return format!("{message}; terminate worker process tree: {error}").into();
+    }
+    message.into()
+}
+
 struct SocketFile(PathBuf);
 
 impl Drop for SocketFile {
@@ -811,7 +1006,7 @@ mod tests {
         AnalyzerContribution, AnalyzerMetadata, CacheStatistics, InputKind, RepositoryInput,
         RepositorySnapshot, SemanticSnapshot, WorkspaceSnapshot,
     };
-    use std::{fs, sync::Arc, time::SystemTime};
+    use std::{env, fs, sync::Arc, time::SystemTime};
 
     #[test]
     fn worker_environment_variables_have_one_consistent_shape() {
@@ -827,6 +1022,10 @@ mod tests {
             worker_environment_variable("rust", "max_output_bytes"),
             "BEHOLDER_RUST_WORKER_MAX_OUTPUT_BYTES"
         );
+        assert_eq!(
+            worker_environment_variable("typescript", "memory_limit_bytes"),
+            "BEHOLDER_TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES"
+        );
     }
 
     #[test]
@@ -839,6 +1038,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(worker.timeout, Duration::from_secs(1_200));
+    }
+
+    #[test]
+    fn worker_memory_limit_keeps_gc_headroom() {
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("typescript", "1")
+            .memory_limit(4 * 1024 * 1024 * 1024)
+            .accept_extension("ts")
+            .build()
+            .unwrap();
+
+        assert_eq!(worker.memory_limit_bytes, Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(
+            soft_memory_limit_bytes(worker.memory_limit_bytes.unwrap()),
+            3_758_096_384
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn over_limit_worker_cannot_start_an_analysis_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!(
+            "beholder-over-limit-worker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("worker");
+        fs::write(&executable, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = WorkerAnalyzerBuilder::new(&executable, root.join("sockets"))
+            .identity("typescript", "1")
+            .memory_limit(1)
+            .accept_extension("ts")
+            .build()
+            .unwrap();
+
+        let error = worker
+            .start_session(Duration::from_secs(1), worker.memory_limit_bytes())
+            .await
+            .err()
+            .expect("over-limit worker unexpectedly started");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded its 1-byte memory limit")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
