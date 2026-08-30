@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Beholder Graph",
+  "version": "0.1.0",
+  "identifier": "dev.beholder.graph",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Beholder Graph",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1040,
+        "minHeight": 680
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": { "active": false }
+}
