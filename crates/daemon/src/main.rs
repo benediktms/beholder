@@ -366,7 +366,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .map_err(|error| error.to_string())?;
         builder.add_enricher(worker)
     } else {
-        tracing::info!("TypeScript analyzer worker not configured; compiler enrichment disabled");
+        tracing::info!("TypeScript analyzer worker not found; compiler enrichment disabled");
         builder
     };
     let mut builder = builder
@@ -449,23 +449,26 @@ fn typescript_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn 
     configured_typescript_worker_executable(
         std::env::var_os(worker_environment_variable("typescript", "PATH"))
             .map(std::path::PathBuf::from),
+        std::env::current_exe()?.with_file_name("beholder-worker-typescript"),
     )
 }
 
 fn configured_typescript_worker_executable(
-    executable: Option<std::path::PathBuf>,
+    configured: Option<std::path::PathBuf>,
+    installed: std::path::PathBuf,
 ) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
-    let Some(executable) = executable else {
-        return Ok(None);
-    };
-    if !executable.is_file() {
-        return Err(format!(
+    let executable = configured.clone().unwrap_or(installed);
+    if executable.is_file() {
+        Ok(Some(executable))
+    } else if configured.is_some() {
+        Err(format!(
             "configured TypeScript analyzer worker not found at {}",
             executable.display()
         )
-        .into());
+        .into())
+    } else {
+        Ok(None)
     }
-    Ok(Some(executable))
 }
 
 #[cfg(test)]
@@ -487,21 +490,33 @@ mod tests {
     use std::{env, fs, path::Path, time::Duration};
 
     #[test]
-    fn typescript_worker_requires_an_explicit_path() {
-        assert_eq!(configured_typescript_worker_executable(None).unwrap(), None);
-
-        let executable = env::temp_dir().join(format!(
+    fn typescript_worker_discovers_the_packaged_executable_or_override() {
+        let installed = env::temp_dir().join(format!(
             "beholder-worker-typescript-path-{}",
             std::process::id()
         ));
-        fs::write(&executable, "worker").unwrap();
         assert_eq!(
-            configured_typescript_worker_executable(Some(executable.clone())).unwrap(),
-            Some(executable.clone())
+            configured_typescript_worker_executable(None, installed.clone()).unwrap(),
+            None
         );
-        fs::remove_file(&executable).unwrap();
+
+        fs::write(&installed, "worker").unwrap();
+        assert_eq!(
+            configured_typescript_worker_executable(None, installed.clone()).unwrap(),
+            Some(installed.clone())
+        );
+        fs::remove_file(&installed).unwrap();
+
+        let configured = installed.with_extension("override");
+        fs::write(&configured, "worker").unwrap();
+        assert_eq!(
+            configured_typescript_worker_executable(Some(configured.clone()), installed.clone())
+                .unwrap(),
+            Some(configured.clone())
+        );
+        fs::remove_file(&configured).unwrap();
         assert!(
-            configured_typescript_worker_executable(Some(executable))
+            configured_typescript_worker_executable(Some(configured), installed)
                 .unwrap_err()
                 .to_string()
                 .contains("configured TypeScript analyzer worker not found")
