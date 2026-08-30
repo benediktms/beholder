@@ -1451,7 +1451,7 @@ pub fn resolve_workspace_calls(
             let sources = repository
                 .sources
                 .iter()
-                .map(|(path, analysis)| (path.as_path(), analysis))
+                .map(|(path, analysis)| (path.as_path(), analysis.as_ref()))
                 .collect::<Vec<_>>();
             let manifests = repository
                 .manifests

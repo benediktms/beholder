@@ -69,7 +69,7 @@ impl RepositoryEnricher<TypescriptLanguage> for TsProtoPlugin {
         let sources = repository
             .sources
             .iter()
-            .map(|(path, analysis)| (path.as_path(), analysis))
+            .map(|(path, analysis)| (path.as_path(), analysis.as_ref()))
             .collect::<Vec<_>>();
         let generated = ts_proto::grpc_methods(&repository.repository, &sources);
         Ok(RepositoryEnrichment {
@@ -145,7 +145,7 @@ impl RepositoryEnricher<TypescriptLanguage> for NestjsPlugin {
         let sources = repository
             .sources
             .iter()
-            .map(|(path, analysis)| (path.as_path(), analysis))
+            .map(|(path, analysis)| (path.as_path(), analysis.as_ref()))
             .collect::<Vec<_>>();
         let generated = ts_proto::grpc_methods(&repository.repository, &sources);
         let (grpc_bindings, diagnostics) = nestjs::bindings(
