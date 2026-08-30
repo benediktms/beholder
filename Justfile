@@ -71,6 +71,13 @@ graph-ui:
     mise exec -- pnpm --dir apps/graph-ui install --frozen-lockfile
     mise exec -- pnpm --dir apps/graph-ui tauri dev
 
+# Build and launch the optimized desktop graph prototype.
+[group('manual')]
+graph-ui-release:
+    mise exec -- pnpm --dir apps/graph-ui install --frozen-lockfile
+    mise exec -- pnpm --dir apps/graph-ui tauri build --no-bundle
+    ./target/release/beholder-graph-ui
+
 # Benchmark cold and unchanged indexing with a bounded worker count.
 [group('manual')]
 index-bench workers repositories:
