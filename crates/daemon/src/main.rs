@@ -426,49 +426,67 @@ fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
 
 #[cfg(not(test))]
 fn elixir_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
-    let configured = std::env::var_os(worker_environment_variable("elixir", "PATH"));
-    let executable = configured
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or(std::env::current_exe()?.with_file_name("beholder-worker-elixir"));
-    if executable.is_file() {
-        Ok(Some(executable))
-    } else if configured.is_some() {
-        Err(format!(
-            "configured Elixir analyzer worker not found at {}",
-            executable.display()
-        )
-        .into())
-    } else {
-        Ok(None)
-    }
+    optional_worker_executable("elixir", "Elixir")
 }
 
 #[cfg(not(test))]
 fn typescript_worker_executable() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
-    configured_typescript_worker_executable(
-        std::env::var_os(worker_environment_variable("typescript", "PATH"))
-            .map(std::path::PathBuf::from),
-        std::env::current_exe()?.with_file_name("beholder-worker-typescript"),
+    optional_worker_executable("typescript", "TypeScript")
+}
+
+#[cfg(not(test))]
+fn optional_worker_executable(
+    worker: &str,
+    display_name: &str,
+) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    let binary_name = format!("beholder-worker-{worker}");
+    configured_optional_worker_executable(
+        display_name,
+        std::env::var_os(worker_environment_variable(worker, "PATH")).map(std::path::PathBuf::from),
+        worker_sibling_candidates(
+            std::env::args_os().next(),
+            std::env::current_exe()?,
+            &binary_name,
+        ),
     )
 }
 
-fn configured_typescript_worker_executable(
-    configured: Option<std::path::PathBuf>,
-    installed: std::path::PathBuf,
-) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
-    let executable = configured.clone().unwrap_or(installed);
-    if executable.is_file() {
-        Ok(Some(executable))
-    } else if configured.is_some() {
-        Err(format!(
-            "configured TypeScript analyzer worker not found at {}",
-            executable.display()
-        )
-        .into())
-    } else {
-        Ok(None)
+fn worker_sibling_candidates(
+    invoked: Option<std::ffi::OsString>,
+    resolved: std::path::PathBuf,
+    binary_name: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(invoked) = invoked.map(std::path::PathBuf::from)
+        && invoked
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        candidates.push(invoked.with_file_name(binary_name));
     }
+    candidates.push(resolved.with_file_name(binary_name));
+    candidates
+}
+
+fn configured_optional_worker_executable(
+    display_name: &str,
+    configured: Option<std::path::PathBuf>,
+    installed: Vec<std::path::PathBuf>,
+) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    if let Some(executable) = configured {
+        return if executable.is_file() {
+            Ok(Some(executable))
+        } else {
+            Err(format!(
+                "configured {display_name} analyzer worker not found at {}",
+                executable.display()
+            )
+            .into())
+        };
+    }
+    Ok(installed
+        .into_iter()
+        .find(|executable| executable.is_file()))
 }
 
 #[cfg(test)]
@@ -490,37 +508,67 @@ mod tests {
     use std::{env, fs, path::Path, time::Duration};
 
     #[test]
-    fn typescript_worker_discovers_the_packaged_executable_or_override() {
-        let installed = env::temp_dir().join(format!(
-            "beholder-worker-typescript-path-{}",
-            std::process::id()
+    fn optional_worker_discovers_the_symlink_installation_or_override() {
+        let root = env::temp_dir().join(format!(
+            "beholder-worker-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
+        let installed_daemon = root.join("bin/beholderd");
+        let resolved_daemon = root.join("target/release/beholderd");
+        let installed_worker = installed_daemon.with_file_name("beholder-worker-typescript");
+        let resolved_worker = resolved_daemon.with_file_name("beholder-worker-typescript");
+        fs::create_dir_all(installed_daemon.parent().unwrap()).unwrap();
+        fs::create_dir_all(resolved_daemon.parent().unwrap()).unwrap();
+        let candidates = || {
+            worker_sibling_candidates(
+                Some(installed_daemon.clone().into_os_string()),
+                resolved_daemon.clone(),
+                "beholder-worker-typescript",
+            )
+        };
+
         assert_eq!(
-            configured_typescript_worker_executable(None, installed.clone()).unwrap(),
+            configured_optional_worker_executable("TypeScript", None, candidates()).unwrap(),
             None
         );
 
-        fs::write(&installed, "worker").unwrap();
+        fs::write(&installed_worker, "worker").unwrap();
         assert_eq!(
-            configured_typescript_worker_executable(None, installed.clone()).unwrap(),
-            Some(installed.clone())
+            configured_optional_worker_executable("TypeScript", None, candidates()).unwrap(),
+            Some(installed_worker.clone())
         );
-        fs::remove_file(&installed).unwrap();
+        fs::remove_file(&installed_worker).unwrap();
 
-        let configured = installed.with_extension("override");
+        fs::write(&resolved_worker, "worker").unwrap();
+        assert_eq!(
+            configured_optional_worker_executable("TypeScript", None, candidates()).unwrap(),
+            Some(resolved_worker)
+        );
+
+        let configured = root.join("override/beholder-worker-typescript");
+        fs::create_dir_all(configured.parent().unwrap()).unwrap();
         fs::write(&configured, "worker").unwrap();
         assert_eq!(
-            configured_typescript_worker_executable(Some(configured.clone()), installed.clone())
-                .unwrap(),
+            configured_optional_worker_executable(
+                "TypeScript",
+                Some(configured.clone()),
+                candidates()
+            )
+            .unwrap(),
             Some(configured.clone())
         );
         fs::remove_file(&configured).unwrap();
         assert!(
-            configured_typescript_worker_executable(Some(configured), installed)
+            configured_optional_worker_executable("TypeScript", Some(configured), candidates())
                 .unwrap_err()
                 .to_string()
                 .contains("configured TypeScript analyzer worker not found")
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     async fn wait_for_job(
