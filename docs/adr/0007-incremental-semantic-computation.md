@@ -238,6 +238,29 @@ contract; an unavailable or stale compiler snapshot does not. Compiler evidence
 is path-stable because exact line movement remains baseline evidence rather than
 part of reusable compiler identity.
 
+### TypeScript adoption
+
+The TypeScript frontend uses its content-addressed file cache as the parse and
+file-summary boundary and publishes source-owned fact shards. Repository call
+resolution and framework observations are retained in one bounded warm entry per
+repository and persisted by the same semantic key for restart reuse. The key
+includes position-free file semantics together with manifest, configuration,
+schema, analyzer, and active-plugin inputs. Comments, whitespace, and pure
+formatting therefore reuse repository semantic output while a changed call,
+module surface, configuration, schema, or plugin identity invalidates it.
+
+Workspace call resolution remains a separate computation over the selected
+repository outputs. The TypeScript compiler worker consumes the selected semantic
+candidates and shard-derived currentness inputs; a no-op edit does not start it.
+The generic repository cache aliases equal canonical output across raw source
+fingerprints, and Mnestic backdates an unchanged semantic publication with a
+metadata-only currentness transaction. Neither path reconstructs a graph revision
+for formatting-only source changes.
+
+This does not yet make genuine TypeScript semantic changes file-incremental:
+changing the repository semantic key still recomputes repository call resolution.
+Module- and symbol-level propagation remains the next TypeScript frontend slice.
+
 ## Consequences
 
 - Ordinary edits no longer imply repository-wide semantic recomputation or
