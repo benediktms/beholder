@@ -21,8 +21,8 @@ mod worker;
 mod workspace;
 
 pub use worker::{
-    WorkspaceSnapshotBuilder, analyze_events, analyze_requests, contribution_from_events,
-    descriptor_from_wire, descriptor_to_wire, workspace_snapshot,
+    ContributionAccumulator, WorkspaceSnapshotBuilder, analyze_events, analyze_requests,
+    contribution_from_events, descriptor_from_wire, descriptor_to_wire, workspace_snapshot,
 };
 
 #[cfg(test)]

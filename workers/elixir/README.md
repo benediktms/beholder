@@ -12,6 +12,11 @@ source, Mix manifests, lockfiles and compile-time configuration are not used. Th
 child VM inherits `MIX_HOME` and `HEX_HOME`, including configured private Hex
 repositories, while dependency sources remain in Beholder's cache.
 
+Inventory-provided content hashes let the worker rewrite only changed files in
+that isolated workspace. A persistent worker keeps compiler events as compressed
+per-source shards and atomically persists the same shards for restart reuse, so
+warm edits do not decode, rebuild, or remap the complete repository trace.
+
 When `OTEL_EXPORTER_OTLP_ENDPOINT` or
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is configured, the worker exports OTLP/HTTP
 traces as `beholder-worker-elixir`. It extracts W3C trace context from the local

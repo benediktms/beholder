@@ -2,6 +2,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @moduledoc false
 
   alias Beholder.Worker.Elixir.Compiler.BeamExporter
+  alias Beholder.Worker.Elixir.Compiler.TraceCache
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
   @default_timeout_ms 900_000
@@ -9,7 +10,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @termination_grace_ms 1_000
   @process_group_pid_retries 100
   @process_group_pid_retry_ms 10
-  @trace_cache_version 1
+  @materialization_manifest_version 1
   @dependency_progress "BEHOLDER_PROGRESS dependency_preparation"
   @compilation_progress "BEHOLDER_PROGRESS project_compilation"
 
@@ -17,6 +18,10 @@ defmodule Beholder.Worker.Elixir.Compiler do
           status: :ok | :error,
           diagnostics: [map()],
           events: [map()],
+          events_complete?: boolean(),
+          changed_events: [map()],
+          changed_files: [String.t()],
+          traced_files: [String.t()],
           elixir_version: String.t(),
           otp_release: String.t(),
           output: String.t()
@@ -39,13 +44,25 @@ defmodule Beholder.Worker.Elixir.Compiler do
     original_repositories = [repository | contexts]
     working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)])
     materialization_root = Path.join(working_dir, "snapshot")
+    materialization_manifest = Path.join(working_dir, "snapshot-inputs.term")
 
     with {:ok, project_root} <- Repository.mix_project_root(repository),
-         {:ok, materialized_repositories} <-
-           materialize(original_repositories, materialization_root) do
+         {:ok, materialized_repositories, changed_inputs} <-
+           materialize(
+             original_repositories,
+             materialization_root,
+             materialization_manifest
+           ) do
       [repository | contexts] = materialized_repositories
 
-      case run_materialized(repository, contexts, cache_dir, project_root, on_progress) do
+      case run_materialized(
+             repository,
+             contexts,
+             changed_inputs,
+             cache_dir,
+             project_root,
+             on_progress
+           ) do
         {:ok, result} ->
           {:ok, remap_result_paths(result, materialized_repositories, original_repositories)}
 
@@ -55,7 +72,14 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp run_materialized(repository, contexts, cache_dir, project_root, on_progress) do
+  defp run_materialized(
+         repository,
+         contexts,
+         changed_inputs,
+         cache_dir,
+         project_root,
+         on_progress
+       ) do
     repositories = [repository | contexts]
 
     with :ok <- validate_local_paths(repositories),
@@ -66,7 +90,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
       identity = build_identity(repositories, mix, mix_env)
       build_path = Path.join(working_dir, "build-#{identity}")
       trace_cache_path = Path.join(working_dir, "trace-cache-#{identity}.term")
-      trace_cache = read_trace_cache(trace_cache_path)
+      trace_cache_status = TraceCache.load(trace_cache_path)
       result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
       deps_path = Path.join(working_dir, "deps")
       File.mkdir_p!(deps_path)
@@ -77,7 +101,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
         {"MIX_DEPS_PATH", deps_path},
         {"MIX_ENV", mix_env},
         {"BEHOLDER_ELIXIR_FORCE_COMPILE",
-         if(match?({:ok, _cache}, trace_cache), do: "false", else: "true")},
+         if(trace_cache_status == :miss, do: "true", else: "false")},
         {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
       ]
 
@@ -98,8 +122,11 @@ defmodule Beholder.Worker.Elixir.Compiler do
           on_progress
         )
 
+      on_progress.("validating compiler result")
+
       with {:ok, result} <- finalize_run(repositories, result_path, result) do
-        {:ok, merge_trace_cache(result, repositories, trace_cache_path, trace_cache)}
+        on_progress.("merging compiler trace cache")
+        {:ok, merge_trace_cache(result, changed_inputs, trace_cache_path, trace_cache_status)}
       end
     end
   end
@@ -122,14 +149,17 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end)
   end
 
-  defp materialize(repositories, root) do
+  defp materialize(repositories, root, manifest_path) do
     with :ok <- File.mkdir_p(root),
          {:ok, root} <- physical_path(root),
          {:ok, common} <- common_repository_root(repositories),
          {:ok, materialized} <- map_materialized_repositories(repositories, common, root),
-         :ok <- remove_stale_inputs(root, materialized),
-         :ok <- materialize_inputs(materialized) do
-      {:ok, materialized}
+         previous = read_materialization_manifest(manifest_path),
+         identities = materialization_identities(materialized),
+         {:ok, removed} <- remove_stale_inputs(root, identities, previous),
+         {:ok, changed} <- materialize_inputs(materialized, previous),
+         :ok <- write_materialization_manifest(manifest_path, identities) do
+      {:ok, materialized, MapSet.union(removed, changed)}
     else
       {:error, reason} -> {:error, format_materialization_error(reason)}
     end
@@ -184,25 +214,31 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp materialize_inputs(repositories) do
-    Enum.reduce_while(repositories, :ok, fn repository, :ok ->
-      case materialize_repository_inputs(repository) do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
+  defp materialize_inputs(repositories, previous) do
+    Enum.reduce_while(repositories, {:ok, MapSet.new()}, fn repository, {:ok, changed} ->
+      case materialize_repository_inputs(repository, previous) do
+        {:ok, repository_changed} ->
+          {:cont, {:ok, MapSet.union(changed, repository_changed)}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
       end
     end)
   end
 
-  defp materialize_repository_inputs(repository) do
-    Enum.reduce_while(Repository.sorted_inputs(repository), :ok, fn input, :ok ->
+  defp materialize_repository_inputs(repository, previous) do
+    Enum.reduce_while(Repository.sorted_inputs(repository), {:ok, MapSet.new()}, fn input,
+                                                                                    {:ok, changed} ->
       destination = Path.expand(input.path, repository.base)
+      identity = input_identity(input)
 
       if Path.type(input.path) != :relative or not within?(destination, repository.base) do
         {:halt, {:error, "snapshot input escapes repository: #{input.path}"}}
       else
-        with :ok <- File.mkdir_p(Path.dirname(destination)),
-             :ok <- write_if_changed(destination, input.content) do
-          {:cont, :ok}
+        with {:ok, changed?} <-
+               write_if_changed(destination, input.content, identity, previous) do
+          changed = if changed?, do: MapSet.put(changed, destination), else: changed
+          {:cont, {:ok, changed}}
         else
           {:error, reason} -> {:halt, {:error, reason}}
         end
@@ -210,29 +246,102 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end)
   end
 
-  defp write_if_changed(path, content) do
-    if File.read(path) == {:ok, content}, do: :ok, else: File.write(path, content)
+  defp write_if_changed(path, content, identity, previous) when is_map(previous) do
+    if Map.get(previous, path) == identity do
+      {:ok, false}
+    else
+      write_input(path, content)
+    end
   end
 
-  defp remove_stale_inputs(root, repositories) do
-    expected =
-      repositories
-      |> Enum.flat_map(fn repository ->
-        Enum.map(Repository.sorted_inputs(repository), &Path.expand(&1.path, repository.base))
-      end)
-      |> MapSet.new()
+  defp write_if_changed(path, content, _identity, nil) do
+    if File.read(path) == {:ok, content},
+      do: {:ok, false},
+      else: write_input(path, content)
+  end
 
-    with :ok <-
-           root
-           |> files_under()
+  defp write_input(path, content) do
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(path, content) do
+      {:ok, true}
+    end
+  end
+
+  defp remove_stale_inputs(root, identities, previous) do
+    expected = Map.keys(identities) |> MapSet.new()
+
+    existing =
+      if is_map(previous),
+        do: Map.keys(previous),
+        else: files_under(root)
+
+    with {:ok, removed} <-
+           existing
            |> Enum.reject(&MapSet.member?(expected, &1))
-           |> Enum.reduce_while(:ok, fn path, :ok ->
+           |> Enum.reduce_while({:ok, MapSet.new()}, fn path, {:ok, removed} ->
              case File.rm(path) do
-               :ok -> {:cont, :ok}
+               :ok -> {:cont, {:ok, MapSet.put(removed, path)}}
                {:error, reason} -> {:halt, {:error, reason}}
              end
            end) do
-      remove_empty_directories(root)
+      if MapSet.size(removed) > 0, do: remove_empty_directories(root)
+      {:ok, removed}
+    end
+  end
+
+  defp materialization_identities(repositories) do
+    repositories
+    |> Enum.flat_map(fn repository ->
+      Enum.map(Repository.sorted_inputs(repository), fn input ->
+        {Path.expand(input.path, repository.base), input_identity(input)}
+      end)
+    end)
+    |> Map.new()
+  end
+
+  defp input_identity(input) do
+    content_hash =
+      Map.get_lazy(input, :content_hash, fn -> :crypto.hash(:sha256, input.content) end)
+
+    {input.kind, content_hash}
+  end
+
+  defp read_materialization_manifest(path) do
+    with {:ok, encoded} <- File.read(path),
+         %{version: @materialization_manifest_version, inputs: inputs} when is_map(inputs) <-
+           :erlang.binary_to_term(encoded, [:safe]),
+         true <-
+           Enum.all?(inputs, fn
+             {path, {kind, hash}} when is_binary(path) and is_atom(kind) and is_binary(hash) ->
+               true
+
+             _invalid_input ->
+               false
+           end) do
+      inputs
+    else
+      _missing_or_invalid -> nil
+    end
+  rescue
+    _invalid_manifest -> nil
+  end
+
+  defp write_materialization_manifest(path, inputs) do
+    temporary = "#{path}.#{System.unique_integer([:positive])}.tmp"
+
+    encoded =
+      :erlang.term_to_binary(%{
+        version: @materialization_manifest_version,
+        inputs: inputs
+      })
+
+    try do
+      with :ok <- File.write(temporary, encoded),
+           :ok <- File.rename(temporary, path) do
+        :ok
+      end
+    after
+      File.rm(temporary)
     end
   end
 
@@ -294,7 +403,11 @@ defmodule Beholder.Worker.Elixir.Compiler do
       |> Enum.sort_by(fn {materialized, _original} -> -String.length(materialized) end)
 
     result
+    |> Map.put(:trace_cache_bases, bases)
     |> Map.update(:events, [], &Enum.map(&1, fn event -> remap_file(event, bases) end))
+    |> Map.update(:changed_events, [], &Enum.map(&1, fn event -> remap_file(event, bases) end))
+    |> Map.update(:changed_files, [], &Enum.map(&1, fn path -> remap_path(path, bases) end))
+    |> Map.update(:traced_files, [], &Enum.map(&1, fn path -> remap_path(path, bases) end))
     |> Map.update(:diagnostics, [], fn diagnostics ->
       Enum.map(diagnostics, &remap_file(&1, bases))
     end)
@@ -419,81 +532,36 @@ defmodule Beholder.Worker.Elixir.Compiler do
     error -> {:error, "invalid compiler trace result: #{Exception.message(error)}"}
   end
 
-  defp merge_trace_cache(result, repositories, cache_path, trace_cache) do
-    fingerprints = input_fingerprints(repositories)
+  @doc false
+  def complete_events(%{events_complete?: true, events: events}), do: events
 
-    cached =
-      if match?({:ok, _cache}, trace_cache), do: elem(trace_cache, 1), else: empty_trace_cache()
+  def complete_events(%{
+        trace_cache_path: trace_cache_path,
+        trace_cache_bases: bases
+      }) do
+    trace_cache_path
+    |> TraceCache.all_events()
+    |> Enum.map(&remap_file(&1, bases))
+  end
 
-    invalidated =
-      Map.keys(fingerprints)
-      |> Kernel.++(Map.keys(cached.fingerprints))
-      |> Enum.filter(&(Map.get(fingerprints, &1) != Map.get(cached.fingerprints, &1)))
-      |> MapSet.new()
+  def complete_events(%{events: events}), do: events
 
-    invalidated = MapSet.union(invalidated, MapSet.new(result.events, & &1.file))
+  defp merge_trace_cache(result, changed_inputs, cache_path, trace_cache_status) do
+    changed_events = result.events
 
-    events =
-      cached.events
-      |> Enum.reject(&MapSet.member?(invalidated, &1.file))
-      |> Kernel.++(result.events)
-
-    result = %{result | events: events}
-
-    if result.status == :ok do
-      write_trace_cache(cache_path, %{fingerprints: fingerprints, events: events})
-    end
+    cache =
+      TraceCache.merge(
+        cache_path,
+        trace_cache_status,
+        changed_inputs,
+        changed_events,
+        result.status
+      )
 
     result
-  end
-
-  defp input_fingerprints(repositories) do
-    Map.new(repositories, fn repository ->
-      entries =
-        Map.new(Repository.sorted_inputs(repository), fn input ->
-          fingerprint = :erlang.term_to_binary({input.kind, input.content})
-          {Path.expand(input.path, repository.base), :crypto.hash(:sha256, fingerprint)}
-        end)
-
-      {repository.identity, entries}
-    end)
-    |> Enum.flat_map(fn {_repository, entries} -> entries end)
-    |> Map.new()
-  end
-
-  defp read_trace_cache(path) do
-    with {:ok, encoded} <- File.read(path),
-         %{version: @trace_cache_version, fingerprints: fingerprints, events: events}
-         when is_map(fingerprints) and is_list(events) <-
-           :erlang.binary_to_term(encoded, [:safe]) do
-      if Enum.all?(events, &(is_map(&1) and is_binary(&1[:file]))) do
-        {:ok, %{fingerprints: fingerprints, events: events}}
-      else
-        :error
-      end
-    else
-      _missing_or_invalid -> :error
-    end
-  rescue
-    _invalid_cache -> :error
-  end
-
-  defp empty_trace_cache, do: %{fingerprints: %{}, events: []}
-
-  defp write_trace_cache(path, cache) do
-    temporary = "#{path}.#{System.unique_integer([:positive])}.tmp"
-
-    encoded =
-      :erlang.term_to_binary(Map.put(cache, :version, @trace_cache_version), compressed: 6)
-
-    try do
-      with :ok <- File.write(temporary, encoded),
-           :ok <- File.rename(temporary, path) do
-        :ok
-      end
-    after
-      File.rm(temporary)
-    end
+    |> Map.merge(cache)
+    |> Map.put(:changed_events, changed_events)
+    |> Map.put(:trace_cache_path, cache_path)
   end
 
   defp append_code_path(nil, path), do: "-pa #{path}"

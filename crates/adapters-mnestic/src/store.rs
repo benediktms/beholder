@@ -59,13 +59,14 @@ pub struct SemanticStore {
     engine: Mutex<()>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct EnrichmentPayload<'a> {
     pub entities: &'a [EntityFact],
     pub observations: &'a [Observation],
     pub overrides: &'a [DependencyOverride],
     pub diagnostics: &'a [(String, AnalysisDiagnostic)],
     pub diagnostic_replacements: &'a [(String, String)],
+    pub fact_shards: &'a [FactShard],
 }
 
 #[derive(Clone, Copy)]

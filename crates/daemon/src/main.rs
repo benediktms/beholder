@@ -274,7 +274,8 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "20:10:elixir-compiler:15")
+        .identity(ELIXIR_WORKER_ID, "20:10:elixir-compiler:17")
+        .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
         .accept_extension("ex")

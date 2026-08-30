@@ -209,6 +209,7 @@ defmodule Beholder.Worker.V1.RepositoryInput do
   field :path, 2, type: :string
   field :content, 3, type: :bytes
   field :kind, 4, type: Beholder.Worker.V1.InputKind, enum: true
+  field :content_hash, 5, type: :bytes, json_name: "contentHash"
 end
 
 defmodule Beholder.Worker.V1.AnalysisFinish do
@@ -370,6 +371,23 @@ defmodule Beholder.Worker.V1.RepositoryContribution do
     repeated: true,
     type: :string,
     json_name: "replacedDiagnosticCodes"
+
+  field :fact_shards, 8,
+    repeated: true,
+    type: Beholder.Worker.V1.FactShard,
+    json_name: "factShards"
+end
+
+defmodule Beholder.Worker.V1.FactShard do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :repository, 1, type: :string
+  field :producer, 2, type: :string
+  field :owner, 3, type: :string
+  field :version, 4, type: :string
+  field :entities, 5, repeated: true, type: Beholder.Worker.V1.EntityFact
+  field :observations, 6, repeated: true, type: Beholder.Worker.V1.Observation
 end
 
 defmodule Beholder.Worker.V1.EntityFact do

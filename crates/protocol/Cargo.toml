@@ -8,6 +8,7 @@ beholder-domain.workspace = true
 beholder-dto.workspace = true
 beholder-indexing.workspace = true
 prost = "0.14.4"
+sha2 = "0.10.9"
 tonic.workspace = true
 tonic-prost = "0.14.6"
 

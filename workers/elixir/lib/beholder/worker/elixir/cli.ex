@@ -34,6 +34,8 @@ defmodule Beholder.Worker.Elixir.CLI do
 
   defp configure(cache_dir) do
     File.mkdir_p!(cache_dir)
+    Beholder.Worker.Elixir.Compiler.TraceCache.start_cache()
+    Beholder.Worker.Elixir.EventMapper.start_cache()
     Application.put_env(:beholder_worker_elixir, :cache_dir, cache_dir)
     :ok
   end

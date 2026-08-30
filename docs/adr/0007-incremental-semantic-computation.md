@@ -221,6 +221,15 @@ source identity.
 
 The Elixir compiler worker consumes selected Elixir shards plus dependency,
 configuration, standard Mix `priv/` resources, toolchain, and environment inputs.
+A worker input carries its inventory-owned content hash, allowing the isolated
+compiler snapshot to persist a path-to-input manifest and rewrite only changed
+files without rereading the complete materialized repository. The persistent
+worker owns a warm trace cache of compressed per-source event shards. Ordinary
+edits replace only invalidated event shards and pass only changed events to the
+semantic mapper; the complete event set is decoded only on a cold worker or when
+an interface change requires repository-wide re-resolution. The same shards are
+persisted atomically for restart reuse.
+
 A no-op source edit therefore keeps the selected compiler snapshot current
 without starting the worker. A successful compiler snapshot with no error
 diagnostics replaces the baseline

@@ -101,6 +101,7 @@ message RepositoryInput {
   string path = 2;
   bytes content = 3;
   InputKind kind = 4;
+  bytes content_hash = 5;
 }
 
 message AnalysisFinish {}
@@ -208,6 +209,16 @@ message RepositoryContribution {
   repeated Observation observations = 5;
   repeated AnalysisDiagnostic diagnostics = 6;
   repeated string replaced_diagnostic_codes = 7;
+  repeated FactShard fact_shards = 8;
+}
+
+message FactShard {
+  string repository = 1;
+  string producer = 2;
+  string owner = 3;
+  string version = 4;
+  repeated EntityFact entities = 5;
+  repeated Observation observations = 6;
 }
 
 enum AnalysisCompleteness {

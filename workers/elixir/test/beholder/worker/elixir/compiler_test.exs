@@ -2,7 +2,35 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   use ExUnit.Case, async: false
 
   alias Beholder.Worker.Elixir.Compiler
+  alias Beholder.Worker.Elixir.Compiler.Collector
+  alias Beholder.Worker.Elixir.Compiler.TraceCache
   alias Beholder.Worker.Elixir.Snapshot.Repository
+
+  test "deduplicates trace events at published semantic granularity" do
+    start_supervised!(Collector)
+
+    event = %{
+      kind: :remote_function,
+      file: "/tmp/example/lib/example.ex",
+      line: 2,
+      column: 5,
+      caller_module: "Example",
+      caller_function: {"call", 0},
+      from_macro: false,
+      target: "Target",
+      name: "run",
+      arity: 0
+    }
+
+    assert :ok = Collector.record(event)
+    assert :ok = Collector.record(%{event | line: 20, column: 9})
+    assert :ok = Collector.record(%{event | target: "Other"})
+
+    assert ["Other", "Target"] ==
+             Collector.drain()
+             |> Enum.map(& &1.target)
+             |> Enum.sort()
+  end
 
   test "compiles a Mix project and returns trace events from a warm build" do
     root = temp_dir("project")
@@ -55,16 +83,21 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert {:ok, second} = Compiler.run(repository, cache)
     assert second.status == :ok, inspect(second)
 
-    assert Enum.any?(second.events, fn event ->
+    assert second.events == []
+    refute second.events_complete?
+    complete_events = Compiler.complete_events(second)
+
+    assert Enum.any?(complete_events, fn event ->
              event.kind == :module and {"call", 1} in event.definitions
            end)
 
-    assert Enum.any?(second.events, &(&1.kind == :remote_function and &1.target == "Enum"))
+    assert Enum.any?(complete_events, &(&1.kind == :remote_function and &1.target == "Enum"))
 
     [trace_cache] =
       Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "trace-cache-*.term"]))
 
     File.write!(trace_cache, "invalid")
+    TraceCache.clear()
     assert {:ok, rebuilt} = Compiler.run(repository, cache)
     assert rebuilt.status == :ok
     assert rebuilt.output =~ "Compiling 1 file"
@@ -116,7 +149,12 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert second.status == :ok
     assert second.output =~ "Compiling 1 file"
 
-    assert Enum.any?(second.events, fn event ->
+    refute Enum.any?(second.events, fn event ->
+             event.kind == :module and event.target == "IncrementalFixture.Unchanged" and
+               {"call", 0} in event.definitions
+           end)
+
+    assert Enum.any?(Compiler.complete_events(second), fn event ->
              event.kind == :module and event.target == "IncrementalFixture.Unchanged" and
                {"call", 0} in event.definitions
            end)
@@ -125,6 +163,9 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              event.kind == :module and event.target == "IncrementalFixture.Changed" and
                {"second", 0} in event.definitions
            end)
+
+    assert Enum.any?(second.changed_events, &(&1[:target] == "IncrementalFixture.Changed"))
+    refute Enum.any?(second.changed_events, &(&1[:target] == "IncrementalFixture.Unchanged"))
 
     repository = %{
       repository

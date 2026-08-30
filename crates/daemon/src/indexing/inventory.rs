@@ -843,6 +843,7 @@ mod tests {
             vec!["init"],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Beholder Test"],
+            vec!["config", "commit.gpgsign", "false"],
             vec!["add", "."],
             vec!["commit", "-m", "first"],
         ] {

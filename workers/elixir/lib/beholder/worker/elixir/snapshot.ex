@@ -95,7 +95,18 @@ defmodule Beholder.Worker.Elixir.Snapshot do
   defp push(snapshot, %AnalyzeRequest{request: {:input, input}}) do
     case Map.fetch(snapshot.repositories, input.repository) do
       {:ok, repository} ->
-        input = %{path: input.path, content: input.content, kind: input.kind}
+        content_hash =
+          if byte_size(input.content_hash) == 32,
+            do: input.content_hash,
+            else: :crypto.hash(:sha256, input.content)
+
+        input = %{
+          path: input.path,
+          content: input.content,
+          content_hash: content_hash,
+          kind: input.kind
+        }
+
         repository = %{repository | inputs: [input | repository.inputs]}
         {:ok, put_in(snapshot.repositories[repository.identity], repository)}
 

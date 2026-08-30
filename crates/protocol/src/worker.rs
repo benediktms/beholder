@@ -1,7 +1,7 @@
 use crate::{v1, worker_v1 as wire};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, CandidateOverride, Confidence,
-    DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata,
+    DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactShard,
     GraphqlOperationKind, GraphqlTypeKind, GrpcBindingCandidate, GrpcBindingRole,
     LogicalRepository, Observation, ProtoTypeKind, Provenance, RepositoryState, RpcCardinality,
     SemanticCandidate, SemanticRelation, SourcePosition, SourceSpan, StructuralRelation,
@@ -12,6 +12,7 @@ use beholder_indexing::{
     PluginInputScope, PluginInputSelector, PluginPathMatcher, RepositoryContribution,
     RepositoryInput, RepositorySnapshot, SemanticSnapshot, WorkspaceSnapshot,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -52,6 +53,7 @@ pub fn analyze_requests(snapshot: EnrichmentSnapshot) -> Result<Vec<wire::Analyz
                             repository: identity.clone(),
                             path: input.path.to_string_lossy().into_owned(),
                             content: input.content.to_vec(),
+                            content_hash: Sha256::digest(input.content.as_ref()).to_vec(),
                             kind: match input.kind {
                                 InputKind::Source => wire::InputKind::Source as i32,
                                 InputKind::ProtobufDescriptor => {
@@ -464,17 +466,19 @@ pub fn analyze_events(
     Ok(events)
 }
 
-pub fn contribution_from_events(
-    events: impl IntoIterator<Item = wire::AnalyzeEvent>,
-) -> Result<AnalyzerContribution, String> {
-    let mut repositories = Vec::<RepositoryContribution>::new();
-    let mut overrides = Vec::new();
-    let mut candidate_overrides = Vec::new();
-    let mut graphql_resolvers = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut completed = None;
-    for event in events {
-        if completed.is_some() {
+#[derive(Default)]
+pub struct ContributionAccumulator {
+    repositories: Vec<RepositoryContribution>,
+    overrides: Vec<DependencyOverride>,
+    candidate_overrides: Vec<CandidateOverride>,
+    graphql_resolvers: Vec<GraphqlResolverCandidate>,
+    diagnostics: Vec<(String, AnalysisDiagnostic)>,
+    completed: Option<wire::AnalysisCompleted>,
+}
+
+impl ContributionAccumulator {
+    pub fn push(&mut self, event: wire::AnalyzeEvent) -> Result<(), String> {
+        if self.completed.is_some() {
             return Err("worker event followed analysis completion".into());
         }
         match event.event.ok_or("worker event is empty")? {
@@ -490,7 +494,8 @@ pub fn contribution_from_events(
             }
             wire::analyze_event::Event::Repository(repository) => {
                 let mut chunk = repository_from_wire(repository)?;
-                if let Some(repository) = repositories
+                if let Some(repository) = self
+                    .repositories
                     .iter_mut()
                     .find(|repository| repository.repository == chunk.repository)
                 {
@@ -504,12 +509,27 @@ pub fn contribution_from_events(
                     repository
                         .replaced_diagnostic_codes
                         .append(&mut chunk.replaced_diagnostic_codes);
+                    for mut shard in chunk.fact_shards {
+                        if let Some(existing) = repository.fact_shards.iter_mut().find(|existing| {
+                            existing.repository == shard.repository
+                                && existing.producer == shard.producer
+                                && existing.owner == shard.owner
+                        }) {
+                            if existing.version != shard.version {
+                                return Err("worker fact shard chunks disagree on version".into());
+                            }
+                            existing.entities.append(&mut shard.entities);
+                            existing.observations.append(&mut shard.observations);
+                        } else {
+                            repository.fact_shards.push(shard);
+                        }
+                    }
                 } else {
-                    repositories.push(chunk);
+                    self.repositories.push(chunk);
                 }
             }
             wire::analyze_event::Event::Completed(value) => {
-                if completed.replace(value).is_some() {
+                if self.completed.replace(value).is_some() {
                     return Err("worker completed more than once".into());
                 }
             }
@@ -517,76 +537,87 @@ pub fn contribution_from_events(
                 return Err(format!("{}: {}", failure.code, failure.message));
             }
             wire::analyze_event::Event::Contribution(contribution) => {
-                overrides.extend(
-                    contribution
-                        .overrides
-                        .into_iter()
-                        .map(override_from_wire)
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                candidate_overrides.extend(contribution.candidate_overrides.into_iter().map(
-                    |override_| CandidateOverride {
-                        candidate_id: override_.candidate_id,
-                        resolved_to: override_.resolved_to.into(),
-                        evidence: override_.evidence.into(),
-                    },
-                ));
-                graphql_resolvers.extend(contribution.graphql_resolvers.into_iter().map(
-                    |resolver| GraphqlResolverCandidate {
-                        repository: resolver.repository,
-                        field: resolver.field,
-                        parent: resolver.parent,
-                        resolver: resolver.resolver.into(),
-                        evidence: resolver.evidence.into(),
-                    },
-                ));
-                diagnostics.extend(
-                    contribution
-                        .diagnostics
-                        .into_iter()
-                        .map(|diagnostic| {
-                            Ok((
-                                diagnostic.repository,
-                                diagnostic_from_wire(
-                                    diagnostic
-                                        .diagnostic
-                                        .ok_or("worker diagnostic is missing")?,
-                                )?,
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?,
-                );
+                for r#override in contribution.overrides {
+                    self.overrides.push(override_from_wire(r#override)?);
+                }
+                self.candidate_overrides
+                    .extend(
+                        contribution
+                            .candidate_overrides
+                            .into_iter()
+                            .map(|override_| CandidateOverride {
+                                candidate_id: override_.candidate_id,
+                                resolved_to: override_.resolved_to.into(),
+                                evidence: override_.evidence.into(),
+                            }),
+                    );
+                self.graphql_resolvers
+                    .extend(contribution.graphql_resolvers.into_iter().map(|resolver| {
+                        GraphqlResolverCandidate {
+                            repository: resolver.repository,
+                            field: resolver.field,
+                            parent: resolver.parent,
+                            resolver: resolver.resolver.into(),
+                            evidence: resolver.evidence.into(),
+                        }
+                    }));
+                for diagnostic in contribution.diagnostics {
+                    self.diagnostics.push((
+                        diagnostic.repository,
+                        diagnostic_from_wire(
+                            diagnostic
+                                .diagnostic
+                                .ok_or("worker diagnostic is missing")?,
+                        )?,
+                    ));
+                }
             }
         }
+        Ok(())
     }
-    let completed = completed.ok_or("worker stream ended without completion")?;
-    let metadata = completed.metadata.ok_or("worker metadata is missing")?;
-    let cache = completed
-        .cache
-        .ok_or("worker cache statistics are missing")?;
-    Ok(AnalyzerContribution {
-        metadata: AnalyzerMetadata {
-            id: metadata.id,
-            version: metadata.version,
-        },
-        active_repositories: completed.active_repositories,
-        repositories,
-        overrides,
-        candidate_overrides,
-        graphql_resolvers,
-        diagnostics,
-        cache: CacheStatistics {
-            memory_hits: cache
-                .memory_hits
-                .try_into()
-                .map_err(|_| "cache hit overflow")?,
-            disk_hits: cache
-                .disk_hits
-                .try_into()
-                .map_err(|_| "cache hit overflow")?,
-            misses: cache.misses.try_into().map_err(|_| "cache miss overflow")?,
-        },
-    })
+
+    pub fn finish(self) -> Result<AnalyzerContribution, String> {
+        let completed = self
+            .completed
+            .ok_or("worker stream ended without completion")?;
+        let metadata = completed.metadata.ok_or("worker metadata is missing")?;
+        let cache = completed
+            .cache
+            .ok_or("worker cache statistics are missing")?;
+        Ok(AnalyzerContribution {
+            metadata: AnalyzerMetadata {
+                id: metadata.id,
+                version: metadata.version,
+            },
+            active_repositories: completed.active_repositories,
+            repositories: self.repositories,
+            overrides: self.overrides,
+            candidate_overrides: self.candidate_overrides,
+            graphql_resolvers: self.graphql_resolvers,
+            diagnostics: self.diagnostics,
+            cache: CacheStatistics {
+                memory_hits: cache
+                    .memory_hits
+                    .try_into()
+                    .map_err(|_| "cache hit overflow")?,
+                disk_hits: cache
+                    .disk_hits
+                    .try_into()
+                    .map_err(|_| "cache hit overflow")?,
+                misses: cache.misses.try_into().map_err(|_| "cache miss overflow")?,
+            },
+        })
+    }
+}
+
+pub fn contribution_from_events(
+    events: impl IntoIterator<Item = wire::AnalyzeEvent>,
+) -> Result<AnalyzerContribution, String> {
+    let mut accumulator = ContributionAccumulator::default();
+    for event in events {
+        accumulator.push(event)?;
+    }
+    accumulator.finish()
 }
 
 fn analysis_contribution_events(
@@ -662,6 +693,7 @@ fn repository_events(
     let mut observations = repository.observations.into_iter().peekable();
     let mut diagnostics = repository.diagnostics.into_iter().peekable();
     let mut replaced_diagnostic_codes = repository.replaced_diagnostic_codes.into_iter().peekable();
+    let mut fact_shards = repository.fact_shards.into_iter().peekable();
     let mut events = Vec::new();
     loop {
         events.push(wire::AnalyzeEvent {
@@ -686,6 +718,10 @@ fn repository_events(
                         .by_ref()
                         .take(CONTRIBUTION_CHUNK_ITEMS)
                         .collect(),
+                    fact_shards: fact_shards
+                        .by_ref()
+                        .take(CONTRIBUTION_CHUNK_ITEMS)
+                        .collect(),
                 },
             )),
         });
@@ -694,6 +730,7 @@ fn repository_events(
             && observations.peek().is_none()
             && diagnostics.peek().is_none()
             && replaced_diagnostic_codes.peek().is_none()
+            && fact_shards.peek().is_none()
         {
             break;
         }
@@ -731,6 +768,11 @@ fn repository_to_wire(
             .map(diagnostic_to_wire)
             .collect(),
         replaced_diagnostic_codes: repository.replaced_diagnostic_codes.into_iter().collect(),
+        fact_shards: repository
+            .fact_shards
+            .into_iter()
+            .map(fact_shard_to_wire)
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -753,7 +795,11 @@ fn repository_from_wire(
             .into_iter()
             .map(entity_from_wire)
             .collect::<Result<_, _>>()?,
-        fact_shards: Vec::new(),
+        fact_shards: repository
+            .fact_shards
+            .into_iter()
+            .map(fact_shard_from_wire)
+            .collect::<Result<_, _>>()?,
         grpc_bindings: repository
             .grpc_bindings
             .into_iter()
@@ -825,6 +871,44 @@ fn candidate_from_wire(value: wire::SemanticCandidate) -> Result<SemanticCandida
             },
         },
         evidence: value.evidence.into(),
+    })
+}
+
+fn fact_shard_to_wire(shard: FactShard) -> Result<wire::FactShard, String> {
+    Ok(wire::FactShard {
+        repository: shard.repository,
+        producer: shard.producer,
+        owner: shard.owner.to_string(),
+        version: shard.version,
+        entities: shard
+            .entities
+            .into_iter()
+            .map(entity_to_wire)
+            .collect::<Result<_, _>>()?,
+        observations: shard
+            .observations
+            .into_iter()
+            .map(observation_to_wire)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn fact_shard_from_wire(shard: wire::FactShard) -> Result<FactShard, String> {
+    Ok(FactShard {
+        repository: shard.repository,
+        producer: shard.producer,
+        owner: shard.owner.into(),
+        version: shard.version,
+        entities: shard
+            .entities
+            .into_iter()
+            .map(entity_from_wire)
+            .collect::<Result<_, _>>()?,
+        observations: shard
+            .observations
+            .into_iter()
+            .map(observation_from_wire)
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -1319,7 +1403,26 @@ mod tests {
                 semantic_candidates: Vec::new(),
                 diagnostics: Vec::new(),
                 replaced_diagnostic_codes: BTreeSet::from(["syntax.unresolved".into()]),
-                fact_shards: Vec::new(),
+                fact_shards: vec![FactShard {
+                    repository: "example/repo".into(),
+                    producer: "rust".into(),
+                    owner: "repo://example/repo/rust/src/lib.rs".into(),
+                    version: "source-v1".into(),
+                    entities: vec![
+                        EntityFact::new(
+                            "repo://example/repo/rust/lib",
+                            EntityKind::Namespace,
+                            None,
+                        )
+                        .unwrap(),
+                    ],
+                    observations: vec![Observation::dependency(
+                        "repo://example/repo/rust/lib",
+                        DependencyRelation::Calls,
+                        "rust-call://target",
+                        "src/lib.rs:1",
+                    )],
+                }],
             }],
             overrides: (0..5_000)
                 .map(|index| DependencyOverride {
