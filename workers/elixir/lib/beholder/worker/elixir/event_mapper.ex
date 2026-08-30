@@ -113,10 +113,18 @@ defmodule Beholder.Worker.Elixir.EventMapper do
           {definitions(repository, events, source_paths), events, source_paths}
 
         cached ->
+          removed_paths =
+            cached.shards
+            |> Map.keys()
+            |> Enum.reject(&MapSet.member?(source_paths, &1))
+            |> MapSet.new()
+
+          invalidated_paths = MapSet.union(changed_paths, removed_paths)
+
           definitions =
             cached.definitions
             |> Enum.reject(fn {_module, {path, _functions}} ->
-              MapSet.member?(changed_paths, path)
+              MapSet.member?(invalidated_paths, path)
             end)
             |> Map.new()
             |> Map.merge(definitions(repository, changed_events, source_paths))
@@ -131,16 +139,11 @@ defmodule Beholder.Worker.Elixir.EventMapper do
                 Map.get(cached.definition_fingerprints, module)
             end)
 
-          removed_paths =
-            cached.shards
-            |> Map.keys()
-            |> Enum.reject(&MapSet.member?(source_paths, &1))
-            |> MapSet.new()
-
           if interface_changed do
-            {definitions, Compiler.complete_events(result), source_paths}
+            {definitions, Compiler.complete_events(result),
+             MapSet.union(source_paths, removed_paths)}
           else
-            {definitions, changed_events, MapSet.union(changed_paths, removed_paths)}
+            {definitions, changed_events, invalidated_paths}
           end
       end
 

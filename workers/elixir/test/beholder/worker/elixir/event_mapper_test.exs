@@ -188,6 +188,28 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
       })
 
     assert shard_observation_target(contribution, "lib/b.ex") == "elixir-call://A/run/0"
+
+    EventMapper.contribution(repository, %{
+      status: :ok,
+      diagnostics: [],
+      changed_files: ["/tmp/cached-example/lib/a.ex"],
+      changed_events: [module_a],
+      events: [module_a, module_b, call_a]
+    })
+
+    repository_without_a = %{repository | inputs: [List.last(repository.inputs)]}
+
+    contribution =
+      EventMapper.contribution(repository_without_a, %{
+        status: :ok,
+        diagnostics: [],
+        changed_files: ["/tmp/cached-example/lib/a.ex"],
+        changed_events: [],
+        events: [module_b, call_a]
+      })
+
+    assert shard_observation_target(contribution, "lib/b.ex") == "elixir-call://A/run/0"
+    refute Enum.any?(contribution.fact_shards, &String.ends_with?(&1.owner, "lib/a.ex"))
   end
 
   defp shard_observation_target(contribution, path) do
