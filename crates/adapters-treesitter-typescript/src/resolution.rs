@@ -344,6 +344,7 @@ fn imported_file(
 
 struct RepositoryIndex<'a> {
     files: BTreeMap<PathBuf, &'a TypescriptAnalysis>,
+    symbols: BTreeMap<(PathBuf, String), EntityId>,
     packages: BTreeMap<String, Package>,
     aliases: Vec<PathAliases>,
     exports: BTreeMap<(PathBuf, String), EntityId>,
@@ -352,6 +353,7 @@ struct RepositoryIndex<'a> {
     bases: BTreeMap<(PathBuf, String), (PathBuf, String)>,
     field_types: BTreeMap<(PathBuf, String, String), (PathBuf, String)>,
     return_types: BTreeMap<(PathBuf, String), (PathBuf, String)>,
+    callback_returns: BTreeSet<(PathBuf, String)>,
     caller_files: BTreeMap<String, PathBuf>,
     caller_owners: BTreeMap<String, (PathBuf, String)>,
     caller_bindings: BTreeMap<String, &'a [Binding]>,
@@ -707,6 +709,7 @@ fn repository_index<'a>(
     let mut raw_bases = BTreeMap::<(PathBuf, String), String>::new();
     let mut raw_field_types = BTreeMap::<(PathBuf, String, String), String>::new();
     let mut raw_return_types = BTreeMap::<(PathBuf, String), String>::new();
+    let mut callback_returns = BTreeSet::new();
     let mut factories = BTreeMap::<(PathBuf, String), String>::new();
     let mut caller_files = BTreeMap::<String, PathBuf>::new();
     let mut caller_owners = BTreeMap::<String, (PathBuf, String)>::new();
@@ -743,7 +746,7 @@ fn repository_index<'a>(
                 let key = ((*path).to_path_buf(), definition.qualified_name.clone());
                 symbols.insert(key.clone(), EntityId::from(id.clone()));
                 if definition.exported {
-                    insert_origin(&mut origins, &mut origins_by_file, key.clone(), key);
+                    insert_origin(&mut origins, &mut origins_by_file, key.clone(), key.clone());
                 }
                 if let Some(factory) = &definition.factory {
                     factories.insert(
@@ -775,6 +778,9 @@ fn repository_index<'a>(
                         return_type.clone(),
                     );
                 }
+                if definition.callback_return_type.is_some() {
+                    callback_returns.insert(key.clone());
+                }
             }
             if let Some((namespace, member)) = definition.qualified_name.rsplit_once('/')
                 && member_owners.contains(&namespace)
@@ -788,11 +794,13 @@ fn repository_index<'a>(
                     EntityId::from(id.clone()),
                 );
             }
-            if definition.kind == DefinitionKind::Callable {
+            if definition.kind == DefinitionKind::Callable || !definition.calls.is_empty() {
                 caller_files.insert(id.clone(), (*path).to_path_buf());
                 caller_bindings.insert(id.clone(), &definition.bindings);
                 caller_alias_bindings.insert(id.clone(), &definition.alias_bindings);
-                caller_factory_bindings.insert(id, &definition.factory_bindings);
+                caller_factory_bindings.insert(id.clone(), &definition.factory_bindings);
+            }
+            if definition.kind == DefinitionKind::Callable {
                 if let Some((owner, member)) = definition.qualified_name.rsplit_once('/')
                     && !member.contains('/')
                     && member_owners.contains(&owner)
@@ -1028,6 +1036,7 @@ fn repository_index<'a>(
 
     RepositoryIndex {
         files,
+        symbols,
         packages,
         aliases,
         exports,
@@ -1036,6 +1045,7 @@ fn repository_index<'a>(
         bases,
         field_types,
         return_types,
+        callback_returns,
         caller_files,
         caller_owners,
         caller_bindings,
@@ -1217,6 +1227,29 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             .get(caller_file)
             .copied()
             .unwrap_or_default();
+        let returned = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-returned://")
+            .or_else(|| {
+                observation
+                    .to
+                    .as_str()
+                    .strip_prefix("javascript-returned://")
+            })
+            .and_then(|target| target.split_once('/'));
+        if let Some((argument, _method)) = returned {
+            let origin = imported_origin(index, caller_file, argument)
+                .or_else(|| Some((caller_file.clone(), argument.to_owned())))
+                .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
+            if let Some(origin) = origin.filter(|origin| index.callback_returns.contains(origin))
+                && let Some(target) = index.symbols.get(&origin)
+            {
+                observation.to = target.clone();
+                observation.confidence = Confidence::Inferred;
+            }
+            continue;
+        }
         let direct = observation
             .to
             .as_str()
@@ -1716,6 +1749,58 @@ mod tests {
         assert!(observations.iter().any(|observation| {
             observation.to.as_str() == format!("typescript-method://{receiver}/execute")
         }));
+    }
+
+    #[test]
+    fn resolves_a_loader_returned_by_a_callback_factory() {
+        let sources = [
+            (
+                Path::new("src/loader.ts"),
+                "export class Client { fetch() {} } const client = new Client(); export const loader = createContext(() => new Loader(async () => client.fetch()));",
+            ),
+            (
+                Path::new("src/entry.ts"),
+                "import { loader } from './loader'; export function entry(context: Context) { return context.get(loader).load('key'); }",
+            ),
+        ];
+        let analyses = sources
+            .iter()
+            .map(|(path, source)| {
+                (
+                    *path,
+                    *source,
+                    analyze(source, SourceLanguage::TypeScript).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut observations = analyses
+            .iter()
+            .flat_map(|(path, source, analysis)| {
+                observations_from_analysis("example", analysis, source, path)
+            })
+            .collect::<Vec<_>>();
+        let indexed = analyses
+            .iter()
+            .map(|(path, _, analysis)| (*path, analysis))
+            .collect::<Vec<_>>();
+
+        resolve_repository_calls("example", &mut observations, &indexed, &[], &[]);
+
+        let edges = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| (observation.from.as_str(), observation.to.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/entry",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/loader",
+            "repo://example/typescript/src/loader/Client/fetch",
+        )));
     }
 
     #[test]

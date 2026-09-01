@@ -1,7 +1,9 @@
 use super::model::*;
 use super::plugin::{ElixirLanguage, built_in_plugins};
 use beholder_adapters_treesitter::recover;
-use beholder_domain::{DependencyRelation, Observation, Provenance, UnsafeTreeRecovery};
+use beholder_domain::{
+    Confidence, DependencyRelation, Observation, Provenance, UnsafeTreeRecovery,
+};
 use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -157,28 +159,59 @@ fn piped_argument(node: Node<'_>, source: &[u8]) -> usize {
 
 fn parsed_call(node: Node<'_>, source: &[u8]) -> Option<ElixirCall> {
     let target = node.child_by_field_name("target")?;
-    let (module, name) = match target.kind() {
-        "identifier" => (None, text(target, source)?.to_owned()),
+    let (module, name, dynamic_struct) = match target.kind() {
+        "identifier" => (None, text(target, source)?.to_owned(), false),
         "dot" => {
             let left = target.child_by_field_name("left")?;
             let right = target.child_by_field_name("right")?;
-            if left.kind() != "alias" && text(left, source) != Some("__MODULE__") {
+            if left.kind() == "alias" || text(left, source) == Some("__MODULE__") {
+                (
+                    Some(text(left, source)?.to_owned()),
+                    text(right, source)?.to_owned(),
+                    false,
+                )
+            } else if left.kind() == "dot"
+                && left
+                    .child_by_field_name("right")
+                    .and_then(|field| text(field, source))
+                    == Some("__struct__")
+            {
+                (None, text(right, source)?.to_owned(), true)
+            } else {
                 return None;
             }
-            (
-                Some(text(left, source)?.to_owned()),
-                text(right, source)?.to_owned(),
-            )
         }
         _ => return None,
     };
     let arity = arguments(node).map_or(0, |arguments| arguments.named_child_count())
         + piped_argument(node, source);
+    let captures = arguments(node).map_or_else(Vec::new, |arguments| {
+        arguments
+            .named_children(&mut arguments.walk())
+            .filter_map(|argument| {
+                let capture = text(argument, source)?.strip_prefix('&')?;
+                let (target, arity) = capture.rsplit_once('/')?;
+                let (module, name) = target
+                    .rsplit_once('.')
+                    .map_or((None, target), |(module, name)| {
+                        (Some(module.to_owned()), name)
+                    });
+                Some(ElixirCapture {
+                    module,
+                    name: name.into(),
+                    arity: arity.parse().ok()?,
+                    line: argument.start_position().row + 1,
+                })
+            })
+            .collect()
+    });
     Some(ElixirCall {
         module,
         name,
         arity,
         line: node.start_position().row + 1,
+        dynamic_struct,
+        captures,
     })
 }
 
@@ -448,12 +481,19 @@ fn push_function(
                     name: name.clone(),
                     arity,
                     line: node.start_position().row + 1,
+                    dynamic_struct: false,
+                    captures: Vec::new(),
                 }]
             },
         );
         for call in &mut calls {
             if let Some(module) = &mut call.module {
                 *module = expand_alias(module, aliases, current_module);
+            }
+            for capture in &mut call.captures {
+                if let Some(module) = &mut capture.module {
+                    *module = expand_alias(module, aliases, current_module);
+                }
             }
         }
         let mut struct_uses = function_struct_uses(node, source);
@@ -642,37 +682,55 @@ pub(super) fn call_observations(
         let function_id = format!("{module_id}/{}/{}", function.name, function.arity);
         let mut targets = BTreeSet::new();
         for call in &function.calls {
-            let target = if let Some(target_module) = &call.module {
-                let candidate = format!(
-                    "repo://{repository}/elixir/{target_module}/{}/{}",
-                    call.name, call.arity
+            let target_for = |target_module: Option<&str>, name: &str, arity: usize| {
+                let candidate = target_module.map_or_else(
+                    || format!("{module_id}/{name}/{arity}"),
+                    |module| format!("repo://{repository}/elixir/{module}/{name}/{arity}"),
                 );
                 if definitions.contains(&candidate) {
                     candidate
+                } else if let Some(module) = target_module {
+                    format!("elixir-call://{module}/{name}/{arity}")
                 } else {
-                    format!("elixir-call://{target_module}/{}/{}", call.name, call.arity)
-                }
-            } else {
-                let candidate = format!("{module_id}/{}/{}", call.name, call.arity);
-                if definitions.contains(&candidate) {
-                    candidate
-                } else {
-                    format!("elixir-call://{}/{}", call.name, call.arity)
+                    format!("elixir-call://{name}/{arity}")
                 }
             };
-            if !targets.insert(target.clone()) {
-                continue;
+            let target = if call.dynamic_struct {
+                format!("elixir-dynamic-call://{}/{}", call.name, call.arity)
+            } else {
+                target_for(call.module.as_deref(), &call.name, call.arity)
+            };
+            if targets.insert(target.clone()) {
+                let mut observation = Observation::dependency(
+                    function_id.clone(),
+                    DependencyRelation::Calls,
+                    target,
+                    format!("{}:{}", path.display(), call.line),
+                );
+                if call.dynamic_struct {
+                    observation.confidence = Confidence::Inferred;
+                }
+                if generated {
+                    observation.provenance = Provenance::Generated;
+                }
+                observations.push(observation);
             }
-            let mut observation = Observation::dependency(
-                function_id.clone(),
-                DependencyRelation::Calls,
-                target,
-                format!("{}:{}", path.display(), call.line),
-            );
-            if generated {
-                observation.provenance = Provenance::Generated;
+            for capture in &call.captures {
+                let target = target_for(capture.module.as_deref(), &capture.name, capture.arity);
+                if targets.insert(target.clone()) {
+                    let mut observation = Observation::dependency(
+                        function_id.clone(),
+                        DependencyRelation::Calls,
+                        target,
+                        format!("{}:{}", path.display(), capture.line),
+                    );
+                    observation.confidence = Confidence::Inferred;
+                    if generated {
+                        observation.provenance = Provenance::Generated;
+                    }
+                    observations.push(observation);
+                }
             }
-            observations.push(observation);
         }
     }
     observations

@@ -110,6 +110,21 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
     Some(Call {
         kind,
         receiver,
+        returned_receiver: target
+            .child_by_field_name("object")
+            .filter(|object| object.kind() == "call_expression")
+            .and_then(|object| object.child_by_field_name("arguments"))
+            .and_then(|arguments| {
+                let arguments = arguments
+                    .named_children(&mut arguments.walk())
+                    .collect::<Vec<_>>();
+                let [argument] = arguments.as_slice() else {
+                    return None;
+                };
+                (argument.kind() == "identifier")
+                    .then(|| text(*argument, source).map(str::to_owned))
+                    .flatten()
+            }),
         name,
         arguments: node
             .child_by_field_name("arguments")
@@ -515,6 +530,24 @@ fn returned_constructor(node: Node<'_>, source: &[u8], root: Node<'_>) -> Option
         .find_map(|child| returned_constructor(child, source, root))
 }
 
+fn callback_return<'tree>(node: Node<'tree>, source: &[u8]) -> Option<(Node<'tree>, String)> {
+    let arguments = node.child_by_field_name("arguments")?;
+    arguments
+        .named_children(&mut arguments.walk())
+        .filter(|argument| matches!(argument.kind(), "arrow_function" | "function_expression"))
+        .find_map(|callback| {
+            let body = callback.child_by_field_name("body")?;
+            let constructor = if body.kind() == "new_expression" {
+                body.child_by_field_name("constructor")
+                    .and_then(|constructor| text(constructor, source))
+                    .map(str::to_owned)
+            } else {
+                returned_constructor(body, source, body)
+            }?;
+            Some((body, constructor))
+        })
+}
+
 fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
     let mut bindings = Vec::new();
     let mut cursor = body.walk();
@@ -611,6 +644,7 @@ fn definition(
         alias_bindings,
         factory_bindings,
         factory: None,
+        callback_return_type: None,
         base: None,
         return_type,
         exported: is_exported(node),
@@ -919,6 +953,12 @@ fn collect_definitions(
                 let mut factory_definition =
                     definition(node, None, source, scope, name, DefinitionKind::Namespace);
                 factory_definition.factory = Some(factory.into());
+                if let Some((body, return_type)) =
+                    value.and_then(|value| callback_return(value, source))
+                {
+                    collect_calls(body, source, body, &mut factory_definition.calls);
+                    factory_definition.callback_return_type = Some(return_type);
+                }
                 definitions.push(factory_definition);
                 return;
             }
@@ -1308,6 +1348,11 @@ fn observation_target(
     scope: &str,
     call: &Call,
 ) -> String {
+    if call.kind == CallKind::Member
+        && let Some(receiver) = &call.returned_receiver
+    {
+        return format!("{language}-returned://{receiver}/{}", call.name);
+    }
     match call.kind {
         CallKind::Direct => ids
             .get(&qualified(

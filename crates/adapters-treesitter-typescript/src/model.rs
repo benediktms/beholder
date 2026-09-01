@@ -147,6 +147,8 @@ pub(super) struct Definition {
     pub(super) alias_bindings: Vec<AliasBinding>,
     pub(super) factory_bindings: Vec<FactoryBinding>,
     pub(super) factory: Option<String>,
+    #[serde(default)]
+    pub(super) callback_return_type: Option<String>,
     pub(super) base: Option<String>,
     pub(super) return_type: Option<String>,
     pub(super) exported: bool,
@@ -218,6 +220,8 @@ pub(super) enum CallKind {
 pub(super) struct Call {
     pub(super) kind: CallKind,
     pub(super) receiver: Option<String>,
+    #[serde(default)]
+    pub(super) returned_receiver: Option<String>,
     pub(super) name: String,
     pub(super) arguments: Vec<String>,
     pub(super) type_arguments: Vec<String>,

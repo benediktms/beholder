@@ -73,6 +73,18 @@ pub(super) struct ElixirCall {
     pub(super) name: String,
     pub(super) arity: usize,
     pub(super) line: usize,
+    #[serde(default)]
+    pub(super) dynamic_struct: bool,
+    #[serde(default)]
+    pub(super) captures: Vec<ElixirCapture>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ElixirCapture {
+    pub(super) module: Option<String>,
+    pub(super) name: String,
+    pub(super) arity: usize,
+    pub(super) line: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

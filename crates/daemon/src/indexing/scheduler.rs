@@ -2777,6 +2777,203 @@ mod tests {
     use beholder_dto::{AnalysisCompleteness, EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
+    #[test]
+    fn traces_returned_loader_through_dynamic_elixir_dispatch_and_two_rpcs() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state = std::env::temp_dir().join(format!("beholder-dynamic-grpc-{unique}"));
+        let contracts = state.join("contracts");
+        let gateway = state.join("gateway");
+        let checkout = state.join("checkout");
+        let packages = state.join("packages");
+        for directory in [
+            contracts.as_path(),
+            gateway.join("src").as_path(),
+            checkout.join("lib").as_path(),
+            packages.join("lib").as_path(),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            contracts.join("services.proto"),
+            r#"
+            syntax = "proto3";
+            package fixture.v1;
+            message InitializeRequest {}
+            message InitializeResponse {}
+            message GetPackageTemplatesRequest {}
+            message GetPackageTemplatesResponse {}
+            service CheckoutService {
+              rpc Initialize(InitializeRequest) returns (InitializeResponse);
+            }
+            service PackagesService {
+              rpc GetPackageTemplates(GetPackageTemplatesRequest) returns (GetPackageTemplatesResponse);
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            gateway.join("src/generated.ts"),
+            r#"
+            export const CheckoutServiceServiceName = "fixture.v1.CheckoutService";
+            export class CheckoutServiceClientImpl {
+              constructor(private readonly rpc: Rpc) {}
+              initialize(request: InitializeRequest): Promise<InitializeResponse> {
+                return this.rpc.request(this.service, "Initialize", request);
+              }
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            gateway.join("src/loader.ts"),
+            r#"
+            import { CheckoutServiceClientImpl } from "./generated";
+            const client = new CheckoutServiceClientImpl({} as Rpc);
+            export const checkoutLoader = createContext(
+              () => new Loader(async () => client.initialize({})),
+            );
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            gateway.join("src/entry.ts"),
+            r#"
+            import { checkoutLoader } from "./loader";
+            export function preview(context: Context) {
+              return context.get(checkoutLoader).load("preview");
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            checkout.join("lib/services.pb.ex"),
+            r#"
+            defmodule Fixture.V1.CheckoutService.Service do
+              use GRPC.Service, name: "fixture.v1.CheckoutService"
+              rpc :Initialize, Fixture.V1.InitializeRequest, Fixture.V1.InitializeResponse
+            end
+
+            defmodule Fixture.V1.PackagesService.Service do
+              use GRPC.Service, name: "fixture.v1.PackagesService"
+              rpc :GetPackageTemplates, Fixture.V1.GetPackageTemplatesRequest, Fixture.V1.GetPackageTemplatesResponse
+            end
+
+            defmodule Fixture.V1.PackagesService.Stub do
+              use GRPC.Stub, service: Fixture.V1.PackagesService.Service
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            checkout.join("lib/flow.ex"),
+            r#"
+            defmodule Fixture.Job do
+              @callback load(term(), struct()) :: term()
+            end
+
+            defmodule Fixture.Source do
+              alias Fixture.V1.PackagesService.Stub
+              def new(channel), do: Dataloader.KV.new(&fetch/2)
+              defp fetch(channel, request), do: Stub.get_package_templates(channel, request)
+            end
+
+            defmodule Fixture.Worker do
+              @behaviour Fixture.Job
+              defstruct []
+              @impl true
+              def load(context, _job), do: Fixture.Source.new(context)
+            end
+
+            defmodule Fixture.Engine do
+              def dispatch(context, job), do: job.__struct__.load(context, job)
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            checkout.join("lib/server.ex"),
+            r#"
+            defmodule Fixture.CheckoutServer do
+              alias Fixture.V1.CheckoutService.Service
+              use GRPC.Server, service: Service
+              def initialize(_request, stream), do: Fixture.Engine.dispatch(stream, %Fixture.Worker{})
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            packages.join("lib/packages.pb.ex"),
+            r#"
+            defmodule Fixture.V1.PackagesService.Service do
+              use GRPC.Service, name: "fixture.v1.PackagesService"
+              rpc :GetPackageTemplates, Fixture.V1.GetPackageTemplatesRequest, Fixture.V1.GetPackageTemplatesResponse
+            end
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            packages.join("lib/server.ex"),
+            r#"
+            defmodule Fixture.PackagesDomain do
+              def get_by_ids(request), do: request
+            end
+
+            defmodule Fixture.PackagesServer do
+              alias Fixture.V1.PackagesService.Service
+              use GRPC.Server, service: Service
+              def get_package_templates(request, _stream), do: Fixture.PackagesDomain.get_by_ids(request)
+            end
+            "#,
+        )
+        .unwrap();
+
+        let mut registry = WorkspaceRegistry::open(state.join("workspaces.json")).unwrap();
+        let workspace = registry
+            .register(
+                "dynamic-grpc".into(),
+                vec![
+                    contracts,
+                    gateway.clone(),
+                    checkout.clone(),
+                    packages.clone(),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        let gateway_identity = beholder_adapters_git::repository_identity(&gateway).unwrap();
+        let checkout_identity = beholder_adapters_git::repository_identity(&checkout).unwrap();
+        let packages_identity = beholder_adapters_git::repository_identity(&packages).unwrap();
+        let entry = format!("repo://{gateway_identity}/typescript/src/entry/preview");
+        let worker = format!("repo://{checkout_identity}/elixir/Fixture.Worker/load/2");
+        let callback = format!("repo://{checkout_identity}/elixir/Fixture.Source/fetch/2");
+        let domain =
+            format!("repo://{packages_identity}/elixir/Fixture.PackagesDomain/get_by_ids/1");
+        let scheduler = IndexScheduler::new(state.join("frontend-cache"));
+        let store = SemanticStore::persistent(&state.join("beholder.db"), true).unwrap();
+
+        scheduler.index(&store, &workspace).unwrap();
+
+        let trace = store.trace("dynamic-grpc", &entry, &domain, 32).unwrap();
+        assert!(trace.paths.iter().any(|path| {
+            path.nodes.contains(&worker)
+                && path.nodes.contains(&callback)
+                && path
+                    .nodes
+                    .iter()
+                    .any(|node| node == "grpc://fixture.v1.CheckoutService/Initialize")
+                && path
+                    .nodes
+                    .iter()
+                    .any(|node| node == "grpc://fixture.v1.PackagesService/GetPackageTemplates")
+        }));
+
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
     struct MutatingAnalyzer {
         source: PathBuf,
     }
