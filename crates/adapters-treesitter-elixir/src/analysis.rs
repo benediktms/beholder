@@ -170,9 +170,11 @@ fn parsed_call(node: Node<'_>, source: &[u8]) -> Option<ElixirCall> {
                     text(right, source)?.to_owned(),
                     false,
                 )
-            } else if left.kind() == "dot"
+            } else if left.kind() == "call"
                 && left
-                    .child_by_field_name("right")
+                    .child_by_field_name("target")
+                    .filter(|target| target.kind() == "dot")
+                    .and_then(|target| target.child_by_field_name("right"))
                     .and_then(|field| text(field, source))
                     == Some("__struct__")
             {
