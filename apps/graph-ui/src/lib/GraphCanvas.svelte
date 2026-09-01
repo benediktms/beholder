@@ -107,7 +107,6 @@
     hoveredId = null;
     keyboardIndex = -1;
     graph.graphData({ nodes: next.nodes, links: next.links }).d3ReheatSimulation();
-    setHighlight(selectedId);
   }
 
   function setHighlight(id: string | null) {

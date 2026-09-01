@@ -151,6 +151,12 @@
     origins = origins.includes(origin)
       ? origins.filter((selected) => selected !== origin)
       : [...origins, origin];
+    clearFocus();
+  }
+
+  function toggleTests() {
+    includeTests = !includeTests;
+    clearFocus();
   }
 
   function setDrawerWidth(side: 'filters' | 'inspector', width: number) {
@@ -311,7 +317,7 @@
           variant="outline"
           role="switch"
           aria-checked={includeTests}
-          onclick={() => (includeTests = !includeTests)}
+          onclick={toggleTests}
         >
           <span class:enabled={includeTests} class="switch-track" aria-hidden="true"><span></span></span>
           <span>Include tests</span>

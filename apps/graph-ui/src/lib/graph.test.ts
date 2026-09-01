@@ -139,6 +139,7 @@ test('visible guards keep deterministic topology and report omissions', () => {
     { nodes: 2, links: 1 }
   );
   assert.deepEqual(graph.nodes.map((node) => node.id), ['a', 'b']);
+  assert.deepEqual(graph.nodes.map((node) => node.degree), [1, 1]);
   assert.equal(graph.omittedNodes, 1);
   assert.equal(graph.omittedLinks, 1);
   assert.equal(graph.truncated, true);

@@ -187,10 +187,6 @@ export function projectGraph(
 
   for (const link of links.values()) {
     link.rawEdgeIds.sort();
-    const source = groups.get(endpointId(link.source));
-    const target = groups.get(endpointId(link.target));
-    if (source) source.degree += 1;
-    if (target) target.degree += 1;
   }
   const allNodes = [...groups.values()].sort(compareById);
   const keptNodes = allNodes.slice(0, limits.nodes);
@@ -201,6 +197,12 @@ export function projectGraph(
       (link) => keptIds.has(endpointId(link.source)) && keptIds.has(endpointId(link.target))
     )
     .slice(0, limits.links);
+  for (const link of keptLinks) {
+    const source = groups.get(endpointId(link.source));
+    const target = groups.get(endpointId(link.target));
+    if (source) source.degree += 1;
+    if (target) target.degree += 1;
+  }
   const omittedNodes = allNodes.length - keptNodes.length;
   const omittedLinks = allLinks.length - keptLinks.length;
   return {
