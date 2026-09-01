@@ -1539,6 +1539,52 @@ pub fn resolve_workspace_calls(
             .get(caller_file)
             .copied()
             .unwrap_or_default();
+        let returned = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-returned://")
+            .or_else(|| {
+                observation
+                    .to
+                    .as_str()
+                    .strip_prefix("javascript-returned://")
+            })
+            .and_then(|target| target.split_once('/'));
+        if let Some((argument, _method)) = returned {
+            let target = imports.iter().find_map(|import| {
+                let binding = import
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.local == argument && binding.imported != "*")?;
+                let (target_index, file) =
+                    workspace_imported_file(&import.source, &packages, &indexes)?;
+                let target = &indexes[target_index];
+                let origin = target
+                    .origins
+                    .get(&(file.clone(), binding.imported.clone()))
+                    .cloned()
+                    .unwrap_or((file, binding.imported.clone()));
+                target
+                    .callback_returns
+                    .contains(&origin)
+                    .then(|| target.symbols.get(&origin))
+                    .flatten()
+            });
+            if let Some(target) = target {
+                overrides.push(DependencyOverride {
+                    from: observation.from.clone(),
+                    relation: DependencyRelation::Calls,
+                    unresolved_to: observation.to.clone(),
+                    resolved_to: target.clone(),
+                    evidence: observation.evidence.clone(),
+                    confidence: Confidence::Inferred,
+                    provenance: observation.provenance,
+                });
+                observation.to = target.clone();
+                observation.confidence = Confidence::Inferred;
+            }
+            continue;
+        }
         let direct = observation
             .to
             .as_str()
@@ -1801,6 +1847,50 @@ mod tests {
             "repo://example/typescript/src/loader/loader",
             "repo://example/typescript/src/loader/Client/fetch",
         )));
+    }
+
+    #[test]
+    fn resolves_a_returned_callback_from_a_workspace_package() {
+        let consumer_source = "import { loader } from '@example/provider'; export function entry(context: Context) { return context.get(loader).load('key'); }";
+        let provider_source = "export class Client { fetch() {} } const client = new Client(); export const loader = createContext(() => new Loader(async () => client.fetch()));";
+        let consumer_path = PathBuf::from("src/entry.ts");
+        let provider_path = PathBuf::from("src/loader.ts");
+        let consumer = analyze(consumer_source, SourceLanguage::TypeScript).unwrap();
+        let provider = analyze(provider_source, SourceLanguage::TypeScript).unwrap();
+        let repositories = vec![
+            TypescriptRepository::new(
+                "consumer",
+                vec![(consumer_path.clone(), consumer.clone())],
+                vec![],
+                vec![],
+            ),
+            TypescriptRepository::new(
+                "provider",
+                vec![(provider_path.clone(), provider.clone())],
+                vec![(
+                    PathBuf::from("package.json"),
+                    r#"{"name":"@example/provider"}"#.into(),
+                )],
+                vec![],
+            ),
+        ];
+        let mut observations =
+            observations_from_analysis("consumer", &consumer, consumer_source, &consumer_path);
+        observations.extend(observations_from_analysis(
+            "provider",
+            &provider,
+            provider_source,
+            &provider_path,
+        ));
+
+        let overrides = resolve_workspace_calls(&mut observations, &repositories);
+
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://consumer/typescript/src/entry/entry"
+                && override_.unresolved_to.as_str() == "typescript-returned://loader/load"
+                && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
+                && override_.confidence == Confidence::Inferred
+        }));
     }
 
     #[test]

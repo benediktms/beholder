@@ -509,11 +509,18 @@ fn push_function(
             let function = &mut functions[index];
             function.body_hash = append_hash(function.body_hash, body_hash);
             for call in calls {
-                if !function.calls.iter().any(|existing| {
+                if let Some(existing) = function.calls.iter_mut().find(|existing| {
                     existing.module == call.module
                         && existing.name == call.name
                         && existing.arity == call.arity
+                        && existing.dynamic_struct == call.dynamic_struct
                 }) {
+                    for capture in call.captures {
+                        if !existing.captures.contains(&capture) {
+                            existing.captures.push(capture);
+                        }
+                    }
+                } else {
                     function.calls.push(call);
                 }
             }

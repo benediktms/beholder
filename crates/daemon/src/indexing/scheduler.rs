@@ -36,7 +36,9 @@ use beholder_adapters_treesitter_elixir::{
     generated_observations as elixir_generated_observations,
     graphql_resolver_bindings as elixir_graphql_resolver_bindings,
     grpc_bindings as elixir_grpc_bindings, observations_from_analysis as elixir_observations,
-    resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
+    resolve_repository_calls as resolve_elixir_repository_calls,
+    resolve_workspace_dynamic_dispatch as resolve_elixir_workspace_dynamic_dispatch,
+    resolve_workspace_modules,
 };
 #[cfg(test)]
 use beholder_adapters_treesitter_elixir::{
@@ -2736,6 +2738,7 @@ fn index_workspace_versioned(
             .collect::<Vec<_>>();
         overrides = resolve_rust_repository_calls(&mut all_observations);
         overrides.extend(resolve_workspace_modules(&all_observations));
+        overrides.extend(resolve_elixir_workspace_dynamic_dispatch(&all_observations));
         overrides.extend(resolve_typescript_workspace_calls(
             &mut all_observations,
             &typescript_repositories,
@@ -2870,10 +2873,6 @@ mod tests {
         fs::write(
             checkout.join("lib/flow.ex"),
             r#"
-            defmodule Fixture.Job do
-              @callback load(term(), struct()) :: term()
-            end
-
             defmodule Fixture.Source do
               alias Fixture.V1.PackagesService.Stub
               def new(channel), do: Dataloader.KV.new(&fetch/2)
@@ -2917,6 +2916,10 @@ mod tests {
         fs::write(
             packages.join("lib/server.ex"),
             r#"
+            defmodule Fixture.Job do
+              @callback load(term(), struct()) :: term()
+            end
+
             defmodule Fixture.PackagesDomain do
               def get_by_ids(request), do: request
             end

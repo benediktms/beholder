@@ -353,7 +353,7 @@ pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<Dependency
         .collect()
 }
 
-fn dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observation> {
+fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observation, EntityId)> {
     let callbacks = observations
         .iter()
         .filter(|observation| {
@@ -391,7 +391,7 @@ fn dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observatio
                 .map(|signature| (observation, signature))
         });
     let mut seen = BTreeSet::new();
-    let mut generated = Vec::new();
+    let mut candidates = Vec::new();
     let implementations = implementations.collect::<Vec<_>>();
     for (call, signature) in dynamic_calls {
         for implementation in &implementations {
@@ -403,18 +403,43 @@ fn dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observatio
             if definitions.contains(target.as_str())
                 && seen.insert((call.from.clone(), target.clone()))
             {
-                let mut observation = Observation::dependency(
-                    call.from.clone(),
-                    DependencyRelation::Calls,
-                    target,
-                    call.evidence.clone(),
-                );
-                observation.confidence = Confidence::Inferred;
-                generated.push(observation);
+                candidates.push((call, target));
             }
         }
     }
-    generated
+    candidates
+}
+
+fn dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observation> {
+    dynamic_dispatch_candidates(observations)
+        .into_iter()
+        .map(|(call, target)| {
+            let mut observation = Observation::dependency(
+                call.from.clone(),
+                DependencyRelation::Calls,
+                target,
+                call.evidence.clone(),
+            );
+            observation.confidence = Confidence::Inferred;
+            observation.provenance = call.provenance;
+            observation
+        })
+        .collect()
+}
+
+pub fn resolve_workspace_dynamic_dispatch(observations: &[Observation]) -> Vec<DependencyOverride> {
+    dynamic_dispatch_candidates(observations)
+        .into_iter()
+        .map(|(call, target)| DependencyOverride {
+            from: call.from.clone(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: call.to.clone(),
+            resolved_to: target,
+            evidence: call.evidence.clone(),
+            confidence: Confidence::Inferred,
+            provenance: call.provenance,
+        })
+        .collect()
 }
 
 pub fn resolve_repository_calls(
@@ -612,6 +637,74 @@ mod tests {
             "repo://example/elixir/Example.Source/fetch/2",
             "repo://example/elixir/Example.Client/fetch/1",
         )));
+    }
+
+    #[test]
+    fn preserves_captures_from_every_function_clause() {
+        let observations = observations(
+            "example",
+            r#"
+            defmodule Example.Source do
+              def new(:first), do: Dataloader.KV.new(&fetch_first/2)
+              def new(:second), do: Dataloader.KV.new(&fetch_second/2)
+              defp fetch_first(batch, keys), do: {batch, keys}
+              defp fetch_second(batch, keys), do: {batch, keys}
+            end
+            "#,
+            Path::new("lib/source.ex"),
+        )
+        .unwrap();
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example.Source/new/1"
+                    && observation.relation
+                        == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(targets.contains("repo://example/elixir/Example.Source/fetch_first/2"));
+        assert!(targets.contains("repo://example/elixir/Example.Source/fetch_second/2"));
+    }
+
+    #[test]
+    fn resolves_dynamic_dispatch_against_a_workspace_behaviour() {
+        let mut observations = observations(
+            "contracts",
+            "defmodule Example.Job do\n  @callback load(term(), struct()) :: term()\nend",
+            Path::new("lib/job.ex"),
+        )
+        .unwrap();
+        observations.extend(
+            observations(
+                "app",
+                r#"
+                defmodule Example.Worker do
+                  @behaviour Example.Job
+                  defstruct []
+                  @impl true
+                  def load(context, _job), do: context
+                end
+
+                defmodule Example.Dispatcher do
+                  def dispatch(context, job), do: job.__struct__.load(context, job)
+                end
+                "#,
+                Path::new("lib/generated.pb.ex"),
+            )
+            .unwrap(),
+        );
+
+        let overrides = resolve_workspace_dynamic_dispatch(&observations);
+
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
+                && override_.unresolved_to.as_str() == "elixir-dynamic-call://load/2"
+                && override_.resolved_to.as_str() == "repo://app/elixir/Example.Worker/load/2"
+                && override_.confidence == Confidence::Inferred
+                && override_.provenance == Provenance::Generated
+        }));
     }
 
     #[test]
