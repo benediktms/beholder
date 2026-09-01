@@ -1871,7 +1871,7 @@ mod tests {
                 vec![(provider_path.clone(), provider.clone())],
                 vec![(
                     PathBuf::from("package.json"),
-                    r#"{"name":"@example/provider"}"#.into(),
+                    r#"{"name":"@example/provider","source":"src/loader.ts"}"#.into(),
                 )],
                 vec![],
             ),
@@ -1886,10 +1886,9 @@ mod tests {
         ));
 
         let overrides = resolve_workspace_calls(&mut observations, &repositories);
-
         assert!(overrides.iter().any(|override_| {
             override_.from.as_str() == "repo://consumer/typescript/src/entry/entry"
-                && override_.unresolved_to.as_str() == "typescript-returned://loader/load"
+                && override_.unresolved_to.as_str() == "typescript-returned://selected/load"
                 && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
                 && override_.confidence == Confidence::Inferred
         }));
