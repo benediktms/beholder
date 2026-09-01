@@ -410,7 +410,7 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
     candidates
 }
 
-fn dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observation> {
+pub fn workspace_dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observation> {
     dynamic_dispatch_candidates(observations)
         .into_iter()
         .map(|(call, target)| {
@@ -427,26 +427,11 @@ fn dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observatio
         .collect()
 }
 
-pub fn resolve_workspace_dynamic_dispatch(observations: &[Observation]) -> Vec<DependencyOverride> {
-    dynamic_dispatch_candidates(observations)
-        .into_iter()
-        .map(|(call, target)| DependencyOverride {
-            from: call.from.clone(),
-            relation: DependencyRelation::Calls,
-            unresolved_to: call.to.clone(),
-            resolved_to: target,
-            evidence: call.evidence.clone(),
-            confidence: Confidence::Inferred,
-            provenance: call.provenance,
-        })
-        .collect()
-}
-
 pub fn resolve_repository_calls(
     observations: &mut Vec<Observation>,
     sources: &[(&Path, &ElixirAnalysis)],
 ) {
-    let dynamic = dynamic_dispatch_observations(observations);
+    let dynamic = workspace_dynamic_dispatch_observations(observations);
     observations.extend(dynamic);
     let definitions = observations
         .iter()
@@ -670,17 +655,24 @@ mod tests {
 
     #[test]
     fn resolves_dynamic_dispatch_against_a_workspace_behaviour() {
-        let mut observations = observations(
+        let mut workspace_observations = observations(
             "contracts",
             "defmodule Example.Job do\n  @callback load(term(), struct()) :: term()\nend",
             Path::new("lib/job.ex"),
         )
         .unwrap();
-        observations.extend(
+        workspace_observations.extend(
             observations(
                 "app",
                 r#"
                 defmodule Example.Worker do
+                  @behaviour Example.Job
+                  defstruct []
+                  @impl true
+                  def load(context, _job), do: context
+                end
+
+                defmodule Example.OtherWorker do
                   @behaviour Example.Job
                   defstruct []
                   @impl true
@@ -696,15 +688,24 @@ mod tests {
             .unwrap(),
         );
 
-        let overrides = resolve_workspace_dynamic_dispatch(&observations);
+        let resolved = workspace_dynamic_dispatch_observations(&workspace_observations);
+        let targets = resolved
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
+                    && observation.confidence == Confidence::Inferred
+                    && observation.provenance == Provenance::Generated
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
 
-        assert!(overrides.iter().any(|override_| {
-            override_.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
-                && override_.unresolved_to.as_str() == "elixir-dynamic-call://load/2"
-                && override_.resolved_to.as_str() == "repo://app/elixir/Example.Worker/load/2"
-                && override_.confidence == Confidence::Inferred
-                && override_.provenance == Provenance::Generated
-        }));
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                "repo://app/elixir/Example.OtherWorker/load/2",
+                "repo://app/elixir/Example.Worker/load/2",
+            ])
+        );
     }
 
     #[test]

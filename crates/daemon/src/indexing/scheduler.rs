@@ -29,6 +29,7 @@ use beholder_adapters_treesitter_csharp::{
     CsharpAnalyzer, FRONTEND_VERSION as CSHARP_FRONTEND_VERSION,
     RESOLVER_VERSION as CSHARP_RESOLVER_VERSION,
 };
+use beholder_adapters_treesitter_elixir::workspace_dynamic_dispatch_observations;
 #[cfg(test)]
 use beholder_adapters_treesitter_elixir::{
     ElixirAnalysis, diagnostics_from_analysis as elixir_diagnostics,
@@ -36,9 +37,7 @@ use beholder_adapters_treesitter_elixir::{
     generated_observations as elixir_generated_observations,
     graphql_resolver_bindings as elixir_graphql_resolver_bindings,
     grpc_bindings as elixir_grpc_bindings, observations_from_analysis as elixir_observations,
-    resolve_repository_calls as resolve_elixir_repository_calls,
-    resolve_workspace_dynamic_dispatch as resolve_elixir_workspace_dynamic_dispatch,
-    resolve_workspace_modules,
+    resolve_repository_calls as resolve_elixir_repository_calls, resolve_workspace_modules,
 };
 #[cfg(test)]
 use beholder_adapters_treesitter_elixir::{
@@ -74,11 +73,11 @@ use beholder_adapters_treesitter_typescript::{
 #[cfg(test)]
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, RepositoryFacts, RepositoryState, SourceAnalysisError,
+    RepositoryState, SourceAnalysisError,
 };
 use beholder_domain::{
-    BeholderError, BeholderErrorCode, BeholderErrorKind, RepositoryDependencyGraph, Workspace,
-    WorkspaceRepository, WorkspaceView,
+    BeholderError, BeholderErrorCode, BeholderErrorKind, Observation, RepositoryDependencyGraph,
+    RepositoryFacts, Workspace, WorkspaceRepository, WorkspaceView,
 };
 use beholder_dto::{Freshness, QueryMetadata};
 #[cfg(test)]
@@ -2163,6 +2162,29 @@ fn index_workspace(
     )
 }
 
+fn append_workspace_observations(
+    repositories: &mut [RepositoryFacts],
+    observations: impl IntoIterator<Item = Observation>,
+) {
+    for observation in observations {
+        let Some(repository) = repositories
+            .iter_mut()
+            .filter(|repository| {
+                observation
+                    .from
+                    .as_str()
+                    .starts_with(&format!("repo://{}/", repository.state.repository.identity))
+            })
+            .max_by_key(|repository| repository.state.repository.identity.len())
+        else {
+            continue;
+        };
+        if !repository.observations.contains(&observation) {
+            repository.observations.push(observation);
+        }
+    }
+}
+
 fn index_workspace_through_port(
     scheduler: &IndexScheduler,
     store: &SemanticStore,
@@ -2319,7 +2341,7 @@ fn index_workspace_through_port(
     let mut memory_hits = 0;
     let mut disk_hits = 0;
     let mut misses = 0;
-    let repository_facts = analysis
+    let mut repository_facts = analysis
         .repositories
         .into_iter()
         .map(|repository| {
@@ -2331,6 +2353,14 @@ fn index_workspace_through_port(
             repository.facts
         })
         .collect::<Vec<_>>();
+    let workspace_observations = repository_facts
+        .iter()
+        .flat_map(|facts| facts.observations.iter().cloned())
+        .collect::<Vec<_>>();
+    append_workspace_observations(
+        &mut repository_facts,
+        workspace_dynamic_dispatch_observations(&workspace_observations),
+    );
     let mut dependency_graph =
         RepositoryDependencyGraph::from_baseline(&repository_facts, &analysis.overrides)?;
     dependency_graph.add_candidates(analysis.repository_dependencies)?;
@@ -2738,7 +2768,10 @@ fn index_workspace_versioned(
             .collect::<Vec<_>>();
         overrides = resolve_rust_repository_calls(&mut all_observations);
         overrides.extend(resolve_workspace_modules(&all_observations));
-        overrides.extend(resolve_elixir_workspace_dynamic_dispatch(&all_observations));
+        append_workspace_observations(
+            &mut repository_facts,
+            workspace_dynamic_dispatch_observations(&all_observations),
+        );
         overrides.extend(resolve_typescript_workspace_calls(
             &mut all_observations,
             &typescript_repositories,

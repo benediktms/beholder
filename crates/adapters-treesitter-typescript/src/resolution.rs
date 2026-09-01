@@ -1239,8 +1239,9 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             })
             .and_then(|target| target.split_once('/'));
         if let Some((argument, _method)) = returned {
-            let origin = imported_origin(index, caller_file, argument)
-                .or_else(|| Some((caller_file.clone(), argument.to_owned())))
+            let argument = aliased_receiver(index, observation.from.as_str(), argument);
+            let origin = imported_origin(index, caller_file, &argument)
+                .or_else(|| Some((caller_file.clone(), argument)))
                 .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
             if let Some(origin) = origin.filter(|origin| index.callback_returns.contains(origin))
                 && let Some(target) = index.symbols.get(&origin)
@@ -1551,6 +1552,7 @@ pub fn resolve_workspace_calls(
             })
             .and_then(|target| target.split_once('/'));
         if let Some((argument, _method)) = returned {
+            let argument = aliased_receiver(caller, observation.from.as_str(), argument);
             let target = imports.iter().find_map(|import| {
                 let binding = import
                     .bindings
@@ -1806,7 +1808,7 @@ mod tests {
             ),
             (
                 Path::new("src/entry.ts"),
-                "import { loader } from './loader'; export function entry(context: Context) { return context.get(loader).load('key'); }",
+                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); }",
             ),
         ];
         let analyses = sources
@@ -1851,7 +1853,7 @@ mod tests {
 
     #[test]
     fn resolves_a_returned_callback_from_a_workspace_package() {
-        let consumer_source = "import { loader } from '@example/provider'; export function entry(context: Context) { return context.get(loader).load('key'); }";
+        let consumer_source = "import { loader } from '@example/provider'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); }";
         let provider_source = "export class Client { fetch() {} } const client = new Client(); export const loader = createContext(() => new Loader(async () => client.fetch()));";
         let consumer_path = PathBuf::from("src/entry.ts");
         let provider_path = PathBuf::from("src/loader.ts");
