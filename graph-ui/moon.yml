@@ -1,0 +1,9 @@
+language: 'typescript'
+
+tasks:
+  build:
+    command: 'pnpm build'
+  check:
+    command: 'pnpm check'
+  test:
+    command: 'pnpm test'

@@ -36,4 +36,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: jdx/mise-action@v4
+      - run: mise exec -- pnpm install --frozen-lockfile
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
       - run: moon ci
