@@ -31,6 +31,7 @@
   let highlightedDownstreamNodes = new Set<string>();
   let highlightedUpstreamLinks = new Set<string>();
   let highlightedDownstreamLinks = new Set<string>();
+  let particleLinks = new Set<string>();
   const selectedStrength = new Map<string, number>();
   const upstreamNodeStrength = new Map<string, number>();
   const downstreamNodeStrength = new Map<string, number>();
@@ -56,7 +57,7 @@
       .linkDirectionalArrowLength((link) => 2.5 + linkHighlight(link.id) * 2.5)
       .linkDirectionalArrowRelPos(0.88)
       .linkDirectionalArrowColor(linkColor)
-      .linkDirectionalParticles((link) => (linkHighlight(link.id) > 0.01 ? 4 : 0))
+      .linkDirectionalParticles((link) => (particleLinks.has(link.id) ? 4 : 0))
       .linkDirectionalParticleColor(() => '#e2e8f0')
       .linkDirectionalParticleSpeed(0.006)
       .linkDirectionalParticleWidth((link) => linkHighlight(link.id) * 3.5)
@@ -114,14 +115,10 @@
     const next = directHighlight(projection.links, id);
     highlightedUpstreamNodes = next.upstreamNodeIds;
     highlightedDownstreamNodes = next.downstreamNodeIds;
-    highlightedUpstreamLinks = new Set(
-      [...next.upstreamLinkIds].slice(0, MAX_ANIMATED_LINKS)
-    );
-    highlightedDownstreamLinks = new Set(
-      [...next.downstreamLinkIds].slice(
-        0,
-        MAX_ANIMATED_LINKS - highlightedUpstreamLinks.size
-      )
+    highlightedUpstreamLinks = next.upstreamLinkIds;
+    highlightedDownstreamLinks = next.downstreamLinkIds;
+    particleLinks = new Set(
+      [...next.upstreamLinkIds, ...next.downstreamLinkIds].slice(0, MAX_ANIMATED_LINKS)
     );
     startTransition();
   }
