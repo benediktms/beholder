@@ -1,6 +1,6 @@
 # Beholder graph UI prototype
 
-This Tauri 2 desktop prototype renders a SvelteKit/shadcn-svelte workspace graph with `force-graph`. Its realistic Fresha-shaped fixture exists only in `src-tauri/src/fixture.rs` and reaches the frontend through the `list_workspaces` and `load_graph` Tauri commands. It does not add or bypass a Beholder daemon API.
+This Tauri 2 desktop prototype renders a SvelteKit/shadcn-svelte workspace graph with `force-graph`. Its realistic fixture exists only in `../crates/graph-ui/src/fixture.rs` and reaches the frontend through the `list_workspaces` and `load_graph` Tauri commands. It does not add or bypass a Beholder daemon API.
 
 ## Run
 
@@ -16,9 +16,9 @@ The prototype opens on the workspace's typed entities. Use the repository and se
 Focused checks:
 
 ```sh
-pnpm test
-pnpm check
-pnpm build
+pnpm --filter @beholder/graph-ui test
+pnpm --filter @beholder/graph-ui check
+pnpm --filter @beholder/graph-ui build
 cargo check -p beholder-graph-ui
 ```
 

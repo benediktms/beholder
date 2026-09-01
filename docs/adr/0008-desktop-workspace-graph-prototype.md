@@ -230,10 +230,10 @@ a measured renderer profile, not graph size alone, shows the canvas/CPU ceiling.
 
 ### Implementation layout
 
-Keep the prototype in one application:
+Keep the web application and native shell as sibling workspace members:
 
 ```text
-apps/graph-ui/
+graph-ui/
 ├── package.json                 # SvelteKit, Tauri JS API, force-graph
 ├── svelte.config.js             # adapter-static with SPA fallback
 ├── vite.config.ts
@@ -244,20 +244,21 @@ apps/graph-ui/
 │   └── routes/
 │       ├── +layout.ts           # export const ssr = false
 │       └── +page.svelte         # controls, graph, evidence inspector
-└── src-tauri/
-    ├── Cargo.toml               # tauri + beholder-dto
-    ├── build.rs
-    ├── tauri.conf.json
-    └── src/
-        ├── fixture.rs           # realistic typed graph fixture
-        └── main.rs              # list_workspaces/load_graph commands
+
+crates/graph-ui/
+├── Cargo.toml                   # tauri + beholder-dto
+├── build.rs
+├── tauri.conf.json
+└── src/
+    ├── fixture.rs               # realistic typed graph fixture
+    └── main.rs                  # list_workspaces/load_graph commands
 ```
 
-Register `apps/graph-ui` in Moon, add its `src-tauri` crate to the Cargo
-workspace, and pin Node/pnpm in `mise.toml`. Keep Cargo authoritative for Rust
-and package scripts authoritative for Svelte. Do not create a shared UI crate,
-renderer adapter interface, graph service, global store, or component library
-for one screen.
+Register `graph-ui` in the root pnpm and Moon workspaces, add `crates/graph-ui`
+to the Cargo workspace, and pin Node/pnpm in `mise.toml`. Keep Cargo
+authoritative for Rust and package scripts authoritative for Svelte. Do not
+create a shared UI crate, renderer adapter interface, graph service, global
+store, or component library for one screen.
 
 The smallest checks cover edge bundling, degree sizing inputs, direct
 highlights, stable disconnected nodes, and visible guards, followed by Svelte

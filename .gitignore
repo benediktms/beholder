@@ -1,11 +1,12 @@
 /target
 /.pnpm-store
+/node_modules
 /.moon/cache
 /workers/elixir/_build
 /workers/elixir/deps
 /workers/elixir/beholder-worker-elixir
 /workers/typescript/beholder-worker-typescript
-/apps/graph-ui/.svelte-kit
-/apps/graph-ui/build
-/apps/graph-ui/node_modules
-/apps/graph-ui/src-tauri/gen
+/graph-ui/.svelte-kit
+/graph-ui/build
+/graph-ui/node_modules
+/crates/graph-ui/gen

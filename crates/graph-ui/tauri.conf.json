@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "dev.beholder.graph",
   "build": {
-    "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build",
+    "beforeDevCommand": "pnpm --filter @beholder/graph-ui dev",
+    "beforeBuildCommand": "pnpm --filter @beholder/graph-ui build",
     "devUrl": "http://localhost:1420",
-    "frontendDist": "../build"
+    "frontendDist": "../../graph-ui/build"
   },
   "app": {
     "windows": [

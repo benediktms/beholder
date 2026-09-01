@@ -1,6 +1,6 @@
 projects:
   beholder: '.'
-  graph-ui: 'apps/graph-ui'
+  graph-ui: 'graph-ui'
   worker-elixir: 'workers/elixir'
   worker-typescript: 'workers/typescript'
 

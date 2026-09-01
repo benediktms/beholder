@@ -6,7 +6,7 @@ settings:
 
 importers:
 
-  .:
+  graph-ui:
     dependencies:
       '@tauri-apps/api':
         specifier: 2.10.1

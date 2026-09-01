@@ -8,7 +8,7 @@
     "build": "vite build",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "dev": "vite dev",
-    "tauri": "tauri",
+    "tauri": "cd ../crates/graph-ui && ../../graph-ui/node_modules/.bin/tauri",
     "test": "node --test src/lib/graph.test.ts"
   },
   "dependencies": {
