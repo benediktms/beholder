@@ -254,6 +254,21 @@ impl SemanticStore {
         semantic_candidates: &[SemanticCandidate],
         verification_fingerprint: &str,
     ) -> Result<FactChanges, Box<dyn Error>> {
+        beholder_domain::validate_entity_complete_semantics(
+            repositories
+                .iter()
+                .flat_map(|repository| repository.entities.iter())
+                .chain(fact_shards.iter().flat_map(|shard| shard.entities.iter())),
+            repositories
+                .iter()
+                .flat_map(|repository| repository.observations.iter())
+                .chain(
+                    fact_shards
+                        .iter()
+                        .flat_map(|shard| shard.observations.iter()),
+                ),
+            overrides.iter(),
+        )?;
         self.access(|| {
             publish_observations(
                 &self.db,

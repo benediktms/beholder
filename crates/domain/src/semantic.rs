@@ -376,6 +376,51 @@ impl EntityFact {
     }
 }
 
+/// Validates the entity contract shared by semantic producers and publishers.
+///
+/// A published graph is only useful when entity identity is authoritative: every
+/// relationship endpoint must have one fact, and multiple producers describing
+/// the same entity must agree completely. Keeping this validation in the domain
+/// crate makes workers, the baseline publisher, and enrichment publication use
+/// the same rules.
+pub fn validate_entity_complete_semantics<'a>(
+    entities: impl IntoIterator<Item = &'a EntityFact>,
+    observations: impl IntoIterator<Item = &'a Observation>,
+    overrides: impl IntoIterator<Item = &'a DependencyOverride>,
+) -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut selected = BTreeMap::<&str, (&EntityKind, &Option<EntityMetadata>)>::new();
+    for entity in entities {
+        match selected.get(entity.id.as_str()) {
+            Some((kind, metadata)) if **kind != entity.kind || **metadata != entity.metadata => {
+                return Err(format!("conflicting entity facts for {}", entity.id));
+            }
+            Some(_) => {}
+            None => {
+                selected.insert(entity.id.as_str(), (&entity.kind, &entity.metadata));
+            }
+        }
+    }
+
+    let mut required = BTreeSet::new();
+    for observation in observations {
+        required.insert(observation.from.as_str());
+        required.insert(observation.to.as_str());
+    }
+    for dependency_override in overrides {
+        required.insert(dependency_override.from.as_str());
+        required.insert(dependency_override.unresolved_to.as_str());
+        required.insert(dependency_override.resolved_to.as_str());
+    }
+    if let Some(missing) = required.into_iter().find(|id| !selected.contains_key(id)) {
+        return Err(format!(
+            "missing entity fact for relationship endpoint {missing}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod entity_fact_tests {
     use super::*;
