@@ -2356,6 +2356,12 @@ fn index_workspace_through_port(
     let workspace_observations = repository_facts
         .iter()
         .flat_map(|facts| facts.observations.iter().cloned())
+        .chain(
+            analysis
+                .fact_shards
+                .iter()
+                .flat_map(|shard| shard.observations.iter().cloned()),
+        )
         .collect::<Vec<_>>();
     append_workspace_observations(
         &mut repository_facts,
@@ -2851,7 +2857,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            gateway.join("src/generated.ts"),
+            gateway.join("src/client.generated.ts"),
             r#"
             export const CheckoutServiceServiceName = "fixture.v1.CheckoutService";
             export class CheckoutServiceClientImpl {
@@ -2866,7 +2872,7 @@ mod tests {
         fs::write(
             gateway.join("src/loader.ts"),
             r#"
-            import { CheckoutServiceClientImpl } from "./generated";
+            import { CheckoutServiceClientImpl } from "./client.generated";
             const client = new CheckoutServiceClientImpl({} as Rpc);
             export const checkoutLoader = createContext(
               () => new Loader(async () => client.initialize({})),
