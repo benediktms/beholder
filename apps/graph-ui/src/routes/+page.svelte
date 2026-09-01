@@ -16,8 +16,7 @@
     type GraphSnapshot,
     type Projection,
     type RelationKind,
-    type WorkspaceSummary,
-    type ZoomBand
+    type WorkspaceSummary
   } from '$lib/graph';
 
   const emptyProjection: Projection = {
@@ -27,34 +26,45 @@
     rawLinkCount: 0,
     omittedNodes: 0,
     omittedLinks: 0,
-    omittedAnimations: 0,
     truncated: false
   };
+  const MIN_DRAWER_WIDTH = 192;
+  const MAX_DRAWER_WIDTH = 512;
 
   let workspaces: WorkspaceSummary[] = [];
   let selectedWorkspace = '';
   let snapshot: GraphSnapshot | null = null;
-  let repository = '';
+  let repositories: string[] = [];
   let relationKinds: RelationKind[] = [...RELATION_KINDS];
   let origins: EntityOrigin[] = [...ORIGINS];
   let includeTests = true;
-  let band: ZoomBand = 'repository';
   let rootId: string | null = null;
-  let selectedId: string | null = null;
+  let filtersOpen = true;
+  let inspectorOpen = true;
+  let filtersWidth = 240;
+  let inspectorWidth = 288;
   let loading = true;
   let error = '';
 
   $: projection = snapshot
     ? projectGraph(snapshot, {
-        band,
-        repository: repository || null,
+        repositories,
         relationKinds,
         includeTests,
-        origins,
-        rootId,
-        selectedId
+        origins
       })
     : emptyProjection;
+  $: repositoryOptions = [
+    ...(snapshot?.workspace.repositories ?? []),
+    ...(snapshot?.nodes.some((node) => node.repository === null)
+      ? [{ identity: EXTERNAL_REPOSITORY, displayName: 'External contracts' }]
+      : [])
+  ];
+  $: repositoryLabel = repositories.length === 0
+    ? 'All repositories'
+    : repositories.length === 1
+      ? repositoryOptions.find((item) => item.identity === repositories[0])?.displayName ?? repositories[0]
+      : `${repositories.length} repositories`;
   $: selectedEntity = snapshot?.nodes.find((node) => node.id === rootId) ?? null;
   $: selectedEdges = snapshot && rootId
     ? snapshot.edges.filter((edge) => edge.from === rootId || edge.to === rootId)
@@ -95,39 +105,89 @@
 
   function selectNode(node: GraphNode | null) {
     if (!node) {
-      selectedId = null;
+      clearFocus();
       return;
     }
-    selectedId = node.id;
-    if (node.level === 'repository') {
-      const raw = snapshot?.nodes.find((entity) => node.rawEntityIds.includes(entity.id));
-      repository = raw?.repository ?? EXTERNAL_REPOSITORY;
-      rootId = null;
-      band = 'module';
-    } else if (node.level === 'entity' && node.rawEntityIds.length === 1) {
-      rootId = node.rawEntityIds[0];
-      repository = '';
-    }
+    rootId = node.id;
   }
 
   function clearFocus() {
     rootId = null;
-    selectedId = null;
   }
 
   function returnToWorkspace() {
-    repository = '';
+    repositories = [];
     clearFocus();
-    band = 'repository';
   }
 
   function returnToRepository() {
     clearFocus();
-    band = 'module';
   }
 
   function selectAllRelations() {
     relationKinds = [...RELATION_KINDS];
+  }
+
+  function selectAllRepositories() {
+    repositories = [];
+    clearFocus();
+  }
+
+  function toggleRepository(identity: string) {
+    const next = repositories.includes(identity)
+      ? repositories.filter((repository) => repository !== identity)
+      : [...repositories, identity];
+    repositories = next.length === repositoryOptions.length ? [] : next;
+    clearFocus();
+  }
+
+  function toggleRelationKind(kind: RelationKind) {
+    relationKinds = relationKinds.includes(kind)
+      ? relationKinds.filter((selected) => selected !== kind)
+      : [...relationKinds, kind];
+  }
+
+  function toggleOrigin(origin: EntityOrigin) {
+    origins = origins.includes(origin)
+      ? origins.filter((selected) => selected !== origin)
+      : [...origins, origin];
+  }
+
+  function setDrawerWidth(side: 'filters' | 'inspector', width: number) {
+    const next = Math.min(MAX_DRAWER_WIDTH, Math.max(MIN_DRAWER_WIDTH, width));
+    if (side === 'filters') filtersWidth = next;
+    else inspectorWidth = next;
+  }
+
+  function startDrawerResize(event: PointerEvent, side: 'filters' | 'inspector') {
+    event.preventDefault();
+    const handle = event.currentTarget as HTMLButtonElement;
+    const startX = event.clientX;
+    const startWidth = side === 'filters' ? filtersWidth : inspectorWidth;
+    handle.setPointerCapture(event.pointerId);
+
+    const move = (next: PointerEvent) => {
+      const delta = side === 'filters' ? next.clientX - startX : startX - next.clientX;
+      setDrawerWidth(side, startWidth + delta);
+    };
+    const stop = (end: PointerEvent) => {
+      if (handle.hasPointerCapture(end.pointerId)) handle.releasePointerCapture(end.pointerId);
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', stop);
+      handle.removeEventListener('pointercancel', stop);
+    };
+
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', stop);
+    handle.addEventListener('pointercancel', stop);
+  }
+
+  function resizeDrawerWithKeyboard(event: KeyboardEvent, side: 'filters' | 'inspector') {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const direction = event.key === 'ArrowRight' ? 1 : -1;
+    const current = side === 'filters' ? filtersWidth : inspectorWidth;
+    setDrawerWidth(side, current + direction * (side === 'filters' ? 16 : -16));
   }
 </script>
 
@@ -145,10 +205,10 @@
 
     <nav class="breadcrumbs" aria-label="Graph location">
       <Button variant="ghost" onclick={returnToWorkspace}>Workspace</Button>
-      {#if repository}
+      {#if repositories.length}
         <span aria-hidden="true">/</span>
         <Button variant="ghost" onclick={returnToRepository}>
-          {snapshot?.workspace.repositories.find((item) => item.identity === repository)?.displayName ?? repository}
+          {repositoryLabel}
         </Button>
       {/if}
       {#if selectedEntity}
@@ -165,77 +225,126 @@
   </header>
 
   <main>
-    <aside class="filters" aria-label="Graph filters">
-      <div class="panel-heading">
-        <div><span class="eyebrow">Scope</span><h2>Workspace view</h2></div>
-        <Badge>{band}</Badge>
-      </div>
+    <details class="drawer filters" bind:open={filtersOpen} style:width={`${filtersWidth}px`}>
+      <summary>
+        <span class="drawer-heading"><span class="eyebrow">Filters</span><strong>Workspace view</strong></span>
+        <span class="drawer-label">Filters</span>
+        <i aria-hidden="true"></i>
+      </summary>
+      <div class="drawer-content">
+        <details class="filter-section" open>
+          <summary><span>Scope</span><i aria-hidden="true"></i></summary>
+          <div class="filter-section-content">
+            <label>
+              <span>Workspace</span>
+              <select value={selectedWorkspace} onchange={changeWorkspace}>
+                {#each workspaces as workspace}
+                  <option value={workspace.name}>{workspace.name}</option>
+                {/each}
+              </select>
+            </label>
 
-      <label>
-        <span>Workspace</span>
-        <select value={selectedWorkspace} onchange={changeWorkspace}>
-          {#each workspaces as workspace}
-            <option value={workspace.name}>{workspace.name}</option>
-          {/each}
-        </select>
-      </label>
+            <div class="repo-field">
+              <span>Repository</span>
+              <details class="multi-select">
+                <summary>{repositoryLabel}</summary>
+                <div class="multi-options">
+                  <label>
+                    <input type="checkbox" checked={repositories.length === 0} onchange={selectAllRepositories} />
+                    <span>All repositories</span>
+                  </label>
+                  {#each repositoryOptions as item}
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={repositories.includes(item.identity)}
+                        onchange={() => toggleRepository(item.identity)}
+                      />
+                      <span>{item.displayName}</span>
+                    </label>
+                  {/each}
+                </div>
+              </details>
+            </div>
+          </div>
+        </details>
 
-      <label>
-        <span>Repository</span>
-        <select bind:value={repository} onchange={clearFocus}>
-          <option value="">All repositories</option>
-          {#each snapshot?.workspace.repositories ?? [] as item}
-            <option value={item.identity}>{item.displayName}</option>
-          {/each}
-          {#if snapshot?.nodes.some((node) => node.repository === null)}
-            <option value={EXTERNAL_REPOSITORY}>External contracts</option>
-          {/if}
-        </select>
-      </label>
+        <details class="filter-section" open>
+          <summary><span>Relationship kind</span><i aria-hidden="true"></i></summary>
+          <div class="filter-section-content">
+            <button class="text-button select-all" onclick={selectAllRelations}>Select all</button>
+            <div class="filter-options" aria-label="Relationship kinds">
+              {#each RELATION_KINDS as kind}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  aria-pressed={relationKinds.includes(kind)}
+                  onclick={() => toggleRelationKind(kind)}
+                >
+                  {kind.replaceAll('_', ' ')}
+                </Button>
+              {/each}
+            </div>
+          </div>
+        </details>
 
-      <div class="field">
-        <div class="field-title">
-          <span>Relationship kind</span>
-          <button class="text-button" onclick={selectAllRelations}>Select all</button>
+        <details class="filter-section" open>
+          <summary><span>Origin</span><i aria-hidden="true"></i></summary>
+          <div class="filter-section-content">
+            <div class="filter-options" aria-label="Entity origins">
+              {#each ORIGINS as origin}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  aria-pressed={origins.includes(origin)}
+                  onclick={() => toggleOrigin(origin)}
+                >
+                  {origin.replaceAll('_', ' ')}
+                </Button>
+              {/each}
+            </div>
+          </div>
+        </details>
+
+        <Button
+          class="switch-button"
+          variant="outline"
+          role="switch"
+          aria-checked={includeTests}
+          onclick={() => (includeTests = !includeTests)}
+        >
+          <span class:enabled={includeTests} class="switch-track" aria-hidden="true"><span></span></span>
+          <span>Include tests</span>
+        </Button>
+
+        <div class="guard-note">
+          <span class="eyebrow">Render guard</span>
+          <strong>{MAX_VISIBLE_NODES.toLocaleString()} nodes · {MAX_VISIBLE_LINKS.toLocaleString()} links</strong>
+          <p>The full fixture stays loaded. Oversized projections stop here and ask for narrower filters.</p>
         </div>
-        <select multiple size="7" bind:value={relationKinds} aria-label="Relationship kinds">
-          {#each RELATION_KINDS as kind}
-            <option value={kind}>{kind.replaceAll('_', ' ')}</option>
-          {/each}
-        </select>
       </div>
-
-      <label>
-        <span>Origin</span>
-        <select multiple size="3" bind:value={origins} aria-label="Entity origins">
-          {#each ORIGINS as origin}
-            <option value={origin}>{origin.replaceAll('_', ' ')}</option>
-          {/each}
-        </select>
-      </label>
-
-      <label class="check-row">
-        <input type="checkbox" bind:checked={includeTests} />
-        <span>Include tests</span>
-      </label>
-
-      <div class="guard-note">
-        <span class="eyebrow">Render guard</span>
-        <strong>{MAX_VISIBLE_NODES.toLocaleString()} nodes · {MAX_VISIBLE_LINKS.toLocaleString()} links</strong>
-        <p>The full fixture stays loaded. Oversized projections stop here and ask for narrower filters.</p>
-      </div>
-    </aside>
+    </details>
+    {#if filtersOpen}
+      <button
+        class="drawer-resizer"
+        type="button"
+        aria-label="Resize filters panel"
+        title="Drag or use arrow keys to resize filters"
+        onpointerdown={(event) => startDrawerResize(event, 'filters')}
+        onkeydown={(event) => resizeDrawerWithKeyboard(event, 'filters')}
+      ></button>
+    {/if}
 
     <section class="workspace" aria-busy={loading}>
       <div class="graph-toolbar">
         <div>
-          <span class="eyebrow">{rootId ? 'Reachable topology' : 'Aggregated topology'}</span>
+          <span class="eyebrow">{rootId ? 'Relationship focus' : 'Workspace topology'}</span>
           <h1>{selectedEntity?.name ?? snapshot?.workspace.name ?? 'Loading graph'}</h1>
         </div>
-        <div class="legend" aria-label="Path colors">
+        <div class="legend" aria-label="Highlight colors">
+          <span><i class="selected"></i>Selected</span>
           <span><i class="upstream"></i>Upstream</span>
           <span><i class="downstream"></i>Downstream</span>
-          <span><i class="neutral"></i>Unfocused</span>
         </div>
         <div class="toolbar-actions">
           {#if rootId}<Button variant="outline" onclick={clearFocus}>Clear focus</Button>{/if}
@@ -250,8 +359,8 @@
             <strong>The loaded traversal is incomplete.</strong> Narrow the backend query before treating this view as complete.
           {:else}
             <strong>Visible graph truncated.</strong>
-            Omitted {projection.omittedNodes} nodes, {projection.omittedLinks} links, and
-            {projection.omittedAnimations} animations. Narrow repository, relationship, origin, tests, or zoom before continuing.
+            Omitted {projection.omittedNodes} nodes and {projection.omittedLinks} links.
+            Narrow repository, relationship, origin, or tests before continuing.
           {/if}
         </div>
       {/if}
@@ -262,50 +371,62 @@
         {:else if loading}
           <div class="empty"><span class="loader"></span><strong>Loading typed graph…</strong></div>
         {:else}
-          <GraphCanvas {projection} {band} onSelect={selectNode} onBandChange={(next) => (band = next)} />
-          <div class="zoom-hint">Zoom to expand · hover to inspect neighbours · click an entity to re-root</div>
+          <GraphCanvas {projection} selectedId={rootId} onSelect={selectNode} />
+          <div class="zoom-hint">Scroll to zoom · hover to preview · click an entity to keep its relationship flow</div>
         {/if}
       </div>
     </section>
 
-    <aside class="inspector" aria-label="Entity inspector">
-      <div class="panel-heading">
-        <div><span class="eyebrow">Inspector</span><h2>{selectedEntity ? 'Entity detail' : 'How to explore'}</h2></div>
+    {#if inspectorOpen}
+      <button
+        class="drawer-resizer"
+        type="button"
+        aria-label="Resize inspector panel"
+        title="Drag or use arrow keys to resize inspector"
+        onpointerdown={(event) => startDrawerResize(event, 'inspector')}
+        onkeydown={(event) => resizeDrawerWithKeyboard(event, 'inspector')}
+      ></button>
+    {/if}
+    <details class="drawer inspector" bind:open={inspectorOpen} style:width={`${inspectorWidth}px`}>
+      <summary>
+        <span class="drawer-heading"><span class="eyebrow">Inspector</span><strong>{selectedEntity ? 'Entity detail' : 'How to explore'}</strong></span>
+        <span class="drawer-label">Inspector</span>
+        <i aria-hidden="true"></i>
+      </summary>
+      <div class="drawer-content">
+        {#if selectedEntity}
+          <h3>{selectedEntity.name}</h3>
+          <code>{selectedEntity.id}</code>
+          <dl>
+            <div><dt>Kind</dt><dd>{selectedEntity.kind}</dd></div>
+            <div><dt>Origin</dt><dd>{selectedEntity.origin.replaceAll('_', ' ')}</dd></div>
+            <div><dt>Repository</dt><dd>{selectedEntity.repository ?? 'external'}</dd></div>
+            <div><dt>Test</dt><dd>{selectedEntity.test ? 'yes' : 'no'}</dd></div>
+          </dl>
+          <div class="relationships">
+            <span class="eyebrow">Incident evidence</span>
+            {#each selectedEdges as edge}
+              <article>
+                <div><Badge>{edge.kind}</Badge><span>{edge.from === rootId ? 'downstream' : 'upstream'}</span></div>
+                <strong>{snapshot?.nodes.find((node) => node.id === (edge.from === rootId ? edge.to : edge.from))?.name}</strong>
+                {#if edge.evidence[0]?.path}
+                  <small>{edge.evidence[0].path}:{edge.evidence[0].line ?? '—'}</small>
+                {/if}
+              </article>
+            {/each}
+          </div>
+        {:else}
+          <div class="instructions">
+            <div><span>01</span><p>Start with the typed entities across the fixture workspace.</p></div>
+            <div><span>02</span><p>Use repository, relationship, origin, and test filters to narrow the topology.</p></div>
+            <div><span>03</span><p>Select an entity to persist its direct neighbours and directional relationship flow.</p></div>
+          </div>
+          <div class="interaction-key">
+            <p><strong>Hover</strong> highlights direct neighbours and incident links.</p>
+            <p><strong>Select</strong> persists upstream/downstream neighbours and relationship flow.</p>
+          </div>
+        {/if}
       </div>
-
-      {#if selectedEntity}
-        <div class="entity-icon">{selectedEntity.kind.slice(0, 2).toUpperCase()}</div>
-        <h3>{selectedEntity.name}</h3>
-        <code>{selectedEntity.id}</code>
-        <dl>
-          <div><dt>Kind</dt><dd>{selectedEntity.kind}</dd></div>
-          <div><dt>Origin</dt><dd>{selectedEntity.origin.replaceAll('_', ' ')}</dd></div>
-          <div><dt>Repository</dt><dd>{selectedEntity.repository ?? 'external'}</dd></div>
-          <div><dt>Test</dt><dd>{selectedEntity.test ? 'yes' : 'no'}</dd></div>
-        </dl>
-        <div class="relationships">
-          <span class="eyebrow">Incident evidence</span>
-          {#each selectedEdges as edge}
-            <article>
-              <div><Badge>{edge.kind}</Badge><span>{edge.from === rootId ? 'downstream' : 'upstream'}</span></div>
-              <strong>{snapshot?.nodes.find((node) => node.id === (edge.from === rootId ? edge.to : edge.from))?.name}</strong>
-              {#if edge.evidence[0]?.path}
-                <small>{edge.evidence[0].path}:{edge.evidence[0].line ?? '—'}</small>
-              {/if}
-            </article>
-          {/each}
-        </div>
-      {:else}
-        <div class="instructions">
-          <div><span>01</span><p>Start with repositories bundled across the fixture workspace.</p></div>
-          <div><span>02</span><p>Zoom to reconnect topology through modules, files, types, and functions.</p></div>
-          <div><span>03</span><p>Select an entity to show every reachable upstream and downstream path.</p></div>
-        </div>
-        <div class="interaction-key">
-          <p><strong>Hover</strong> highlights direct neighbours and incident links.</p>
-          <p><strong>Select</strong> persists the outline and animates only emphasized links.</p>
-        </div>
-      {/if}
-    </aside>
+    </details>
   </main>
 </div>

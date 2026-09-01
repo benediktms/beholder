@@ -2,63 +2,73 @@
   import ForceGraph from 'force-graph';
   import { onMount } from 'svelte';
   import {
-    endpointId,
-    zoomBand,
+    MAX_ANIMATED_LINKS,
+    directHighlight,
+    labelOpacity,
+    nodeValue,
     type GraphLink,
     type GraphNode,
-    type Projection,
-    type ZoomBand
+    type Projection
   } from './graph';
 
   let {
     projection,
-    band,
-    onSelect,
-    onBandChange
+    selectedId,
+    onSelect
   }: {
     projection: Projection;
-    band: ZoomBand;
+    selectedId: string | null;
     onSelect: (node: GraphNode | null) => void;
-    onBandChange: (band: ZoomBand) => void;
   } = $props();
 
   let container: HTMLDivElement;
   let graph: ForceGraph<GraphNode, GraphLink> | null = null;
+  let initialFitPending = true;
   let hoveredId = $state<string | null>(null);
-  let hoveredNodes = new Set<string>();
-  let hoveredLinks = new Set<string>();
   let keyboardIndex = $state(-1);
+  let activeId: string | null = null;
+  let highlightedUpstreamNodes = new Set<string>();
+  let highlightedDownstreamNodes = new Set<string>();
+  let highlightedUpstreamLinks = new Set<string>();
+  let highlightedDownstreamLinks = new Set<string>();
+  const selectedStrength = new Map<string, number>();
+  const upstreamNodeStrength = new Map<string, number>();
+  const downstreamNodeStrength = new Map<string, number>();
+  const upstreamLinkStrength = new Map<string, number>();
+  const downstreamLinkStrength = new Map<string, number>();
+  let transitionFrame: number | null = null;
 
   onMount(() => {
     graph = new ForceGraph<GraphNode, GraphLink>(container)
       .backgroundColor('#080b12')
       .nodeId('id')
-      .nodeVal((node) => Math.max(1.5, Math.log2(node.count + 1) * 2.2))
-      .nodeLabel((node) => `${node.label} · ${node.count} ${node.count === 1 ? 'entity' : 'entities'}`)
-      .nodeColor(nodeColor)
+      .nodeRelSize(4)
+      .nodeVal((node) => nodeValue(node.degree))
+      .nodeLabel((node) => node.label)
+      .nodeColor('#3388bb')
+      .nodePointerAreaPaint(drawNodePointerArea)
       .nodeCanvasObjectMode(() => 'after')
       .nodeCanvasObject(drawNodeOverlay)
+      .onRenderFramePre(drawHighlightHalos)
       .linkLabel((link) => `${link.kind} · ${link.count} relationship${link.count === 1 ? '' : 's'}`)
       .linkColor(linkColor)
-      .linkWidth((link) => (emphasized(link) ? 2.2 : Math.min(1.6, 0.5 + link.count * 0.18)))
-      .linkLineDash((link) => (link.direction === 'neutral' ? null : [2, 5]))
-      .linkDirectionalArrowLength(3.5)
+      .linkWidth((link) => 0.7 + linkHighlight(link.id) * 3.3)
+      .linkDirectionalArrowLength((link) => 2.5 + linkHighlight(link.id) * 2.5)
       .linkDirectionalArrowRelPos(0.88)
       .linkDirectionalArrowColor(linkColor)
-      .linkDirectionalParticles((link) => (emphasized(link) ? 2 : 0))
-      .linkDirectionalParticleColor(linkColor)
+      .linkDirectionalParticles((link) => (linkHighlight(link.id) > 0.01 ? 4 : 0))
+      .linkDirectionalParticleColor(() => '#e2e8f0')
       .linkDirectionalParticleSpeed(0.006)
-      .linkDirectionalParticleWidth(2)
-      .onNodeHover(setHover)
-      .onNodeClick((node) => {
-        onSelect(node);
-        if (node.x !== undefined && node.y !== undefined) graph?.centerAt(node.x, node.y, 380);
-      })
+      .linkDirectionalParticleWidth((link) => linkHighlight(link.id) * 3.5)
+      .onNodeHover((node) => (hoveredId = node?.id ?? null))
+      .onNodeClick(onSelect)
       .onBackgroundClick(() => onSelect(null))
-      .onZoomEnd(({ k }) => {
-        const next = zoomBand(k);
-        if (next !== band) onBandChange(next);
+      .onEngineStop(() => {
+        if (!initialFitPending || !graph?.graphData().nodes.length) return;
+        initialFitPending = false;
+        graph.zoomToFit(400, 36);
       })
+      .autoPauseRedraw(false)
       .cooldownTicks(140);
 
     const resize = new ResizeObserver(([entry]) => {
@@ -66,9 +76,9 @@
     });
     resize.observe(container);
     updateData(projection);
-    graph.zoom(0.55);
     return () => {
       resize.disconnect();
+      if (transitionFrame !== null) cancelAnimationFrame(transitionFrame);
       graph?._destructor();
       graph = null;
     };
@@ -80,20 +90,15 @@
   });
 
   $effect(() => {
-    const requestedBand = band;
-    if (graph && zoomBand(graph.zoom()) !== requestedBand) {
-      graph.zoom({ repository: 0.55, module: 1, file: 2, entity: 3.5 }[requestedBand], 350);
-    }
+    const nextActiveId = hoveredId ?? selectedId;
+    if (graph) setHighlight(nextActiveId);
   });
 
   function updateData(next: Projection) {
     if (!graph) return;
-    const previousByEntity = new Map<string, GraphNode>();
-    for (const node of graph.graphData().nodes) {
-      for (const rawId of node.rawEntityIds) previousByEntity.set(rawId, node);
-    }
+    const previousById = new Map(graph.graphData().nodes.map((node) => [node.id, node]));
     for (const node of next.nodes) {
-      const previous = node.rawEntityIds.map((id) => previousByEntity.get(id)).find(Boolean);
+      const previous = previousById.get(node.id);
       if (previous?.x !== undefined && previous.y !== undefined) {
         node.x = previous.x;
         node.y = previous.y;
@@ -101,27 +106,70 @@
     }
     hoveredId = null;
     keyboardIndex = -1;
-    hoveredNodes = new Set();
-    hoveredLinks = new Set();
     graph.graphData({ nodes: next.nodes, links: next.links }).d3ReheatSimulation();
+    setHighlight(selectedId);
   }
 
-  function setHover(node: GraphNode | null) {
-    hoveredId = node?.id ?? null;
-    hoveredNodes = new Set(node ? [node.id] : []);
-    hoveredLinks = new Set();
-    if (node) {
-      for (const link of projection.links) {
-        const source = endpointId(link.source);
-        const target = endpointId(link.target);
-        if (source === node.id || target === node.id) {
-          hoveredLinks.add(link.id);
-          hoveredNodes.add(source);
-          hoveredNodes.add(target);
-        }
-      }
+  function setHighlight(id: string | null) {
+    activeId = id;
+    const next = directHighlight(projection.links, id);
+    highlightedUpstreamNodes = next.upstreamNodeIds;
+    highlightedDownstreamNodes = next.downstreamNodeIds;
+    highlightedUpstreamLinks = new Set(
+      [...next.upstreamLinkIds].slice(0, MAX_ANIMATED_LINKS)
+    );
+    highlightedDownstreamLinks = new Set(
+      [...next.downstreamLinkIds].slice(
+        0,
+        MAX_ANIMATED_LINKS - highlightedUpstreamLinks.size
+      )
+    );
+    startTransition();
+  }
+
+  function startTransition() {
+    if (transitionFrame !== null) return;
+    transitionFrame = requestAnimationFrame(animateHighlight);
+  }
+
+  function animateHighlight() {
+    let unsettled = false;
+    for (const node of projection.nodes) {
+      unsettled = tween(selectedStrength, node.id, node.id === activeId ? 1 : 0) || unsettled;
+      unsettled = tween(
+        upstreamNodeStrength,
+        node.id,
+        highlightedUpstreamNodes.has(node.id) ? 1 : 0
+      ) || unsettled;
+      unsettled = tween(
+        downstreamNodeStrength,
+        node.id,
+        highlightedDownstreamNodes.has(node.id) ? 1 : 0
+      ) || unsettled;
     }
-    refreshStyles();
+    for (const link of projection.links) {
+      unsettled = tween(
+        upstreamLinkStrength,
+        link.id,
+        highlightedUpstreamLinks.has(link.id) ? 1 : 0
+      ) || unsettled;
+      unsettled = tween(
+        downstreamLinkStrength,
+        link.id,
+        highlightedDownstreamLinks.has(link.id) ? 1 : 0
+      ) || unsettled;
+    }
+    transitionFrame = unsettled ? requestAnimationFrame(animateHighlight) : null;
+  }
+
+  function tween(values: Map<string, number>, id: string, target: number): boolean {
+    const current = strength(values, id);
+    if (Math.abs(target - current) < 0.01) {
+      values.set(id, target);
+      return false;
+    }
+    values.set(id, current + (target - current) * 0.16);
+    return true;
   }
 
   function handleKeydown(event: KeyboardEvent) {
@@ -130,45 +178,64 @@
       event.preventDefault();
       const step = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1;
       keyboardIndex = (keyboardIndex + step + projection.nodes.length) % projection.nodes.length;
-      setHover(projection.nodes[keyboardIndex]);
+      hoveredId = projection.nodes[keyboardIndex].id;
     } else if (event.key === 'Enter' && keyboardIndex >= 0) {
       onSelect(projection.nodes[keyboardIndex]);
     } else if (event.key === 'Escape') {
       keyboardIndex = -1;
-      setHover(null);
+      hoveredId = null;
+      onSelect(null);
     }
   }
 
-  function refreshStyles() {
-    graph
-      ?.nodeColor(nodeColor)
-      .linkColor(linkColor)
-      .linkWidth((link) => (emphasized(link) ? 2.2 : Math.min(1.6, 0.5 + link.count * 0.18)))
-      .linkDirectionalParticles((link) => (emphasized(link) ? 2 : 0));
+  function strength(values: Map<string, number>, id: string): number {
+    return values.get(id) ?? 0;
   }
 
-  function emphasized(link: GraphLink): boolean {
-    return hoveredId ? hoveredLinks.has(link.id) : link.animated;
-  }
-
-  function nodeColor(node: GraphNode): string {
-    if (hoveredId && !hoveredNodes.has(node.id)) return 'rgba(51, 65, 85, 0.25)';
-    if (node.direction === 'upstream') return '#5eead4';
-    if (node.direction === 'downstream') return '#fb7185';
-    if (node.direction === 'both') return '#f8fafc';
-    if (node.level === 'repository') return '#7dd3fc';
-    if (node.level === 'module') return '#fbbf24';
-    if (node.level === 'file') return '#c4b5fd';
-    return '#94a3b8';
+  function linkHighlight(id: string): number {
+    return Math.min(
+      1,
+      strength(upstreamLinkStrength, id) + strength(downstreamLinkStrength, id)
+    );
   }
 
   function linkColor(link: GraphLink): string {
-    if (hoveredId && !hoveredLinks.has(link.id)) return 'rgba(51, 65, 85, 0.16)';
-    if (link.direction === 'upstream') return '#2dd4bf';
-    if (link.direction === 'downstream') return '#fb7185';
-    if (link.direction === 'both') return '#e2e8f0';
-    if (link.selected) return '#f8fafc';
-    return 'rgba(100, 116, 139, 0.58)';
+    const upstream = strength(upstreamLinkStrength, link.id);
+    const downstream = strength(downstreamLinkStrength, link.id);
+    const base = Math.max(0, 1 - upstream - downstream);
+    const weight = base + upstream + downstream;
+    const red = Math.round((203 * base + 45 * upstream + 245 * downstream) / weight);
+    const green = Math.round((213 * base + 212 * upstream + 158 * downstream) / weight);
+    const blue = Math.round((225 * base + 191 * upstream + 11 * downstream) / weight);
+    return `rgba(${red}, ${green}, ${blue}, ${0.28 + linkHighlight(link.id) * 0.62})`;
+  }
+
+  function drawHighlightHalos(context: CanvasRenderingContext2D, scale: number) {
+    for (const node of graph?.graphData().nodes ?? []) {
+      if (node.x === undefined || node.y === undefined) continue;
+      const nodeRadius = Math.sqrt(nodeValue(node.degree)) * 4;
+      const upstream = strength(upstreamNodeStrength, node.id);
+      const downstream = strength(downstreamNodeStrength, node.id);
+      const selected = strength(selectedStrength, node.id);
+      if (upstream > 0) {
+        context.beginPath();
+        context.arc(node.x, node.y, nodeRadius + 6 / scale, 0, 2 * Math.PI);
+        context.fillStyle = `rgba(45, 212, 191, ${upstream})`;
+        context.fill();
+      }
+      if (downstream > 0) {
+        context.beginPath();
+        context.arc(node.x, node.y, nodeRadius + 4 / scale, 0, 2 * Math.PI);
+        context.fillStyle = `rgba(245, 158, 11, ${downstream})`;
+        context.fill();
+      }
+      if (selected > 0) {
+        context.beginPath();
+        context.arc(node.x, node.y, nodeRadius + 4 / scale, 0, 2 * Math.PI);
+        context.fillStyle = `rgba(239, 68, 68, ${selected})`;
+        context.fill();
+      }
+    }
   }
 
   function drawNodeOverlay(
@@ -177,21 +244,41 @@
     scale: number
   ) {
     if (node.x === undefined || node.y === undefined) return;
-    const radius = Math.sqrt(Math.max(1.5, Math.log2(node.count + 1) * 2.2)) * 4;
-    if (node.selected) {
-      context.beginPath();
-      context.arc(node.x, node.y, radius + 3 / scale, 0, 2 * Math.PI);
-      context.strokeStyle = '#ffffff';
-      context.lineWidth = 2.4 / scale;
-      context.stroke();
-    }
-    if (node.level === 'entity' && !node.selected && hoveredId !== node.id) return;
+    const radius = Math.sqrt(nodeValue(node.degree)) * 4;
+    const opacity = labelOpacity(
+      scale,
+      Math.max(
+        strength(selectedStrength, node.id),
+        strength(upstreamNodeStrength, node.id),
+        strength(downstreamNodeStrength, node.id)
+      )
+    );
+    if (opacity < 0.01) return;
     const fontSize = 11 / scale;
     context.font = `600 ${fontSize}px Inter, ui-sans-serif, system-ui`;
     context.textAlign = 'center';
     context.textBaseline = 'top';
-    context.fillStyle = hoveredId && !hoveredNodes.has(node.id) ? '#475569' : '#e2e8f0';
+    context.fillStyle = `rgba(226, 232, 240, ${opacity})`;
     context.fillText(node.label, node.x, node.y + radius + 4 / scale);
+  }
+
+  function drawNodePointerArea(
+    node: GraphNode,
+    color: string,
+    context: CanvasRenderingContext2D,
+    scale: number
+  ) {
+    if (node.x === undefined || node.y === undefined) return;
+    context.beginPath();
+    context.arc(
+      node.x,
+      node.y,
+      Math.max(Math.sqrt(nodeValue(node.degree)) * 4, 8 / scale),
+      0,
+      2 * Math.PI
+    );
+    context.fillStyle = color;
+    context.fill();
   }
 </script>
 

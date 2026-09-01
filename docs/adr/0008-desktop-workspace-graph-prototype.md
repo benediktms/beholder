@@ -10,11 +10,10 @@ workspace from its broad structure down to a local dependency neighbourhood.
 The interaction model is uncertain enough that an executable prototype is more
 useful than committing to a production backend contract first.
 
-The prototype needs to open on an aggregated workspace graph, narrow to a
-repository, expand modules into files and typed entities as the user zooms, and
-re-root around a selected entity. A re-rooted graph includes every reachable
-upstream and downstream entity. Direction must remain legible while selection
-and hover emphasize the active neighbourhood.
+The prototype needs to open on a workspace's typed semantic graph, narrow to a
+repository, and inspect a selected entity without changing the graph topology
+or force layout. Direction must remain legible while selection and hover
+emphasize the direct neighbourhood.
 
 ## Decision
 
@@ -30,19 +29,17 @@ existing entity and semantic-edge DTOs with explicit truncation metadata.
 
 The UI:
 
-1. opens on aggregated workspace repositories and modules;
+1. opens on the workspace's typed entities;
 2. filters to a repository;
-3. expands topology through repository, module, file, and entity zoom bands;
-4. re-roots on selection around all reachable upstream and downstream nodes;
-5. colors upstream and downstream paths differently;
-6. uses animated directional particles only on emphasized links;
-7. highlights the selected node, direct neighbours, and incident edges; and
-8. limits filters to repository, relationship kind, tests, and origin.
+3. persistently highlights the selected node, direct neighbours, and incident edges;
+4. uses animated directional particles on the selected node's incident links;
+5. sizes nodes by their visible relationship count; and
+6. limits filters to repository, relationship kind, tests, and origin.
 
-Visible node, link, and animation guards protect the renderer without changing
-all-reachable traversal semantics. When a projection exceeds a guard, the UI
-keeps the nearest topology deterministically, reports omissions, and asks the
-user to narrow the basic filters.
+Visible node and link guards protect the renderer. When a projection exceeds a
+guard, the UI keeps a deterministic subset, reports omissions, and asks the
+user to narrow the basic filters. The animation guard caps selected incident
+links without changing topology.
 
 Do not add entity search, persisted layouts, graph editing, daemon lifecycle
 management, a generic renderer abstraction, or a new backend API to this slice.
@@ -58,7 +55,7 @@ SvelteKit view
     -> existing Unix-socket gRPC daemon
     -> revision-consistent SemanticStore snapshot
     -> existing typed query DTO
-    -> client-side filter and aggregation
+    -> client-side filtering and reachability
     -> force-graph
 ```
 
@@ -66,9 +63,9 @@ The ownership boundaries are explicit in the current code:
 
 | Surface | Existing contract | Production use |
 | --- | --- | --- |
-| Workspace | `ListWorkspaces` returns names and selected repositories ([proto](../../proto/beholder/v1/daemon.proto#L333-L377)); the client exposes `list_workspaces` ([client](../../crates/daemon-client/src/lib.rs#L447-L457)). | Workspace picker and virtual workspace/repository grouping nodes. |
+| Workspace | `ListWorkspaces` returns names and selected repositories ([proto](../../proto/beholder/v1/daemon.proto#L333-L377)); the client exposes `list_workspaces` ([client](../../crates/daemon-client/src/lib.rs#L447-L457)). | Workspace picker and repository filter. |
 | Repository | `GetRepository` returns revision and indexing status ([proto](../../proto/beholder/v1/daemon.proto#L379-L411)); the client exposes `get_repository` ([client](../../crates/daemon-client/src/lib.rs#L422-L435)). | Optional freshness detail in the inspector; not a graph query. |
-| Entity | `EntityRef` already carries stable ID, kind, display name, repository, origin, test flag, and typed metadata ([DTO](../../crates/dto/src/lib.rs#L245-L254)). | Raw leaf node. No second entity model in Rust. |
+| Entity | `EntityRef` already carries stable ID, kind, display name, repository, origin, test flag, and typed metadata ([DTO](../../crates/dto/src/lib.rs#L245-L254)). | Graph node. No second entity model in Rust. |
 | Relationship | `SemanticEdge` already carries direction, closed relation kind, confidence, and evidence ([DTO](../../crates/dto/src/lib.rs#L256-L359)). | Raw directed link and inspector evidence. |
 | Direct context | `context(workspace, entity)` returns incoming and outgoing incident edges ([client](../../crates/daemon-client/src/lib.rs#L253-L263), [mapper](../../crates/adapters-mnestic/src/semantic.rs#L21-L58)). | One-hop detail refresh after selection, if needed. |
 | Downstream | `dependencies(workspace, entity, max_hops)` returns the outgoing reachable subgraph and hop counts ([client](../../crates/daemon-client/src/lib.rs#L265-L280), [mapper](../../crates/adapters-mnestic/src/semantic.rs#L60-L92)). | “Downstream” mode. |
@@ -85,7 +82,7 @@ that boundary.
 
 Two details prevent accidental contract drift:
 
-- Workspace and repository are view/ownership metadata, not semantic entities. Add them only as UI-owned virtual grouping nodes; do not publish fake semantic facts.
+- Workspace and repository are view/ownership metadata, not semantic entities. Use them for selection and filtering; do not publish fake semantic facts.
 - Query edge IDs (`e1`, `e2`, and so on) are response-local. Client merges must key a raw relationship by `(from, to, kind)` and merge evidence, not treat the returned edge ID as durable identity.
 
 #### Current gaps that the prototype must expose rather than hide
@@ -106,14 +103,14 @@ Two details prevent accidental contract drift:
 
 All four candidates are framework-agnostic browser libraries and can be created after Svelte mount in a Tauri webview. Tauri's official SvelteKit guidance requires a static adapter, SPA mode, and disabled SSR, which also avoids browser-global checks for these renderers ([Tauri SvelteKit guide](https://v2.tauri.app/start/frontend/sveltekit/)).
 
-| Renderer | Force layout | Zoom-time topology changes | Direction and animation | Selection | Large graph posture | Decision |
+| Renderer | Force layout | Data updates | Direction and animation | Selection | Large graph posture | Decision |
 | --- | --- | --- | --- | --- | --- | --- |
-| [`force-graph`](https://github.com/vasturiano/force-graph) | Built-in `d3-force`, configurable and reheatable. | `graphData()` supports incremental updates; `onZoomEnd` exposes scale. | Native arrowheads and moving `source -> target` particles. | Click/hover callbacks plus documented highlight and multi-select examples. | Canvas renderer with official ~4k and ~75k element examples; CPU simulation is the ceiling. | **Choose.** Meets every prototype interaction with one dependency and no custom renderer. |
+| [`force-graph`](https://github.com/vasturiano/force-graph) | Built-in `d3-force`, configurable and reheatable. | `graphData()` supports incremental updates. | Native arrowheads and moving `source -> target` particles. | Click/hover callbacks plus documented highlight and multi-select examples. | Canvas renderer with official ~4k and ~75k element examples; CPU simulation is the ceiling. | **Choose.** Meets every prototype interaction with one dependency and no custom renderer. |
 | [Cytoscape.js](https://js.cytoscape.org/) | Built-in CoSE and extension layouts. | Mature add/remove, events, classes, and zoom API. | Arrow styles are native; moving dashed edges require repeatedly changing `line-dash-offset`. | Best built-in selection/state model of the shortlist. | Canvas docs warn that edges, arrows, labels, and animation degrade on large graphs ([performance notes](https://js.cytoscape.org/#performance)). | Viable fallback if editing/compound graph UX becomes more important than reachability scale. More machinery for this read-only prototype. |
 | [Sigma.js](https://www.sigmajs.org/docs/) + Graphology | ForceAtlas2 is available as a separate layout/worker. | Graphology mutations trigger refresh; camera state is available. | Native arrow program, but moving directional edges require a custom WebGL program or extra layer ([renderer model](https://www.sigmajs.org/docs/advanced/renderers/)). | Reducers are a good highlighting mechanism. | WebGL library explicitly aimed at thousands of nodes and edges. | Reject for prototype: it turns one explicit requirement into custom rendering and adds Graphology plus layout wiring. |
 | [`@cosmograph/cosmograph`](https://cosmograph.app/docs-lib/) | Native GPU force simulation. | Hot add/remove APIs and zoom control are documented ([hot updates](https://cosmograph.app/docs-lib/features/data-update/)). | Native arrowheads, but no documented moving directional particle/flow primitive. | Native point/link selection and highlighting. | Strongest large-graph option, with Arrow-oriented advanced input. | Reject for prototype: heavier data preparation and custom animation would be required. Revisit only after a measured `force-graph` ceiling. |
 
-`force-graph` directly documents the required primitives: incremental `graphData`, directional arrows and particles, force configuration, click/hover handlers, and zoom-end callbacks in its [API](https://github.com/vasturiano/force-graph#api-reference). Its large example is evidence that the renderer is worth prototyping, not a Beholder performance guarantee.
+`force-graph` directly documents the required primitives: incremental `graphData`, directional arrows and particles, force configuration, and click/hover handlers in its [API](https://github.com/vasturiano/force-graph#api-reference). Its large example is evidence that the renderer is worth prototyping, not a Beholder performance guarantee.
 
 ### Prototype data contract
 
@@ -127,12 +124,9 @@ The frontend derives renderer input as a view model, not a transport contract:
 
 ```ts
 type GraphNode = {
-  id: string;                 // raw entity ID or virtual ui:<level>:<key>
+  id: string;                 // raw entity ID
   label: string;
-  level: 'workspace' | 'repository' | 'file' | 'scope' | 'entity';
-  rawEntityIds: string[];
-  count: number;
-  selected: boolean;
+  degree: number;
 };
 
 type GraphLink = {
@@ -142,58 +136,37 @@ type GraphLink = {
   count: number;
   confidence: number;         // maximum confidence among bundled raw edges
   evidenceCount: number;
-  selected: boolean;
 };
 ```
 
 Keep the original DTO arrays alongside this projection so selection can show exact entity metadata and evidence without another backend call.
 
-### Aggregation and semantic zoom rules
+### Projection rules
 
-Build one deterministic projection from the immutable graph snapshot at four
-detail levels. Never rewrite the underlying semantic graph.
+Build one deterministic projection from the immutable graph snapshot. Every
+visible entity remains a node at every camera scale; zoom changes only the
+viewport and never changes graph topology.
 
-1. **Repository:** group the workspace by `EntityRef.repository`; unowned
-   entities remain in an external group.
-2. **Module:** group source scopes and the entities they define.
-3. **File:** derive containment from structural edges and evidence paths;
-   ambiguous entities remain in a deterministic fallback bucket.
-4. **Entity:** show raw typed entities, including callables, operations, RPCs,
-   messages, topics, and services.
+Show raw typed entities, including callables, operations, RPCs, messages,
+topics, and services. Bundle only parallel edges with the same
+`(source, target, RelationKind)` while preserving raw edge IDs, evidence count,
+and maximum confidence. Drop self-links. Structural edges remain available as
+ordinary visible relationships when their filter is enabled.
 
-At each level, map every raw endpoint to its visible ancestor. Bundle only
-edges with the same visible `(source, target, RelationKind)`. Drop visible
-self-links but retain their count on the aggregate node as `internalEdges`.
-Structural edges establish containment; dependency, contract, RPC, GraphQL,
-and messaging edges remain visible between containers.
+### Highlight semantics
 
-Use zoom bands with hysteresis, recalculating only on `onZoomEnd` when a boundary is crossed:
+Selection is renderer state, not a projection input. Clicking a node must not
+replace `graphData`, reheat the force simulation, remove unrelated nodes, or
+move the camera.
 
-| Relative zoom `k` | Visible level |
-| --- | --- |
-| `< 0.75` | repository |
-| `0.75 .. < 1.5` | module |
-| `1.5 .. < 3` | file |
-| `>= 3` | raw entity |
+- every node retains a blue base color;
+- the selected node receives a red halo, upstream neighbours receive teal halos, and downstream neighbours receive orange halos;
+- incident links widen and emit particles from `source` to `target`;
+- node area scales with visible incident edge count, with degree-zero and degree-one nodes kept at the smallest size; and
+- highlight strengths interpolate so halos, links, and particles fade between states.
 
-These are calibration defaults, not a backend contract. Recalculate only after
-a zoom boundary is crossed, update `graphData`, and briefly reheat the force
-simulation.
-
-### Traversal semantics
-
-Selecting a raw entity re-roots the projection. The client mirrors the
-backend's relation-aware traversal rules for non-structural edges:
-
-- **Downstream** follows `from` to `to` and answers what the entity depends on.
-- **Upstream** normally follows incoming edges. When it reaches a `grpc://`
-  operation, it also follows that operation's `implemented_by` edge forward to
-  the concrete server implementation. This preserves the existing `impact`
-  contract that a Protobuf contract reaches both clients and servers.
-- A node or edge reachable in both directions uses a combined visual state.
-
-The traversal has no semantic hop limit. Render guards may omit distant visible
-topology, but the omission is explicit and does not redefine reachability.
+Hover temporarily previews the same direct neighbourhood. Moving away restores
+the clicked selection; clicking the background or **Clear focus** removes it.
 
 ### Minimal controls and filters
 
@@ -204,15 +177,14 @@ The prototype needs only:
 - include tests; and
 - origin: source, generated, external dependency.
 
-Filtering happens after the typed response is received. After filtering edges,
-retain only nodes still reachable from the selected root so the renderer does
-not show unexplained islands. No text search, saved views, confidence slider,
-time travel, ownership filter, minimap, or layout selector belongs in this
-prototype.
+Filtering happens after the typed response is received. Retain every node that
+passes the node filters, including nodes disconnected by relationship filters.
+No text search, saved views, confidence slider, time travel, ownership filter,
+minimap, or layout selector belongs in this prototype.
 
-Selection highlights the chosen aggregate/raw node, its incident visible edges,
-and neighbouring nodes; everything else is dimmed. Directional particles are
-limited by the animation guard.
+Selection highlights the chosen raw node and animates its incident visible
+edges in source-to-target direction. Directional particles are limited by the
+animation guard.
 
 ### Representative validation fixture
 
@@ -223,11 +195,12 @@ a claim about live workspace contents.
 
 The acceptance pass is:
 
-1. repository -> module -> file -> entity expansion occurs only when zoom bands change;
-2. selecting an aggregate highlights all represented raw IDs and the inspector shows exact evidence;
-3. selecting an entity shows all upstream and downstream reachable topology;
-4. tests, origins, repositories, and relation kinds filter without breaking connectivity; and
-5. the graph remains interactive at the prototype render guard below.
+1. zooming and panning never changes the visible semantic topology;
+2. selection leaves node and link identity, position, and force state unchanged;
+3. selected, upstream, and downstream nodes fade to red, teal, and orange halos while direct relationships animate in source-to-target direction;
+4. node size increases with visible incident edge count and degree-one nodes remain small;
+5. tests, origins, repositories, and relation kinds filter deterministically; and
+6. the graph remains interactive at the prototype render guard below.
 
 ### Known ceilings and stop conditions
 
@@ -247,10 +220,10 @@ renderer performance.
 
 - maximum 10,000 visible nodes;
 - maximum 25,000 visible links;
-- maximum 250 simultaneously animated links, with the normal case limited to the selected edge/path; and
-- labels only for selected/hovered nodes below file level.
+- maximum 250 simultaneously animated links, limited to the selected node's incident links; and
+- labels fade in between relative camera scales `1.1` and `1.5`; selected and directly highlighted nodes remain labelled below that range.
 
-When a projection exceeds a guard, keep the nearest-hop nodes deterministically
+When a projection exceeds a guard, keep nodes and links deterministically by ID
 and show how many were omitted; ask the user to narrow repositories, relations,
 tests, or origins. Revisit Cosmograph or Sigma only if the query is healthy and
 a measured renderer profile, not graph size alone, shows the canvas/CPU ceiling.
@@ -266,7 +239,7 @@ apps/graph-ui/
 ├── vite.config.ts
 ├── src/
 │   ├── lib/
-│   │   ├── graph.ts             # reachability, filters, projection, guards
+│   │   ├── graph.ts             # filters, projection, direct highlights, guards
 │   │   └── GraphCanvas.svelte   # force-graph lifecycle and interactions
 │   └── routes/
 │       ├── +layout.ts           # export const ssr = false
@@ -286,9 +259,9 @@ and package scripts authoritative for Svelte. Do not create a shared UI crate,
 renderer adapter interface, graph service, global store, or component library
 for one screen.
 
-The smallest checks cover edge bundling, all-reachable re-rooting, containment
-projection, and visible guards, followed by Svelte type-check/build and a Tauri
-Rust check.
+The smallest checks cover edge bundling, degree sizing inputs, direct
+highlights, stable disconnected nodes, and visible guards, followed by Svelte
+type-check/build and a Tauri Rust check.
 
 ## Consequences
 
@@ -297,7 +270,7 @@ Rust check.
 - `force-graph` supplies the required interaction primitives with one renderer
   dependency, but its CPU simulation needs explicit visible guards.
 - Production integration is a separate decision after the prototype proves the
-  workspace-to-neighbourhood interaction.
+  stable workspace-neighbourhood interaction.
 - A different renderer is justified only by a measured rendering bottleneck.
 
 ## Sources
