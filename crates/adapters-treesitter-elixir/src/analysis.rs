@@ -690,20 +690,20 @@ pub(super) fn call_observations(
     for function in functions {
         let function_id = format!("{module_id}/{}/{}", function.name, function.arity);
         let mut targets = BTreeSet::new();
+        let target_for = |target_module: Option<&str>, name: &str, arity: usize| {
+            let candidate = target_module.map_or_else(
+                || format!("{module_id}/{name}/{arity}"),
+                |module| format!("repo://{repository}/elixir/{module}/{name}/{arity}"),
+            );
+            if definitions.contains(&candidate) {
+                candidate
+            } else if let Some(module) = target_module {
+                format!("elixir-call://{module}/{name}/{arity}")
+            } else {
+                format!("elixir-call://{name}/{arity}")
+            }
+        };
         for call in &function.calls {
-            let target_for = |target_module: Option<&str>, name: &str, arity: usize| {
-                let candidate = target_module.map_or_else(
-                    || format!("{module_id}/{name}/{arity}"),
-                    |module| format!("repo://{repository}/elixir/{module}/{name}/{arity}"),
-                );
-                if definitions.contains(&candidate) {
-                    candidate
-                } else if let Some(module) = target_module {
-                    format!("elixir-call://{module}/{name}/{arity}")
-                } else {
-                    format!("elixir-call://{name}/{arity}")
-                }
-            };
             let target = if call.dynamic_struct {
                 format!("elixir-dynamic-call://{}/{}", call.name, call.arity)
             } else {
@@ -724,21 +724,21 @@ pub(super) fn call_observations(
                 }
                 observations.push(observation);
             }
-            for capture in &call.captures {
-                let target = target_for(capture.module.as_deref(), &capture.name, capture.arity);
-                if targets.insert(target.clone()) {
-                    let mut observation = Observation::dependency(
-                        function_id.clone(),
-                        DependencyRelation::Calls,
-                        target,
-                        format!("{}:{}", path.display(), capture.line),
-                    );
-                    observation.confidence = Confidence::Inferred;
-                    if generated {
-                        observation.provenance = Provenance::Generated;
-                    }
-                    observations.push(observation);
+        }
+        for capture in function.calls.iter().flat_map(|call| &call.captures) {
+            let target = target_for(capture.module.as_deref(), &capture.name, capture.arity);
+            if targets.insert(target.clone()) {
+                let mut observation = Observation::dependency(
+                    function_id.clone(),
+                    DependencyRelation::Calls,
+                    target,
+                    format!("{}:{}", path.display(), capture.line),
+                );
+                observation.confidence = Confidence::Inferred;
+                if generated {
+                    observation.provenance = Provenance::Generated;
                 }
+                observations.push(observation);
             }
         }
     }

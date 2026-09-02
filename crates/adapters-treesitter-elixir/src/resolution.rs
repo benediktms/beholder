@@ -679,6 +679,26 @@ mod tests {
     }
 
     #[test]
+    fn prefers_exact_calls_over_earlier_capture_evidence() {
+        let observations = observations(
+            "example",
+            "defmodule Example.Source do\n  def run(items, item) do\n    Enum.map(items, &fetch/1)\n    fetch(item)\n  end\n  defp fetch(item), do: item\nend",
+            Path::new("lib/source.ex"),
+        )
+        .unwrap();
+        let call = observations
+            .iter()
+            .find(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example.Source/run/2"
+                    && observation.to.as_str() == "repo://example/elixir/Example.Source/fetch/1"
+            })
+            .unwrap();
+
+        assert_eq!(call.confidence, Confidence::Exact);
+        assert_eq!(call.evidence.as_str(), "lib/source.ex:4");
+    }
+
+    #[test]
     fn resolves_dynamic_dispatch_against_a_workspace_behaviour() {
         let mut workspace_observations = observations(
             "contracts",
