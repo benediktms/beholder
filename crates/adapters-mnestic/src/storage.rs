@@ -6093,6 +6093,11 @@ mod tests {
             "src/lib.rs:2",
         );
         let mut baseline = facts(&view, vec![call.clone()]);
+        baseline.entities.push(EntityFact::new(
+            "repo://example/repo/rust/lib/helper",
+            EntityKind::Callable,
+            None,
+        ).unwrap());
         baseline.diagnostics.push(AnalysisDiagnostic {
             code: "rust.syntax_recovered".into(),
             severity: AnalysisDiagnosticSeverity::Warning,
