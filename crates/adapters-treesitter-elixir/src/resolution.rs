@@ -388,6 +388,42 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
         })
         .map(|observation| observation.to.as_str())
         .collect::<BTreeSet<_>>();
+    let used_modules = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::Uses)
+        })
+        .filter_map(|observation| {
+            observation
+                .to
+                .as_str()
+                .strip_prefix("elixir-module://")
+                .map(|module| (observation.from.clone(), module.to_owned()))
+        })
+        .fold(
+            BTreeMap::<EntityId, BTreeSet<String>>::new(),
+            |mut modules, (caller, module)| {
+                modules.entry(caller).or_default().insert(module);
+                modules
+            },
+        );
+    let caller_receiver_modules = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+        })
+        .filter_map(|observation| {
+            used_modules
+                .get(&observation.from)
+                .map(|modules| (observation.to.clone(), modules))
+        })
+        .fold(
+            BTreeMap::<EntityId, BTreeSet<String>>::new(),
+            |mut receivers, (callee, modules)| {
+                receivers.entry(callee).or_default().extend(modules.clone());
+                receivers
+            },
+        );
     let implementations = observations.iter().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Implements)
     });
@@ -411,7 +447,12 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
     let mut candidates = Vec::new();
     let implementations = implementations.collect::<Vec<_>>();
     for (call, receiver_module, signature) in dynamic_calls {
-        let Some(receiver_module) = receiver_module else {
+        let direct_receiver = receiver_module.map(str::to_owned).into_iter().collect();
+        let receiver_modules = if receiver_module.is_some() {
+            &direct_receiver
+        } else if let Some(receiver_modules) = caller_receiver_modules.get(&call.from) {
+            receiver_modules
+        } else {
             continue;
         };
         let Some(Some(callback_owner)) = callback_owners.get(&signature) else {
@@ -423,7 +464,7 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
             else {
                 continue;
             };
-            if receiver_module != implementation_module {
+            if !receiver_modules.contains(implementation_module) {
                 continue;
             }
             let Some(behaviour) = implementation
@@ -784,7 +825,11 @@ mod tests {
                 end
 
                 defmodule Example.Dispatcher do
-                  def dispatch(context, %Example.Worker{} = job), do: job.__struct__.load(context, job)
+                  def dispatch(context, job), do: job.__struct__.load(context, job)
+                end
+
+                defmodule Example.Caller do
+                  def run(context), do: Example.Dispatcher.dispatch(context, %Example.Worker{})
                 end
                 "#,
                 Path::new("lib/generated.pb.ex"),
