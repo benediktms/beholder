@@ -1819,7 +1819,7 @@ mod tests {
             ),
             (
                 Path::new("src/entry.ts"),
-                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function unrelated(cache: Cache) { return cache.has(loader).toString(); }",
+                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); }",
             ),
             (
                 Path::new("src/qualified.ts"),
