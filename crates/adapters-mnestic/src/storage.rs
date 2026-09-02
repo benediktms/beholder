@@ -3060,6 +3060,33 @@ pub(super) fn publish_enrichment(
         transaction.abort()?;
         return Ok(EnrichmentPublishOutcome::Superseded);
     }
+    let baseline_entities = transaction.run_script(
+        "entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, repository: $repository, state}, *state_entity{state, id, kind, metadata}\n\
+         entity[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, repository: $repository, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
+         ?[id, kind, metadata] := entity[id, kind, metadata]",
+        BTreeMap::from([("view".into(), view.into()), ("repository".into(), repository.into())]),
+    )?.rows.into_iter().map(|row| -> Result<EntityFact, Box<dyn Error>> {
+        let id = stored_string(&row, 0, "entity ID")?.to_owned();
+        Ok(EntityFact::new(id, parse_entity_kind(stored_string(&row, 1, "entity kind")?)?, parse_entity_metadata(stored_string(&row, 2, "entity metadata")?)?)?)
+    }).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    beholder_domain::validate_entity_complete_semantics(
+        baseline_entities
+            .iter()
+            .chain(payload.entities.iter())
+            .chain(
+                payload
+                    .fact_shards
+                    .iter()
+                    .flat_map(|shard| shard.entities.iter()),
+            ),
+        payload.observations.iter().chain(
+            payload
+                .fact_shards
+                .iter()
+                .flat_map(|shard| shard.observations.iter()),
+        ),
+        payload.overrides.iter(),
+    )?;
     let current_selections = transaction
         .run_script(
             "?[owner, version, input_fingerprint] := \
@@ -4470,12 +4497,19 @@ mod tests {
         time::{Instant, SystemTime},
     };
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
+        let entities = observations
+            .iter()
+            .flat_map(|observation| [&observation.from, &observation.to])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|id| EntityFact::new(id.clone(), EntityKind::Callable, None).unwrap())
+            .collect();
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities,
             grpc_bindings: Vec::new(),
             observations,
         }
@@ -5583,7 +5617,10 @@ mod tests {
             producer: "elixir".into(),
             owner: owner.into(),
             version: version.into(),
-            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            entities: vec![
+                EntityFact::new(owner, EntityKind::Callable, None).unwrap(),
+                EntityFact::new(target, EntityKind::Callable, None).unwrap(),
+            ],
             observations: vec![Observation::dependency(
                 owner,
                 DependencyRelation::Calls,
@@ -6248,6 +6285,8 @@ mod tests {
 
         let generated = "repo://example/repo/elixir/Example/generated/0";
         let entity = EntityFact::new(generated, EntityKind::Callable, None).unwrap();
+        let external =
+            EntityFact::new("elixir-call://External/run/0", EntityKind::Callable, None).unwrap();
         let mut observation = Observation::dependency(
             generated,
             DependencyRelation::Calls,
@@ -6268,7 +6307,7 @@ mod tests {
                         version: "1",
                     },
                     EnrichmentPayload {
-                        entities: &[entity],
+                        entities: &[entity, external],
                         observations: &[observation],
                         ..EnrichmentPayload::default()
                     },
@@ -6409,65 +6448,9 @@ mod tests {
                         fact_shards: &[],
                     },
                 )
-                .unwrap()
+                .is_err()
         );
-        assert_eq!(current_revision(&store, "baseline-collision"), 2);
-
-        assert!(
-            store
-                .publish_enrichment(
-                    &view.name,
-                    "example/repo",
-                    &input,
-                    EnrichmentOwner {
-                        analyzer: "compiler",
-                        version: "2",
-                    },
-                    EnrichmentPayload::default(),
-                )
-                .unwrap()
-        );
-        assert_eq!(current_revision(&store, "baseline-collision"), 3);
-        let rows = store
-            .db
-            .run_script(
-                "?[kind, confidence, provenance, resolved_to, override_provenance, detail] := \
-                     *analysis_revision{view: 'baseline-collision', revision}, \
-                     *analysis_revision_state{view: 'baseline-collision', revision, state}, \
-                     *state_entity{state, id: $id, kind}, \
-                     *state_observation_metadata{\
-                         state, from: $id, relation: 'calls', to: 'call://shared', confidence, \
-                         provenance\
-                     }, not *analysis_revision_entity{\
-                         view: 'baseline-collision', revision, id: $id\
-                     }, not *analysis_revision_observation{\
-                         view: 'baseline-collision', revision, from: $id, relation: 'calls', \
-                         to: 'call://shared', evidence: 'src/lib.rs:1'\
-                     }, *analysis_revision_dependency_override{\
-                         view: 'baseline-collision', revision, from: $id, relation: 'calls', \
-                         unresolved_to: 'call://shared', resolved_to\
-                     }, *analysis_revision_dependency_override_metadata{\
-                         view: 'baseline-collision', revision, from: $id, relation: 'calls', \
-                         unresolved_to: 'call://shared', provenance: override_provenance\
-                     }, *analysis_revision_diagnostic{\
-                         view: 'baseline-collision', revision, repository: 'example/repo', \
-                         code: 'shared.warning', severity: 'known_limitation', path: 'src/lib.rs', \
-                         line: 7, detail\
-                     }",
-                BTreeMap::from([("id".into(), entity.id.as_str().into())]),
-                ScriptMutability::Immutable,
-            )
-            .unwrap();
-        assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0][0].get_str(), Some(entity_kind(entity.kind)));
-        assert_eq!(rows.rows[0][1].get_float(), Some(Confidence::Exact.score()));
-        assert_eq!(rows.rows[0][2].get_str(), Some(Provenance::Ast.as_str()));
-        assert_eq!(
-            rows.rows[0][3].get_str(),
-            Some("repo://example/repo/baseline-target")
-        );
-        assert_eq!(rows.rows[0][4].get_str(), Some(Provenance::Ast.as_str()));
-        assert_eq!(rows.rows[0][5].get_str(), Some("baseline detail"));
+        assert_eq!(current_revision(&store, "baseline-collision"), 1);
     }
 
     #[test]
@@ -6964,9 +6947,12 @@ mod tests {
             "call://target",
             "src/lib.rs:1",
         );
-        store
-            .publish(&view, &[facts(&view, vec![call.clone()])], &[])
-            .unwrap();
+        let mut baseline = facts(&view, vec![call.clone()]);
+        baseline.entities.extend([
+            EntityFact::new("repo://example/repo/target-a", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://example/repo/target-b", EntityKind::Callable, None).unwrap(),
+        ]);
+        store.publish(&view, &[baseline], &[]).unwrap();
         let override_for = |resolved_to: &str, confidence, provenance| DependencyOverride {
             from: call.from.clone(),
             relation: DependencyRelation::Calls,
@@ -7091,9 +7077,16 @@ mod tests {
             "rust-call://helper",
             "src/lib.rs:2",
         );
-        store
-            .publish(&first, &[facts(&first, vec![call.clone()])], &[])
-            .unwrap();
+        let mut baseline = facts(&first, vec![call.clone()]);
+        baseline.entities.push(
+            EntityFact::new(
+                "repo://example/repo/rust/lib/helper",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
+        store.publish(&first, &[baseline], &[]).unwrap();
         let input =
             first.repository_enrichment_input_fingerprint(&first.repository_states[0], "rust");
         store
