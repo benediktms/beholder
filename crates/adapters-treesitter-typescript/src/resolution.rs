@@ -1815,7 +1815,7 @@ mod tests {
         let sources = [
             (
                 Path::new("src/loader.ts"),
-                "export class Client { fetch() {} } const client = new Client(); export const loader = createContext(() => new Loader(async () => client.fetch()));",
+                "export class Client { fetch() {} } function makeClient(): Client { return new Client(); } export const loader = createContext(() => { const client = new Client(); const selected = client; const produced = makeClient(); return new Loader(async () => { selected.fetch(); produced.fetch(); }); });",
             ),
             (
                 Path::new("src/entry.ts"),
@@ -1846,6 +1846,30 @@ mod tests {
             .iter()
             .map(|(path, _, analysis)| (*path, analysis))
             .collect::<Vec<_>>();
+        let loader = analyses[0]
+            .2
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "loader")
+            .unwrap();
+        assert!(
+            loader
+                .bindings
+                .iter()
+                .any(|binding| binding.receiver == "client" && binding.type_name == "Client")
+        );
+        assert!(
+            loader
+                .alias_bindings
+                .iter()
+                .any(|binding| binding.receiver == "selected" && binding.source == "client")
+        );
+        assert!(
+            loader
+                .factory_bindings
+                .iter()
+                .any(|binding| binding.receiver == "produced" && binding.factory == "makeClient")
+        );
 
         resolve_repository_calls("example", &mut observations, &indexed, &[], &[]);
 
@@ -1877,7 +1901,7 @@ mod tests {
     #[test]
     fn resolves_a_returned_callback_from_a_workspace_package() {
         let consumer_source = "import { loader } from '@example/provider'; import * as loaders from '@example/provider'; export function entry(context: Context) { const selected = loader; context.get(selected).load('key'); } export function qualified(context: Context) { context.get(loaders.loader).load('key'); }";
-        let provider_source = "export class Client { fetch() {} } const client = new Client(); export const loader = createContext(() => new Loader(async () => client.fetch()));";
+        let provider_source = "export class Client { fetch() {} } export const loader = createContext(() => { const client = new Client(); const selected = client; return new Loader(async () => selected.fetch()); });";
         let consumer_path = PathBuf::from("src/entry.ts");
         let provider_path = PathBuf::from("src/loader.ts");
         let consumer = analyze(consumer_source, SourceLanguage::TypeScript).unwrap();

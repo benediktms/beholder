@@ -964,6 +964,19 @@ fn collect_definitions(
                     value.and_then(|value| callback_return(value, source))
                 {
                     collect_calls(body, source, body, &mut factory_definition.calls);
+                    collect_bindings(body, source, body, &mut factory_definition.bindings);
+                    collect_alias_bindings(
+                        body,
+                        source,
+                        body,
+                        &mut factory_definition.alias_bindings,
+                    );
+                    collect_factory_bindings(
+                        body,
+                        source,
+                        body,
+                        &mut factory_definition.factory_bindings,
+                    );
                     factory_definition.callback_return_type = Some(return_type);
                 }
                 definitions.push(factory_definition);
