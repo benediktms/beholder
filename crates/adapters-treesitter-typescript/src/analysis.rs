@@ -524,6 +524,8 @@ fn has_conditional_ancestor(node: Node<'_>, source: &[u8], root: Node<'_>) -> bo
                 ancestor.kind(),
                 "if_statement"
                     | "catch_clause"
+                    | "arrow_function"
+                    | "function_expression"
                     | "switch_case"
                     | "ternary_expression"
                     | "for_statement"

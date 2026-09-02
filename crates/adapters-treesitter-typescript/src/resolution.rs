@@ -1392,14 +1392,25 @@ fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryI
                 ))
             });
         if let Some((language, context, argument, method)) = contextual {
-            let is_context = receiver_type(
+            let context_type = receiver_type(
                 index,
                 observation.from.as_str(),
                 &context,
                 call_site,
                 &mut receiver_types,
-            )
-            .is_some_and(|(_, type_name)| type_name.rsplit('.').next() == Some("Context"));
+            );
+            let is_context = context_type
+                .as_ref()
+                .is_some_and(|(_, type_name)| type_name.rsplit('.').next() == Some("Context"))
+                || context_type.as_ref().is_some_and(|(file, type_name)| {
+                    index.file_imports.get(file).is_some_and(|imports| {
+                        imports.iter().any(|import| {
+                            import.bindings.iter().any(|binding| {
+                                binding.local == *type_name && binding.imported == "Context"
+                            })
+                        })
+                    })
+                });
             observation.to = if is_context {
                 EntityId::from(format!("{language}-returned://{argument}/{method}"))
             } else {
@@ -2266,6 +2277,11 @@ mod tests {
                 { const selected = second; consume(selected); }
                 context.get(selected).load('block-scoped');
             }
+            export function callbackWrite(context: Context) {
+                let selected = first;
+                maybeRun(() => { selected = second; });
+                context.get(selected).load('callback-write');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -2327,7 +2343,13 @@ mod tests {
                 BTreeSet::from(["repo://example/typescript/src/entry/first"])
             );
         }
-        for caller in ["shortCircuit", "caught", "ternary", "tryBody"] {
+        for caller in [
+            "shortCircuit",
+            "caught",
+            "ternary",
+            "tryBody",
+            "callbackWrite",
+        ] {
             let caller = format!("repo://example/typescript/src/entry/{caller}");
             let targets = observations
                 .iter()
@@ -2398,6 +2420,7 @@ mod tests {
     fn resolves_a_returned_callback_from_a_workspace_package() {
         let consumer_source = r#"
             import { first, loader, second } from '@example/provider';
+            import type { Context as RequestContext } from '@example/provider';
             import * as loaders from '@example/provider';
             export function entry(context: Context) {
                 const selected = loader;
@@ -2406,13 +2429,16 @@ mod tests {
             export function qualified(context: Context) {
                 context.get(loaders.loader).load('key');
             }
+            export function aliasedContext(context: RequestContext) {
+                context.get(loader).load('key');
+            }
             export function conditional(context: Context, flag: boolean) {
                 let selected = first;
                 if (flag) selected = second;
                 context.get(selected).load('key');
             }
         "#;
-        let provider_source = "export class Client { fetch() {} } export const loader = createContext(() => new Loader(async () => { const client = new Client(); const selected = client; return selected.fetch(); })); export const first = createContext(() => new Loader(() => {})); export const second = createContext(() => new Loader(() => {}));";
+        let provider_source = "export class Context {} export class Client { fetch() {} } export const loader = createContext(() => new Loader(async () => { const client = new Client(); const selected = client; return selected.fetch(); })); export const first = createContext(() => new Loader(() => {})); export const second = createContext(() => new Loader(() => {}));";
         let consumer_path = PathBuf::from("src/entry.ts");
         let provider_path = PathBuf::from("src/loader.ts");
         let consumer = analyze(consumer_source, SourceLanguage::TypeScript).unwrap();
@@ -2464,6 +2490,11 @@ mod tests {
         assert!(overrides.iter().any(|override_| {
             override_.from.as_str() == "repo://consumer/typescript/src/entry/qualified"
                 && override_.unresolved_to.as_str() == "typescript-returned://loaders.loader/load"
+                && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
+                && override_.confidence == Confidence::Inferred
+        }));
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://consumer/typescript/src/entry/aliasedContext"
                 && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
                 && override_.confidence == Confidence::Inferred
         }));

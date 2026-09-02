@@ -92,6 +92,18 @@ impl TypescriptAnalysis {
                 .collect::<Vec<_>>();
             scopes.sort_unstable();
             scopes.dedup();
+            let normalize_scope = |scope: (usize, usize)| {
+                let index = scopes.binary_search(&scope).unwrap_or_default();
+                let parent = scopes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| {
+                        **candidate != scope && candidate.0 <= scope.0 && scope.1 <= candidate.1
+                    })
+                    .min_by_key(|(_, candidate)| candidate.1 - candidate.0)
+                    .map_or(0, |(parent, _)| parent + 1);
+                (index, parent)
+            };
             let alias_positions = definition
                 .alias_bindings
                 .iter()
@@ -102,32 +114,24 @@ impl TypescriptAnalysis {
                     .iter()
                     .filter(|position| **position <= (call.line, call.start_character))
                     .count();
-                call.scope_start = scopes
-                    .binary_search(&(call.scope_start, call.scope_end))
-                    .unwrap_or_default();
-                call.scope_end = 0;
+                (call.scope_start, call.scope_end) =
+                    normalize_scope((call.scope_start, call.scope_end));
                 call.clear_position();
                 call.line = alias_order;
             }
             for binding in &mut definition.bindings {
-                binding.scope_start = scopes
-                    .binary_search(&(binding.scope_start, binding.scope_end))
-                    .unwrap_or_default();
-                binding.scope_end = 0;
+                (binding.scope_start, binding.scope_end) =
+                    normalize_scope((binding.scope_start, binding.scope_end));
             }
             for binding in &mut definition.alias_bindings {
                 binding.line = 0;
                 binding.character = 0;
-                binding.scope_start = scopes
-                    .binary_search(&(binding.scope_start, binding.scope_end))
-                    .unwrap_or_default();
-                binding.scope_end = 0;
+                (binding.scope_start, binding.scope_end) =
+                    normalize_scope((binding.scope_start, binding.scope_end));
             }
             for binding in &mut definition.factory_bindings {
-                binding.scope_start = scopes
-                    .binary_search(&(binding.scope_start, binding.scope_end))
-                    .unwrap_or_default();
-                binding.scope_end = 0;
+                (binding.scope_start, binding.scope_end) =
+                    normalize_scope((binding.scope_start, binding.scope_end));
             }
         }
         for document in &mut analysis.graphql_documents {

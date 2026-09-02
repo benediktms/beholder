@@ -1,5 +1,5 @@
-pub const FRONTEND_VERSION: &str = "40";
-pub const RESOLVER_VERSION: &str = "24";
+pub const FRONTEND_VERSION: &str = "41";
+pub const RESOLVER_VERSION: &str = "25";
 
 mod analysis;
 mod analyzer;
