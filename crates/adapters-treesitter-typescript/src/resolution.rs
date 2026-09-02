@@ -2055,6 +2055,11 @@ mod tests {
             }
             export function compact(context: Context) { let selected = first; const finalLoader = selected; selected = second; context.get(finalLoader).load('compact'); }
             export function beforeReassignment(context: Context) { let selected = first; context.get(selected).load('before'); selected = second; }
+            export function shortCircuit(context: Context, flag: boolean) {
+                let selected = first;
+                flag && (selected = second);
+                context.get(selected).load('short-circuit');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -2116,6 +2121,21 @@ mod tests {
                 BTreeSet::from(["repo://example/typescript/src/entry/first"])
             );
         }
+        let short_circuit = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/shortCircuit"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            short_circuit,
+            BTreeSet::from([
+                "repo://example/typescript/src/entry/first",
+                "repo://example/typescript/src/entry/second",
+            ])
+        );
     }
 
     #[test]

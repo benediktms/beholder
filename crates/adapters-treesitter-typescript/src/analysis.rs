@@ -454,6 +454,12 @@ fn collect_factory_bindings(
     }
 }
 
+fn is_short_circuit(node: Node<'_>, source: &[u8]) -> bool {
+    node.child_by_field_name("operator")
+        .and_then(|operator| text(operator, source))
+        .is_some_and(|operator| matches!(operator, "&&" | "||" | "??" | "&&=" | "||=" | "??="))
+}
+
 fn collect_alias_bindings(
     node: Node<'_>,
     source: &[u8],
@@ -469,6 +475,10 @@ fn collect_alias_bindings(
             node.child_by_field_name("value"),
         ),
         "assignment_expression" => (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ),
+        "augmented_assignment_expression" if is_short_circuit(node, source) => (
             node.child_by_field_name("left"),
             node.child_by_field_name("right"),
         ),
@@ -491,14 +501,14 @@ fn collect_alias_bindings(
                         | "for_in_statement"
                         | "while_statement"
                         | "do_statement"
-                )
+                ) || (ancestor.kind() == "binary_expression" && is_short_circuit(ancestor, source))
             });
         bindings.push(AliasBinding {
             receiver: receiver.into(),
             source: source_name.into(),
             line: node.start_position().row + 1,
             character: lsp_position(node, source, false).map_or(0, |position| position.character),
-            conditional,
+            conditional: conditional || node.kind() == "augmented_assignment_expression",
         });
     }
     let mut cursor = node.walk();
