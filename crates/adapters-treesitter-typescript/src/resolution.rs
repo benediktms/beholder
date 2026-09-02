@@ -1099,11 +1099,17 @@ fn imported_origin(
     file: &Path,
     name: &str,
 ) -> Option<(PathBuf, String)> {
+    let qualified = name.split_once('.');
     index.file_imports.get(file)?.iter().find_map(|import| {
-        let binding = import
-            .bindings
-            .iter()
-            .find(|binding| binding.local == name && binding.imported != "*")?;
+        let binding = import.bindings.iter().find(|binding| {
+            binding.local == name && binding.imported != "*"
+                || qualified.is_some_and(|(namespace, _)| {
+                    binding.local == namespace && binding.imported == "*"
+                })
+        })?;
+        let imported = qualified
+            .filter(|_| binding.imported == "*")
+            .map_or(binding.imported.as_str(), |(_, member)| member);
         let imported_file = imported_file(
             file,
             &import.source,
@@ -1113,7 +1119,7 @@ fn imported_origin(
         )?;
         index
             .origins
-            .get(&(imported_file, binding.imported.clone()))
+            .get(&(imported_file, imported.to_owned()))
             .cloned()
     })
 }
@@ -1552,19 +1558,25 @@ pub fn resolve_workspace_calls(
             .and_then(|target| target.split_once('/'));
         if let Some((argument, _method)) = returned {
             let argument = aliased_receiver(caller, observation.from.as_str(), argument);
+            let qualified = argument.split_once('.');
             let target = imports.iter().find_map(|import| {
-                let binding = import
-                    .bindings
-                    .iter()
-                    .find(|binding| binding.local == argument && binding.imported != "*")?;
+                let binding = import.bindings.iter().find(|binding| {
+                    binding.local == argument && binding.imported != "*"
+                        || qualified.is_some_and(|(namespace, _)| {
+                            binding.local == namespace && binding.imported == "*"
+                        })
+                })?;
+                let imported = qualified
+                    .filter(|_| binding.imported == "*")
+                    .map_or(binding.imported.as_str(), |(_, member)| member);
                 let (target_index, file) =
                     workspace_imported_file(&import.source, &packages, &indexes)?;
                 let target = &indexes[target_index];
                 let origin = target
                     .origins
-                    .get(&(file.clone(), binding.imported.clone()))
+                    .get(&(file.clone(), imported.to_owned()))
                     .cloned()
-                    .unwrap_or((file, binding.imported.clone()));
+                    .unwrap_or((file, imported.to_owned()));
                 target
                     .callback_returns
                     .contains(&origin)
@@ -1809,6 +1821,10 @@ mod tests {
                 Path::new("src/entry.ts"),
                 "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); }",
             ),
+            (
+                Path::new("src/qualified.ts"),
+                "import * as loaders from './loader'; export function entry(context: Context) { return context.get(loaders.loader).load('key'); }",
+            ),
         ];
         let analyses = sources
             .iter()
@@ -1845,6 +1861,10 @@ mod tests {
             "repo://example/typescript/src/loader/loader",
         )));
         assert!(edges.contains(&(
+            "repo://example/typescript/src/qualified/entry",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
             "repo://example/typescript/src/loader/loader",
             "repo://example/typescript/src/loader/Client/fetch",
         )));
@@ -1852,7 +1872,7 @@ mod tests {
 
     #[test]
     fn resolves_a_returned_callback_from_a_workspace_package() {
-        let consumer_source = "import { loader } from '@example/provider'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); }";
+        let consumer_source = "import { loader } from '@example/provider'; import * as loaders from '@example/provider'; export function entry(context: Context) { const selected = loader; context.get(selected).load('key'); } export function qualified(context: Context) { context.get(loaders.loader).load('key'); }";
         let provider_source = "export class Client { fetch() {} } const client = new Client(); export const loader = createContext(() => new Loader(async () => client.fetch()));";
         let consumer_path = PathBuf::from("src/entry.ts");
         let provider_path = PathBuf::from("src/loader.ts");
@@ -1888,6 +1908,12 @@ mod tests {
         assert!(overrides.iter().any(|override_| {
             override_.from.as_str() == "repo://consumer/typescript/src/entry/entry"
                 && override_.unresolved_to.as_str() == "typescript-returned://selected/load"
+                && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
+                && override_.confidence == Confidence::Inferred
+        }));
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://consumer/typescript/src/entry/qualified"
+                && override_.unresolved_to.as_str() == "typescript-returned://loaders.loader/load"
                 && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
                 && override_.confidence == Confidence::Inferred
         }));

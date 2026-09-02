@@ -121,7 +121,7 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
                 let [argument] = arguments.as_slice() else {
                     return None;
                 };
-                (argument.kind() == "identifier")
+                matches!(argument.kind(), "identifier" | "member_expression")
                     .then(|| text(*argument, source).map(str::to_owned))
                     .flatten()
             }),
