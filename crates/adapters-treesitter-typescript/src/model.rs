@@ -70,6 +70,7 @@ impl TypescriptAnalysis {
             }
             for binding in &mut definition.alias_bindings {
                 binding.line = 0;
+                binding.character = 0;
             }
         }
         for document in &mut analysis.graphql_documents {
@@ -187,6 +188,8 @@ pub(super) struct AliasBinding {
     pub(super) source: String,
     #[serde(default)]
     pub(super) line: usize,
+    #[serde(default)]
+    pub(super) character: u32,
     #[serde(default)]
     pub(super) conditional: bool,
 }

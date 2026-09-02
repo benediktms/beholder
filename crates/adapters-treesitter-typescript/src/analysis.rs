@@ -497,6 +497,7 @@ fn collect_alias_bindings(
             receiver: receiver.into(),
             source: source_name.into(),
             line: node.start_position().row + 1,
+            character: lsp_position(node, source, false).map_or(0, |position| position.character),
             conditional,
         });
     }
