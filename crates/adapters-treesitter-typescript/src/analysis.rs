@@ -257,8 +257,8 @@ fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     call_target(node, target, source, kind)
 }
 
-fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
-    if node != root
+fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
+    node != root
         && (matches!(
             node.kind(),
             "function_declaration"
@@ -269,7 +269,10 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
             && node
                 .parent()
                 .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
-    {
+}
+
+fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
+    if is_collection_boundary(node, root) {
         return;
     }
     match node.kind() {
@@ -392,16 +395,7 @@ fn injection_token(node: Node<'_>, source: &[u8]) -> Option<String> {
 }
 
 fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mut Vec<Binding>) {
-    if node != root
-        && matches!(
-            node.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        )
-    {
+    if is_collection_boundary(node, root) {
         return;
     }
     if matches!(
@@ -423,16 +417,7 @@ fn collect_factory_bindings(
     root: Node<'_>,
     bindings: &mut Vec<FactoryBinding>,
 ) {
-    if node != root
-        && matches!(
-            node.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        )
-    {
+    if is_collection_boundary(node, root) {
         return;
     }
     if node.kind() == "variable_declarator"
@@ -471,16 +456,7 @@ fn collect_alias_bindings(
     root: Node<'_>,
     bindings: &mut Vec<AliasBinding>,
 ) {
-    if node != root
-        && matches!(
-            node.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        )
-    {
+    if is_collection_boundary(node, root) {
         return;
     }
     let pair = match node.kind() {
