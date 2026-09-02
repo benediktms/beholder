@@ -506,6 +506,16 @@ fn collect_alias_bindings(
     }
 }
 
+fn unparenthesized(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(child) = node.named_child(0) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
 fn returned_constructor(node: Node<'_>, source: &[u8], root: Node<'_>) -> Option<String> {
     if node != root
         && matches!(
@@ -520,7 +530,7 @@ fn returned_constructor(node: Node<'_>, source: &[u8], root: Node<'_>) -> Option
         return None;
     }
     if node.kind() == "return_statement"
-        && let Some(value) = node.named_child(0)
+        && let Some(value) = node.named_child(0).map(unparenthesized)
         && value.kind() == "new_expression"
     {
         return value
@@ -539,7 +549,7 @@ fn callback_return<'tree>(node: Node<'tree>, source: &[u8]) -> Option<(Node<'tre
         .named_children(&mut arguments.walk())
         .filter(|argument| matches!(argument.kind(), "arrow_function" | "function_expression"))
         .find_map(|callback| {
-            let body = callback.child_by_field_name("body")?;
+            let body = unparenthesized(callback.child_by_field_name("body")?);
             let constructor = if body.kind() == "new_expression" {
                 body.child_by_field_name("constructor")
                     .and_then(|constructor| text(constructor, source))

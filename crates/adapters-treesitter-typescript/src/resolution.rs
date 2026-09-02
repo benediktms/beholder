@@ -2056,6 +2056,32 @@ mod tests {
     }
 
     #[test]
+    fn resolves_a_parenthesized_callback_constructor() {
+        let source = r#"
+            class Client { fetch() {} }
+            const loader = createContext(() => (new Loader(() => {
+                const client = new Client();
+                return client.fetch();
+            })));
+            function entry(context: Context) { context.get(loader).load('key'); }
+        "#;
+        let path = Path::new("src/entry.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/entry"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/loader"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/loader"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/Client/fetch"
+        }));
+    }
+
+    #[test]
     fn resolves_a_returned_callback_from_a_workspace_package() {
         let consumer_source = r#"
             import { first, loader, second } from '@example/provider';
