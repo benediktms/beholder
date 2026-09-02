@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use beholder_domain::Workspace;
-use beholder_dto::{QueryMetadata, WorkspaceTopology};
+use beholder_dto::{EntityRef, QueryMetadata, SemanticEdge, WorkspaceTopology};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize)]
@@ -41,8 +41,10 @@ struct GraphRequest {
 #[derive(Debug, Serialize)]
 struct GraphSnapshot {
     workspace: WorkspaceSummary,
-    #[serde(flatten)]
-    topology: WorkspaceTopology,
+    schema: String,
+    metadata: QueryMetadata,
+    nodes: Vec<EntityRef>,
+    edges: Vec<SemanticEdge>,
 }
 
 #[tauri::command]
@@ -61,12 +63,20 @@ async fn load_graph(request: GraphRequest) -> Result<GraphSnapshot, String> {
         .into_iter()
         .find(|workspace| workspace.name == request.workspace)
         .ok_or_else(|| format!("unknown workspace: {}", request.workspace))?;
-    let topology = beholder_daemon_client::workspace_topology(request.workspace)
+    let WorkspaceTopology {
+        schema,
+        metadata,
+        nodes,
+        edges,
+    } = beholder_daemon_client::workspace_topology(request.workspace)
         .await
         .map_err(|error| error.to_string())?;
     Ok(GraphSnapshot {
         workspace: workspace.into(),
-        topology,
+        schema,
+        metadata,
+        nodes,
+        edges,
     })
 }
 

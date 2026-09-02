@@ -44,6 +44,7 @@
   let inspectorWidth = 288;
   let loading = true;
   let error = '';
+  let statusError = '';
   let status: QueryMetadata | null = null;
   let search = '';
   let mode: InvestigationMode = 'context';
@@ -95,27 +96,34 @@
 
   async function pollStatus() {
     if (!selectedWorkspace || !snapshot) return;
+    const workspace = selectedWorkspace;
     try {
-      status = await invoke<QueryMetadata>('topology_status', { request: { workspace: selectedWorkspace } });
+      const nextStatus = await invoke<QueryMetadata>('topology_status', { request: { workspace } });
+      if (workspace !== selectedWorkspace) return;
+      status = nextStatus;
+      statusError = '';
     } catch (cause) {
-      error = String(cause);
+      if (workspace === selectedWorkspace) statusError = String(cause);
     }
   }
 
   async function loadWorkspace() {
     if (!selectedWorkspace) return;
+    const workspace = selectedWorkspace;
     loading = true;
     error = '';
     try {
-      snapshot = await invoke<GraphSnapshot>('load_graph', {
-        request: { workspace: selectedWorkspace }
+      const nextSnapshot = await invoke<GraphSnapshot>('load_graph', {
+        request: { workspace }
       });
+      if (workspace !== selectedWorkspace) return;
+      snapshot = nextSnapshot;
       status = snapshot.metadata;
       returnToWorkspace();
     } catch (cause) {
-      error = String(cause);
+      if (workspace === selectedWorkspace) error = String(cause);
     } finally {
-      loading = false;
+      if (workspace === selectedWorkspace) loading = false;
     }
   }
 
@@ -255,6 +263,7 @@
       <Badge>rev {snapshot?.metadata.revision ?? '—'}</Badge>
       <span class:healthy={Boolean(snapshot && !snapshot.metadata.freshness.stale)} class="status-dot"></span>
       <span>{snapshot?.metadata.freshness.stale ? 'stale' : 'snapshot ready'}</span>
+      {#if statusError}<span>{statusError}</span>{/if}
       {#if status && snapshot && status.revision > snapshot.metadata.revision}
         <Button size="sm" variant="outline" onclick={loadWorkspace}>Revision {status.revision} available · Refresh</Button>
       {/if}
