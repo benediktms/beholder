@@ -5,17 +5,16 @@
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import {
-    MAX_VISIBLE_LINKS,
-    MAX_VISIBLE_NODES,
     EXTERNAL_REPOSITORY,
     ORIGINS,
     RELATION_KINDS,
     projectGraph,
+    investigate,
     type EntityOrigin,
     type GraphNode,
     type GraphSnapshot,
     type Projection,
-    type RelationKind,
+    type RelationKind, type InvestigationMode, type QueryMetadata,
     type WorkspaceSummary
   } from '$lib/graph';
 
@@ -45,9 +44,17 @@
   let inspectorWidth = 288;
   let loading = true;
   let error = '';
+  let status: QueryMetadata | null = null;
+  let search = '';
+  let mode: InvestigationMode = 'context';
+  let traceTarget = '';
 
-  $: projection = snapshot
-    ? projectGraph(snapshot, {
+  $: investigation = snapshot && rootId ? investigate(snapshot, mode, rootId, traceTarget || undefined) : null;
+  $: visibleSnapshot = snapshot && investigation
+    ? { ...snapshot, nodes: snapshot.nodes.filter((node) => investigation.nodeIds.has(node.id)), edges: snapshot.edges.filter((edge) => investigation.edgeIds.has(edge.id)) }
+    : snapshot;
+  $: projection = visibleSnapshot
+    ? projectGraph(visibleSnapshot, {
         repositories,
         relationKinds,
         includeTests,
@@ -70,17 +77,30 @@
     ? snapshot.edges.filter((edge) => edge.from === rootId || edge.to === rootId)
     : [];
 
-  onMount(async () => {
+  onMount(() => {
+    void (async () => {
+      try {
+        workspaces = await invoke<WorkspaceSummary[]>('list_workspaces');
+        selectedWorkspace = workspaces[0]?.name ?? '';
+        if (selectedWorkspace) await loadWorkspace();
+      } catch (cause) {
+        error = String(cause);
+      } finally {
+        loading = false;
+      }
+    })();
+    const poll = window.setInterval(() => void pollStatus(), 3000);
+    return () => window.clearInterval(poll);
+  });
+
+  async function pollStatus() {
+    if (!selectedWorkspace || !snapshot) return;
     try {
-      workspaces = await invoke<WorkspaceSummary[]>('list_workspaces');
-      selectedWorkspace = workspaces[0]?.name ?? '';
-      if (selectedWorkspace) await loadWorkspace();
+      status = await invoke<QueryMetadata>('topology_status', { request: { workspace: selectedWorkspace } });
     } catch (cause) {
       error = String(cause);
-    } finally {
-      loading = false;
     }
-  });
+  }
 
   async function loadWorkspace() {
     if (!selectedWorkspace) return;
@@ -90,12 +110,20 @@
       snapshot = await invoke<GraphSnapshot>('load_graph', {
         request: { workspace: selectedWorkspace }
       });
+      status = snapshot.metadata;
       returnToWorkspace();
     } catch (cause) {
       error = String(cause);
     } finally {
       loading = false;
     }
+  }
+
+  function selectSearch() {
+    const query = search.trim().toLocaleLowerCase();
+    const entity = snapshot?.nodes.find((node) => node.id.toLocaleLowerCase() === query || node.name.toLocaleLowerCase() === query)
+      ?? snapshot?.nodes.find((node) => node.id.toLocaleLowerCase().includes(query) || node.name.toLocaleLowerCase().includes(query));
+    if (entity) rootId = entity.id;
   }
 
   function changeWorkspace(event: Event) {
@@ -224,9 +252,12 @@
     </nav>
 
     <div class="header-meta">
-      <Badge>fixture · rev {snapshot?.metadata.revision ?? '—'}</Badge>
+      <Badge>rev {snapshot?.metadata.revision ?? '—'}</Badge>
       <span class:healthy={Boolean(snapshot && !snapshot.metadata.freshness.stale)} class="status-dot"></span>
       <span>{snapshot?.metadata.freshness.stale ? 'stale' : 'snapshot ready'}</span>
+      {#if status && snapshot && status.revision > snapshot.metadata.revision}
+        <Button size="sm" variant="outline" onclick={loadWorkspace}>Revision {status.revision} available · Refresh</Button>
+      {/if}
     </div>
   </header>
 
@@ -323,11 +354,6 @@
           <span>Include tests</span>
         </Button>
 
-        <div class="guard-note">
-          <span class="eyebrow">Render guard</span>
-          <strong>{MAX_VISIBLE_NODES.toLocaleString()} nodes · {MAX_VISIBLE_LINKS.toLocaleString()} links</strong>
-          <p>The full fixture stays loaded. Oversized projections stop here and ask for narrower filters.</p>
-        </div>
       </div>
     </details>
     {#if filtersOpen}
@@ -353,27 +379,26 @@
           <span><i class="downstream"></i>Downstream</span>
         </div>
         <div class="toolbar-actions">
+          <input aria-label="Search entities" placeholder="Canonical ID or name" bind:value={search} onkeydown={(event) => event.key === 'Enter' && selectSearch()} />
+          <Button variant="outline" onclick={selectSearch}>Find</Button>
+          <select aria-label="Investigation mode" bind:value={mode}>
+            <option value="context">Context</option>
+            <option value="dependencies">Dependencies</option>
+            <option value="impact">Impact</option>
+            <option value="trace">Trace</option>
+          </select>
+          {#if mode === 'trace'}
+            <input aria-label="Trace target" placeholder="Trace target ID" bind:value={traceTarget} />
+          {/if}
           {#if rootId}<Button variant="outline" onclick={clearFocus}>Clear focus</Button>{/if}
           <Badge>{projection.nodes.length} nodes</Badge>
           <Badge>{projection.links.length} links</Badge>
         </div>
       </div>
 
-      {#if projection.truncated}
-        <div class="warning" role="alert">
-          {#if snapshot?.traversal.truncated}
-            <strong>The loaded traversal is incomplete.</strong> Narrow the backend query before treating this view as complete.
-          {:else}
-            <strong>Visible graph truncated.</strong>
-            Omitted {projection.omittedNodes} nodes and {projection.omittedLinks} links.
-            Narrow repository, relationship, origin, or tests before continuing.
-          {/if}
-        </div>
-      {/if}
-
       <div class="canvas-wrap">
         {#if error}
-          <div class="empty"><strong>Could not load the Tauri fixture.</strong><span>{error}</span></div>
+          <div class="empty"><strong>Could not load the workspace graph.</strong><span>{error}</span></div>
         {:else if loading}
           <div class="empty"><span class="loader"></span><strong>Loading typed graph…</strong></div>
         {:else}
@@ -423,7 +448,7 @@
           </div>
         {:else}
           <div class="instructions">
-            <div><span>01</span><p>Start with the typed entities across the fixture workspace.</p></div>
+            <div><span>01</span><p>Start with the typed entities across the selected workspace.</p></div>
             <div><span>02</span><p>Use repository, relationship, origin, and test filters to narrow the topology.</p></div>
             <div><span>03</span><p>Select an entity to persist its direct neighbours and directional relationship flow.</p></div>
           </div>
