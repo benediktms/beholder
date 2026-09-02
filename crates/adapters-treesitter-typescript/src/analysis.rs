@@ -264,11 +264,8 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
     node != root
         && (matches!(
             node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        ) || (node.kind() == "arrow_function"
+            "function_declaration" | "generator_function_declaration" | "method_definition"
+        ) || (matches!(node.kind(), "arrow_function" | "function_expression")
             && node
                 .parent()
                 .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
@@ -604,6 +601,7 @@ fn collect_alias_bindings(
                         |binding| (binding.scope_start, binding.scope_end),
                     )
             };
+            let (source_scope_start, source_scope_end) = lexical_scope(node, root);
             for (index, source_node) in sources.drain(..).enumerate() {
                 let Some(source_name) = text(source_node, source) else {
                     continue;
@@ -616,6 +614,8 @@ fn collect_alias_bindings(
                         .map_or(0, |position| position.character),
                     scope_start,
                     scope_end,
+                    source_scope_start,
+                    source_scope_end,
                     conditional: conditional || index > 0,
                 });
             }

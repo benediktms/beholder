@@ -1286,6 +1286,7 @@ fn aliased_receiver(
         };
         receiver = binding.source.clone();
         call_site.0 = (binding.line, binding.character);
+        call_site.1 = (binding.source_scope_start, binding.source_scope_end);
     }
     receiver
 }
@@ -1301,11 +1302,16 @@ fn aliased_receivers(
         .get(caller)
         .copied()
         .unwrap_or_default();
-    let mut pending = vec![(receiver.to_owned(), call_site.0, aliases.len() + 1)];
+    let mut pending = vec![(
+        receiver.to_owned(),
+        call_site.0,
+        call_site.1,
+        aliases.len() + 1,
+    )];
     let mut resolved = BTreeSet::new();
-    while let Some((receiver, position, remaining)) = pending.pop() {
-        let binding = alias_at_call_site(aliases, &receiver, (position, call_site.1))
-            .zip(remaining.checked_sub(1));
+    while let Some((receiver, position, scope, remaining)) = pending.pop() {
+        let binding =
+            alias_at_call_site(aliases, &receiver, (position, scope)).zip(remaining.checked_sub(1));
         let Some((binding, remaining)) = binding else {
             resolved.insert(receiver);
             continue;
@@ -1316,11 +1322,12 @@ fn aliased_receivers(
             } else {
                 (binding.line, binding.character - 1)
             };
-            pending.push((receiver, before, remaining));
+            pending.push((receiver, before, scope, remaining));
         }
         pending.push((
             binding.source.clone(),
             (binding.line, binding.character),
+            (binding.source_scope_start, binding.source_scope_end),
             remaining,
         ));
     }
@@ -1392,25 +1399,29 @@ fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryI
                 ))
             });
         if let Some((language, context, argument, method)) = contextual {
-            let context_type = receiver_type(
-                index,
-                observation.from.as_str(),
-                &context,
-                call_site,
-                &mut receiver_types,
-            );
-            let is_context = context_type
-                .as_ref()
-                .is_some_and(|(_, type_name)| type_name.rsplit('.').next() == Some("Context"))
-                || context_type.as_ref().is_some_and(|(file, type_name)| {
-                    index.file_imports.get(file).is_some_and(|imports| {
-                        imports.iter().any(|import| {
-                            import.bindings.iter().any(|binding| {
-                                binding.local == *type_name && binding.imported == "Context"
+            let is_context =
+                aliased_receivers(index, observation.from.as_str(), &context, call_site)
+                    .into_iter()
+                    .any(|context| {
+                        let context_type = receiver_type(
+                            index,
+                            observation.from.as_str(),
+                            &context,
+                            call_site,
+                            &mut receiver_types,
+                        );
+                        context_type.as_ref().is_some_and(|(_, type_name)| {
+                            type_name.rsplit('.').next() == Some("Context")
+                        }) || context_type.as_ref().is_some_and(|(file, type_name)| {
+                            index.file_imports.get(file).is_some_and(|imports| {
+                                imports.iter().any(|import| {
+                                    import.bindings.iter().any(|binding| {
+                                        binding.local == *type_name && binding.imported == "Context"
+                                    })
+                                })
                             })
                         })
-                    })
-                });
+                    });
             observation.to = if is_context {
                 EntityId::from(format!("{language}-returned://{argument}/{method}"))
             } else {
@@ -2041,7 +2052,7 @@ mod tests {
             ),
             (
                 Path::new("src/entry.ts"),
-                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function renamed(ctx: Context) { return ctx.get(loader).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); } export function nonInvoking(context: Context) { return context.get(loader).clear(); } export class Preview { constructor(private context: Context) {} run() { return this.context.get(loader).load('key'); } }",
+                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function renamed(ctx: Context) { return ctx.get(loader).load('key'); } export function conditionalContext(context: Context, map: Map<unknown, Loader>, flag: boolean) { let holder = context; if (flag) holder = map; return holder.get(loader).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); } export function nonInvoking(context: Context) { return context.get(loader).clear(); } export class Preview { constructor(private context: Context) {} run() { return this.context.get(loader).load('key'); } }",
             ),
             (
                 Path::new("src/qualified.ts"),
@@ -2112,6 +2123,10 @@ mod tests {
         )));
         assert!(edges.contains(&(
             "repo://example/typescript/src/entry/renamed",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/conditionalContext",
             "repo://example/typescript/src/loader/loader",
         )));
         assert!(edges.contains(&(
@@ -2282,6 +2297,11 @@ mod tests {
                 maybeRun(() => { selected = second; });
                 context.get(selected).load('callback-write');
             }
+            export function blockSource(context: Context) {
+                let selected = first;
+                { const local = second; selected = local; }
+                context.get(selected).load('block-source');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -2388,13 +2408,25 @@ mod tests {
             block_scoped,
             BTreeSet::from(["repo://example/typescript/src/entry/first"])
         );
+        let block_source = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/blockSource"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            block_source,
+            BTreeSet::from(["repo://example/typescript/src/entry/second"])
+        );
     }
 
     #[test]
     fn resolves_a_parenthesized_callback_constructor() {
         let source = r#"
             class Client { fetch() {} }
-            const loader = Runtime.createContext(() => (new Loader(() => {
+            const loader = Runtime.createContext(() => (new Loader(async function () {
                 const client = new Client();
                 return client.fetch();
             })));

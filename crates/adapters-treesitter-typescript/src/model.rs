@@ -85,6 +85,12 @@ impl TypescriptAnalysis {
                 )
                 .chain(
                     definition
+                        .alias_bindings
+                        .iter()
+                        .map(|binding| (binding.source_scope_start, binding.source_scope_end)),
+                )
+                .chain(
+                    definition
                         .factory_bindings
                         .iter()
                         .map(|binding| (binding.scope_start, binding.scope_end)),
@@ -128,6 +134,8 @@ impl TypescriptAnalysis {
                 binding.character = 0;
                 (binding.scope_start, binding.scope_end) =
                     normalize_scope((binding.scope_start, binding.scope_end));
+                (binding.source_scope_start, binding.source_scope_end) =
+                    normalize_scope((binding.source_scope_start, binding.source_scope_end));
             }
             for binding in &mut definition.factory_bindings {
                 (binding.scope_start, binding.scope_end) =
@@ -259,6 +267,10 @@ pub(super) struct AliasBinding {
     pub(super) scope_start: usize,
     #[serde(default)]
     pub(super) scope_end: usize,
+    #[serde(default)]
+    pub(super) source_scope_start: usize,
+    #[serde(default)]
+    pub(super) source_scope_end: usize,
     #[serde(default)]
     pub(super) conditional: bool,
 }
