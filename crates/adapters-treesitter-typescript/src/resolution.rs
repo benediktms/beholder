@@ -2150,6 +2150,15 @@ mod tests {
                 const selected = flag ? first : second;
                 context.get(selected).load('ternary');
             }
+            export function nullish(context: Context, preferred?: Loader) {
+                const selected = preferred ?? first;
+                context.get(selected).load('nullish');
+            }
+            export function tryBody(context: Context) {
+                let selected = first;
+                try { mayThrow(); selected = second; } catch {}
+                context.get(selected).load('try-body');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -2211,7 +2220,7 @@ mod tests {
                 BTreeSet::from(["repo://example/typescript/src/entry/first"])
             );
         }
-        for caller in ["shortCircuit", "caught", "ternary"] {
+        for caller in ["shortCircuit", "caught", "ternary", "tryBody"] {
             let caller = format!("repo://example/typescript/src/entry/{caller}");
             let targets = observations
                 .iter()
@@ -2229,13 +2238,22 @@ mod tests {
                 ])
             );
         }
+        let nullish = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/nullish"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(nullish.contains("repo://example/typescript/src/entry/first"));
     }
 
     #[test]
     fn resolves_a_parenthesized_callback_constructor() {
         let source = r#"
             class Client { fetch() {} }
-            const loader = createContext(() => (new Loader(() => {
+            const loader = Runtime.createContext(() => (new Loader(() => {
                 const client = new Client();
                 return client.fetch();
             })));

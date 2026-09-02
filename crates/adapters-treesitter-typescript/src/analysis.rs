@@ -499,6 +499,10 @@ fn has_conditional_ancestor(node: Node<'_>, source: &[u8], root: Node<'_>) -> bo
                     | "while_statement"
                     | "do_statement"
             ) || (ancestor.kind() == "binary_expression" && is_short_circuit(ancestor, source))
+                || (ancestor.kind() == "try_statement"
+                    && ancestor.child_by_field_name("body").is_some_and(|body| {
+                        body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
+                    }))
         })
 }
 
@@ -533,8 +537,13 @@ fn collect_alias_bindings(
         let value = unparenthesized(value);
         let conditional = has_conditional_ancestor(node, source, root)
             || node.kind() == "augmented_assignment_expression";
-        let mut sources = if value.kind() == "ternary_expression" {
-            ["consequence", "alternative"]
+        let fields = match value.kind() {
+            "ternary_expression" => Some(["consequence", "alternative"]),
+            "binary_expression" if is_short_circuit(value, source) => Some(["left", "right"]),
+            _ => None,
+        };
+        let mut sources = if let Some(fields) = fields {
+            fields
                 .into_iter()
                 .filter_map(|field| value.child_by_field_name(field).map(unparenthesized))
                 .collect::<Vec<_>>()
@@ -1022,7 +1031,7 @@ fn collect_definitions(
             if let Some(factory) = value
                 .filter(|value| value.kind() == "call_expression")
                 .and_then(|value| value.child_by_field_name("function"))
-                .filter(|function| function.kind() == "identifier")
+                .filter(|function| matches!(function.kind(), "identifier" | "member_expression"))
                 .and_then(|function| text(function, source))
                 && let Some(name) = node
                     .child_by_field_name("name")
