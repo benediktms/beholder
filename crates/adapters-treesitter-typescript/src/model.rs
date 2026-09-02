@@ -62,9 +62,24 @@ impl TypescriptAnalysis {
         let mut analysis = self.clone();
         for call in &mut analysis.calls {
             call.clear_position();
+            call.scope_start = 0;
+            call.scope_end = 0;
         }
         for definition in &mut analysis.definitions {
             definition.line = 0;
+            let mut scopes = definition
+                .calls
+                .iter()
+                .map(|call| (call.scope_start, call.scope_end))
+                .chain(
+                    definition
+                        .bindings
+                        .iter()
+                        .map(|binding| (binding.scope_start, binding.scope_end)),
+                )
+                .collect::<Vec<_>>();
+            scopes.sort_unstable();
+            scopes.dedup();
             let alias_positions = definition
                 .alias_bindings
                 .iter()
@@ -75,8 +90,18 @@ impl TypescriptAnalysis {
                     .iter()
                     .filter(|position| **position <= (call.line, call.start_character))
                     .count();
+                call.scope_start = scopes
+                    .binary_search(&(call.scope_start, call.scope_end))
+                    .unwrap_or_default();
+                call.scope_end = 0;
                 call.clear_position();
                 call.line = alias_order;
+            }
+            for binding in &mut definition.bindings {
+                binding.scope_start = scopes
+                    .binary_search(&(binding.scope_start, binding.scope_end))
+                    .unwrap_or_default();
+                binding.scope_end = 0;
             }
             for binding in &mut definition.alias_bindings {
                 binding.line = 0;
@@ -173,6 +198,10 @@ pub(super) struct Binding {
     pub(super) receiver: String,
     pub(super) type_name: String,
     pub(super) injection_token: Option<String>,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -254,6 +283,10 @@ pub(super) struct Call {
     pub(super) end_line: u32,
     #[serde(default)]
     pub(super) end_character: u32,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

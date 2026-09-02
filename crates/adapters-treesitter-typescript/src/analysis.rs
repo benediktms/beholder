@@ -176,6 +176,8 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
         start_character: start.character,
         end_line: end.line,
         end_character: end.character,
+        scope_start: 0,
+        scope_end: 0,
     })
 }
 
@@ -275,23 +277,41 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
                 .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
 }
 
+fn lexical_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
+    let scope = std::iter::successors(Some(node), |ancestor| ancestor.parent())
+        .find(|ancestor| {
+            matches!(
+                ancestor.kind(),
+                "arrow_function"
+                    | "function_declaration"
+                    | "function_expression"
+                    | "generator_function_declaration"
+                    | "method_definition"
+            )
+        })
+        .unwrap_or(root);
+    (scope.start_byte(), scope.end_byte())
+}
+
 fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
     if is_collection_boundary(node, root) {
         return;
     }
     match node.kind() {
         "call_expression" => {
-            if let Some(call) = call(node, source, CallKind::Direct) {
+            if let Some(mut call) = call(node, source, CallKind::Direct) {
+                (call.scope_start, call.scope_end) = lexical_scope(node, root);
                 calls.push(call);
             }
         }
         "new_expression" => {
-            if let Some(call) = call(node, source, CallKind::Constructor) {
+            if let Some(mut call) = call(node, source, CallKind::Constructor) {
+                (call.scope_start, call.scope_end) = lexical_scope(node, root);
                 calls.push(call);
             }
         }
         "jsx_opening_element" | "jsx_self_closing_element" => {
-            if let Some(call) = node
+            if let Some(mut call) = node
                 .child_by_field_name("name")
                 .filter(|target| {
                     target.kind() == "member_expression"
@@ -301,6 +321,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
                 })
                 .and_then(|target| call_target(node, target, source, CallKind::Direct))
             {
+                (call.scope_start, call.scope_end) = lexical_scope(node, root);
                 calls.push(call);
             }
         }
@@ -374,6 +395,8 @@ fn binding(node: Node<'_>, source: &[u8]) -> Option<Binding> {
         receiver,
         type_name,
         injection_token: injection_token(node, source),
+        scope_start: 0,
+        scope_end: 0,
     })
 }
 
@@ -405,8 +428,9 @@ fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mu
     if matches!(
         node.kind(),
         "required_parameter" | "optional_parameter" | "variable_declarator"
-    ) && let Some(binding) = binding(node, source)
+    ) && let Some(mut binding) = binding(node, source)
     {
+        (binding.scope_start, binding.scope_end) = lexical_scope(node, root);
         bindings.push(binding);
     }
     let mut cursor = node.walk();
@@ -654,6 +678,8 @@ fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
                     receiver: alias.receiver,
                     type_name: parameter.type_name.clone(),
                     injection_token: parameter.injection_token.clone(),
+                    scope_start: 0,
+                    scope_end: 0,
                 })
             }));
         }

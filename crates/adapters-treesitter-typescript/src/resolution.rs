@@ -359,13 +359,14 @@ struct RepositoryIndex<'a> {
     caller_bindings: BTreeMap<String, &'a [Binding]>,
     caller_alias_bindings: BTreeMap<String, &'a [AliasBinding]>,
     caller_factory_bindings: BTreeMap<String, &'a [FactoryBinding]>,
-    caller_call_positions: BTreeMap<String, Vec<SourceOrder>>,
+    caller_call_positions: BTreeMap<String, Vec<CallSite>>,
     file_imports: BTreeMap<PathBuf, &'a [Import]>,
 }
 
 type Origin = (PathBuf, String);
 type SourceOrder = (usize, u32);
-type ReceiverTypeCache = BTreeMap<(String, String, SourceOrder), Option<Origin>>;
+type CallSite = (SourceOrder, (usize, usize));
+type ReceiverTypeCache = BTreeMap<(String, String, CallSite), Option<Origin>>;
 type Origins = BTreeMap<Origin, Origin>;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -381,11 +382,31 @@ struct ResolvedNestModule {
     exports: Vec<Origin>,
 }
 
-fn call_positions(calls: &[Call]) -> Vec<SourceOrder> {
+fn call_positions(calls: &[Call]) -> Vec<CallSite> {
     calls
         .iter()
-        .map(|call| (call.line, call.start_character))
+        .map(|call| {
+            (
+                (call.line, call.start_character),
+                (call.scope_start, call.scope_end),
+            )
+        })
         .collect()
+}
+
+fn binding_at_call_site<'a>(
+    bindings: &'a [Binding],
+    receiver: &str,
+    scope: (usize, usize),
+) -> Option<&'a Binding> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.receiver == receiver
+                && binding.scope_start <= scope.0
+                && scope.1 <= binding.scope_end
+        })
+        .max_by_key(|binding| binding.scope_start)
 }
 
 fn insert_origin(
@@ -1142,15 +1163,15 @@ fn receiver_type(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
-    position: SourceOrder,
+    call_site: CallSite,
     cache: &mut ReceiverTypeCache,
 ) -> Option<(PathBuf, String)> {
-    let key = (caller.to_owned(), receiver.to_owned(), position);
+    let key = (caller.to_owned(), receiver.to_owned(), call_site);
     if let Some(resolved) = cache.get(&key) {
         return resolved.clone();
     }
     cache.insert(key.clone(), None);
-    let resolved = receiver_type_uncached(index, caller, receiver, position, cache);
+    let resolved = receiver_type_uncached(index, caller, receiver, call_site, cache);
     cache.insert(key, resolved.clone());
     resolved
 }
@@ -1159,11 +1180,11 @@ fn receiver_type_uncached(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
-    position: SourceOrder,
+    call_site: CallSite,
     cache: &mut ReceiverTypeCache,
 ) -> Option<(PathBuf, String)> {
     let file = index.caller_files.get(caller)?;
-    let receiver = aliased_receiver(index, caller, receiver, position);
+    let receiver = aliased_receiver(index, caller, receiver, call_site.0);
     if let Some(field) = receiver.strip_prefix("this.")
         && !field.contains('.')
         && let Some((owner_file, owner)) = index.caller_owners.get(caller)
@@ -1174,7 +1195,7 @@ fn receiver_type_uncached(
     if let Some(type_name) = index
         .caller_bindings
         .get(caller)
-        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+        .and_then(|bindings| binding_at_call_site(bindings, &receiver, call_site.1))
         .map(|binding| binding.type_name.as_str())
     {
         return imported_origin(index, file, type_name)
@@ -1197,7 +1218,7 @@ fn receiver_type_uncached(
     let parts = receiver.split('.').collect::<Vec<_>>();
     for prefix_length in (1..parts.len()).rev() {
         let prefix = parts[..prefix_length].join(".");
-        let Some(mut current) = receiver_type(index, caller, &prefix, position, cache) else {
+        let Some(mut current) = receiver_type(index, caller, &prefix, call_site, cache) else {
             continue;
         };
         let mut resolved = true;
@@ -1298,7 +1319,7 @@ fn observation_position(
     observation: &Observation,
     index: &RepositoryIndex<'_>,
     occurrences: &mut BTreeMap<String, usize>,
-) -> SourceOrder {
+) -> CallSite {
     let key = observation.from.to_string();
     let occurrence = occurrences.entry(key).or_default();
     let position = index
@@ -1306,7 +1327,7 @@ fn observation_position(
         .get(observation.from.as_str())
         .and_then(|positions| positions.get(*occurrence))
         .copied()
-        .unwrap_or((observation_line(observation), u32::MAX));
+        .unwrap_or(((observation_line(observation), u32::MAX), (0, usize::MAX)));
     *occurrence += 1;
     position
 }
@@ -1326,7 +1347,7 @@ fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryI
             .get(caller_file)
             .copied()
             .unwrap_or_default();
-        let position = observation_position(observation, index, &mut occurrences);
+        let call_site = observation_position(observation, index, &mut occurrences);
         let returned = observation
             .to
             .as_str()
@@ -1345,28 +1366,29 @@ fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryI
                     .map(|(argument, method)| (language, argument, method))
             });
         if let Some((language, argument, method)) = returned {
-            let targets = aliased_receivers(index, observation.from.as_str(), argument, position)
-                .into_iter()
-                .map(|argument| {
-                    let origin = imported_origin(index, caller_file, &argument)
-                        .or_else(|| Some((caller_file.clone(), argument.clone())))
-                        .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
-                    origin
-                        .filter(|origin| index.callback_returns.contains(origin))
-                        .and_then(|origin| index.symbols.get(&origin).cloned())
-                        .map_or_else(
-                            || {
-                                (
-                                    EntityId::from(format!(
-                                        "{language}-returned://{argument}/{method}"
-                                    )),
-                                    observation.confidence,
-                                )
-                            },
-                            |target| (target, Confidence::Inferred),
-                        )
-                })
-                .collect::<BTreeMap<_, _>>();
+            let targets =
+                aliased_receivers(index, observation.from.as_str(), argument, call_site.0)
+                    .into_iter()
+                    .map(|argument| {
+                        let origin = imported_origin(index, caller_file, &argument)
+                            .or_else(|| Some((caller_file.clone(), argument.clone())))
+                            .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
+                        origin
+                            .filter(|origin| index.callback_returns.contains(origin))
+                            .and_then(|origin| index.symbols.get(&origin).cloned())
+                            .map_or_else(
+                                || {
+                                    (
+                                        EntityId::from(format!(
+                                            "{language}-returned://{argument}/{method}"
+                                        )),
+                                        observation.confidence,
+                                    )
+                                },
+                                |target| (target, Confidence::Inferred),
+                            )
+                    })
+                    .collect::<BTreeMap<_, _>>();
             if let Some((target, confidence)) = targets.first_key_value() {
                 observation.to = target.clone();
                 observation.confidence = *confidence;
@@ -1441,7 +1463,7 @@ fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryI
                     index,
                     observation.from.as_str(),
                     receiver,
-                    position,
+                    call_site,
                     &mut receiver_types,
                 )?;
                 member_entity(index, file, type_name, name)
@@ -1671,7 +1693,7 @@ pub fn resolve_workspace_calls(
             .get(caller_file)
             .copied()
             .unwrap_or_default();
-        let position = observation_position(observation, caller, &mut occurrences);
+        let call_site = observation_position(observation, caller, &mut occurrences);
         let returned = observation
             .to
             .as_str()
@@ -1684,7 +1706,8 @@ pub fn resolve_workspace_calls(
             })
             .and_then(|target| target.split_once('/'));
         if let Some((argument, _method)) = returned {
-            let argument = aliased_receiver(caller, observation.from.as_str(), argument, position);
+            let argument =
+                aliased_receiver(caller, observation.from.as_str(), argument, call_site.0);
             let qualified = argument.split_once('.');
             let target = imports.iter().find_map(|import| {
                 let binding = import.bindings.iter().find(|binding| {
@@ -1772,12 +1795,9 @@ pub fn resolve_workspace_calls(
             })
             .or_else(|| {
                 let receiver =
-                    aliased_receiver(caller, observation.from.as_str(), receiver?, position);
-                let type_name = caller
-                    .caller_bindings
-                    .get(observation.from.as_str())?
-                    .iter()
-                    .find(|binding| binding.receiver == receiver)?
+                    aliased_receiver(caller, observation.from.as_str(), receiver?, call_site.0);
+                let bindings = caller.caller_bindings.get(observation.from.as_str())?;
+                let type_name = binding_at_call_site(bindings, &receiver, call_site.1)?
                     .type_name
                     .as_str();
                 let (target_index, file, imported) = imports.iter().find_map(|import| {
@@ -1799,7 +1819,7 @@ pub fn resolve_workspace_calls(
             })
             .or_else(|| {
                 let receiver =
-                    aliased_receiver(caller, observation.from.as_str(), receiver?, position);
+                    aliased_receiver(caller, observation.from.as_str(), receiver?, call_site.0);
                 let factory = caller
                     .caller_factory_bindings
                     .get(observation.from.as_str())?
@@ -2029,6 +2049,36 @@ mod tests {
             "repo://example/typescript/src/loader/loader",
             "repo://example/typescript/src/loader/Client/fetch",
         )));
+    }
+
+    #[test]
+    fn resolves_shadowed_bindings_in_nested_callback_scopes() {
+        let source = r#"
+            class First { fetch() {} }
+            class Second { fetch() {} }
+            const loader = createContext(() => {
+                const client = new First();
+                return new Loader(() => {
+                    const client = new Second();
+                    return client.fetch();
+                });
+            });
+        "#;
+        let path = Path::new("src/loader.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/loader/loader"
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.contains("repo://example/typescript/src/loader/Second/fetch"));
+        assert!(!targets.contains("repo://example/typescript/src/loader/First/fetch"));
     }
 
     #[test]
