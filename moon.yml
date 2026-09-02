@@ -88,7 +88,9 @@ tasks:
       runInCI: false
 
   release:
-    command: 'cargo build --release -p beholder-cli -p beholder-daemon -p beholder-worker-rust'
+    command: 'cargo build --release -p beholder-cli -p beholder-daemon -p beholder-worker-rust -p beholder-graph-ui'
+    deps:
+      - 'graph-ui:build'
     inputs:
       - '@group(sources)'
     options:

@@ -49,7 +49,7 @@ fn binary() -> Result<PathBuf, Box<dyn Error>> {
     }
 }
 
-async fn start() -> Result<(), Box<dyn Error>> {
+pub(super) async fn start() -> Result<(), Box<dyn Error>> {
     if let Some(pid) = wait_to_start().await? {
         stdout(format_args!("already running (pid {pid})"))?;
         return Ok(());

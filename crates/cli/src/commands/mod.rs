@@ -6,6 +6,7 @@ use std::{error::Error, path::PathBuf};
 mod admin;
 mod daemon;
 mod enrich;
+mod gui;
 mod index;
 mod job;
 mod query;
@@ -24,6 +25,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Start the daemon when needed and launch the desktop graph explorer.
+    Gui,
     /// Control the centralized Beholder daemon.
     Daemon {
         #[command(subcommand)]
@@ -338,6 +341,7 @@ impl OutputArgs {
 
 pub(super) async fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Some(Command::Gui) => gui::run().await?,
         Some(Command::Daemon { command }) => daemon::run(command).await?,
         Some(Command::Job { command }) => job::run(command).await?,
         Some(Command::IndexRust { source, database }) => {
