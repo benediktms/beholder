@@ -13,7 +13,11 @@ use ra_ap_syntax::{
     ast::{self, HasName},
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, error::Error, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    path::Path,
+};
 use tree_sitter::{Node, Parser};
 
 pub(super) fn collect_tree_sitter_functions<'tree>(
@@ -582,6 +586,21 @@ pub fn entities_from_analysis(
             )
             .unwrap()
         }))
+        .collect()
+}
+
+pub fn unresolved_endpoint_entities(observations: &[Observation]) -> Vec<EntityFact> {
+    observations
+        .iter()
+        .flat_map(|observation| [&observation.from, &observation.to])
+        .filter(|id| {
+            id.as_str().starts_with("rust-call://")
+                || id.as_str().starts_with("rust-method://")
+        })
+        .map(|id| id.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
         .collect()
 }
 

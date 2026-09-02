@@ -2,7 +2,7 @@ use crate::{
     ElixirAnalysis, ElixirRepository, FRONTEND_VERSION, RESOLVER_VERSION,
     diagnostics_from_analysis, entities_from_analysis, generated_entities, generated_observations,
     graphql_resolver_bindings, observations_from_analysis, resolve_repository_calls,
-    resolve_workspace_modules,
+    resolve_workspace_modules, unresolved_endpoint_entities,
 };
 use crate::{
     analysis::analyze_with_plugins,
@@ -285,6 +285,7 @@ impl WorkspaceAnalyzer for ElixirAnalyzer {
             entities.extend(enrichment.entities);
             observations.extend(enrichment.observations);
             diagnostics.extend(enrichment.diagnostics);
+            entities.extend(unresolved_endpoint_entities(&observations));
             let fact_shards = build_fact_shards(
                 &repository.state.repository.identity,
                 &analyzed,

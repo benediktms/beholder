@@ -4655,6 +4655,7 @@ mod tests {
             )
             .unwrap(),
             EntityFact::new("kafka-topic://events", EntityKind::KafkaTopic, None).unwrap(),
+            EntityFact::new("kafka-topic://external", EntityKind::KafkaTopic, None).unwrap(),
             EntityFact::new(
                 "proto-type://events.Envelope",
                 EntityKind::ProtoType,
@@ -4703,7 +4704,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(entities.len(), 3);
+        assert_eq!(entities.len(), 4);
         assert_eq!(observations.len(), 2);
         assert_eq!(candidates, vec![candidate]);
         assert_eq!(observations[0].relation.as_str(), "publishes");

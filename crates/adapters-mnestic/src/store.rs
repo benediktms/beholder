@@ -780,7 +780,10 @@ mod tests {
             producer: "rust".into(),
             owner: owner.into(),
             version: version.into(),
-            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            entities: vec![
+                EntityFact::new(owner, EntityKind::Callable, None).unwrap(),
+                EntityFact::new(target, EntityKind::Callable, None).unwrap(),
+            ],
             observations: vec![Observation::dependency(
                 owner,
                 DependencyRelation::Calls,
@@ -1238,7 +1241,10 @@ mod tests {
             producer: "typescript".into(),
             owner: owner.into(),
             version: "semantic-1".into(),
-            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            entities: vec![
+                EntityFact::new(owner, EntityKind::Callable, None).unwrap(),
+                EntityFact::new("typescript-call://first", EntityKind::Callable, None).unwrap(),
+            ],
             observations: vec![Observation::dependency(
                 owner,
                 DependencyRelation::Calls,

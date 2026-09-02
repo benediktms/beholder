@@ -17,6 +17,7 @@ mod ts_proto;
 
 pub use analysis::{
     analyze, diagnostics_from_analysis, entities_from_analysis, observations_from_analysis,
+    unresolved_endpoint_entities,
 };
 pub use analyzer::TypescriptAnalyzer;
 pub use graphql::{

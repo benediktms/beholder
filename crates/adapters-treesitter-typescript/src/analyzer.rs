@@ -3,7 +3,7 @@ use crate::{
     RESOLVER_VERSION, SourceLanguage, TypescriptAnalysis, TypescriptRepository,
     collect_graphql_facts, collect_graphql_resolvers, diagnostics_from_analysis,
     entities_from_analysis, resolve_repository_calls, resolve_workspace_calls,
-    unresolved_call_diagnostics,
+    unresolved_call_diagnostics, unresolved_endpoint_entities,
 };
 use crate::{
     analysis::{analyze_with_plugins, semantics_from_analysis, source_stem},
@@ -487,6 +487,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             observations.extend(graphql.observations);
             entities.extend(graphql.entities);
             diagnostics.extend(graphql.diagnostics);
+            entities.extend(unresolved_endpoint_entities(&observations));
             let fact_shards = build_fact_shards(
                 &repository.state.repository.identity,
                 &repository_plan.analysis.version,
