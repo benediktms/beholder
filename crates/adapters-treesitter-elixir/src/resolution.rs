@@ -349,7 +349,7 @@ pub fn unresolved_endpoint_entities(observations: &[Observation]) -> Vec<EntityF
         .flat_map(|observation| [&observation.from, &observation.to])
         .filter_map(|id| {
             let id = id.as_str();
-            if id.starts_with("elixir-call://") {
+            if id.starts_with("elixir-call://") || id.starts_with("elixir-dynamic-call://") {
                 Some((id, EntityKind::Callable))
             } else if id.starts_with("elixir-module://") || id.starts_with("erlang-module://") {
                 Some((id, EntityKind::Namespace))

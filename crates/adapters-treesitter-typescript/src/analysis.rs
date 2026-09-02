@@ -1891,6 +1891,8 @@ pub fn unresolved_endpoint_entities(observations: &[Observation]) -> Vec<EntityF
                 "javascript-call://",
                 "javascript-method://",
                 "javascript-constructor://",
+                "typescript-returned://",
+                "javascript-returned://",
             ]
             .iter()
             .any(|prefix| id.starts_with(prefix))
