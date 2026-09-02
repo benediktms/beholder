@@ -1847,7 +1847,16 @@ pub fn entities_from_analysis(
         analysis.language.id_segment(),
         source_stem(path)
     );
-    let mut entities = BTreeMap::from([(module_id.clone(), EntityKind::Namespace)]);
+    let source_id = format!(
+        "repo://{}/{}-source/{}",
+        repository,
+        analysis.language.id_segment(),
+        path.display()
+    );
+    let mut entities = BTreeMap::from([
+        (source_id, EntityKind::Namespace),
+        (module_id.clone(), EntityKind::Namespace),
+    ]);
     for definition in &analysis.definitions {
         let id = format!("{module_id}/{}", definition.qualified_name);
         let kind = match definition.kind {
