@@ -460,6 +460,24 @@ fn is_short_circuit(node: Node<'_>, source: &[u8]) -> bool {
         .is_some_and(|operator| matches!(operator, "&&" | "||" | "??" | "&&=" | "||=" | "??="))
 }
 
+fn has_conditional_ancestor(node: Node<'_>, source: &[u8], root: Node<'_>) -> bool {
+    std::iter::successors(node.parent(), |ancestor| ancestor.parent())
+        .take_while(|ancestor| *ancestor != root)
+        .any(|ancestor| {
+            matches!(
+                ancestor.kind(),
+                "if_statement"
+                    | "catch_clause"
+                    | "switch_case"
+                    | "ternary_expression"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "while_statement"
+                    | "do_statement"
+            ) || (ancestor.kind() == "binary_expression" && is_short_circuit(ancestor, source))
+        })
+}
+
 fn collect_alias_bindings(
     node: Node<'_>,
     source: &[u8],
@@ -486,31 +504,37 @@ fn collect_alias_bindings(
     };
     if let (Some(receiver), Some(value)) = pair
         && matches!(receiver.kind(), "identifier" | "member_expression")
-        && matches!(value.kind(), "identifier" | "member_expression")
-        && let (Some(receiver), Some(source_name)) = (text(receiver, source), text(value, source))
+        && let Some(receiver) = text(receiver, source)
     {
-        let conditional = std::iter::successors(node.parent(), |ancestor| ancestor.parent())
-            .take_while(|ancestor| *ancestor != root)
-            .any(|ancestor| {
-                matches!(
-                    ancestor.kind(),
-                    "if_statement"
-                        | "catch_clause"
-                        | "switch_case"
-                        | "ternary_expression"
-                        | "for_statement"
-                        | "for_in_statement"
-                        | "while_statement"
-                        | "do_statement"
-                ) || (ancestor.kind() == "binary_expression" && is_short_circuit(ancestor, source))
-            });
-        bindings.push(AliasBinding {
-            receiver: receiver.into(),
-            source: source_name.into(),
-            line: node.start_position().row + 1,
-            character: lsp_position(node, source, false).map_or(0, |position| position.character),
-            conditional: conditional || node.kind() == "augmented_assignment_expression",
-        });
+        let value = unparenthesized(value);
+        let conditional = has_conditional_ancestor(node, source, root)
+            || node.kind() == "augmented_assignment_expression";
+        let mut sources = if value.kind() == "ternary_expression" {
+            ["consequence", "alternative"]
+                .into_iter()
+                .filter_map(|field| value.child_by_field_name(field).map(unparenthesized))
+                .collect::<Vec<_>>()
+        } else {
+            vec![value]
+        };
+        if sources
+            .iter()
+            .all(|source| matches!(source.kind(), "identifier" | "member_expression"))
+        {
+            for (index, source_node) in sources.drain(..).enumerate() {
+                let Some(source_name) = text(source_node, source) else {
+                    continue;
+                };
+                bindings.push(AliasBinding {
+                    receiver: receiver.into(),
+                    source: source_name.into(),
+                    line: source_node.start_position().row + 1,
+                    character: lsp_position(source_node, source, false)
+                        .map_or(0, |position| position.character),
+                    conditional: conditional || index > 0,
+                });
+            }
+        }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {

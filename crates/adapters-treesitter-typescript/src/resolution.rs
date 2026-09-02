@@ -2065,6 +2065,10 @@ mod tests {
                 try { work(); } catch { selected = second; }
                 context.get(selected).load('caught');
             }
+            export function ternary(context: Context, flag: boolean) {
+                const selected = flag ? first : second;
+                context.get(selected).load('ternary');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -2126,7 +2130,7 @@ mod tests {
                 BTreeSet::from(["repo://example/typescript/src/entry/first"])
             );
         }
-        for caller in ["shortCircuit", "caught"] {
+        for caller in ["shortCircuit", "caught", "ternary"] {
             let caller = format!("repo://example/typescript/src/entry/{caller}");
             let targets = observations
                 .iter()
