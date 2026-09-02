@@ -495,6 +495,7 @@ fn collect_alias_bindings(
                 matches!(
                     ancestor.kind(),
                     "if_statement"
+                        | "catch_clause"
                         | "switch_case"
                         | "ternary_expression"
                         | "for_statement"

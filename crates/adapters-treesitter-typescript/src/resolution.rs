@@ -2060,6 +2060,11 @@ mod tests {
                 flag && (selected = second);
                 context.get(selected).load('short-circuit');
             }
+            export function caught(context: Context) {
+                let selected = first;
+                try { work(); } catch { selected = second; }
+                context.get(selected).load('caught');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -2121,21 +2126,24 @@ mod tests {
                 BTreeSet::from(["repo://example/typescript/src/entry/first"])
             );
         }
-        let short_circuit = observations
-            .iter()
-            .filter(|observation| {
-                observation.from.as_str() == "repo://example/typescript/src/entry/shortCircuit"
-                    && observation.to.as_str().starts_with("repo://")
-            })
-            .map(|observation| observation.to.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            short_circuit,
-            BTreeSet::from([
-                "repo://example/typescript/src/entry/first",
-                "repo://example/typescript/src/entry/second",
-            ])
-        );
+        for caller in ["shortCircuit", "caught"] {
+            let caller = format!("repo://example/typescript/src/entry/{caller}");
+            let targets = observations
+                .iter()
+                .filter(|observation| {
+                    observation.from.as_str() == caller
+                        && observation.to.as_str().starts_with("repo://")
+                })
+                .map(|observation| observation.to.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                targets,
+                BTreeSet::from([
+                    "repo://example/typescript/src/entry/first",
+                    "repo://example/typescript/src/entry/second",
+                ])
+            );
+        }
     }
 
     #[test]
