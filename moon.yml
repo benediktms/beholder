@@ -17,6 +17,57 @@ tasks:
     command: 'cargo test --workspace'
     inputs:
       - '@group(sources)'
+    options:
+      runInCI: false
+
+  test-core:
+    command: >-
+      cargo test
+      -p beholder-dto
+      -p beholder-domain
+      -p beholder-protocol
+      -p beholder-presentation
+      -p beholder-observability
+      -p beholder-plugin-sdk
+      -p beholder-worker-client
+      -p sqlite3-src
+    inputs:
+      - '@group(sources)'
+    options:
+      runInCI: false
+
+  test-adapters:
+    command: >-
+      cargo test
+      --features beholder-adapters-mnestic/sqlite
+      -p beholder-adapters-git
+      -p beholder-adapters-graphql
+      -p beholder-adapters-mnestic
+      -p beholder-adapters-protobuf
+      -p beholder-adapters-treesitter
+      -p beholder-adapters-treesitter-csharp
+      -p beholder-adapters-treesitter-elixir
+      -p beholder-adapters-treesitter-rust
+      -p beholder-adapters-treesitter-typescript
+    inputs:
+      - '@group(sources)'
+    options:
+      runInCI: false
+
+  test-runtime:
+    command: >-
+      cargo test
+      -p beholder-cli
+      -p beholder-daemon
+      -p beholder-daemon-client
+      -p beholder-graph-ui
+      -p beholder-indexing
+      -p beholder-worker-rust
+      -p shell-mnestic
+    inputs:
+      - '@group(sources)'
+    options:
+      runInCI: false
 
   lint:
     command: 'cargo clippy --workspace --all-targets --no-deps -- -D warnings'

@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
+  checks:
     strategy:
       fail-fast: false
       matrix:
@@ -52,3 +52,39 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
       - run: moon ci
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        shard: [core, adapters, runtime]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+      - uses: moonrepo/setup-rust@v1
+        with:
+          inherit-toolchain: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: jdx/mise-action@v4
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - run: moon exec --ignore-ci-checks beholder:test-${{ matrix.shard }}
