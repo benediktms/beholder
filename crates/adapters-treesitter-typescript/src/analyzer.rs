@@ -809,6 +809,33 @@ mod tests {
     }
 
     #[test]
+    fn semantic_cache_changes_when_a_call_crosses_an_alias_assignment() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-typescript-alias-order-{}",
+            std::process::id()
+        ));
+        let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
+        let key = |source: &[u8], fingerprint: &str| {
+            analyzer.analyze(&snapshot(source, fingerprint)).unwrap();
+            analyzer.repository_cache.lock().unwrap()["example/repo"]
+                .0
+                .clone()
+        };
+
+        let before = key(
+            b"export function run(context: Context) { let selected = first; context.get(selected).load(); selected = second; }",
+            "before",
+        );
+        let after = key(
+            b"export function run(context: Context) { let selected = first; selected = second; context.get(selected).load(); }",
+            "after",
+        );
+
+        assert_ne!(before, after);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
     fn repository_semantics_are_reused_after_restart() {
         let cache_dir = std::env::temp_dir().join(format!(
             "beholder-typescript-repository-cache-{}",

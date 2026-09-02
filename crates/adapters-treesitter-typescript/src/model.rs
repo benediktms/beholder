@@ -65,8 +65,18 @@ impl TypescriptAnalysis {
         }
         for definition in &mut analysis.definitions {
             definition.line = 0;
+            let alias_positions = definition
+                .alias_bindings
+                .iter()
+                .map(|binding| (binding.line, binding.character))
+                .collect::<Vec<_>>();
             for call in &mut definition.calls {
+                let alias_order = alias_positions
+                    .iter()
+                    .filter(|position| **position <= (call.line, call.start_character))
+                    .count();
                 call.clear_position();
+                call.line = alias_order;
             }
             for binding in &mut definition.alias_bindings {
                 binding.line = 0;
