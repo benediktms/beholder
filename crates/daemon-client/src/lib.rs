@@ -2,7 +2,7 @@ use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Works
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionEvent,
     GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus, ImpactResult,
-    RepositoryStatus, TraceResult, WhyResult,
+    QueryMetadata, RepositoryStatus, TraceResult, WhyResult, WorkspaceTopology,
 };
 use beholder_protocol::{
     ERROR_CODE_METADATA_KEY,
@@ -11,7 +11,8 @@ use beholder_protocol::{
         GarbageCollectEvent as ProtocolGarbageCollectEvent, GarbageCollectPhase,
         GarbageCollectProgress as ProtocolGarbageCollectProgress, GarbageCollectRequest,
         GetGarbageCollectionStatusRequest, GetJobRequest, GetJobResponse, GetRepositoryRequest,
-        GetStatusRequest, GetStatusResponse, ListJobsRequest, ListJobsResponse,
+        GetStatusRequest, GetStatusResponse, GetWorkspaceTopologyRequest,
+        GetWorkspaceTopologyStatusRequest, ListJobsRequest, ListJobsResponse,
         ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
         RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest, SubmitEnrichmentRequest,
         SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse, TraversalEntityRequest,
@@ -259,6 +260,30 @@ pub async fn context(
         .context(request(EntityRequest { workspace, entity }))
         .await?
         .into_inner()
+        .try_into()?)
+}
+
+pub async fn workspace_topology(
+    workspace: String,
+) -> Result<WorkspaceTopology, Box<dyn std::error::Error>> {
+    Ok(connect()
+        .await?
+        .get_workspace_topology(request(GetWorkspaceTopologyRequest { workspace }))
+        .await?
+        .into_inner()
+        .try_into()?)
+}
+
+pub async fn workspace_topology_status(
+    workspace: String,
+) -> Result<QueryMetadata, Box<dyn std::error::Error>> {
+    Ok(connect()
+        .await?
+        .get_workspace_topology_status(request(GetWorkspaceTopologyStatusRequest { workspace }))
+        .await?
+        .into_inner()
+        .metadata
+        .ok_or("topology status metadata is missing")?
         .try_into()?)
 }
 

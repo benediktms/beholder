@@ -6,6 +6,7 @@ pub const DEPENDENCIES_SCHEMA_V2: &str = "beholder.dependencies.v2";
 pub const IMPACT_SCHEMA_V2: &str = "beholder.impact.v2";
 pub const TRACE_SCHEMA_V2: &str = "beholder.trace.v2";
 pub const WHY_SCHEMA_V2: &str = "beholder.why.v2";
+pub const WORKSPACE_TOPOLOGY_SCHEMA_V1: &str = "beholder.workspace_topology.v1";
 pub const DEFAULT_MAX_HOPS: u32 = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -358,6 +359,15 @@ pub struct SemanticEdge {
     pub evidence: Vec<EvidenceRef>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct WorkspaceTopology {
+    pub schema: String,
+    #[serde(flatten)]
+    pub metadata: QueryMetadata,
+    pub nodes: Vec<EntityRef>,
+    pub edges: Vec<SemanticEdge>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SemanticPath {
     pub nodes: Vec<String>,
@@ -482,6 +492,7 @@ semantic_result!(
     ImpactResult,
     TraceResult,
     WhyResult,
+    WorkspaceTopology,
 );
 
 #[derive(Clone, Debug, PartialEq)]

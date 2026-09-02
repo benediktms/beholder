@@ -11,6 +11,8 @@ service Daemon {
   rpc Dependencies(TraversalEntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetRepository(GetRepositoryRequest) returns (RepositoryResponse);
+  rpc GetWorkspaceTopology(GetWorkspaceTopologyRequest) returns (GetWorkspaceTopologyResponse);
+  rpc GetWorkspaceTopologyStatus(GetWorkspaceTopologyStatusRequest) returns (GetWorkspaceTopologyStatusResponse);
   rpc Impact(TraversalEntityRequest) returns (ImpactResponse);
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
   rpc GetJob(GetJobRequest) returns (GetJobResponse);
@@ -100,6 +102,25 @@ message QueryMetadata {
   Freshness freshness = 3;
   AnalysisCompleteness completeness = 4;
   repeated AnalysisDiagnostic diagnostics = 5;
+}
+
+message GetWorkspaceTopologyRequest {
+  string workspace = 1;
+}
+
+message GetWorkspaceTopologyResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  repeated Entity nodes = 3;
+  repeated Edge edges = 4;
+}
+
+message GetWorkspaceTopologyStatusRequest {
+  string workspace = 1;
+}
+
+message GetWorkspaceTopologyStatusResponse {
+  QueryMetadata metadata = 1;
 }
 
 message Freshness {

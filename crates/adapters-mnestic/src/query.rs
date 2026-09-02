@@ -848,6 +848,55 @@ pub(super) fn entity_facts(
     ))
 }
 
+pub(super) fn all_entity_facts(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
+    query(
+        db,
+        view,
+        "selected_state[state] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, state}\n\
+         selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
+         baseline_id[id] := selected_state[state], *state_entity{state, id}\n\
+         baseline_id[id] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_entity{view: $view, revision, id}\n\
+         baseline_id[id] := *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id}\n\
+         ?[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}\n\
+         ?[id, kind, metadata] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
+         ?[id, kind, metadata] := \
+             *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
+         ?[id, kind, metadata] := \
+             *analysis_enrichment_entity_selection{view: $view, id, owner}, \
+             selected_enrichment[owner], \
+             *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, \
+             not baseline_id[id]\n\
+         :order id",
+        [],
+    )
+}
+
+pub(super) fn workspace_topology(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
+    query(
+        db,
+        view,
+        &format!(
+            "{DIRECT_RULES}\n\
+             ?[from, to, relation, evidence, confidence, provenance] := \
+                 direct[from, to, relation, evidence, confidence, provenance]\n\
+             :order from, to, relation, evidence"
+        ),
+        [],
+    )
+}
+
 pub(super) fn inspect_observations(
     db: &DbInstance,
     relation: Option<&str>,

@@ -4,10 +4,10 @@ use super::{
     database::{benchmark_database, memory_database, persistent_database},
     inspection::{InspectionResult, inspection_result},
     query::{
-        SnapshotQueryRunner, analysis_metadata, analysis_revision, context, dependencies,
-        entity_facts, impact, inspect_grpc_bindings, inspect_observations, inspect_relations,
-        inspect_revisions, published_repository_head, repository_revision, trace,
-        warn_on_slow_semantic_query,
+        SnapshotQueryRunner, all_entity_facts, analysis_metadata, analysis_revision, context,
+        dependencies, entity_facts, impact, inspect_grpc_bindings, inspect_observations,
+        inspect_relations, inspect_revisions, published_repository_head, repository_revision,
+        trace, warn_on_slow_semantic_query, workspace_topology,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -26,7 +26,7 @@ use beholder_domain::{
 };
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
-    RepositoryRevision, Revisioned, TraceResult,
+    RepositoryRevision, Revisioned, TraceResult, WorkspaceTopology,
 };
 use mnestic_engine::{DataValue, DbInstance, NamedRows};
 use std::{
@@ -505,6 +505,23 @@ impl SemanticStore {
                 inspection_result(entity_facts(transaction, view, &entities)?),
             )
         })
+    }
+
+    pub fn workspace_topology_snapshot(
+        &self,
+        view: &str,
+    ) -> Result<Revisioned<WorkspaceTopology>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            semantic::workspace_topology(
+                view,
+                inspection_result(workspace_topology(transaction, view)?),
+                inspection_result(all_entity_facts(transaction, view)?),
+            )
+        })
+    }
+
+    pub fn workspace_topology_status(&self, view: &str) -> Result<Revisioned<()>, Box<dyn Error>> {
+        self.snapshot(view, |_| Ok(()))
     }
 
     pub fn trace(
