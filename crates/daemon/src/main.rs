@@ -697,7 +697,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 20);
+        assert_eq!(status.protocol_version, 21);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");
