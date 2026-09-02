@@ -453,11 +453,9 @@ pub fn workspace_dynamic_dispatch_observations(observations: &[Observation]) -> 
 }
 
 pub fn resolve_repository_calls(
-    observations: &mut Vec<Observation>,
+    observations: &mut [Observation],
     sources: &[(&Path, &ElixirAnalysis)],
 ) {
-    let dynamic = workspace_dynamic_dispatch_observations(observations);
-    observations.extend(dynamic);
     let definitions = observations
         .iter()
         .filter(|observation| {
@@ -712,6 +710,11 @@ mod tests {
             )
             .unwrap(),
         );
+        assert!(!workspace_observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
+                && observation.to.as_str().starts_with("repo://")
+                && observation.to.as_str().ends_with("/load/2")
+        }));
 
         let resolved = workspace_dynamic_dispatch_observations(&workspace_observations);
         let targets = resolved
