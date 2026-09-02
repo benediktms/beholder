@@ -570,6 +570,7 @@ fn has_conditional_ancestor(node: Node<'_>, source: &[u8], root: Node<'_>) -> bo
                     | "arrow_function"
                     | "function_expression"
                     | "switch_case"
+                    | "switch_default"
                     | "ternary_expression"
                     | "for_statement"
                     | "for_in_statement"
@@ -711,9 +712,10 @@ fn local_callable<'tree>(
     node: Node<'tree>,
     source: &[u8],
     root: Node<'tree>,
+    reference: Node<'tree>,
     name: &str,
-) -> Option<Node<'tree>> {
-    if node.kind() == "variable_declarator"
+) -> Option<(usize, Node<'tree>)> {
+    let candidate = if node.kind() == "variable_declarator"
         && node
             .child_by_field_name("name")
             .and_then(|name| text(name, source))
@@ -721,8 +723,19 @@ fn local_callable<'tree>(
         && let Some(value) = node.child_by_field_name("value").map(unparenthesized)
         && callable_value(value)
     {
-        return Some(value);
+        Some((lexical_scope(node, root), value))
+    } else if node.kind() == "function_declaration"
+        && node
+            .child_by_field_name("name")
+            .and_then(|name| text(name, source))
+            == Some(name)
+    {
+        Some((lexical_scope(node.parent().unwrap_or(root), root), node))
+    } else {
+        None
     }
+    .filter(|((start, end), _)| *start <= reference.start_byte() && reference.end_byte() <= *end)
+    .map(|((start, _), callback)| (start, callback));
     if node != root
         && matches!(
             node.kind(),
@@ -733,11 +746,49 @@ fn local_callable<'tree>(
                 | "method_definition"
         )
     {
-        return None;
+        return candidate;
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find_map(|child| local_callable(child, source, root, name))
+        .filter_map(|child| local_callable(child, source, root, reference, name))
+        .chain(candidate)
+        .max_by_key(|(scope_start, _)| *scope_start)
+}
+
+fn callback_constructor<'tree>(
+    body: Node<'tree>,
+    source: &[u8],
+) -> Option<(String, Vec<Node<'tree>>)> {
+    let body = unparenthesized(body);
+    let returned = if body.kind() == "new_expression" {
+        Some(body)
+    } else {
+        returned_constructor_node(body, body)
+    }?;
+    let constructor = returned
+        .child_by_field_name("constructor")
+        .and_then(|constructor| text(constructor, source))?
+        .to_owned();
+    let constructor_arguments = returned.child_by_field_name("arguments")?;
+    let mut local_callbacks = Vec::new();
+    let mut has_callback = false;
+    for argument in constructor_arguments
+        .named_children(&mut constructor_arguments.walk())
+        .filter(|argument| argument.kind() != "comment")
+    {
+        let argument = unparenthesized(argument);
+        if callable_value(argument) {
+            has_callback = true;
+        } else if let Some(name) = (argument.kind() == "identifier")
+            .then(|| text(argument, source))
+            .flatten()
+            && let Some((_, callback)) = local_callable(body, source, body, argument, name)
+        {
+            local_callbacks.push(callback);
+            has_callback = true;
+        }
+    }
+    has_callback.then_some((constructor, local_callbacks))
 }
 
 fn callback_return<'tree>(
@@ -750,35 +801,8 @@ fn callback_return<'tree>(
         .filter(|argument| matches!(argument.kind(), "arrow_function" | "function_expression"))
         .find_map(|callback| {
             let body = unparenthesized(callback.child_by_field_name("body")?);
-            let returned = if body.kind() == "new_expression" {
-                Some(body)
-            } else {
-                returned_constructor_node(body, body)
-            }?;
-            let constructor = returned
-                .child_by_field_name("constructor")
-                .and_then(|constructor| text(constructor, source))?
-                .to_owned();
-            let constructor_arguments = returned.child_by_field_name("arguments")?;
-            let mut local_callbacks = Vec::new();
-            let mut has_callback = false;
-            for argument in constructor_arguments
-                .named_children(&mut constructor_arguments.walk())
-                .filter(|argument| argument.kind() != "comment")
-            {
-                let argument = unparenthesized(argument);
-                if callable_value(argument) {
-                    has_callback = true;
-                } else if let Some(name) = (argument.kind() == "identifier")
-                    .then(|| text(argument, source))
-                    .flatten()
-                    && let Some(callback) = local_callable(body, source, body, name)
-                {
-                    local_callbacks.push(callback);
-                    has_callback = true;
-                }
-            }
-            has_callback.then_some((body, constructor, local_callbacks))
+            let (constructor, local_callbacks) = callback_constructor(body, source)?;
+            Some((body, constructor, local_callbacks))
         })
 }
 
@@ -856,6 +880,10 @@ fn definition(
     name: &str,
     kind: DefinitionKind,
 ) -> Definition {
+    let collection_root = node
+        .child_by_field_name("value")
+        .filter(|value| kind == DefinitionKind::Callable && callable_value(*value))
+        .unwrap_or(node);
     let mut calls = Vec::new();
     let mut bindings = Vec::new();
     let mut alias_bindings = Vec::new();
@@ -864,19 +892,32 @@ fn definition(
         collect_calls(body, source, body, &mut calls);
     }
     collect_decorator_calls(node, source, &mut calls);
-    collect_bindings(node, source, node, &mut bindings);
-    collect_alias_bindings(node, source, node, &mut alias_bindings);
-    collect_factory_bindings(node, source, node, &mut factory_bindings);
-    let return_type = node
+    collect_bindings(collection_root, source, collection_root, &mut bindings);
+    collect_alias_bindings(
+        collection_root,
+        source,
+        collection_root,
+        &mut alias_bindings,
+    );
+    collect_factory_bindings(
+        collection_root,
+        source,
+        collection_root,
+        &mut factory_bindings,
+    );
+    let return_type = collection_root
         .child_by_field_name("return_type")
         .and_then(|annotation| return_type_name(annotation, source))
         .or_else(|| {
-            returned_constructor_node(node, node)?
+            returned_constructor_node(collection_root, collection_root)?
                 .child_by_field_name("constructor")
                 .and_then(|constructor| text(constructor, source))
                 .map(str::to_owned)
         });
-    Definition {
+    let callback = (kind == DefinitionKind::Callable)
+        .then(|| body.and_then(|body| callback_constructor(body, source)))
+        .flatten();
+    let mut definition = Definition {
         qualified_name: qualified(scope, name),
         kind,
         line: node.start_position().row + 1,
@@ -885,11 +926,27 @@ fn definition(
         alias_bindings,
         factory_bindings,
         factory: None,
-        callback_return_type: None,
+        factory_callback: None,
+        callback_return_type: callback
+            .as_ref()
+            .map(|(constructor, _)| constructor.clone()),
         base: None,
         return_type,
         exported: is_exported(node),
+    };
+    if let Some((_, callbacks)) = callback {
+        for callback in callbacks {
+            collect_callback_evidence(callback, source, &mut definition);
+        }
     }
+    definition
+}
+
+fn collect_callback_evidence(callback: Node<'_>, source: &[u8], definition: &mut Definition) {
+    collect_calls(callback, source, callback, &mut definition.calls);
+    collect_bindings(callback, source, callback, &mut definition.bindings);
+    collect_alias_bindings(callback, source, callback, &mut definition.alias_bindings);
+    collect_factory_bindings(callback, source, callback, &mut definition.factory_bindings);
 }
 
 fn string_value(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -1212,36 +1269,27 @@ fn collect_definitions(
                         &mut factory_definition.factory_bindings,
                     );
                     for callback in local_callbacks {
-                        let Some(callback_body) = callback.child_by_field_name("body") else {
-                            continue;
-                        };
-                        let callback_body = unparenthesized(callback_body);
-                        collect_calls(
-                            callback_body,
-                            source,
-                            callback_body,
-                            &mut factory_definition.calls,
-                        );
-                        collect_bindings(
-                            callback_body,
-                            source,
-                            callback_body,
-                            &mut factory_definition.bindings,
-                        );
-                        collect_alias_bindings(
-                            callback_body,
-                            source,
-                            callback_body,
-                            &mut factory_definition.alias_bindings,
-                        );
-                        collect_factory_bindings(
-                            callback_body,
-                            source,
-                            callback_body,
-                            &mut factory_definition.factory_bindings,
-                        );
+                        collect_callback_evidence(callback, source, &mut factory_definition);
                     }
                     factory_definition.callback_return_type = Some(return_type);
+                } else if let Some(factory_call) = value
+                    && let Some(arguments) = factory_call.child_by_field_name("arguments")
+                {
+                    let arguments = arguments
+                        .named_children(&mut arguments.walk())
+                        .filter(|argument| argument.kind() != "comment")
+                        .collect::<Vec<_>>();
+                    if let [callback] = arguments.as_slice()
+                        && matches!(callback.kind(), "identifier" | "member_expression")
+                        && let Some(callback_name) = text(*callback, source)
+                    {
+                        factory_definition.factory_callback = Some(callback_name.into());
+                        if let Some(calls) =
+                            call_target(factory_call, *callback, source, CallKind::Direct)
+                        {
+                            factory_definition.calls.extend(calls);
+                        }
+                    }
                 }
                 definitions.push(factory_definition);
                 return;

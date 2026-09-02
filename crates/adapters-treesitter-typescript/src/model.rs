@@ -221,6 +221,8 @@ pub(super) struct Definition {
     pub(super) factory_bindings: Vec<FactoryBinding>,
     pub(super) factory: Option<String>,
     #[serde(default)]
+    pub(super) factory_callback: Option<String>,
+    #[serde(default)]
     pub(super) callback_return_type: Option<String>,
     pub(super) base: Option<String>,
     pub(super) return_type: Option<String>,

@@ -773,6 +773,7 @@ fn repository_index<'a>(
     let mut raw_return_types = BTreeMap::<(PathBuf, String), String>::new();
     let mut callback_returns = BTreeSet::new();
     let mut factories = BTreeMap::<(PathBuf, String), String>::new();
+    let mut factory_callbacks = BTreeMap::<(PathBuf, String), String>::new();
     let mut caller_files = BTreeMap::<String, PathBuf>::new();
     let mut caller_owners = BTreeMap::<String, (PathBuf, String)>::new();
     let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
@@ -817,6 +818,9 @@ fn repository_index<'a>(
                         ((*path).to_path_buf(), definition.qualified_name.clone()),
                         factory.clone(),
                     );
+                }
+                if let Some(callback) = &definition.factory_callback {
+                    factory_callbacks.insert(key.clone(), callback.clone());
                 }
                 if let Some(base) = &definition.base {
                     raw_bases.insert(
@@ -948,6 +952,33 @@ fn repository_index<'a>(
         }
         if !changed {
             break;
+        }
+    }
+    for (factory, callback) in factory_callbacks {
+        let file = &factory.0;
+        let qualified = callback.split_once('.');
+        let callback_origin = origins
+            .get(&(file.clone(), callback.clone()))
+            .cloned()
+            .or_else(|| {
+                file_imports.get(file)?.iter().find_map(|import| {
+                    let binding = import.bindings.iter().find(|binding| {
+                        binding.local == callback && binding.imported != "*"
+                            || qualified.is_some_and(|(namespace, _)| {
+                                binding.local == namespace && binding.imported == "*"
+                            })
+                    })?;
+                    let imported = qualified
+                        .filter(|_| binding.imported == "*")
+                        .map_or(binding.imported.as_str(), |(_, member)| member);
+                    let imported_file =
+                        imported_file(file, &import.source, &packages, &aliases, &files)?;
+                    origins.get(&(imported_file, imported.into())).cloned()
+                })
+            })
+            .unwrap_or_else(|| (file.clone(), callback));
+        if callback_returns.contains(&callback_origin) {
+            callback_returns.insert(factory);
         }
     }
     let exports = origins
@@ -1433,7 +1464,9 @@ fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryI
                             call_site,
                             &mut receiver_types,
                         );
-                        context_type.is_some_and(|origin| is_context_type(index, origin))
+                        context_type.map_or(context == "context", |origin| {
+                            is_context_type(index, origin)
+                        })
                     });
             observation.to = if is_context {
                 EntityId::from(format!("{language}-returned://{argument}/{method}"))
@@ -2187,6 +2220,125 @@ mod tests {
     }
 
     #[test]
+    fn resolves_named_context_factory_callbacks_across_files() {
+        let sources = [
+            (
+                Path::new("src/builder.ts"),
+                "export class Client { fetch() {} } export function build() { const client = new Client(); return new Loader(() => client.fetch()); }",
+            ),
+            (
+                Path::new("src/loader.ts"),
+                "import { build as importedBuild } from './builder'; class Local { fetch() {} } const localBuild = () => { const client = new Local(); return new Loader(() => client.fetch()); }; export const localLoader = createContext(localBuild); export const importedLoader = createContext(importedBuild);",
+            ),
+            (
+                Path::new("src/entry.ts"),
+                "import { importedLoader, localLoader } from './loader'; export function run(context: Context) { context.get(localLoader).load('local'); context.get(importedLoader).load('imported'); }",
+            ),
+        ];
+        let analyses = sources
+            .iter()
+            .map(|(path, source)| {
+                (
+                    *path,
+                    *source,
+                    analyze(source, SourceLanguage::TypeScript).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut observations = analyses
+            .iter()
+            .flat_map(|(path, source, analysis)| {
+                observations_from_analysis("example", analysis, source, path)
+            })
+            .collect::<Vec<_>>();
+        let indexed = analyses
+            .iter()
+            .map(|(path, _, analysis)| (*path, analysis))
+            .collect::<Vec<_>>();
+
+        resolve_repository_calls("example", &mut observations, &indexed, &[], &[]);
+
+        let edges = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| (observation.from.as_str(), observation.to.as_str()))
+            .collect::<BTreeSet<_>>();
+        for loader in ["importedLoader", "localLoader"] {
+            assert!(
+                edges.contains(&(
+                    "repo://example/typescript/src/entry/run",
+                    format!("repo://example/typescript/src/loader/{loader}").as_str(),
+                )),
+                "{edges:#?}"
+            );
+        }
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/localLoader",
+            "repo://example/typescript/src/loader/localBuild",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/importedLoader",
+            "repo://example/typescript/src/builder/build",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/localBuild",
+            "repo://example/typescript/src/loader/Local/fetch",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/builder/build",
+            "repo://example/typescript/src/builder/Client/fetch",
+        )));
+    }
+
+    #[test]
+    fn resolves_the_visible_local_constructor_callback() {
+        let source = r#"
+            class First { fetch() {} }
+            class Second { fetch() {} }
+            const loader = createContext(() => {
+                const batch = (client: First) => client.fetch();
+                {
+                    function batch(client: Second) { return client.fetch(); }
+                    return new Loader(batch);
+                }
+            });
+            function run(context: Context) { return context.get(loader).load('key'); }
+        "#;
+        let path = Path::new("src/loader.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/loader/loader"
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.contains("repo://example/typescript/src/loader/Second/fetch"));
+        assert!(!targets.contains("repo://example/typescript/src/loader/First/fetch"));
+    }
+
+    #[test]
+    fn preserves_untyped_javascript_context_get() {
+        let source = "const loader = createContext(() => new Loader(() => {})); function run(context) { return context.get(loader).load('key'); }";
+        let path = Path::new("src/loader.js");
+        let analysis = analyze(source, SourceLanguage::JavaScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/javascript/src/loader/run"
+                && observation.to.as_str() == "repo://example/javascript/src/loader/loader"
+        }));
+    }
+
+    #[test]
     fn resolves_shadowed_bindings_in_nested_callback_scopes() {
         let source = r#"
             class First { fetch() {} }
@@ -2341,6 +2493,11 @@ mod tests {
                 { const local = second; selected = local; }
                 context.get(selected).load('block-source');
             }
+            export function switchDefault(context: Context, kind: string) {
+                let selected = first;
+                switch (kind) { case 'known': break; default: selected = second; }
+                context.get(selected).load('switch-default');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -2408,6 +2565,7 @@ mod tests {
             "ternary",
             "tryBody",
             "callbackWrite",
+            "switchDefault",
         ] {
             let caller = format!("repo://example/typescript/src/entry/{caller}");
             let targets = observations
