@@ -110,28 +110,32 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
     Some(Call {
         kind,
         receiver,
-        returned_receiver: target
-            .child_by_field_name("object")
-            .filter(|object| object.kind() == "call_expression")
-            .filter(|object| {
-                // ponytail: broaden only when receiver types can prove the getter contract.
-                object
-                    .child_by_field_name("function")
-                    .and_then(|function| text(function, source))
-                    == Some("context.get")
+        returned_receiver: (name == "load")
+            .then(|| {
+                target
+                    .child_by_field_name("object")
+                    .filter(|object| object.kind() == "call_expression")
+                    .filter(|object| {
+                        // ponytail: broaden when receiver types and invoking methods can be proven.
+                        object
+                            .child_by_field_name("function")
+                            .and_then(|function| text(function, source))
+                            == Some("context.get")
+                    })
+                    .and_then(|object| object.child_by_field_name("arguments"))
+                    .and_then(|arguments| {
+                        let arguments = arguments
+                            .named_children(&mut arguments.walk())
+                            .collect::<Vec<_>>();
+                        let [argument] = arguments.as_slice() else {
+                            return None;
+                        };
+                        matches!(argument.kind(), "identifier" | "member_expression")
+                            .then(|| text(*argument, source).map(str::to_owned))
+                            .flatten()
+                    })
             })
-            .and_then(|object| object.child_by_field_name("arguments"))
-            .and_then(|arguments| {
-                let arguments = arguments
-                    .named_children(&mut arguments.walk())
-                    .collect::<Vec<_>>();
-                let [argument] = arguments.as_slice() else {
-                    return None;
-                };
-                matches!(argument.kind(), "identifier" | "member_expression")
-                    .then(|| text(*argument, source).map(str::to_owned))
-                    .flatten()
-            }),
+            .flatten(),
         name,
         arguments: node
             .child_by_field_name("arguments")

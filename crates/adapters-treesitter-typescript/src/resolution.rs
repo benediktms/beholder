@@ -1819,7 +1819,7 @@ mod tests {
             ),
             (
                 Path::new("src/entry.ts"),
-                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); }",
+                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); } export function nonInvoking(context: Context) { return context.get(loader).clear(); }",
             ),
             (
                 Path::new("src/qualified.ts"),
@@ -1890,6 +1890,10 @@ mod tests {
         )));
         assert!(!edges.contains(&(
             "repo://example/typescript/src/entry/unrelated",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(!edges.contains(&(
+            "repo://example/typescript/src/entry/nonInvoking",
             "repo://example/typescript/src/loader/loader",
         )));
         assert!(edges.contains(&(
