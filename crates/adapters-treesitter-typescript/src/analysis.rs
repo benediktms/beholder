@@ -482,6 +482,7 @@ fn collect_alias_bindings(
         bindings.push(AliasBinding {
             receiver: receiver.into(),
             source: source_name.into(),
+            line: node.start_position().row + 1,
         });
     }
     let mut cursor = node.walk();

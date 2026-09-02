@@ -68,6 +68,9 @@ impl TypescriptAnalysis {
             for call in &mut definition.calls {
                 call.clear_position();
             }
+            for binding in &mut definition.alias_bindings {
+                binding.line = 0;
+            }
         }
         for document in &mut analysis.graphql_documents {
             document.line = 0;
@@ -182,6 +185,8 @@ pub(super) struct NestProvider {
 pub(super) struct AliasBinding {
     pub(super) receiver: String,
     pub(super) source: String,
+    #[serde(default)]
+    pub(super) line: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

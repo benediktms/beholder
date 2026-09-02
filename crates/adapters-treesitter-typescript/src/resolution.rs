@@ -363,6 +363,7 @@ struct RepositoryIndex<'a> {
 }
 
 type Origin = (PathBuf, String);
+type ReceiverTypeCache = BTreeMap<(String, String, usize), Option<Origin>>;
 type Origins = BTreeMap<Origin, Origin>;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1128,14 +1129,15 @@ fn receiver_type(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
-    cache: &mut BTreeMap<(String, String), Option<(PathBuf, String)>>,
+    line: usize,
+    cache: &mut ReceiverTypeCache,
 ) -> Option<(PathBuf, String)> {
-    let key = (caller.to_owned(), receiver.to_owned());
+    let key = (caller.to_owned(), receiver.to_owned(), line);
     if let Some(resolved) = cache.get(&key) {
         return resolved.clone();
     }
     cache.insert(key.clone(), None);
-    let resolved = receiver_type_uncached(index, caller, receiver, cache);
+    let resolved = receiver_type_uncached(index, caller, receiver, line, cache);
     cache.insert(key, resolved.clone());
     resolved
 }
@@ -1144,10 +1146,11 @@ fn receiver_type_uncached(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
-    cache: &mut BTreeMap<(String, String), Option<(PathBuf, String)>>,
+    line: usize,
+    cache: &mut ReceiverTypeCache,
 ) -> Option<(PathBuf, String)> {
     let file = index.caller_files.get(caller)?;
-    let receiver = aliased_receiver(index, caller, receiver);
+    let receiver = aliased_receiver(index, caller, receiver, line);
     if let Some(field) = receiver.strip_prefix("this.")
         && !field.contains('.')
         && let Some((owner_file, owner)) = index.caller_owners.get(caller)
@@ -1181,7 +1184,7 @@ fn receiver_type_uncached(
     let parts = receiver.split('.').collect::<Vec<_>>();
     for prefix_length in (1..parts.len()).rev() {
         let prefix = parts[..prefix_length].join(".");
-        let Some(mut current) = receiver_type(index, caller, &prefix, cache) else {
+        let Some(mut current) = receiver_type(index, caller, &prefix, line, cache) else {
             continue;
         };
         let mut resolved = true;
@@ -1199,7 +1202,12 @@ fn receiver_type_uncached(
     None
 }
 
-fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -> String {
+fn aliased_receiver(
+    index: &RepositoryIndex<'_>,
+    caller: &str,
+    receiver: &str,
+    line: usize,
+) -> String {
     let aliases = index
         .caller_alias_bindings
         .get(caller)
@@ -1209,7 +1217,9 @@ fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -
     for _ in 0..=aliases.len() {
         let Some(source) = aliases
             .iter()
-            .find(|binding| binding.receiver == receiver)
+            // ponytail: line ordering; retain spans if same-line reassignment matters.
+            .filter(|binding| binding.receiver == receiver && binding.line <= line)
+            .max_by_key(|binding| binding.line)
             .map(|binding| binding.source.clone())
         else {
             break;
@@ -1217,6 +1227,15 @@ fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -
         receiver = source;
     }
     receiver
+}
+
+fn observation_line(observation: &Observation) -> usize {
+    observation
+        .evidence
+        .as_str()
+        .rsplit_once(':')
+        .and_then(|(_, line)| line.parse().ok())
+        .unwrap_or(usize::MAX)
 }
 
 fn resolve_observations(observations: &mut [Observation], index: &RepositoryIndex<'_>) {
@@ -1232,6 +1251,7 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             .get(caller_file)
             .copied()
             .unwrap_or_default();
+        let line = observation_line(observation);
         let returned = observation
             .to
             .as_str()
@@ -1244,7 +1264,7 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             })
             .and_then(|target| target.split_once('/'));
         if let Some((argument, _method)) = returned {
-            let argument = aliased_receiver(index, observation.from.as_str(), argument);
+            let argument = aliased_receiver(index, observation.from.as_str(), argument, line);
             let origin = imported_origin(index, caller_file, &argument)
                 .or_else(|| Some((caller_file.clone(), argument)))
                 .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
@@ -1318,6 +1338,7 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
                     index,
                     observation.from.as_str(),
                     receiver,
+                    line,
                     &mut receiver_types,
                 )?;
                 member_entity(index, file, type_name, name)
@@ -1545,6 +1566,7 @@ pub fn resolve_workspace_calls(
             .get(caller_file)
             .copied()
             .unwrap_or_default();
+        let line = observation_line(observation);
         let returned = observation
             .to
             .as_str()
@@ -1557,7 +1579,7 @@ pub fn resolve_workspace_calls(
             })
             .and_then(|target| target.split_once('/'));
         if let Some((argument, _method)) = returned {
-            let argument = aliased_receiver(caller, observation.from.as_str(), argument);
+            let argument = aliased_receiver(caller, observation.from.as_str(), argument, line);
             let qualified = argument.split_once('.');
             let target = imports.iter().find_map(|import| {
                 let binding = import.bindings.iter().find(|binding| {
@@ -1644,7 +1666,7 @@ pub fn resolve_workspace_calls(
                     .get(&(file, imported.to_owned()))
             })
             .or_else(|| {
-                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?);
+                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?, line);
                 let type_name = caller
                     .caller_bindings
                     .get(observation.from.as_str())?
@@ -1670,7 +1692,7 @@ pub fn resolve_workspace_calls(
                 member_entity(target, file, owner, name)
             })
             .or_else(|| {
-                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?);
+                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?, line);
                 let factory = caller
                     .caller_factory_bindings
                     .get(observation.from.as_str())?
@@ -1900,6 +1922,42 @@ mod tests {
             "repo://example/typescript/src/loader/loader",
             "repo://example/typescript/src/loader/Client/fetch",
         )));
+    }
+
+    #[test]
+    fn resolves_mutable_loader_aliases_at_each_call_site() {
+        let source = r#"
+            export const first = createContext(() => new Loader(() => {}));
+            export const second = createContext(() => new Loader(() => {}));
+            export function entry(context: Context) {
+                let selected = first;
+                context.get(selected).load('first');
+                selected = second;
+                context.get(selected).load('second');
+            }
+        "#;
+        let path = Path::new("src/entry.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation.from.as_str() == "repo://example/typescript/src/entry/entry"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                "repo://example/typescript/src/entry/first",
+                "repo://example/typescript/src/entry/second",
+            ])
+        );
     }
 
     #[test]
