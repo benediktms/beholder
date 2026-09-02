@@ -4759,6 +4759,54 @@ mod tests {
     }
 
     #[test]
+    fn topology_includes_structural_observations() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "app".into(),
+                },
+                head: None,
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let mut facts = facts(
+            &view,
+            vec![Observation::structural(
+                "repo://app/elixir/Producer",
+                StructuralRelation::Defines,
+                "repo://app/elixir/Producer.publish/1",
+                "lib/producer.ex:3",
+            )],
+        );
+        facts.entities = vec![
+            EntityFact::new("repo://app/elixir/Producer", EntityKind::Namespace, None).unwrap(),
+            EntityFact::new(
+                "repo://app/elixir/Producer.publish/1",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        ];
+        store
+            .publish_verified_sharded(&view, &[facts], &[], &[], &[], "verified")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .workspace_topology_snapshot("main")
+                .unwrap()
+                .result
+                .edges
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn stores_entities_across_batch_boundaries() {
         let store = SemanticStore::memory().unwrap();
         let transaction = store.db.multi_transaction(true);

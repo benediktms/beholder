@@ -890,7 +890,7 @@ pub(super) fn workspace_topology(
         &format!(
             "{DIRECT_RULES}\n\
              ?[from, to, relation, evidence, confidence, provenance] := \
-                 direct[from, to, relation, evidence, confidence, provenance]\n\
+                 effective_observation[from, to, relation, evidence, confidence, provenance]\n\
              :order from, to, relation, evidence"
         ),
         [],
