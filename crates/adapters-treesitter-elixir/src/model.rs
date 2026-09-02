@@ -63,6 +63,8 @@ pub(super) struct ElixirFunction {
     pub(super) body_hash: [u8; 32],
     pub(super) line: usize,
     pub(super) calls: Vec<ElixirCall>,
+    #[serde(default)]
+    pub(super) captures: Vec<ElixirCapture>,
     pub(super) struct_uses: Vec<ElixirStructUse>,
     pub(super) imports: Vec<ElixirModuleReference>,
 }

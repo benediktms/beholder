@@ -157,6 +157,37 @@ fn piped_argument(node: Node<'_>, source: &[u8]) -> usize {
         .is_some_and(|right| right == node) as usize
 }
 
+fn parsed_capture(node: Node<'_>, source: &[u8]) -> Option<ElixirCapture> {
+    let capture = text(node, source)?.strip_prefix('&')?;
+    let (target, arity) = capture.rsplit_once('/')?;
+    let (module, name) = target
+        .rsplit_once('.')
+        .map_or((None, target), |(module, name)| {
+            (Some(module.to_owned()), name)
+        });
+    Some(ElixirCapture {
+        module,
+        name: name.into(),
+        arity: arity.parse().ok()?,
+        line: node.start_position().row + 1,
+    })
+}
+
+fn collect_captures(node: Node<'_>, source: &[u8], captures: &mut Vec<ElixirCapture>) {
+    if node.kind() == "call" && call_target(node, source) == Some("quote") {
+        return;
+    }
+    if let Some(capture) = parsed_capture(node, source)
+        && !captures.contains(&capture)
+    {
+        captures.push(capture);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_captures(child, source, captures);
+    }
+}
+
 fn parsed_call(node: Node<'_>, source: &[u8]) -> Option<ElixirCall> {
     let target = node.child_by_field_name("target")?;
     let (module, name, dynamic_struct) = match target.kind() {
@@ -190,21 +221,7 @@ fn parsed_call(node: Node<'_>, source: &[u8]) -> Option<ElixirCall> {
     let captures = arguments(node).map_or_else(Vec::new, |arguments| {
         arguments
             .named_children(&mut arguments.walk())
-            .filter_map(|argument| {
-                let capture = text(argument, source)?.strip_prefix('&')?;
-                let (target, arity) = capture.rsplit_once('/')?;
-                let (module, name) = target
-                    .rsplit_once('.')
-                    .map_or((None, target), |(module, name)| {
-                        (Some(module.to_owned()), name)
-                    });
-                Some(ElixirCapture {
-                    module,
-                    name: name.into(),
-                    arity: arity.parse().ok()?,
-                    line: argument.start_position().row + 1,
-                })
-            })
+            .filter_map(|argument| parsed_capture(argument, source))
             .collect()
     });
     Some(ElixirCall {
@@ -266,6 +283,12 @@ fn function_calls(node: Node<'_>, source: &[u8]) -> Vec<ElixirCall> {
         collect_calls(body, source, &mut calls);
     }
     calls
+}
+
+fn function_captures(node: Node<'_>, source: &[u8]) -> Vec<ElixirCapture> {
+    let mut captures = Vec::new();
+    collect_captures(node, source, &mut captures);
+    captures
 }
 
 fn keyword_token<'a>(node: Node<'a>, source: &'a [u8], key: &str) -> Option<&'a str> {
@@ -498,6 +521,12 @@ fn push_function(
                 }
             }
         }
+        let mut captures = function_captures(node, source);
+        for capture in &mut captures {
+            if let Some(module) = &mut capture.module {
+                *module = expand_alias(module, aliases, current_module);
+            }
+        }
         let mut struct_uses = function_struct_uses(node, source);
         for r#use in &mut struct_uses {
             r#use.module = expand_alias(&r#use.module, aliases, current_module);
@@ -510,6 +539,11 @@ fn push_function(
         {
             let function = &mut functions[index];
             function.body_hash = append_hash(function.body_hash, body_hash);
+            for capture in captures {
+                if !function.captures.contains(&capture) {
+                    function.captures.push(capture);
+                }
+            }
             for call in calls {
                 if let Some(existing) = function.calls.iter_mut().find(|existing| {
                     existing.module == call.module
@@ -549,6 +583,7 @@ fn push_function(
             body_hash,
             line: node.start_position().row + 1,
             calls,
+            captures,
             struct_uses,
             imports: imports.clone(),
         });
@@ -725,7 +760,11 @@ pub(super) fn call_observations(
                 observations.push(observation);
             }
         }
-        for capture in function.calls.iter().flat_map(|call| &call.captures) {
+        for capture in function
+            .captures
+            .iter()
+            .chain(function.calls.iter().flat_map(|call| &call.captures))
+        {
             let target = target_for(capture.module.as_deref(), &capture.name, capture.arity);
             if targets.insert(target.clone()) {
                 let mut observation = Observation::dependency(
@@ -795,6 +834,7 @@ fn callback_definition(node: Node<'_>, source: &[u8]) -> Option<ElixirFunction> 
         body_hash: [0; 32],
         line: node.start_position().row + 1,
         calls: Vec::new(),
+        captures: Vec::new(),
         struct_uses: Vec::new(),
         imports: Vec::new(),
     })
@@ -1317,6 +1357,7 @@ fn absinthe_resolver(
             body_hash: [0; 32],
             line,
             calls,
+            captures: Vec::new(),
             struct_uses,
             imports,
         }),

@@ -657,8 +657,13 @@ mod tests {
             defmodule Example.Source do
               def new(:first), do: Dataloader.KV.new(&fetch_first/2)
               def new(:second), do: Dataloader.KV.new(&fetch_second/2)
+              def aliased do
+                callback = &fetch_aliased/2
+                Dataloader.KV.new(callback)
+              end
               defp fetch_first(batch, keys), do: {batch, keys}
               defp fetch_second(batch, keys), do: {batch, keys}
+              defp fetch_aliased(batch, keys), do: {batch, keys}
             end
             "#,
             Path::new("lib/source.ex"),
@@ -676,6 +681,10 @@ mod tests {
 
         assert!(targets.contains("repo://example/elixir/Example.Source/fetch_first/2"));
         assert!(targets.contains("repo://example/elixir/Example.Source/fetch_second/2"));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/elixir/Example.Source/aliased/0"
+                && observation.to.as_str() == "repo://example/elixir/Example.Source/fetch_aliased/2"
+        }));
     }
 
     #[test]
