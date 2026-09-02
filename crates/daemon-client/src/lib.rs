@@ -27,6 +27,7 @@ use tonic::{Code, Request, Status, transport::Channel};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const SUBMIT_INDEX_TIMEOUT: Duration = Duration::from_secs(10);
+pub type ClientError = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn socket_path() -> Result<PathBuf, String> {
     Ok(state_dir()?.join("beholder.sock"))
@@ -40,6 +41,12 @@ fn endpoint() -> Result<String, String> {
 }
 
 async fn connect() -> Result<DaemonClient<Channel>, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(endpoint()?)
+        .await?
+        .max_decoding_message_size(MAX_RESPONSE_BYTES))
+}
+
+async fn connect_send() -> Result<DaemonClient<Channel>, ClientError> {
     Ok(DaemonClient::connect(endpoint()?)
         .await?
         .max_decoding_message_size(MAX_RESPONSE_BYTES))
@@ -265,8 +272,8 @@ pub async fn context(
 
 pub async fn workspace_topology(
     workspace: String,
-) -> Result<WorkspaceTopology, Box<dyn std::error::Error>> {
-    Ok(connect()
+) -> Result<WorkspaceTopology, ClientError> {
+    Ok(connect_send()
         .await?
         .get_workspace_topology(request(GetWorkspaceTopologyRequest { workspace }))
         .await?
@@ -276,8 +283,8 @@ pub async fn workspace_topology(
 
 pub async fn workspace_topology_status(
     workspace: String,
-) -> Result<QueryMetadata, Box<dyn std::error::Error>> {
-    Ok(connect()
+) -> Result<QueryMetadata, ClientError> {
+    Ok(connect_send()
         .await?
         .get_workspace_topology_status(request(GetWorkspaceTopologyStatusRequest { workspace }))
         .await?
