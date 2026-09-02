@@ -425,6 +425,21 @@ fn alias_at_call_site<'a>(
         .max_by_key(|binding| (binding.line, binding.character))
 }
 
+fn factory_binding_at_call_site<'a>(
+    bindings: &'a [FactoryBinding],
+    receiver: &str,
+    scope: (usize, usize),
+) -> Option<&'a FactoryBinding> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.receiver == receiver
+                && binding.scope_start <= scope.0
+                && scope.1 <= binding.scope_end
+        })
+        .max_by_key(|binding| binding.scope_start)
+}
+
 fn insert_origin(
     origins: &mut Origins,
     origins_by_file: &mut BTreeMap<PathBuf, BTreeMap<String, Origin>>,
@@ -1222,7 +1237,7 @@ fn receiver_type_uncached(
     if let Some(factory) = index
         .caller_factory_bindings
         .get(caller)
-        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+        .and_then(|bindings| factory_binding_at_call_site(bindings, &receiver, call_site.1))
         .map(|binding| binding.factory.as_str())
     {
         let factory_origin = imported_origin(index, file, factory)
@@ -1868,9 +1883,10 @@ pub fn resolve_workspace_calls(
                     aliased_receiver(caller, observation.from.as_str(), receiver?, call_site);
                 let factory = caller
                     .caller_factory_bindings
-                    .get(observation.from.as_str())?
-                    .iter()
-                    .find(|binding| binding.receiver == receiver)?
+                    .get(observation.from.as_str())
+                    .and_then(|bindings| {
+                        factory_binding_at_call_site(bindings, &receiver, call_site.1)
+                    })?
                     .factory
                     .as_str();
                 let (target_index, file, imported) = imports.iter().find_map(|import| {
@@ -2136,6 +2152,41 @@ mod tests {
     }
 
     #[test]
+    fn resolves_factory_bindings_in_nested_callback_scopes() {
+        let source = r#"
+            class First { fetch() {} }
+            class Second { fetch() {} }
+            function makeFirst(): First { return new First(); }
+            function makeSecond(): Second { return new Second(); }
+            const loader = createContext(() => {
+                new Wrapper(() => {
+                    const client = makeFirst();
+                    return client.fetch();
+                });
+                return new Loader(() => {
+                    const client = makeSecond();
+                    return client.fetch();
+                });
+            });
+        "#;
+        let path = Path::new("src/loader.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/loader/loader"
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.contains("repo://example/typescript/src/loader/First/fetch"));
+        assert!(targets.contains("repo://example/typescript/src/loader/Second/fetch"));
+    }
+
+    #[test]
     fn ignores_aliases_from_sibling_callback_scopes() {
         let source = r#"
             const first = createContext(() => new Loader(() => {}));
@@ -2209,6 +2260,11 @@ mod tests {
                 let selected = first;
                 try { mayThrow(); selected = second; } catch {}
                 context.get(selected).load('try-body');
+            }
+            export function blockScoped(context: Context) {
+                const selected = first;
+                { const selected = second; consume(selected); }
+                context.get(selected).load('block-scoped');
             }
         "#;
         let path = Path::new("src/entry.ts");
@@ -2298,6 +2354,18 @@ mod tests {
             .map(|observation| observation.to.as_str())
             .collect::<BTreeSet<_>>();
         assert!(nullish.contains("repo://example/typescript/src/entry/first"));
+        let block_scoped = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/blockScoped"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            block_scoped,
+            BTreeSet::from(["repo://example/typescript/src/entry/first"])
+        );
     }
 
     #[test]

@@ -83,6 +83,12 @@ impl TypescriptAnalysis {
                         .iter()
                         .map(|binding| (binding.scope_start, binding.scope_end)),
                 )
+                .chain(
+                    definition
+                        .factory_bindings
+                        .iter()
+                        .map(|binding| (binding.scope_start, binding.scope_end)),
+                )
                 .collect::<Vec<_>>();
             scopes.sort_unstable();
             scopes.dedup();
@@ -112,6 +118,12 @@ impl TypescriptAnalysis {
             for binding in &mut definition.alias_bindings {
                 binding.line = 0;
                 binding.character = 0;
+                binding.scope_start = scopes
+                    .binary_search(&(binding.scope_start, binding.scope_end))
+                    .unwrap_or_default();
+                binding.scope_end = 0;
+            }
+            for binding in &mut definition.factory_bindings {
                 binding.scope_start = scopes
                     .binary_search(&(binding.scope_start, binding.scope_end))
                     .unwrap_or_default();
@@ -251,6 +263,10 @@ pub(super) struct AliasBinding {
 pub(super) struct FactoryBinding {
     pub(super) receiver: String,
     pub(super) factory: String,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

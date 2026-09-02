@@ -274,7 +274,7 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
                 .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
 }
 
-fn lexical_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
+fn callable_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
     let scope = std::iter::successors(Some(node), |ancestor| ancestor.parent())
         .find(|ancestor| {
             matches!(
@@ -288,6 +288,38 @@ fn lexical_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
         })
         .unwrap_or(root);
     (scope.start_byte(), scope.end_byte())
+}
+
+fn lexical_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
+    let scope = std::iter::successors(Some(node), |ancestor| ancestor.parent())
+        .find(|ancestor| {
+            matches!(
+                ancestor.kind(),
+                "statement_block"
+                    | "switch_body"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "catch_clause"
+                    | "arrow_function"
+                    | "function_declaration"
+                    | "function_expression"
+                    | "generator_function_declaration"
+                    | "method_definition"
+            )
+        })
+        .unwrap_or(root);
+    (scope.start_byte(), scope.end_byte())
+}
+
+fn declaration_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "variable_declaration")
+    {
+        callable_scope(node, root)
+    } else {
+        lexical_scope(node, root)
+    }
 }
 
 fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
@@ -427,7 +459,7 @@ fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mu
         "required_parameter" | "optional_parameter" | "variable_declarator"
     ) && let Some(mut binding) = binding(node, source)
     {
-        (binding.scope_start, binding.scope_end) = lexical_scope(node, root);
+        (binding.scope_start, binding.scope_end) = declaration_scope(node, root);
         bindings.push(binding);
     }
     let mut cursor = node.walk();
@@ -464,9 +496,12 @@ fn collect_factory_bindings(
             .filter(|function| function.kind() == "identifier")
             .and_then(|function| text(function, source))
     {
+        let (scope_start, scope_end) = declaration_scope(node, root);
         bindings.push(FactoryBinding {
             receiver: receiver.into(),
             factory: factory.into(),
+            scope_start,
+            scope_end,
         });
     }
     let mut cursor = node.walk();
@@ -551,7 +586,22 @@ fn collect_alias_bindings(
             .iter()
             .all(|source| matches!(source.kind(), "identifier" | "member_expression"))
         {
-            let (scope_start, scope_end) = lexical_scope(node, root);
+            let (scope_start, scope_end) = if node.kind() == "variable_declarator" {
+                declaration_scope(node, root)
+            } else {
+                bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.receiver == receiver
+                            && binding.scope_start <= node.start_byte()
+                            && node.end_byte() <= binding.scope_end
+                    })
+                    .max_by_key(|binding| binding.scope_start)
+                    .map_or_else(
+                        || callable_scope(node, root),
+                        |binding| (binding.scope_start, binding.scope_end),
+                    )
+            };
             for (index, source_node) in sources.drain(..).enumerate() {
                 let Some(source_name) = text(source_node, source) else {
                     continue;
