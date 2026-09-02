@@ -410,7 +410,6 @@ pub fn validate_entity_complete_semantics<'a>(
     }
     for dependency_override in overrides {
         required.insert(dependency_override.from.as_str());
-        required.insert(dependency_override.unresolved_to.as_str());
         required.insert(dependency_override.resolved_to.as_str());
     }
     if let Some(missing) = required.into_iter().find(|id| !selected.contains_key(id)) {
@@ -424,6 +423,34 @@ pub fn validate_entity_complete_semantics<'a>(
 #[cfg(test)]
 mod entity_fact_tests {
     use super::*;
+
+    #[test]
+    fn accepts_resolved_overrides_without_facts_for_lookup_keys() {
+        let caller =
+            EntityFact::new("repo://example/rust/caller", EntityKind::Callable, None).unwrap();
+        let target =
+            EntityFact::new("repo://example/rust/target", EntityKind::Callable, None).unwrap();
+        let observation = Observation::dependency(
+            caller.id.clone(),
+            DependencyRelation::Calls,
+            target.id.clone(),
+            "src/lib.rs:1",
+        );
+        let override_ = DependencyOverride {
+            from: caller.id.clone(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: "rust-call://target".into(),
+            resolved_to: target.id.clone(),
+            evidence: observation.evidence.clone(),
+            confidence: Confidence::Inferred,
+            provenance: Provenance::UniqueNameHeuristic,
+        };
+
+        assert!(
+            validate_entity_complete_semantics([&caller, &target], [&observation], [&override_],)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn rejects_incompatible_metadata() {
