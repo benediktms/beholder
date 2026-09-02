@@ -361,7 +361,7 @@ pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<Dependency
 
 fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observation, EntityId)> {
     let behaviour_owners = workspace_module_definitions(observations);
-    let mut callbacks = BTreeMap::<EntityId, BTreeSet<String>>::new();
+    let mut callback_owners = BTreeMap::<String, Option<EntityId>>::new();
     for observation in observations.iter().filter(|observation| {
         observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
     }) {
@@ -372,10 +372,14 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
         else {
             continue;
         };
-        callbacks
-            .entry(observation.from.clone())
-            .or_default()
-            .insert(signature.to_owned());
+        callback_owners
+            .entry(signature.to_owned())
+            .and_modify(|candidate| {
+                if candidate.as_ref() != Some(&observation.from) {
+                    *candidate = None;
+                }
+            })
+            .or_insert_with(|| Some(observation.from.clone()));
     }
     let definitions = observations
         .iter()
@@ -403,6 +407,9 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
     let mut candidates = Vec::new();
     let implementations = implementations.collect::<Vec<_>>();
     for (call, signature) in dynamic_calls {
+        let Some(Some(callback_owner)) = callback_owners.get(signature) else {
+            continue;
+        };
         for implementation in &implementations {
             let Some(behaviour) = implementation
                 .to
@@ -413,10 +420,7 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
             else {
                 continue;
             };
-            if !callbacks
-                .get(behaviour)
-                .is_some_and(|callbacks| callbacks.contains(signature))
-            {
+            if behaviour != callback_owner {
                 continue;
             }
             let target = format!("{}/{signature}", implementation.from);
@@ -752,6 +756,56 @@ mod tests {
                   defstruct []
                   @impl true
                   def load(context, _job), do: context
+                end
+
+                defmodule Example.Dispatcher do
+                  def dispatch(context, job), do: job.__struct__.load(context, job)
+                end
+                "#,
+                Path::new("lib/worker.ex"),
+            )
+            .unwrap(),
+        );
+
+        let resolved = workspace_dynamic_dispatch_observations(&workspace_observations);
+
+        assert!(!resolved.iter().any(|observation| {
+            observation.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
+        }));
+    }
+
+    #[test]
+    fn skips_dynamic_dispatch_for_an_ambiguous_callback_signature() {
+        let mut workspace_observations = observations(
+            "contracts",
+            r#"
+            defmodule Example.Job do
+              @callback load(term(), struct()) :: term()
+            end
+
+            defmodule Example.Serializer do
+              @callback load(term(), struct()) :: term()
+            end
+            "#,
+            Path::new("lib/contracts.ex"),
+        )
+        .unwrap();
+        workspace_observations.extend(
+            observations(
+                "app",
+                r#"
+                defmodule Example.Worker do
+                  @behaviour Example.Job
+                  defstruct []
+                  @impl true
+                  def load(context, _job), do: context
+                end
+
+                defmodule Example.Encoder do
+                  @behaviour Example.Serializer
+                  defstruct []
+                  @impl true
+                  def load(context, _serializer), do: context
                 end
 
                 defmodule Example.Dispatcher do
