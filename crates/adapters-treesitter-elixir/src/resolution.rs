@@ -397,20 +397,35 @@ fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observatio
             observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
         })
         .filter_map(|observation| {
-            observation
+            let target = observation
                 .to
                 .as_str()
-                .strip_prefix("elixir-dynamic-call://")
-                .map(|signature| (observation, signature))
+                .strip_prefix("elixir-dynamic-call://")?;
+            let (target, arity) = target.rsplit_once('/')?;
+            let (receiver_module, name) = target
+                .rsplit_once('/')
+                .map_or((None, target), |(module, name)| (Some(module), name));
+            Some((observation, receiver_module, format!("{name}/{arity}")))
         });
     let mut seen = BTreeSet::new();
     let mut candidates = Vec::new();
     let implementations = implementations.collect::<Vec<_>>();
-    for (call, signature) in dynamic_calls {
-        let Some(Some(callback_owner)) = callback_owners.get(signature) else {
+    for (call, receiver_module, signature) in dynamic_calls {
+        let Some(receiver_module) = receiver_module else {
+            continue;
+        };
+        let Some(Some(callback_owner)) = callback_owners.get(&signature) else {
             continue;
         };
         for implementation in &implementations {
+            let Some((_, implementation_module)) =
+                implementation.from.as_str().split_once("/elixir/")
+            else {
+                continue;
+            };
+            if receiver_module != implementation_module {
+                continue;
+            }
             let Some(behaviour) = implementation
                 .to
                 .as_str()
@@ -615,13 +630,27 @@ mod tests {
             end
 
             defmodule Example.Dispatcher do
-              def dispatch(context, job), do: job.__struct__.load(context, job)
+              def dispatch(context, %Example.Worker{} = job), do: job.__struct__.load(context, job)
             end
             "#,
             Path::new("lib/example.ex"),
         )
         .unwrap();
         let dynamic = workspace_dynamic_dispatch_observations(&observations);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| {
+                    observation.from.as_str()
+                        == "repo://example/elixir/Example.Dispatcher/dispatch/2"
+                })
+                .map(|observation| observation.to.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "elixir-dynamic-call://Example.Worker/load/2",
+                "elixir-module://Example.Worker",
+            ])
+        );
         observations.extend(dynamic);
         let edges = observations
             .iter()
@@ -661,9 +690,22 @@ mod tests {
                 callback = &fetch_aliased/2
                 Dataloader.KV.new(callback)
               end
+              def unused do
+                callback = &fetch_unused/2
+                :ok
+              end
+              def locally_aliased do
+                alias Example.Callbacks, as: Callbacks
+                Dataloader.KV.new(&Callbacks.fetch/2)
+              end
               defp fetch_first(batch, keys), do: {batch, keys}
               defp fetch_second(batch, keys), do: {batch, keys}
               defp fetch_aliased(batch, keys), do: {batch, keys}
+              defp fetch_unused(batch, keys), do: {batch, keys}
+            end
+
+            defmodule Example.Callbacks do
+              def fetch(batch, keys), do: {batch, keys}
             end
             "#,
             Path::new("lib/source.ex"),
@@ -684,6 +726,14 @@ mod tests {
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://example/elixir/Example.Source/aliased/0"
                 && observation.to.as_str() == "repo://example/elixir/Example.Source/fetch_aliased/2"
+        }));
+        assert!(!observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/elixir/Example.Source/unused/0"
+                && observation.to.as_str() == "repo://example/elixir/Example.Source/fetch_unused/2"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/elixir/Example.Source/locally_aliased/0"
+                && observation.to.as_str() == "repo://example/elixir/Example.Callbacks/fetch/2"
         }));
     }
 
@@ -734,7 +784,7 @@ mod tests {
                 end
 
                 defmodule Example.Dispatcher do
-                  def dispatch(context, job), do: job.__struct__.load(context, job)
+                  def dispatch(context, %Example.Worker{} = job), do: job.__struct__.load(context, job)
                 end
                 "#,
                 Path::new("lib/generated.pb.ex"),
@@ -760,10 +810,7 @@ mod tests {
 
         assert_eq!(
             targets,
-            BTreeSet::from([
-                "repo://app/elixir/Example.OtherWorker/load/2",
-                "repo://app/elixir/Example.Worker/load/2",
-            ])
+            BTreeSet::from(["repo://app/elixir/Example.Worker/load/2"])
         );
     }
 
