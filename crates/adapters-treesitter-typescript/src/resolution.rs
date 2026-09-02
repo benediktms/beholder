@@ -1819,7 +1819,7 @@ mod tests {
             ),
             (
                 Path::new("src/entry.ts"),
-                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); }",
+                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function unrelated(cache: Cache) { return cache.has(loader).toString(); }",
             ),
             (
                 Path::new("src/qualified.ts"),
@@ -1862,6 +1862,10 @@ mod tests {
         )));
         assert!(edges.contains(&(
             "repo://example/typescript/src/qualified/entry",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(!edges.contains(&(
+            "repo://example/typescript/src/entry/unrelated",
             "repo://example/typescript/src/loader/loader",
         )));
         assert!(edges.contains(&(

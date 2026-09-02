@@ -113,6 +113,13 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
         returned_receiver: target
             .child_by_field_name("object")
             .filter(|object| object.kind() == "call_expression")
+            .filter(|object| {
+                object
+                    .child_by_field_name("function")
+                    .and_then(|function| function.child_by_field_name("property"))
+                    .and_then(|property| text(property, source))
+                    == Some("get")
+            })
             .and_then(|object| object.child_by_field_name("arguments"))
             .and_then(|arguments| {
                 let arguments = arguments
