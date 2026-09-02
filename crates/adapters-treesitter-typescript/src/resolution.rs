@@ -1229,6 +1229,37 @@ fn aliased_receiver(
     receiver
 }
 
+fn aliased_receivers(
+    index: &RepositoryIndex<'_>,
+    caller: &str,
+    receiver: &str,
+    line: usize,
+) -> BTreeSet<String> {
+    let aliases = index
+        .caller_alias_bindings
+        .get(caller)
+        .copied()
+        .unwrap_or_default();
+    let mut pending = vec![(receiver.to_owned(), line, aliases.len() + 1)];
+    let mut resolved = BTreeSet::new();
+    while let Some((receiver, line, remaining)) = pending.pop() {
+        let binding = aliases
+            .iter()
+            .filter(|binding| binding.receiver == receiver && binding.line <= line)
+            .max_by_key(|binding| binding.line)
+            .zip(remaining.checked_sub(1));
+        let Some((binding, remaining)) = binding else {
+            resolved.insert(receiver);
+            continue;
+        };
+        if binding.conditional {
+            pending.push((receiver, binding.line.saturating_sub(1), remaining));
+        }
+        pending.push((binding.source.clone(), binding.line, remaining));
+    }
+    resolved
+}
+
 fn observation_line(observation: &Observation) -> usize {
     observation
         .evidence
@@ -1238,8 +1269,9 @@ fn observation_line(observation: &Observation) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn resolve_observations(observations: &mut [Observation], index: &RepositoryIndex<'_>) {
+fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryIndex<'_>) {
     let mut receiver_types = BTreeMap::new();
+    let mut additional = Vec::new();
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
     }) {
@@ -1256,23 +1288,51 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             .to
             .as_str()
             .strip_prefix("typescript-returned://")
+            .map(|target| ("typescript", target))
             .or_else(|| {
                 observation
                     .to
                     .as_str()
                     .strip_prefix("javascript-returned://")
+                    .map(|target| ("javascript", target))
             })
-            .and_then(|target| target.split_once('/'));
-        if let Some((argument, _method)) = returned {
-            let argument = aliased_receiver(index, observation.from.as_str(), argument, line);
-            let origin = imported_origin(index, caller_file, &argument)
-                .or_else(|| Some((caller_file.clone(), argument)))
-                .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
-            if let Some(origin) = origin.filter(|origin| index.callback_returns.contains(origin))
-                && let Some(target) = index.symbols.get(&origin)
-            {
+            .and_then(|(language, target)| {
+                target
+                    .split_once('/')
+                    .map(|(argument, method)| (language, argument, method))
+            });
+        if let Some((language, argument, method)) = returned {
+            let targets = aliased_receivers(index, observation.from.as_str(), argument, line)
+                .into_iter()
+                .map(|argument| {
+                    let origin = imported_origin(index, caller_file, &argument)
+                        .or_else(|| Some((caller_file.clone(), argument.clone())))
+                        .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
+                    origin
+                        .filter(|origin| index.callback_returns.contains(origin))
+                        .and_then(|origin| index.symbols.get(&origin).cloned())
+                        .map_or_else(
+                            || {
+                                (
+                                    EntityId::from(format!(
+                                        "{language}-returned://{argument}/{method}"
+                                    )),
+                                    observation.confidence,
+                                )
+                            },
+                            |target| (target, Confidence::Inferred),
+                        )
+                })
+                .collect::<BTreeMap<_, _>>();
+            if let Some((target, confidence)) = targets.first_key_value() {
                 observation.to = target.clone();
-                observation.confidence = Confidence::Inferred;
+                observation.confidence = *confidence;
+                additional.extend(targets.iter().skip(1).map(|(target, confidence)| {
+                    let mut resolved = observation.clone();
+                    resolved.to = target.clone();
+                    resolved.confidence = *confidence;
+                    resolved
+                }));
             }
             continue;
         }
@@ -1373,6 +1433,7 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             observation.to = target.clone();
         }
     }
+    observations.extend(additional);
 }
 
 fn graphql_operation_calls(
@@ -1941,6 +2002,11 @@ mod tests {
                 selected = second;
                 context.get(finalLoader).load('snapshot');
             }
+            export function conditional(context: Context, flag: boolean) {
+                let selected = first;
+                if (flag) selected = second;
+                context.get(selected).load('conditional');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -1972,12 +2038,42 @@ mod tests {
             observation.from.as_str() == "repo://example/typescript/src/entry/chained"
                 && observation.to.as_str() == "repo://example/typescript/src/entry/second"
         }));
+        let conditional = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/conditional"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            conditional,
+            BTreeSet::from([
+                "repo://example/typescript/src/entry/first",
+                "repo://example/typescript/src/entry/second",
+            ])
+        );
     }
 
     #[test]
     fn resolves_a_returned_callback_from_a_workspace_package() {
-        let consumer_source = "import { loader } from '@example/provider'; import * as loaders from '@example/provider'; export function entry(context: Context) { const selected = loader; context.get(selected).load('key'); } export function qualified(context: Context) { context.get(loaders.loader).load('key'); }";
-        let provider_source = "export class Client { fetch() {} } export const loader = createContext(() => new Loader(async () => { const client = new Client(); const selected = client; return selected.fetch(); }));";
+        let consumer_source = r#"
+            import { first, loader, second } from '@example/provider';
+            import * as loaders from '@example/provider';
+            export function entry(context: Context) {
+                const selected = loader;
+                context.get(selected).load('key');
+            }
+            export function qualified(context: Context) {
+                context.get(loaders.loader).load('key');
+            }
+            export function conditional(context: Context, flag: boolean) {
+                let selected = first;
+                if (flag) selected = second;
+                context.get(selected).load('key');
+            }
+        "#;
+        let provider_source = "export class Client { fetch() {} } export const loader = createContext(() => new Loader(async () => { const client = new Client(); const selected = client; return selected.fetch(); })); export const first = createContext(() => new Loader(() => {})); export const second = createContext(() => new Loader(() => {}));";
         let consumer_path = PathBuf::from("src/entry.ts");
         let provider_path = PathBuf::from("src/loader.ts");
         let consumer = analyze(consumer_source, SourceLanguage::TypeScript).unwrap();
@@ -2001,17 +2097,28 @@ mod tests {
         ];
         let mut observations =
             observations_from_analysis("consumer", &consumer, consumer_source, &consumer_path);
-        observations.extend(observations_from_analysis(
+        resolve_repository_calls(
+            "consumer",
+            &mut observations,
+            &[(consumer_path.as_path(), &consumer)],
+            &[],
+            &[],
+        );
+        let mut provider_observations =
+            observations_from_analysis("provider", &provider, provider_source, &provider_path);
+        resolve_repository_calls(
             "provider",
-            &provider,
-            provider_source,
-            &provider_path,
-        ));
+            &mut provider_observations,
+            &[(provider_path.as_path(), &provider)],
+            &[],
+            &[],
+        );
+        observations.extend(provider_observations);
 
         let overrides = resolve_workspace_calls(&mut observations, &repositories);
         assert!(overrides.iter().any(|override_| {
             override_.from.as_str() == "repo://consumer/typescript/src/entry/entry"
-                && override_.unresolved_to.as_str() == "typescript-returned://selected/load"
+                && override_.unresolved_to.as_str() == "typescript-returned://loader/load"
                 && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
                 && override_.confidence == Confidence::Inferred
         }));
@@ -2021,6 +2128,31 @@ mod tests {
                 && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
                 && override_.confidence == Confidence::Inferred
         }));
+        let conditional = overrides
+            .iter()
+            .filter(|override_| {
+                override_.from.as_str() == "repo://consumer/typescript/src/entry/conditional"
+            })
+            .map(|override_| {
+                (
+                    override_.unresolved_to.as_str(),
+                    override_.resolved_to.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            conditional,
+            BTreeSet::from([
+                (
+                    "typescript-returned://first/load",
+                    "repo://provider/typescript/src/loader/first",
+                ),
+                (
+                    "typescript-returned://second/load",
+                    "repo://provider/typescript/src/loader/second",
+                ),
+            ])
+        );
     }
 
     #[test]

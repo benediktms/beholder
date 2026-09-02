@@ -187,6 +187,8 @@ pub(super) struct AliasBinding {
     pub(super) source: String,
     #[serde(default)]
     pub(super) line: usize,
+    #[serde(default)]
+    pub(super) conditional: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

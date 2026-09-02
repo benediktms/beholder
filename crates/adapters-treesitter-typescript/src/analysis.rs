@@ -479,10 +479,25 @@ fn collect_alias_bindings(
         && matches!(value.kind(), "identifier" | "member_expression")
         && let (Some(receiver), Some(source_name)) = (text(receiver, source), text(value, source))
     {
+        let conditional = std::iter::successors(node.parent(), |ancestor| ancestor.parent())
+            .take_while(|ancestor| *ancestor != root)
+            .any(|ancestor| {
+                matches!(
+                    ancestor.kind(),
+                    "if_statement"
+                        | "switch_case"
+                        | "ternary_expression"
+                        | "for_statement"
+                        | "for_in_statement"
+                        | "while_statement"
+                        | "do_statement"
+                )
+            });
         bindings.push(AliasBinding {
             receiver: receiver.into(),
             source: source_name.into(),
             line: node.start_position().row + 1,
+            conditional,
         });
     }
     let mut cursor = node.walk();
