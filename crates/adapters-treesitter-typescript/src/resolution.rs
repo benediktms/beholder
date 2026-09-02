@@ -1206,7 +1206,7 @@ fn aliased_receiver(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
-    line: usize,
+    mut line: usize,
 ) -> String {
     let aliases = index
         .caller_alias_bindings
@@ -1215,16 +1215,16 @@ fn aliased_receiver(
         .unwrap_or_default();
     let mut receiver = receiver.to_owned();
     for _ in 0..=aliases.len() {
-        let Some(source) = aliases
+        let Some(binding) = aliases
             .iter()
             // ponytail: line ordering; retain spans if same-line reassignment matters.
             .filter(|binding| binding.receiver == receiver && binding.line <= line)
             .max_by_key(|binding| binding.line)
-            .map(|binding| binding.source.clone())
         else {
             break;
         };
-        receiver = source;
+        receiver = binding.source.clone();
+        line = binding.line;
     }
     receiver
 }
@@ -1935,6 +1935,12 @@ mod tests {
                 selected = second;
                 context.get(selected).load('second');
             }
+            export function chained(context: Context) {
+                let selected = first;
+                const finalLoader = selected;
+                selected = second;
+                context.get(finalLoader).load('snapshot');
+            }
         "#;
         let path = Path::new("src/entry.ts");
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -1958,6 +1964,14 @@ mod tests {
                 "repo://example/typescript/src/entry/second",
             ])
         );
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/chained"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/first"
+        }));
+        assert!(!observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/chained"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/second"
+        }));
     }
 
     #[test]
