@@ -594,8 +594,7 @@ pub fn unresolved_endpoint_entities(observations: &[Observation]) -> Vec<EntityF
         .iter()
         .flat_map(|observation| [&observation.from, &observation.to])
         .filter(|id| {
-            id.as_str().starts_with("rust-call://")
-                || id.as_str().starts_with("rust-method://")
+            id.as_str().starts_with("rust-call://") || id.as_str().starts_with("rust-method://")
         })
         .map(|id| id.as_str())
         .collect::<BTreeSet<_>>()

@@ -159,6 +159,16 @@ pub fn entities_from_analysis(
                 .unwrap(),
             );
         }
+        for field in &module.struct_fields {
+            entities.push(
+                EntityFact::new(
+                    format!("{module_id}/field/{}", field.name),
+                    EntityKind::Namespace,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
     }
     entities
 }

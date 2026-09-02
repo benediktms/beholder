@@ -244,6 +244,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
       |> Enum.uniq()
       |> Map.new(fn path ->
         observations = Map.get(observations_by_path, path, [])
+
         entities =
           entities_by_path
           |> Map.get(path, [])
