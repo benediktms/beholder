@@ -270,9 +270,7 @@ pub async fn context(
         .try_into()?)
 }
 
-pub async fn workspace_topology(
-    workspace: String,
-) -> Result<WorkspaceTopology, ClientError> {
+pub async fn workspace_topology(workspace: String) -> Result<WorkspaceTopology, ClientError> {
     Ok(connect_send()
         .await?
         .get_workspace_topology(request(GetWorkspaceTopologyRequest { workspace }))
@@ -281,9 +279,7 @@ pub async fn workspace_topology(
         .try_into()?)
 }
 
-pub async fn workspace_topology_status(
-    workspace: String,
-) -> Result<QueryMetadata, ClientError> {
+pub async fn workspace_topology_status(workspace: String) -> Result<QueryMetadata, ClientError> {
     Ok(connect_send()
         .await?
         .get_workspace_topology_status(request(GetWorkspaceTopologyStatusRequest { workspace }))
