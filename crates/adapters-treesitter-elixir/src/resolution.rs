@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn resolves_struct_dispatch_and_captured_source_callbacks_from_behaviour_evidence() {
-        let observations = observations(
+        let mut observations = observations(
             "example",
             r#"
             defmodule Example.Job do
@@ -621,6 +621,8 @@ mod tests {
             Path::new("lib/example.ex"),
         )
         .unwrap();
+        let dynamic = workspace_dynamic_dispatch_observations(&observations);
+        observations.extend(dynamic);
         let edges = observations
             .iter()
             .filter(|observation| {
