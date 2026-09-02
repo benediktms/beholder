@@ -800,16 +800,15 @@ fn repository_index<'a>(
                 caller_alias_bindings.insert(id.clone(), &definition.alias_bindings);
                 caller_factory_bindings.insert(id.clone(), &definition.factory_bindings);
             }
-            if definition.kind == DefinitionKind::Callable {
-                if let Some((owner, member)) = definition.qualified_name.rsplit_once('/')
-                    && !member.contains('/')
-                    && member_owners.contains(&owner)
-                {
-                    caller_owners.insert(
-                        format!("{module_id}/{}", definition.qualified_name),
-                        ((*path).to_path_buf(), owner.to_owned()),
-                    );
-                }
+            if definition.kind == DefinitionKind::Callable
+                && let Some((owner, member)) = definition.qualified_name.rsplit_once('/')
+                && !member.contains('/')
+                && member_owners.contains(&owner)
+            {
+                caller_owners.insert(
+                    format!("{module_id}/{}", definition.qualified_name),
+                    ((*path).to_path_buf(), owner.to_owned()),
+                );
             }
         }
     }
