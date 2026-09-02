@@ -46,6 +46,8 @@ pub struct TypescriptAnalysis {
     pub(super) language: SourceLanguage,
     pub(super) calls: Vec<Call>,
     pub(super) definitions: Vec<Definition>,
+    #[serde(default)]
+    pub(super) top_level_aliases: Vec<SimpleAlias>,
     pub(super) imports: Vec<Import>,
     pub(super) exports: Vec<Export>,
     pub(super) string_constants: Vec<StringConstant>,
@@ -227,6 +229,12 @@ pub(super) struct Definition {
     pub(super) base: Option<String>,
     pub(super) return_type: Option<String>,
     pub(super) exported: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct SimpleAlias {
+    pub(super) receiver: String,
+    pub(super) source: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
