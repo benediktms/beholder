@@ -545,6 +545,7 @@ fn collect_alias_bindings(
             .iter()
             .all(|source| matches!(source.kind(), "identifier" | "member_expression"))
         {
+            let (scope_start, scope_end) = lexical_scope(node, root);
             for (index, source_node) in sources.drain(..).enumerate() {
                 let Some(source_name) = text(source_node, source) else {
                     continue;
@@ -555,6 +556,8 @@ fn collect_alias_bindings(
                     line: source_node.start_position().row + 1,
                     character: lsp_position(source_node, source, false)
                         .map_or(0, |position| position.character),
+                    scope_start,
+                    scope_end,
                     conditional: conditional || index > 0,
                 });
             }

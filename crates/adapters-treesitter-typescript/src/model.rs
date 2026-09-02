@@ -77,6 +77,12 @@ impl TypescriptAnalysis {
                         .iter()
                         .map(|binding| (binding.scope_start, binding.scope_end)),
                 )
+                .chain(
+                    definition
+                        .alias_bindings
+                        .iter()
+                        .map(|binding| (binding.scope_start, binding.scope_end)),
+                )
                 .collect::<Vec<_>>();
             scopes.sort_unstable();
             scopes.dedup();
@@ -106,6 +112,10 @@ impl TypescriptAnalysis {
             for binding in &mut definition.alias_bindings {
                 binding.line = 0;
                 binding.character = 0;
+                binding.scope_start = scopes
+                    .binary_search(&(binding.scope_start, binding.scope_end))
+                    .unwrap_or_default();
+                binding.scope_end = 0;
             }
         }
         for document in &mut analysis.graphql_documents {
@@ -229,6 +239,10 @@ pub(super) struct AliasBinding {
     pub(super) line: usize,
     #[serde(default)]
     pub(super) character: u32,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
     #[serde(default)]
     pub(super) conditional: bool,
 }
