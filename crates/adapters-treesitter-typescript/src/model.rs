@@ -46,6 +46,8 @@ pub struct TypescriptAnalysis {
     pub(super) language: SourceLanguage,
     pub(super) calls: Vec<Call>,
     pub(super) definitions: Vec<Definition>,
+    #[serde(default)]
+    pub(super) top_level_aliases: Vec<SimpleAlias>,
     pub(super) imports: Vec<Import>,
     pub(super) exports: Vec<Export>,
     pub(super) string_constants: Vec<StringConstant>,
@@ -62,11 +64,84 @@ impl TypescriptAnalysis {
         let mut analysis = self.clone();
         for call in &mut analysis.calls {
             call.clear_position();
+            call.scope_start = 0;
+            call.scope_end = 0;
         }
         for definition in &mut analysis.definitions {
             definition.line = 0;
+            let mut scopes = definition
+                .calls
+                .iter()
+                .map(|call| (call.scope_start, call.scope_end))
+                .chain(
+                    definition
+                        .bindings
+                        .iter()
+                        .map(|binding| (binding.scope_start, binding.scope_end)),
+                )
+                .chain(
+                    definition
+                        .alias_bindings
+                        .iter()
+                        .map(|binding| (binding.scope_start, binding.scope_end)),
+                )
+                .chain(
+                    definition
+                        .alias_bindings
+                        .iter()
+                        .map(|binding| (binding.source_scope_start, binding.source_scope_end)),
+                )
+                .chain(
+                    definition
+                        .factory_bindings
+                        .iter()
+                        .map(|binding| (binding.scope_start, binding.scope_end)),
+                )
+                .collect::<Vec<_>>();
+            scopes.sort_unstable();
+            scopes.dedup();
+            let normalize_scope = |scope: (usize, usize)| {
+                let index = scopes.binary_search(&scope).unwrap_or_default();
+                let parent = scopes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| {
+                        **candidate != scope && candidate.0 <= scope.0 && scope.1 <= candidate.1
+                    })
+                    .min_by_key(|(_, candidate)| candidate.1 - candidate.0)
+                    .map_or(0, |(parent, _)| parent + 1);
+                (index, parent)
+            };
+            let alias_positions = definition
+                .alias_bindings
+                .iter()
+                .map(|binding| (binding.line, binding.character))
+                .collect::<Vec<_>>();
             for call in &mut definition.calls {
+                let alias_order = alias_positions
+                    .iter()
+                    .filter(|position| **position <= (call.line, call.start_character))
+                    .count();
+                (call.scope_start, call.scope_end) =
+                    normalize_scope((call.scope_start, call.scope_end));
                 call.clear_position();
+                call.line = alias_order;
+            }
+            for binding in &mut definition.bindings {
+                (binding.scope_start, binding.scope_end) =
+                    normalize_scope((binding.scope_start, binding.scope_end));
+            }
+            for binding in &mut definition.alias_bindings {
+                binding.line = 0;
+                binding.character = 0;
+                (binding.scope_start, binding.scope_end) =
+                    normalize_scope((binding.scope_start, binding.scope_end));
+                (binding.source_scope_start, binding.source_scope_end) =
+                    normalize_scope((binding.source_scope_start, binding.source_scope_end));
+            }
+            for binding in &mut definition.factory_bindings {
+                (binding.scope_start, binding.scope_end) =
+                    normalize_scope((binding.scope_start, binding.scope_end));
             }
         }
         for document in &mut analysis.graphql_documents {
@@ -147,9 +222,19 @@ pub(super) struct Definition {
     pub(super) alias_bindings: Vec<AliasBinding>,
     pub(super) factory_bindings: Vec<FactoryBinding>,
     pub(super) factory: Option<String>,
+    #[serde(default)]
+    pub(super) factory_callback: Option<String>,
+    #[serde(default)]
+    pub(super) callback_return_type: Option<String>,
     pub(super) base: Option<String>,
     pub(super) return_type: Option<String>,
     pub(super) exported: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct SimpleAlias {
+    pub(super) receiver: String,
+    pub(super) source: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -157,6 +242,10 @@ pub(super) struct Binding {
     pub(super) receiver: String,
     pub(super) type_name: String,
     pub(super) injection_token: Option<String>,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -180,12 +269,30 @@ pub(super) struct NestProvider {
 pub(super) struct AliasBinding {
     pub(super) receiver: String,
     pub(super) source: String,
+    #[serde(default)]
+    pub(super) line: usize,
+    #[serde(default)]
+    pub(super) character: u32,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
+    #[serde(default)]
+    pub(super) source_scope_start: usize,
+    #[serde(default)]
+    pub(super) source_scope_end: usize,
+    #[serde(default)]
+    pub(super) conditional: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct FactoryBinding {
     pub(super) receiver: String,
     pub(super) factory: String,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +325,10 @@ pub(super) enum CallKind {
 pub(super) struct Call {
     pub(super) kind: CallKind,
     pub(super) receiver: Option<String>,
+    #[serde(default)]
+    pub(super) returned_context: Option<String>,
+    #[serde(default)]
+    pub(super) returned_receiver: Option<String>,
     pub(super) name: String,
     pub(super) arguments: Vec<String>,
     pub(super) type_arguments: Vec<String>,
@@ -230,6 +341,10 @@ pub(super) struct Call {
     pub(super) end_line: u32,
     #[serde(default)]
     pub(super) end_character: u32,
+    #[serde(default)]
+    pub(super) scope_start: usize,
+    #[serde(default)]
+    pub(super) scope_end: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

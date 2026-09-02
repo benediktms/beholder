@@ -77,7 +77,33 @@ fn lsp_position(node: Node<'_>, source: &[u8], end: bool) -> Option<SourcePositi
     })
 }
 
-fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
+fn feasible_values(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let node = unparenthesized(node);
+    let fields = match node.kind() {
+        "ternary_expression" => Some(["consequence", "alternative"]),
+        "binary_expression" if is_short_circuit(node, source) => Some(["left", "right"]),
+        _ => None,
+    };
+    if let Some(fields) = fields {
+        return fields
+            .into_iter()
+            .filter_map(|field| node.child_by_field_name(field))
+            .flat_map(|node| feasible_values(node, source))
+            .collect();
+    }
+    matches!(node.kind(), "identifier" | "member_expression")
+        .then(|| text(node, source).map(str::to_owned))
+        .flatten()
+        .into_iter()
+        .collect()
+}
+
+fn call_target(
+    node: Node<'_>,
+    target: Node<'_>,
+    source: &[u8],
+    kind: CallKind,
+) -> Option<Vec<Call>> {
     let (receiver, name, kind, selection): (Option<String>, String, CallKind, Node<'_>) =
         match target.kind() {
             "identifier" => (None, text(target, source)?.into(), kind, target),
@@ -107,9 +133,33 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
     let preserve_type_arguments = name == "getService";
     let start = lsp_position(selection, source, false)?;
     let end = lsp_position(selection, source, true)?;
-    Some(Call {
+    let returned = (name == "load")
+        .then(|| {
+            let object = target
+                .child_by_field_name("object")
+                .filter(|object| object.kind() == "call_expression")?;
+            let function = object
+                .child_by_field_name("function")
+                .filter(|function| function.kind() == "member_expression")?;
+            (text(function.child_by_field_name("property")?, source)? == "get").then_some(())?;
+            let context = text(function.child_by_field_name("object")?, source)?.to_owned();
+            let arguments = object.child_by_field_name("arguments")?;
+            let arguments = arguments
+                .named_children(&mut arguments.walk())
+                .filter(|argument| argument.kind() != "comment")
+                .collect::<Vec<_>>();
+            let [argument] = arguments.as_slice() else {
+                return None;
+            };
+            let receivers = feasible_values(*argument, source);
+            (!receivers.is_empty()).then_some((context, receivers))
+        })
+        .flatten();
+    let call = Call {
         kind,
         receiver,
+        returned_context: None,
+        returned_receiver: None,
         name,
         arguments: node
             .child_by_field_name("arguments")
@@ -150,6 +200,21 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
         start_character: start.character,
         end_line: end.line,
         end_character: end.character,
+        scope_start: 0,
+        scope_end: 0,
+    };
+    Some(if let Some((context, receivers)) = returned {
+        receivers
+            .into_iter()
+            .map(|receiver| {
+                let mut call = call.clone();
+                call.returned_context = Some(context.clone());
+                call.returned_receiver = Some(receiver);
+                call
+            })
+            .collect()
+    } else {
+        vec![call]
     })
 }
 
@@ -227,7 +292,7 @@ fn collect_string_constants(node: Node<'_>, source: &[u8], constants: &mut Vec<S
     }
 }
 
-fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
+fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Vec<Call>> {
     let target = node.child_by_field_name(match kind {
         CallKind::Constructor => "constructor",
         CallKind::Direct | CallKind::Member => "function",
@@ -235,34 +300,88 @@ fn call(node: Node<'_>, source: &[u8], kind: CallKind) -> Option<Call> {
     call_target(node, target, source, kind)
 }
 
-fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
-    if node != root
+fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
+    node != root
         && (matches!(
             node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        ) || (node.kind() == "arrow_function"
+            "function_declaration" | "generator_function_declaration" | "method_definition"
+        ) || (matches!(node.kind(), "arrow_function" | "function_expression")
             && node
                 .parent()
                 .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
+}
+
+fn callable_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
+    let scope = std::iter::successors(Some(node), |ancestor| ancestor.parent())
+        .find(|ancestor| {
+            matches!(
+                ancestor.kind(),
+                "arrow_function"
+                    | "function_declaration"
+                    | "function_expression"
+                    | "generator_function_declaration"
+                    | "method_definition"
+            )
+        })
+        .unwrap_or(root);
+    (scope.start_byte(), scope.end_byte())
+}
+
+fn lexical_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
+    let scope = std::iter::successors(Some(node), |ancestor| ancestor.parent())
+        .find(|ancestor| {
+            matches!(
+                ancestor.kind(),
+                "statement_block"
+                    | "switch_body"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "catch_clause"
+                    | "arrow_function"
+                    | "function_declaration"
+                    | "function_expression"
+                    | "generator_function_declaration"
+                    | "method_definition"
+            )
+        })
+        .unwrap_or(root);
+    (scope.start_byte(), scope.end_byte())
+}
+
+fn declaration_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "variable_declaration")
     {
+        callable_scope(node, root)
+    } else {
+        lexical_scope(node, root)
+    }
+}
+
+fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
+    if is_collection_boundary(node, root) {
         return;
     }
     match node.kind() {
         "call_expression" => {
-            if let Some(call) = call(node, source, CallKind::Direct) {
-                calls.push(call);
+            if let Some(found) = call(node, source, CallKind::Direct) {
+                for mut call in found {
+                    (call.scope_start, call.scope_end) = lexical_scope(node, root);
+                    calls.push(call);
+                }
             }
         }
         "new_expression" => {
-            if let Some(call) = call(node, source, CallKind::Constructor) {
-                calls.push(call);
+            if let Some(found) = call(node, source, CallKind::Constructor) {
+                for mut call in found {
+                    (call.scope_start, call.scope_end) = lexical_scope(node, root);
+                    calls.push(call);
+                }
             }
         }
         "jsx_opening_element" | "jsx_self_closing_element" => {
-            if let Some(call) = node
+            if let Some(found) = node
                 .child_by_field_name("name")
                 .filter(|target| {
                     target.kind() == "member_expression"
@@ -272,7 +391,10 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
                 })
                 .and_then(|target| call_target(node, target, source, CallKind::Direct))
             {
-                calls.push(call);
+                for mut call in found {
+                    (call.scope_start, call.scope_end) = lexical_scope(node, root);
+                    calls.push(call);
+                }
             }
         }
         _ => {}
@@ -345,6 +467,8 @@ fn binding(node: Node<'_>, source: &[u8]) -> Option<Binding> {
         receiver,
         type_name,
         injection_token: injection_token(node, source),
+        scope_start: 0,
+        scope_end: 0,
     })
 }
 
@@ -370,23 +494,15 @@ fn injection_token(node: Node<'_>, source: &[u8]) -> Option<String> {
 }
 
 fn collect_bindings(node: Node<'_>, source: &[u8], root: Node<'_>, bindings: &mut Vec<Binding>) {
-    if node != root
-        && matches!(
-            node.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        )
-    {
+    if is_collection_boundary(node, root) {
         return;
     }
     if matches!(
         node.kind(),
         "required_parameter" | "optional_parameter" | "variable_declarator"
-    ) && let Some(binding) = binding(node, source)
+    ) && let Some(mut binding) = binding(node, source)
     {
+        (binding.scope_start, binding.scope_end) = declaration_scope(node, root);
         bindings.push(binding);
     }
     let mut cursor = node.walk();
@@ -401,16 +517,7 @@ fn collect_factory_bindings(
     root: Node<'_>,
     bindings: &mut Vec<FactoryBinding>,
 ) {
-    if node != root
-        && matches!(
-            node.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        )
-    {
+    if is_collection_boundary(node, root) {
         return;
     }
     if node.kind() == "variable_declarator"
@@ -432,9 +539,12 @@ fn collect_factory_bindings(
             .filter(|function| function.kind() == "identifier")
             .and_then(|function| text(function, source))
     {
+        let (scope_start, scope_end) = declaration_scope(node, root);
         bindings.push(FactoryBinding {
             receiver: receiver.into(),
             factory: factory.into(),
+            scope_start,
+            scope_end,
         });
     }
     let mut cursor = node.walk();
@@ -443,22 +553,44 @@ fn collect_factory_bindings(
     }
 }
 
+fn is_short_circuit(node: Node<'_>, source: &[u8]) -> bool {
+    node.child_by_field_name("operator")
+        .and_then(|operator| text(operator, source))
+        .is_some_and(|operator| matches!(operator, "&&" | "||" | "??" | "&&=" | "||=" | "??="))
+}
+
+fn has_conditional_ancestor(node: Node<'_>, source: &[u8], root: Node<'_>) -> bool {
+    std::iter::successors(node.parent(), |ancestor| ancestor.parent())
+        .take_while(|ancestor| *ancestor != root)
+        .any(|ancestor| {
+            matches!(
+                ancestor.kind(),
+                "if_statement"
+                    | "catch_clause"
+                    | "arrow_function"
+                    | "function_expression"
+                    | "switch_case"
+                    | "switch_default"
+                    | "ternary_expression"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "while_statement"
+                    | "do_statement"
+            ) || (ancestor.kind() == "binary_expression" && is_short_circuit(ancestor, source))
+                || (ancestor.kind() == "try_statement"
+                    && ancestor.child_by_field_name("body").is_some_and(|body| {
+                        body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
+                    }))
+        })
+}
+
 fn collect_alias_bindings(
     node: Node<'_>,
     source: &[u8],
     root: Node<'_>,
     bindings: &mut Vec<AliasBinding>,
 ) {
-    if node != root
-        && matches!(
-            node.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function_declaration"
-                | "method_definition"
-        )
-    {
+    if is_collection_boundary(node, root) {
         return;
     }
     let pair = match node.kind() {
@@ -470,17 +602,71 @@ fn collect_alias_bindings(
             node.child_by_field_name("left"),
             node.child_by_field_name("right"),
         ),
+        "augmented_assignment_expression" if is_short_circuit(node, source) => (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ),
         _ => (None, None),
     };
     if let (Some(receiver), Some(value)) = pair
         && matches!(receiver.kind(), "identifier" | "member_expression")
-        && matches!(value.kind(), "identifier" | "member_expression")
-        && let (Some(receiver), Some(source_name)) = (text(receiver, source), text(value, source))
+        && let Some(receiver) = text(receiver, source)
     {
-        bindings.push(AliasBinding {
-            receiver: receiver.into(),
-            source: source_name.into(),
-        });
+        let value = unparenthesized(value);
+        let conditional = has_conditional_ancestor(node, source, root)
+            || node.kind() == "augmented_assignment_expression";
+        let fields = match value.kind() {
+            "ternary_expression" => Some(["consequence", "alternative"]),
+            "binary_expression" if is_short_circuit(value, source) => Some(["left", "right"]),
+            _ => None,
+        };
+        let mut sources = if let Some(fields) = fields {
+            fields
+                .into_iter()
+                .filter_map(|field| value.child_by_field_name(field).map(unparenthesized))
+                .collect::<Vec<_>>()
+        } else {
+            vec![value]
+        };
+        if sources
+            .iter()
+            .all(|source| matches!(source.kind(), "identifier" | "member_expression"))
+        {
+            let (scope_start, scope_end) = if node.kind() == "variable_declarator" {
+                declaration_scope(node, root)
+            } else {
+                bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.receiver == receiver
+                            && binding.scope_start <= node.start_byte()
+                            && node.end_byte() <= binding.scope_end
+                    })
+                    .max_by_key(|binding| binding.scope_start)
+                    .map_or_else(
+                        || callable_scope(node, root),
+                        |binding| (binding.scope_start, binding.scope_end),
+                    )
+            };
+            let (source_scope_start, source_scope_end) = lexical_scope(node, root);
+            for (index, source_node) in sources.drain(..).enumerate() {
+                let Some(source_name) = text(source_node, source) else {
+                    continue;
+                };
+                bindings.push(AliasBinding {
+                    receiver: receiver.into(),
+                    source: source_name.into(),
+                    line: source_node.start_position().row + 1,
+                    character: lsp_position(source_node, source, false)
+                        .map_or(0, |position| position.character),
+                    scope_start,
+                    scope_end,
+                    source_scope_start,
+                    source_scope_end,
+                    conditional: conditional || index > 0,
+                });
+            }
+        }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -488,7 +674,17 @@ fn collect_alias_bindings(
     }
 }
 
-fn returned_constructor(node: Node<'_>, source: &[u8], root: Node<'_>) -> Option<String> {
+fn unparenthesized(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(child) = node.named_child(0) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+fn returned_constructor_node<'tree>(node: Node<'tree>, root: Node<'tree>) -> Option<Node<'tree>> {
     if node != root
         && matches!(
             node.kind(),
@@ -502,17 +698,199 @@ fn returned_constructor(node: Node<'_>, source: &[u8], root: Node<'_>) -> Option
         return None;
     }
     if node.kind() == "return_statement"
-        && let Some(value) = node.named_child(0)
+        && let Some(value) = node.named_child(0).map(unparenthesized)
         && value.kind() == "new_expression"
     {
-        return value
-            .child_by_field_name("constructor")
-            .and_then(|constructor| text(constructor, source))
-            .map(str::to_owned);
+        return Some(value);
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find_map(|child| returned_constructor(child, source, root))
+        .find_map(|child| returned_constructor_node(child, root))
+}
+
+fn local_callable<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+    root: Node<'tree>,
+    reference: Node<'tree>,
+    name: &str,
+) -> Option<(usize, Node<'tree>)> {
+    local_callable_inner(node, source, root, reference, name, 32)
+}
+
+fn local_callable_inner<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+    root: Node<'tree>,
+    reference: Node<'tree>,
+    name: &str,
+    remaining: usize,
+) -> Option<(usize, Node<'tree>)> {
+    if remaining == 0 {
+        return None;
+    }
+    let candidate = if node.kind() == "variable_declarator"
+        && node
+            .child_by_field_name("name")
+            .and_then(|name| text(name, source))
+            == Some(name)
+        && let Some(value) = node.child_by_field_name("value").map(unparenthesized)
+    {
+        let scope = lexical_scope(node, root);
+        (scope.0 <= reference.start_byte() && reference.end_byte() <= scope.1)
+            .then(|| {
+                if callable_value(value) {
+                    Some((scope.0, value))
+                } else {
+                    let alias = (value.kind() == "identifier")
+                        .then(|| text(value, source))
+                        .flatten()?;
+                    local_callable_inner(root, source, root, value, alias, remaining - 1)
+                        .map(|(_, callback)| (scope.0, callback))
+                }
+            })
+            .flatten()
+    } else if node.kind() == "function_declaration"
+        && node
+            .child_by_field_name("name")
+            .and_then(|name| text(name, source))
+            == Some(name)
+    {
+        let scope = lexical_scope(node.parent().unwrap_or(root), root);
+        (scope.0 <= reference.start_byte() && reference.end_byte() <= scope.1)
+            .then_some((scope.0, node))
+    } else {
+        None
+    };
+    if node != root
+        && matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function_declaration"
+                | "method_definition"
+        )
+    {
+        return candidate;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter_map(|child| local_callable_inner(child, source, root, reference, name, remaining))
+        .chain(candidate)
+        .max_by_key(|(scope_start, _)| *scope_start)
+}
+
+fn callback_constructor<'tree>(
+    body: Node<'tree>,
+    source: &[u8],
+) -> Option<(String, Vec<Node<'tree>>)> {
+    let body = unparenthesized(body);
+    let mut returned = Vec::new();
+    collect_constructor_values(body, source, &mut returned);
+    if returned.is_empty() {
+        collect_returned_constructors(body, source, body, &mut returned);
+    }
+    let mut constructor = None;
+    let mut local_callbacks = Vec::new();
+    for returned in returned {
+        let Some(arguments) = returned.child_by_field_name("arguments") else {
+            continue;
+        };
+        let mut has_callback = false;
+        for argument in arguments
+            .named_children(&mut arguments.walk())
+            .filter(|argument| argument.kind() != "comment")
+        {
+            let argument = unparenthesized(argument);
+            if callable_value(argument) {
+                has_callback = true;
+            } else if let Some(name) = (argument.kind() == "identifier")
+                .then(|| text(argument, source))
+                .flatten()
+                && let Some((_, callback)) = local_callable(body, source, body, argument, name)
+            {
+                local_callbacks.push(callback);
+                has_callback = true;
+            }
+        }
+        if has_callback && constructor.is_none() {
+            constructor = returned
+                .child_by_field_name("constructor")
+                .and_then(|constructor| text(constructor, source))
+                .map(str::to_owned);
+        }
+    }
+    constructor.map(|constructor| (constructor, local_callbacks))
+}
+
+fn collect_constructor_values<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+    constructors: &mut Vec<Node<'tree>>,
+) {
+    let node = unparenthesized(node);
+    let fields = match node.kind() {
+        "ternary_expression" => Some(["consequence", "alternative"]),
+        "binary_expression" if is_short_circuit(node, source) => Some(["left", "right"]),
+        _ => None,
+    };
+    if node.kind() == "new_expression" {
+        constructors.push(node);
+    } else if let Some(fields) = fields {
+        for value in fields
+            .into_iter()
+            .filter_map(|field| node.child_by_field_name(field))
+        {
+            collect_constructor_values(value, source, constructors);
+        }
+    }
+}
+
+fn collect_returned_constructors<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+    root: Node<'tree>,
+    constructors: &mut Vec<Node<'tree>>,
+) {
+    if node != root
+        && matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function_declaration"
+                | "method_definition"
+        )
+    {
+        return;
+    }
+    if node.kind() == "return_statement" {
+        if let Some(value) = node.named_child(0) {
+            collect_constructor_values(value, source, constructors);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_returned_constructors(child, source, root, constructors);
+    }
+}
+
+fn callback_return<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+) -> Option<(Node<'tree>, String, Vec<Node<'tree>>)> {
+    let arguments = node.child_by_field_name("arguments")?;
+    arguments
+        .named_children(&mut arguments.walk())
+        .map(unparenthesized)
+        .filter(|argument| callable_value(*argument))
+        .find_map(|callback| {
+            let body = unparenthesized(callback.child_by_field_name("body")?);
+            let (constructor, local_callbacks) = callback_constructor(body, source)?;
+            Some((body, constructor, local_callbacks))
+        })
 }
 
 fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
@@ -572,6 +950,8 @@ fn class_bindings(body: Node<'_>, source: &[u8]) -> Vec<Binding> {
                     receiver: alias.receiver,
                     type_name: parameter.type_name.clone(),
                     injection_token: parameter.injection_token.clone(),
+                    scope_start: 0,
+                    scope_end: 0,
                 })
             }));
         }
@@ -587,6 +967,10 @@ fn definition(
     name: &str,
     kind: DefinitionKind,
 ) -> Definition {
+    let collection_root = node
+        .child_by_field_name("value")
+        .filter(|value| kind == DefinitionKind::Callable && callable_value(*value))
+        .unwrap_or(node);
     let mut calls = Vec::new();
     let mut bindings = Vec::new();
     let mut alias_bindings = Vec::new();
@@ -595,14 +979,32 @@ fn definition(
         collect_calls(body, source, body, &mut calls);
     }
     collect_decorator_calls(node, source, &mut calls);
-    collect_bindings(node, source, node, &mut bindings);
-    collect_alias_bindings(node, source, node, &mut alias_bindings);
-    collect_factory_bindings(node, source, node, &mut factory_bindings);
-    let return_type = node
+    collect_bindings(collection_root, source, collection_root, &mut bindings);
+    collect_alias_bindings(
+        collection_root,
+        source,
+        collection_root,
+        &mut alias_bindings,
+    );
+    collect_factory_bindings(
+        collection_root,
+        source,
+        collection_root,
+        &mut factory_bindings,
+    );
+    let return_type = collection_root
         .child_by_field_name("return_type")
         .and_then(|annotation| return_type_name(annotation, source))
-        .or_else(|| returned_constructor(node, source, node));
-    Definition {
+        .or_else(|| {
+            returned_constructor_node(collection_root, collection_root)?
+                .child_by_field_name("constructor")
+                .and_then(|constructor| text(constructor, source))
+                .map(str::to_owned)
+        });
+    let callback = (kind == DefinitionKind::Callable)
+        .then(|| body.and_then(|body| callback_constructor(body, source)))
+        .flatten();
+    let mut definition = Definition {
         qualified_name: qualified(scope, name),
         kind,
         line: node.start_position().row + 1,
@@ -611,10 +1013,27 @@ fn definition(
         alias_bindings,
         factory_bindings,
         factory: None,
+        factory_callback: None,
+        callback_return_type: callback
+            .as_ref()
+            .map(|(constructor, _)| constructor.clone()),
         base: None,
         return_type,
         exported: is_exported(node),
+    };
+    if let Some((_, callbacks)) = callback {
+        for callback in callbacks {
+            collect_callback_evidence(callback, source, &mut definition);
+        }
     }
+    definition
+}
+
+fn collect_callback_evidence(callback: Node<'_>, source: &[u8], definition: &mut Definition) {
+    collect_calls(callback, source, callback, &mut definition.calls);
+    collect_bindings(callback, source, callback, &mut definition.bindings);
+    collect_alias_bindings(callback, source, callback, &mut definition.alias_bindings);
+    collect_factory_bindings(callback, source, callback, &mut definition.factory_bindings);
 }
 
 fn string_value(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -910,7 +1329,7 @@ fn collect_definitions(
             if let Some(factory) = value
                 .filter(|value| value.kind() == "call_expression")
                 .and_then(|value| value.child_by_field_name("function"))
-                .filter(|function| function.kind() == "identifier")
+                .filter(|function| matches!(function.kind(), "identifier" | "member_expression"))
                 .and_then(|function| text(function, source))
                 && let Some(name) = node
                     .child_by_field_name("name")
@@ -919,6 +1338,46 @@ fn collect_definitions(
                 let mut factory_definition =
                     definition(node, None, source, scope, name, DefinitionKind::Namespace);
                 factory_definition.factory = Some(factory.into());
+                if let Some((body, return_type, local_callbacks)) =
+                    value.and_then(|value| callback_return(value, source))
+                {
+                    collect_calls(body, source, body, &mut factory_definition.calls);
+                    collect_bindings(body, source, body, &mut factory_definition.bindings);
+                    collect_alias_bindings(
+                        body,
+                        source,
+                        body,
+                        &mut factory_definition.alias_bindings,
+                    );
+                    collect_factory_bindings(
+                        body,
+                        source,
+                        body,
+                        &mut factory_definition.factory_bindings,
+                    );
+                    for callback in local_callbacks {
+                        collect_callback_evidence(callback, source, &mut factory_definition);
+                    }
+                    factory_definition.callback_return_type = Some(return_type);
+                } else if let Some(factory_call) = value
+                    && let Some(arguments) = factory_call.child_by_field_name("arguments")
+                {
+                    let arguments = arguments
+                        .named_children(&mut arguments.walk())
+                        .filter(|argument| argument.kind() != "comment")
+                        .collect::<Vec<_>>();
+                    if let [callback] = arguments.as_slice()
+                        && matches!(callback.kind(), "identifier" | "member_expression")
+                        && let Some(callback_name) = text(*callback, source)
+                    {
+                        factory_definition.factory_callback = Some(callback_name.into());
+                        if let Some(calls) =
+                            call_target(factory_call, *callback, source, CallKind::Direct)
+                        {
+                            factory_definition.calls.extend(calls);
+                        }
+                    }
+                }
                 definitions.push(factory_definition);
                 return;
             }
@@ -1046,8 +1505,40 @@ fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) 
         "new_expression" => CallKind::Constructor,
         _ => return,
     };
-    if let Some(call) = call(expression, source, kind) {
-        calls.push(call);
+    if let Some(found) = call(expression, source, kind) {
+        calls.extend(found);
+    }
+}
+
+fn collect_top_level_aliases(node: Node<'_>, source: &[u8], aliases: &mut Vec<SimpleAlias>) {
+    if matches!(
+        node.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "arrow_function"
+            | "function_expression"
+            | "class_declaration"
+    ) {
+        return;
+    }
+    if node.kind() == "variable_declarator"
+        && let (Some(receiver), Some(value)) = (
+            node.child_by_field_name("name")
+                .filter(|name| name.kind() == "identifier"),
+            node.child_by_field_name("value").map(unparenthesized),
+        )
+        && matches!(value.kind(), "identifier" | "member_expression")
+        && let (Some(receiver), Some(source)) = (text(receiver, source), text(value, source))
+    {
+        aliases.push(SimpleAlias {
+            receiver: receiver.into(),
+            source: source.into(),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_top_level_aliases(child, source, aliases);
     }
 }
 
@@ -1089,6 +1580,7 @@ pub(super) fn analyze_with_plugins(
             .ok_or("JavaScript/TypeScript parser returned no tree")?;
     }
     let mut definitions = Vec::new();
+    let mut top_level_aliases = Vec::new();
     let mut calls = Vec::new();
     let mut imports = Vec::new();
     let mut exports = Vec::new();
@@ -1101,6 +1593,7 @@ pub(super) fn analyze_with_plugins(
     let incomplete = recovery.is_incomplete();
     for root in recovery.roots {
         collect_definitions(root, source.as_bytes(), &mut Vec::new(), &mut definitions);
+        collect_top_level_aliases(root, source.as_bytes(), &mut top_level_aliases);
         collect_top_level_call(root, source.as_bytes(), &mut calls);
         collect_imports(root, source.as_bytes(), &mut imports);
         collect_exports(root, source.as_bytes(), &mut exports);
@@ -1118,6 +1611,7 @@ pub(super) fn analyze_with_plugins(
         language,
         calls,
         definitions,
+        top_level_aliases,
         imports,
         exports,
         string_constants,
@@ -1308,6 +1802,15 @@ fn observation_target(
     scope: &str,
     call: &Call,
 ) -> String {
+    if call.kind == CallKind::Member
+        && let Some(context) = &call.returned_context
+        && let Some(receiver) = &call.returned_receiver
+    {
+        return format!(
+            "{language}-context-returned://{context}/{receiver}/{}",
+            call.name
+        );
+    }
     match call.kind {
         CallKind::Direct => ids
             .get(&qualified(

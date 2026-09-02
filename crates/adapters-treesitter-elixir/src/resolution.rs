@@ -304,8 +304,10 @@ pub fn generated_entities(observations: &[Observation]) -> Vec<EntityFact> {
         .collect()
 }
 
-pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<DependencyOverride> {
-    let mut definitions = BTreeMap::<String, Option<String>>::new();
+fn workspace_module_definitions(
+    observations: &[Observation],
+) -> BTreeMap<String, Option<EntityId>> {
+    let mut definitions = BTreeMap::<String, Option<EntityId>>::new();
     for observation in observations.iter().filter(|observation| {
         observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
     }) {
@@ -321,13 +323,17 @@ pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<Dependency
         definitions
             .entry(name.into())
             .and_modify(|candidate| {
-                if candidate.as_deref() != Some(observation.to.as_str()) {
+                if candidate.as_ref().map(EntityId::as_str) != Some(observation.to.as_str()) {
                     *candidate = None;
                 }
             })
-            .or_insert_with(|| Some(observation.to.as_str().into()));
+            .or_insert_with(|| Some(observation.to.clone()));
     }
+    definitions
+}
 
+pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<DependencyOverride> {
+    let definitions = workspace_module_definitions(observations);
     observations
         .iter()
         .filter_map(|observation| {
@@ -344,11 +350,160 @@ pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<Dependency
                 from: observation.from.clone(),
                 relation,
                 unresolved_to: observation.to.clone(),
-                resolved_to: EntityId::from(target.clone()),
+                resolved_to: target.clone(),
                 evidence: observation.evidence.clone(),
                 confidence: Confidence::Exact,
                 provenance: Provenance::Ast,
             })
+        })
+        .collect()
+}
+
+fn dynamic_dispatch_candidates(observations: &[Observation]) -> Vec<(&Observation, EntityId)> {
+    let behaviour_owners = workspace_module_definitions(observations);
+    let mut callback_owners = BTreeMap::<String, Option<EntityId>>::new();
+    for observation in observations.iter().filter(|observation| {
+        observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+    }) {
+        let Some(signature) = observation
+            .to
+            .as_str()
+            .strip_prefix(&format!("{}/callback/", observation.from))
+        else {
+            continue;
+        };
+        callback_owners
+            .entry(signature.to_owned())
+            .and_modify(|candidate| {
+                if candidate.as_ref() != Some(&observation.from) {
+                    *candidate = None;
+                }
+            })
+            .or_insert_with(|| Some(observation.from.clone()));
+    }
+    let definitions = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
+        })
+        .map(|observation| observation.to.as_str())
+        .collect::<BTreeSet<_>>();
+    let used_modules = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::Uses)
+        })
+        .filter_map(|observation| {
+            observation
+                .to
+                .as_str()
+                .strip_prefix("elixir-module://")
+                .map(|module| (observation.from.clone(), module.to_owned()))
+        })
+        .fold(
+            BTreeMap::<EntityId, BTreeSet<String>>::new(),
+            |mut modules, (caller, module)| {
+                modules.entry(caller).or_default().insert(module);
+                modules
+            },
+        );
+    let caller_receiver_modules = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+        })
+        .filter_map(|observation| {
+            used_modules
+                .get(&observation.from)
+                .map(|modules| (observation.to.clone(), modules))
+        })
+        .fold(
+            BTreeMap::<EntityId, BTreeSet<String>>::new(),
+            |mut receivers, (callee, modules)| {
+                receivers.entry(callee).or_default().extend(modules.clone());
+                receivers
+            },
+        );
+    let implementations = observations.iter().filter(|observation| {
+        observation.relation == SemanticRelation::Dependency(DependencyRelation::Implements)
+    });
+    let dynamic_calls = observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+        })
+        .filter_map(|observation| {
+            let target = observation
+                .to
+                .as_str()
+                .strip_prefix("elixir-dynamic-call://")?;
+            let (target, arity) = target.rsplit_once('/')?;
+            let (receiver_module, name) = target
+                .rsplit_once('/')
+                .map_or((None, target), |(module, name)| (Some(module), name));
+            Some((observation, receiver_module, format!("{name}/{arity}")))
+        });
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    let implementations = implementations.collect::<Vec<_>>();
+    for (call, receiver_module, signature) in dynamic_calls {
+        let direct_receiver = receiver_module.map(str::to_owned).into_iter().collect();
+        let receiver_modules = if receiver_module.is_some() {
+            &direct_receiver
+        } else if let Some(receiver_modules) = caller_receiver_modules.get(&call.from) {
+            receiver_modules
+        } else {
+            continue;
+        };
+        let Some(Some(callback_owner)) = callback_owners.get(&signature) else {
+            continue;
+        };
+        for implementation in &implementations {
+            let Some((_, implementation_module)) =
+                implementation.from.as_str().split_once("/elixir/")
+            else {
+                continue;
+            };
+            if !receiver_modules.contains(implementation_module) {
+                continue;
+            }
+            let Some(behaviour) = implementation
+                .to
+                .as_str()
+                .strip_prefix("elixir-module://")
+                .and_then(|name| behaviour_owners.get(name))
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if behaviour != callback_owner {
+                continue;
+            }
+            let target = format!("{}/{signature}", implementation.from);
+            let target = EntityId::from(target);
+            if definitions.contains(target.as_str())
+                && seen.insert((call.from.clone(), target.clone()))
+            {
+                candidates.push((call, target));
+            }
+        }
+    }
+    candidates
+}
+
+pub fn workspace_dynamic_dispatch_observations(observations: &[Observation]) -> Vec<Observation> {
+    dynamic_dispatch_candidates(observations)
+        .into_iter()
+        .map(|(call, target)| {
+            let mut observation = Observation::dependency(
+                call.from.clone(),
+                DependencyRelation::Calls,
+                target,
+                call.evidence.clone(),
+            );
+            observation.confidence = Confidence::Inferred;
+            observation.provenance = call.provenance;
+            observation
         })
         .collect()
 }
@@ -483,6 +638,315 @@ mod tests {
         assert!(entities.iter().any(|entity| {
             entity.id.as_str() == "repo://example/elixir/Example.Worker/callback/work/1"
                 && entity.kind == EntityKind::Callable
+        }));
+    }
+
+    #[test]
+    fn resolves_struct_dispatch_and_captured_source_callbacks_from_behaviour_evidence() {
+        let mut observations = observations(
+            "example",
+            r#"
+            defmodule Example.Job do
+              @callback load(term(), struct()) :: term()
+            end
+
+            defmodule Example.Client do
+              def fetch(keys), do: keys
+            end
+
+            defmodule Example.Source do
+              def new, do: Dataloader.KV.new(&fetch/2)
+              defp fetch(batch, keys), do: Example.Client.fetch({batch, keys})
+            end
+
+            defmodule Example.Worker do
+              @behaviour Example.Job
+              defstruct [:id]
+              @impl true
+              def load(context, _job), do: {context, Example.Source.new()}
+            end
+
+            defmodule Example.Impostor do
+              def load(context, job), do: {context, job}
+            end
+
+            defmodule Example.Dispatcher do
+              def dispatch(context, %Example.Worker{} = job), do: job.__struct__.load(context, job)
+            end
+            "#,
+            Path::new("lib/example.ex"),
+        )
+        .unwrap();
+        let dynamic = workspace_dynamic_dispatch_observations(&observations);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| {
+                    observation.from.as_str()
+                        == "repo://example/elixir/Example.Dispatcher/dispatch/2"
+                })
+                .map(|observation| observation.to.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "elixir-dynamic-call://Example.Worker/load/2",
+                "elixir-module://Example.Worker",
+            ])
+        );
+        observations.extend(dynamic);
+        let edges = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| (observation.from.as_str(), observation.to.as_str()))
+            .collect::<BTreeSet<_>>();
+
+        assert!(edges.contains(&(
+            "repo://example/elixir/Example.Dispatcher/dispatch/2",
+            "repo://example/elixir/Example.Worker/load/2",
+        )));
+        assert!(!edges.contains(&(
+            "repo://example/elixir/Example.Dispatcher/dispatch/2",
+            "repo://example/elixir/Example.Impostor/load/2",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/elixir/Example.Source/new/0",
+            "repo://example/elixir/Example.Source/fetch/2",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/elixir/Example.Source/fetch/2",
+            "repo://example/elixir/Example.Client/fetch/1",
+        )));
+    }
+
+    #[test]
+    fn preserves_captures_from_every_function_clause() {
+        let observations = observations(
+            "example",
+            r#"
+            defmodule Example.Source do
+              def new(:first), do: Dataloader.KV.new(&fetch_first/2)
+              def new(:second), do: Dataloader.KV.new(&fetch_second/2)
+              def aliased do
+                callback = &fetch_aliased/2
+                Dataloader.KV.new(callback)
+              end
+              def unused do
+                callback = &fetch_unused/2
+                :ok
+              end
+              def locally_aliased do
+                alias Example.Callbacks, as: Callbacks
+                Dataloader.KV.new(&Callbacks.fetch/2)
+              end
+              defp fetch_first(batch, keys), do: {batch, keys}
+              defp fetch_second(batch, keys), do: {batch, keys}
+              defp fetch_aliased(batch, keys), do: {batch, keys}
+              defp fetch_unused(batch, keys), do: {batch, keys}
+            end
+
+            defmodule Example.Callbacks do
+              def fetch(batch, keys), do: {batch, keys}
+            end
+            "#,
+            Path::new("lib/source.ex"),
+        )
+        .unwrap();
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example.Source/new/1"
+                    && observation.relation
+                        == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(targets.contains("repo://example/elixir/Example.Source/fetch_first/2"));
+        assert!(targets.contains("repo://example/elixir/Example.Source/fetch_second/2"));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/elixir/Example.Source/aliased/0"
+                && observation.to.as_str() == "repo://example/elixir/Example.Source/fetch_aliased/2"
+        }));
+        assert!(!observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/elixir/Example.Source/unused/0"
+                && observation.to.as_str() == "repo://example/elixir/Example.Source/fetch_unused/2"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/elixir/Example.Source/locally_aliased/0"
+                && observation.to.as_str() == "repo://example/elixir/Example.Callbacks/fetch/2"
+        }));
+    }
+
+    #[test]
+    fn prefers_exact_calls_over_earlier_capture_evidence() {
+        let observations = observations(
+            "example",
+            "defmodule Example.Source do\n  def run(items, item) do\n    Enum.map(items, &fetch/1)\n    fetch(item)\n  end\n  defp fetch(item), do: item\nend",
+            Path::new("lib/source.ex"),
+        )
+        .unwrap();
+        let call = observations
+            .iter()
+            .find(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example.Source/run/2"
+                    && observation.to.as_str() == "repo://example/elixir/Example.Source/fetch/1"
+            })
+            .unwrap();
+
+        assert_eq!(call.confidence, Confidence::Exact);
+        assert_eq!(call.evidence.as_str(), "lib/source.ex:4");
+    }
+
+    #[test]
+    fn resolves_dynamic_dispatch_against_a_workspace_behaviour() {
+        let mut workspace_observations = observations(
+            "contracts",
+            "defmodule Example.Job do\n  @callback load(term(), struct()) :: term()\nend",
+            Path::new("lib/job.ex"),
+        )
+        .unwrap();
+        workspace_observations.extend(
+            observations(
+                "app",
+                r#"
+                defmodule Example.Worker do
+                  @behaviour Example.Job
+                  defstruct []
+                  @impl true
+                  def load(context, _job), do: context
+                end
+
+                defmodule Example.OtherWorker do
+                  @behaviour Example.Job
+                  defstruct []
+                  @impl true
+                  def load(context, _job), do: context
+                end
+
+                defmodule Example.Dispatcher do
+                  def dispatch(context, job), do: job.__struct__.load(context, job)
+                end
+
+                defmodule Example.Caller do
+                  def run(context), do: Example.Dispatcher.dispatch(context, %Example.Worker{})
+                end
+                "#,
+                Path::new("lib/generated.pb.ex"),
+            )
+            .unwrap(),
+        );
+        assert!(!workspace_observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
+                && observation.to.as_str().starts_with("repo://")
+                && observation.to.as_str().ends_with("/load/2")
+        }));
+
+        let resolved = workspace_dynamic_dispatch_observations(&workspace_observations);
+        let targets = resolved
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
+                    && observation.confidence == Confidence::Inferred
+                    && observation.provenance == Provenance::Generated
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            targets,
+            BTreeSet::from(["repo://app/elixir/Example.Worker/load/2"])
+        );
+    }
+
+    #[test]
+    fn skips_dynamic_dispatch_for_an_ambiguous_workspace_behaviour() {
+        let behaviour =
+            "defmodule Example.Job do\n  @callback load(term(), struct()) :: term()\nend";
+        let mut workspace_observations =
+            observations("contracts-a", behaviour, Path::new("lib/job.ex")).unwrap();
+        workspace_observations.extend(
+            observations(
+                "contracts-b",
+                "defmodule Example.Job do\nend",
+                Path::new("lib/job.ex"),
+            )
+            .unwrap(),
+        );
+        workspace_observations.extend(
+            observations(
+                "app",
+                r#"
+                defmodule Example.Worker do
+                  @behaviour Example.Job
+                  defstruct []
+                  @impl true
+                  def load(context, _job), do: context
+                end
+
+                defmodule Example.Dispatcher do
+                  def dispatch(context, job), do: job.__struct__.load(context, job)
+                end
+                "#,
+                Path::new("lib/worker.ex"),
+            )
+            .unwrap(),
+        );
+
+        let resolved = workspace_dynamic_dispatch_observations(&workspace_observations);
+
+        assert!(!resolved.iter().any(|observation| {
+            observation.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
+        }));
+    }
+
+    #[test]
+    fn skips_dynamic_dispatch_for_an_ambiguous_callback_signature() {
+        let mut workspace_observations = observations(
+            "contracts",
+            r#"
+            defmodule Example.Job do
+              @callback load(term(), struct()) :: term()
+            end
+
+            defmodule Example.Serializer do
+              @callback load(term(), struct()) :: term()
+            end
+            "#,
+            Path::new("lib/contracts.ex"),
+        )
+        .unwrap();
+        workspace_observations.extend(
+            observations(
+                "app",
+                r#"
+                defmodule Example.Worker do
+                  @behaviour Example.Job
+                  defstruct []
+                  @impl true
+                  def load(context, _job), do: context
+                end
+
+                defmodule Example.Encoder do
+                  @behaviour Example.Serializer
+                  defstruct []
+                  @impl true
+                  def load(context, _serializer), do: context
+                end
+
+                defmodule Example.Dispatcher do
+                  def dispatch(context, job), do: job.__struct__.load(context, job)
+                end
+                "#,
+                Path::new("lib/worker.ex"),
+            )
+            .unwrap(),
+        );
+
+        let resolved = workspace_dynamic_dispatch_observations(&workspace_observations);
+
+        assert!(!resolved.iter().any(|observation| {
+            observation.from.as_str() == "repo://app/elixir/Example.Dispatcher/dispatch/2"
         }));
     }
 

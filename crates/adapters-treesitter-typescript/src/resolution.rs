@@ -344,6 +344,7 @@ fn imported_file(
 
 struct RepositoryIndex<'a> {
     files: BTreeMap<PathBuf, &'a TypescriptAnalysis>,
+    symbols: BTreeMap<(PathBuf, String), EntityId>,
     packages: BTreeMap<String, Package>,
     aliases: Vec<PathAliases>,
     exports: BTreeMap<(PathBuf, String), EntityId>,
@@ -352,15 +353,21 @@ struct RepositoryIndex<'a> {
     bases: BTreeMap<(PathBuf, String), (PathBuf, String)>,
     field_types: BTreeMap<(PathBuf, String, String), (PathBuf, String)>,
     return_types: BTreeMap<(PathBuf, String), (PathBuf, String)>,
+    callback_returns: BTreeSet<(PathBuf, String)>,
+    top_level_aliases: BTreeMap<(PathBuf, String), String>,
     caller_files: BTreeMap<String, PathBuf>,
     caller_owners: BTreeMap<String, (PathBuf, String)>,
     caller_bindings: BTreeMap<String, &'a [Binding]>,
     caller_alias_bindings: BTreeMap<String, &'a [AliasBinding]>,
     caller_factory_bindings: BTreeMap<String, &'a [FactoryBinding]>,
+    caller_call_positions: BTreeMap<String, Vec<CallSite>>,
     file_imports: BTreeMap<PathBuf, &'a [Import]>,
 }
 
 type Origin = (PathBuf, String);
+type SourceOrder = (usize, u32);
+type CallSite = (SourceOrder, (usize, usize));
+type ReceiverTypeCache = BTreeMap<(String, String, CallSite), Option<Origin>>;
 type Origins = BTreeMap<Origin, Origin>;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -374,6 +381,64 @@ struct ResolvedNestModule {
     providers: Vec<Origin>,
     members: Vec<Origin>,
     exports: Vec<Origin>,
+}
+
+fn call_positions(calls: &[Call]) -> Vec<CallSite> {
+    calls
+        .iter()
+        .map(|call| {
+            (
+                (call.line, call.start_character),
+                (call.scope_start, call.scope_end),
+            )
+        })
+        .collect()
+}
+
+fn binding_at_call_site<'a>(
+    bindings: &'a [Binding],
+    receiver: &str,
+    scope: (usize, usize),
+) -> Option<&'a Binding> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.receiver == receiver
+                && binding.scope_start <= scope.0
+                && scope.1 <= binding.scope_end
+        })
+        .max_by_key(|binding| binding.scope_start)
+}
+
+fn alias_at_call_site<'a>(
+    aliases: &'a [AliasBinding],
+    receiver: &str,
+    call_site: CallSite,
+) -> Option<&'a AliasBinding> {
+    aliases
+        .iter()
+        .filter(|binding| {
+            binding.receiver == receiver
+                && (binding.line, binding.character) <= call_site.0
+                && binding.scope_start <= call_site.1.0
+                && call_site.1.1 <= binding.scope_end
+        })
+        .max_by_key(|binding| (binding.line, binding.character))
+}
+
+fn factory_binding_at_call_site<'a>(
+    bindings: &'a [FactoryBinding],
+    receiver: &str,
+    scope: (usize, usize),
+) -> Option<&'a FactoryBinding> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.receiver == receiver
+                && binding.scope_start <= scope.0
+                && scope.1 <= binding.scope_end
+        })
+        .max_by_key(|binding| binding.scope_start)
 }
 
 fn insert_origin(
@@ -707,12 +772,16 @@ fn repository_index<'a>(
     let mut raw_bases = BTreeMap::<(PathBuf, String), String>::new();
     let mut raw_field_types = BTreeMap::<(PathBuf, String, String), String>::new();
     let mut raw_return_types = BTreeMap::<(PathBuf, String), String>::new();
+    let mut callback_returns = BTreeSet::new();
     let mut factories = BTreeMap::<(PathBuf, String), String>::new();
+    let mut factory_callbacks = BTreeMap::<(PathBuf, String), String>::new();
+    let mut top_level_aliases = BTreeMap::<(PathBuf, String), String>::new();
     let mut caller_files = BTreeMap::<String, PathBuf>::new();
     let mut caller_owners = BTreeMap::<String, (PathBuf, String)>::new();
     let mut caller_bindings = BTreeMap::<String, &[Binding]>::new();
     let mut caller_alias_bindings = BTreeMap::<String, &[AliasBinding]>::new();
     let mut caller_factory_bindings = BTreeMap::<String, &[FactoryBinding]>::new();
+    let mut caller_call_positions = BTreeMap::new();
     let mut file_imports = BTreeMap::<PathBuf, &[Import]>::new();
     let mut file_exports = BTreeMap::<PathBuf, &[Export]>::new();
     for (path, analysis) in sources {
@@ -724,10 +793,17 @@ fn repository_index<'a>(
         );
         file_imports.insert((*path).to_path_buf(), &analysis.imports);
         file_exports.insert((*path).to_path_buf(), &analysis.exports);
+        top_level_aliases.extend(analysis.top_level_aliases.iter().map(|alias| {
+            (
+                ((*path).to_path_buf(), alias.receiver.clone()),
+                alias.source.clone(),
+            )
+        }));
         caller_files.insert(module_id.clone(), (*path).to_path_buf());
         caller_bindings.insert(module_id.clone(), &[]);
         caller_alias_bindings.insert(module_id.clone(), &[]);
         caller_factory_bindings.insert(module_id.clone(), &[]);
+        caller_call_positions.insert(module_id.clone(), call_positions(&analysis.calls));
         let member_owners = analysis
             .definitions
             .iter()
@@ -743,13 +819,16 @@ fn repository_index<'a>(
                 let key = ((*path).to_path_buf(), definition.qualified_name.clone());
                 symbols.insert(key.clone(), EntityId::from(id.clone()));
                 if definition.exported {
-                    insert_origin(&mut origins, &mut origins_by_file, key.clone(), key);
+                    insert_origin(&mut origins, &mut origins_by_file, key.clone(), key.clone());
                 }
                 if let Some(factory) = &definition.factory {
                     factories.insert(
                         ((*path).to_path_buf(), definition.qualified_name.clone()),
                         factory.clone(),
                     );
+                }
+                if let Some(callback) = &definition.factory_callback {
+                    factory_callbacks.insert(key.clone(), callback.clone());
                 }
                 if let Some(base) = &definition.base {
                     raw_bases.insert(
@@ -775,6 +854,9 @@ fn repository_index<'a>(
                         return_type.clone(),
                     );
                 }
+                if definition.callback_return_type.is_some() {
+                    callback_returns.insert(key.clone());
+                }
             }
             if let Some((namespace, member)) = definition.qualified_name.rsplit_once('/')
                 && member_owners.contains(&namespace)
@@ -788,20 +870,22 @@ fn repository_index<'a>(
                     EntityId::from(id.clone()),
                 );
             }
-            if definition.kind == DefinitionKind::Callable {
+            if definition.kind == DefinitionKind::Callable || !definition.calls.is_empty() {
                 caller_files.insert(id.clone(), (*path).to_path_buf());
                 caller_bindings.insert(id.clone(), &definition.bindings);
                 caller_alias_bindings.insert(id.clone(), &definition.alias_bindings);
-                caller_factory_bindings.insert(id, &definition.factory_bindings);
-                if let Some((owner, member)) = definition.qualified_name.rsplit_once('/')
-                    && !member.contains('/')
-                    && member_owners.contains(&owner)
-                {
-                    caller_owners.insert(
-                        format!("{module_id}/{}", definition.qualified_name),
-                        ((*path).to_path_buf(), owner.to_owned()),
-                    );
-                }
+                caller_factory_bindings.insert(id.clone(), &definition.factory_bindings);
+                caller_call_positions.insert(id.clone(), call_positions(&definition.calls));
+            }
+            if definition.kind == DefinitionKind::Callable
+                && let Some((owner, member)) = definition.qualified_name.rsplit_once('/')
+                && !member.contains('/')
+                && member_owners.contains(&owner)
+            {
+                caller_owners.insert(
+                    format!("{module_id}/{}", definition.qualified_name),
+                    ((*path).to_path_buf(), owner.to_owned()),
+                );
             }
         }
     }
@@ -878,6 +962,39 @@ fn repository_index<'a>(
             break;
         }
     }
+    for (factory, mut callback) in factory_callbacks {
+        let file = &factory.0;
+        for _ in 0..=top_level_aliases.len() {
+            let Some(source) = top_level_aliases.get(&(file.clone(), callback.clone())) else {
+                break;
+            };
+            callback = source.clone();
+        }
+        let qualified = callback.split_once('.');
+        let callback_origin = origins
+            .get(&(file.clone(), callback.clone()))
+            .cloned()
+            .or_else(|| {
+                file_imports.get(file)?.iter().find_map(|import| {
+                    let binding = import.bindings.iter().find(|binding| {
+                        binding.local == callback && binding.imported != "*"
+                            || qualified.is_some_and(|(namespace, _)| {
+                                binding.local == namespace && binding.imported == "*"
+                            })
+                    })?;
+                    let imported = qualified
+                        .filter(|_| binding.imported == "*")
+                        .map_or(binding.imported.as_str(), |(_, member)| member);
+                    let imported_file =
+                        imported_file(file, &import.source, &packages, &aliases, &files)?;
+                    origins.get(&(imported_file, imported.into())).cloned()
+                })
+            })
+            .unwrap_or_else(|| (file.clone(), callback));
+        if callback_returns.contains(&callback_origin) {
+            callback_returns.insert(factory);
+        }
+    }
     let exports = origins
         .iter()
         .filter_map(|(export, origin)| {
@@ -913,7 +1030,7 @@ fn repository_index<'a>(
         .collect::<BTreeMap<_, _>>();
     let mut field_types = raw_field_types
         .into_iter()
-        .filter_map(|((file, owner, field), type_name)| {
+        .map(|((file, owner, field), type_name)| {
             let origin = file_imports
                 .get(&file)
                 .and_then(|imports| {
@@ -929,10 +1046,11 @@ fn repository_index<'a>(
                     })
                 })
                 .or_else(|| {
-                    let key = (file.clone(), type_name);
+                    let key = (file.clone(), type_name.clone());
                     symbols.contains_key(&key).then_some(key)
-                })?;
-            Some(((file, owner, field), origin))
+                })
+                .unwrap_or_else(|| (file.clone(), type_name));
+            ((file, owner, field), origin)
         })
         .collect::<BTreeMap<_, _>>();
     field_types.extend(nest_injected_field_types(NestInjectionContext {
@@ -979,7 +1097,7 @@ fn repository_index<'a>(
     }
     let mut bases = raw_bases
         .into_iter()
-        .filter_map(|((file, owner), base)| {
+        .map(|((file, owner), base)| {
             let origin = file_imports
                 .get(&file)
                 .and_then(|imports| {
@@ -996,10 +1114,11 @@ fn repository_index<'a>(
                     })
                 })
                 .or_else(|| {
-                    let key = (file.clone(), base);
+                    let key = (file.clone(), base.clone());
                     symbols.contains_key(&key).then_some(key)
-                })?;
-            Some(((file, owner), origin))
+                })
+                .unwrap_or_else(|| (file.clone(), base));
+            ((file, owner), origin)
         })
         .collect::<BTreeMap<_, _>>();
     for ((file, namespace), factory) in factories {
@@ -1028,6 +1147,7 @@ fn repository_index<'a>(
 
     RepositoryIndex {
         files,
+        symbols,
         packages,
         aliases,
         exports,
@@ -1036,11 +1156,14 @@ fn repository_index<'a>(
         bases,
         field_types,
         return_types,
+        callback_returns,
+        top_level_aliases,
         caller_files,
         caller_owners,
         caller_bindings,
         caller_alias_bindings,
         caller_factory_bindings,
+        caller_call_positions,
         file_imports,
     }
 }
@@ -1090,11 +1213,17 @@ fn imported_origin(
     file: &Path,
     name: &str,
 ) -> Option<(PathBuf, String)> {
+    let qualified = name.split_once('.');
     index.file_imports.get(file)?.iter().find_map(|import| {
-        let binding = import
-            .bindings
-            .iter()
-            .find(|binding| binding.local == name && binding.imported != "*")?;
+        let binding = import.bindings.iter().find(|binding| {
+            binding.local == name && binding.imported != "*"
+                || qualified.is_some_and(|(namespace, _)| {
+                    binding.local == namespace && binding.imported == "*"
+                })
+        })?;
+        let imported = qualified
+            .filter(|_| binding.imported == "*")
+            .map_or(binding.imported.as_str(), |(_, member)| member);
         let imported_file = imported_file(
             file,
             &import.source,
@@ -1104,35 +1233,73 @@ fn imported_origin(
         )?;
         index
             .origins
-            .get(&(imported_file, binding.imported.clone()))
+            .get(&(imported_file, imported.to_owned()))
             .cloned()
     })
+}
+
+fn top_level_alias(index: &RepositoryIndex<'_>, file: &Path, name: &str) -> String {
+    let mut name = name.to_owned();
+    for _ in 0..=index.top_level_aliases.len() {
+        let Some(source) = index
+            .top_level_aliases
+            .get(&(file.to_path_buf(), name.clone()))
+        else {
+            break;
+        };
+        name = source.clone();
+    }
+    name
 }
 
 fn receiver_type(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
-    cache: &mut BTreeMap<(String, String), Option<(PathBuf, String)>>,
+    call_site: CallSite,
+    cache: &mut ReceiverTypeCache,
 ) -> Option<(PathBuf, String)> {
-    let key = (caller.to_owned(), receiver.to_owned());
+    let key = (caller.to_owned(), receiver.to_owned(), call_site);
     if let Some(resolved) = cache.get(&key) {
         return resolved.clone();
     }
     cache.insert(key.clone(), None);
-    let resolved = receiver_type_uncached(index, caller, receiver, cache);
+    let resolved = receiver_type_uncached(index, caller, receiver, call_site, cache);
     cache.insert(key, resolved.clone());
     resolved
+}
+
+fn is_context_type(index: &RepositoryIndex<'_>, mut origin: (PathBuf, String)) -> bool {
+    for _ in 0..=index.bases.len() {
+        if origin.1.rsplit('.').next() == Some("Context")
+            || index.file_imports.get(&origin.0).is_some_and(|imports| {
+                imports.iter().any(|import| {
+                    import
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.local == origin.1 && binding.imported == "Context")
+                })
+            })
+        {
+            return true;
+        }
+        let Some(base) = index.bases.get(&origin) else {
+            return false;
+        };
+        origin = base.clone();
+    }
+    false
 }
 
 fn receiver_type_uncached(
     index: &RepositoryIndex<'_>,
     caller: &str,
     receiver: &str,
-    cache: &mut BTreeMap<(String, String), Option<(PathBuf, String)>>,
+    call_site: CallSite,
+    cache: &mut ReceiverTypeCache,
 ) -> Option<(PathBuf, String)> {
     let file = index.caller_files.get(caller)?;
-    let receiver = aliased_receiver(index, caller, receiver);
+    let receiver = aliased_receiver(index, caller, receiver, call_site);
     if let Some(field) = receiver.strip_prefix("this.")
         && !field.contains('.')
         && let Some((owner_file, owner)) = index.caller_owners.get(caller)
@@ -1143,7 +1310,7 @@ fn receiver_type_uncached(
     if let Some(type_name) = index
         .caller_bindings
         .get(caller)
-        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+        .and_then(|bindings| binding_at_call_site(bindings, &receiver, call_site.1))
         .map(|binding| binding.type_name.as_str())
     {
         return imported_origin(index, file, type_name)
@@ -1153,7 +1320,7 @@ fn receiver_type_uncached(
     if let Some(factory) = index
         .caller_factory_bindings
         .get(caller)
-        .and_then(|bindings| bindings.iter().find(|binding| binding.receiver == receiver))
+        .and_then(|bindings| factory_binding_at_call_site(bindings, &receiver, call_site.1))
         .map(|binding| binding.factory.as_str())
     {
         let factory_origin = imported_origin(index, file, factory)
@@ -1166,7 +1333,7 @@ fn receiver_type_uncached(
     let parts = receiver.split('.').collect::<Vec<_>>();
     for prefix_length in (1..parts.len()).rev() {
         let prefix = parts[..prefix_length].join(".");
-        let Some(mut current) = receiver_type(index, caller, &prefix, cache) else {
+        let Some(mut current) = receiver_type(index, caller, &prefix, call_site, cache) else {
             continue;
         };
         let mut resolved = true;
@@ -1184,7 +1351,12 @@ fn receiver_type_uncached(
     None
 }
 
-fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -> String {
+fn aliased_receiver(
+    index: &RepositoryIndex<'_>,
+    caller: &str,
+    receiver: &str,
+    mut call_site: CallSite,
+) -> String {
     let aliases = index
         .caller_alias_bindings
         .get(caller)
@@ -1192,20 +1364,89 @@ fn aliased_receiver(index: &RepositoryIndex<'_>, caller: &str, receiver: &str) -
         .unwrap_or_default();
     let mut receiver = receiver.to_owned();
     for _ in 0..=aliases.len() {
-        let Some(source) = aliases
-            .iter()
-            .find(|binding| binding.receiver == receiver)
-            .map(|binding| binding.source.clone())
-        else {
+        let Some(binding) = alias_at_call_site(aliases, &receiver, call_site) else {
             break;
         };
-        receiver = source;
+        receiver = binding.source.clone();
+        call_site.0 = (binding.line, binding.character);
+        call_site.1 = (binding.source_scope_start, binding.source_scope_end);
     }
     receiver
 }
 
-fn resolve_observations(observations: &mut [Observation], index: &RepositoryIndex<'_>) {
+fn aliased_receivers(
+    index: &RepositoryIndex<'_>,
+    caller: &str,
+    receiver: &str,
+    call_site: CallSite,
+) -> BTreeSet<(String, CallSite)> {
+    let aliases = index
+        .caller_alias_bindings
+        .get(caller)
+        .copied()
+        .unwrap_or_default();
+    let mut pending = vec![(
+        receiver.to_owned(),
+        call_site.0,
+        call_site.1,
+        aliases.len() + 1,
+    )];
+    let mut resolved = BTreeSet::new();
+    while let Some((receiver, position, scope, remaining)) = pending.pop() {
+        let binding =
+            alias_at_call_site(aliases, &receiver, (position, scope)).zip(remaining.checked_sub(1));
+        let Some((binding, remaining)) = binding else {
+            resolved.insert((receiver, (position, scope)));
+            continue;
+        };
+        if binding.conditional {
+            let before = if binding.character == 0 {
+                (binding.line.saturating_sub(1), u32::MAX)
+            } else {
+                (binding.line, binding.character - 1)
+            };
+            pending.push((receiver, before, scope, remaining));
+        }
+        pending.push((
+            binding.source.clone(),
+            (binding.line, binding.character),
+            (binding.source_scope_start, binding.source_scope_end),
+            remaining,
+        ));
+    }
+    resolved
+}
+
+fn observation_line(observation: &Observation) -> usize {
+    observation
+        .evidence
+        .as_str()
+        .rsplit_once(':')
+        .and_then(|(_, line)| line.parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
+fn observation_position(
+    observation: &Observation,
+    index: &RepositoryIndex<'_>,
+    occurrences: &mut BTreeMap<String, usize>,
+) -> CallSite {
+    let key = observation.from.to_string();
+    let occurrence = occurrences.entry(key).or_default();
+    let position = index
+        .caller_call_positions
+        .get(observation.from.as_str())
+        .and_then(|positions| positions.get(*occurrence))
+        .copied()
+        .unwrap_or(((observation_line(observation), u32::MAX), (0, usize::MAX)));
+    *occurrence += 1;
+    position
+}
+
+fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryIndex<'_>) {
     let mut receiver_types = BTreeMap::new();
+    let mut occurrences = BTreeMap::new();
+    let mut additional = Vec::new();
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
     }) {
@@ -1217,6 +1458,108 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             .get(caller_file)
             .copied()
             .unwrap_or_default();
+        let call_site = observation_position(observation, index, &mut occurrences);
+        let contextual = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-context-returned://")
+            .map(|target| ("typescript", target))
+            .or_else(|| {
+                observation
+                    .to
+                    .as_str()
+                    .strip_prefix("javascript-context-returned://")
+                    .map(|target| ("javascript", target))
+            })
+            .and_then(|(language, target)| {
+                let (context, target) = target.split_once('/')?;
+                let (argument, method) = target.split_once('/')?;
+                Some((
+                    language.to_owned(),
+                    context.to_owned(),
+                    argument.to_owned(),
+                    method.to_owned(),
+                ))
+            });
+        if let Some((language, context, argument, method)) = contextual {
+            let is_context =
+                aliased_receivers(index, observation.from.as_str(), &context, call_site)
+                    .into_iter()
+                    .any(|(context, context_site)| {
+                        let context_type = receiver_type(
+                            index,
+                            observation.from.as_str(),
+                            &context,
+                            context_site,
+                            &mut receiver_types,
+                        );
+                        context_type.map_or(context == "context", |origin| {
+                            is_context_type(index, origin)
+                        })
+                    });
+            observation.to = if is_context {
+                EntityId::from(format!("{language}-returned://{argument}/{method}"))
+            } else {
+                EntityId::from(format!(
+                    "{language}-method://{context}.get({argument})/{method}"
+                ))
+            };
+            if !is_context {
+                continue;
+            }
+        }
+        let returned = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-returned://")
+            .map(|target| ("typescript", target))
+            .or_else(|| {
+                observation
+                    .to
+                    .as_str()
+                    .strip_prefix("javascript-returned://")
+                    .map(|target| ("javascript", target))
+            })
+            .and_then(|(language, target)| {
+                target
+                    .split_once('/')
+                    .map(|(argument, method)| (language, argument, method))
+            });
+        if let Some((language, argument, method)) = returned {
+            let targets = aliased_receivers(index, observation.from.as_str(), argument, call_site)
+                .into_iter()
+                .map(|(argument, _)| {
+                    let origin = imported_origin(index, caller_file, &argument)
+                        .or_else(|| Some((caller_file.clone(), argument.clone())))
+                        .map(|origin| index.origins.get(&origin).cloned().unwrap_or(origin));
+                    origin
+                        .filter(|origin| index.callback_returns.contains(origin))
+                        .and_then(|origin| index.symbols.get(&origin).cloned())
+                        .map_or_else(
+                            || {
+                                (
+                                    EntityId::from(format!(
+                                        "{language}-returned://{argument}/{method}"
+                                    )),
+                                    observation.confidence,
+                                )
+                            },
+                            |target| (target, Confidence::Inferred),
+                        )
+                })
+                .collect::<BTreeMap<_, _>>();
+            if let Some((target, confidence)) = targets.first_key_value() {
+                observation.to = target.clone();
+                observation.confidence = *confidence;
+                additional.extend(targets.iter().skip(1).map(|(target, confidence)| {
+                    let mut resolved = observation.clone();
+                    resolved.to = target.clone();
+                    resolved.confidence = *confidence;
+                    resolved
+                }));
+            }
+            continue;
+        }
         let direct = observation
             .to
             .as_str()
@@ -1244,26 +1587,42 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
         let Some((name, receiver)) = direct.or(member).or(constructor) else {
             continue;
         };
-        let candidate = imports
-            .iter()
-            .find_map(|import| {
-                let binding = import.bindings.iter().find(|binding| match receiver {
-                    Some(receiver) => binding.local == receiver && binding.imported == "*",
-                    None => binding.local == name && binding.imported != "*",
-                })?;
-                let imported = if binding.imported == "*" {
-                    name
-                } else {
-                    &binding.imported
-                };
-                let file = imported_file(
-                    caller_file,
-                    &import.source,
-                    &index.packages,
-                    &index.aliases,
-                    &index.files,
-                )?;
-                index.exports.get(&(file, imported.to_owned()))
+        let name = if receiver.is_none() {
+            top_level_alias(index, caller_file, name)
+        } else {
+            name.to_owned()
+        };
+        let name = name.as_str();
+        let candidate = receiver
+            .is_none()
+            .then(|| {
+                imported_origin(index, caller_file, name)
+                    .unwrap_or_else(|| (caller_file.to_path_buf(), name.to_owned()))
+            })
+            .and_then(|origin| {
+                let origin = index.origins.get(&origin).cloned().unwrap_or(origin);
+                index.symbols.get(&origin)
+            })
+            .or_else(|| {
+                imports.iter().find_map(|import| {
+                    let binding = import.bindings.iter().find(|binding| match receiver {
+                        Some(receiver) => binding.local == receiver && binding.imported == "*",
+                        None => binding.local == name && binding.imported != "*",
+                    })?;
+                    let imported = if binding.imported == "*" {
+                        name
+                    } else {
+                        &binding.imported
+                    };
+                    let file = imported_file(
+                        caller_file,
+                        &import.source,
+                        &index.packages,
+                        &index.aliases,
+                        &index.files,
+                    )?;
+                    index.exports.get(&(file, imported.to_owned()))
+                })
             })
             .or_else(|| {
                 (receiver == Some("this"))
@@ -1279,6 +1638,7 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
                     index,
                     observation.from.as_str(),
                     receiver,
+                    call_site,
                     &mut receiver_types,
                 )?;
                 member_entity(index, file, type_name, name)
@@ -1313,6 +1673,7 @@ fn resolve_observations(observations: &mut [Observation], index: &RepositoryInde
             observation.to = target.clone();
         }
     }
+    observations.extend(additional);
 }
 
 fn graphql_operation_calls(
@@ -1493,6 +1854,7 @@ pub fn resolve_workspace_calls(
         .collect::<BTreeMap<_, _>>();
 
     let mut overrides = Vec::new();
+    let mut occurrences = BTreeMap::new();
     for observation in observations.iter_mut().filter(|observation| {
         observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
     }) {
@@ -1506,6 +1868,60 @@ pub fn resolve_workspace_calls(
             .get(caller_file)
             .copied()
             .unwrap_or_default();
+        let call_site = observation_position(observation, caller, &mut occurrences);
+        let returned = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-returned://")
+            .or_else(|| {
+                observation
+                    .to
+                    .as_str()
+                    .strip_prefix("javascript-returned://")
+            })
+            .and_then(|target| target.split_once('/'));
+        if let Some((argument, _method)) = returned {
+            let argument = aliased_receiver(caller, observation.from.as_str(), argument, call_site);
+            let qualified = argument.split_once('.');
+            let target = imports.iter().find_map(|import| {
+                let binding = import.bindings.iter().find(|binding| {
+                    binding.local == argument && binding.imported != "*"
+                        || qualified.is_some_and(|(namespace, _)| {
+                            binding.local == namespace && binding.imported == "*"
+                        })
+                })?;
+                let imported = qualified
+                    .filter(|_| binding.imported == "*")
+                    .map_or(binding.imported.as_str(), |(_, member)| member);
+                let (target_index, file) =
+                    workspace_imported_file(&import.source, &packages, &indexes)?;
+                let target = &indexes[target_index];
+                let origin = target
+                    .origins
+                    .get(&(file.clone(), imported.to_owned()))
+                    .cloned()
+                    .unwrap_or((file, imported.to_owned()));
+                target
+                    .callback_returns
+                    .contains(&origin)
+                    .then(|| target.symbols.get(&origin))
+                    .flatten()
+            });
+            if let Some(target) = target {
+                overrides.push(DependencyOverride {
+                    from: observation.from.clone(),
+                    relation: DependencyRelation::Calls,
+                    unresolved_to: observation.to.clone(),
+                    resolved_to: target.clone(),
+                    evidence: observation.evidence.clone(),
+                    confidence: Confidence::Inferred,
+                    provenance: observation.provenance,
+                });
+                observation.to = target.clone();
+                observation.confidence = Confidence::Inferred;
+            }
+            continue;
+        }
         let direct = observation
             .to
             .as_str()
@@ -1552,12 +1968,10 @@ pub fn resolve_workspace_calls(
                     .get(&(file, imported.to_owned()))
             })
             .or_else(|| {
-                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?);
-                let type_name = caller
-                    .caller_bindings
-                    .get(observation.from.as_str())?
-                    .iter()
-                    .find(|binding| binding.receiver == receiver)?
+                let receiver =
+                    aliased_receiver(caller, observation.from.as_str(), receiver?, call_site);
+                let bindings = caller.caller_bindings.get(observation.from.as_str())?;
+                let type_name = binding_at_call_site(bindings, &receiver, call_site.1)?
                     .type_name
                     .as_str();
                 let (target_index, file, imported) = imports.iter().find_map(|import| {
@@ -1578,12 +1992,14 @@ pub fn resolve_workspace_calls(
                 member_entity(target, file, owner, name)
             })
             .or_else(|| {
-                let receiver = aliased_receiver(caller, observation.from.as_str(), receiver?);
+                let receiver =
+                    aliased_receiver(caller, observation.from.as_str(), receiver?, call_site);
                 let factory = caller
                     .caller_factory_bindings
-                    .get(observation.from.as_str())?
-                    .iter()
-                    .find(|binding| binding.receiver == receiver)?
+                    .get(observation.from.as_str())
+                    .and_then(|bindings| {
+                        factory_binding_at_call_site(bindings, &receiver, call_site.1)
+                    })?
                     .factory
                     .as_str();
                 let (target_index, file, imported) = imports.iter().find_map(|import| {
@@ -1716,6 +2132,682 @@ mod tests {
         assert!(observations.iter().any(|observation| {
             observation.to.as_str() == format!("typescript-method://{receiver}/execute")
         }));
+    }
+
+    #[test]
+    fn resolves_a_loader_returned_by_a_callback_factory() {
+        let sources = [
+            (
+                Path::new("src/loader.ts"),
+                "export class Client { fetch() {} } function makeClient(): Client { return new Client(); } export const loader = createContext(() => { const fetchBatch = async () => { const client = new Client(); const selected = client; const produced = makeClient(); selected.fetch(); produced.fetch(); }; const batch = fetchBatch; return new Loader(batch); }); export const alternate = createContext(() => new Loader(() => {})); export const wrapped = createContext((() => new Loader(() => {}))); export const conditional = createContext(() => flag ? new Loader(() => {}) : new Loader(() => {})); export const shortCircuit = createContext(() => flag && new Loader(() => {}) || new Loader(() => {})); export const plain = createContext(() => new Client());",
+            ),
+            (
+                Path::new("src/entry.ts"),
+                "import { alternate, conditional, loader, plain, shortCircuit, wrapped } from './loader'; type RequestContext = Context; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function renamed(ctx: Context) { return ctx.get(loader).load('key'); } export function localAlias(ctx: RequestContext) { return ctx.get(loader).load('key'); } export function directConditional(context: Context, flag: boolean) { context.get(flag ? loader : alternate).load('key'); context.get(loader ?? alternate).load('key'); } export function returnedVariants(context: Context) { context.get(wrapped).load('wrapped'); context.get(conditional).load('conditional'); context.get(shortCircuit).load('short-circuit'); } export function aliasSnapshot(context: Context, map: Map<unknown, Loader>) { let current: Context = context; const holder = current; current = map; return holder.get(loader).load('key'); } export function commented(context: Context) { return context.get(/* primary */ loader).load('key'); } export function plainLookup(context: Context) { return context.get(plain).load('key'); } export function conditionalContext(context: Context, map: Map<unknown, Loader>, flag: boolean) { let holder = context; if (flag) holder = map; return holder.get(loader).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); } export function nonInvoking(context: Context) { return context.get(loader).clear(); } export class Preview { constructor(private context: Context) {} run() { return this.context.get(loader).load('key'); } }",
+            ),
+            (
+                Path::new("src/qualified.ts"),
+                "import * as loaders from './loader'; export function entry(context: Context) { return context.get(loaders.loader).load('key'); }",
+            ),
+        ];
+        let analyses = sources
+            .iter()
+            .map(|(path, source)| {
+                (
+                    *path,
+                    *source,
+                    analyze(source, SourceLanguage::TypeScript).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut observations = analyses
+            .iter()
+            .flat_map(|(path, source, analysis)| {
+                observations_from_analysis("example", analysis, source, path)
+            })
+            .collect::<Vec<_>>();
+        let indexed = analyses
+            .iter()
+            .map(|(path, _, analysis)| (*path, analysis))
+            .collect::<Vec<_>>();
+        let loader = analyses[0]
+            .2
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "loader")
+            .unwrap();
+        let plain = analyses[0]
+            .2
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "plain")
+            .unwrap();
+        assert_eq!(loader.callback_return_type.as_deref(), Some("Loader"));
+        assert!(plain.callback_return_type.is_none());
+        assert!(
+            loader
+                .bindings
+                .iter()
+                .any(|binding| binding.receiver == "client" && binding.type_name == "Client")
+        );
+        assert!(
+            loader
+                .alias_bindings
+                .iter()
+                .any(|binding| binding.receiver == "selected" && binding.source == "client")
+        );
+        assert!(
+            loader
+                .factory_bindings
+                .iter()
+                .any(|binding| binding.receiver == "produced" && binding.factory == "makeClient")
+        );
+
+        resolve_repository_calls("example", &mut observations, &indexed, &[], &[]);
+
+        let edges = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| (observation.from.as_str(), observation.to.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/entry",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/qualified/entry",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/renamed",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/localAlias",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/commented",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/aliasSnapshot",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        for target in ["conditional", "shortCircuit", "wrapped"] {
+            assert!(edges.contains(&(
+                "repo://example/typescript/src/entry/returnedVariants",
+                format!("repo://example/typescript/src/loader/{target}").as_str(),
+            )));
+        }
+        for target in ["alternate", "loader"] {
+            assert!(edges.contains(&(
+                "repo://example/typescript/src/entry/directConditional",
+                format!("repo://example/typescript/src/loader/{target}").as_str(),
+            )));
+        }
+        assert!(!edges.contains(&(
+            "repo://example/typescript/src/entry/plainLookup",
+            "repo://example/typescript/src/loader/plain",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/conditionalContext",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/Preview/run",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(!edges.contains(&(
+            "repo://example/typescript/src/entry/unrelated",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(!edges.contains(&(
+            "repo://example/typescript/src/entry/nonInvoking",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/loader",
+            "repo://example/typescript/src/loader/Client/fetch",
+        )));
+    }
+
+    #[test]
+    fn resolves_named_context_factory_callbacks_across_files() {
+        let sources = [
+            (
+                Path::new("src/builder.ts"),
+                "export class Client { fetch() {} } export function build() { const client = new Client(); return new Loader(() => client.fetch()); }",
+            ),
+            (
+                Path::new("src/loader.ts"),
+                "import { build as importedBuild } from './builder'; class Local { fetch() {} } const localBuild = () => { const client = new Local(); return new Loader(() => client.fetch()); }; const localMake = localBuild; const importedMake = importedBuild; export const localLoader = createContext(localMake); export const importedLoader = createContext(importedMake);",
+            ),
+            (
+                Path::new("src/entry.ts"),
+                "import { importedLoader, localLoader } from './loader'; export function run(context: Context) { context.get(localLoader).load('local'); context.get(importedLoader).load('imported'); }",
+            ),
+        ];
+        let analyses = sources
+            .iter()
+            .map(|(path, source)| {
+                (
+                    *path,
+                    *source,
+                    analyze(source, SourceLanguage::TypeScript).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut observations = analyses
+            .iter()
+            .flat_map(|(path, source, analysis)| {
+                observations_from_analysis("example", analysis, source, path)
+            })
+            .collect::<Vec<_>>();
+        let indexed = analyses
+            .iter()
+            .map(|(path, _, analysis)| (*path, analysis))
+            .collect::<Vec<_>>();
+
+        resolve_repository_calls("example", &mut observations, &indexed, &[], &[]);
+
+        let edges = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .map(|observation| (observation.from.as_str(), observation.to.as_str()))
+            .collect::<BTreeSet<_>>();
+        for loader in ["importedLoader", "localLoader"] {
+            assert!(
+                edges.contains(&(
+                    "repo://example/typescript/src/entry/run",
+                    format!("repo://example/typescript/src/loader/{loader}").as_str(),
+                )),
+                "{edges:#?}"
+            );
+        }
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/localLoader",
+            "repo://example/typescript/src/loader/localBuild",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/importedLoader",
+            "repo://example/typescript/src/builder/build",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/loader/localBuild",
+            "repo://example/typescript/src/loader/Local/fetch",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/builder/build",
+            "repo://example/typescript/src/builder/Client/fetch",
+        )));
+    }
+
+    #[test]
+    fn resolves_the_visible_local_constructor_callback() {
+        let source = r#"
+            class First { fetch() {} }
+            class Second { fetch() {} }
+            const loader = createContext(() => {
+                const batch = (client: First) => client.fetch();
+                {
+                    function batch(client: Second) { return client.fetch(); }
+                    const callback = batch;
+                    return new Loader(callback);
+                }
+            });
+            function run(context: Context) { return context.get(loader).load('key'); }
+        "#;
+        let path = Path::new("src/loader.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/loader/loader"
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.contains("repo://example/typescript/src/loader/Second/fetch"));
+        assert!(!targets.contains("repo://example/typescript/src/loader/First/fetch"));
+    }
+
+    #[test]
+    fn preserves_untyped_javascript_context_get() {
+        let source = "const loader = createContext(() => new Loader(() => {})); function run(context) { return context.get(loader).load('key'); }";
+        let path = Path::new("src/loader.js");
+        let analysis = analyze(source, SourceLanguage::JavaScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/javascript/src/loader/run"
+                && observation.to.as_str() == "repo://example/javascript/src/loader/loader"
+        }));
+    }
+
+    #[test]
+    fn resolves_shadowed_bindings_in_nested_callback_scopes() {
+        let source = r#"
+            class First { fetch() {} }
+            class Second { fetch() {} }
+            const loader = createContext(() => {
+                const client = new First();
+                return new Loader(() => {
+                    const client = new Second();
+                    return client.fetch();
+                });
+            });
+        "#;
+        let path = Path::new("src/loader.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/loader/loader"
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.contains("repo://example/typescript/src/loader/Second/fetch"));
+        assert!(!targets.contains("repo://example/typescript/src/loader/First/fetch"));
+    }
+
+    #[test]
+    fn resolves_factory_bindings_in_nested_callback_scopes() {
+        let source = r#"
+            class First { fetch() {} }
+            class Second { fetch() {} }
+            function makeFirst(): First { return new First(); }
+            function makeSecond(): Second { return new Second(); }
+            const loader = createContext(() => {
+                new Wrapper(() => {
+                    const client = makeFirst();
+                    return client.fetch();
+                });
+                return new Loader(() => {
+                    const client = makeSecond();
+                    return client.fetch();
+                });
+            });
+        "#;
+        let path = Path::new("src/loader.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/loader/loader"
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.contains("repo://example/typescript/src/loader/First/fetch"));
+        assert!(targets.contains("repo://example/typescript/src/loader/Second/fetch"));
+    }
+
+    #[test]
+    fn ignores_aliases_from_sibling_callback_scopes() {
+        let source = r#"
+            const first = createContext(() => new Loader(() => {}));
+            const second = createContext(() => new Loader(() => {}));
+            const loader = createContext((context: Context) => {
+                const selected = first;
+                new Wrapper(() => { const selected = second; return selected; });
+                return new Loader(() => context.get(selected).load('key'));
+            });
+        "#;
+        let path = Path::new("src/loader.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/loader/loader"
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(targets.contains("repo://example/typescript/src/loader/first"));
+        assert!(!targets.contains("repo://example/typescript/src/loader/second"));
+    }
+
+    #[test]
+    fn resolves_mutable_loader_aliases_at_each_call_site() {
+        let source = r#"
+            export const first = createContext(() => new Loader(() => {}));
+            export const second = createContext(() => new Loader(() => {}));
+            export function entry(context: Context) {
+                let selected = first;
+                context.get(selected).load('first');
+                selected = second;
+                context.get(selected).load('second');
+            }
+            export function chained(context: Context) {
+                let selected = first;
+                const finalLoader = selected;
+                selected = second;
+                context.get(finalLoader).load('snapshot');
+            }
+            export function conditional(context: Context, flag: boolean) {
+                let selected = first;
+                if (flag) selected = second;
+                context.get(selected).load('conditional');
+            }
+            export function compact(context: Context) { let selected = first; const finalLoader = selected; selected = second; context.get(finalLoader).load('compact'); }
+            export function beforeReassignment(context: Context) { let selected = first; context.get(selected).load('before'); selected = second; }
+            export function shortCircuit(context: Context, flag: boolean) {
+                let selected = first;
+                flag && (selected = second);
+                context.get(selected).load('short-circuit');
+            }
+            export function caught(context: Context) {
+                let selected = first;
+                try { work(); } catch { selected = second; }
+                context.get(selected).load('caught');
+            }
+            export function ternary(context: Context, flag: boolean) {
+                const selected = flag ? first : second;
+                context.get(selected).load('ternary');
+            }
+            export function nullish(context: Context, preferred?: Loader) {
+                const selected = preferred ?? first;
+                context.get(selected).load('nullish');
+            }
+            export function tryBody(context: Context) {
+                let selected = first;
+                try { mayThrow(); selected = second; } catch {}
+                context.get(selected).load('try-body');
+            }
+            export function blockScoped(context: Context) {
+                const selected = first;
+                { const selected = second; consume(selected); }
+                context.get(selected).load('block-scoped');
+            }
+            export function callbackWrite(context: Context) {
+                let selected = first;
+                maybeRun(() => { selected = second; });
+                context.get(selected).load('callback-write');
+            }
+            export function blockSource(context: Context) {
+                let selected = first;
+                { const local = second; selected = local; }
+                context.get(selected).load('block-source');
+            }
+            export function switchDefault(context: Context, kind: string) {
+                let selected = first;
+                switch (kind) { case 'known': break; default: selected = second; }
+                context.get(selected).load('switch-default');
+            }
+        "#;
+        let path = Path::new("src/entry.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        let targets = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation.from.as_str() == "repo://example/typescript/src/entry/entry"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                "repo://example/typescript/src/entry/first",
+                "repo://example/typescript/src/entry/second",
+            ])
+        );
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/chained"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/first"
+        }));
+        assert!(!observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/chained"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/second"
+        }));
+        let conditional = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/conditional"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            conditional,
+            BTreeSet::from([
+                "repo://example/typescript/src/entry/first",
+                "repo://example/typescript/src/entry/second",
+            ])
+        );
+        for caller in ["compact", "beforeReassignment"] {
+            let targets = observations
+                .iter()
+                .filter(|observation| {
+                    observation.from.as_str()
+                        == format!("repo://example/typescript/src/entry/{caller}")
+                        && observation.to.as_str().starts_with("repo://")
+                })
+                .map(|observation| observation.to.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                targets,
+                BTreeSet::from(["repo://example/typescript/src/entry/first"])
+            );
+        }
+        for caller in [
+            "shortCircuit",
+            "caught",
+            "ternary",
+            "tryBody",
+            "callbackWrite",
+            "switchDefault",
+        ] {
+            let caller = format!("repo://example/typescript/src/entry/{caller}");
+            let targets = observations
+                .iter()
+                .filter(|observation| {
+                    observation.from.as_str() == caller
+                        && observation.to.as_str().starts_with("repo://")
+                })
+                .map(|observation| observation.to.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                targets,
+                BTreeSet::from([
+                    "repo://example/typescript/src/entry/first",
+                    "repo://example/typescript/src/entry/second",
+                ])
+            );
+        }
+        let nullish = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/nullish"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(nullish.contains("repo://example/typescript/src/entry/first"));
+        let block_scoped = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/blockScoped"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            block_scoped,
+            BTreeSet::from(["repo://example/typescript/src/entry/first"])
+        );
+        let block_source = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/typescript/src/entry/blockSource"
+                    && observation.to.as_str().starts_with("repo://")
+            })
+            .map(|observation| observation.to.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            block_source,
+            BTreeSet::from(["repo://example/typescript/src/entry/second"])
+        );
+    }
+
+    #[test]
+    fn resolves_a_parenthesized_callback_constructor() {
+        let source = r#"
+            class Client { fetch() {} }
+            const loader = Runtime.createContext(() => (new Loader(async function () {
+                const client = new Client();
+                return client.fetch();
+            })));
+            function entry(context: Context) { context.get(loader).load('key'); }
+        "#;
+        let path = Path::new("src/entry.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/entry"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/loader"
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/entry/loader"
+                && observation.to.as_str() == "repo://example/typescript/src/entry/Client/fetch"
+        }));
+    }
+
+    #[test]
+    fn resolves_a_returned_callback_from_a_workspace_package() {
+        let consumer_source = r#"
+            import { first, loader, second } from '@example/provider';
+            import type { Context as RequestContext } from '@example/provider';
+            import * as loaders from '@example/provider';
+            export function entry(context: Context) {
+                const selected = loader;
+                context.get(selected).load('key');
+            }
+            export function qualified(context: Context) {
+                context.get(loaders.loader).load('key');
+            }
+            export function aliasedContext(context: RequestContext) {
+                context.get(loader).load('key');
+            }
+            export function conditional(context: Context, flag: boolean) {
+                let selected = first;
+                if (flag) selected = second;
+                context.get(selected).load('key');
+            }
+        "#;
+        let provider_source = "export class Context {} export class Client { fetch() {} } export const loader = createContext(() => new Loader(async () => { const client = new Client(); const selected = client; return selected.fetch(); })); export const first = createContext(() => new Loader(() => {})); export const second = createContext(() => new Loader(() => {}));";
+        let consumer_path = PathBuf::from("src/entry.ts");
+        let provider_path = PathBuf::from("src/loader.ts");
+        let consumer = analyze(consumer_source, SourceLanguage::TypeScript).unwrap();
+        let provider = analyze(provider_source, SourceLanguage::TypeScript).unwrap();
+        let repositories = vec![
+            TypescriptRepository::new(
+                "consumer",
+                vec![(consumer_path.clone(), consumer.clone())],
+                vec![],
+                vec![],
+            ),
+            TypescriptRepository::new(
+                "provider",
+                vec![(provider_path.clone(), provider.clone())],
+                vec![(
+                    PathBuf::from("package.json"),
+                    r#"{"name":"@example/provider","source":"src/loader.ts"}"#.into(),
+                )],
+                vec![],
+            ),
+        ];
+        let mut observations =
+            observations_from_analysis("consumer", &consumer, consumer_source, &consumer_path);
+        resolve_repository_calls(
+            "consumer",
+            &mut observations,
+            &[(consumer_path.as_path(), &consumer)],
+            &[],
+            &[],
+        );
+        let mut provider_observations =
+            observations_from_analysis("provider", &provider, provider_source, &provider_path);
+        resolve_repository_calls(
+            "provider",
+            &mut provider_observations,
+            &[(provider_path.as_path(), &provider)],
+            &[],
+            &[],
+        );
+        observations.extend(provider_observations);
+
+        let overrides = resolve_workspace_calls(&mut observations, &repositories);
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://consumer/typescript/src/entry/entry"
+                && override_.unresolved_to.as_str() == "typescript-returned://loader/load"
+                && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
+                && override_.confidence == Confidence::Inferred
+        }));
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://consumer/typescript/src/entry/qualified"
+                && override_.unresolved_to.as_str() == "typescript-returned://loaders.loader/load"
+                && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
+                && override_.confidence == Confidence::Inferred
+        }));
+        assert!(overrides.iter().any(|override_| {
+            override_.from.as_str() == "repo://consumer/typescript/src/entry/aliasedContext"
+                && override_.resolved_to.as_str() == "repo://provider/typescript/src/loader/loader"
+                && override_.confidence == Confidence::Inferred
+        }));
+        let conditional = overrides
+            .iter()
+            .filter(|override_| {
+                override_.from.as_str() == "repo://consumer/typescript/src/entry/conditional"
+            })
+            .map(|override_| {
+                (
+                    override_.unresolved_to.as_str(),
+                    override_.resolved_to.as_str(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            conditional,
+            BTreeSet::from([
+                (
+                    "typescript-returned://first/load",
+                    "repo://provider/typescript/src/loader/first",
+                ),
+                (
+                    "typescript-returned://second/load",
+                    "repo://provider/typescript/src/loader/second",
+                ),
+            ])
+        );
     }
 
     #[test]

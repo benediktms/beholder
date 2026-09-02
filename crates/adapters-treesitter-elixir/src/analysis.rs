@@ -1,10 +1,12 @@
 use super::model::*;
 use super::plugin::{ElixirLanguage, built_in_plugins};
 use beholder_adapters_treesitter::recover;
-use beholder_domain::{DependencyRelation, Observation, Provenance, UnsafeTreeRecovery};
+use beholder_domain::{
+    Confidence, DependencyRelation, Observation, Provenance, UnsafeTreeRecovery,
+};
 use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
@@ -155,34 +157,189 @@ fn piped_argument(node: Node<'_>, source: &[u8]) -> usize {
         .is_some_and(|right| right == node) as usize
 }
 
+fn parsed_capture(node: Node<'_>, source: &[u8]) -> Option<ElixirCapture> {
+    let capture = text(node, source)?.strip_prefix('&')?;
+    let (target, arity) = capture.rsplit_once('/')?;
+    let (module, name) = target
+        .rsplit_once('.')
+        .map_or((None, target), |(module, name)| {
+            (Some(module.to_owned()), name)
+        });
+    Some(ElixirCapture {
+        module,
+        name: name.into(),
+        arity: arity.parse().ok()?,
+        line: node.start_position().row + 1,
+    })
+}
+
+fn collect_capture_bindings(
+    node: Node<'_>,
+    source: &[u8],
+    bindings: &mut Vec<(String, ElixirCapture)>,
+) {
+    if node.kind() == "call" && call_target(node, source) == Some("quote") {
+        return;
+    }
+    if node.kind() == "binary_operator"
+        && node
+            .child_by_field_name("operator")
+            .and_then(|operator| text(operator, source))
+            == Some("=")
+        && let Some(name) = node
+            .child_by_field_name("left")
+            .filter(|left| left.kind() == "identifier")
+            .and_then(|left| text(left, source))
+        && let Some(capture) = node
+            .child_by_field_name("right")
+            .and_then(|right| parsed_capture(right, source))
+    {
+        bindings.push((name.into(), capture));
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_capture_bindings(child, source, bindings);
+    }
+}
+
+fn collect_call_argument_names(node: Node<'_>, source: &[u8], names: &mut BTreeSet<String>) {
+    if node.kind() == "call" && call_target(node, source) == Some("quote") {
+        return;
+    }
+    if node.kind() == "call"
+        && let Some(arguments) = arguments(node)
+    {
+        let mut cursor = arguments.walk();
+        names.extend(
+            arguments
+                .named_children(&mut cursor)
+                .filter(|argument| argument.kind() == "identifier")
+                .filter_map(|argument| text(argument, source).map(str::to_owned)),
+        );
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_call_argument_names(child, source, names);
+    }
+}
+
 fn parsed_call(node: Node<'_>, source: &[u8]) -> Option<ElixirCall> {
     let target = node.child_by_field_name("target")?;
-    let (module, name) = match target.kind() {
-        "identifier" => (None, text(target, source)?.to_owned()),
+    let (module, name, dynamic_struct) = match target.kind() {
+        "identifier" => (None, text(target, source)?.to_owned(), false),
         "dot" => {
             let left = target.child_by_field_name("left")?;
             let right = target.child_by_field_name("right")?;
-            if left.kind() != "alias" && text(left, source) != Some("__MODULE__") {
+            if left.kind() == "alias" || text(left, source) == Some("__MODULE__") {
+                (
+                    Some(text(left, source)?.to_owned()),
+                    text(right, source)?.to_owned(),
+                    false,
+                )
+            } else if left.kind() == "call"
+                && left
+                    .child_by_field_name("target")
+                    .filter(|target| target.kind() == "dot")
+                    .and_then(|target| target.child_by_field_name("right"))
+                    .and_then(|field| text(field, source))
+                    == Some("__struct__")
+            {
+                (None, text(right, source)?.to_owned(), true)
+            } else {
                 return None;
             }
-            (
-                Some(text(left, source)?.to_owned()),
-                text(right, source)?.to_owned(),
-            )
         }
         _ => return None,
     };
     let arity = arguments(node).map_or(0, |arguments| arguments.named_child_count())
         + piped_argument(node, source);
+    let captures = arguments(node).map_or_else(Vec::new, |arguments| {
+        arguments
+            .named_children(&mut arguments.walk())
+            .filter_map(|argument| parsed_capture(argument, source))
+            .collect()
+    });
     Some(ElixirCall {
         module,
         name,
         arity,
         line: node.start_position().row + 1,
+        dynamic_struct,
+        captures,
     })
 }
 
-fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<ElixirCall>) {
+fn dynamic_receiver<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+    node.child_by_field_name("target")?
+        .child_by_field_name("left")?
+        .child_by_field_name("target")?
+        .child_by_field_name("left")
+        .filter(|receiver| receiver.kind() == "identifier")
+        .and_then(|receiver| text(receiver, source))
+}
+
+fn struct_module<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+    if node.kind() == "struct" {
+        return node
+            .named_child(0)
+            .filter(|module| module.kind() == "alias")
+            .and_then(|module| text(module, source));
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| struct_module(child, source))
+}
+
+fn identifier<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+    (node.kind() == "identifier")
+        .then(|| text(node, source))
+        .flatten()
+}
+
+fn collect_struct_bindings(
+    node: Node<'_>,
+    source: &[u8],
+    bindings: &mut BTreeMap<String, Vec<(usize, String)>>,
+) {
+    if node.kind() == "call" && call_target(node, source) == Some("quote") {
+        return;
+    }
+    if node.kind() == "binary_operator"
+        && node
+            .child_by_field_name("operator")
+            .and_then(|operator| text(operator, source))
+            == Some("=")
+        && let (Some(left), Some(right)) = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        )
+    {
+        let binding = if let (Some(module), Some(name)) =
+            (struct_module(left, source), identifier(right, source))
+        {
+            Some((name, module))
+        } else {
+            identifier(left, source).zip(struct_module(right, source))
+        };
+        if let Some((name, module)) = binding {
+            bindings
+                .entry(name.into())
+                .or_default()
+                .push((node.start_byte(), module.into()));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_struct_bindings(child, source, bindings);
+    }
+}
+
+fn collect_calls(
+    node: Node<'_>,
+    source: &[u8],
+    struct_bindings: &BTreeMap<String, Vec<(usize, String)>>,
+    calls: &mut Vec<ElixirCall>,
+) {
     if node.kind() == "call" {
         let target = call_target(node, source);
         if target == Some("quote") {
@@ -204,23 +361,36 @@ fn collect_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<ElixirCall>) {
                         | "use"
                 )
             )
-            && let Some(call) = parsed_call(node, source)
+            && let Some(mut call) = parsed_call(node, source)
         {
+            if call.dynamic_struct {
+                call.module = dynamic_receiver(node, source)
+                    .and_then(|receiver| struct_bindings.get(receiver))
+                    .and_then(|bindings| {
+                        bindings
+                            .iter()
+                            .rev()
+                            .find(|(position, _)| *position <= node.start_byte())
+                    })
+                    .map(|(_, module)| module.clone());
+            }
             calls.push(call);
         }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_calls(child, source, calls);
+        collect_calls(child, source, struct_bindings, calls);
     }
 }
 
 fn function_calls(node: Node<'_>, source: &[u8]) -> Vec<ElixirCall> {
+    let mut struct_bindings = BTreeMap::new();
+    collect_struct_bindings(node, source, &mut struct_bindings);
     let mut calls = Vec::new();
     if let Some(arguments) = arguments(node) {
         let mut cursor = arguments.walk();
         for body in arguments.named_children(&mut cursor).skip(1) {
-            collect_calls(body, source, &mut calls);
+            collect_calls(body, source, &struct_bindings, &mut calls);
         }
     }
     let mut cursor = node.walk();
@@ -228,9 +398,42 @@ fn function_calls(node: Node<'_>, source: &[u8]) -> Vec<ElixirCall> {
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "do_block")
     {
-        collect_calls(body, source, &mut calls);
+        collect_calls(body, source, &struct_bindings, &mut calls);
     }
     calls
+}
+
+fn function_captures(node: Node<'_>, source: &[u8]) -> Vec<ElixirCapture> {
+    let mut bindings = Vec::new();
+    collect_capture_bindings(node, source, &mut bindings);
+    let mut arguments = BTreeSet::new();
+    collect_call_argument_names(node, source, &mut arguments);
+    bindings
+        .into_iter()
+        .filter_map(|(name, capture)| arguments.contains(&name).then_some(capture))
+        .collect()
+}
+
+fn collect_function_aliases(
+    node: Node<'_>,
+    source: &[u8],
+    aliases: &mut Vec<ElixirAlias>,
+    current_module: &str,
+) {
+    if node.kind() == "call" && call_target(node, source) == Some("quote") {
+        return;
+    }
+    if node.kind() == "call" && call_target(node, source) == Some("alias") {
+        for mut alias in alias_definitions(node, source) {
+            alias.target = expand_alias(&alias.target, aliases, current_module);
+            aliases.push(alias);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_function_aliases(child, source, aliases, current_module);
+    }
 }
 
 fn keyword_token<'a>(node: Node<'a>, source: &'a [u8], key: &str) -> Option<&'a str> {
@@ -427,12 +630,14 @@ fn push_function(
     } else {
         None
     };
+    let mut aliases = aliases.to_vec();
+    collect_function_aliases(node, source, &mut aliases, current_module);
     let mut imports = references
         .iter()
         .filter(|reference| reference.kind == ElixirModuleReferenceKind::Import)
         .cloned()
         .collect::<Vec<_>>();
-    for import in function_imports(node, source, aliases, current_module) {
+    for import in function_imports(node, source, &aliases, current_module) {
         if !imports.contains(&import) {
             imports.push(import);
         }
@@ -448,17 +653,30 @@ fn push_function(
                     name: name.clone(),
                     arity,
                     line: node.start_position().row + 1,
+                    dynamic_struct: false,
+                    captures: Vec::new(),
                 }]
             },
         );
         for call in &mut calls {
             if let Some(module) = &mut call.module {
-                *module = expand_alias(module, aliases, current_module);
+                *module = expand_alias(module, &aliases, current_module);
+            }
+            for capture in &mut call.captures {
+                if let Some(module) = &mut capture.module {
+                    *module = expand_alias(module, &aliases, current_module);
+                }
+            }
+        }
+        let mut captures = function_captures(node, source);
+        for capture in &mut captures {
+            if let Some(module) = &mut capture.module {
+                *module = expand_alias(module, &aliases, current_module);
             }
         }
         let mut struct_uses = function_struct_uses(node, source);
         for r#use in &mut struct_uses {
-            r#use.module = expand_alias(&r#use.module, aliases, current_module);
+            r#use.module = expand_alias(&r#use.module, &aliases, current_module);
         }
         // ponytail: retain first-clause evidence until storage supports multiple
         // evidence records for one semantic edge.
@@ -468,12 +686,24 @@ fn push_function(
         {
             let function = &mut functions[index];
             function.body_hash = append_hash(function.body_hash, body_hash);
+            for capture in captures {
+                if !function.captures.contains(&capture) {
+                    function.captures.push(capture);
+                }
+            }
             for call in calls {
-                if !function.calls.iter().any(|existing| {
+                if let Some(existing) = function.calls.iter_mut().find(|existing| {
                     existing.module == call.module
                         && existing.name == call.name
                         && existing.arity == call.arity
+                        && existing.dynamic_struct == call.dynamic_struct
                 }) {
+                    for capture in call.captures {
+                        if !existing.captures.contains(&capture) {
+                            existing.captures.push(capture);
+                        }
+                    }
+                } else {
                     function.calls.push(call);
                 }
             }
@@ -500,6 +730,7 @@ fn push_function(
             body_hash,
             line: node.start_position().row + 1,
             calls,
+            captures,
             struct_uses,
             imports: imports.clone(),
         });
@@ -641,38 +872,68 @@ pub(super) fn call_observations(
     for function in functions {
         let function_id = format!("{module_id}/{}/{}", function.name, function.arity);
         let mut targets = BTreeSet::new();
-        for call in &function.calls {
-            let target = if let Some(target_module) = &call.module {
-                let candidate = format!(
-                    "repo://{repository}/elixir/{target_module}/{}/{}",
-                    call.name, call.arity
-                );
-                if definitions.contains(&candidate) {
-                    candidate
-                } else {
-                    format!("elixir-call://{target_module}/{}/{}", call.name, call.arity)
-                }
-            } else {
-                let candidate = format!("{module_id}/{}/{}", call.name, call.arity);
-                if definitions.contains(&candidate) {
-                    candidate
-                } else {
-                    format!("elixir-call://{}/{}", call.name, call.arity)
-                }
-            };
-            if !targets.insert(target.clone()) {
-                continue;
-            }
-            let mut observation = Observation::dependency(
-                function_id.clone(),
-                DependencyRelation::Calls,
-                target,
-                format!("{}:{}", path.display(), call.line),
+        let target_for = |target_module: Option<&str>, name: &str, arity: usize| {
+            let candidate = target_module.map_or_else(
+                || format!("{module_id}/{name}/{arity}"),
+                |module| format!("repo://{repository}/elixir/{module}/{name}/{arity}"),
             );
-            if generated {
-                observation.provenance = Provenance::Generated;
+            if definitions.contains(&candidate) {
+                candidate
+            } else if let Some(module) = target_module {
+                format!("elixir-call://{module}/{name}/{arity}")
+            } else {
+                format!("elixir-call://{name}/{arity}")
             }
-            observations.push(observation);
+        };
+        for call in &function.calls {
+            let target = if call.dynamic_struct {
+                call.module.as_ref().map_or_else(
+                    || format!("elixir-dynamic-call://{}/{}", call.name, call.arity),
+                    |module| {
+                        format!(
+                            "elixir-dynamic-call://{module}/{}/{}",
+                            call.name, call.arity
+                        )
+                    },
+                )
+            } else {
+                target_for(call.module.as_deref(), &call.name, call.arity)
+            };
+            if targets.insert(target.clone()) {
+                let mut observation = Observation::dependency(
+                    function_id.clone(),
+                    DependencyRelation::Calls,
+                    target,
+                    format!("{}:{}", path.display(), call.line),
+                );
+                if call.dynamic_struct {
+                    observation.confidence = Confidence::Inferred;
+                }
+                if generated {
+                    observation.provenance = Provenance::Generated;
+                }
+                observations.push(observation);
+            }
+        }
+        for capture in function
+            .captures
+            .iter()
+            .chain(function.calls.iter().flat_map(|call| &call.captures))
+        {
+            let target = target_for(capture.module.as_deref(), &capture.name, capture.arity);
+            if targets.insert(target.clone()) {
+                let mut observation = Observation::dependency(
+                    function_id.clone(),
+                    DependencyRelation::Calls,
+                    target,
+                    format!("{}:{}", path.display(), capture.line),
+                );
+                observation.confidence = Confidence::Inferred;
+                if generated {
+                    observation.provenance = Provenance::Generated;
+                }
+                observations.push(observation);
+            }
         }
     }
     observations
@@ -728,6 +989,7 @@ fn callback_definition(node: Node<'_>, source: &[u8]) -> Option<ElixirFunction> 
         body_hash: [0; 32],
         line: node.start_position().row + 1,
         calls: Vec::new(),
+        captures: Vec::new(),
         struct_uses: Vec::new(),
         imports: Vec::new(),
     })
@@ -1215,8 +1477,15 @@ fn absinthe_resolver(
     }
     let function = format!("__absinthe_{}_{field}_resolver", owner.identity);
     let mut calls = Vec::new();
+    let mut struct_bindings = BTreeMap::new();
+    collect_struct_bindings(argument, source, &mut struct_bindings);
     for clause in clauses {
-        collect_calls(clause.child_by_field_name("right")?, source, &mut calls);
+        collect_calls(
+            clause.child_by_field_name("right")?,
+            source,
+            &struct_bindings,
+            &mut calls,
+        );
     }
     for call in &mut calls {
         if let Some(module) = &mut call.module {
@@ -1250,6 +1519,7 @@ fn absinthe_resolver(
             body_hash: [0; 32],
             line,
             calls,
+            captures: Vec::new(),
             struct_uses,
             imports,
         }),

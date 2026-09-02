@@ -63,12 +63,26 @@ pub(super) struct ElixirFunction {
     pub(super) body_hash: [u8; 32],
     pub(super) line: usize,
     pub(super) calls: Vec<ElixirCall>,
+    #[serde(default)]
+    pub(super) captures: Vec<ElixirCapture>,
     pub(super) struct_uses: Vec<ElixirStructUse>,
     pub(super) imports: Vec<ElixirModuleReference>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct ElixirCall {
+    pub(super) module: Option<String>,
+    pub(super) name: String,
+    pub(super) arity: usize,
+    pub(super) line: usize,
+    #[serde(default)]
+    pub(super) dynamic_struct: bool,
+    #[serde(default)]
+    pub(super) captures: Vec<ElixirCapture>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ElixirCapture {
     pub(super) module: Option<String>,
     pub(super) name: String,
     pub(super) arity: usize,
