@@ -970,7 +970,7 @@ fn repository_index<'a>(
         .collect::<BTreeMap<_, _>>();
     let mut field_types = raw_field_types
         .into_iter()
-        .filter_map(|((file, owner, field), type_name)| {
+        .map(|((file, owner, field), type_name)| {
             let origin = file_imports
                 .get(&file)
                 .and_then(|imports| {
@@ -986,10 +986,11 @@ fn repository_index<'a>(
                     })
                 })
                 .or_else(|| {
-                    let key = (file.clone(), type_name);
+                    let key = (file.clone(), type_name.clone());
                     symbols.contains_key(&key).then_some(key)
-                })?;
-            Some(((file, owner, field), origin))
+                })
+                .unwrap_or_else(|| (file.clone(), type_name));
+            ((file, owner, field), origin)
         })
         .collect::<BTreeMap<_, _>>();
     field_types.extend(nest_injected_field_types(NestInjectionContext {
@@ -1353,6 +1354,48 @@ fn resolve_observations(observations: &mut Vec<Observation>, index: &RepositoryI
             .copied()
             .unwrap_or_default();
         let call_site = observation_position(observation, index, &mut occurrences);
+        let contextual = observation
+            .to
+            .as_str()
+            .strip_prefix("typescript-context-returned://")
+            .map(|target| ("typescript", target))
+            .or_else(|| {
+                observation
+                    .to
+                    .as_str()
+                    .strip_prefix("javascript-context-returned://")
+                    .map(|target| ("javascript", target))
+            })
+            .and_then(|(language, target)| {
+                let (context, target) = target.split_once('/')?;
+                let (argument, method) = target.split_once('/')?;
+                Some((
+                    language.to_owned(),
+                    context.to_owned(),
+                    argument.to_owned(),
+                    method.to_owned(),
+                ))
+            });
+        if let Some((language, context, argument, method)) = contextual {
+            let is_context = receiver_type(
+                index,
+                observation.from.as_str(),
+                &context,
+                call_site,
+                &mut receiver_types,
+            )
+            .is_some_and(|(_, type_name)| type_name.rsplit('.').next() == Some("Context"));
+            observation.to = if is_context {
+                EntityId::from(format!("{language}-returned://{argument}/{method}"))
+            } else {
+                EntityId::from(format!(
+                    "{language}-method://{context}.get({argument})/{method}"
+                ))
+            };
+            if !is_context {
+                continue;
+            }
+        }
         let returned = observation
             .to
             .as_str()
@@ -1971,7 +2014,7 @@ mod tests {
             ),
             (
                 Path::new("src/entry.ts"),
-                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); } export function nonInvoking(context: Context) { return context.get(loader).clear(); }",
+                "import { loader } from './loader'; export function entry(context: Context) { const selected = loader; return context.get(selected).load('key'); } export function renamed(ctx: Context) { return ctx.get(loader).load('key'); } export function unrelated(map: Map<unknown, Loader>) { return map.get(loader).load('key'); } export function nonInvoking(context: Context) { return context.get(loader).clear(); } export class Preview { constructor(private context: Context) {} run() { return this.context.get(loader).load('key'); } }",
             ),
             (
                 Path::new("src/qualified.ts"),
@@ -2040,6 +2083,14 @@ mod tests {
             "repo://example/typescript/src/qualified/entry",
             "repo://example/typescript/src/loader/loader",
         )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/renamed",
+            "repo://example/typescript/src/loader/loader",
+        )));
+        assert!(edges.contains(&(
+            "repo://example/typescript/src/entry/Preview/run",
+            "repo://example/typescript/src/loader/loader",
+        )));
         assert!(!edges.contains(&(
             "repo://example/typescript/src/entry/unrelated",
             "repo://example/typescript/src/loader/loader",
@@ -2089,7 +2140,7 @@ mod tests {
         let source = r#"
             const first = createContext(() => new Loader(() => {}));
             const second = createContext(() => new Loader(() => {}));
-            const loader = createContext(() => {
+            const loader = createContext((context: Context) => {
                 const selected = first;
                 new Wrapper(() => { const selected = second; return selected; });
                 return new Loader(() => context.get(selected).load('key'));

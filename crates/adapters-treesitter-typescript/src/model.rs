@@ -284,6 +284,8 @@ pub(super) struct Call {
     pub(super) kind: CallKind,
     pub(super) receiver: Option<String>,
     #[serde(default)]
+    pub(super) returned_context: Option<String>,
+    #[serde(default)]
     pub(super) returned_receiver: Option<String>,
     pub(super) name: String,
     pub(super) arguments: Vec<String>,

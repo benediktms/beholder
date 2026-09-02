@@ -107,35 +107,32 @@ fn call_target(node: Node<'_>, target: Node<'_>, source: &[u8], kind: CallKind) 
     let preserve_type_arguments = name == "getService";
     let start = lsp_position(selection, source, false)?;
     let end = lsp_position(selection, source, true)?;
+    let returned = (name == "load")
+        .then(|| {
+            let object = target
+                .child_by_field_name("object")
+                .filter(|object| object.kind() == "call_expression")?;
+            let function = object
+                .child_by_field_name("function")
+                .filter(|function| function.kind() == "member_expression")?;
+            (text(function.child_by_field_name("property")?, source)? == "get").then_some(())?;
+            let context = text(function.child_by_field_name("object")?, source)?.to_owned();
+            let arguments = object.child_by_field_name("arguments")?;
+            let arguments = arguments
+                .named_children(&mut arguments.walk())
+                .collect::<Vec<_>>();
+            let [argument] = arguments.as_slice() else {
+                return None;
+            };
+            matches!(argument.kind(), "identifier" | "member_expression")
+                .then_some((context, text(*argument, source)?.to_owned()))
+        })
+        .flatten();
     Some(Call {
         kind,
         receiver,
-        returned_receiver: (name == "load")
-            .then(|| {
-                target
-                    .child_by_field_name("object")
-                    .filter(|object| object.kind() == "call_expression")
-                    .filter(|object| {
-                        // ponytail: broaden when receiver types and invoking methods can be proven.
-                        object
-                            .child_by_field_name("function")
-                            .and_then(|function| text(function, source))
-                            == Some("context.get")
-                    })
-                    .and_then(|object| object.child_by_field_name("arguments"))
-                    .and_then(|arguments| {
-                        let arguments = arguments
-                            .named_children(&mut arguments.walk())
-                            .collect::<Vec<_>>();
-                        let [argument] = arguments.as_slice() else {
-                            return None;
-                        };
-                        matches!(argument.kind(), "identifier" | "member_expression")
-                            .then(|| text(*argument, source).map(str::to_owned))
-                            .flatten()
-                    })
-            })
-            .flatten(),
+        returned_context: returned.as_ref().map(|(context, _)| context.clone()),
+        returned_receiver: returned.map(|(_, receiver)| receiver),
         name,
         arguments: node
             .child_by_field_name("arguments")
@@ -1449,9 +1446,13 @@ fn observation_target(
     call: &Call,
 ) -> String {
     if call.kind == CallKind::Member
+        && let Some(context) = &call.returned_context
         && let Some(receiver) = &call.returned_receiver
     {
-        return format!("{language}-returned://{receiver}/{}", call.name);
+        return format!(
+            "{language}-context-returned://{context}/{receiver}/{}",
+            call.name
+        );
     }
     match call.kind {
         CallKind::Direct => ids
