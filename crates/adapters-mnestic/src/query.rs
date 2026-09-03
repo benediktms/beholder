@@ -178,6 +178,17 @@ fn remaining_query_budget() -> f64 {
     })
 }
 
+fn without_consuming_query_budget<T>(read: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = read();
+    SEMANTIC_QUERY_DEADLINE.with(|deadline| {
+        if let Some(deadline_at) = deadline.get() {
+            deadline.set(Some(deadline_at + started.elapsed()));
+        }
+    });
+    result
+}
+
 fn observed_query(
     db: &impl QueryRunner,
     spec: QuerySpec<'_>,
@@ -205,19 +216,28 @@ fn observed_query(
     if let Ok(rows) = &result {
         span.record("db.rows", rows.rows.len());
     }
-    if result.is_err() || started.elapsed().as_secs_f64() >= SLOW_QUERY_SECONDS {
-        let plan_timeout = remaining_query_budget().min(QUERY_PLAN_TIMEOUT_SECONDS);
-        if plan_timeout == 0.0 {
-            span.record("db.plan.outcome", "deadline_exhausted");
-            return result;
-        }
+    if !span.is_disabled()
+        && (result.is_err() || started.elapsed().as_secs_f64() >= SLOW_QUERY_SECONDS)
+    {
         let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
         params.extend(
             additions
                 .into_iter()
                 .map(|(name, value)| (name.into(), value)),
         );
-        match db.explain_query(spec.script, params, plan_timeout) {
+        let plan = if result.is_ok() {
+            without_consuming_query_budget(|| {
+                db.explain_query(spec.script, params, QUERY_PLAN_TIMEOUT_SECONDS)
+            })
+        } else {
+            let plan_timeout = remaining_query_budget().min(QUERY_PLAN_TIMEOUT_SECONDS);
+            if plan_timeout == 0.0 {
+                span.record("db.plan.outcome", "deadline_exhausted");
+                return result;
+            }
+            db.explain_query(spec.script, params, plan_timeout)
+        };
+        match plan {
             Ok(Some(plan)) => record_query_plan(&span, &plan),
             Ok(None) => {
                 span.record("db.plan.outcome", "unsupported");
@@ -1000,6 +1020,29 @@ mod tests {
         }
     }
 
+    struct DisabledPlanRunner(Cell<bool>);
+
+    impl QueryRunner for DisabledPlanRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            _timeout: f64,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            Err("query failed".into())
+        }
+
+        fn explain_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            _timeout: f64,
+        ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+            self.0.set(true);
+            Ok(None)
+        }
+    }
+
     #[test]
     fn one_budget_is_shared_by_every_query_in_a_semantic_read() {
         let runner = TimeoutRunner(RefCell::new(Vec::new()));
@@ -1061,6 +1104,32 @@ mod tests {
         });
 
         assert!(!runner.0.get());
+    }
+
+    #[test]
+    fn disabled_query_span_skips_plan_collection() {
+        let runner = DisabledPlanRunner(Cell::new(false));
+
+        let _ = within_query_budget(|| {
+            observed_query(
+                &runner,
+                QuerySpec::new("test", "main", "?[value] <- [[1]]"),
+                vec![],
+            )
+        });
+
+        assert!(!runner.0.get());
+    }
+
+    #[test]
+    fn diagnostics_do_not_consume_the_query_budget() {
+        within_query_budget(|| {
+            let before = SEMANTIC_QUERY_DEADLINE.get().unwrap();
+            without_consuming_query_budget(|| thread::sleep(Duration::from_millis(5)));
+            let after = SEMANTIC_QUERY_DEADLINE.get().unwrap();
+
+            assert!(after > before);
+        });
     }
 
     #[test]
