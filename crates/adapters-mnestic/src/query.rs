@@ -204,6 +204,8 @@ fn observed_query(
             db.operation = spec.operation,
             db.rows = tracing::field::Empty,
             db.outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.status_message = tracing::field::Empty,
         );
         let _entered = span.enter();
         let started = Instant::now();
@@ -212,6 +214,9 @@ fn observed_query(
         span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
         if let Ok(rows) = &result {
             span.record("db.rows", rows.rows.len());
+        } else if let Err(error) = &result {
+            span.record("otel.status_code", "ERROR");
+            span.record("otel.status_message", tracing::field::display(error));
         }
         (result, elapsed, !span.is_disabled())
     };
@@ -230,24 +235,31 @@ fn observed_query(
             db.plan.loaded_relations = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let explain = |timeout| {
+        let explain_params = || {
             let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
             params.extend(
                 additions()
                     .into_iter()
                     .map(|(name, value)| (name.into(), value)),
             );
-            db.explain_query(spec.script, params, timeout)
+            params
         };
         let plan = if result.is_ok() {
-            without_consuming_query_budget(|| explain(QUERY_PLAN_TIMEOUT_SECONDS))
+            without_consuming_query_budget(|| {
+                db.explain_query(spec.script, explain_params(), QUERY_PLAN_TIMEOUT_SECONDS)
+            })
         } else {
+            if remaining_query_budget() == 0.0 {
+                span.record("db.plan.outcome", "deadline_exhausted");
+                return result;
+            }
+            let params = explain_params();
             let plan_timeout = remaining_query_budget().min(QUERY_PLAN_TIMEOUT_SECONDS);
             if plan_timeout == 0.0 {
                 span.record("db.plan.outcome", "deadline_exhausted");
                 return result;
             }
-            explain(plan_timeout)
+            db.explain_query(spec.script, params, plan_timeout)
         };
         match plan {
             Ok(Some(plan)) => record_query_plan(&span, &plan),
@@ -519,16 +531,20 @@ pub(super) fn entity_facts(
     view: &str,
     entities: &BTreeSet<String>,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let requested = DataValue::List(
-        entities
-            .iter()
-            .map(|id| DataValue::List(vec![id.as_str().into()]))
-            .collect(),
-    );
-    let mut baseline = query(
+    let requested = || {
+        DataValue::List(
+            entities
+                .iter()
+                .map(|id| DataValue::List(vec![id.as_str().into()]))
+                .collect(),
+        )
+    };
+    let mut baseline = observed_query(
         db,
-        view,
-        "requested[id] <- $entities\n\
+        QuerySpec::new(
+            "entity_facts.baseline",
+            view,
+            "requested[id] <- $entities\n\
          selected_state[state] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view: $view, revision, state}\n\
          ?[id, kind, metadata] := requested[id], selected_state[state], \
@@ -536,7 +552,8 @@ pub(super) fn entity_facts(
          ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
              *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
          :order id",
-        [("entities", requested.clone())],
+        ),
+        || vec![("entities", requested())],
     )?;
     let mut baseline_ids = baseline
         .rows
@@ -544,17 +561,12 @@ pub(super) fn entity_facts(
         .filter_map(|row| row[0].get_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
 
-    let remaining = DataValue::List(
-        entities
-            .iter()
-            .filter(|id| !baseline_ids.contains(*id))
-            .map(|id| DataValue::List(vec![id.as_str().into()]))
-            .collect(),
-    );
-    let nested = query(
+    let nested = observed_query(
         db,
-        view,
-        "requested[id] <- $entities\n\
+        QuerySpec::new(
+            "entity_facts.shard",
+            view,
+            "requested[id] <- $entities\n\
          ?[id, kind, metadata] := requested[id], \
              *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, \
              *analysis_fact_shard_selection:by_owner{\
@@ -562,7 +574,19 @@ pub(super) fn entity_facts(
              }\n\
          :order id\n\
          :reorder written",
-        [("entities", remaining)],
+        ),
+        || {
+            vec![(
+                "entities",
+                DataValue::List(
+                    entities
+                        .iter()
+                        .filter(|id| !baseline_ids.contains(*id))
+                        .map(|id| DataValue::List(vec![id.as_str().into()]))
+                        .collect(),
+                ),
+            )]
+        },
     )?;
     baseline_ids.extend(
         nested
@@ -572,10 +596,12 @@ pub(super) fn entity_facts(
     );
     baseline.rows.extend(nested.rows);
 
-    let enrichment = query(
+    let enrichment = observed_query(
         db,
-        view,
-        "requested[id] <- $entities\n\
+        QuerySpec::new(
+            "entity_facts.enrichment",
+            view,
+            "requested[id] <- $entities\n\
          selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
          ?[id, kind, metadata] := requested[id], \
@@ -583,7 +609,8 @@ pub(super) fn entity_facts(
              selected_enrichment[owner], \
              *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
          :order id",
-        [("entities", requested)],
+        ),
+        || vec![("entities", requested())],
     )?;
     baseline
         .rows
@@ -1050,6 +1077,38 @@ mod tests {
         }
     }
 
+    struct ExpiringPlanRunner(Cell<bool>);
+
+    impl QueryRunner for ExpiringPlanRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            _timeout: f64,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() + Duration::from_millis(1)));
+            Err("query failed".into())
+        }
+
+        fn explain_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            _timeout: f64,
+        ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+            self.0.set(true);
+            Ok(None)
+        }
+    }
+
+    fn with_info_spans<T>(read: impl FnOnce() -> T) -> T {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, read)
+    }
+
     #[test]
     fn one_budget_is_shared_by_every_query_in_a_semantic_read() {
         let runner = TimeoutRunner(RefCell::new(Vec::new()));
@@ -1103,19 +1162,46 @@ mod tests {
         let runner = ExhaustedPlanRunner(Cell::new(false));
         let parameter_builds = Cell::new(0);
 
-        let _ = within_query_budget(|| {
-            observed_query(
-                &runner,
-                QuerySpec::new("test", "main", "?[value] <- [[1]]"),
-                || {
-                    parameter_builds.set(parameter_builds.get() + 1);
-                    Vec::new()
-                },
-            )
+        let _ = with_info_spans(|| {
+            within_query_budget(|| {
+                observed_query(
+                    &runner,
+                    QuerySpec::new("test", "main", "?[value] <- [[1]]"),
+                    || {
+                        parameter_builds.set(parameter_builds.get() + 1);
+                        Vec::new()
+                    },
+                )
+            })
         });
 
         assert!(!runner.0.get());
         assert_eq!(parameter_builds.get(), 1);
+    }
+
+    #[test]
+    fn parameter_building_cannot_extend_failure_plan_past_the_deadline() {
+        let runner = ExpiringPlanRunner(Cell::new(false));
+        let parameter_builds = Cell::new(0);
+
+        let _ = with_info_spans(|| {
+            within_query_budget(|| {
+                observed_query(
+                    &runner,
+                    QuerySpec::new("test", "main", "?[value] <- [[1]]"),
+                    || {
+                        parameter_builds.set(parameter_builds.get() + 1);
+                        if parameter_builds.get() == 2 {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Vec::new()
+                    },
+                )
+            })
+        });
+
+        assert!(!runner.0.get());
+        assert_eq!(parameter_builds.get(), 2);
     }
 
     #[test]
