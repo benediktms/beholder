@@ -533,6 +533,36 @@ fn closure(
         "{override_rules}\n\
          frontier[id] <- $frontier"
     );
+    let boundary_rule = match direction {
+        TraversalDirection::Outgoing => {
+            "\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
+                 direct[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 frontier[edge_from], not visited[edge_to], \
+                 row_kind = 'edge', entity = '', hops = 0"
+        }
+        TraversalDirection::Incoming => {
+            "\
+             special[edge_from, edge_to, relation] := \
+                 direct[edge_from, edge_to, relation, _, _, _], \
+                 relation = 'implemented_by', starts_with(edge_from, 'grpc://')\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
+                 direct[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 frontier[edge_to], not special[edge_from, edge_to, relation], \
+                 not visited[edge_from], row_kind = 'edge', entity = '', hops = 0\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
+                 direct[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 special[edge_from, edge_to, relation], frontier[edge_from], \
+                 not visited[edge_to], row_kind = 'edge', entity = '', hops = 0"
+        }
+    };
+    let boundary_script = format!(
+        "{DIRECT_RULES}\n\
+         frontier[id] <- $frontier\n\
+         visited[id] <- $visited\n\
+         {boundary_rule}\n\
+         :limit 1"
+    );
     let mut frontier = BTreeSet::from([entity.to_owned()]);
     let mut visited = frontier.clone();
     let mut rows = Vec::new();
@@ -544,6 +574,28 @@ fn closure(
                 .map(|entity| DataValue::List(vec![entity.as_str().into()]))
                 .collect(),
         );
+        if hops == max_hops {
+            let visited_values = DataValue::List(
+                visited
+                    .iter()
+                    .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                    .collect(),
+            );
+            let mut result = query(
+                db,
+                view,
+                &boundary_script,
+                [("frontier", values), ("visited", visited_values)],
+            )?;
+            for row in &mut result.rows {
+                row[2] = i64::from(hops).into();
+            }
+            if headers.is_empty() {
+                headers = result.headers;
+            }
+            rows.extend(result.rows);
+            break;
+        }
         let mut edge_groups = Vec::new();
         for script in &scripts {
             let result = query(db, view, script, [("frontier", values.clone())])?;
@@ -557,10 +609,6 @@ fn closure(
         let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
         for row in &mut result_rows {
             row[2] = i64::from(hops).into();
-        }
-        if hops == max_hops {
-            rows.extend(result_rows);
-            break;
         }
         let mut next = BTreeSet::new();
         for row in &result_rows {
@@ -835,6 +883,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.paths[0].nodes, ["start", "left", "end"]);
+
+        let boundary = dependencies(&db, "diamond", "start", 0).unwrap();
+        assert_eq!(boundary.rows.len(), 1);
 
         let limited_rows = trace(&db, "diamond", "start", "end", 1).unwrap();
         assert!(
