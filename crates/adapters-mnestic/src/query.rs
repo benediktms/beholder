@@ -192,7 +192,7 @@ fn without_consuming_query_budget<T>(read: impl FnOnce() -> T) -> T {
 fn observed_query(
     db: &impl QueryRunner,
     spec: QuerySpec<'_>,
-    additions: Vec<(&'static str, DataValue)>,
+    additions: impl Fn() -> Vec<(&'static str, DataValue)>,
 ) -> Result<NamedRows, Box<dyn Error>> {
     let span = tracing::info_span!(
         "db.query",
@@ -211,7 +211,7 @@ fn observed_query(
     );
     let _entered = span.enter();
     let started = Instant::now();
-    let result = query(db, spec.view, spec.script, additions.clone());
+    let result = query(db, spec.view, spec.script, additions());
     span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
     if let Ok(rows) = &result {
         span.record("db.rows", rows.rows.len());
@@ -221,7 +221,7 @@ fn observed_query(
     {
         let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
         params.extend(
-            additions
+            additions()
                 .into_iter()
                 .map(|(name, value)| (name.into(), value)),
         );
@@ -641,11 +641,9 @@ pub(super) fn context(
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    observed_query(
-        db,
-        QuerySpec::new("context", view, CONTEXT_QUERY),
-        vec![("entity", entity.into())],
-    )
+    observed_query(db, QuerySpec::new("context", view, CONTEXT_QUERY), || {
+        vec![("entity", entity.into())]
+    })
 }
 
 pub(super) fn trace(
@@ -836,14 +834,13 @@ fn closure(
                     .collect(),
             );
             for (operation, script) in boundary_operations.into_iter().zip(&boundary_scripts) {
-                let mut result = observed_query(
-                    db,
-                    QuerySpec::new(operation, view, script),
-                    vec![
-                        ("frontier", values.clone()),
-                        ("visited", visited_values.clone()),
-                    ],
-                )?;
+                let mut result =
+                    observed_query(db, QuerySpec::new(operation, view, script), || {
+                        vec![
+                            ("frontier", values.clone()),
+                            ("visited", visited_values.clone()),
+                        ]
+                    })?;
                 if headers.is_empty() {
                     headers = result.headers;
                 }
@@ -857,11 +854,9 @@ fn closure(
         }
         let mut edge_groups = Vec::new();
         for (operation, script) in operations.into_iter().zip(&scripts) {
-            let result = observed_query(
-                db,
-                QuerySpec::new(operation, view, script),
-                vec![("frontier", values.clone())],
-            )?;
+            let result = observed_query(db, QuerySpec::new(operation, view, script), || {
+                vec![("frontier", values.clone())]
+            })?;
             if headers.is_empty() {
                 headers = result.headers;
             }
@@ -870,7 +865,7 @@ fn closure(
         let overrides = observed_query(
             db,
             QuerySpec::new(override_operation, view, &override_script),
-            vec![("frontier", values)],
+            || vec![("frontier", values.clone())],
         )?;
         merge_fact_shard_overrides(&mut edge_groups[1], overrides.rows, direction, &frontier);
         let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
@@ -1099,7 +1094,7 @@ mod tests {
             observed_query(
                 &runner,
                 QuerySpec::new("test", "main", "?[value] <- [[1]]"),
-                vec![],
+                Vec::new,
             )
         });
 
@@ -1109,16 +1104,21 @@ mod tests {
     #[test]
     fn disabled_query_span_skips_plan_collection() {
         let runner = DisabledPlanRunner(Cell::new(false));
+        let parameter_builds = Cell::new(0);
 
         let _ = within_query_budget(|| {
             observed_query(
                 &runner,
                 QuerySpec::new("test", "main", "?[value] <- [[1]]"),
-                vec![],
+                || {
+                    parameter_builds.set(parameter_builds.get() + 1);
+                    Vec::new()
+                },
             )
         });
 
         assert!(!runner.0.get());
+        assert_eq!(parameter_builds.get(), 1);
     }
 
     #[test]
