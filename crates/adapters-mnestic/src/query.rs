@@ -700,7 +700,6 @@ fn edge_key(row: &[DataValue], target: usize) -> (String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::DIRECT_RULES;
     use crate::{SemanticStore, database::memory_database};
     use beholder_domain::{
         DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,

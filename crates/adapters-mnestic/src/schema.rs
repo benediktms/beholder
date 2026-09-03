@@ -667,7 +667,6 @@ pub(super) const SEED_STATES: &str = r#"
 :put analysis_revision_state {view, revision, repository => state}
 "#;
 
-#[cfg(test)]
 pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
 pub(super) const BASE_DIRECT_RULES: &str = include_str!("../../../rules/core/base_direct.datalog");
 pub(super) const OUTGOING_DEPENDENCY_RULES: &str =
