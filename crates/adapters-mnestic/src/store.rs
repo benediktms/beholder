@@ -945,7 +945,23 @@ mod tests {
             producer: "rust".into(),
             owner: shard_owner.into(),
             version: "body-1".into(),
-            entities: vec![EntityFact::new(shard_owner, EntityKind::Callable, None).unwrap()],
+            entities: [
+                shard_owner,
+                source,
+                state_owner,
+                state_unresolved,
+                base_resolved,
+                base_unresolved,
+                losing_enrichment_resolved,
+                enrichment_resolved,
+                enrichment_unresolved,
+                duplicate_target,
+                state_resolved,
+                structural_target,
+            ]
+            .into_iter()
+            .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
+            .collect(),
             observations: vec![
                 Observation::dependency(
                     source,
