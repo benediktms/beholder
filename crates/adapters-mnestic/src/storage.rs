@@ -3370,10 +3370,17 @@ fn refresh_resolved_dependencies(
         }
     }
     let mut materialized = BTreeMap::new();
-    for mut edge in edges {
-        let confidence = edge.remove(4);
+    for edge in edges {
+        let confidence = edge[4].clone();
+        let key = (
+            stored_string(&edge, 0, "dependency source")?.to_owned(),
+            stored_string(&edge, 1, "dependency destination")?.to_owned(),
+            stored_string(&edge, 2, "dependency relation")?.to_owned(),
+            stored_string(&edge, 3, "dependency evidence")?.to_owned(),
+            stored_string(&edge, 5, "dependency provenance")?.to_owned(),
+        );
         materialized
-            .entry(edge)
+            .entry(key)
             .and_modify(|existing| {
                 if confidence > *existing {
                     *existing = confidence.clone();
@@ -3384,11 +3391,16 @@ fn refresh_resolved_dependencies(
     let edge_count = materialized.len();
     let rows = materialized
         .into_iter()
-        .map(|(mut edge, confidence)| {
-            edge.insert(4, confidence);
-            let mut row = vec![view.into()];
-            row.append(&mut edge);
-            DataValue::List(row)
+        .map(|((from, to, relation, evidence, provenance), confidence)| {
+            DataValue::List(vec![
+                view.into(),
+                from.into(),
+                to.into(),
+                relation.into(),
+                evidence.into(),
+                confidence,
+                provenance.into(),
+            ])
         })
         .collect::<Vec<_>>();
     for rows in rows.chunks(FACT_BATCH_SIZE) {
