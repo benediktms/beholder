@@ -242,6 +242,23 @@ fn query(
     db.run_query(script, params)
 }
 
+fn observed_query(
+    db: &impl QueryRunner,
+    spec: QuerySpec<'_>,
+    additions: impl Fn() -> Vec<(&'static str, DataValue)>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let view = spec.view;
+    observed_bound_query(db, spec, || {
+        let mut params = BTreeMap::from([("view".into(), view.into())]);
+        params.extend(
+            additions()
+                .into_iter()
+                .map(|(name, value)| (name.into(), value)),
+        );
+        params
+    })
+}
+
 fn observed_bound_query(
     db: &impl QueryRunner,
     spec: QuerySpec<'_>,
