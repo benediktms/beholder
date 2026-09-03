@@ -487,6 +487,22 @@ pub(super) const CREATE_REVISION_OBSERVATION_TO_INDEX: &str = "::index create an
      {view, revision, to, from, relation, evidence, confidence, provenance}";
 pub(super) const CREATE_ENRICHMENT_OBSERVATION_SELECTION_TO_INDEX: &str = "::index create analysis_enrichment_observation_selection:by_to \
      {view, to, from, relation, evidence, owner}";
+pub(super) const CREATE_FACT_SHARD_ENTITY_ID_INDEX: &str = "::index create analysis_fact_shard_entity:by_id \
+     {id, producer, owner, version, kind, metadata}";
+pub(super) const CREATE_FACT_SHARD_SELECTION_OWNER_INDEX: &str = "::index create analysis_fact_shard_selection:by_owner \
+     {view, owner, producer, version, repository}";
+pub(super) const CREATE_FACT_SHARD_OBSERVATION_TO_INDEX: &str = "::index create analysis_fact_shard_observation:by_to \
+     {to, producer, owner, version, from, relation, evidence, confidence, provenance}";
+pub(super) const CREATE_REVISION_STATE_STATE_INDEX: &str = "::index create analysis_revision_state:by_state \
+     {view, state, revision, repository}";
+pub(super) const CREATE_OVERRIDE_UNRESOLVED_INDEX: &str = "::index create analysis_revision_dependency_override:by_unresolved \
+     {view, revision, unresolved_to, from, relation, resolved_to, evidence}";
+pub(super) const CREATE_OVERRIDE_RESOLVED_INDEX: &str = "::index create analysis_revision_dependency_override:by_resolved \
+     {view, revision, resolved_to, from, relation, unresolved_to, evidence}";
+pub(super) const CREATE_ENRICHMENT_OVERRIDE_SELECTION_UNRESOLVED_INDEX: &str = "::index create analysis_enrichment_override_selection:by_unresolved \
+     {view, unresolved_to, from, relation, owner}";
+pub(super) const CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_RESOLVED_INDEX: &str = "::index create enrichment_override_contribution:by_resolved \
+     {view, resolved_to, owner, from, relation, unresolved_to, evidence, confidence, provenance}";
 
 pub(super) const CREATE_OVERRIDE_SCHEMA: &str = r#"
 :create analysis_revision_dependency_override {
@@ -649,8 +665,19 @@ pub(super) const SEED_STATES: &str = r#"
 :put analysis_revision_state {view, revision, repository => state}
 "#;
 
+#[cfg(test)]
 pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
 pub(super) const BASE_DIRECT_RULES: &str = include_str!("../../../rules/core/base_direct.datalog");
-pub(super) const DEPENDENCY_RULES: &str = include_str!("../../../rules/core/dependencies.datalog");
-pub(super) const IMPACT_RULES: &str = include_str!("../../../rules/core/impact.datalog");
+pub(super) const OUTGOING_DEPENDENCY_RULES: &str =
+    include_str!("../../../rules/core/outgoing_dependencies.datalog");
+pub(super) const OUTGOING_FACT_SHARD_DEPENDENCY_RULES: &str =
+    include_str!("../../../rules/core/outgoing_fact_shard_dependencies.datalog");
+pub(super) const OUTGOING_DEPENDENCY_OVERRIDE_QUERY: &str =
+    include_str!("../../../rules/core/outgoing_dependency_overrides.datalog");
+pub(super) const INCOMING_DEPENDENCY_RULES: &str =
+    include_str!("../../../rules/core/incoming_dependencies.datalog");
+pub(super) const INCOMING_FACT_SHARD_DEPENDENCY_RULES: &str =
+    include_str!("../../../rules/core/incoming_fact_shard_dependencies.datalog");
+pub(super) const INCOMING_DEPENDENCY_OVERRIDE_QUERY: &str =
+    include_str!("../../../rules/core/incoming_dependency_overrides.datalog");
 pub(super) const CONTEXT_QUERY: &str = include_str!("../../../rules/core/context.datalog");

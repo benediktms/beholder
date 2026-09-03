@@ -6,7 +6,7 @@ use super::{
     query::{
         analysis_metadata, analysis_revision, context, dependencies, entity_facts, impact,
         inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions,
-        published_repository_head, repository_revision, trace,
+        published_repository_head, repository_revision, trace, within_query_budget,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -463,14 +463,16 @@ impl SemanticStore {
     }
 
     pub fn context(&self, view: &str, entity: &str) -> Result<ContextResult, Box<dyn Error>> {
-        let result = context(&self.read_db, view, entity)?;
-        let entities = relevant_entities(&result, &[entity], &[2]);
-        semantic::context(
-            view,
-            entity,
-            inspection_result(result),
-            inspection_result(entity_facts(&self.read_db, view, &entities)?),
-        )
+        within_query_budget(|| {
+            let result = context(&self.read_db, view, entity)?;
+            let entities = relevant_entities(&result, &[entity], &[2]);
+            semantic::context(
+                view,
+                entity,
+                inspection_result(result),
+                inspection_result(entity_facts(&self.read_db, view, &entities)?),
+            )
+        })
     }
 
     pub fn context_snapshot(
@@ -497,16 +499,18 @@ impl SemanticStore {
         to: &str,
         max_hops: u32,
     ) -> Result<TraceResult, Box<dyn Error>> {
-        let result = trace(&self.read_db, view, from, to)?;
-        let entities = relevant_entities(&result, &[from, to], &[3, 4]);
-        semantic::trace(
-            view,
-            from,
-            to,
-            max_hops,
-            inspection_result(result),
-            inspection_result(entity_facts(&self.read_db, view, &entities)?),
-        )
+        within_query_budget(|| {
+            let result = trace(&self.read_db, view, from, to, max_hops)?;
+            let entities = relevant_entities(&result, &[from, to], &[3, 4]);
+            semantic::trace(
+                view,
+                from,
+                to,
+                max_hops,
+                inspection_result(result),
+                inspection_result(entity_facts(&self.read_db, view, &entities)?),
+            )
+        })
     }
 
     pub fn trace_snapshot(
@@ -517,7 +521,7 @@ impl SemanticStore {
         max_hops: u32,
     ) -> Result<Revisioned<TraceResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
-            let result = trace(transaction, view, from, to)?;
+            let result = trace(transaction, view, from, to, max_hops)?;
             let entities = relevant_entities(&result, &[from, to], &[3, 4]);
             semantic::trace(
                 view,
@@ -536,15 +540,17 @@ impl SemanticStore {
         entity: &str,
         max_hops: u32,
     ) -> Result<ImpactResult, Box<dyn Error>> {
-        let result = impact(&self.read_db, view, entity)?;
-        let entities = relevant_entities(&result, &[entity], &[3, 4]);
-        semantic::impact(
-            view,
-            entity,
-            max_hops,
-            inspection_result(result),
-            inspection_result(entity_facts(&self.read_db, view, &entities)?),
-        )
+        within_query_budget(|| {
+            let result = impact(&self.read_db, view, entity, max_hops)?;
+            let entities = relevant_entities(&result, &[entity], &[3, 4]);
+            semantic::impact(
+                view,
+                entity,
+                max_hops,
+                inspection_result(result),
+                inspection_result(entity_facts(&self.read_db, view, &entities)?),
+            )
+        })
     }
 
     pub fn impact_snapshot(
@@ -554,7 +560,7 @@ impl SemanticStore {
         max_hops: u32,
     ) -> Result<Revisioned<ImpactResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
-            let result = impact(transaction, view, entity)?;
+            let result = impact(transaction, view, entity, max_hops)?;
             let entities = relevant_entities(&result, &[entity], &[3, 4]);
             semantic::impact(
                 view,
@@ -572,15 +578,17 @@ impl SemanticStore {
         entity: &str,
         max_hops: u32,
     ) -> Result<DependenciesResult, Box<dyn Error>> {
-        let result = dependencies(&self.read_db, view, entity)?;
-        let entities = relevant_entities(&result, &[entity], &[3, 4]);
-        semantic::dependencies(
-            view,
-            entity,
-            max_hops,
-            inspection_result(result),
-            inspection_result(entity_facts(&self.read_db, view, &entities)?),
-        )
+        within_query_budget(|| {
+            let result = dependencies(&self.read_db, view, entity, max_hops)?;
+            let entities = relevant_entities(&result, &[entity], &[3, 4]);
+            semantic::dependencies(
+                view,
+                entity,
+                max_hops,
+                inspection_result(result),
+                inspection_result(entity_facts(&self.read_db, view, &entities)?),
+            )
+        })
     }
 
     pub fn dependencies_snapshot(
@@ -590,7 +598,7 @@ impl SemanticStore {
         max_hops: u32,
     ) -> Result<Revisioned<DependenciesResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
-            let result = dependencies(transaction, view, entity)?;
+            let result = dependencies(transaction, view, entity, max_hops)?;
             let entities = relevant_entities(&result, &[entity], &[3, 4]);
             semantic::dependencies(
                 view,
@@ -607,23 +615,25 @@ impl SemanticStore {
         view: &str,
         read: impl FnOnce(&MultiTransaction) -> Result<T, Box<dyn Error>>,
     ) -> Result<Revisioned<T>, Box<dyn Error>> {
-        let transaction = self.read_db.multi_transaction(false);
-        let analysis_revision = analysis_revision(&transaction, view)?;
-        if analysis_revision == 0 {
+        within_query_budget(|| {
+            let transaction = self.read_db.multi_transaction(false);
+            let analysis_revision = analysis_revision(&transaction, view)?;
+            if analysis_revision == 0 {
+                transaction.abort()?;
+                return Err(Box::new(BeholderError::new(
+                    BeholderErrorKind::Unavailable,
+                    BeholderErrorCode::WorkspaceRevisionUnavailable,
+                    format!("workspace has no completed analysis revision: {view}"),
+                )) as Box<dyn Error>);
+            }
+            let result = read(&transaction)?;
+            let analysis = analysis_metadata(&transaction, view, analysis_revision)?;
             transaction.abort()?;
-            return Err(Box::new(BeholderError::new(
-                BeholderErrorKind::Unavailable,
-                BeholderErrorCode::WorkspaceRevisionUnavailable,
-                format!("workspace has no completed analysis revision: {view}"),
-            )));
-        }
-        let result = read(&transaction)?;
-        let analysis = analysis_metadata(&transaction, view, analysis_revision)?;
-        transaction.abort()?;
-        Ok(Revisioned {
-            result,
-            analysis_revision,
-            analysis,
+            Ok(Revisioned {
+                result,
+                analysis_revision,
+                analysis,
+            })
         })
     }
 
@@ -659,11 +669,13 @@ fn sqlite_pragma(path: &Path, pragma: &str) -> Result<u64, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{EnrichmentOwner, EnrichmentPayload};
     use crate::SemanticStore;
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
-        DependencyRelation, EntityFact, EntityKind, FactShard, LogicalRepository, Observation,
-        RepositoryFacts, RepositoryState, WorkspaceView,
+        Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, FactShard,
+        LogicalRepository, Observation, Provenance, RepositoryFacts, RepositoryState,
+        WorkspaceView,
     };
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity as DtoSeverity};
     use std::{
@@ -799,6 +811,141 @@ mod tests {
                 .edges
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn fact_shard_overrides_apply_to_bounded_traversals() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "overridden-shard",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example/repository".into(),
+                },
+                head: None,
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap()
+        .with_repository_contexts(BTreeMap::from([("rust".into(), BTreeMap::new())]))
+        .unwrap()
+        .with_repository_enrichment_inputs(BTreeMap::from([(
+            "rust".into(),
+            BTreeMap::from([("example/repository".into(), "semantic".into())]),
+        )]))
+        .unwrap();
+        let repository = facts(&view, Vec::new());
+        let owner = "repo://example/repository/rust/lib/run";
+        let base_unresolved = "rust-call://base-target";
+        let base_resolved = "repo://example/repository/rust/lib/base-target";
+        let enrichment_unresolved = "rust-call://enrichment-target";
+        let enrichment_resolved = "repo://example/repository/rust/lib/enrichment-target";
+        let shard = FactShard {
+            repository: "example/repository".into(),
+            producer: "rust".into(),
+            owner: owner.into(),
+            version: "body-1".into(),
+            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            observations: vec![
+                Observation::dependency(
+                    owner,
+                    DependencyRelation::Calls,
+                    base_unresolved,
+                    "src/lib.rs:1",
+                ),
+                Observation::dependency(
+                    owner,
+                    DependencyRelation::Calls,
+                    enrichment_unresolved,
+                    "src/lib.rs:2",
+                ),
+            ],
+        };
+        let base_override = DependencyOverride {
+            from: owner.into(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: base_unresolved.into(),
+            resolved_to: base_resolved.into(),
+            evidence: "src/lib.rs:1".into(),
+            confidence: Confidence::Inferred,
+            provenance: Provenance::UniqueNameHeuristic,
+        };
+        let enrichment_override = DependencyOverride {
+            from: owner.into(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: enrichment_unresolved.into(),
+            resolved_to: enrichment_resolved.into(),
+            evidence: "src/lib.rs:2".into(),
+            confidence: Confidence::Inferred,
+            provenance: Provenance::UniqueNameHeuristic,
+        };
+        store
+            .publish_verified_sharded(
+                &view,
+                &[repository],
+                &[base_override],
+                &[shard],
+                &[],
+                "verified",
+            )
+            .unwrap();
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
+        store
+            .publish_enrichment(
+                &view.name,
+                "example/repository",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "rust",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    overrides: &[enrichment_override],
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let dependencies = store.dependencies(&view.name, owner, 1).unwrap();
+        assert!(
+            dependencies
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.entity == base_resolved)
+        );
+        assert!(
+            dependencies
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.entity == enrichment_resolved)
+        );
+        for unresolved in [base_unresolved, enrichment_unresolved] {
+            assert!(
+                !dependencies
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.entity == unresolved)
+            );
+            assert!(
+                store
+                    .impact(&view.name, unresolved, 1)
+                    .unwrap()
+                    .affected
+                    .is_empty()
+            );
+        }
+        for resolved in [base_resolved, enrichment_resolved] {
+            assert!(
+                store
+                    .impact(&view.name, resolved, 1)
+                    .unwrap()
+                    .affected
+                    .iter()
+                    .any(|affected| affected.entity == owner)
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::jobs::{
     StoredJobKind, StoredJobStatus, StoredJobTarget,
 };
 use crate::repository_registry::RegisteredRepository;
+use crate::rpc::semantic_query;
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
     DEFAULT_MAX_HOPS, GarbageCollectionPhase,
@@ -214,12 +215,11 @@ impl Daemon for BeholderDaemon {
             .active_enrichment_repositories(&request.workspace)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        self.query_response(
-            &request.workspace,
-            enriching,
-            self.store
-                .context_snapshot(&request.workspace, &request.entity),
-        )
+        let store = self.store.clone();
+        let workspace = request.workspace.clone();
+        let entity = request.entity.clone();
+        let result = semantic_query(move || store.context_snapshot(&workspace, &entity)).await?;
+        self.query_response(&request.workspace, enriching, result)
     }
 
     #[tracing::instrument(
@@ -273,12 +273,13 @@ impl Daemon for BeholderDaemon {
             .active_enrichment_repositories(&request.workspace)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        self.query_response(
-            &request.workspace,
-            enriching,
-            self.store
-                .dependencies_snapshot(&request.workspace, &request.entity, max_hops),
-        )
+        let store = self.store.clone();
+        let workspace = request.workspace.clone();
+        let entity = request.entity.clone();
+        let result =
+            semantic_query(move || store.dependencies_snapshot(&workspace, &entity, max_hops))
+                .await?;
+        self.query_response(&request.workspace, enriching, result)
     }
 
     #[tracing::instrument(name = "rpc.get_status", skip_all, err)]
@@ -661,12 +662,12 @@ impl Daemon for BeholderDaemon {
             .active_enrichment_repositories(&request.workspace)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        self.query_response(
-            &request.workspace,
-            enriching,
-            self.store
-                .impact_snapshot(&request.workspace, &request.entity, max_hops),
-        )
+        let store = self.store.clone();
+        let workspace = request.workspace.clone();
+        let entity = request.entity.clone();
+        let result =
+            semantic_query(move || store.impact_snapshot(&workspace, &entity, max_hops)).await?;
+        self.query_response(&request.workspace, enriching, result)
     }
 
     #[tracing::instrument(name = "rpc.list_workspaces", skip_all, err)]
@@ -784,12 +785,13 @@ impl Daemon for BeholderDaemon {
             .active_enrichment_repositories(&request.workspace)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        self.query_response(
-            &request.workspace,
-            enriching,
-            self.store
-                .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops),
-        )
+        let store = self.store.clone();
+        let workspace = request.workspace.clone();
+        let from = request.from.clone();
+        let to = request.to.clone();
+        let result =
+            semantic_query(move || store.trace_snapshot(&workspace, &from, &to, max_hops)).await?;
+        self.query_response(&request.workspace, enriching, result)
     }
 
     #[tracing::instrument(
@@ -805,14 +807,20 @@ impl Daemon for BeholderDaemon {
             .active_enrichment_repositories(&request.workspace)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        let revisioned = self
-            .store
-            .trace_snapshot(&request.workspace, &request.from, &request.to, max_hops)
-            .map(|revisioned| Revisioned {
-                result: WhyResult::from(revisioned.result),
-                analysis_revision: revisioned.analysis_revision,
-                analysis: revisioned.analysis,
-            });
+        let store = self.store.clone();
+        let workspace = request.workspace.clone();
+        let from = request.from.clone();
+        let to = request.to.clone();
+        let revisioned = semantic_query(move || {
+            store
+                .trace_snapshot(&workspace, &from, &to, max_hops)
+                .map(|revisioned| Revisioned {
+                    result: WhyResult::from(revisioned.result),
+                    analysis_revision: revisioned.analysis_revision,
+                    analysis: revisioned.analysis,
+                })
+        })
+        .await?;
         self.query_response(&request.workspace, enriching, revisioned)
     }
 }

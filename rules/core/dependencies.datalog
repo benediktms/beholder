@@ -1,8 +1,0 @@
-reachable[node] := start[node]
-reachable[to] :=
-    reachable[from],
-    direct_pair[from, to]
-
-selected_edge[from, to, relation, evidence, confidence, provenance] :=
-    reachable[from],
-    direct[from, to, relation, evidence, confidence, provenance]

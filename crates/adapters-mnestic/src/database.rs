@@ -141,6 +141,21 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_FACT_SHARD_ENTITY_ID_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_FACT_SHARD_SELECTION_OWNER_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_FACT_SHARD_OBSERVATION_TO_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_OVERRIDE_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -150,6 +165,14 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
+    for script in [
+        CREATE_OVERRIDE_UNRESOLVED_INDEX,
+        CREATE_OVERRIDE_RESOLVED_INDEX,
+        CREATE_ENRICHMENT_OVERRIDE_SELECTION_UNRESOLVED_INDEX,
+        CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_RESOLVED_INDEX,
+    ] {
+        db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)?;
+    }
     db.run_script(
         CREATE_REVISION_SCHEMA,
         BTreeMap::new(),
@@ -157,6 +180,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
     )?;
     db.run_script(
         CREATE_REVISION_STATE_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_REVISION_STATE_STATE_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
@@ -558,6 +586,38 @@ pub(super) fn persistent_database(
             (
                 "analysis_enrichment_observation_selection:by_to",
                 CREATE_ENRICHMENT_OBSERVATION_SELECTION_TO_INDEX,
+            ),
+            (
+                "analysis_fact_shard_entity:by_id",
+                CREATE_FACT_SHARD_ENTITY_ID_INDEX,
+            ),
+            (
+                "analysis_fact_shard_selection:by_owner",
+                CREATE_FACT_SHARD_SELECTION_OWNER_INDEX,
+            ),
+            (
+                "analysis_fact_shard_observation:by_to",
+                CREATE_FACT_SHARD_OBSERVATION_TO_INDEX,
+            ),
+            (
+                "analysis_revision_state:by_state",
+                CREATE_REVISION_STATE_STATE_INDEX,
+            ),
+            (
+                "analysis_revision_dependency_override:by_unresolved",
+                CREATE_OVERRIDE_UNRESOLVED_INDEX,
+            ),
+            (
+                "analysis_revision_dependency_override:by_resolved",
+                CREATE_OVERRIDE_RESOLVED_INDEX,
+            ),
+            (
+                "analysis_enrichment_override_selection:by_unresolved",
+                CREATE_ENRICHMENT_OVERRIDE_SELECTION_UNRESOLVED_INDEX,
+            ),
+            (
+                "enrichment_override_contribution:by_resolved",
+                CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_RESOLVED_INDEX,
             ),
         ] {
             if !relations

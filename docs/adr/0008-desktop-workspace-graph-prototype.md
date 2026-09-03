@@ -208,7 +208,7 @@ There are two independent ceilings.
 
 #### Query ceiling
 
-`dependencies` and `impact` compute transitive reachability in Datalog first; the Rust mapper applies `max_hops` afterward ([dependency rules](../../rules/core/dependencies.datalog), [mapper](../../crates/adapters-mnestic/src/semantic.rs#L128-L146)). A low hop setting therefore bounds the returned graph but does not necessarily bound storage-query work. The daemon client also caps decoded responses at 64 MiB ([client](../../crates/daemon-client/src/lib.rs#L27-L45)).
+`dependencies`, `impact`, and `trace` acquire effective edges one bounded frontier at a time, including a final boundary probe used to report truncation; the Rust mapper then shapes the requested result ([query](../../crates/adapters-mnestic/src/query.rs), [mapper](../../crates/adapters-mnestic/src/semantic.rs)). The daemon client also caps decoded responses at 64 MiB ([client](../../crates/daemon-client/src/lib.rs#L27-L45)).
 
 Do not “fix” either limit in the UI prototype. Production integration must add
 the bounded workspace topology query first and measure it independently from

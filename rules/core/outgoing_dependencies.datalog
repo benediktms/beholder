@@ -1,0 +1,131 @@
+selected_state[state] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_state{view: $view, revision, state}
+
+selected_enrichment[owner] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_repository_enrichment{view: $view, revision, owner}
+
+baseline_observation[from, relation, to, evidence] :=
+    frontier[from],
+    selected_state[state],
+    *state_observation{state, from, relation, to, evidence}
+
+baseline_observation[from, relation, to, evidence] :=
+    frontier[from],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{view: $view, revision, from, relation, to, evidence}
+
+base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
+    frontier[from],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence,
+    },
+    *analysis_revision_dependency_override_metadata{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        confidence,
+        provenance,
+    }
+
+enrichment_override[
+    from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    frontier[from],
+    *analysis_enrichment_override_selection{
+        view: $view,
+        from,
+        relation,
+        unresolved_to,
+        owner,
+    },
+    selected_enrichment[owner],
+    *enrichment_override_contribution{
+        view: $view,
+        owner,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence,
+        confidence,
+        provenance,
+    }
+
+dependency_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
+    base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance]
+
+dependency_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
+    enrichment_override[
+        from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+    ],
+    not base_override[from, relation, unresolved_to, _, _, _, _]
+
+overridden[from, relation, unresolved_to, evidence] :=
+    baseline_observation[from, relation, unresolved_to, evidence],
+    dependency_override[from, relation, unresolved_to, _, _, _, _]
+
+selected_edge[from, to, relation, evidence, confidence, provenance] :=
+    frontier[from],
+    selected_state[state],
+    *state_dependency_observation{state, from, relation, to, evidence},
+    *state_observation_metadata{state, from, relation, to, confidence, provenance},
+    not overridden[from, relation, to, evidence]
+
+selected_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
+    base_override[from, relation, _, resolved_to, evidence, confidence, provenance]
+
+selected_edge[from, to, relation, evidence, confidence, provenance] :=
+    frontier[from],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    }
+
+selected_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
+    baseline_observation[from, relation, unresolved_to, evidence],
+    enrichment_override[
+        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
+    ],
+    not base_override[from, relation, _, _, _, _, _]
+
+selected_edge[from, to, relation, evidence, confidence, provenance] :=
+    frontier[from],
+    *analysis_enrichment_observation_selection{
+        view: $view,
+        from,
+        relation,
+        to,
+        evidence,
+        owner,
+    },
+    selected_enrichment[owner],
+    *enrichment_observation_contribution{
+        view: $view,
+        owner,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    },
+    not baseline_observation[from, relation, to, evidence],
+    not overridden[from, relation, to, evidence]
