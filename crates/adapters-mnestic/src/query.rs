@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const SEMANTIC_QUERY_WARNING_SECONDS: f64 = 5.0;
+const REPOSITORY_QUERY_TIMEOUT_SECONDS: f64 = 5.0;
 const SLOW_QUERY_SECONDS: f64 = 1.0;
 const QUERY_PLAN_TIMEOUT_SECONDS: f64 = 0.25;
 const ANALYSIS_METADATA_RULES: &str = include_str!("../../../rules/core/analysis_metadata.datalog");
@@ -370,14 +371,16 @@ pub(super) fn analysis_metadata(
 }
 
 pub(super) fn repository_revision(
-    db: &impl QueryRunner,
+    db: &DbInstance,
     repository: &str,
 ) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
     let params = BTreeMap::from([("repository".into(), repository.into())]);
-    let revision = db.run_query(
+    let revision = db.run_script_with_options(
         "?[source_state, analysis_identity, head, incomplete] := \
              *repository_revision{repository: $repository, source_state, analysis_identity, head, incomplete}",
         params.clone(),
+        ScriptMutability::Immutable,
+        ScriptRunOptions::new().with_timeout(REPOSITORY_QUERY_TIMEOUT_SECONDS),
     )?;
     let Some(row) = revision.rows.first() else {
         return Ok(None);
@@ -397,11 +400,13 @@ pub(super) fn repository_revision(
         DataValue::Bool(value) => *value,
         _ => return Err("stored repository completeness is not a boolean".into()),
     };
-    let diagnostics = db.run_query(
+    let diagnostics = db.run_script_with_options(
         "?[code, severity, path, line, detail] := \
              *repository_revision_diagnostic{repository: $repository, code, severity, path, line, detail}\n\
          :order severity, path, line, code",
         params,
+        ScriptMutability::Immutable,
+        ScriptRunOptions::new().with_timeout(REPOSITORY_QUERY_TIMEOUT_SECONDS),
     )?;
     let diagnostics = diagnostics
         .rows
