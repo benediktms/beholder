@@ -1,0 +1,39 @@
+selected_enrichment[owner, repository] :=
+    *analysis_revision{view: $view, revision: $revision},
+    *analysis_revision_repository_enrichment{
+        view: $view,
+        revision: $revision,
+        owner,
+        repository,
+    }
+
+enrichment_diagnostic[repository, code, severity, path, line, detail] :=
+    *analysis_enrichment_diagnostic_selection{
+        view: $view,
+        repository,
+        code,
+        severity,
+        path,
+        line,
+        owner,
+    },
+    selected_enrichment[owner, repository],
+    *enrichment_diagnostic_contribution{
+        view: $view,
+        owner,
+        repository,
+        code,
+        severity,
+        path,
+        line,
+        detail,
+    }
+
+selected_diagnostic_replacement[repository, code] :=
+    selected_enrichment[owner, repository],
+    *enrichment_diagnostic_replacement{
+        view: $view,
+        owner,
+        repository,
+        code,
+    }

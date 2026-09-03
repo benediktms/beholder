@@ -3,16 +3,29 @@ use beholder_dto::{
     AnalysisCompleteness, AnalysisDiagnostic, AnalysisDiagnosticSeverity, AnalysisMetadata,
     RepositoryRevision,
 };
-use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability};
+use mnestic_engine::{
+    DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions,
+};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::io;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+const SEMANTIC_QUERY_TIMEOUT_SECONDS: f64 = 5.0;
+const ANALYSIS_METADATA_RULES: &str = include_str!("../../../rules/core/analysis_metadata.datalog");
+
+thread_local! {
+    static SEMANTIC_QUERY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
 
 pub(super) trait QueryRunner {
     fn run_query(
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
+        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>>;
 }
 
@@ -21,8 +34,14 @@ impl QueryRunner for DbInstance {
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
+        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>> {
-        Ok(self.run_script(script, params, ScriptMutability::Immutable)?)
+        Ok(self.run_script_with_options(
+            script,
+            params,
+            ScriptMutability::Immutable,
+            ScriptRunOptions::new().with_timeout(timeout),
+        )?)
     }
 }
 
@@ -31,9 +50,19 @@ impl QueryRunner for MultiTransaction {
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
+        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>> {
-        Ok(self.run_script(script, params)?)
+        Ok(self.run_script(&format!("{script}\n:timeout {timeout}"), params)?)
     }
+}
+
+pub(super) fn within_query_budget<T>(read: impl FnOnce() -> T) -> T {
+    let previous = SEMANTIC_QUERY_DEADLINE.replace(Some(
+        Instant::now() + Duration::from_secs_f64(SEMANTIC_QUERY_TIMEOUT_SECONDS),
+    ));
+    let result = read();
+    SEMANTIC_QUERY_DEADLINE.set(previous);
+    result
 }
 
 pub(super) fn query(
@@ -48,7 +77,33 @@ pub(super) fn query(
             .into_iter()
             .map(|(name, value)| (name.into(), value)),
     );
-    db.run_query(script, params)
+    let timeout = SEMANTIC_QUERY_DEADLINE.with(|deadline| {
+        deadline
+            .get()
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64()
+            })
+            .unwrap_or(SEMANTIC_QUERY_TIMEOUT_SECONDS)
+    });
+    if timeout == 0.0 {
+        return Err(query_timeout().into());
+    }
+    db.run_query(script, params, timeout).map_err(|error| {
+        if error.to_string() == "Query exceeded its time budget" {
+            Box::new(query_timeout()) as Box<dyn Error>
+        } else {
+            error
+        }
+    })
+}
+
+fn query_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "semantic query exceeded its five-second budget",
+    )
 }
 
 pub(super) fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
@@ -114,7 +169,7 @@ pub(super) fn analysis_metadata(
         db,
         view,
         &format!(
-            "{DIRECT_RULES}\n\
+            "{ANALYSIS_METADATA_RULES}\n\
              baseline_diagnostic[repository, code, severity, path, line, detail] := \
                  *analysis_revision_diagnostic{{\
                      view: $view, revision: $revision, repository, code, severity, path, line, detail\
@@ -169,6 +224,7 @@ pub(super) fn repository_revision(
         "?[source_state, analysis_identity, head, incomplete] := \
              *repository_revision{repository: $repository, source_state, analysis_identity, head, incomplete}",
         params.clone(),
+        SEMANTIC_QUERY_TIMEOUT_SECONDS,
     )?;
     let Some(row) = revision.rows.first() else {
         return Ok(None);
@@ -193,6 +249,7 @@ pub(super) fn repository_revision(
              *repository_revision_diagnostic{repository: $repository, code, severity, path, line, detail}\n\
          :order severity, path, line, code",
         params,
+        SEMANTIC_QUERY_TIMEOUT_SECONDS,
     )?;
     let diagnostics = diagnostics
         .rows
@@ -266,41 +323,80 @@ pub(super) fn entity_facts(
     view: &str,
     entities: &BTreeSet<String>,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let entities = DataValue::List(
+    let requested = DataValue::List(
         entities
             .iter()
             .map(|id| DataValue::List(vec![id.as_str().into()]))
             .collect(),
     );
-    query(
+    let mut baseline = query(
         db,
         view,
         "requested[id] <- $entities\n\
          selected_state[state] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view: $view, revision, state}\n\
-         selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
-             *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
-         baseline_id[id] := requested[id], selected_state[state], *state_entity{state, id}\n\
-         baseline_id[id] := requested[id], *analysis_revision{view: $view, revision}, \
-             *analysis_revision_entity{view: $view, revision, id}\n\
-         baseline_id[id] := requested[id], \
-             *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
-             *analysis_fact_shard_entity{producer, owner, version, id}\n\
          ?[id, kind, metadata] := requested[id], selected_state[state], \
              *state_entity{state, id, kind, metadata}\n\
          ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
              *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
+         :order id",
+        [("entities", requested.clone())],
+    )?;
+    let mut baseline_ids = baseline
+        .rows
+        .iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+
+    let remaining = DataValue::List(
+        entities
+            .iter()
+            .filter(|id| !baseline_ids.contains(*id))
+            .map(|id| DataValue::List(vec![id.as_str().into()]))
+            .collect(),
+    );
+    let nested = query(
+        db,
+        view,
+        "requested[id] <- $entities\n\
          ?[id, kind, metadata] := requested[id], \
-             *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
-             *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
+             *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, \
+             *analysis_fact_shard_selection:by_owner{\
+                 view: $view, owner, producer, version\
+             }\n\
+         :order id\n\
+         :reorder written",
+        [("entities", remaining)],
+    )?;
+    baseline_ids.extend(
+        nested
+            .rows
+            .iter()
+            .filter_map(|row| row[0].get_str().map(str::to_owned)),
+    );
+    baseline.rows.extend(nested.rows);
+
+    let enrichment = query(
+        db,
+        view,
+        "requested[id] <- $entities\n\
+         selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
          ?[id, kind, metadata] := requested[id], \
              *analysis_enrichment_entity_selection{view: $view, id, owner}, \
              selected_enrichment[owner], \
-             *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, \
-             not baseline_id[id]\n\
+             *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
          :order id",
-        [("entities", entities)],
-    )
+        [("entities", requested)],
+    )?;
+    baseline
+        .rows
+        .extend(enrichment.rows.into_iter().filter(|row| {
+            row[0]
+                .get_str()
+                .is_some_and(|id| !baseline_ids.contains(id))
+        }));
+    Ok(baseline)
 }
 
 pub(super) fn inspect_observations(
@@ -369,46 +465,279 @@ pub(super) fn trace(
     view: &str,
     from: &str,
     _to: &str,
+    max_hops: u32,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    closure(db, view, from, DEPENDENCY_RULES)
+    closure(db, view, from, max_hops, TraversalDirection::Outgoing)
 }
 
 pub(super) fn impact(
     db: &impl QueryRunner,
     view: &str,
     entity: &str,
+    max_hops: u32,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    closure(db, view, entity, IMPACT_RULES)
+    closure(db, view, entity, max_hops, TraversalDirection::Incoming)
 }
 
 pub(super) fn dependencies(
     db: &impl QueryRunner,
     view: &str,
     entity: &str,
+    max_hops: u32,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    closure(db, view, entity, DEPENDENCY_RULES)
+    closure(db, view, entity, max_hops, TraversalDirection::Outgoing)
+}
+
+#[derive(Clone, Copy)]
+enum TraversalDirection {
+    Outgoing,
+    Incoming,
 }
 
 fn closure(
     db: &impl QueryRunner,
     view: &str,
     entity: &str,
-    traversal_rules: &str,
+    max_hops: u32,
+    direction: TraversalDirection,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        &format!(
-            "{DIRECT_RULES}\n{traversal_rules}\n\
-             start[] <- [[$from]]\n\
+    let rules = match direction {
+        TraversalDirection::Outgoing => vec![
+            (
+                OUTGOING_DEPENDENCY_RULES,
+                "selected_edge",
+                ":reorder written",
+            ),
+            (
+                OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
+                "shard_edge",
+                ":reorder written",
+            ),
+        ],
+        TraversalDirection::Incoming => vec![
+            (INCOMING_DEPENDENCY_RULES, "selected_edge", ""),
+            (
+                INCOMING_FACT_SHARD_DEPENDENCY_RULES,
+                "shard_edge",
+                ":reorder written",
+            ),
+        ],
+    };
+    let scripts = rules
+        .into_iter()
+        .map(|(rules, edge_rule, reorder)| {
+            format!(
+                "{rules}\n\
+                 frontier[id] <- $frontier\n\
+                 ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
+                     {edge_rule}[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                     row_kind = 'edge', entity = '', hops = 0\n\
+                 :order edge_from, edge_to, relation\n\
+                 {reorder}"
+            )
+        })
+        .collect::<Vec<_>>();
+    let override_rules = match direction {
+        TraversalDirection::Outgoing => OUTGOING_DEPENDENCY_OVERRIDE_QUERY,
+        TraversalDirection::Incoming => INCOMING_DEPENDENCY_OVERRIDE_QUERY,
+    };
+    let override_script = format!(
+        "{override_rules}\n\
+         frontier[id] <- $frontier"
+    );
+    let boundary_projection = match direction {
+        TraversalDirection::Outgoing => {
+            "\
              ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 selected_edge[\
-                     edge_from, edge_to, relation, evidence, confidence, provenance\
-                 ], \
-                 row_kind = 'edge', entity = '', hops = 0\n\
-             :order edge_from, edge_to, relation"
+                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 frontier[edge_from], not visited[edge_to], \
+                 row_kind = 'edge', entity = '', hops = 0"
+        }
+        TraversalDirection::Incoming => {
+            "\
+             special[edge_from, edge_to, relation] := \
+                 boundary_edge[edge_from, edge_to, relation, _, _, _], \
+                 relation = 'implemented_by', starts_with(edge_from, 'grpc://')\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
+                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 frontier[edge_to], not special[edge_from, edge_to, relation], \
+                 not visited[edge_from], row_kind = 'edge', entity = '', hops = 0\n\
+             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
+                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 special[edge_from, edge_to, relation], frontier[edge_from], \
+                 not visited[edge_to], row_kind = 'edge', entity = '', hops = 0"
+        }
+    };
+    let (core_rules, shard_rules, shard_not_overridden) = match direction {
+        TraversalDirection::Outgoing => (
+            OUTGOING_DEPENDENCY_RULES,
+            OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
+            "not dependency_override[from, relation, to, _, _, _, _]",
         ),
-        [("from", entity.into())],
+        TraversalDirection::Incoming => (
+            INCOMING_DEPENDENCY_RULES,
+            INCOMING_FACT_SHARD_DEPENDENCY_RULES,
+            "not dependency_override[from, relation, to]",
+        ),
+    };
+    let boundary_scripts = [
+        format!(
+            "{core_rules}\n\
+             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
+                 selected_edge[from, to, relation, evidence, confidence, provenance]\n\
+             frontier[id] <- $frontier\n\
+             visited[id] <- $visited\n\
+             {boundary_projection}\n\
+             :limit 1"
+        ),
+        format!(
+            "{core_rules}\n{shard_rules}\n\
+             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
+                 shard_edge[from, to, relation, evidence, confidence, provenance], \
+                 {shard_not_overridden}\n\
+             frontier[id] <- $frontier\n\
+             visited[id] <- $visited\n\
+             {boundary_projection}\n\
+             :limit 1"
+        ),
+    ];
+    let mut frontier = BTreeSet::from([entity.to_owned()]);
+    let mut visited = frontier.clone();
+    let mut rows = Vec::new();
+    let mut headers = Vec::new();
+    for hops in 0..=max_hops {
+        let values = DataValue::List(
+            frontier
+                .iter()
+                .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                .collect(),
+        );
+        if hops == max_hops {
+            let visited_values = DataValue::List(
+                visited
+                    .iter()
+                    .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                    .collect(),
+            );
+            for script in &boundary_scripts {
+                let mut result = query(
+                    db,
+                    view,
+                    script,
+                    [
+                        ("frontier", values.clone()),
+                        ("visited", visited_values.clone()),
+                    ],
+                )?;
+                if headers.is_empty() {
+                    headers = result.headers;
+                }
+                if let Some(mut row) = result.rows.pop() {
+                    row[2] = i64::from(hops).into();
+                    rows.push(row);
+                    break;
+                }
+            }
+            break;
+        }
+        let mut edge_groups = Vec::new();
+        for script in &scripts {
+            let result = query(db, view, script, [("frontier", values.clone())])?;
+            if headers.is_empty() {
+                headers = result.headers;
+            }
+            edge_groups.push(result.rows);
+        }
+        let overrides = query(db, view, &override_script, [("frontier", values)])?;
+        merge_fact_shard_overrides(&mut edge_groups[1], overrides.rows, direction, &frontier);
+        let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
+        for row in &mut result_rows {
+            row[2] = i64::from(hops).into();
+        }
+        let mut next = BTreeSet::new();
+        for row in &result_rows {
+            let from = row[3].get_str().unwrap_or_default();
+            let to = row[4].get_str().unwrap_or_default();
+            let relation = row[5].get_str().unwrap_or_default();
+            let entity = match direction {
+                TraversalDirection::Outgoing => to,
+                TraversalDirection::Incoming
+                    if relation == "implemented_by" && from.starts_with("grpc://") =>
+                {
+                    to
+                }
+                TraversalDirection::Incoming => from,
+            };
+            if visited.insert(entity.to_owned()) {
+                next.insert(entity.to_owned());
+            }
+        }
+        rows.extend(result_rows);
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok(NamedRows::new(headers, rows))
+}
+
+fn merge_fact_shard_overrides(
+    shard_edges: &mut Vec<Vec<DataValue>>,
+    overrides: Vec<Vec<DataValue>>,
+    direction: TraversalDirection,
+    frontier: &BTreeSet<String>,
+) {
+    let original = std::mem::take(shard_edges);
+    let overridden = overrides
+        .iter()
+        .map(|row| edge_key(row, 1))
+        .collect::<BTreeSet<_>>();
+    shard_edges.extend(
+        original
+            .iter()
+            .filter(|row| !overridden.contains(&edge_key(row, 4)))
+            .cloned(),
+    );
+    for mut override_ in overrides {
+        let resolved_is_frontier = override_[4]
+            .get_str()
+            .is_some_and(|resolved| frontier.contains(resolved));
+        match (override_[0].get_str(), direction) {
+            (Some("base_override"), TraversalDirection::Outgoing) => {
+                override_[0] = "edge".into();
+                override_[1] = "".into();
+                shard_edges.push(override_);
+            }
+            (Some("base_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
+                override_[0] = "edge".into();
+                override_[1] = "".into();
+                shard_edges.push(override_);
+            }
+            (Some("enrichment_override"), TraversalDirection::Outgoing) => {
+                let key = edge_key(&override_, 1);
+                for row in original.iter().filter(|row| edge_key(row, 4) == key) {
+                    let mut resolved = override_.clone();
+                    resolved[0] = "edge".into();
+                    resolved[1] = "".into();
+                    resolved[6] = row[6].clone();
+                    shard_edges.push(resolved);
+                }
+            }
+            (Some("enrichment_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
+                override_[0] = "edge".into();
+                override_[1] = "".into();
+                shard_edges.push(override_);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn edge_key(row: &[DataValue], target: usize) -> (String, String, String) {
+    (
+        row[3].get_str().unwrap_or_default().to_owned(),
+        row[5].get_str().unwrap_or_default().to_owned(),
+        row[target].get_str().unwrap_or_default().to_owned(),
     )
 }
 
@@ -423,10 +752,75 @@ mod tests {
     };
     use mnestic_engine::ScriptMutability;
     use std::{
+        cell::RefCell,
         collections::{BTreeMap, BTreeSet},
-        fs,
+        fs, thread,
+        time::Duration,
         time::SystemTime,
     };
+
+    struct TimeoutRunner(RefCell<Vec<f64>>);
+
+    impl QueryRunner for TimeoutRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            timeout: f64,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            self.0.borrow_mut().push(timeout);
+            Ok(NamedRows::default())
+        }
+    }
+
+    #[test]
+    fn one_budget_is_shared_by_every_query_in_a_semantic_read() {
+        let runner = TimeoutRunner(RefCell::new(Vec::new()));
+
+        within_query_budget(|| {
+            query(&runner, "main", "?[value] <- [[1]]", []).unwrap();
+            thread::sleep(Duration::from_millis(5));
+            query(&runner, "main", "?[value] <- [[1]]", []).unwrap();
+        });
+
+        let timeouts = runner.0.into_inner();
+        assert!(timeouts[0] <= SEMANTIC_QUERY_TIMEOUT_SECONDS);
+        assert!(timeouts[1] < timeouts[0]);
+
+        SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() - Duration::from_millis(1)));
+        let error = query(
+            &TimeoutRunner(RefCell::new(Vec::new())),
+            "main",
+            "?[value] <- [[1]]",
+            [],
+        )
+        .unwrap_err();
+        SEMANTIC_QUERY_DEADLINE.set(None);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[test]
+    fn mnestic_stops_work_when_the_query_budget_expires() {
+        let db = memory_database().unwrap();
+        SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() + Duration::from_millis(1)));
+        let error = query(
+            &db,
+            "main",
+            "?[left, right] := left in int_range(100000), right in int_range(100000)",
+            [],
+        )
+        .unwrap_err();
+        SEMANTIC_QUERY_DEADLINE.set(None);
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
+    }
+
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
         RepositoryFacts {
             state: view.repository_states[0].clone(),
@@ -474,6 +868,8 @@ mod tests {
                     ['diamond-state', 'start', 'calls', 'right', 'right:1'],
                     ['diamond-state', 'left', 'calls', 'end', 'left:2'],
                     ['diamond-state', 'right', 'calls', 'end', 'right:2'],
+                    ['diamond-state', 'before', 'calls', 'start', 'before:1'],
+                    ['diamond-state', 'end', 'calls', 'far', 'far:1'],
                  ]
                  :put state_dependency_observation {state, from, relation, to => evidence}",
             BTreeMap::new(),
@@ -513,7 +909,16 @@ mod tests {
             "start",
             "end",
             beholder_dto::DEFAULT_MAX_HOPS,
-            crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+            crate::inspection::inspection_result(
+                trace(
+                    &db,
+                    "diamond",
+                    "start",
+                    "end",
+                    beholder_dto::DEFAULT_MAX_HOPS,
+                )
+                .unwrap(),
+            ),
             crate::inspection::InspectionResult {
                 headers: Vec::new(),
                 rows: Vec::new(),
@@ -523,12 +928,29 @@ mod tests {
         .unwrap();
         assert_eq!(result.paths[0].nodes, ["start", "left", "end"]);
 
+        let boundary = dependencies(&db, "diamond", "start", 0).unwrap();
+        assert_eq!(boundary.rows.len(), 1);
+
+        let limited_rows = trace(&db, "diamond", "start", "end", 1).unwrap();
+        assert!(
+            limited_rows
+                .rows
+                .iter()
+                .all(|row| row[3].get_str() != Some("end"))
+        );
+        let limited_impact = impact(&db, "diamond", "end", 1).unwrap();
+        assert!(
+            limited_impact
+                .rows
+                .iter()
+                .all(|row| row[3].get_str() != Some("before"))
+        );
         let limited = crate::semantic::trace(
             "diamond",
             "start",
             "end",
             1,
-            crate::inspection::inspection_result(trace(&db, "diamond", "start", "end").unwrap()),
+            crate::inspection::inspection_result(limited_rows),
             crate::inspection::InspectionResult {
                 headers: Vec::new(),
                 rows: Vec::new(),

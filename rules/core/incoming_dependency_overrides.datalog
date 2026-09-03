@@ -1,0 +1,177 @@
+selected_enrichment[owner] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_repository_enrichment{view: $view, revision, owner}
+
+base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
+    frontier[unresolved_to],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override:by_unresolved{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence,
+    },
+    *analysis_revision_dependency_override_metadata{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        confidence,
+        provenance,
+    }
+
+base_override_exists[from, relation, unresolved_to] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+    }
+
+base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
+    frontier[resolved_to],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override:by_resolved{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence,
+    },
+    *analysis_revision_dependency_override_metadata{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+        confidence,
+        provenance,
+    }
+
+effective_override[
+    kind, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance],
+    kind = 'base_override'
+
+effective_override[
+    kind, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    frontier[unresolved_to],
+    *analysis_enrichment_override_selection:by_unresolved{
+        view: $view,
+        from,
+        relation,
+        unresolved_to,
+        owner,
+    },
+    selected_enrichment[owner],
+    *analysis_fact_shard_observation:by_to{
+        to: unresolved_to,
+        producer,
+        owner: shard_owner,
+        version,
+        from,
+        relation,
+        evidence: baseline_evidence,
+    },
+    *analysis_fact_shard_selection:by_owner{
+        view: $view,
+        owner: shard_owner,
+        producer,
+        version,
+    },
+    *enrichment_override_contribution{
+        view: $view,
+        owner,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence: override_evidence,
+        confidence,
+        provenance,
+    },
+    not base_override_exists[from, relation, unresolved_to],
+    kind = 'enrichment_override',
+    evidence = baseline_evidence
+
+effective_override[
+    kind, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+] :=
+    frontier[resolved_to],
+    *enrichment_override_contribution:by_resolved{
+        view: $view,
+        owner,
+        from,
+        relation,
+        unresolved_to,
+        resolved_to,
+        evidence: override_evidence,
+        confidence,
+        provenance,
+    },
+    *analysis_enrichment_override_selection{
+        view: $view,
+        from,
+        relation,
+        unresolved_to,
+        owner,
+    },
+    selected_enrichment[owner],
+    *analysis_fact_shard_observation:by_to{
+        to: unresolved_to,
+        producer,
+        owner: shard_owner,
+        version,
+        from,
+        relation,
+        evidence: baseline_evidence,
+    },
+    *analysis_fact_shard_selection:by_owner{
+        view: $view,
+        owner: shard_owner,
+        producer,
+        version,
+    },
+    not base_override_exists[from, relation, unresolved_to],
+    kind = 'enrichment_override',
+    evidence = baseline_evidence
+
+?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] :=
+    effective_override[
+        row_kind,
+        edge_from,
+        relation,
+        entity,
+        edge_to,
+        evidence,
+        confidence,
+        provenance,
+    ],
+    frontier[entity],
+    hops = 0
+
+?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] :=
+    effective_override[
+        row_kind,
+        edge_from,
+        relation,
+        entity,
+        edge_to,
+        evidence,
+        confidence,
+        provenance,
+    ],
+    frontier[edge_to],
+    hops = 0
+
+:order edge_from, edge_to, relation

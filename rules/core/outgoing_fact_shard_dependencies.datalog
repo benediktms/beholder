@@ -1,0 +1,28 @@
+shard_edge[from, to, relation, evidence, confidence, provenance] :=
+    frontier[from],
+    *analysis_fact_shard_dependency_observation:by_from{
+        from,
+        producer,
+        owner,
+        version,
+        relation,
+        to,
+        evidence,
+    },
+    *analysis_fact_shard_selection:by_owner{
+        view: $view,
+        owner,
+        producer,
+        version,
+    },
+    *analysis_fact_shard_observation{
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        to,
+        evidence,
+        confidence,
+        provenance,
+    }
