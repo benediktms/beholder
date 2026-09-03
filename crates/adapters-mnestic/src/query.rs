@@ -357,13 +357,17 @@ pub(super) fn analysis_metadata(
     view: &str,
     revision: u64,
 ) -> Result<AnalysisMetadata, Box<dyn Error>> {
-    let rows = query(
+    let revision = i64::try_from(revision)?;
+    let rows = observed_query(
         db,
-        view,
-        "?[incomplete] := *analysis_revision_metadata{\
+        QuerySpec::new(
+            "analysis_metadata.completeness",
+            view,
+            "?[incomplete] := *analysis_revision_metadata{\
              view: $view, revision: $revision, incomplete\
          }",
-        [("revision", i64::try_from(revision)?.into())],
+        ),
+        || vec![("revision", revision.into())],
     )?;
     let incomplete = rows
         .rows
@@ -373,24 +377,24 @@ pub(super) fn analysis_metadata(
             _ => None,
         })
         .unwrap_or_default();
-    let rows = query(
+    let script = format!(
+        "{ANALYSIS_METADATA_RULES}\n\
+         baseline_diagnostic[repository, code, severity, path, line, detail] := \
+             *analysis_revision_diagnostic{{\
+                 view: $view, revision: $revision, repository, code, severity, path, line, detail\
+             }}, \
+             not selected_diagnostic_replacement[repository, code]\n\
+         ?[repository, code, severity, path, line, detail] := \
+             baseline_diagnostic[repository, code, severity, path, line, detail]\n\
+         ?[repository, code, severity, path, line, detail] := \
+             enrichment_diagnostic[repository, code, severity, path, line, detail], \
+             not baseline_diagnostic[repository, code, severity, path, line, _]\n\
+         :order severity, repository, path, line, code"
+    );
+    let rows = observed_query(
         db,
-        view,
-        &format!(
-            "{ANALYSIS_METADATA_RULES}\n\
-             baseline_diagnostic[repository, code, severity, path, line, detail] := \
-                 *analysis_revision_diagnostic{{\
-                     view: $view, revision: $revision, repository, code, severity, path, line, detail\
-                 }}, \
-                 not selected_diagnostic_replacement[repository, code]\n\
-             ?[repository, code, severity, path, line, detail] := \
-                 baseline_diagnostic[repository, code, severity, path, line, detail]\n\
-             ?[repository, code, severity, path, line, detail] := \
-                 enrichment_diagnostic[repository, code, severity, path, line, detail], \
-                 not baseline_diagnostic[repository, code, severity, path, line, _]\n\
-             :order severity, repository, path, line, code"
-        ),
-        [("revision", i64::try_from(revision)?.into())],
+        QuerySpec::new("analysis_metadata.diagnostics", view, &script),
+        || vec![("revision", revision.into())],
     )?;
     let diagnostics = rows
         .rows
