@@ -701,7 +701,7 @@ mod tests {
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
         Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, FactShard,
         LogicalRepository, Observation, Provenance, RepositoryFacts, RepositoryState,
-        WorkspaceView,
+        StructuralRelation, WorkspaceView,
     };
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity as DtoSeverity};
     use mnestic_engine::NamedRows;
@@ -911,6 +911,7 @@ mod tests {
         let enrichment_unresolved = "rust-call://enrichment-target";
         let enrichment_resolved = "repo://example/repository/rust/lib/enrichment-target";
         let duplicate_target = "rust-call://duplicate-target";
+        let structural_target = "repo://example/repository/rust/lib/structural-target";
         let shard = FactShard {
             repository: "example/repository".into(),
             producer: "rust".into(),
@@ -941,6 +942,12 @@ mod tests {
                     DependencyRelation::Calls,
                     duplicate_target,
                     "src/lib.rs:5",
+                ),
+                Observation::structural(
+                    source,
+                    StructuralRelation::Defines,
+                    structural_target,
+                    "src/lib.rs:8",
                 ),
             ],
         };
@@ -994,6 +1001,14 @@ mod tests {
         );
         duplicate_plain_observation.confidence = Confidence::Inferred;
         duplicate_plain_observation.provenance = Provenance::UniqueNameHeuristic;
+        let mut duplicate_structural_observation = Observation::structural(
+            source,
+            StructuralRelation::Defines,
+            structural_target,
+            "src/lib.rs:8",
+        );
+        duplicate_structural_observation.confidence = Confidence::Inferred;
+        duplicate_structural_observation.provenance = Provenance::UniqueNameHeuristic;
         store
             .publish_verified_sharded(
                 &view,
@@ -1016,7 +1031,11 @@ mod tests {
                     version: "1",
                 },
                 EnrichmentPayload {
-                    observations: &[duplicate_override_observation, duplicate_plain_observation],
+                    observations: &[
+                        duplicate_override_observation,
+                        duplicate_plain_observation,
+                        duplicate_structural_observation,
+                    ],
                     overrides: &[
                         enrichment_override,
                         losing_enrichment_override,
@@ -1045,6 +1064,19 @@ mod tests {
             .unwrap();
 
         let dependencies = store.dependencies(&view.name, source, 1).unwrap();
+        assert!(
+            !dependencies
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.entity == structural_target)
+        );
+        assert!(
+            store
+                .impact(&view.name, structural_target, 1)
+                .unwrap()
+                .affected
+                .is_empty()
+        );
         assert!(
             dependencies
                 .dependencies

@@ -2,6 +2,12 @@ selected_enrichment[owner] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_repository_enrichment{view: $view, revision, owner}
 
+dependency_relation[relation] <- [
+    ['binds_contract'], ['calls'], ['calls_graphql'], ['calls_rpc'], ['consumed_by'],
+    ['implements'], ['implemented_by'], ['imports'], ['publishes'], ['requires'],
+    ['resolved_by'], ['selects'], ['uses'],
+]
+
 baseline_observation[from, relation, to, evidence] :=
     frontier[to],
     *state_observation:by_to{state, from, relation, to, evidence},
@@ -237,6 +243,7 @@ selected_edge[from, to, relation, evidence, confidence, provenance] :=
         confidence,
         provenance,
     },
+    dependency_relation[relation],
     not baseline_observation[from, relation, to, evidence],
     not dependency_override[from, relation, to]
 
