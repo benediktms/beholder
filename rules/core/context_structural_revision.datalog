@@ -1,6 +1,12 @@
+structural_relation[relation] <- [
+    ['defines'], ['field_of'], ['request_type'], ['response_type']
+]
+
 ?[direction, relation, related, evidence, confidence, provenance] :=
-    *analysis_resolved_dependency{
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
         view: $view,
+        revision,
         from: $entity,
         relation,
         to: related,
@@ -8,11 +14,14 @@
         confidence,
         provenance,
     },
+    structural_relation[relation],
     direction = 'outgoing'
 
 ?[direction, relation, related, evidence, confidence, provenance] :=
-    *analysis_resolved_dependency:by_to{
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation:by_to{
         view: $view,
+        revision,
         from: related,
         relation,
         to: $entity,
@@ -20,6 +29,7 @@
         confidence,
         provenance,
     },
+    structural_relation[relation],
     direction = 'incoming'
 
 :order direction, relation, related

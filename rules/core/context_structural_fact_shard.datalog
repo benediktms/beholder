@@ -1,0 +1,41 @@
+structural_relation[relation] <- [
+    ['defines'], ['field_of'], ['request_type'], ['response_type']
+]
+
+selected_shard[producer, owner, version] :=
+    *analysis_fact_shard_selection{view: $view, producer, owner, version}
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_fact_shard_observation:by_from{
+        producer,
+        owner,
+        version,
+        from: $entity,
+        relation,
+        to: related,
+        evidence,
+        confidence,
+        provenance,
+    },
+    selected_shard[producer, owner, version],
+    structural_relation[relation],
+    direction = 'outgoing'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_fact_shard_observation:by_to{
+        producer,
+        owner,
+        version,
+        from: related,
+        relation,
+        to: $entity,
+        evidence,
+        confidence,
+        provenance,
+    },
+    selected_shard[producer, owner, version],
+    structural_relation[relation],
+    direction = 'incoming'
+
+:order direction, relation, related
+:reorder written

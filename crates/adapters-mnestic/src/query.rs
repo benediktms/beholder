@@ -6,42 +6,147 @@ use beholder_dto::{
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions,
 };
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::io;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const SEMANTIC_QUERY_TIMEOUT_SECONDS: f64 = 5.0;
+const SEMANTIC_QUERY_WARNING_SECONDS: f64 = 5.0;
+const REPOSITORY_QUERY_TIMEOUT_SECONDS: f64 = 5.0;
+const SLOW_QUERY_SECONDS: f64 = 1.0;
+const QUERY_PLAN_TIMEOUT_SECONDS: f64 = 0.25;
 const ANALYSIS_METADATA_RULES: &str = include_str!("../../../rules/core/analysis_metadata.datalog");
-
-thread_local! {
-    static SEMANTIC_QUERY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
-}
 
 pub(super) trait QueryRunner {
     fn run_query(
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
-        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>>;
+
+    fn explain_query(
+        &self,
+        _script: &str,
+        _params: BTreeMap<String, DataValue>,
+        _timeout: f64,
+    ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+        Ok(None)
+    }
+
+    fn run<Q: MnesticQuery>(&self, view: &str, params: Q::Params) -> Result<Vec<Q::Row>, QueryError>
+    where
+        Self: Sized,
+    {
+        let bind = || {
+            let mut bound = BTreeMap::from([("view".into(), view.into())]);
+            bound.extend(Q::bind(&params));
+            bound
+        };
+        let result =
+            observed_bound_query(self, QuerySpec::new(Q::OPERATION, view, Q::SCRIPT), bind)
+                .map_err(|error| QueryError::new(Q::OPERATION, error.to_string()))?;
+        let expected = Q::HEADERS
+            .iter()
+            .map(|header| (*header).to_owned())
+            .collect::<Vec<_>>();
+        if result.headers != expected {
+            return Err(QueryError::new(
+                Q::OPERATION,
+                format!(
+                    "unexpected output headers: expected {expected:?}, got {:?}",
+                    result.headers
+                ),
+            ));
+        }
+        if let Some((index, row)) = result
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.len() != expected.len())
+        {
+            return Err(QueryError::new(
+                Q::OPERATION,
+                format!(
+                    "unexpected row width at row {index}: expected {}, got {}",
+                    expected.len(),
+                    row.len()
+                ),
+            ));
+        }
+        result
+            .rows
+            .iter()
+            .map(|row| Q::decode(&result.headers, row))
+            .collect()
+    }
 }
+
+pub(super) trait MnesticQuery {
+    const OPERATION: &'static str;
+    const SCRIPT: &'static str;
+    const HEADERS: &'static [&'static str];
+
+    type Params;
+    type Row;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue>;
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError>;
+}
+
+#[derive(Debug)]
+pub(super) struct QueryError {
+    operation: &'static str,
+    detail: String,
+}
+
+impl QueryError {
+    fn new(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            operation,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Mnestic query {} failed: {}",
+            self.operation, self.detail
+        )
+    }
+}
+
+impl Error for QueryError {}
 
 impl QueryRunner for DbInstance {
     fn run_query(
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
-        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>> {
         Ok(self.run_script_with_options(
             script,
             params,
             ScriptMutability::Immutable,
-            ScriptRunOptions::new().with_timeout(timeout),
+            ScriptRunOptions::new(),
         )?)
+    }
+
+    fn explain_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        timeout: f64,
+    ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+        Ok(Some(self.run_script_with_options(
+            &format!("::explain {{ {script} }}"),
+            params,
+            ScriptMutability::Immutable,
+            ScriptRunOptions::new().with_timeout(timeout),
+        )?))
     }
 }
 
@@ -50,22 +155,79 @@ impl QueryRunner for MultiTransaction {
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
-        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>> {
-        Ok(self.run_script(&format!("{script}\n:timeout {timeout}"), params)?)
+        Ok(self.run_script(script, params)?)
     }
 }
 
-pub(super) fn within_query_budget<T>(read: impl FnOnce() -> T) -> T {
-    let previous = SEMANTIC_QUERY_DEADLINE.replace(Some(
-        Instant::now() + Duration::from_secs_f64(SEMANTIC_QUERY_TIMEOUT_SECONDS),
-    ));
+pub(super) struct SnapshotQueryRunner<'a> {
+    transaction: &'a MultiTransaction,
+    explain_db: &'a DbInstance,
+}
+
+impl<'a> SnapshotQueryRunner<'a> {
+    pub(super) fn new(transaction: &'a MultiTransaction, explain_db: &'a DbInstance) -> Self {
+        Self {
+            transaction,
+            explain_db,
+        }
+    }
+}
+
+impl QueryRunner for SnapshotQueryRunner<'_> {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        self.transaction.run_query(script, params)
+    }
+
+    fn explain_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        timeout: f64,
+    ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+        self.explain_db.explain_query(script, params, timeout)
+    }
+}
+
+pub(super) fn warn_on_slow_semantic_query<T>(read: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
     let result = read();
-    SEMANTIC_QUERY_DEADLINE.set(previous);
+    let elapsed = started.elapsed();
+    if semantic_query_is_slow(elapsed) {
+        tracing::warn!(
+            elapsed_ms = elapsed.as_millis(),
+            threshold_seconds = SEMANTIC_QUERY_WARNING_SECONDS,
+            "semantic query exceeded warning threshold"
+        );
+    }
     result
 }
 
-pub(super) fn query(
+fn semantic_query_is_slow(elapsed: Duration) -> bool {
+    elapsed.as_secs_f64() >= SEMANTIC_QUERY_WARNING_SECONDS
+}
+
+struct QuerySpec<'a> {
+    operation: &'static str,
+    view: &'a str,
+    script: &'a str,
+}
+
+impl<'a> QuerySpec<'a> {
+    fn new(operation: &'static str, view: &'a str, script: &'a str) -> Self {
+        Self {
+            operation,
+            view,
+            script,
+        }
+    }
+}
+
+fn query(
     db: &impl QueryRunner,
     view: &str,
     script: &str,
@@ -77,33 +239,117 @@ pub(super) fn query(
             .into_iter()
             .map(|(name, value)| (name.into(), value)),
     );
-    let timeout = SEMANTIC_QUERY_DEADLINE.with(|deadline| {
-        deadline
-            .get()
-            .map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_secs_f64()
-            })
-            .unwrap_or(SEMANTIC_QUERY_TIMEOUT_SECONDS)
-    });
-    if timeout == 0.0 {
-        return Err(query_timeout().into());
-    }
-    db.run_query(script, params, timeout).map_err(|error| {
-        if error.to_string() == "Query exceeded its time budget" {
-            Box::new(query_timeout()) as Box<dyn Error>
-        } else {
-            error
-        }
+    db.run_query(script, params)
+}
+
+fn observed_query(
+    db: &impl QueryRunner,
+    spec: QuerySpec<'_>,
+    additions: impl Fn() -> Vec<(&'static str, DataValue)>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let view = spec.view;
+    observed_bound_query(db, spec, || {
+        let mut params = BTreeMap::from([("view".into(), view.into())]);
+        params.extend(
+            additions()
+                .into_iter()
+                .map(|(name, value)| (name.into(), value)),
+        );
+        params
     })
 }
 
-fn query_timeout() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::TimedOut,
-        "semantic query exceeded its five-second budget",
-    )
+fn observed_bound_query(
+    db: &impl QueryRunner,
+    spec: QuerySpec<'_>,
+    params: impl Fn() -> BTreeMap<String, DataValue>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let (result, elapsed, span_enabled) = {
+        let span = tracing::info_span!(
+            "db.query",
+            otel.kind = "client",
+            peer.service = "mnestic",
+            db.system.name = "mnestic",
+            db.namespace = spec.view,
+            db.operation = spec.operation,
+            db.rows = tracing::field::Empty,
+            db.outcome = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.status_message = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
+        let result = db.run_query(spec.script, params());
+        let elapsed = started.elapsed();
+        span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
+        if let Ok(rows) = &result {
+            span.record("db.rows", rows.rows.len());
+        } else if let Err(error) = &result {
+            span.record("otel.status_code", "ERROR");
+            span.record("otel.status_message", tracing::field::display(error));
+        }
+        (result, elapsed, !span.is_disabled())
+    };
+    if span_enabled && (result.is_err() || elapsed.as_secs_f64() >= SLOW_QUERY_SECONDS) {
+        let span = tracing::info_span!(
+            "db.query.explain",
+            otel.kind = "client",
+            peer.service = "mnestic",
+            db.system.name = "mnestic",
+            db.namespace = spec.view,
+            db.operation = spec.operation,
+            db.plan.outcome = tracing::field::Empty,
+            db.plan.materialized_joins = tracing::field::Empty,
+            db.plan.prefix_joins = tracing::field::Empty,
+            db.plan.stored_loads = tracing::field::Empty,
+            db.plan.loaded_relations = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let plan = db.explain_query(spec.script, params(), QUERY_PLAN_TIMEOUT_SECONDS);
+        match plan {
+            Ok(Some(plan)) => record_query_plan(&span, &plan),
+            Ok(None) => {
+                span.record("db.plan.outcome", "unsupported");
+            }
+            Err(_) => {
+                span.record("db.plan.outcome", "error");
+            }
+        }
+    }
+    result
+}
+
+fn record_query_plan(span: &tracing::Span, plan: &NamedRows) {
+    let Some(operation_column) = plan.headers.iter().position(|header| header == "op") else {
+        span.record("db.plan.outcome", "invalid");
+        return;
+    };
+    let reference_column = plan.headers.iter().position(|header| header == "ref");
+    let mut materialized_joins = 0;
+    let mut prefix_joins = 0;
+    let mut stored_loads = 0;
+    let mut loaded_relations = BTreeSet::new();
+    for row in &plan.rows {
+        match row[operation_column].get_str() {
+            Some("stored_mat_join") => materialized_joins += 1,
+            Some("stored_prefix_join") => prefix_joins += 1,
+            Some(operation) if operation.starts_with("load_stored") => {
+                stored_loads += 1;
+                if let Some(relation) = reference_column.and_then(|column| row[column].get_str()) {
+                    loaded_relations.insert(relation);
+                }
+            }
+            _ => {}
+        }
+    }
+    span.record("db.plan.outcome", "ok");
+    span.record("db.plan.materialized_joins", materialized_joins);
+    span.record("db.plan.prefix_joins", prefix_joins);
+    span.record("db.plan.stored_loads", stored_loads);
+    span.record(
+        "db.plan.loaded_relations",
+        loaded_relations.into_iter().collect::<Vec<_>>().join(","),
+    );
 }
 
 pub(super) fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
@@ -149,13 +395,17 @@ pub(super) fn analysis_metadata(
     view: &str,
     revision: u64,
 ) -> Result<AnalysisMetadata, Box<dyn Error>> {
-    let rows = query(
+    let revision = i64::try_from(revision)?;
+    let rows = observed_query(
         db,
-        view,
-        "?[incomplete] := *analysis_revision_metadata{\
+        QuerySpec::new(
+            "analysis_metadata.completeness",
+            view,
+            "?[incomplete] := *analysis_revision_metadata{\
              view: $view, revision: $revision, incomplete\
          }",
-        [("revision", i64::try_from(revision)?.into())],
+        ),
+        || vec![("revision", revision.into())],
     )?;
     let incomplete = rows
         .rows
@@ -165,24 +415,24 @@ pub(super) fn analysis_metadata(
             _ => None,
         })
         .unwrap_or_default();
-    let rows = query(
+    let script = format!(
+        "{ANALYSIS_METADATA_RULES}\n\
+         baseline_diagnostic[repository, code, severity, path, line, detail] := \
+             *analysis_revision_diagnostic{{\
+                 view: $view, revision: $revision, repository, code, severity, path, line, detail\
+             }}, \
+             not selected_diagnostic_replacement[repository, code]\n\
+         ?[repository, code, severity, path, line, detail] := \
+             baseline_diagnostic[repository, code, severity, path, line, detail]\n\
+         ?[repository, code, severity, path, line, detail] := \
+             enrichment_diagnostic[repository, code, severity, path, line, detail], \
+             not baseline_diagnostic[repository, code, severity, path, line, _]\n\
+         :order severity, repository, path, line, code"
+    );
+    let rows = observed_query(
         db,
-        view,
-        &format!(
-            "{ANALYSIS_METADATA_RULES}\n\
-             baseline_diagnostic[repository, code, severity, path, line, detail] := \
-                 *analysis_revision_diagnostic{{\
-                     view: $view, revision: $revision, repository, code, severity, path, line, detail\
-                 }}, \
-                 not selected_diagnostic_replacement[repository, code]\n\
-             ?[repository, code, severity, path, line, detail] := \
-                 baseline_diagnostic[repository, code, severity, path, line, detail]\n\
-             ?[repository, code, severity, path, line, detail] := \
-                 enrichment_diagnostic[repository, code, severity, path, line, detail], \
-                 not baseline_diagnostic[repository, code, severity, path, line, _]\n\
-             :order severity, repository, path, line, code"
-        ),
-        [("revision", i64::try_from(revision)?.into())],
+        QuerySpec::new("analysis_metadata.diagnostics", view, &script),
+        || vec![("revision", revision.into())],
     )?;
     let diagnostics = rows
         .rows
@@ -216,15 +466,16 @@ pub(super) fn analysis_metadata(
 }
 
 pub(super) fn repository_revision(
-    db: &impl QueryRunner,
+    db: &DbInstance,
     repository: &str,
 ) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
     let params = BTreeMap::from([("repository".into(), repository.into())]);
-    let revision = db.run_query(
+    let revision = db.run_script_with_options(
         "?[source_state, analysis_identity, head, incomplete] := \
              *repository_revision{repository: $repository, source_state, analysis_identity, head, incomplete}",
         params.clone(),
-        SEMANTIC_QUERY_TIMEOUT_SECONDS,
+        ScriptMutability::Immutable,
+        ScriptRunOptions::new().with_timeout(REPOSITORY_QUERY_TIMEOUT_SECONDS),
     )?;
     let Some(row) = revision.rows.first() else {
         return Ok(None);
@@ -244,12 +495,13 @@ pub(super) fn repository_revision(
         DataValue::Bool(value) => *value,
         _ => return Err("stored repository completeness is not a boolean".into()),
     };
-    let diagnostics = db.run_query(
+    let diagnostics = db.run_script_with_options(
         "?[code, severity, path, line, detail] := \
              *repository_revision_diagnostic{repository: $repository, code, severity, path, line, detail}\n\
          :order severity, path, line, code",
         params,
-        SEMANTIC_QUERY_TIMEOUT_SECONDS,
+        ScriptMutability::Immutable,
+        ScriptRunOptions::new().with_timeout(REPOSITORY_QUERY_TIMEOUT_SECONDS),
     )?;
     let diagnostics = diagnostics
         .rows
@@ -323,16 +575,20 @@ pub(super) fn entity_facts(
     view: &str,
     entities: &BTreeSet<String>,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let requested = DataValue::List(
-        entities
-            .iter()
-            .map(|id| DataValue::List(vec![id.as_str().into()]))
-            .collect(),
-    );
-    let mut baseline = query(
+    let requested = || {
+        DataValue::List(
+            entities
+                .iter()
+                .map(|id| DataValue::List(vec![id.as_str().into()]))
+                .collect(),
+        )
+    };
+    let mut baseline = observed_query(
         db,
-        view,
-        "requested[id] <- $entities\n\
+        QuerySpec::new(
+            "entity_facts.baseline",
+            view,
+            "requested[id] <- $entities\n\
          selected_state[state] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view: $view, revision, state}\n\
          ?[id, kind, metadata] := requested[id], selected_state[state], \
@@ -340,7 +596,8 @@ pub(super) fn entity_facts(
          ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
              *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
          :order id",
-        [("entities", requested.clone())],
+        ),
+        || vec![("entities", requested())],
     )?;
     let mut baseline_ids = baseline
         .rows
@@ -348,17 +605,12 @@ pub(super) fn entity_facts(
         .filter_map(|row| row[0].get_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
 
-    let remaining = DataValue::List(
-        entities
-            .iter()
-            .filter(|id| !baseline_ids.contains(*id))
-            .map(|id| DataValue::List(vec![id.as_str().into()]))
-            .collect(),
-    );
-    let nested = query(
+    let nested = observed_query(
         db,
-        view,
-        "requested[id] <- $entities\n\
+        QuerySpec::new(
+            "entity_facts.shard",
+            view,
+            "requested[id] <- $entities\n\
          ?[id, kind, metadata] := requested[id], \
              *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, \
              *analysis_fact_shard_selection:by_owner{\
@@ -366,7 +618,19 @@ pub(super) fn entity_facts(
              }\n\
          :order id\n\
          :reorder written",
-        [("entities", remaining)],
+        ),
+        || {
+            vec![(
+                "entities",
+                DataValue::List(
+                    entities
+                        .iter()
+                        .filter(|id| !baseline_ids.contains(*id))
+                        .map(|id| DataValue::List(vec![id.as_str().into()]))
+                        .collect(),
+                ),
+            )]
+        },
     )?;
     baseline_ids.extend(
         nested
@@ -376,10 +640,12 @@ pub(super) fn entity_facts(
     );
     baseline.rows.extend(nested.rows);
 
-    let enrichment = query(
+    let enrichment = observed_query(
         db,
-        view,
-        "requested[id] <- $entities\n\
+        QuerySpec::new(
+            "entity_facts.enrichment",
+            view,
+            "requested[id] <- $entities\n\
          selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
          ?[id, kind, metadata] := requested[id], \
@@ -387,7 +653,8 @@ pub(super) fn entity_facts(
              selected_enrichment[owner], \
              *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
          :order id",
-        [("entities", requested)],
+        ),
+        || vec![("entities", requested())],
     )?;
     baseline
         .rows
@@ -452,12 +719,155 @@ pub(super) fn inspect_grpc_bindings(db: &DbInstance) -> Result<NamedRows, Box<dy
     )?)
 }
 
+struct ContextParams {
+    entity: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct ContextRow {
+    pub(super) direction: String,
+    pub(super) relation: String,
+    pub(super) related: String,
+    pub(super) evidence: String,
+    pub(super) confidence: f64,
+    pub(super) provenance: String,
+}
+
+impl ContextRow {
+    fn edge_key(&self) -> (String, String, String, String) {
+        (
+            self.direction.clone(),
+            self.relation.clone(),
+            self.related.clone(),
+            self.evidence.clone(),
+        )
+    }
+}
+
+const CONTEXT_HEADERS: &[&str] = &[
+    "direction",
+    "relation",
+    "related",
+    "evidence",
+    "confidence",
+    "provenance",
+];
+
+macro_rules! context_query {
+    ($name:ident, $operation:literal, $script:expr) => {
+        struct $name;
+
+        impl MnesticQuery for $name {
+            const OPERATION: &'static str = $operation;
+            const SCRIPT: &'static str = $script;
+            const HEADERS: &'static [&'static str] = CONTEXT_HEADERS;
+
+            type Params = ContextParams;
+            type Row = ContextRow;
+
+            fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+                BTreeMap::from([("entity".into(), params.entity.as_str().into())])
+            }
+
+            fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+                decode_context(Self::OPERATION, headers, row)
+            }
+        }
+    };
+}
+
+context_query!(
+    MaterializedContextDependencies,
+    "context.dependencies",
+    CONTEXT_QUERY
+);
+context_query!(
+    StateStructuralContext,
+    "context.structural.state",
+    include_str!("../../../rules/core/context_structural_state.datalog")
+);
+context_query!(
+    FactShardStructuralContext,
+    "context.structural.fact_shard",
+    include_str!("../../../rules/core/context_structural_fact_shard.datalog")
+);
+context_query!(
+    RevisionStructuralContext,
+    "context.structural.revision",
+    include_str!("../../../rules/core/context_structural_revision.datalog")
+);
+context_query!(
+    EnrichmentStructuralContext,
+    "context.structural.enrichment",
+    include_str!("../../../rules/core/context_structural_enrichment.datalog")
+);
+
+fn decode_context(
+    operation: &'static str,
+    headers: &[String],
+    row: &[DataValue],
+) -> Result<ContextRow, QueryError> {
+    let string = |index: usize| {
+        row.get(index)
+            .and_then(DataValue::get_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                QueryError::new(
+                    operation,
+                    format!("column {} is not a string", headers[index]),
+                )
+            })
+    };
+    Ok(ContextRow {
+        direction: string(0)?,
+        relation: string(1)?,
+        related: string(2)?,
+        evidence: string(3)?,
+        confidence: row
+            .get(4)
+            .and_then(DataValue::get_float)
+            .ok_or_else(|| QueryError::new(operation, "column confidence is not a float"))?,
+        provenance: string(5)?,
+    })
+}
+
+fn context_params(entity: &str) -> ContextParams {
+    ContextParams {
+        entity: entity.to_owned(),
+    }
+}
+
 pub(super) fn context(
     db: &impl QueryRunner,
     view: &str,
     entity: &str,
-) -> Result<NamedRows, Box<dyn Error>> {
-    query(db, view, CONTEXT_QUERY, [("entity", entity.into())])
+) -> Result<Vec<ContextRow>, Box<dyn Error>> {
+    let mut result = db.run::<MaterializedContextDependencies>(view, context_params(entity))?;
+    let mut baseline_structural = BTreeSet::new();
+    for rows in [
+        db.run::<StateStructuralContext>(view, context_params(entity))?,
+        db.run::<FactShardStructuralContext>(view, context_params(entity))?,
+        db.run::<RevisionStructuralContext>(view, context_params(entity))?,
+    ] {
+        baseline_structural.extend(rows.iter().map(ContextRow::edge_key));
+        result.extend(rows);
+    }
+    result.extend(
+        db.run::<EnrichmentStructuralContext>(view, context_params(entity))?
+            .into_iter()
+            .filter(|row| !baseline_structural.contains(&row.edge_key())),
+    );
+    result.sort_by(|left, right| {
+        left.direction
+            .cmp(&right.direction)
+            .then_with(|| left.relation.cmp(&right.relation))
+            .then_with(|| left.related.cmp(&right.related))
+            .then_with(|| left.evidence.cmp(&right.evidence))
+            .then_with(|| left.confidence.total_cmp(&right.confidence))
+            .then_with(|| left.provenance.cmp(&right.provenance))
+    });
+    result.dedup();
+    Ok(result)
 }
 
 pub(super) fn trace(
@@ -494,6 +904,145 @@ enum TraversalDirection {
     Incoming,
 }
 
+struct ResolvedDependencyParams {
+    frontier: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedDependencyRow {
+    from: String,
+    to: String,
+    relation: String,
+    evidence: String,
+    confidence: f64,
+    provenance: String,
+}
+
+impl ResolvedDependencyRow {
+    fn into_values(self, hops: u32) -> Vec<DataValue> {
+        vec![
+            "edge".into(),
+            "".into(),
+            i64::from(hops).into(),
+            self.from.into(),
+            self.to.into(),
+            self.relation.into(),
+            self.evidence.into(),
+            self.confidence.into(),
+            self.provenance.into(),
+        ]
+    }
+}
+
+const RESOLVED_DEPENDENCY_HEADERS: &[&str] = &[
+    "from",
+    "to",
+    "relation",
+    "evidence",
+    "confidence",
+    "provenance",
+];
+
+struct OutgoingResolvedDependencies;
+
+impl MnesticQuery for OutgoingResolvedDependencies {
+    const OPERATION: &'static str = "traversal.outgoing.materialized";
+    const SCRIPT: &'static str = "frontier[id] <- $frontier\n\
+         ?[from, to, relation, evidence, confidence, provenance] := frontier[from], \
+             *analysis_resolved_dependency{\
+                 view: $view, from, relation, to, evidence, confidence, provenance\
+             }\n\
+         :order from, to, relation\n\
+         :reorder written";
+    const HEADERS: &'static [&'static str] = RESOLVED_DEPENDENCY_HEADERS;
+
+    type Params = ResolvedDependencyParams;
+    type Row = ResolvedDependencyRow;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        bind_resolved_dependency_params(params)
+    }
+
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        decode_resolved_dependency(Self::OPERATION, headers, row)
+    }
+}
+
+struct IncomingResolvedDependencies;
+
+impl MnesticQuery for IncomingResolvedDependencies {
+    const OPERATION: &'static str = "traversal.incoming.materialized";
+    const SCRIPT: &'static str = "frontier[id] <- $frontier\n\
+         ?[from, to, relation, evidence, confidence, provenance] := frontier[to], \
+             *analysis_resolved_dependency:by_to{\
+                 view: $view, to, from, relation, evidence, confidence, provenance\
+             }\n\
+         ?[from, to, relation, evidence, confidence, provenance] := frontier[from], \
+             starts_with(from, 'grpc://'), \
+             *analysis_resolved_dependency{\
+                 view: $view, from, relation: 'implemented_by', to, evidence, \
+                 confidence, provenance\
+             }, relation = 'implemented_by'\n\
+         :order from, to, relation\n\
+         :reorder written";
+    const HEADERS: &'static [&'static str] = RESOLVED_DEPENDENCY_HEADERS;
+
+    type Params = ResolvedDependencyParams;
+    type Row = ResolvedDependencyRow;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        bind_resolved_dependency_params(params)
+    }
+
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        decode_resolved_dependency(Self::OPERATION, headers, row)
+    }
+}
+
+fn bind_resolved_dependency_params(
+    params: &ResolvedDependencyParams,
+) -> BTreeMap<String, DataValue> {
+    BTreeMap::from([(
+        "frontier".into(),
+        DataValue::List(
+            params
+                .frontier
+                .iter()
+                .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                .collect(),
+        ),
+    )])
+}
+
+fn decode_resolved_dependency(
+    operation: &'static str,
+    headers: &[String],
+    row: &[DataValue],
+) -> Result<ResolvedDependencyRow, QueryError> {
+    let string = |index: usize| {
+        row.get(index)
+            .and_then(DataValue::get_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                QueryError::new(
+                    operation,
+                    format!("column {} is not a string", headers[index]),
+                )
+            })
+    };
+    Ok(ResolvedDependencyRow {
+        from: string(0)?,
+        to: string(1)?,
+        relation: string(2)?,
+        evidence: string(3)?,
+        confidence: row
+            .get(4)
+            .and_then(DataValue::get_float)
+            .ok_or_else(|| QueryError::new(operation, "column confidence is not a float"))?,
+        provenance: string(5)?,
+    })
+}
+
 fn closure(
     db: &impl QueryRunner,
     view: &str,
@@ -501,244 +1050,78 @@ fn closure(
     max_hops: u32,
     direction: TraversalDirection,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let rules = match direction {
-        TraversalDirection::Outgoing => vec![
-            (
-                OUTGOING_DEPENDENCY_RULES,
-                "selected_edge",
-                ":reorder written",
-            ),
-            (
-                OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
-                "shard_edge",
-                ":reorder written",
-            ),
-        ],
-        TraversalDirection::Incoming => vec![
-            (INCOMING_DEPENDENCY_RULES, "selected_edge", ""),
-            (
-                INCOMING_FACT_SHARD_DEPENDENCY_RULES,
-                "shard_edge",
-                ":reorder written",
-            ),
-        ],
-    };
-    let scripts = rules
-        .into_iter()
-        .map(|(rules, edge_rule, reorder)| {
-            format!(
-                "{rules}\n\
-                 frontier[id] <- $frontier\n\
-                 ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                     {edge_rule}[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                     row_kind = 'edge', entity = '', hops = 0\n\
-                 :order edge_from, edge_to, relation\n\
-                 {reorder}"
-            )
-        })
-        .collect::<Vec<_>>();
-    let override_rules = match direction {
-        TraversalDirection::Outgoing => OUTGOING_DEPENDENCY_OVERRIDE_QUERY,
-        TraversalDirection::Incoming => INCOMING_DEPENDENCY_OVERRIDE_QUERY,
-    };
-    let override_script = format!(
-        "{override_rules}\n\
-         frontier[id] <- $frontier"
-    );
-    let boundary_projection = match direction {
-        TraversalDirection::Outgoing => {
-            "\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                 frontier[edge_from], not visited[edge_to], \
-                 row_kind = 'edge', entity = '', hops = 0"
-        }
-        TraversalDirection::Incoming => {
-            "\
-             special[edge_from, edge_to, relation] := \
-                 boundary_edge[edge_from, edge_to, relation, _, _, _], \
-                 relation = 'implemented_by', starts_with(edge_from, 'grpc://')\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                 frontier[edge_to], not special[edge_from, edge_to, relation], \
-                 not visited[edge_from], row_kind = 'edge', entity = '', hops = 0\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                 special[edge_from, edge_to, relation], frontier[edge_from], \
-                 not visited[edge_to], row_kind = 'edge', entity = '', hops = 0"
-        }
-    };
-    let (core_rules, shard_rules, shard_not_overridden) = match direction {
-        TraversalDirection::Outgoing => (
-            OUTGOING_DEPENDENCY_RULES,
-            OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
-            "not dependency_override[from, relation, to, _, _, _, _]",
-        ),
-        TraversalDirection::Incoming => (
-            INCOMING_DEPENDENCY_RULES,
-            INCOMING_FACT_SHARD_DEPENDENCY_RULES,
-            "not dependency_override[from, relation, to]",
-        ),
-    };
-    let boundary_scripts = [
-        format!(
-            "{core_rules}\n\
-             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
-                 selected_edge[from, to, relation, evidence, confidence, provenance]\n\
-             frontier[id] <- $frontier\n\
-             visited[id] <- $visited\n\
-             {boundary_projection}\n\
-             :limit 1"
-        ),
-        format!(
-            "{core_rules}\n{shard_rules}\n\
-             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
-                 shard_edge[from, to, relation, evidence, confidence, provenance], \
-                 {shard_not_overridden}\n\
-             frontier[id] <- $frontier\n\
-             visited[id] <- $visited\n\
-             {boundary_projection}\n\
-             :limit 1"
-        ),
-    ];
     let mut frontier = BTreeSet::from([entity.to_owned()]);
     let mut visited = frontier.clone();
     let mut rows = Vec::new();
-    let mut headers = Vec::new();
     for hops in 0..=max_hops {
-        let values = DataValue::List(
-            frontier
-                .iter()
-                .map(|entity| DataValue::List(vec![entity.as_str().into()]))
-                .collect(),
+        let hop_span = tracing::info_span!(
+            "graph.traversal.hop",
+            graph.direction = match direction {
+                TraversalDirection::Outgoing => "outgoing",
+                TraversalDirection::Incoming => "incoming",
+            },
+            graph.hop = hops,
+            graph.frontier_size = frontier.len(),
         );
+        let _entered = hop_span.enter();
+        let params = ResolvedDependencyParams {
+            frontier: frontier.clone(),
+        };
+        let result = match direction {
+            TraversalDirection::Outgoing => db.run::<OutgoingResolvedDependencies>(view, params)?,
+            TraversalDirection::Incoming => db.run::<IncomingResolvedDependencies>(view, params)?,
+        };
         if hops == max_hops {
-            let visited_values = DataValue::List(
-                visited
-                    .iter()
-                    .map(|entity| DataValue::List(vec![entity.as_str().into()]))
-                    .collect(),
-            );
-            for script in &boundary_scripts {
-                let mut result = query(
-                    db,
-                    view,
-                    script,
-                    [
-                        ("frontier", values.clone()),
-                        ("visited", visited_values.clone()),
-                    ],
-                )?;
-                if headers.is_empty() {
-                    headers = result.headers;
-                }
-                if let Some(mut row) = result.rows.pop() {
-                    row[2] = i64::from(hops).into();
-                    rows.push(row);
-                    break;
-                }
+            if let Some(row) = result
+                .into_iter()
+                .find(|row| !visited.contains(next_entity(row, direction)))
+            {
+                rows.push(row.into_values(hops));
             }
             break;
         }
-        let mut edge_groups = Vec::new();
-        for script in &scripts {
-            let result = query(db, view, script, [("frontier", values.clone())])?;
-            if headers.is_empty() {
-                headers = result.headers;
-            }
-            edge_groups.push(result.rows);
-        }
-        let overrides = query(db, view, &override_script, [("frontier", values)])?;
-        merge_fact_shard_overrides(&mut edge_groups[1], overrides.rows, direction, &frontier);
-        let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
-        for row in &mut result_rows {
-            row[2] = i64::from(hops).into();
-        }
         let mut next = BTreeSet::new();
-        for row in &result_rows {
-            let from = row[3].get_str().unwrap_or_default();
-            let to = row[4].get_str().unwrap_or_default();
-            let relation = row[5].get_str().unwrap_or_default();
-            let entity = match direction {
-                TraversalDirection::Outgoing => to,
-                TraversalDirection::Incoming
-                    if relation == "implemented_by" && from.starts_with("grpc://") =>
-                {
-                    to
-                }
-                TraversalDirection::Incoming => from,
-            };
+        for row in &result {
+            let entity = next_entity(row, direction);
             if visited.insert(entity.to_owned()) {
                 next.insert(entity.to_owned());
             }
         }
-        rows.extend(result_rows);
+        rows.extend(result.into_iter().map(|row| row.into_values(hops)));
         if next.is_empty() {
             break;
         }
         frontier = next;
     }
-    Ok(NamedRows::new(headers, rows))
+    Ok(NamedRows::new(
+        [
+            "row_kind",
+            "entity",
+            "hops",
+            "edge_from",
+            "edge_to",
+            "relation",
+            "evidence",
+            "confidence",
+            "provenance",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        rows,
+    ))
 }
 
-fn merge_fact_shard_overrides(
-    shard_edges: &mut Vec<Vec<DataValue>>,
-    overrides: Vec<Vec<DataValue>>,
-    direction: TraversalDirection,
-    frontier: &BTreeSet<String>,
-) {
-    let original = std::mem::take(shard_edges);
-    let overridden = overrides
-        .iter()
-        .map(|row| edge_key(row, 1))
-        .collect::<BTreeSet<_>>();
-    shard_edges.extend(
-        original
-            .iter()
-            .filter(|row| !overridden.contains(&edge_key(row, 4)))
-            .cloned(),
-    );
-    for mut override_ in overrides {
-        let resolved_is_frontier = override_[4]
-            .get_str()
-            .is_some_and(|resolved| frontier.contains(resolved));
-        match (override_[0].get_str(), direction) {
-            (Some("base_override"), TraversalDirection::Outgoing) => {
-                override_[0] = "edge".into();
-                override_[1] = "".into();
-                shard_edges.push(override_);
-            }
-            (Some("base_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
-                override_[0] = "edge".into();
-                override_[1] = "".into();
-                shard_edges.push(override_);
-            }
-            (Some("enrichment_override"), TraversalDirection::Outgoing) => {
-                let key = edge_key(&override_, 1);
-                for row in original.iter().filter(|row| edge_key(row, 4) == key) {
-                    let mut resolved = override_.clone();
-                    resolved[0] = "edge".into();
-                    resolved[1] = "".into();
-                    resolved[6] = row[6].clone();
-                    shard_edges.push(resolved);
-                }
-            }
-            (Some("enrichment_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
-                override_[0] = "edge".into();
-                override_[1] = "".into();
-                shard_edges.push(override_);
-            }
-            _ => {}
+fn next_entity(row: &ResolvedDependencyRow, direction: TraversalDirection) -> &str {
+    match direction {
+        TraversalDirection::Outgoing => &row.to,
+        TraversalDirection::Incoming
+            if row.relation == "implemented_by" && row.from.starts_with("grpc://") =>
+        {
+            &row.to
         }
+        TraversalDirection::Incoming => &row.from,
     }
-}
-
-fn edge_key(row: &[DataValue], target: usize) -> (String, String, String) {
-    (
-        row[3].get_str().unwrap_or_default().to_owned(),
-        row[5].get_str().unwrap_or_default().to_owned(),
-        row[target].get_str().unwrap_or_default().to_owned(),
-    )
 }
 
 #[cfg(test)]
@@ -751,74 +1134,101 @@ mod tests {
         StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
-    use std::{
-        cell::RefCell,
-        collections::{BTreeMap, BTreeSet},
-        fs, thread,
-        time::Duration,
-        time::SystemTime,
-    };
+    use std::{cell::Cell, collections::BTreeSet, fs, time::Duration, time::SystemTime};
 
-    struct TimeoutRunner(RefCell<Vec<f64>>);
+    struct DisabledPlanRunner(Cell<bool>);
 
-    impl QueryRunner for TimeoutRunner {
+    impl QueryRunner for DisabledPlanRunner {
         fn run_query(
             &self,
             _script: &str,
             _params: BTreeMap<String, DataValue>,
-            timeout: f64,
         ) -> Result<NamedRows, Box<dyn Error>> {
-            self.0.borrow_mut().push(timeout);
-            Ok(NamedRows::default())
+            Err("query failed".into())
+        }
+
+        fn explain_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            _timeout: f64,
+        ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+            self.0.set(true);
+            Ok(None)
+        }
+    }
+
+    struct WrongShapeRunner;
+
+    impl QueryRunner for WrongShapeRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            Ok(NamedRows::new(vec!["to".into(), "from".into()], vec![]))
         }
     }
 
     #[test]
-    fn one_budget_is_shared_by_every_query_in_a_semantic_read() {
-        let runner = TimeoutRunner(RefCell::new(Vec::new()));
+    fn typed_query_rejects_an_incorrect_output_shape() {
+        let error = WrongShapeRunner
+            .run::<OutgoingResolvedDependencies>(
+                "main",
+                ResolvedDependencyParams {
+                    frontier: BTreeSet::new(),
+                },
+            )
+            .unwrap_err();
 
-        within_query_budget(|| {
-            query(&runner, "main", "?[value] <- [[1]]", []).unwrap();
-            thread::sleep(Duration::from_millis(5));
-            query(&runner, "main", "?[value] <- [[1]]", []).unwrap();
-        });
-
-        let timeouts = runner.0.into_inner();
-        assert!(timeouts[0] <= SEMANTIC_QUERY_TIMEOUT_SECONDS);
-        assert!(timeouts[1] < timeouts[0]);
-
-        SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() - Duration::from_millis(1)));
-        let error = query(
-            &TimeoutRunner(RefCell::new(Vec::new())),
-            "main",
-            "?[value] <- [[1]]",
-            [],
-        )
-        .unwrap_err();
-        SEMANTIC_QUERY_DEADLINE.set(None);
         assert_eq!(
-            error.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::TimedOut)
+            error.to_string(),
+            "Mnestic query traversal.outgoing.materialized failed: unexpected output headers: \
+             expected [\"from\", \"to\", \"relation\", \"evidence\", \"confidence\", \
+             \"provenance\"], got [\"to\", \"from\"]"
         );
     }
 
     #[test]
-    fn mnestic_stops_work_when_the_query_budget_expires() {
-        let db = memory_database().unwrap();
-        SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() + Duration::from_millis(1)));
-        let error = query(
-            &db,
-            "main",
-            "?[left, right] := left in int_range(100000), right in int_range(100000)",
-            [],
-        )
-        .unwrap_err();
-        SEMANTIC_QUERY_DEADLINE.set(None);
+    fn semantic_query_warns_at_five_seconds() {
+        assert!(!semantic_query_is_slow(Duration::from_millis(4_999)));
+        assert!(semantic_query_is_slow(Duration::from_secs(5)));
+    }
 
-        assert_eq!(
-            error.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::TimedOut)
+    #[test]
+    fn disabled_query_span_skips_plan_collection() {
+        let runner = DisabledPlanRunner(Cell::new(false));
+        let parameter_builds = Cell::new(0);
+
+        let _ = observed_bound_query(
+            &runner,
+            QuerySpec::new("test", "main", "?[value] <- [[1]]"),
+            || {
+                parameter_builds.set(parameter_builds.get() + 1);
+                BTreeMap::new()
+            },
         );
+
+        assert!(!runner.0.get());
+        assert_eq!(parameter_builds.get(), 1);
+    }
+
+    #[test]
+    fn snapshot_queries_can_be_explained() {
+        let db = memory_database().unwrap();
+        let transaction = db.multi_transaction(false);
+        let query_runner = SnapshotQueryRunner::new(&transaction, &db);
+        let plan = query_runner
+            .explain_query(
+                "?[value] <- [[1]]",
+                BTreeMap::new(),
+                QUERY_PLAN_TIMEOUT_SECONDS,
+            )
+            .unwrap()
+            .unwrap();
+        transaction.abort().unwrap();
+
+        assert!(plan.headers.iter().any(|header| header == "op"));
     }
 
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
@@ -903,6 +1313,9 @@ mod tests {
             ScriptMutability::Mutable,
         )
         .unwrap();
+        let transaction = db.multi_transaction(true);
+        crate::storage::rebuild_resolved_dependencies(&transaction, "diamond").unwrap();
+        transaction.commit().unwrap();
 
         let result = crate::semantic::trace(
             "diamond",

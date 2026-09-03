@@ -1,4 +1,4 @@
-use crate::{InspectionResult, InspectionValue};
+use crate::{InspectionResult, InspectionValue, query::ContextRow};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
     EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
@@ -21,27 +21,31 @@ enum TraversalDirection {
 pub(super) fn context(
     view: &str,
     entity: &str,
-    result: InspectionResult,
+    result: Vec<ContextRow>,
     entities: InspectionResult,
 ) -> Result<ContextResult, Box<dyn Error>> {
     let mut graph = GraphBuilder::default();
     graph.hint_facts(entity_kinds(entities)?);
     graph.hint(entity, infer_kind(entity));
-    for row in result.rows {
-        let direction = text(&row, 0, "context direction")?;
-        let relation = text(&row, 1, "context relation")?;
-        let related = text(&row, 2, "context related entity")?;
-        let evidence = text(&row, 3, "context evidence")?;
-        let confidence = float(&row, 4, "context confidence")? as f32;
-        let provenance = text(&row, 5, "context provenance")?;
-        let _ = match direction {
-            "outgoing" => {
-                graph.add_edge(entity, related, relation, evidence, confidence, provenance)?
-            }
-            "incoming" => {
-                graph.add_edge(related, entity, relation, evidence, confidence, provenance)?
-            }
-            _ => return Err(format!("unknown context direction: {direction}").into()),
+    for row in result {
+        let _ = match row.direction.as_str() {
+            "outgoing" => graph.add_edge(
+                entity,
+                &row.related,
+                &row.relation,
+                &row.evidence,
+                row.confidence as f32,
+                &row.provenance,
+            )?,
+            "incoming" => graph.add_edge(
+                &row.related,
+                entity,
+                &row.relation,
+                &row.evidence,
+                row.confidence as f32,
+                &row.provenance,
+            )?,
+            direction => return Err(format!("unknown context direction: {direction}").into()),
         };
     }
     let output = graph.finish();

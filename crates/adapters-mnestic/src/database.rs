@@ -1,4 +1,5 @@
 use super::schema::*;
+use super::storage::rebuild_resolved_dependencies;
 use mnestic_engine::{DbInstance, ScriptMutability};
 use std::{collections::BTreeMap, error::Error, path::Path};
 
@@ -114,6 +115,7 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         CREATE_FACT_SHARD_ENTITY_SCHEMA,
         CREATE_FACT_SHARD_OBSERVATION_SCHEMA,
         CREATE_FACT_SHARD_DEPENDENCY_SCHEMA,
+        CREATE_RESOLVED_DEPENDENCY_SCHEMA,
         CREATE_BASELINE_FINGERPRINT_SCHEMA,
         CREATE_SEMANTIC_CANDIDATE_SCHEMA,
         CREATE_SCHEMA_MIGRATION_SCHEMA,
@@ -156,7 +158,17 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_FACT_SHARD_OBSERVATION_FROM_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_RESOLVED_DEPENDENCY_TO_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
@@ -451,6 +463,10 @@ pub(super) fn persistent_database(
             CREATE_FACT_SHARD_DEPENDENCY_SCHEMA,
         ),
         (
+            "analysis_resolved_dependency",
+            CREATE_RESOLVED_DEPENDENCY_SCHEMA,
+        ),
+        (
             "analysis_baseline_fingerprint",
             CREATE_BASELINE_FINGERPRINT_SCHEMA,
         ),
@@ -605,8 +621,16 @@ pub(super) fn persistent_database(
                 CREATE_FACT_SHARD_OBSERVATION_TO_INDEX,
             ),
             (
+                "analysis_fact_shard_observation:by_from",
+                CREATE_FACT_SHARD_OBSERVATION_FROM_INDEX,
+            ),
+            (
                 "analysis_fact_shard_dependency_observation:by_from",
                 CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX,
+            ),
+            (
+                "analysis_resolved_dependency:by_to",
+                CREATE_RESOLVED_DEPENDENCY_TO_INDEX,
             ),
             (
                 "analysis_revision_state:by_state",
@@ -668,6 +692,47 @@ fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
     if !migration_applied(db, "enrichment-winners", 1)? {
         migrate_enrichment_winners(db)?;
     }
+    if !migration_applied(db, "resolved-dependencies", 2)? {
+        migrate_resolved_dependencies(db)?;
+    }
+    Ok(())
+}
+
+fn migrate_resolved_dependencies(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    db.run_script(
+        "::index drop analysis_resolved_dependency:by_to",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        "::remove analysis_resolved_dependency",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_RESOLVED_DEPENDENCY_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_RESOLVED_DEPENDENCY_TO_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    let transaction = db.multi_transaction(true);
+    let views = transaction.run_script("?[view] := *analysis_revision{view}", BTreeMap::new())?;
+    for row in views.rows {
+        let view = row[0]
+            .get_str()
+            .ok_or("analysis revision view is not a string")?;
+        rebuild_resolved_dependencies(&transaction, view)?;
+    }
+    transaction.run_script(
+        "?[name, version] <- [['resolved-dependencies', 2]] \
+         :put schema_migration {name => version}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -985,6 +1050,93 @@ mod tests {
             store.context("legacy", "repo/target").unwrap().edges.len(),
             1
         );
+        drop(store);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn migrates_resolved_dependencies_to_a_provenance_key() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let state_dir = std::env::temp_dir().join(format!("beholder-provenance-key-{unique}"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let path = state_dir.join("beholder.db");
+        let store = SemanticStore::persistent(&path, true).unwrap();
+        let view = WorkspaceView::new(
+            "provenance-key",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: None,
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .publish(
+                &view,
+                &[facts(
+                    &view,
+                    vec![Observation::dependency(
+                        "repo/source",
+                        DependencyRelation::Calls,
+                        "repo/target",
+                        "src/lib.rs:1",
+                    )],
+                )],
+                &[],
+            )
+            .unwrap();
+        drop(store);
+
+        let db = benchmark_database("sqlite", path.to_str()).unwrap();
+        for script in [
+            "::index drop analysis_resolved_dependency:by_to",
+            "::remove analysis_resolved_dependency",
+            ":create analysis_resolved_dependency {\
+                 view: String, from: String, relation: String, to: String, evidence: String => \
+                 confidence: Float, provenance: String\
+             }",
+            "?[name, version] <- [['resolved-dependencies', 1]] \
+             :put schema_migration {name => version}",
+        ] {
+            db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)
+                .unwrap();
+        }
+        drop(db);
+
+        let store = SemanticStore::persistent(&path, true).unwrap();
+        store
+            .db
+            .run_script(
+                "?[view, from, relation, to, evidence, provenance, confidence] <- [[\
+                     'provenance-key', 'repo/source', 'calls', 'repo/target', 'src/lib.rs:1', \
+                     'compiler', 1.0\
+                 ]] \
+                 :put analysis_resolved_dependency {\
+                     view, from, relation, to, evidence, provenance => confidence\
+                 }",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+        let migrated = store
+            .db
+            .run_script(
+                "?[count(provenance), version] := *analysis_resolved_dependency{\
+                     view: 'provenance-key', from: 'repo/source', relation: 'calls', \
+                     to: 'repo/target', evidence: 'src/lib.rs:1', provenance\
+                 }, *schema_migration{name: 'resolved-dependencies', version}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(migrated.rows[0][0].get_int(), Some(2));
+        assert_eq!(migrated.rows[0][1].get_int(), Some(2));
         drop(store);
         fs::remove_dir_all(state_dir).unwrap();
     }

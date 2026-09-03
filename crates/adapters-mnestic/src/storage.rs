@@ -77,7 +77,7 @@ fn replace_fact_shards(
     transaction: &MultiTransaction,
     view: &str,
     shards: &[FactShard],
-) -> Result<FactChanges, Box<dyn Error>> {
+) -> Result<(FactChanges, BTreeSet<String>), Box<dyn Error>> {
     validate_fact_shards(shards)?;
     let incoming = shards
         .iter()
@@ -119,6 +119,39 @@ fn replace_fact_shards(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, Box<dyn Error>>>()?;
+
+    let changed_current = current
+        .iter()
+        .filter(|((producer, repository, owner), version)| {
+            incoming
+                .get(&(producer.as_str(), repository.as_str(), owner.as_str()))
+                .is_none_or(|shard| shard.version != **version)
+        })
+        .map(|((producer, _, owner), version)| {
+            DataValue::List(vec![
+                producer.as_str().into(),
+                owner.as_str().into(),
+                version.as_str().into(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut affected_sources = if changed_current.is_empty() {
+        BTreeSet::new()
+    } else {
+        transaction
+            .run_script(
+                "changed[producer, owner, version] <- $shards\n\
+                 ?[from] := changed[producer, owner, version], \
+                     *analysis_fact_shard_dependency_observation{\
+                         producer, owner, version, from\
+                     }",
+                BTreeMap::from([("shards".into(), DataValue::List(changed_current))]),
+            )?
+            .rows
+            .into_iter()
+            .filter_map(|row| row[0].get_str().map(str::to_owned))
+            .collect()
+    };
 
     let mut changes = FactChanges::default();
     let removed = current
@@ -162,6 +195,13 @@ fn replace_fact_shards(
             Some(_) => changes.updated += shard.observations.len(),
             None => changes.inserted += shard.observations.len(),
         }
+        affected_sources.extend(
+            shard
+                .observations
+                .iter()
+                .filter(|observation| observation.relation.dependency().is_some())
+                .map(|observation| observation.from.as_str().to_owned()),
+        );
         let scope = [
             shard.producer.as_str().into(),
             shard.owner.as_str().into(),
@@ -251,7 +291,7 @@ fn replace_fact_shards(
             )?;
         }
     }
-    Ok(changes)
+    Ok((changes, affected_sources))
 }
 
 fn enrichment_owner_key(analyzer: &str, repository: &str) -> String {
@@ -1110,7 +1150,9 @@ fn refresh_semantic_noop(
         )?;
     }
     store_revision_inputs(&transaction, view)?;
-    reconcile_obsolete_enrichments(&transaction, &view.name)?;
+    let obsolete = reconcile_obsolete_enrichments(&transaction, &view.name)?;
+    let affected_sources = enrichment_dependency_sources(&transaction, &view.name, &obsolete)?;
+    refresh_resolved_dependencies(&transaction, &view.name, &affected_sources)?;
     transaction.commit()?;
     Ok(true)
 }
@@ -1387,6 +1429,10 @@ fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<()
         ("analysis_baseline_fingerprint", "view"),
         ("analysis_semantic_candidate", "view, id"),
         ("analysis_semantic_fingerprint", "view"),
+        (
+            "analysis_resolved_dependency",
+            "view, from, relation, to, evidence, provenance",
+        ),
         ("analysis_fingerprint", "view"),
         ("analysis_verification_fingerprint", "view"),
         ("analysis_revision", "view"),
@@ -1742,6 +1788,116 @@ fn store_grpc_resolution(
     Ok(())
 }
 
+fn current_revision_dependency_sources(
+    transaction: &MultiTransaction,
+    view: &str,
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    Ok(transaction
+        .run_script(
+            "?[from] := *analysis_revision{view: $view, revision}, \
+                 *analysis_revision_observation{view: $view, revision, from}\n\
+             ?[from] := *analysis_revision{view: $view, revision}, \
+                 *analysis_revision_dependency_override{view: $view, revision, from}",
+            BTreeMap::from([("view".into(), view.into())]),
+        )?
+        .rows
+        .into_iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect())
+}
+
+fn changed_repository_dependency_sources(
+    transaction: &MultiTransaction,
+    view: &WorkspaceView,
+    repositories: &[RepositoryFacts],
+    analyzed_states: &[String],
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let current = transaction
+        .run_script(
+            "?[repository, state] := *analysis_revision{view: $view, revision}, \
+                 *analysis_revision_state{view: $view, revision, repository, state}",
+            BTreeMap::from([("view".into(), view.name.clone().into())]),
+        )?
+        .rows
+        .into_iter()
+        .filter_map(|row| Some((row[0].get_str()?.to_owned(), row[1].get_str()?.to_owned())))
+        .collect::<BTreeMap<_, _>>();
+    let next = repositories
+        .iter()
+        .zip(analyzed_states)
+        .map(|(facts, state)| (facts.state.repository.identity.as_str(), state.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut states = current
+        .iter()
+        .filter(|(repository, state)| {
+            next.get(repository.as_str()).copied() != Some(state.as_str())
+        })
+        .map(|(_, state)| state.clone())
+        .collect::<BTreeSet<_>>();
+    states.extend(
+        next.iter()
+            .filter(|(repository, state)| {
+                current.get(**repository).map(String::as_str) != Some(**state)
+            })
+            .map(|(_, state)| (*state).to_owned()),
+    );
+    if states.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(transaction
+        .run_script(
+            "changed[state] <- $states\n\
+             ?[from] := changed[state], *state_dependency_observation{state, from}",
+            BTreeMap::from([(
+                "states".into(),
+                DataValue::List(
+                    states
+                        .into_iter()
+                        .map(|state| DataValue::List(vec![state.into()]))
+                        .collect(),
+                ),
+            )]),
+        )?
+        .rows
+        .into_iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect())
+}
+
+fn enrichment_dependency_sources(
+    transaction: &MultiTransaction,
+    view: &str,
+    owners: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    if owners.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(transaction
+        .run_script(
+            "changed[owner] <- $owners\n\
+             ?[from] := changed[owner], \
+                 *enrichment_observation_contribution{view: $view, owner, from}\n\
+             ?[from] := changed[owner], \
+                 *enrichment_override_contribution{view: $view, owner, from}",
+            BTreeMap::from([
+                ("view".into(), view.into()),
+                (
+                    "owners".into(),
+                    DataValue::List(
+                        owners
+                            .iter()
+                            .map(|owner| DataValue::List(vec![owner.as_str().into()]))
+                            .collect(),
+                    ),
+                ),
+            ]),
+        )?
+        .rows
+        .into_iter()
+        .filter_map(|row| row[0].get_str().map(str::to_owned))
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn publish_observations(
     db: &DbInstance,
@@ -1931,7 +2087,8 @@ pub(super) fn publish_observations(
     };
 
     let started = Instant::now();
-    let shard_changes = replace_fact_shards(&transaction, &view.name, fact_shards)?;
+    let (shard_changes, mut affected_sources) =
+        replace_fact_shards(&transaction, &view.name, fact_shards)?;
     tracing::info!(
         target: "beholder::publication",
         stage = "replace_fact_shards",
@@ -1964,6 +2121,30 @@ pub(super) fn publish_observations(
             desired
         };
         analyzed_states.push(state);
+    }
+    if report_shard_changes {
+        affected_sources.extend(current_revision_dependency_sources(
+            &transaction,
+            &view.name,
+        )?);
+        affected_sources.extend(changed_repository_dependency_sources(
+            &transaction,
+            view,
+            repositories,
+            &analyzed_states,
+        )?);
+        affected_sources.extend(
+            resolution
+                .observations
+                .iter()
+                .filter(|observation| observation.relation.dependency().is_some())
+                .map(|observation| observation.from.as_str().to_owned()),
+        );
+        affected_sources.extend(
+            overrides
+                .iter()
+                .map(|override_| override_.from.as_str().to_owned()),
+        );
     }
     tracing::info!(
         target: "beholder::publication",
@@ -2068,13 +2249,25 @@ pub(super) fn publish_observations(
     );
     let started = Instant::now();
     let obsolete = remove_obsolete_enrichment_selections(&transaction, &view.name)?;
+    if report_shard_changes {
+        affected_sources.extend(enrichment_dependency_sources(
+            &transaction,
+            &view.name,
+            &obsolete,
+        )?);
+    }
     tracing::info!(
         target: "beholder::publication",
         stage = "remove_obsolete_enrichment_selections",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        obsolete_selections = obsolete,
+        obsolete_selections = obsolete.len(),
         "Mnestic publication stage completed"
     );
+    if report_shard_changes {
+        refresh_resolved_dependencies(&transaction, &view.name, &affected_sources)?;
+    } else {
+        rebuild_resolved_dependencies(&transaction, &view.name)?;
+    }
     let started = Instant::now();
     transaction.commit()?;
     tracing::info!(
@@ -2201,7 +2394,9 @@ pub(super) fn ensure_revision_inputs(
         BTreeMap::from([("view".into(), view.name.clone().into())]),
     )?;
     store_revision_inputs(&transaction, view)?;
-    reconcile_obsolete_enrichments(&transaction, &view.name)?;
+    let obsolete = reconcile_obsolete_enrichments(&transaction, &view.name)?;
+    let affected_sources = enrichment_dependency_sources(&transaction, &view.name, &obsolete)?;
+    refresh_resolved_dependencies(&transaction, &view.name, &affected_sources)?;
     transaction.commit()?;
     Ok(true)
 }
@@ -2303,7 +2498,7 @@ fn carry_forward_enrichment_selections(
 fn remove_obsolete_enrichment_selections(
     transaction: &MultiTransaction,
     view: &str,
-) -> Result<usize, Box<dyn Error>> {
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
     let params = BTreeMap::from([("view".into(), view.into())]);
     let obsolete = transaction.run_script(
         "?[view, revision, owner] := *analysis_revision{view: $view, revision}, \
@@ -2319,8 +2514,7 @@ fn remove_obsolete_enrichment_selections(
         .iter()
         .filter_map(|row| row[2].get_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let count = owners.len();
-    if count != 0 {
+    if !owners.is_empty() {
         transaction.run_script(
             "?[view, revision, owner] := *analysis_revision{view: $view, revision}, \
                  *analysis_revision_repository_enrichment{\
@@ -2342,7 +2536,7 @@ fn remove_obsolete_enrichment_selections(
             .ok_or("published analysis revision is missing")?;
         refresh_enrichment_fact_selections(transaction, view, revision, &owners)?;
     }
-    Ok(count)
+    Ok(owners)
 }
 
 fn refresh_enrichment_fact_selections(
@@ -2573,7 +2767,7 @@ fn rebuild_enrichment_fact_selections(
 fn reconcile_obsolete_enrichments(
     transaction: &MultiTransaction,
     view: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
     let obsolete = transaction.run_script(
         "?[owner] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_repository_enrichment{\
@@ -2584,7 +2778,7 @@ fn reconcile_obsolete_enrichments(
         BTreeMap::from([("view".into(), view.into())]),
     )?;
     if obsolete.rows.is_empty() {
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
     let previous = transaction
         .run_script(
@@ -2605,8 +2799,7 @@ fn reconcile_obsolete_enrichments(
             ("revision".into(), revision.into()),
         ]),
     )?;
-    remove_obsolete_enrichment_selections(transaction, view)?;
-    Ok(())
+    remove_obsolete_enrichment_selections(transaction, view)
 }
 
 pub(super) fn enrichment_matches(
@@ -3034,6 +3227,8 @@ pub(super) fn publish_enrichment(
          :put analysis_revision {view => revision}",
         params,
     )?;
+    let affected_sources = enrichment_dependency_sources(&transaction, view, &changed_owners)?;
+    refresh_resolved_dependencies(&transaction, view, &affected_sources)?;
     let started = Instant::now();
     transaction.commit()?;
     tracing::info!(
@@ -3054,6 +3249,179 @@ pub(super) fn publish_enrichment(
         "Mnestic enrichment publication completed"
     );
     Ok(EnrichmentPublishOutcome::Published)
+}
+
+pub(super) fn rebuild_resolved_dependencies(
+    transaction: &MultiTransaction,
+    view: &str,
+) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    let params = BTreeMap::from([("view".into(), view.into())]);
+    transaction.run_script(
+        "?[view, from, relation, to, evidence, provenance] := \
+             *analysis_resolved_dependency{view: $view, from, relation, to, evidence, provenance}, \
+             view = $view \
+         :rm analysis_resolved_dependency {view, from, relation, to, evidence, provenance}",
+        params.clone(),
+    )?;
+    transaction.run_script(
+        &format!(
+            "{DIRECT_RULES}\n\
+             dependency_relation[relation] <- [\n\
+                 ['binds_contract'], ['calls'], ['calls_graphql'], ['calls_rpc'],\n\
+                 ['consumed_by'], ['implements'], ['implemented_by'], ['imports'],\n\
+                 ['publishes'], ['requires'], ['resolved_by'], ['selects'], ['uses']\n\
+             ]\n\
+             materialized[view, from, relation, to, evidence, max(confidence), provenance] := \
+                 direct[from, to, relation, evidence, confidence, provenance], \
+                 dependency_relation[relation], view = $view\n\
+             ?[view, from, relation, to, evidence, confidence, provenance] := \
+                 materialized[view, from, relation, to, evidence, confidence, provenance]\n\
+             :put analysis_resolved_dependency {{\
+                 view, from, relation, to, evidence, provenance => confidence\
+             }}"
+        ),
+        params,
+    )?;
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "rebuild_resolved_dependencies",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        view,
+        "Mnestic publication stage completed"
+    );
+    Ok(())
+}
+
+fn refresh_resolved_dependencies(
+    transaction: &MultiTransaction,
+    view: &str,
+    affected_sources: &BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    if affected_sources.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let params = BTreeMap::from([
+        ("view".into(), view.into()),
+        (
+            "sources".into(),
+            DataValue::List(
+                affected_sources
+                    .iter()
+                    .map(|source| DataValue::List(vec![source.as_str().into()]))
+                    .collect(),
+            ),
+        ),
+    ]);
+    transaction.run_script(
+        "affected[from] <- $sources\n\
+         ?[view, from, relation, to, evidence, provenance] := affected[from], \
+             *analysis_resolved_dependency{view: $view, from, relation, to, evidence, provenance}, \
+             view = $view \
+         :rm analysis_resolved_dependency {view, from, relation, to, evidence, provenance}",
+        params.clone(),
+    )?;
+    let mut edges = transaction
+        .run_script(
+            &format!(
+                "{OUTGOING_DEPENDENCY_RULES}\n\
+                 frontier[id] <- $sources\n\
+                 ?[from, to, relation, evidence, max(confidence), provenance] := \
+                     selected_edge[from, to, relation, evidence, confidence, provenance]\n\
+                 :reorder written"
+            ),
+            params.clone(),
+        )?
+        .rows;
+    let shard_edges = transaction.run_script(
+        &format!(
+            "{OUTGOING_FACT_SHARD_DEPENDENCY_RULES}\n\
+             frontier[id] <- $sources\n\
+             ?[from, to, relation, evidence, max(confidence), provenance] := \
+                 shard_edge[from, to, relation, evidence, confidence, provenance]\n\
+             :reorder written"
+        ),
+        params.clone(),
+    )?;
+    let overrides = transaction.run_script(
+        &format!("{OUTGOING_DEPENDENCY_OVERRIDE_QUERY}\nfrontier[id] <- $sources"),
+        params,
+    )?;
+    let overridden = overrides
+        .rows
+        .iter()
+        .map(|row| {
+            Ok((
+                stored_string(row, 3, "override source")?.to_owned(),
+                stored_string(row, 5, "override relation")?.to_owned(),
+                stored_string(row, 1, "override unresolved destination")?.to_owned(),
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, Box<dyn Error>>>()?;
+    for row in shard_edges.rows {
+        let key = (
+            stored_string(&row, 0, "dependency source")?,
+            stored_string(&row, 2, "dependency relation")?,
+            stored_string(&row, 1, "dependency destination")?,
+        );
+        if !overridden.contains(&(key.0.to_owned(), key.1.to_owned(), key.2.to_owned())) {
+            edges.push(row);
+        }
+    }
+    let mut materialized = BTreeMap::new();
+    for edge in edges {
+        let confidence = edge[4].clone();
+        let key = (
+            stored_string(&edge, 0, "dependency source")?.to_owned(),
+            stored_string(&edge, 1, "dependency destination")?.to_owned(),
+            stored_string(&edge, 2, "dependency relation")?.to_owned(),
+            stored_string(&edge, 3, "dependency evidence")?.to_owned(),
+            stored_string(&edge, 5, "dependency provenance")?.to_owned(),
+        );
+        materialized
+            .entry(key)
+            .and_modify(|existing| {
+                if confidence > *existing {
+                    *existing = confidence.clone();
+                }
+            })
+            .or_insert(confidence);
+    }
+    let edge_count = materialized.len();
+    let rows = materialized
+        .into_iter()
+        .map(|((from, to, relation, evidence, provenance), confidence)| {
+            DataValue::List(vec![
+                view.into(),
+                from.into(),
+                to.into(),
+                relation.into(),
+                evidence.into(),
+                confidence,
+                provenance.into(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    for rows in rows.chunks(FACT_BATCH_SIZE) {
+        transaction.run_script(
+            "?[view, from, to, relation, evidence, confidence, provenance] <- $rows \
+             :put analysis_resolved_dependency {\
+                 view, from, relation, to, evidence, provenance => confidence\
+             }",
+            BTreeMap::from([("rows".into(), DataValue::List(rows.to_vec()))]),
+        )?;
+    }
+    tracing::info!(
+        target: "beholder::publication",
+        stage = "refresh_resolved_dependencies",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        view,
+        affected_sources = affected_sources.len(),
+        edges = edge_count,
+        "Mnestic publication stage completed"
+    );
+    Ok(())
 }
 
 fn copy_revision(
@@ -5311,6 +5679,44 @@ mod tests {
     }
 
     #[test]
+    fn fact_shard_replacement_reports_only_changed_dependency_sources() {
+        let store = SemanticStore::memory().unwrap();
+        let shard = |owner: &str, version: &str, target: &str| FactShard {
+            repository: "example/repo".into(),
+            producer: "rust".into(),
+            owner: owner.into(),
+            version: version.into(),
+            entities: Vec::new(),
+            observations: vec![Observation::dependency(
+                owner,
+                DependencyRelation::Calls,
+                target,
+                "src/lib.rs:1",
+            )],
+        };
+        let first = [
+            shard("repo://example/repo/rust/a", "a-1", "rust-call://first"),
+            shard("repo://example/repo/rust/b", "b-1", "rust-call://stable"),
+        ];
+        let transaction = store.db.multi_transaction(true);
+        replace_fact_shards(&transaction, "main", &first).unwrap();
+        transaction.commit().unwrap();
+
+        let second = [
+            shard("repo://example/repo/rust/a", "a-2", "rust-call://second"),
+            first[1].clone(),
+        ];
+        let transaction = store.db.multi_transaction(true);
+        let (_, affected_sources) = replace_fact_shards(&transaction, "main", &second).unwrap();
+        transaction.abort().unwrap();
+
+        assert_eq!(
+            affected_sources,
+            BTreeSet::from(["repo://example/repo/rust/a".to_owned()])
+        );
+    }
+
+    #[test]
     fn bulk_rebuilds_enrichment_selections_for_mass_shard_migrations() {
         let store = SemanticStore::memory().unwrap();
         let view = |fingerprint: &str| {
@@ -6061,6 +6467,164 @@ mod tests {
         );
         assert_eq!(rows.rows[0][4].get_str(), Some(Provenance::Ast.as_str()));
         assert_eq!(rows.rows[0][5].get_str(), Some("baseline detail"));
+    }
+
+    #[test]
+    fn unrelated_base_override_does_not_hide_an_enrichment_override() {
+        let store = SemanticStore::memory().unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "independent-overrides",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: "source".into(),
+                }],
+            )
+            .unwrap(),
+            &["compiler"],
+        );
+        let source = "repo://example/repo/caller";
+        let first = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "call://first",
+            "src/lib.rs:1",
+        );
+        let second = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "call://second",
+            "src/lib.rs:2",
+        );
+        store
+            .publish(
+                &view,
+                &[facts(&view, vec![first.clone(), second.clone()])],
+                &[DependencyOverride {
+                    from: first.from,
+                    relation: DependencyRelation::Calls,
+                    unresolved_to: first.to,
+                    resolved_to: "repo://example/repo/first".into(),
+                    evidence: first.evidence,
+                    confidence: Confidence::Exact,
+                    provenance: Provenance::Ast,
+                }],
+            )
+            .unwrap();
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler");
+        store
+            .publish_enrichment(
+                &view.name,
+                "example/repo",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "compiler",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    overrides: &[DependencyOverride {
+                        from: second.from,
+                        relation: DependencyRelation::Calls,
+                        unresolved_to: second.to,
+                        resolved_to: "repo://example/repo/second".into(),
+                        evidence: second.evidence,
+                        confidence: Confidence::Exact,
+                        provenance: Provenance::Compiler,
+                    }],
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let targets = store
+            .dependencies(&view.name, source, 1)
+            .unwrap()
+            .dependencies
+            .into_iter()
+            .map(|dependency| dependency.entity)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                "repo://example/repo/first".to_owned(),
+                "repo://example/repo/second".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn materialized_dependencies_preserve_provenance_variants() {
+        let store = SemanticStore::memory().unwrap();
+        let source = "repo://example/repo/caller";
+        let mut inferred = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "repo://example/repo/target",
+            "src/lib.rs:1",
+        );
+        inferred.confidence = Confidence::Inferred;
+        let mut compiler = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "repo://example/repo/target",
+            "src/lib.rs:1",
+        );
+        compiler.provenance = Provenance::Compiler;
+        let shards = [
+            FactShard {
+                repository: "example/repo".into(),
+                producer: "syntax".into(),
+                owner: "syntax".into(),
+                version: "1".into(),
+                entities: Vec::new(),
+                observations: vec![Observation::dependency(
+                    source,
+                    DependencyRelation::Calls,
+                    "repo://example/repo/target",
+                    "src/lib.rs:1",
+                )],
+            },
+            FactShard {
+                repository: "example/repo".into(),
+                producer: "compiler".into(),
+                owner: "compiler".into(),
+                version: "1".into(),
+                entities: Vec::new(),
+                observations: vec![compiler],
+            },
+            FactShard {
+                repository: "example/repo".into(),
+                producer: "inferred".into(),
+                owner: "inferred".into(),
+                version: "1".into(),
+                entities: Vec::new(),
+                observations: vec![inferred],
+            },
+        ];
+        let transaction = store.db.multi_transaction(true);
+        replace_fact_shards(&transaction, "main", &shards).unwrap();
+        rebuild_resolved_dependencies(&transaction, "main").unwrap();
+        transaction.commit().unwrap();
+
+        let edge = &store.context("main", source).unwrap().edges[0];
+        assert_eq!(edge.confidence, 1.0);
+        let evidence = edge
+            .evidence
+            .iter()
+            .map(|evidence| evidence.source_kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            evidence,
+            BTreeSet::from([
+                beholder_dto::EvidenceKind::Ast,
+                beholder_dto::EvidenceKind::Compiler,
+            ])
+        );
     }
 
     #[test]
