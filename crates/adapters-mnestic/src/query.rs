@@ -194,48 +194,60 @@ fn observed_query(
     spec: QuerySpec<'_>,
     additions: impl Fn() -> Vec<(&'static str, DataValue)>,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let span = tracing::info_span!(
-        "db.query",
-        otel.kind = "client",
-        peer.service = "mnestic",
-        db.system.name = "mnestic",
-        db.namespace = spec.view,
-        db.operation = spec.operation,
-        db.rows = tracing::field::Empty,
-        db.outcome = tracing::field::Empty,
-        db.plan.outcome = tracing::field::Empty,
-        db.plan.materialized_joins = tracing::field::Empty,
-        db.plan.prefix_joins = tracing::field::Empty,
-        db.plan.stored_loads = tracing::field::Empty,
-        db.plan.loaded_relations = tracing::field::Empty,
-    );
-    let _entered = span.enter();
-    let started = Instant::now();
-    let result = query(db, spec.view, spec.script, additions());
-    span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
-    if let Ok(rows) = &result {
-        span.record("db.rows", rows.rows.len());
-    }
-    if !span.is_disabled()
-        && (result.is_err() || started.elapsed().as_secs_f64() >= SLOW_QUERY_SECONDS)
-    {
-        let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
-        params.extend(
-            additions()
-                .into_iter()
-                .map(|(name, value)| (name.into(), value)),
+    let (result, elapsed, span_enabled) = {
+        let span = tracing::info_span!(
+            "db.query",
+            otel.kind = "client",
+            peer.service = "mnestic",
+            db.system.name = "mnestic",
+            db.namespace = spec.view,
+            db.operation = spec.operation,
+            db.rows = tracing::field::Empty,
+            db.outcome = tracing::field::Empty,
         );
+        let _entered = span.enter();
+        let started = Instant::now();
+        let result = query(db, spec.view, spec.script, additions());
+        let elapsed = started.elapsed();
+        span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
+        if let Ok(rows) = &result {
+            span.record("db.rows", rows.rows.len());
+        }
+        (result, elapsed, !span.is_disabled())
+    };
+    if span_enabled && (result.is_err() || elapsed.as_secs_f64() >= SLOW_QUERY_SECONDS) {
+        let span = tracing::info_span!(
+            "db.query.explain",
+            otel.kind = "client",
+            peer.service = "mnestic",
+            db.system.name = "mnestic",
+            db.namespace = spec.view,
+            db.operation = spec.operation,
+            db.plan.outcome = tracing::field::Empty,
+            db.plan.materialized_joins = tracing::field::Empty,
+            db.plan.prefix_joins = tracing::field::Empty,
+            db.plan.stored_loads = tracing::field::Empty,
+            db.plan.loaded_relations = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let explain = |timeout| {
+            let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
+            params.extend(
+                additions()
+                    .into_iter()
+                    .map(|(name, value)| (name.into(), value)),
+            );
+            db.explain_query(spec.script, params, timeout)
+        };
         let plan = if result.is_ok() {
-            without_consuming_query_budget(|| {
-                db.explain_query(spec.script, params, QUERY_PLAN_TIMEOUT_SECONDS)
-            })
+            without_consuming_query_budget(|| explain(QUERY_PLAN_TIMEOUT_SECONDS))
         } else {
             let plan_timeout = remaining_query_budget().min(QUERY_PLAN_TIMEOUT_SECONDS);
             if plan_timeout == 0.0 {
                 span.record("db.plan.outcome", "deadline_exhausted");
                 return result;
             }
-            db.explain_query(spec.script, params, plan_timeout)
+            explain(plan_timeout)
         };
         match plan {
             Ok(Some(plan)) => record_query_plan(&span, &plan),
@@ -1089,16 +1101,21 @@ mod tests {
     #[test]
     fn exhausted_query_budget_skips_plan_collection() {
         let runner = ExhaustedPlanRunner(Cell::new(false));
+        let parameter_builds = Cell::new(0);
 
         let _ = within_query_budget(|| {
             observed_query(
                 &runner,
                 QuerySpec::new("test", "main", "?[value] <- [[1]]"),
-                Vec::new,
+                || {
+                    parameter_builds.set(parameter_builds.get() + 1);
+                    Vec::new()
+                },
             )
         });
 
         assert!(!runner.0.get());
+        assert_eq!(parameter_builds.get(), 1);
     }
 
     #[test]
