@@ -1,4 +1,4 @@
-selected_edge[from, to, relation, evidence, confidence, provenance] :=
+shard_edge[from, to, relation, evidence, confidence, provenance] :=
     frontier[to],
     *analysis_fact_shard_observation:by_to{
         to,

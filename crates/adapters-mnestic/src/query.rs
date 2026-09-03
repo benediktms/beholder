@@ -503,22 +503,34 @@ fn closure(
 ) -> Result<NamedRows, Box<dyn Error>> {
     let rules = match direction {
         TraversalDirection::Outgoing => vec![
-            (OUTGOING_DEPENDENCY_RULES, ":reorder written"),
-            (OUTGOING_FACT_SHARD_DEPENDENCY_RULES, ":reorder written"),
+            (
+                OUTGOING_DEPENDENCY_RULES,
+                "selected_edge",
+                ":reorder written",
+            ),
+            (
+                OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
+                "shard_edge",
+                ":reorder written",
+            ),
         ],
         TraversalDirection::Incoming => vec![
-            (INCOMING_DEPENDENCY_RULES, ""),
-            (INCOMING_FACT_SHARD_DEPENDENCY_RULES, ":reorder written"),
+            (INCOMING_DEPENDENCY_RULES, "selected_edge", ""),
+            (
+                INCOMING_FACT_SHARD_DEPENDENCY_RULES,
+                "shard_edge",
+                ":reorder written",
+            ),
         ],
     };
     let scripts = rules
         .into_iter()
-        .map(|(rules, reorder)| {
+        .map(|(rules, edge_rule, reorder)| {
             format!(
                 "{rules}\n\
                  frontier[id] <- $frontier\n\
                  ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                     selected_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                     {edge_rule}[edge_from, edge_to, relation, evidence, confidence, provenance], \
                      row_kind = 'edge', entity = '', hops = 0\n\
                  :order edge_from, edge_to, relation\n\
                  {reorder}"
@@ -533,36 +545,62 @@ fn closure(
         "{override_rules}\n\
          frontier[id] <- $frontier"
     );
-    let boundary_rule = match direction {
+    let boundary_projection = match direction {
         TraversalDirection::Outgoing => {
             "\
              ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 direct[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
                  frontier[edge_from], not visited[edge_to], \
                  row_kind = 'edge', entity = '', hops = 0"
         }
         TraversalDirection::Incoming => {
             "\
              special[edge_from, edge_to, relation] := \
-                 direct[edge_from, edge_to, relation, _, _, _], \
+                 boundary_edge[edge_from, edge_to, relation, _, _, _], \
                  relation = 'implemented_by', starts_with(edge_from, 'grpc://')\n\
              ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 direct[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
                  frontier[edge_to], not special[edge_from, edge_to, relation], \
                  not visited[edge_from], row_kind = 'edge', entity = '', hops = 0\n\
              ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 direct[edge_from, edge_to, relation, evidence, confidence, provenance], \
+                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
                  special[edge_from, edge_to, relation], frontier[edge_from], \
                  not visited[edge_to], row_kind = 'edge', entity = '', hops = 0"
         }
     };
-    let boundary_script = format!(
-        "{DIRECT_RULES}\n\
-         frontier[id] <- $frontier\n\
-         visited[id] <- $visited\n\
-         {boundary_rule}\n\
-         :limit 1"
-    );
+    let (core_rules, shard_rules, shard_not_overridden) = match direction {
+        TraversalDirection::Outgoing => (
+            OUTGOING_DEPENDENCY_RULES,
+            OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
+            "not dependency_override[from, relation, to, _, _, _, _]",
+        ),
+        TraversalDirection::Incoming => (
+            INCOMING_DEPENDENCY_RULES,
+            INCOMING_FACT_SHARD_DEPENDENCY_RULES,
+            "not dependency_override[from, relation, to]",
+        ),
+    };
+    let boundary_scripts = [
+        format!(
+            "{core_rules}\n\
+             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
+                 selected_edge[from, to, relation, evidence, confidence, provenance]\n\
+             frontier[id] <- $frontier\n\
+             visited[id] <- $visited\n\
+             {boundary_projection}\n\
+             :limit 1"
+        ),
+        format!(
+            "{core_rules}\n{shard_rules}\n\
+             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
+                 shard_edge[from, to, relation, evidence, confidence, provenance], \
+                 {shard_not_overridden}\n\
+             frontier[id] <- $frontier\n\
+             visited[id] <- $visited\n\
+             {boundary_projection}\n\
+             :limit 1"
+        ),
+    ];
     let mut frontier = BTreeSet::from([entity.to_owned()]);
     let mut visited = frontier.clone();
     let mut rows = Vec::new();
@@ -581,19 +619,25 @@ fn closure(
                     .map(|entity| DataValue::List(vec![entity.as_str().into()]))
                     .collect(),
             );
-            let mut result = query(
-                db,
-                view,
-                &boundary_script,
-                [("frontier", values), ("visited", visited_values)],
-            )?;
-            for row in &mut result.rows {
-                row[2] = i64::from(hops).into();
+            for script in &boundary_scripts {
+                let mut result = query(
+                    db,
+                    view,
+                    script,
+                    [
+                        ("frontier", values.clone()),
+                        ("visited", visited_values.clone()),
+                    ],
+                )?;
+                if headers.is_empty() {
+                    headers = result.headers;
+                }
+                if let Some(mut row) = result.rows.pop() {
+                    row[2] = i64::from(hops).into();
+                    rows.push(row);
+                    break;
+                }
             }
-            if headers.is_empty() {
-                headers = result.headers;
-            }
-            rows.extend(result.rows);
             break;
         }
         let mut edge_groups = Vec::new();
@@ -700,6 +744,7 @@ fn edge_key(row: &[DataValue], target: usize) -> (String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::DIRECT_RULES;
     use crate::{SemanticStore, database::memory_database};
     use beholder_domain::{
         DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
