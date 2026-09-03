@@ -3258,10 +3258,10 @@ pub(super) fn rebuild_resolved_dependencies(
     let started = Instant::now();
     let params = BTreeMap::from([("view".into(), view.into())]);
     transaction.run_script(
-        "?[view, from, relation, to, evidence] := \
-             *analysis_resolved_dependency{view: $view, from, relation, to, evidence}, \
+        "?[view, from, relation, to, evidence, provenance] := \
+             *analysis_resolved_dependency{view: $view, from, relation, to, evidence, provenance}, \
              view = $view \
-         :rm analysis_resolved_dependency {view, from, relation, to, evidence}",
+         :rm analysis_resolved_dependency {view, from, relation, to, evidence, provenance}",
         params.clone(),
     )?;
     transaction.run_script(
@@ -3276,7 +3276,7 @@ pub(super) fn rebuild_resolved_dependencies(
                  direct[from, to, relation, evidence, confidence, provenance], \
                  dependency_relation[relation], view = $view\n\
              :put analysis_resolved_dependency {{\
-                 view, from, relation, to, evidence => confidence, provenance\
+                 view, from, relation, to, evidence, provenance => confidence\
              }}"
         ),
         params,
@@ -3314,10 +3314,10 @@ fn refresh_resolved_dependencies(
     ]);
     transaction.run_script(
         "affected[from] <- $sources\n\
-         ?[view, from, relation, to, evidence] := affected[from], \
-             *analysis_resolved_dependency{view: $view, from, relation, to, evidence}, \
+         ?[view, from, relation, to, evidence, provenance] := affected[from], \
+             *analysis_resolved_dependency{view: $view, from, relation, to, evidence, provenance}, \
              view = $view \
-         :rm analysis_resolved_dependency {view, from, relation, to, evidence}",
+         :rm analysis_resolved_dependency {view, from, relation, to, evidence, provenance}",
         params.clone(),
     )?;
     let mut edges = transaction
@@ -3380,7 +3380,7 @@ fn refresh_resolved_dependencies(
         transaction.run_script(
             "?[view, from, to, relation, evidence, confidence, provenance] <- $rows \
              :put analysis_resolved_dependency {\
-                 view, from, relation, to, evidence => confidence, provenance\
+                 view, from, relation, to, evidence, provenance => confidence\
              }",
             BTreeMap::from([("rows".into(), DataValue::List(rows.to_vec()))]),
         )?;
@@ -6440,6 +6440,147 @@ mod tests {
         );
         assert_eq!(rows.rows[0][4].get_str(), Some(Provenance::Ast.as_str()));
         assert_eq!(rows.rows[0][5].get_str(), Some("baseline detail"));
+    }
+
+    #[test]
+    fn unrelated_base_override_does_not_hide_an_enrichment_override() {
+        let store = SemanticStore::memory().unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "independent-overrides",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: "source".into(),
+                }],
+            )
+            .unwrap(),
+            &["compiler"],
+        );
+        let source = "repo://example/repo/caller";
+        let first = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "call://first",
+            "src/lib.rs:1",
+        );
+        let second = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "call://second",
+            "src/lib.rs:2",
+        );
+        store
+            .publish(
+                &view,
+                &[facts(&view, vec![first.clone(), second.clone()])],
+                &[DependencyOverride {
+                    from: first.from,
+                    relation: DependencyRelation::Calls,
+                    unresolved_to: first.to,
+                    resolved_to: "repo://example/repo/first".into(),
+                    evidence: first.evidence,
+                    confidence: Confidence::Exact,
+                    provenance: Provenance::Ast,
+                }],
+            )
+            .unwrap();
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler");
+        store
+            .publish_enrichment(
+                &view.name,
+                "example/repo",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "compiler",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    overrides: &[DependencyOverride {
+                        from: second.from,
+                        relation: DependencyRelation::Calls,
+                        unresolved_to: second.to,
+                        resolved_to: "repo://example/repo/second".into(),
+                        evidence: second.evidence,
+                        confidence: Confidence::Exact,
+                        provenance: Provenance::Compiler,
+                    }],
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let targets = store
+            .dependencies(&view.name, source, 1)
+            .unwrap()
+            .dependencies
+            .into_iter()
+            .map(|dependency| dependency.entity)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                "repo://example/repo/first".to_owned(),
+                "repo://example/repo/second".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn materialized_dependencies_preserve_provenance_variants() {
+        let store = SemanticStore::memory().unwrap();
+        let source = "repo://example/repo/caller";
+        let mut compiler = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "repo://example/repo/target",
+            "src/lib.rs:1",
+        );
+        compiler.provenance = Provenance::Compiler;
+        let shards = [
+            FactShard {
+                repository: "example/repo".into(),
+                producer: "syntax".into(),
+                owner: "syntax".into(),
+                version: "1".into(),
+                entities: Vec::new(),
+                observations: vec![Observation::dependency(
+                    source,
+                    DependencyRelation::Calls,
+                    "repo://example/repo/target",
+                    "src/lib.rs:1",
+                )],
+            },
+            FactShard {
+                repository: "example/repo".into(),
+                producer: "compiler".into(),
+                owner: "compiler".into(),
+                version: "1".into(),
+                entities: Vec::new(),
+                observations: vec![compiler],
+            },
+        ];
+        let transaction = store.db.multi_transaction(true);
+        replace_fact_shards(&transaction, "main", &shards).unwrap();
+        rebuild_resolved_dependencies(&transaction, "main").unwrap();
+        transaction.commit().unwrap();
+
+        let evidence = store.context("main", source).unwrap().edges[0]
+            .evidence
+            .iter()
+            .map(|evidence| evidence.source_kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            evidence,
+            BTreeSet::from([
+                beholder_dto::EvidenceKind::Ast,
+                beholder_dto::EvidenceKind::Compiler,
+            ])
+        );
     }
 
     #[test]
