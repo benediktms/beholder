@@ -1143,6 +1143,13 @@ mod tests {
                 );
             }
         }
+        assert!(
+            store
+                .impact(&view.name, enrichment_resolved, 0)
+                .unwrap()
+                .traversal
+                .truncated
+        );
         assert_eq!(
             store
                 .impact(&view.name, duplicate_target, 1)

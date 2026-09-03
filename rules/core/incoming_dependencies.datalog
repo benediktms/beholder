@@ -203,6 +203,29 @@ revision_enrichment_override_edge[
         evidence,
     }
 
+fact_shard_enrichment_override_edge[
+    from, resolved_to, relation, evidence, confidence, provenance,
+] :=
+    frontier[resolved_to],
+    enrichment_override_candidate[
+        from, relation, unresolved_to, resolved_to, confidence, provenance,
+    ],
+    *analysis_fact_shard_observation:by_to{
+        to: unresolved_to,
+        producer,
+        owner,
+        version,
+        from,
+        relation,
+        evidence,
+    },
+    *analysis_fact_shard_selection:by_owner{
+        view: $view,
+        owner,
+        producer,
+        version,
+    }
+
 enrichment_observation_edge[from, to, relation, evidence, confidence, provenance] :=
     frontier[to],
     *analysis_enrichment_observation_selection:by_to{

@@ -691,6 +691,7 @@ fn closure(
                 "revision_edge",
                 "state_enrichment_override_edge",
                 "revision_enrichment_override_edge",
+                "fact_shard_enrichment_override_edge",
                 "enrichment_observation_edge",
                 "grpc_implementation_edge",
             ],
@@ -700,6 +701,7 @@ fn closure(
                 "traversal.incoming.revision",
                 "traversal.incoming.state_enrichment_override",
                 "traversal.incoming.revision_enrichment_override",
+                "traversal.incoming.fact_shard_enrichment_override",
                 "traversal.incoming.enrichment_observation",
                 "traversal.incoming.grpc_implementation",
             ],
@@ -709,6 +711,7 @@ fn closure(
                 "traversal.incoming.boundary.revision",
                 "traversal.incoming.boundary.state_enrichment_override",
                 "traversal.incoming.boundary.revision_enrichment_override",
+                "traversal.incoming.boundary.fact_shard_enrichment_override",
                 "traversal.incoming.boundary.enrichment_observation",
                 "traversal.incoming.boundary.grpc_implementation",
             ],
@@ -850,18 +853,26 @@ fn closure(
                 .map(|entity| DataValue::List(vec![entity.as_str().into()]))
                 .collect(),
         );
-        let prefetched_shard = if matches!(direction, TraversalDirection::Incoming) {
-            Some(observed_query(
-                db,
-                QuerySpec::new(shard_operation, view, &shard_script),
-                || vec![("frontier", values.clone())],
-            )?)
-        } else {
-            None
+        let prefetched_shard =
+            if matches!(direction, TraversalDirection::Incoming) && hops < max_hops {
+                Some(observed_query(
+                    db,
+                    QuerySpec::new(shard_operation, view, &shard_script),
+                    || vec![("frontier", values.clone())],
+                )?)
+            } else {
+                None
+            };
+        let fact_shard_baseline = match direction {
+            TraversalDirection::Incoming => Some(
+                prefetched_shard
+                    .as_ref()
+                    .map_or(DataValue::List(Vec::new()), |result| {
+                        fact_shard_baseline(&result.rows)
+                    }),
+            ),
+            TraversalDirection::Outgoing => None,
         };
-        let fact_shard_baseline = prefetched_shard
-            .as_ref()
-            .map(|result| fact_shard_baseline(&result.rows));
         let (dependency_overrides, enrichment_overrides) =
             if matches!(direction, TraversalDirection::Incoming) {
                 let candidates = observed_query(
