@@ -3062,9 +3062,11 @@ pub(super) fn publish_enrichment(
     }
     let baseline_entities = transaction.run_script(
         "entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, repository: $repository, state}, *state_entity{state, id, kind, metadata}\n\
+         entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_context{view: $view, revision, target: $repository, analyzer: $analyzer, context}, *analysis_revision_state{view: $view, revision, repository: context, state}, *state_entity{state, id, kind, metadata}\n\
          entity[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, repository: $repository, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
+         entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_context{view: $view, revision, target: $repository, analyzer: $analyzer, context}, *analysis_fact_shard_selection{view: $view, repository: context, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
          ?[id, kind, metadata] := entity[id, kind, metadata]",
-        BTreeMap::from([("view".into(), view.into()), ("repository".into(), repository.into())]),
+        BTreeMap::from([("view".into(), view.into()), ("repository".into(), repository.into()), ("analyzer".into(), analyzer.into())]),
     )?.rows.into_iter().map(|row| -> Result<EntityFact, Box<dyn Error>> {
         let id = stored_string(&row, 0, "entity ID")?.to_owned();
         Ok(EntityFact::new(id, parse_entity_kind(stored_string(&row, 1, "entity kind")?)?, parse_entity_metadata(stored_string(&row, 2, "entity metadata")?)?)?)
@@ -7051,6 +7053,87 @@ mod tests {
                 .edges
                 .iter()
                 .any(|edge| edge.to == "repo://example/repo/target-b")
+        );
+    }
+
+    #[test]
+    fn enrichment_accepts_resolved_context_entities() {
+        let store = SemanticStore::memory().unwrap();
+        let target = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/target".into(),
+            },
+            head: None,
+            fingerprint: "target".into(),
+        };
+        let context = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/context".into(),
+            },
+            head: None,
+            fingerprint: "context".into(),
+        };
+        let view = WorkspaceView::new(
+            "context-override",
+            "analysis",
+            vec![target.clone(), context],
+        )
+        .unwrap()
+        .with_repository_contexts(BTreeMap::from([(
+            "typescript".into(),
+            BTreeMap::from([("example/target".into(), vec!["example/context".into()])]),
+        )]))
+        .unwrap();
+        let call = Observation::dependency(
+            "repo://example/target/typescript/caller",
+            DependencyRelation::Calls,
+            "typescript-method://counter/value",
+            "src/caller.ts:1",
+        );
+        let mut context_facts = facts(&view, Vec::new());
+        context_facts.state = view.repository_states[1].clone();
+        context_facts.entities.push(
+            EntityFact::new(
+                "repo://example/context/typescript/target/Counter/value",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
+        store
+            .publish(
+                &view,
+                &[facts(&view, vec![call.clone()]), context_facts],
+                &[],
+            )
+            .unwrap();
+
+        let input = view.repository_enrichment_input_fingerprint(&target, "typescript");
+        assert!(
+            store
+                .publish_enrichment(
+                    &view.name,
+                    "example/target",
+                    &input,
+                    EnrichmentOwner {
+                        analyzer: "typescript",
+                        version: "1",
+                    },
+                    EnrichmentPayload {
+                        overrides: &[DependencyOverride {
+                            from: call.from,
+                            relation: DependencyRelation::Calls,
+                            unresolved_to: call.to,
+                            resolved_to: "repo://example/context/typescript/target/Counter/value"
+                                .into(),
+                            evidence: "src/caller.ts:1".into(),
+                            confidence: Confidence::Exact,
+                            provenance: Provenance::Compiler,
+                        }],
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .unwrap()
         );
     }
 
