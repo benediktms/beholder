@@ -1026,6 +1026,23 @@ mod tests {
                 },
             )
             .unwrap();
+        store
+            .db
+            .run_script(
+                "?[view, revision, from, relation, to, evidence, confidence, provenance] := \
+                     *analysis_revision{view: 'overridden-shard', revision}, \
+                     view = 'overridden-shard', \
+                     from = 'repo://example/repository/rust/lib/state_run', \
+                     relation = 'calls', to = 'rust-call://state-target', \
+                     evidence in ['src/lib.rs:6', 'src/lib.rs:7'], \
+                     confidence = 1.0, provenance = 'ast' \
+                 :put analysis_revision_observation {\
+                     view, revision, from, relation, to, evidence => confidence, provenance\
+                 }",
+                BTreeMap::new(),
+                mnestic_engine::ScriptMutability::Mutable,
+            )
+            .unwrap();
 
         let dependencies = store.dependencies(&view.name, source, 1).unwrap();
         assert!(
@@ -1104,13 +1121,22 @@ mod tests {
                 .len(),
             1
         );
+        let state_impact = store.impact(&view.name, state_resolved, 1).unwrap();
         assert!(
-            store
-                .impact(&view.name, state_resolved, 1)
-                .unwrap()
+            state_impact
                 .affected
                 .iter()
                 .any(|affected| affected.entity == state_owner)
+        );
+        assert_eq!(
+            state_impact
+                .edges
+                .iter()
+                .find(|edge| edge.to == state_resolved)
+                .unwrap()
+                .evidence
+                .len(),
+            3
         );
         assert!(
             store

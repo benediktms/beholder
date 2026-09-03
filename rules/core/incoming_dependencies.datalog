@@ -211,9 +211,9 @@ selected_edge[from, to, relation, evidence, confidence, provenance] :=
 
 selected_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
     frontier[resolved_to],
-    baseline_observation[from, relation, unresolved_to, _],
+    baseline_observation[from, relation, unresolved_to, evidence],
     enrichment_override[
-        from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
+        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
     ]
 
 selected_edge[from, to, relation, evidence, confidence, provenance] :=
