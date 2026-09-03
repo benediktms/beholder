@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const SEMANTIC_QUERY_TIMEOUT_SECONDS: f64 = 5.0;
+const SLOW_QUERY_SECONDS: f64 = 1.0;
+const QUERY_PLAN_TIMEOUT_SECONDS: f64 = 0.25;
 const ANALYSIS_METADATA_RULES: &str = include_str!("../../../rules/core/analysis_metadata.datalog");
 
 thread_local! {
@@ -27,6 +29,15 @@ pub(super) trait QueryRunner {
         params: BTreeMap<String, DataValue>,
         timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>>;
+
+    fn explain_query(
+        &self,
+        _script: &str,
+        _params: BTreeMap<String, DataValue>,
+        _timeout: f64,
+    ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+        Ok(None)
+    }
 }
 
 impl QueryRunner for DbInstance {
@@ -43,6 +54,20 @@ impl QueryRunner for DbInstance {
             ScriptRunOptions::new().with_timeout(timeout),
         )?)
     }
+
+    fn explain_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        timeout: f64,
+    ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+        Ok(Some(self.run_script_with_options(
+            &format!("::explain {{ {script} }}"),
+            params,
+            ScriptMutability::Immutable,
+            ScriptRunOptions::new().with_timeout(timeout),
+        )?))
+    }
 }
 
 impl QueryRunner for MultiTransaction {
@@ -56,6 +81,40 @@ impl QueryRunner for MultiTransaction {
     }
 }
 
+pub(super) struct SnapshotQueryRunner<'a> {
+    transaction: &'a MultiTransaction,
+    explain_db: &'a DbInstance,
+}
+
+impl<'a> SnapshotQueryRunner<'a> {
+    pub(super) fn new(transaction: &'a MultiTransaction, explain_db: &'a DbInstance) -> Self {
+        Self {
+            transaction,
+            explain_db,
+        }
+    }
+}
+
+impl QueryRunner for SnapshotQueryRunner<'_> {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        timeout: f64,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        self.transaction.run_query(script, params, timeout)
+    }
+
+    fn explain_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        timeout: f64,
+    ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+        self.explain_db.explain_query(script, params, timeout)
+    }
+}
+
 pub(super) fn within_query_budget<T>(read: impl FnOnce() -> T) -> T {
     let previous = SEMANTIC_QUERY_DEADLINE.replace(Some(
         Instant::now() + Duration::from_secs_f64(SEMANTIC_QUERY_TIMEOUT_SECONDS),
@@ -65,7 +124,23 @@ pub(super) fn within_query_budget<T>(read: impl FnOnce() -> T) -> T {
     result
 }
 
-pub(super) fn query(
+struct QuerySpec<'a> {
+    operation: &'static str,
+    view: &'a str,
+    script: &'a str,
+}
+
+impl<'a> QuerySpec<'a> {
+    fn new(operation: &'static str, view: &'a str, script: &'a str) -> Self {
+        Self {
+            operation,
+            view,
+            script,
+        }
+    }
+}
+
+fn query(
     db: &impl QueryRunner,
     view: &str,
     script: &str,
@@ -77,16 +152,7 @@ pub(super) fn query(
             .into_iter()
             .map(|(name, value)| (name.into(), value)),
     );
-    let timeout = SEMANTIC_QUERY_DEADLINE.with(|deadline| {
-        deadline
-            .get()
-            .map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_secs_f64()
-            })
-            .unwrap_or(SEMANTIC_QUERY_TIMEOUT_SECONDS)
-    });
+    let timeout = remaining_query_budget();
     if timeout == 0.0 {
         return Err(query_timeout().into());
     }
@@ -97,6 +163,104 @@ pub(super) fn query(
             error
         }
     })
+}
+
+fn remaining_query_budget() -> f64 {
+    SEMANTIC_QUERY_DEADLINE.with(|deadline| {
+        deadline
+            .get()
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64()
+            })
+            .unwrap_or(SEMANTIC_QUERY_TIMEOUT_SECONDS)
+    })
+}
+
+fn observed_query(
+    db: &impl QueryRunner,
+    spec: QuerySpec<'_>,
+    additions: Vec<(&'static str, DataValue)>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let span = tracing::info_span!(
+        "db.query",
+        otel.kind = "client",
+        peer.service = "mnestic",
+        db.system.name = "mnestic",
+        db.namespace = spec.view,
+        db.operation = spec.operation,
+        db.rows = tracing::field::Empty,
+        db.outcome = tracing::field::Empty,
+        db.plan.outcome = tracing::field::Empty,
+        db.plan.materialized_joins = tracing::field::Empty,
+        db.plan.prefix_joins = tracing::field::Empty,
+        db.plan.stored_loads = tracing::field::Empty,
+        db.plan.loaded_relations = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let started = Instant::now();
+    let result = query(db, spec.view, spec.script, additions.clone());
+    span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
+    if let Ok(rows) = &result {
+        span.record("db.rows", rows.rows.len());
+    }
+    if result.is_err() || started.elapsed().as_secs_f64() >= SLOW_QUERY_SECONDS {
+        let plan_timeout = remaining_query_budget().min(QUERY_PLAN_TIMEOUT_SECONDS);
+        if plan_timeout == 0.0 {
+            span.record("db.plan.outcome", "deadline_exhausted");
+            return result;
+        }
+        let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
+        params.extend(
+            additions
+                .into_iter()
+                .map(|(name, value)| (name.into(), value)),
+        );
+        match db.explain_query(spec.script, params, plan_timeout) {
+            Ok(Some(plan)) => record_query_plan(&span, &plan),
+            Ok(None) => {
+                span.record("db.plan.outcome", "unsupported");
+            }
+            Err(_) => {
+                span.record("db.plan.outcome", "error");
+            }
+        }
+    }
+    result
+}
+
+fn record_query_plan(span: &tracing::Span, plan: &NamedRows) {
+    let Some(operation_column) = plan.headers.iter().position(|header| header == "op") else {
+        span.record("db.plan.outcome", "invalid");
+        return;
+    };
+    let reference_column = plan.headers.iter().position(|header| header == "ref");
+    let mut materialized_joins = 0;
+    let mut prefix_joins = 0;
+    let mut stored_loads = 0;
+    let mut loaded_relations = BTreeSet::new();
+    for row in &plan.rows {
+        match row[operation_column].get_str() {
+            Some("stored_mat_join") => materialized_joins += 1,
+            Some("stored_prefix_join") => prefix_joins += 1,
+            Some(operation) if operation.starts_with("load_stored") => {
+                stored_loads += 1;
+                if let Some(relation) = reference_column.and_then(|column| row[column].get_str()) {
+                    loaded_relations.insert(relation);
+                }
+            }
+            _ => {}
+        }
+    }
+    span.record("db.plan.outcome", "ok");
+    span.record("db.plan.materialized_joins", materialized_joins);
+    span.record("db.plan.prefix_joins", prefix_joins);
+    span.record("db.plan.stored_loads", stored_loads);
+    span.record(
+        "db.plan.loaded_relations",
+        loaded_relations.into_iter().collect::<Vec<_>>().join(","),
+    );
 }
 
 fn query_timeout() -> io::Error {
@@ -457,7 +621,11 @@ pub(super) fn context(
     view: &str,
     entity: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(db, view, CONTEXT_QUERY, [("entity", entity.into())])
+    observed_query(
+        db,
+        QuerySpec::new("context", view, CONTEXT_QUERY),
+        vec![("entity", entity.into())],
+    )
 }
 
 pub(super) fn trace(
@@ -601,11 +769,39 @@ fn closure(
              :limit 1"
         ),
     ];
+    let (operations, boundary_operations, override_operation) = match direction {
+        TraversalDirection::Outgoing => (
+            ["traversal.outgoing.core", "traversal.outgoing.fact_shard"],
+            [
+                "traversal.outgoing.boundary.core",
+                "traversal.outgoing.boundary.fact_shard",
+            ],
+            "traversal.outgoing.overrides",
+        ),
+        TraversalDirection::Incoming => (
+            ["traversal.incoming.core", "traversal.incoming.fact_shard"],
+            [
+                "traversal.incoming.boundary.core",
+                "traversal.incoming.boundary.fact_shard",
+            ],
+            "traversal.incoming.overrides",
+        ),
+    };
     let mut frontier = BTreeSet::from([entity.to_owned()]);
     let mut visited = frontier.clone();
     let mut rows = Vec::new();
     let mut headers = Vec::new();
     for hops in 0..=max_hops {
+        let hop_span = tracing::info_span!(
+            "graph.traversal.hop",
+            graph.direction = match direction {
+                TraversalDirection::Outgoing => "outgoing",
+                TraversalDirection::Incoming => "incoming",
+            },
+            graph.hop = hops,
+            graph.frontier_size = frontier.len(),
+        );
+        let _entered = hop_span.enter();
         let values = DataValue::List(
             frontier
                 .iter()
@@ -619,12 +815,11 @@ fn closure(
                     .map(|entity| DataValue::List(vec![entity.as_str().into()]))
                     .collect(),
             );
-            for script in &boundary_scripts {
-                let mut result = query(
+            for (operation, script) in boundary_operations.into_iter().zip(&boundary_scripts) {
+                let mut result = observed_query(
                     db,
-                    view,
-                    script,
-                    [
+                    QuerySpec::new(operation, view, script),
+                    vec![
                         ("frontier", values.clone()),
                         ("visited", visited_values.clone()),
                     ],
@@ -641,14 +836,22 @@ fn closure(
             break;
         }
         let mut edge_groups = Vec::new();
-        for script in &scripts {
-            let result = query(db, view, script, [("frontier", values.clone())])?;
+        for (operation, script) in operations.into_iter().zip(&scripts) {
+            let result = observed_query(
+                db,
+                QuerySpec::new(operation, view, script),
+                vec![("frontier", values.clone())],
+            )?;
             if headers.is_empty() {
                 headers = result.headers;
             }
             edge_groups.push(result.rows);
         }
-        let overrides = query(db, view, &override_script, [("frontier", values)])?;
+        let overrides = observed_query(
+            db,
+            QuerySpec::new(override_operation, view, &override_script),
+            vec![("frontier", values)],
+        )?;
         merge_fact_shard_overrides(&mut edge_groups[1], overrides.rows, direction, &frontier);
         let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
         for row in &mut result_rows {
@@ -773,6 +976,30 @@ mod tests {
         }
     }
 
+    struct ExhaustedPlanRunner(Cell<bool>);
+
+    impl QueryRunner for ExhaustedPlanRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            _timeout: f64,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() - Duration::from_millis(1)));
+            Err(query_timeout().into())
+        }
+
+        fn explain_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+            _timeout: f64,
+        ) -> Result<Option<NamedRows>, Box<dyn Error>> {
+            self.0.set(true);
+            Ok(None)
+        }
+    }
+
     #[test]
     fn one_budget_is_shared_by_every_query_in_a_semantic_read() {
         let runner = TimeoutRunner(RefCell::new(Vec::new()));
@@ -819,6 +1046,39 @@ mod tests {
             error.downcast_ref::<io::Error>().map(io::Error::kind),
             Some(io::ErrorKind::TimedOut)
         );
+    }
+
+    #[test]
+    fn exhausted_query_budget_skips_plan_collection() {
+        let runner = ExhaustedPlanRunner(Cell::new(false));
+
+        let _ = within_query_budget(|| {
+            observed_query(
+                &runner,
+                QuerySpec::new("test", "main", "?[value] <- [[1]]"),
+                vec![],
+            )
+        });
+
+        assert!(!runner.0.get());
+    }
+
+    #[test]
+    fn snapshot_queries_can_be_explained() {
+        let db = memory_database().unwrap();
+        let transaction = db.multi_transaction(false);
+        let query_runner = SnapshotQueryRunner::new(&transaction, &db);
+        let plan = query_runner
+            .explain_query(
+                "?[value] <- [[1]]",
+                BTreeMap::new(),
+                QUERY_PLAN_TIMEOUT_SECONDS,
+            )
+            .unwrap()
+            .unwrap();
+        transaction.abort().unwrap();
+
+        assert!(plan.headers.iter().any(|header| header == "op"));
     }
 
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {

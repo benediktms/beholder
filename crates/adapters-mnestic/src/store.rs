@@ -4,9 +4,10 @@ use super::{
     database::{benchmark_database, memory_database, persistent_database},
     inspection::{InspectionResult, inspection_result},
     query::{
-        analysis_metadata, analysis_revision, context, dependencies, entity_facts, impact,
-        inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions,
-        published_repository_head, repository_revision, trace, within_query_budget,
+        SnapshotQueryRunner, analysis_metadata, analysis_revision, context, dependencies,
+        entity_facts, impact, inspect_grpc_bindings, inspect_observations, inspect_relations,
+        inspect_revisions, published_repository_head, repository_revision, trace,
+        within_query_budget,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -27,7 +28,7 @@ use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
     RepositoryRevision, Revisioned, TraceResult,
 };
-use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows};
+use mnestic_engine::{DataValue, DbInstance, NamedRows};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -639,11 +640,12 @@ impl SemanticStore {
     fn snapshot<T>(
         &self,
         view: &str,
-        read: impl FnOnce(&MultiTransaction) -> Result<T, Box<dyn Error>>,
+        read: impl FnOnce(&SnapshotQueryRunner<'_>) -> Result<T, Box<dyn Error>>,
     ) -> Result<Revisioned<T>, Box<dyn Error>> {
         within_query_budget(|| {
             let transaction = self.read_db.multi_transaction(false);
-            let analysis_revision = analysis_revision(&transaction, view)?;
+            let query_runner = SnapshotQueryRunner::new(&transaction, &self.read_db);
+            let analysis_revision = analysis_revision(&query_runner, view)?;
             if analysis_revision == 0 {
                 transaction.abort()?;
                 return Err(Box::new(BeholderError::new(
@@ -652,8 +654,8 @@ impl SemanticStore {
                     format!("workspace has no completed analysis revision: {view}"),
                 )) as Box<dyn Error>);
             }
-            let result = read(&transaction)?;
-            let analysis = analysis_metadata(&transaction, view, analysis_revision)?;
+            let result = read(&query_runner)?;
+            let analysis = analysis_metadata(&query_runner, view, analysis_revision)?;
             transaction.abort()?;
             Ok(Revisioned {
                 result,
