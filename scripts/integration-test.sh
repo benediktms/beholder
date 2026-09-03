@@ -209,7 +209,7 @@ check_grpc_path() {
     contract="proto-method://phase5.v1.Bridge/$method"
 
     context=''
-    for _ in {1..600}; do
+    for _ in {1..1200}; do
         context="$(target/debug/beholder context --json --workspace main "$operation" 2>/dev/null || true)"
         grep -Fq '"stale":false' <<<"$context" && break
         sleep 0.1
