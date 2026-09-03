@@ -8,6 +8,7 @@ use mnestic_engine::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,93 @@ pub(super) trait QueryRunner {
     ) -> Result<Option<NamedRows>, Box<dyn Error>> {
         Ok(None)
     }
+
+    fn run<Q: MnesticQuery>(&self, view: &str, params: Q::Params) -> Result<Vec<Q::Row>, QueryError>
+    where
+        Self: Sized,
+    {
+        let bind = || {
+            let mut bound = BTreeMap::from([("view".into(), view.into())]);
+            bound.extend(Q::bind(&params));
+            bound
+        };
+        let result =
+            observed_bound_query(self, QuerySpec::new(Q::OPERATION, view, Q::SCRIPT), bind)
+                .map_err(|error| QueryError::new(Q::OPERATION, error.to_string()))?;
+        let expected = Q::HEADERS
+            .iter()
+            .map(|header| (*header).to_owned())
+            .collect::<Vec<_>>();
+        if result.headers != expected {
+            return Err(QueryError::new(
+                Q::OPERATION,
+                format!(
+                    "unexpected output headers: expected {expected:?}, got {:?}",
+                    result.headers
+                ),
+            ));
+        }
+        if let Some((index, row)) = result
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.len() != expected.len())
+        {
+            return Err(QueryError::new(
+                Q::OPERATION,
+                format!(
+                    "unexpected row width at row {index}: expected {}, got {}",
+                    expected.len(),
+                    row.len()
+                ),
+            ));
+        }
+        result
+            .rows
+            .iter()
+            .map(|row| Q::decode(&result.headers, row))
+            .collect()
+    }
 }
+
+pub(super) trait MnesticQuery {
+    const OPERATION: &'static str;
+    const SCRIPT: &'static str;
+    const HEADERS: &'static [&'static str];
+
+    type Params;
+    type Row;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue>;
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError>;
+}
+
+#[derive(Debug)]
+pub(super) struct QueryError {
+    operation: &'static str,
+    detail: String,
+}
+
+impl QueryError {
+    fn new(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            operation,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Mnestic query {} failed: {}",
+            self.operation, self.detail
+        )
+    }
+}
+
+impl Error for QueryError {}
 
 impl QueryRunner for DbInstance {
     fn run_query(
@@ -155,10 +242,10 @@ fn query(
     db.run_query(script, params)
 }
 
-fn observed_query(
+fn observed_bound_query(
     db: &impl QueryRunner,
     spec: QuerySpec<'_>,
-    additions: impl Fn() -> Vec<(&'static str, DataValue)>,
+    params: impl Fn() -> BTreeMap<String, DataValue>,
 ) -> Result<NamedRows, Box<dyn Error>> {
     let (result, elapsed, span_enabled) = {
         let span = tracing::info_span!(
@@ -175,7 +262,7 @@ fn observed_query(
         );
         let _entered = span.enter();
         let started = Instant::now();
-        let result = query(db, spec.view, spec.script, additions());
+        let result = db.run_query(spec.script, params());
         let elapsed = started.elapsed();
         span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
         if let Ok(rows) = &result {
@@ -201,16 +288,7 @@ fn observed_query(
             db.plan.loaded_relations = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let explain = || {
-            let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
-            params.extend(
-                additions()
-                    .into_iter()
-                    .map(|(name, value)| (name.into(), value)),
-            );
-            db.explain_query(spec.script, params, QUERY_PLAN_TIMEOUT_SECONDS)
-        };
-        let plan = explain();
+        let plan = db.explain_query(spec.script, params(), QUERY_PLAN_TIMEOUT_SECONDS);
         match plan {
             Ok(Some(plan)) => record_query_plan(&span, &plan),
             Ok(None) => {
@@ -624,14 +702,155 @@ pub(super) fn inspect_grpc_bindings(db: &DbInstance) -> Result<NamedRows, Box<dy
     )?)
 }
 
+struct ContextParams {
+    entity: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) struct ContextRow {
+    pub(super) direction: String,
+    pub(super) relation: String,
+    pub(super) related: String,
+    pub(super) evidence: String,
+    pub(super) confidence: f64,
+    pub(super) provenance: String,
+}
+
+impl ContextRow {
+    fn edge_key(&self) -> (String, String, String, String) {
+        (
+            self.direction.clone(),
+            self.relation.clone(),
+            self.related.clone(),
+            self.evidence.clone(),
+        )
+    }
+}
+
+const CONTEXT_HEADERS: &[&str] = &[
+    "direction",
+    "relation",
+    "related",
+    "evidence",
+    "confidence",
+    "provenance",
+];
+
+macro_rules! context_query {
+    ($name:ident, $operation:literal, $script:expr) => {
+        struct $name;
+
+        impl MnesticQuery for $name {
+            const OPERATION: &'static str = $operation;
+            const SCRIPT: &'static str = $script;
+            const HEADERS: &'static [&'static str] = CONTEXT_HEADERS;
+
+            type Params = ContextParams;
+            type Row = ContextRow;
+
+            fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+                BTreeMap::from([("entity".into(), params.entity.as_str().into())])
+            }
+
+            fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+                decode_context(Self::OPERATION, headers, row)
+            }
+        }
+    };
+}
+
+context_query!(
+    MaterializedContextDependencies,
+    "context.dependencies",
+    CONTEXT_QUERY
+);
+context_query!(
+    StateStructuralContext,
+    "context.structural.state",
+    include_str!("../../../rules/core/context_structural_state.datalog")
+);
+context_query!(
+    FactShardStructuralContext,
+    "context.structural.fact_shard",
+    include_str!("../../../rules/core/context_structural_fact_shard.datalog")
+);
+context_query!(
+    RevisionStructuralContext,
+    "context.structural.revision",
+    include_str!("../../../rules/core/context_structural_revision.datalog")
+);
+context_query!(
+    EnrichmentStructuralContext,
+    "context.structural.enrichment",
+    include_str!("../../../rules/core/context_structural_enrichment.datalog")
+);
+
+fn decode_context(
+    operation: &'static str,
+    headers: &[String],
+    row: &[DataValue],
+) -> Result<ContextRow, QueryError> {
+    let string = |index: usize| {
+        row.get(index)
+            .and_then(DataValue::get_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                QueryError::new(
+                    operation,
+                    format!("column {} is not a string", headers[index]),
+                )
+            })
+    };
+    Ok(ContextRow {
+        direction: string(0)?,
+        relation: string(1)?,
+        related: string(2)?,
+        evidence: string(3)?,
+        confidence: row
+            .get(4)
+            .and_then(DataValue::get_float)
+            .ok_or_else(|| QueryError::new(operation, "column confidence is not a float"))?,
+        provenance: string(5)?,
+    })
+}
+
+fn context_params(entity: &str) -> ContextParams {
+    ContextParams {
+        entity: entity.to_owned(),
+    }
+}
+
 pub(super) fn context(
     db: &impl QueryRunner,
     view: &str,
     entity: &str,
-) -> Result<NamedRows, Box<dyn Error>> {
-    observed_query(db, QuerySpec::new("context", view, CONTEXT_QUERY), || {
-        vec![("entity", entity.into())]
-    })
+) -> Result<Vec<ContextRow>, Box<dyn Error>> {
+    let mut result = db.run::<MaterializedContextDependencies>(view, context_params(entity))?;
+    let mut baseline_structural = BTreeSet::new();
+    for rows in [
+        db.run::<StateStructuralContext>(view, context_params(entity))?,
+        db.run::<FactShardStructuralContext>(view, context_params(entity))?,
+        db.run::<RevisionStructuralContext>(view, context_params(entity))?,
+    ] {
+        baseline_structural.extend(rows.iter().map(ContextRow::edge_key));
+        result.extend(rows);
+    }
+    result.extend(
+        db.run::<EnrichmentStructuralContext>(view, context_params(entity))?
+            .into_iter()
+            .filter(|row| !baseline_structural.contains(&row.edge_key())),
+    );
+    result.sort_by(|left, right| {
+        left.direction
+            .cmp(&right.direction)
+            .then_with(|| left.relation.cmp(&right.relation))
+            .then_with(|| left.related.cmp(&right.related))
+            .then_with(|| left.evidence.cmp(&right.evidence))
+            .then_with(|| left.confidence.total_cmp(&right.confidence))
+            .then_with(|| left.provenance.cmp(&right.provenance))
+    });
+    result.dedup();
+    Ok(result)
 }
 
 pub(super) fn trace(
@@ -668,6 +887,145 @@ enum TraversalDirection {
     Incoming,
 }
 
+struct ResolvedDependencyParams {
+    frontier: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedDependencyRow {
+    from: String,
+    to: String,
+    relation: String,
+    evidence: String,
+    confidence: f64,
+    provenance: String,
+}
+
+impl ResolvedDependencyRow {
+    fn into_values(self, hops: u32) -> Vec<DataValue> {
+        vec![
+            "edge".into(),
+            "".into(),
+            i64::from(hops).into(),
+            self.from.into(),
+            self.to.into(),
+            self.relation.into(),
+            self.evidence.into(),
+            self.confidence.into(),
+            self.provenance.into(),
+        ]
+    }
+}
+
+const RESOLVED_DEPENDENCY_HEADERS: &[&str] = &[
+    "from",
+    "to",
+    "relation",
+    "evidence",
+    "confidence",
+    "provenance",
+];
+
+struct OutgoingResolvedDependencies;
+
+impl MnesticQuery for OutgoingResolvedDependencies {
+    const OPERATION: &'static str = "traversal.outgoing.materialized";
+    const SCRIPT: &'static str = "frontier[id] <- $frontier\n\
+         ?[from, to, relation, evidence, confidence, provenance] := frontier[from], \
+             *analysis_resolved_dependency{\
+                 view: $view, from, relation, to, evidence, confidence, provenance\
+             }\n\
+         :order from, to, relation\n\
+         :reorder written";
+    const HEADERS: &'static [&'static str] = RESOLVED_DEPENDENCY_HEADERS;
+
+    type Params = ResolvedDependencyParams;
+    type Row = ResolvedDependencyRow;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        bind_resolved_dependency_params(params)
+    }
+
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        decode_resolved_dependency(Self::OPERATION, headers, row)
+    }
+}
+
+struct IncomingResolvedDependencies;
+
+impl MnesticQuery for IncomingResolvedDependencies {
+    const OPERATION: &'static str = "traversal.incoming.materialized";
+    const SCRIPT: &'static str = "frontier[id] <- $frontier\n\
+         ?[from, to, relation, evidence, confidence, provenance] := frontier[to], \
+             *analysis_resolved_dependency:by_to{\
+                 view: $view, to, from, relation, evidence, confidence, provenance\
+             }\n\
+         ?[from, to, relation, evidence, confidence, provenance] := frontier[from], \
+             starts_with(from, 'grpc://'), \
+             *analysis_resolved_dependency{\
+                 view: $view, from, relation: 'implemented_by', to, evidence, \
+                 confidence, provenance\
+             }, relation = 'implemented_by'\n\
+         :order from, to, relation\n\
+         :reorder written";
+    const HEADERS: &'static [&'static str] = RESOLVED_DEPENDENCY_HEADERS;
+
+    type Params = ResolvedDependencyParams;
+    type Row = ResolvedDependencyRow;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        bind_resolved_dependency_params(params)
+    }
+
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        decode_resolved_dependency(Self::OPERATION, headers, row)
+    }
+}
+
+fn bind_resolved_dependency_params(
+    params: &ResolvedDependencyParams,
+) -> BTreeMap<String, DataValue> {
+    BTreeMap::from([(
+        "frontier".into(),
+        DataValue::List(
+            params
+                .frontier
+                .iter()
+                .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                .collect(),
+        ),
+    )])
+}
+
+fn decode_resolved_dependency(
+    operation: &'static str,
+    headers: &[String],
+    row: &[DataValue],
+) -> Result<ResolvedDependencyRow, QueryError> {
+    let string = |index: usize| {
+        row.get(index)
+            .and_then(DataValue::get_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                QueryError::new(
+                    operation,
+                    format!("column {} is not a string", headers[index]),
+                )
+            })
+    };
+    Ok(ResolvedDependencyRow {
+        from: string(0)?,
+        to: string(1)?,
+        relation: string(2)?,
+        evidence: string(3)?,
+        confidence: row
+            .get(4)
+            .and_then(DataValue::get_float)
+            .ok_or_else(|| QueryError::new(operation, "column confidence is not a float"))?,
+        provenance: string(5)?,
+    })
+}
+
 fn closure(
     db: &impl QueryRunner,
     view: &str,
@@ -675,169 +1033,9 @@ fn closure(
     max_hops: u32,
     direction: TraversalDirection,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let (core_rules, edge_rules, operations, boundary_operations, reorder) = match direction {
-        TraversalDirection::Outgoing => (
-            OUTGOING_DEPENDENCY_RULES,
-            vec!["selected_edge"],
-            vec!["traversal.outgoing.core"],
-            vec!["traversal.outgoing.boundary.core"],
-            ":reorder written",
-        ),
-        TraversalDirection::Incoming => (
-            INCOMING_DEPENDENCY_RULES,
-            vec![
-                "state_edge",
-                "base_override_edge",
-                "revision_edge",
-                "state_enrichment_override_edge",
-                "revision_enrichment_override_edge",
-                "enrichment_observation_edge",
-                "grpc_implementation_edge",
-            ],
-            vec![
-                "traversal.incoming.state",
-                "traversal.incoming.base_override",
-                "traversal.incoming.revision",
-                "traversal.incoming.state_enrichment_override",
-                "traversal.incoming.revision_enrichment_override",
-                "traversal.incoming.enrichment_observation",
-                "traversal.incoming.grpc_implementation",
-            ],
-            vec![
-                "traversal.incoming.boundary.state",
-                "traversal.incoming.boundary.base_override",
-                "traversal.incoming.boundary.revision",
-                "traversal.incoming.boundary.state_enrichment_override",
-                "traversal.incoming.boundary.revision_enrichment_override",
-                "traversal.incoming.boundary.fact_shard_enrichment_override",
-                "traversal.incoming.boundary.enrichment_observation",
-                "traversal.incoming.boundary.grpc_implementation",
-            ],
-            ":reorder written",
-        ),
-    };
-    let scripts = edge_rules
-        .iter()
-        .map(|edge_rule| {
-            format!(
-                "{core_rules}\n\
-                 frontier[id] <- $frontier\n\
-                 ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                     {edge_rule}[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                     row_kind = 'edge', entity = '', hops = 0\n\
-                 :order edge_from, edge_to, relation\n\
-                 {reorder}"
-            )
-        })
-        .collect::<Vec<_>>();
-    let (
-        shard_rules,
-        shard_operation,
-        shard_boundary_operation,
-        override_rules,
-        override_operation,
-    ) = match direction {
-        TraversalDirection::Outgoing => (
-            OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
-            "traversal.outgoing.fact_shard",
-            "traversal.outgoing.boundary.fact_shard",
-            OUTGOING_DEPENDENCY_OVERRIDE_QUERY,
-            "traversal.outgoing.overrides",
-        ),
-        TraversalDirection::Incoming => (
-            INCOMING_FACT_SHARD_DEPENDENCY_RULES,
-            "traversal.incoming.fact_shard",
-            "traversal.incoming.boundary.fact_shard",
-            INCOMING_DEPENDENCY_OVERRIDE_QUERY,
-            "traversal.incoming.overrides",
-        ),
-    };
-    let shard_script = format!(
-        "{shard_rules}\n\
-         frontier[id] <- $frontier\n\
-         ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-             shard_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
-             row_kind = 'edge', entity = '', hops = 0\n\
-         :order edge_from, edge_to, relation\n\
-         :reorder written"
-    );
-    let override_script = format!(
-        "{override_rules}\n\
-         frontier[id] <- $frontier"
-    );
-    let override_key_script = format!(
-        "{core_rules}\n\
-         frontier[id] <- $frontier\n\
-         ?[kind, from, relation, unresolved_to, resolved_to, confidence, provenance] := \
-             base_override[from, relation, unresolved_to, resolved_to, _, confidence, provenance], \
-             kind = 'base'\n\
-         ?[kind, from, relation, unresolved_to, resolved_to, confidence, provenance] := \
-             enrichment_override[\
-                 from, relation, unresolved_to, resolved_to, _, confidence, provenance\
-             ], \
-             kind = 'enrichment'"
-    );
-    let boundary_projection = match direction {
-        TraversalDirection::Outgoing => {
-            "\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                 frontier[edge_from], not visited[edge_to], \
-                 row_kind = 'edge', entity = '', hops = 0"
-        }
-        TraversalDirection::Incoming => {
-            "\
-             special[edge_from, edge_to, relation] := \
-                 boundary_edge[edge_from, edge_to, relation, _, _, _], \
-                 relation = 'implemented_by', starts_with(edge_from, 'grpc://')\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                 frontier[edge_to], not special[edge_from, edge_to, relation], \
-                 not visited[edge_from], row_kind = 'edge', entity = '', hops = 0\n\
-             ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
-                 boundary_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
-                 special[edge_from, edge_to, relation], frontier[edge_from], \
-                 not visited[edge_to], row_kind = 'edge', entity = '', hops = 0"
-        }
-    };
-    let shard_not_overridden = match direction {
-        TraversalDirection::Outgoing => "not dependency_override[from, relation, to, _, _, _, _]",
-        TraversalDirection::Incoming => "not dependency_override_key[from, relation, to]",
-    };
-    let mut boundary_edge_rules = edge_rules.clone();
-    if matches!(direction, TraversalDirection::Incoming) {
-        boundary_edge_rules.push("fact_shard_enrichment_override_edge");
-    }
-    let mut boundary_scripts = boundary_edge_rules
-        .iter()
-        .map(|edge_rule| {
-            format!(
-                "{core_rules}\n\
-             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
-                 {edge_rule}[from, to, relation, evidence, confidence, provenance]\n\
-             frontier[id] <- $frontier\n\
-             visited[id] <- $visited\n\
-             {boundary_projection}\n\
-             :limit 1"
-            )
-        })
-        .collect::<Vec<_>>();
-    boundary_scripts.push(format!(
-        "{core_rules}\n{shard_rules}\n\
-             boundary_edge[from, to, relation, evidence, confidence, provenance] := \
-                 shard_edge[from, to, relation, evidence, confidence, provenance], \
-                 {shard_not_overridden}\n\
-             frontier[id] <- $frontier\n\
-             visited[id] <- $visited\n\
-             {boundary_projection}\n\
-             :limit 1"
-    ));
-    let mut boundary_operations = boundary_operations;
-    boundary_operations.push(shard_boundary_operation);
     let mut frontier = BTreeSet::from([entity.to_owned()]);
     let mut visited = frontier.clone();
     let mut rows = Vec::new();
-    let mut headers = Vec::new();
     for hops in 0..=max_hops {
         let hop_span = tracing::info_span!(
             "graph.traversal.hop",
@@ -849,281 +1047,64 @@ fn closure(
             graph.frontier_size = frontier.len(),
         );
         let _entered = hop_span.enter();
-        let values = DataValue::List(
-            frontier
-                .iter()
-                .map(|entity| DataValue::List(vec![entity.as_str().into()]))
-                .collect(),
-        );
-        let prefetched_shard =
-            if matches!(direction, TraversalDirection::Incoming) && hops < max_hops {
-                Some(observed_query(
-                    db,
-                    QuerySpec::new(shard_operation, view, &shard_script),
-                    || vec![("frontier", values.clone())],
-                )?)
-            } else {
-                None
-            };
-        let fact_shard_baseline = match direction {
-            TraversalDirection::Incoming => Some(
-                prefetched_shard
-                    .as_ref()
-                    .map_or(DataValue::List(Vec::new()), |result| {
-                        fact_shard_baseline(&result.rows)
-                    }),
-            ),
-            TraversalDirection::Outgoing => None,
+        let params = ResolvedDependencyParams {
+            frontier: frontier.clone(),
         };
-        let (dependency_overrides, enrichment_overrides) =
-            if matches!(direction, TraversalDirection::Incoming) {
-                let candidates = observed_query(
-                    db,
-                    QuerySpec::new(
-                        "traversal.incoming.override_candidates",
-                        view,
-                        &override_key_script,
-                    ),
-                    || {
-                        vec![
-                            ("frontier", values.clone()),
-                            (
-                                "fact_shard_baseline",
-                                fact_shard_baseline
-                                    .clone()
-                                    .unwrap_or(DataValue::List(Vec::new())),
-                            ),
-                            ("dependency_overrides", DataValue::List(Vec::new())),
-                            ("enrichment_overrides", DataValue::List(Vec::new())),
-                        ]
-                    },
-                )?;
-                let (keys, enrichments) = override_parameters(candidates.rows);
-                (Some(keys), Some(enrichments))
-            } else {
-                (None, None)
-            };
-        let enrichment_overrides_empty = enrichment_overrides
-            .as_ref()
-            .is_some_and(|overrides| matches!(overrides, DataValue::List(rows) if rows.is_empty()));
+        let result = match direction {
+            TraversalDirection::Outgoing => db.run::<OutgoingResolvedDependencies>(view, params)?,
+            TraversalDirection::Incoming => db.run::<IncomingResolvedDependencies>(view, params)?,
+        };
         if hops == max_hops {
-            let visited_values = DataValue::List(
-                visited
-                    .iter()
-                    .map(|entity| DataValue::List(vec![entity.as_str().into()]))
-                    .collect(),
-            );
-            for (operation, script) in boundary_operations.iter().copied().zip(&boundary_scripts) {
-                if enrichment_overrides_empty && operation.contains("enrichment_override") {
-                    continue;
-                }
-                let mut result =
-                    observed_query(db, QuerySpec::new(operation, view, script), || {
-                        let mut additions = vec![
-                            ("frontier", values.clone()),
-                            ("visited", visited_values.clone()),
-                        ];
-                        if let Some(baseline) = &fact_shard_baseline {
-                            additions.push(("fact_shard_baseline", baseline.clone()));
-                        }
-                        if let Some(overrides) = &dependency_overrides {
-                            additions.push(("dependency_overrides", overrides.clone()));
-                        }
-                        if let Some(overrides) = &enrichment_overrides {
-                            additions.push(("enrichment_overrides", overrides.clone()));
-                        }
-                        additions
-                    })?;
-                if headers.is_empty() {
-                    headers = result.headers;
-                }
-                if let Some(mut row) = result.rows.pop() {
-                    row[2] = i64::from(hops).into();
-                    rows.push(row);
-                    break;
-                }
+            if let Some(row) = result
+                .into_iter()
+                .find(|row| !visited.contains(next_entity(row, direction)))
+            {
+                rows.push(row.into_values(hops));
             }
             break;
         }
-        let mut edge_groups = if let Some(shard) = prefetched_shard {
-            let baseline = fact_shard_baseline.unwrap_or(DataValue::List(Vec::new()));
-            let mut groups = Vec::new();
-            for (operation, script) in operations.iter().copied().zip(&scripts) {
-                if enrichment_overrides_empty && operation.contains("enrichment_override") {
-                    groups.push(Vec::new());
-                    continue;
-                }
-                let core = observed_query(db, QuerySpec::new(operation, view, script), || {
-                    vec![
-                        ("frontier", values.clone()),
-                        ("fact_shard_baseline", baseline.clone()),
-                        (
-                            "dependency_overrides",
-                            dependency_overrides
-                                .clone()
-                                .unwrap_or(DataValue::List(Vec::new())),
-                        ),
-                        (
-                            "enrichment_overrides",
-                            enrichment_overrides
-                                .clone()
-                                .unwrap_or(DataValue::List(Vec::new())),
-                        ),
-                    ]
-                })?;
-                if headers.is_empty() {
-                    headers = core.headers;
-                }
-                groups.push(core.rows);
-            }
-            groups.push(shard.rows);
-            groups
-        } else {
-            let mut groups = Vec::new();
-            for (operation, script) in operations.iter().copied().zip(&scripts) {
-                let result = observed_query(db, QuerySpec::new(operation, view, script), || {
-                    vec![("frontier", values.clone())]
-                })?;
-                if headers.is_empty() {
-                    headers = result.headers;
-                }
-                groups.push(result.rows);
-            }
-            let shard = observed_query(
-                db,
-                QuerySpec::new(shard_operation, view, &shard_script),
-                || vec![("frontier", values.clone())],
-            )?;
-            groups.push(shard.rows);
-            groups
-        };
-        let overrides = observed_query(
-            db,
-            QuerySpec::new(override_operation, view, &override_script),
-            || vec![("frontier", values.clone())],
-        )?;
-        let shard_group = edge_groups.last_mut().expect("shard query always runs");
-        merge_fact_shard_overrides(shard_group, overrides.rows, direction, &frontier);
-        let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
-        for row in &mut result_rows {
-            row[2] = i64::from(hops).into();
-        }
         let mut next = BTreeSet::new();
-        for row in &result_rows {
-            let from = row[3].get_str().unwrap_or_default();
-            let to = row[4].get_str().unwrap_or_default();
-            let relation = row[5].get_str().unwrap_or_default();
-            let entity = match direction {
-                TraversalDirection::Outgoing => to,
-                TraversalDirection::Incoming
-                    if relation == "implemented_by" && from.starts_with("grpc://") =>
-                {
-                    to
-                }
-                TraversalDirection::Incoming => from,
-            };
+        for row in &result {
+            let entity = next_entity(row, direction);
             if visited.insert(entity.to_owned()) {
                 next.insert(entity.to_owned());
             }
         }
-        rows.extend(result_rows);
+        rows.extend(result.into_iter().map(|row| row.into_values(hops)));
         if next.is_empty() {
             break;
         }
         frontier = next;
     }
-    Ok(NamedRows::new(headers, rows))
+    Ok(NamedRows::new(
+        [
+            "row_kind",
+            "entity",
+            "hops",
+            "edge_from",
+            "edge_to",
+            "relation",
+            "evidence",
+            "confidence",
+            "provenance",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        rows,
+    ))
 }
 
-fn fact_shard_baseline(rows: &[Vec<DataValue>]) -> DataValue {
-    DataValue::List(
-        rows.iter()
-            .map(|row| {
-                DataValue::List(vec![
-                    row[3].clone(),
-                    row[5].clone(),
-                    row[4].clone(),
-                    row[6].clone(),
-                ])
-            })
-            .collect(),
-    )
-}
-
-fn override_parameters(rows: Vec<Vec<DataValue>>) -> (DataValue, DataValue) {
-    let mut keys = Vec::with_capacity(rows.len());
-    let mut enrichments = Vec::new();
-    for row in rows {
-        keys.push(DataValue::List(vec![
-            row[1].clone(),
-            row[2].clone(),
-            row[3].clone(),
-        ]));
-        if row[0].get_str() == Some("enrichment") {
-            enrichments.push(DataValue::List(row[1..].to_vec()));
+fn next_entity(row: &ResolvedDependencyRow, direction: TraversalDirection) -> &str {
+    match direction {
+        TraversalDirection::Outgoing => &row.to,
+        TraversalDirection::Incoming
+            if row.relation == "implemented_by" && row.from.starts_with("grpc://") =>
+        {
+            &row.to
         }
+        TraversalDirection::Incoming => &row.from,
     }
-    (DataValue::List(keys), DataValue::List(enrichments))
-}
-
-fn merge_fact_shard_overrides(
-    shard_edges: &mut Vec<Vec<DataValue>>,
-    overrides: Vec<Vec<DataValue>>,
-    direction: TraversalDirection,
-    frontier: &BTreeSet<String>,
-) {
-    let original = std::mem::take(shard_edges);
-    let overridden = overrides
-        .iter()
-        .map(|row| edge_key(row, 1))
-        .collect::<BTreeSet<_>>();
-    shard_edges.extend(
-        original
-            .iter()
-            .filter(|row| !overridden.contains(&edge_key(row, 4)))
-            .cloned(),
-    );
-    for mut override_ in overrides {
-        let resolved_is_frontier = override_[4]
-            .get_str()
-            .is_some_and(|resolved| frontier.contains(resolved));
-        match (override_[0].get_str(), direction) {
-            (Some("base_override"), TraversalDirection::Outgoing) => {
-                override_[0] = "edge".into();
-                override_[1] = "".into();
-                shard_edges.push(override_);
-            }
-            (Some("base_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
-                override_[0] = "edge".into();
-                override_[1] = "".into();
-                shard_edges.push(override_);
-            }
-            (Some("enrichment_override"), TraversalDirection::Outgoing) => {
-                let key = edge_key(&override_, 1);
-                for row in original.iter().filter(|row| edge_key(row, 4) == key) {
-                    let mut resolved = override_.clone();
-                    resolved[0] = "edge".into();
-                    resolved[1] = "".into();
-                    resolved[6] = row[6].clone();
-                    shard_edges.push(resolved);
-                }
-            }
-            (Some("enrichment_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
-                override_[0] = "edge".into();
-                override_[1] = "".into();
-                shard_edges.push(override_);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn edge_key(row: &[DataValue], target: usize) -> (String, String, String) {
-    (
-        row[3].get_str().unwrap_or_default().to_owned(),
-        row[5].get_str().unwrap_or_default().to_owned(),
-        row[target].get_str().unwrap_or_default().to_owned(),
-    )
 }
 
 #[cfg(test)]
@@ -1160,6 +1141,37 @@ mod tests {
         }
     }
 
+    struct WrongShapeRunner;
+
+    impl QueryRunner for WrongShapeRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            Ok(NamedRows::new(vec!["to".into(), "from".into()], vec![]))
+        }
+    }
+
+    #[test]
+    fn typed_query_rejects_an_incorrect_output_shape() {
+        let error = WrongShapeRunner
+            .run::<OutgoingResolvedDependencies>(
+                "main",
+                ResolvedDependencyParams {
+                    frontier: BTreeSet::new(),
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Mnestic query traversal.outgoing.materialized failed: unexpected output headers: \
+             expected [\"from\", \"to\", \"relation\", \"evidence\", \"confidence\", \
+             \"provenance\"], got [\"to\", \"from\"]"
+        );
+    }
+
     #[test]
     fn semantic_query_warns_at_five_seconds() {
         assert!(!semantic_query_is_slow(Duration::from_millis(4_999)));
@@ -1171,12 +1183,12 @@ mod tests {
         let runner = DisabledPlanRunner(Cell::new(false));
         let parameter_builds = Cell::new(0);
 
-        let _ = observed_query(
+        let _ = observed_bound_query(
             &runner,
             QuerySpec::new("test", "main", "?[value] <- [[1]]"),
             || {
                 parameter_builds.set(parameter_builds.get() + 1);
-                Vec::new()
+                BTreeMap::new()
             },
         );
 
@@ -1284,6 +1296,9 @@ mod tests {
             ScriptMutability::Mutable,
         )
         .unwrap();
+        let transaction = db.multi_transaction(true);
+        crate::storage::rebuild_resolved_dependencies(&transaction, "diamond").unwrap();
+        transaction.commit().unwrap();
 
         let result = crate::semantic::trace(
             "diamond",

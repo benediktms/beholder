@@ -268,7 +268,7 @@ direct[from, resolved_to, relation, evidence, confidence, provenance] :=
     enrichment_dependency_override[
         from, relation, unresolved_to, resolved_to, _, confidence, provenance,
     ],
-    not base_dependency_override[from, relation, _, _, _, _, _]
+    not base_dependency_override[from, relation, unresolved_to, _, _, _, _]
 
 direct[from, to, relation, evidence, confidence, provenance] :=
     enrichment_observation[from, relation, to, evidence, confidence, provenance],
@@ -298,7 +298,7 @@ direct_pair[from, resolved_to] :=
     enrichment_dependency_override[
         from, relation, unresolved_to, resolved_to, _, _, _,
     ],
-    not base_dependency_override[from, _, _, _, _, _, _]
+    not base_dependency_override[from, relation, unresolved_to, _, _, _, _]
 
 direct_pair[from, to] :=
     enrichment_observation[from, relation, to, evidence, _, _],

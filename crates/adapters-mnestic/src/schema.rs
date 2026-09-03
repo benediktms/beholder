@@ -445,6 +445,19 @@ pub(super) const CREATE_FACT_SHARD_DEPENDENCY_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_RESOLVED_DEPENDENCY_SCHEMA: &str = r#"
+:create analysis_resolved_dependency {
+    view: String,
+    from: String,
+    relation: String,
+    to: String,
+    evidence: String,
+    =>
+    confidence: Float,
+    provenance: String,
+}
+"#;
+
 pub(super) const CREATE_BASELINE_FINGERPRINT_SCHEMA: &str = r#"
 :create analysis_baseline_fingerprint {
     view: String,
@@ -493,8 +506,12 @@ pub(super) const CREATE_FACT_SHARD_SELECTION_OWNER_INDEX: &str = "::index create
      {view, owner, producer, version, repository}";
 pub(super) const CREATE_FACT_SHARD_OBSERVATION_TO_INDEX: &str = "::index create analysis_fact_shard_observation:by_to \
      {to, producer, owner, version, from, relation, evidence, confidence, provenance}";
+pub(super) const CREATE_FACT_SHARD_OBSERVATION_FROM_INDEX: &str = "::index create analysis_fact_shard_observation:by_from \
+     {from, producer, owner, version, relation, to, evidence, confidence, provenance}";
 pub(super) const CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX: &str = "::index create analysis_fact_shard_dependency_observation:by_from \
      {from, producer, owner, version, relation, to, evidence}";
+pub(super) const CREATE_RESOLVED_DEPENDENCY_TO_INDEX: &str = "::index create analysis_resolved_dependency:by_to \
+     {view, to, from, relation, evidence, confidence, provenance}";
 pub(super) const CREATE_REVISION_STATE_STATE_INDEX: &str = "::index create analysis_revision_state:by_state \
      {view, state, revision, repository}";
 pub(super) const CREATE_OVERRIDE_UNRESOLVED_INDEX: &str = "::index create analysis_revision_dependency_override:by_unresolved \
@@ -667,7 +684,6 @@ pub(super) const SEED_STATES: &str = r#"
 :put analysis_revision_state {view, revision, repository => state}
 "#;
 
-#[cfg(test)]
 pub(super) const DIRECT_RULES: &str = include_str!("../../../rules/core/direct.datalog");
 pub(super) const BASE_DIRECT_RULES: &str = include_str!("../../../rules/core/base_direct.datalog");
 pub(super) const OUTGOING_DEPENDENCY_RULES: &str =
@@ -676,10 +692,4 @@ pub(super) const OUTGOING_FACT_SHARD_DEPENDENCY_RULES: &str =
     include_str!("../../../rules/core/outgoing_fact_shard_dependencies.datalog");
 pub(super) const OUTGOING_DEPENDENCY_OVERRIDE_QUERY: &str =
     include_str!("../../../rules/core/outgoing_dependency_overrides.datalog");
-pub(super) const INCOMING_DEPENDENCY_RULES: &str =
-    include_str!("../../../rules/core/incoming_dependencies.datalog");
-pub(super) const INCOMING_FACT_SHARD_DEPENDENCY_RULES: &str =
-    include_str!("../../../rules/core/incoming_fact_shard_dependencies.datalog");
-pub(super) const INCOMING_DEPENDENCY_OVERRIDE_QUERY: &str =
-    include_str!("../../../rules/core/incoming_dependency_overrides.datalog");
 pub(super) const CONTEXT_QUERY: &str = include_str!("../../../rules/core/context.datalog");

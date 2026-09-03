@@ -1,4 +1,5 @@
 use super::schema::*;
+use super::storage::rebuild_resolved_dependencies;
 use mnestic_engine::{DbInstance, ScriptMutability};
 use std::{collections::BTreeMap, error::Error, path::Path};
 
@@ -114,6 +115,7 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         CREATE_FACT_SHARD_ENTITY_SCHEMA,
         CREATE_FACT_SHARD_OBSERVATION_SCHEMA,
         CREATE_FACT_SHARD_DEPENDENCY_SCHEMA,
+        CREATE_RESOLVED_DEPENDENCY_SCHEMA,
         CREATE_BASELINE_FINGERPRINT_SCHEMA,
         CREATE_SEMANTIC_CANDIDATE_SCHEMA,
         CREATE_SCHEMA_MIGRATION_SCHEMA,
@@ -156,7 +158,17 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_FACT_SHARD_OBSERVATION_FROM_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_RESOLVED_DEPENDENCY_TO_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
@@ -451,6 +463,10 @@ pub(super) fn persistent_database(
             CREATE_FACT_SHARD_DEPENDENCY_SCHEMA,
         ),
         (
+            "analysis_resolved_dependency",
+            CREATE_RESOLVED_DEPENDENCY_SCHEMA,
+        ),
+        (
             "analysis_baseline_fingerprint",
             CREATE_BASELINE_FINGERPRINT_SCHEMA,
         ),
@@ -605,8 +621,16 @@ pub(super) fn persistent_database(
                 CREATE_FACT_SHARD_OBSERVATION_TO_INDEX,
             ),
             (
+                "analysis_fact_shard_observation:by_from",
+                CREATE_FACT_SHARD_OBSERVATION_FROM_INDEX,
+            ),
+            (
                 "analysis_fact_shard_dependency_observation:by_from",
                 CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX,
+            ),
+            (
+                "analysis_resolved_dependency:by_to",
+                CREATE_RESOLVED_DEPENDENCY_TO_INDEX,
             ),
             (
                 "analysis_revision_state:by_state",
@@ -668,6 +692,27 @@ fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
     if !migration_applied(db, "enrichment-winners", 1)? {
         migrate_enrichment_winners(db)?;
     }
+    if !migration_applied(db, "resolved-dependencies", 1)? {
+        migrate_resolved_dependencies(db)?;
+    }
+    Ok(())
+}
+
+fn migrate_resolved_dependencies(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    let views = transaction.run_script("?[view] := *analysis_revision{view}", BTreeMap::new())?;
+    for row in views.rows {
+        let view = row[0]
+            .get_str()
+            .ok_or("analysis revision view is not a string")?;
+        rebuild_resolved_dependencies(&transaction, view)?;
+    }
+    transaction.run_script(
+        "?[name, version] <- [['resolved-dependencies', 1]] \
+         :put schema_migration {name => version}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 

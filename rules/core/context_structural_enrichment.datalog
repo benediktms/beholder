@@ -1,0 +1,56 @@
+structural_relation[relation] <- [
+    ['defines'], ['field_of'], ['request_type'], ['response_type']
+]
+
+selected_enrichment[owner] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_repository_enrichment{view: $view, revision, owner}
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_enrichment_observation_selection{
+        view: $view,
+        from: $entity,
+        relation,
+        to: related,
+        evidence,
+        owner,
+    },
+    selected_enrichment[owner],
+    *enrichment_observation_contribution{
+        view: $view,
+        owner,
+        from: $entity,
+        relation,
+        to: related,
+        evidence,
+        confidence,
+        provenance,
+    },
+    structural_relation[relation],
+    direction = 'outgoing'
+
+?[direction, relation, related, evidence, confidence, provenance] :=
+    *analysis_enrichment_observation_selection:by_to{
+        view: $view,
+        from: related,
+        relation,
+        to: $entity,
+        evidence,
+        owner,
+    },
+    selected_enrichment[owner],
+    *enrichment_observation_contribution{
+        view: $view,
+        owner,
+        from: related,
+        relation,
+        to: $entity,
+        evidence,
+        confidence,
+        provenance,
+    },
+    structural_relation[relation],
+    direction = 'incoming'
+
+:order direction, relation, related
+:reorder written

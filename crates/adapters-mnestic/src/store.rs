@@ -36,22 +36,6 @@ use std::{
     sync::Mutex,
 };
 
-fn relevant_entities(
-    result: &NamedRows,
-    roots: &[&str],
-    entity_columns: &[usize],
-) -> BTreeSet<String> {
-    roots
-        .iter()
-        .map(|entity| (*entity).to_owned())
-        .chain(result.rows.iter().flat_map(|row| {
-            entity_columns
-                .iter()
-                .filter_map(|&column| row.get(column)?.get_str().map(str::to_owned))
-        }))
-        .collect()
-}
-
 fn relevant_traversal_entities(
     result: &NamedRows,
     roots: &[&str],
@@ -492,11 +476,13 @@ impl SemanticStore {
     pub fn context(&self, view: &str, entity: &str) -> Result<ContextResult, Box<dyn Error>> {
         warn_on_slow_semantic_query(|| {
             let result = context(&self.read_db, view, entity)?;
-            let entities = relevant_entities(&result, &[entity], &[2]);
+            let entities = std::iter::once(entity.to_owned())
+                .chain(result.iter().map(|row| row.related.clone()))
+                .collect();
             semantic::context(
                 view,
                 entity,
-                inspection_result(result),
+                result,
                 inspection_result(entity_facts(&self.read_db, view, &entities)?),
             )
         })
@@ -509,11 +495,13 @@ impl SemanticStore {
     ) -> Result<Revisioned<ContextResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             let result = context(transaction, view, entity)?;
-            let entities = relevant_entities(&result, &[entity], &[2]);
+            let entities = std::iter::once(entity.to_owned())
+                .chain(result.iter().map(|row| row.related.clone()))
+                .collect();
             semantic::context(
                 view,
                 entity,
-                inspection_result(result),
+                result,
                 inspection_result(entity_facts(transaction, view, &entities)?),
             )
         })
@@ -846,6 +834,19 @@ mod tests {
         let context = store.context("incremental", owner).unwrap();
         assert_eq!(context.edges.len(), 1);
         assert_eq!(context.edges[0].to, "rust-call://second");
+        let dependencies = store.dependencies("incremental", owner, 1).unwrap();
+        assert!(
+            dependencies
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.entity == "rust-call://second")
+        );
+        assert!(
+            !dependencies
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.entity == "rust-call://first")
+        );
 
         assert_eq!(
             store
@@ -866,6 +867,13 @@ mod tests {
                 .context("incremental", owner)
                 .unwrap()
                 .edges
+                .is_empty()
+        );
+        assert!(
+            store
+                .dependencies("incremental", owner, 1)
+                .unwrap()
+                .dependencies
                 .is_empty()
         );
     }
@@ -1064,6 +1072,9 @@ mod tests {
                 mnestic_engine::ScriptMutability::Mutable,
             )
             .unwrap();
+        let transaction = store.db.multi_transaction(true);
+        crate::storage::rebuild_resolved_dependencies(&transaction, &view.name).unwrap();
+        transaction.commit().unwrap();
 
         let dependencies = store.dependencies(&view.name, source, 1).unwrap();
         assert!(
