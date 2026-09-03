@@ -554,7 +554,10 @@ fn closure(
         }
         let overrides = query(db, view, &override_script, [("frontier", values)])?;
         merge_fact_shard_overrides(&mut edge_groups[1], overrides.rows, direction, &frontier);
-        let result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
+        let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
+        for row in &mut result_rows {
+            row[2] = i64::from(hops).into();
+        }
         if hops == max_hops {
             rows.extend(result_rows);
             break;
@@ -592,35 +595,50 @@ fn merge_fact_shard_overrides(
     direction: TraversalDirection,
     frontier: &BTreeSet<String>,
 ) {
-    let shard_keys = shard_edges
-        .iter()
-        .map(|row| edge_key(row, 4))
-        .collect::<BTreeSet<_>>();
+    let original = std::mem::take(shard_edges);
     let overridden = overrides
         .iter()
         .map(|row| edge_key(row, 1))
         .collect::<BTreeSet<_>>();
-    shard_edges.retain(|row| !overridden.contains(&edge_key(row, 4)));
-    shard_edges.extend(overrides.into_iter().filter_map(|mut row| {
-        let applies = match row[0].get_str() {
-            Some("base_override") => true,
-            Some("enrichment_override") => match direction {
-                TraversalDirection::Outgoing => shard_keys.contains(&edge_key(&row, 1)),
-                TraversalDirection::Incoming => {
-                    row[4]
-                        .get_str()
-                        .is_some_and(|resolved| frontier.contains(resolved))
-                        || shard_keys.contains(&edge_key(&row, 1))
+    shard_edges.extend(
+        original
+            .iter()
+            .filter(|row| !overridden.contains(&edge_key(row, 4)))
+            .cloned(),
+    );
+    for mut override_ in overrides {
+        let resolved_is_frontier = override_[4]
+            .get_str()
+            .is_some_and(|resolved| frontier.contains(resolved));
+        match (override_[0].get_str(), direction) {
+            (Some("base_override"), TraversalDirection::Outgoing) => {
+                override_[0] = "edge".into();
+                override_[1] = "".into();
+                shard_edges.push(override_);
+            }
+            (Some("base_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
+                override_[0] = "edge".into();
+                override_[1] = "".into();
+                shard_edges.push(override_);
+            }
+            (Some("enrichment_override"), TraversalDirection::Outgoing) => {
+                let key = edge_key(&override_, 1);
+                for row in original.iter().filter(|row| edge_key(row, 4) == key) {
+                    let mut resolved = override_.clone();
+                    resolved[0] = "edge".into();
+                    resolved[1] = "".into();
+                    resolved[6] = row[6].clone();
+                    shard_edges.push(resolved);
                 }
-            },
-            _ => false,
-        };
-        applies.then(|| {
-            row[0] = "edge".into();
-            row[1] = "".into();
-            row
-        })
-    }));
+            }
+            (Some("enrichment_override"), TraversalDirection::Incoming) if resolved_is_frontier => {
+                override_[0] = "edge".into();
+                override_[1] = "".into();
+                shard_edges.push(override_);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn edge_key(row: &[DataValue], target: usize) -> (String, String, String) {

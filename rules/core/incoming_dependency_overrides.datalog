@@ -81,6 +81,7 @@ effective_override[
         version,
         from,
         relation,
+        evidence: baseline_evidence,
     },
     *analysis_fact_shard_selection:by_owner{
         view: $view,
@@ -95,12 +96,13 @@ effective_override[
         relation,
         unresolved_to,
         resolved_to,
-        evidence,
+        evidence: override_evidence,
         confidence,
         provenance,
     },
     not base_override_exists[from, relation, unresolved_to],
-    kind = 'enrichment_override'
+    kind = 'enrichment_override',
+    evidence = baseline_evidence
 
 effective_override[
     kind, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
@@ -113,7 +115,7 @@ effective_override[
         relation,
         unresolved_to,
         resolved_to,
-        evidence,
+        evidence: override_evidence,
         confidence,
         provenance,
     },
@@ -132,6 +134,7 @@ effective_override[
         version,
         from,
         relation,
+        evidence: baseline_evidence,
     },
     *analysis_fact_shard_selection:by_owner{
         view: $view,
@@ -140,7 +143,8 @@ effective_override[
         version,
     },
     not base_override_exists[from, relation, unresolved_to],
-    kind = 'enrichment_override'
+    kind = 'enrichment_override',
+    evidence = baseline_evidence
 
 ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] :=
     effective_override[

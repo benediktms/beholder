@@ -27,7 +27,7 @@ use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
     RepositoryRevision, Revisioned, TraceResult,
 };
-use mnestic_engine::{DbInstance, MultiTransaction, NamedRows};
+use mnestic_engine::{DataValue, DbInstance, MultiTransaction, NamedRows};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -48,6 +48,32 @@ fn relevant_entities(
                 .iter()
                 .filter_map(|&column| row.get(column)?.get_str().map(str::to_owned))
         }))
+        .collect()
+}
+
+fn relevant_traversal_entities(
+    result: &NamedRows,
+    roots: &[&str],
+    max_hops: u32,
+) -> BTreeSet<String> {
+    roots
+        .iter()
+        .map(|entity| (*entity).to_owned())
+        .chain(
+            result
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.get(2)
+                        .and_then(DataValue::get_int)
+                        .is_some_and(|hops| hops < i64::from(max_hops))
+                })
+                .flat_map(|row| {
+                    [3, 4]
+                        .into_iter()
+                        .filter_map(|column| row[column].get_str().map(str::to_owned))
+                }),
+        )
         .collect()
 }
 
@@ -501,7 +527,7 @@ impl SemanticStore {
     ) -> Result<TraceResult, Box<dyn Error>> {
         within_query_budget(|| {
             let result = trace(&self.read_db, view, from, to, max_hops)?;
-            let entities = relevant_entities(&result, &[from, to], &[3, 4]);
+            let entities = relevant_traversal_entities(&result, &[from, to], max_hops);
             semantic::trace(
                 view,
                 from,
@@ -522,7 +548,7 @@ impl SemanticStore {
     ) -> Result<Revisioned<TraceResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             let result = trace(transaction, view, from, to, max_hops)?;
-            let entities = relevant_entities(&result, &[from, to], &[3, 4]);
+            let entities = relevant_traversal_entities(&result, &[from, to], max_hops);
             semantic::trace(
                 view,
                 from,
@@ -542,7 +568,7 @@ impl SemanticStore {
     ) -> Result<ImpactResult, Box<dyn Error>> {
         within_query_budget(|| {
             let result = impact(&self.read_db, view, entity, max_hops)?;
-            let entities = relevant_entities(&result, &[entity], &[3, 4]);
+            let entities = relevant_traversal_entities(&result, &[entity], max_hops);
             semantic::impact(
                 view,
                 entity,
@@ -561,7 +587,7 @@ impl SemanticStore {
     ) -> Result<Revisioned<ImpactResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             let result = impact(transaction, view, entity, max_hops)?;
-            let entities = relevant_entities(&result, &[entity], &[3, 4]);
+            let entities = relevant_traversal_entities(&result, &[entity], max_hops);
             semantic::impact(
                 view,
                 entity,
@@ -580,7 +606,7 @@ impl SemanticStore {
     ) -> Result<DependenciesResult, Box<dyn Error>> {
         within_query_budget(|| {
             let result = dependencies(&self.read_db, view, entity, max_hops)?;
-            let entities = relevant_entities(&result, &[entity], &[3, 4]);
+            let entities = relevant_traversal_entities(&result, &[entity], max_hops);
             semantic::dependencies(
                 view,
                 entity,
@@ -599,7 +625,7 @@ impl SemanticStore {
     ) -> Result<Revisioned<DependenciesResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             let result = dependencies(transaction, view, entity, max_hops)?;
-            let entities = relevant_entities(&result, &[entity], &[3, 4]);
+            let entities = relevant_traversal_entities(&result, &[entity], max_hops);
             semantic::dependencies(
                 view,
                 entity,
@@ -669,7 +695,7 @@ fn sqlite_pragma(path: &Path, pragma: &str) -> Result<u64, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnrichmentOwner, EnrichmentPayload};
+    use super::{EnrichmentOwner, EnrichmentPayload, relevant_traversal_entities};
     use crate::SemanticStore;
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
@@ -678,8 +704,9 @@ mod tests {
         WorkspaceView,
     };
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity as DtoSeverity};
+    use mnestic_engine::NamedRows;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::PathBuf,
         sync::{Arc, mpsc},
@@ -696,6 +723,34 @@ mod tests {
             grpc_bindings: Vec::new(),
             observations,
         }
+    }
+
+    #[test]
+    fn boundary_probe_entities_are_not_hydrated() {
+        let rows = NamedRows::new(
+            Vec::new(),
+            vec![
+                vec![
+                    "edge".into(),
+                    "".into(),
+                    0_i64.into(),
+                    "root".into(),
+                    "near".into(),
+                ],
+                vec![
+                    "edge".into(),
+                    "".into(),
+                    1_i64.into(),
+                    "near".into(),
+                    "far".into(),
+                ],
+            ],
+        );
+
+        assert_eq!(
+            relevant_traversal_entities(&rows, &["root"], 1),
+            BTreeSet::from(["near".to_owned(), "root".to_owned()])
+        );
     }
 
     #[test]
@@ -855,6 +910,7 @@ mod tests {
             "repo://example/repository/rust/lib/losing-enrichment-target";
         let enrichment_unresolved = "rust-call://enrichment-target";
         let enrichment_resolved = "repo://example/repository/rust/lib/enrichment-target";
+        let duplicate_target = "rust-call://duplicate-target";
         let shard = FactShard {
             repository: "example/repository".into(),
             producer: "rust".into(),
@@ -873,6 +929,18 @@ mod tests {
                     DependencyRelation::Calls,
                     enrichment_unresolved,
                     "src/lib.rs:2",
+                ),
+                Observation::dependency(
+                    source,
+                    DependencyRelation::Calls,
+                    enrichment_unresolved,
+                    "src/lib.rs:4",
+                ),
+                Observation::dependency(
+                    source,
+                    DependencyRelation::Calls,
+                    duplicate_target,
+                    "src/lib.rs:5",
                 ),
             ],
         };
@@ -912,12 +980,20 @@ mod tests {
             confidence: Confidence::Inferred,
             provenance: Provenance::UniqueNameHeuristic,
         };
-        let duplicate_enrichment_observation = Observation::dependency(
+        let duplicate_override_observation = Observation::dependency(
             source,
             DependencyRelation::Calls,
             enrichment_unresolved,
             "src/lib.rs:2",
         );
+        let mut duplicate_plain_observation = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            duplicate_target,
+            "src/lib.rs:5",
+        );
+        duplicate_plain_observation.confidence = Confidence::Inferred;
+        duplicate_plain_observation.provenance = Provenance::UniqueNameHeuristic;
         store
             .publish_verified_sharded(
                 &view,
@@ -940,7 +1016,7 @@ mod tests {
                     version: "1",
                 },
                 EnrichmentPayload {
-                    observations: &[duplicate_enrichment_observation],
+                    observations: &[duplicate_override_observation, duplicate_plain_observation],
                     overrides: &[
                         enrichment_override,
                         losing_enrichment_override,
@@ -970,6 +1046,16 @@ mod tests {
                 .iter()
                 .any(|dependency| dependency.entity == enrichment_resolved)
         );
+        assert_eq!(
+            dependencies
+                .edges
+                .iter()
+                .find(|edge| edge.to == enrichment_resolved)
+                .unwrap()
+                .evidence
+                .len(),
+            2
+        );
         for unresolved in [base_unresolved, enrichment_unresolved] {
             assert!(
                 !dependencies
@@ -986,15 +1072,38 @@ mod tests {
             );
         }
         for resolved in [base_resolved, enrichment_resolved] {
+            let impact = store.impact(&view.name, resolved, 1).unwrap();
             assert!(
-                store
-                    .impact(&view.name, resolved, 1)
-                    .unwrap()
+                impact
                     .affected
                     .iter()
                     .any(|affected| affected.entity == source)
             );
+            if resolved == enrichment_resolved {
+                assert_eq!(
+                    impact
+                        .edges
+                        .iter()
+                        .find(|edge| edge.to == enrichment_resolved)
+                        .unwrap()
+                        .evidence
+                        .len(),
+                    2
+                );
+            }
         }
+        assert_eq!(
+            store
+                .impact(&view.name, duplicate_target, 1)
+                .unwrap()
+                .edges
+                .iter()
+                .find(|edge| edge.to == duplicate_target)
+                .unwrap()
+                .evidence
+                .len(),
+            1
+        );
         assert!(
             store
                 .impact(&view.name, state_resolved, 1)
