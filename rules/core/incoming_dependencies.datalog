@@ -2,6 +2,12 @@ selected_enrichment[owner] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_repository_enrichment{view: $view, revision, owner}
 
+fact_shard_baseline[from, relation, to, evidence] <- $fact_shard_baseline
+dependency_override_key[from, relation, unresolved_to] <- $dependency_overrides
+enrichment_override_candidate[
+    from, relation, unresolved_to, resolved_to, confidence, provenance,
+] <- $enrichment_overrides
+
 dependency_relation[relation] <- [
     ['binds_contract'], ['calls'], ['calls_graphql'], ['calls_rpc'], ['consumed_by'],
     ['implements'], ['implemented_by'], ['imports'], ['publishes'], ['requires'],
@@ -24,53 +30,7 @@ baseline_observation[from, relation, to, evidence] :=
     *analysis_revision_observation:by_to{view: $view, revision, from, relation, to, evidence}
 
 baseline_observation[from, relation, to, evidence] :=
-    frontier[to],
-    *analysis_fact_shard_observation:by_to{
-        to,
-        producer,
-        owner,
-        version,
-        from,
-        relation,
-        evidence,
-    },
-    *analysis_fact_shard_selection:by_owner{
-        view: $view,
-        owner,
-        producer,
-        version,
-    },
-    *analysis_fact_shard_dependency_observation{
-        producer,
-        owner,
-        version,
-        from,
-        relation,
-        to,
-        evidence,
-    }
-
-baseline_observation[from, relation, unresolved_to, evidence] :=
-    enrichment_override[from, relation, unresolved_to, _, _, _, _],
-    *state_observation:by_to{state, from, relation, to: unresolved_to, evidence},
-    *analysis_revision_state:by_state{
-        view: $view,
-        state,
-        revision,
-    },
-    *analysis_revision{view: $view, revision}
-
-baseline_observation[from, relation, unresolved_to, evidence] :=
-    enrichment_override[from, relation, unresolved_to, _, _, _, _],
-    *analysis_revision{view: $view, revision},
-    *analysis_revision_observation:by_to{
-        view: $view,
-        revision,
-        from,
-        relation,
-        to: unresolved_to,
-        evidence,
-    }
+    fact_shard_baseline[from, relation, to, evidence]
 
 base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
     frontier[unresolved_to],
@@ -182,7 +142,7 @@ dependency_override[from, relation, unresolved_to] :=
 dependency_override[from, relation, unresolved_to] :=
     enrichment_override[from, relation, unresolved_to, _, _, _, _]
 
-selected_edge[from, to, relation, evidence, confidence, provenance] :=
+state_edge[from, to, relation, evidence, confidence, provenance] :=
     frontier[to],
     *state_observation:by_to{state, from, relation, to, evidence},
     *analysis_revision_state:by_state{
@@ -195,13 +155,13 @@ selected_edge[from, to, relation, evidence, confidence, provenance] :=
     *state_observation_metadata:by_to{
         state, from, relation, to, confidence, provenance,
     },
-    not dependency_override[from, relation, to]
+    not dependency_override_key[from, relation, to]
 
-selected_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
+base_override_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
     frontier[resolved_to],
     base_override[from, relation, _, resolved_to, evidence, confidence, provenance]
 
-selected_edge[from, to, relation, evidence, confidence, provenance] :=
+revision_edge[from, to, relation, evidence, confidence, provenance] :=
     frontier[to],
     *analysis_revision{view: $view, revision},
     *analysis_revision_observation:by_to{
@@ -215,14 +175,35 @@ selected_edge[from, to, relation, evidence, confidence, provenance] :=
         provenance,
     }
 
-selected_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
+state_enrichment_override_edge[
+    from, resolved_to, relation, evidence, confidence, provenance,
+] :=
     frontier[resolved_to],
-    baseline_observation[from, relation, unresolved_to, evidence],
-    enrichment_override[
-        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
-    ]
+    enrichment_override_candidate[
+        from, relation, unresolved_to, resolved_to, confidence, provenance,
+    ],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_state{view: $view, revision, state},
+    *state_observation{state, from, relation, to: unresolved_to, evidence}
 
-selected_edge[from, to, relation, evidence, confidence, provenance] :=
+revision_enrichment_override_edge[
+    from, resolved_to, relation, evidence, confidence, provenance,
+] :=
+    frontier[resolved_to],
+    enrichment_override_candidate[
+        from, relation, unresolved_to, resolved_to, confidence, provenance,
+    ],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation{
+        view: $view,
+        revision,
+        from,
+        relation,
+        to: unresolved_to,
+        evidence,
+    }
+
+enrichment_observation_edge[from, to, relation, evidence, confidence, provenance] :=
     frontier[to],
     *analysis_enrichment_observation_selection:by_to{
         view: $view,
@@ -245,9 +226,9 @@ selected_edge[from, to, relation, evidence, confidence, provenance] :=
     },
     dependency_relation[relation],
     not baseline_observation[from, relation, to, evidence],
-    not dependency_override[from, relation, to]
+    not dependency_override_key[from, relation, to]
 
-selected_edge[from, to, relation, evidence, confidence, provenance] :=
+grpc_implementation_edge[from, to, relation, evidence, confidence, provenance] :=
     frontier[from],
     *analysis_revision{view: $view, revision},
     *analysis_revision_observation{

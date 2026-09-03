@@ -730,33 +730,51 @@ fn closure(
     max_hops: u32,
     direction: TraversalDirection,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let rules = match direction {
-        TraversalDirection::Outgoing => vec![
-            (
-                OUTGOING_DEPENDENCY_RULES,
-                "selected_edge",
-                ":reorder written",
-            ),
-            (
-                OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
-                "shard_edge",
-                ":reorder written",
-            ),
-        ],
-        TraversalDirection::Incoming => vec![
-            (INCOMING_DEPENDENCY_RULES, "selected_edge", ""),
-            (
-                INCOMING_FACT_SHARD_DEPENDENCY_RULES,
-                "shard_edge",
-                ":reorder written",
-            ),
-        ],
+    let (core_rules, edge_rules, operations, boundary_operations, reorder) = match direction {
+        TraversalDirection::Outgoing => (
+            OUTGOING_DEPENDENCY_RULES,
+            vec!["selected_edge"],
+            vec!["traversal.outgoing.core"],
+            vec!["traversal.outgoing.boundary.core"],
+            ":reorder written",
+        ),
+        TraversalDirection::Incoming => (
+            INCOMING_DEPENDENCY_RULES,
+            vec![
+                "state_edge",
+                "base_override_edge",
+                "revision_edge",
+                "state_enrichment_override_edge",
+                "revision_enrichment_override_edge",
+                "enrichment_observation_edge",
+                "grpc_implementation_edge",
+            ],
+            vec![
+                "traversal.incoming.state",
+                "traversal.incoming.base_override",
+                "traversal.incoming.revision",
+                "traversal.incoming.state_enrichment_override",
+                "traversal.incoming.revision_enrichment_override",
+                "traversal.incoming.enrichment_observation",
+                "traversal.incoming.grpc_implementation",
+            ],
+            vec![
+                "traversal.incoming.boundary.state",
+                "traversal.incoming.boundary.base_override",
+                "traversal.incoming.boundary.revision",
+                "traversal.incoming.boundary.state_enrichment_override",
+                "traversal.incoming.boundary.revision_enrichment_override",
+                "traversal.incoming.boundary.enrichment_observation",
+                "traversal.incoming.boundary.grpc_implementation",
+            ],
+            ":reorder written",
+        ),
     };
-    let scripts = rules
-        .into_iter()
-        .map(|(rules, edge_rule, reorder)| {
+    let scripts = edge_rules
+        .iter()
+        .map(|edge_rule| {
             format!(
-                "{rules}\n\
+                "{core_rules}\n\
                  frontier[id] <- $frontier\n\
                  ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
                      {edge_rule}[edge_from, edge_to, relation, evidence, confidence, provenance], \
@@ -766,13 +784,52 @@ fn closure(
             )
         })
         .collect::<Vec<_>>();
-    let override_rules = match direction {
-        TraversalDirection::Outgoing => OUTGOING_DEPENDENCY_OVERRIDE_QUERY,
-        TraversalDirection::Incoming => INCOMING_DEPENDENCY_OVERRIDE_QUERY,
+    let (
+        shard_rules,
+        shard_operation,
+        shard_boundary_operation,
+        override_rules,
+        override_operation,
+    ) = match direction {
+        TraversalDirection::Outgoing => (
+            OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
+            "traversal.outgoing.fact_shard",
+            "traversal.outgoing.boundary.fact_shard",
+            OUTGOING_DEPENDENCY_OVERRIDE_QUERY,
+            "traversal.outgoing.overrides",
+        ),
+        TraversalDirection::Incoming => (
+            INCOMING_FACT_SHARD_DEPENDENCY_RULES,
+            "traversal.incoming.fact_shard",
+            "traversal.incoming.boundary.fact_shard",
+            INCOMING_DEPENDENCY_OVERRIDE_QUERY,
+            "traversal.incoming.overrides",
+        ),
     };
+    let shard_script = format!(
+        "{shard_rules}\n\
+         frontier[id] <- $frontier\n\
+         ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] := \
+             shard_edge[edge_from, edge_to, relation, evidence, confidence, provenance], \
+             row_kind = 'edge', entity = '', hops = 0\n\
+         :order edge_from, edge_to, relation\n\
+         :reorder written"
+    );
     let override_script = format!(
         "{override_rules}\n\
          frontier[id] <- $frontier"
+    );
+    let override_key_script = format!(
+        "{core_rules}\n\
+         frontier[id] <- $frontier\n\
+         ?[kind, from, relation, unresolved_to, resolved_to, confidence, provenance] := \
+             base_override[from, relation, unresolved_to, resolved_to, _, confidence, provenance], \
+             kind = 'base'\n\
+         ?[kind, from, relation, unresolved_to, resolved_to, confidence, provenance] := \
+             enrichment_override[\
+                 from, relation, unresolved_to, resolved_to, _, confidence, provenance\
+             ], \
+             kind = 'enrichment'"
     );
     let boundary_projection = match direction {
         TraversalDirection::Outgoing => {
@@ -797,30 +854,26 @@ fn closure(
                  not visited[edge_to], row_kind = 'edge', entity = '', hops = 0"
         }
     };
-    let (core_rules, shard_rules, shard_not_overridden) = match direction {
-        TraversalDirection::Outgoing => (
-            OUTGOING_DEPENDENCY_RULES,
-            OUTGOING_FACT_SHARD_DEPENDENCY_RULES,
-            "not dependency_override[from, relation, to, _, _, _, _]",
-        ),
-        TraversalDirection::Incoming => (
-            INCOMING_DEPENDENCY_RULES,
-            INCOMING_FACT_SHARD_DEPENDENCY_RULES,
-            "not dependency_override[from, relation, to]",
-        ),
+    let shard_not_overridden = match direction {
+        TraversalDirection::Outgoing => "not dependency_override[from, relation, to, _, _, _, _]",
+        TraversalDirection::Incoming => "not dependency_override_key[from, relation, to]",
     };
-    let boundary_scripts = [
-        format!(
-            "{core_rules}\n\
+    let mut boundary_scripts = edge_rules
+        .iter()
+        .map(|edge_rule| {
+            format!(
+                "{core_rules}\n\
              boundary_edge[from, to, relation, evidence, confidence, provenance] := \
-                 selected_edge[from, to, relation, evidence, confidence, provenance]\n\
+                 {edge_rule}[from, to, relation, evidence, confidence, provenance]\n\
              frontier[id] <- $frontier\n\
              visited[id] <- $visited\n\
              {boundary_projection}\n\
              :limit 1"
-        ),
-        format!(
-            "{core_rules}\n{shard_rules}\n\
+            )
+        })
+        .collect::<Vec<_>>();
+    boundary_scripts.push(format!(
+        "{core_rules}\n{shard_rules}\n\
              boundary_edge[from, to, relation, evidence, confidence, provenance] := \
                  shard_edge[from, to, relation, evidence, confidence, provenance], \
                  {shard_not_overridden}\n\
@@ -828,26 +881,9 @@ fn closure(
              visited[id] <- $visited\n\
              {boundary_projection}\n\
              :limit 1"
-        ),
-    ];
-    let (operations, boundary_operations, override_operation) = match direction {
-        TraversalDirection::Outgoing => (
-            ["traversal.outgoing.core", "traversal.outgoing.fact_shard"],
-            [
-                "traversal.outgoing.boundary.core",
-                "traversal.outgoing.boundary.fact_shard",
-            ],
-            "traversal.outgoing.overrides",
-        ),
-        TraversalDirection::Incoming => (
-            ["traversal.incoming.core", "traversal.incoming.fact_shard"],
-            [
-                "traversal.incoming.boundary.core",
-                "traversal.incoming.boundary.fact_shard",
-            ],
-            "traversal.incoming.overrides",
-        ),
-    };
+    ));
+    let mut boundary_operations = boundary_operations;
+    boundary_operations.push(shard_boundary_operation);
     let mut frontier = BTreeSet::from([entity.to_owned()]);
     let mut visited = frontier.clone();
     let mut rows = Vec::new();
@@ -869,6 +905,49 @@ fn closure(
                 .map(|entity| DataValue::List(vec![entity.as_str().into()]))
                 .collect(),
         );
+        let prefetched_shard = if matches!(direction, TraversalDirection::Incoming) {
+            Some(observed_query(
+                db,
+                QuerySpec::new(shard_operation, view, &shard_script),
+                || vec![("frontier", values.clone())],
+            )?)
+        } else {
+            None
+        };
+        let fact_shard_baseline = prefetched_shard
+            .as_ref()
+            .map(|result| fact_shard_baseline(&result.rows));
+        let (dependency_overrides, enrichment_overrides) =
+            if matches!(direction, TraversalDirection::Incoming) {
+                let candidates = observed_query(
+                    db,
+                    QuerySpec::new(
+                        "traversal.incoming.override_candidates",
+                        view,
+                        &override_key_script,
+                    ),
+                    || {
+                        vec![
+                            ("frontier", values.clone()),
+                            (
+                                "fact_shard_baseline",
+                                fact_shard_baseline
+                                    .clone()
+                                    .unwrap_or(DataValue::List(Vec::new())),
+                            ),
+                            ("dependency_overrides", DataValue::List(Vec::new())),
+                            ("enrichment_overrides", DataValue::List(Vec::new())),
+                        ]
+                    },
+                )?;
+                let (keys, enrichments) = override_parameters(candidates.rows);
+                (Some(keys), Some(enrichments))
+            } else {
+                (None, None)
+            };
+        let enrichment_overrides_empty = enrichment_overrides
+            .as_ref()
+            .is_some_and(|overrides| matches!(overrides, DataValue::List(rows) if rows.is_empty()));
         if hops == max_hops {
             let visited_values = DataValue::List(
                 visited
@@ -876,13 +955,26 @@ fn closure(
                     .map(|entity| DataValue::List(vec![entity.as_str().into()]))
                     .collect(),
             );
-            for (operation, script) in boundary_operations.into_iter().zip(&boundary_scripts) {
+            for (operation, script) in boundary_operations.iter().copied().zip(&boundary_scripts) {
+                if enrichment_overrides_empty && operation.contains("enrichment_override") {
+                    continue;
+                }
                 let mut result =
                     observed_query(db, QuerySpec::new(operation, view, script), || {
-                        vec![
+                        let mut additions = vec![
                             ("frontier", values.clone()),
                             ("visited", visited_values.clone()),
-                        ]
+                        ];
+                        if let Some(baseline) = &fact_shard_baseline {
+                            additions.push(("fact_shard_baseline", baseline.clone()));
+                        }
+                        if let Some(overrides) = &dependency_overrides {
+                            additions.push(("dependency_overrides", overrides.clone()));
+                        }
+                        if let Some(overrides) = &enrichment_overrides {
+                            additions.push(("enrichment_overrides", overrides.clone()));
+                        }
+                        additions
                     })?;
                 if headers.is_empty() {
                     headers = result.headers;
@@ -895,22 +987,65 @@ fn closure(
             }
             break;
         }
-        let mut edge_groups = Vec::new();
-        for (operation, script) in operations.into_iter().zip(&scripts) {
-            let result = observed_query(db, QuerySpec::new(operation, view, script), || {
-                vec![("frontier", values.clone())]
-            })?;
-            if headers.is_empty() {
-                headers = result.headers;
+        let mut edge_groups = if let Some(shard) = prefetched_shard {
+            let baseline = fact_shard_baseline.unwrap_or(DataValue::List(Vec::new()));
+            let mut groups = Vec::new();
+            for (operation, script) in operations.iter().copied().zip(&scripts) {
+                if enrichment_overrides_empty && operation.contains("enrichment_override") {
+                    groups.push(Vec::new());
+                    continue;
+                }
+                let core = observed_query(db, QuerySpec::new(operation, view, script), || {
+                    vec![
+                        ("frontier", values.clone()),
+                        ("fact_shard_baseline", baseline.clone()),
+                        (
+                            "dependency_overrides",
+                            dependency_overrides
+                                .clone()
+                                .unwrap_or(DataValue::List(Vec::new())),
+                        ),
+                        (
+                            "enrichment_overrides",
+                            enrichment_overrides
+                                .clone()
+                                .unwrap_or(DataValue::List(Vec::new())),
+                        ),
+                    ]
+                })?;
+                if headers.is_empty() {
+                    headers = core.headers;
+                }
+                groups.push(core.rows);
             }
-            edge_groups.push(result.rows);
-        }
+            groups.push(shard.rows);
+            groups
+        } else {
+            let mut groups = Vec::new();
+            for (operation, script) in operations.iter().copied().zip(&scripts) {
+                let result = observed_query(db, QuerySpec::new(operation, view, script), || {
+                    vec![("frontier", values.clone())]
+                })?;
+                if headers.is_empty() {
+                    headers = result.headers;
+                }
+                groups.push(result.rows);
+            }
+            let shard = observed_query(
+                db,
+                QuerySpec::new(shard_operation, view, &shard_script),
+                || vec![("frontier", values.clone())],
+            )?;
+            groups.push(shard.rows);
+            groups
+        };
         let overrides = observed_query(
             db,
             QuerySpec::new(override_operation, view, &override_script),
             || vec![("frontier", values.clone())],
         )?;
-        merge_fact_shard_overrides(&mut edge_groups[1], overrides.rows, direction, &frontier);
+        let shard_group = edge_groups.last_mut().expect("shard query always runs");
+        merge_fact_shard_overrides(shard_group, overrides.rows, direction, &frontier);
         let mut result_rows = edge_groups.into_iter().flatten().collect::<Vec<_>>();
         for row in &mut result_rows {
             row[2] = i64::from(hops).into();
@@ -940,6 +1075,37 @@ fn closure(
         frontier = next;
     }
     Ok(NamedRows::new(headers, rows))
+}
+
+fn fact_shard_baseline(rows: &[Vec<DataValue>]) -> DataValue {
+    DataValue::List(
+        rows.iter()
+            .map(|row| {
+                DataValue::List(vec![
+                    row[3].clone(),
+                    row[5].clone(),
+                    row[4].clone(),
+                    row[6].clone(),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn override_parameters(rows: Vec<Vec<DataValue>>) -> (DataValue, DataValue) {
+    let mut keys = Vec::with_capacity(rows.len());
+    let mut enrichments = Vec::new();
+    for row in rows {
+        keys.push(DataValue::List(vec![
+            row[1].clone(),
+            row[2].clone(),
+            row[3].clone(),
+        ]));
+        if row[0].get_str() == Some("enrichment") {
+            enrichments.push(DataValue::List(row[1..].to_vec()));
+        }
+    }
+    (DataValue::List(keys), DataValue::List(enrichments))
 }
 
 fn merge_fact_shard_overrides(
