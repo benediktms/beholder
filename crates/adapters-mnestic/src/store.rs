@@ -835,27 +835,41 @@ mod tests {
             BTreeMap::from([("example/repository".into(), "semantic".into())]),
         )]))
         .unwrap();
-        let repository = facts(&view, Vec::new());
-        let owner = "repo://example/repository/rust/lib/run";
+        let state_owner = "repo://example/repository/rust/lib/state_run";
+        let state_unresolved = "rust-call://state-target";
+        let state_resolved = "repo://example/repository/rust/lib/state-target";
+        let repository = facts(
+            &view,
+            vec![Observation::dependency(
+                state_owner,
+                DependencyRelation::Calls,
+                state_unresolved,
+                "src/lib.rs:3",
+            )],
+        );
+        let shard_owner = "repo://example/repository/rust/lib/shard";
+        let source = "repo://example/repository/rust/lib/run";
         let base_unresolved = "rust-call://base-target";
         let base_resolved = "repo://example/repository/rust/lib/base-target";
+        let losing_enrichment_resolved =
+            "repo://example/repository/rust/lib/losing-enrichment-target";
         let enrichment_unresolved = "rust-call://enrichment-target";
         let enrichment_resolved = "repo://example/repository/rust/lib/enrichment-target";
         let shard = FactShard {
             repository: "example/repository".into(),
             producer: "rust".into(),
-            owner: owner.into(),
+            owner: shard_owner.into(),
             version: "body-1".into(),
-            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            entities: vec![EntityFact::new(shard_owner, EntityKind::Callable, None).unwrap()],
             observations: vec![
                 Observation::dependency(
-                    owner,
+                    source,
                     DependencyRelation::Calls,
                     base_unresolved,
                     "src/lib.rs:1",
                 ),
                 Observation::dependency(
-                    owner,
+                    source,
                     DependencyRelation::Calls,
                     enrichment_unresolved,
                     "src/lib.rs:2",
@@ -863,7 +877,7 @@ mod tests {
             ],
         };
         let base_override = DependencyOverride {
-            from: owner.into(),
+            from: source.into(),
             relation: DependencyRelation::Calls,
             unresolved_to: base_unresolved.into(),
             resolved_to: base_resolved.into(),
@@ -872,7 +886,7 @@ mod tests {
             provenance: Provenance::UniqueNameHeuristic,
         };
         let enrichment_override = DependencyOverride {
-            from: owner.into(),
+            from: source.into(),
             relation: DependencyRelation::Calls,
             unresolved_to: enrichment_unresolved.into(),
             resolved_to: enrichment_resolved.into(),
@@ -880,6 +894,30 @@ mod tests {
             confidence: Confidence::Inferred,
             provenance: Provenance::UniqueNameHeuristic,
         };
+        let losing_enrichment_override = DependencyOverride {
+            from: source.into(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: base_unresolved.into(),
+            resolved_to: losing_enrichment_resolved.into(),
+            evidence: "src/lib.rs:1".into(),
+            confidence: Confidence::Inferred,
+            provenance: Provenance::UniqueNameHeuristic,
+        };
+        let state_override = DependencyOverride {
+            from: state_owner.into(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: state_unresolved.into(),
+            resolved_to: state_resolved.into(),
+            evidence: "src/lib.rs:3".into(),
+            confidence: Confidence::Inferred,
+            provenance: Provenance::UniqueNameHeuristic,
+        };
+        let duplicate_enrichment_observation = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            enrichment_unresolved,
+            "src/lib.rs:2",
+        );
         store
             .publish_verified_sharded(
                 &view,
@@ -902,18 +940,29 @@ mod tests {
                     version: "1",
                 },
                 EnrichmentPayload {
-                    overrides: &[enrichment_override],
+                    observations: &[duplicate_enrichment_observation],
+                    overrides: &[
+                        enrichment_override,
+                        losing_enrichment_override,
+                        state_override,
+                    ],
                     ..EnrichmentPayload::default()
                 },
             )
             .unwrap();
 
-        let dependencies = store.dependencies(&view.name, owner, 1).unwrap();
+        let dependencies = store.dependencies(&view.name, source, 1).unwrap();
         assert!(
             dependencies
                 .dependencies
                 .iter()
                 .any(|dependency| dependency.entity == base_resolved)
+        );
+        assert!(
+            !dependencies
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.entity == losing_enrichment_resolved)
         );
         assert!(
             dependencies
@@ -943,9 +992,24 @@ mod tests {
                     .unwrap()
                     .affected
                     .iter()
-                    .any(|affected| affected.entity == owner)
+                    .any(|affected| affected.entity == source)
             );
         }
+        assert!(
+            store
+                .impact(&view.name, state_resolved, 1)
+                .unwrap()
+                .affected
+                .iter()
+                .any(|affected| affected.entity == state_owner)
+        );
+        assert!(
+            store
+                .impact(&view.name, losing_enrichment_resolved, 1)
+                .unwrap()
+                .affected
+                .is_empty()
+        );
     }
 
     #[test]

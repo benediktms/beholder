@@ -156,6 +156,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         ScriptMutability::Mutable,
     )?;
     db.run_script(
+        CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
         CREATE_OVERRIDE_SCHEMA,
         BTreeMap::new(),
         ScriptMutability::Mutable,
@@ -598,6 +603,10 @@ pub(super) fn persistent_database(
             (
                 "analysis_fact_shard_observation:by_to",
                 CREATE_FACT_SHARD_OBSERVATION_TO_INDEX,
+            ),
+            (
+                "analysis_fact_shard_dependency_observation:by_from",
+                CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX,
             ),
             (
                 "analysis_revision_state:by_state",

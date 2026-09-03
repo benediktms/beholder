@@ -17,6 +17,28 @@ baseline_observation[from, relation, to, evidence] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_observation:by_to{view: $view, revision, from, relation, to, evidence}
 
+baseline_observation[from, relation, unresolved_to, evidence] :=
+    enrichment_override[from, relation, unresolved_to, _, _, _, _],
+    *state_observation:by_to{state, from, relation, to: unresolved_to, evidence},
+    *analysis_revision_state:by_state{
+        view: $view,
+        state,
+        revision,
+    },
+    *analysis_revision{view: $view, revision}
+
+baseline_observation[from, relation, unresolved_to, evidence] :=
+    enrichment_override[from, relation, unresolved_to, _, _, _, _],
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_observation:by_to{
+        view: $view,
+        revision,
+        from,
+        relation,
+        to: unresolved_to,
+        evidence,
+    }
+
 base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
     frontier[unresolved_to],
     *analysis_revision{view: $view, revision},
@@ -37,6 +59,16 @@ base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, 
         unresolved_to,
         confidence,
         provenance,
+    }
+
+base_override_exists[from, relation, unresolved_to] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
     }
 
 base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
@@ -84,7 +116,7 @@ enrichment_override[
         confidence,
         provenance,
     },
-    not base_override[from, relation, unresolved_to, _, _, _, _]
+    not base_override_exists[from, relation, unresolved_to]
 
 enrichment_override[
     from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
@@ -109,7 +141,7 @@ enrichment_override[
         owner,
     },
     selected_enrichment[owner],
-    not base_override[from, relation, unresolved_to, _, _, _, _]
+    not base_override_exists[from, relation, unresolved_to]
 
 dependency_override[from, relation, unresolved_to] :=
     base_override[from, relation, unresolved_to, _, _, _, _]

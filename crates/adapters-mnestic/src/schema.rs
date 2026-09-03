@@ -493,6 +493,8 @@ pub(super) const CREATE_FACT_SHARD_SELECTION_OWNER_INDEX: &str = "::index create
      {view, owner, producer, version, repository}";
 pub(super) const CREATE_FACT_SHARD_OBSERVATION_TO_INDEX: &str = "::index create analysis_fact_shard_observation:by_to \
      {to, producer, owner, version, from, relation, evidence, confidence, provenance}";
+pub(super) const CREATE_FACT_SHARD_DEPENDENCY_FROM_INDEX: &str = "::index create analysis_fact_shard_dependency_observation:by_from \
+     {from, producer, owner, version, relation, to, evidence}";
 pub(super) const CREATE_REVISION_STATE_STATE_INDEX: &str = "::index create analysis_revision_state:by_state \
      {view, state, revision, repository}";
 pub(super) const CREATE_OVERRIDE_UNRESOLVED_INDEX: &str = "::index create analysis_revision_dependency_override:by_unresolved \

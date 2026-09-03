@@ -66,6 +66,7 @@ before reading historical facts:
 | --- | ---: | ---: |
 | fact-shard entity by ID | 15.60 s | 571,813,888 bytes |
 | fact-shard selection by owner | 1.94 s | 88,023,040 bytes |
+| fact-shard dependency by source | 59.42 s | 514,084,864 bytes |
 | revision state by state | 0.03 s | 4,096 bytes |
 | four reverse override indexes | 0.92 s | 34,996,224 bytes |
 | fact-shard observation by target | 109.75 s | 639,747 pages, or 2,620,403,712 bytes at 4 KiB/page |
@@ -76,6 +77,11 @@ database), and made acquisition slower at 3.55 seconds. It is not created by
 Beholder and was dropped from the measurement database. SQLite retains freed
 pages until an explicit reclaim, so the database file does not shrink merely by
 dropping the index.
+
+The narrower retained dependency-by-source index supports valid shards whose
+observation source differs from the shard owner without requiring an entity
+fact. `EXPLAIN` changed that lookup from a full `stored_mat_join` to an indexed
+`stored_prefix_join`; warm lookup of 32 edges took 17-19 milliseconds.
 
 A repository-keyed shard-selection index was also discarded after correcting
 the owner/version index made direct entity-ID candidate validation faster and

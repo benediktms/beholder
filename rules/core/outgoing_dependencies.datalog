@@ -16,6 +16,24 @@ baseline_observation[from, relation, to, evidence] :=
     *analysis_revision{view: $view, revision},
     *analysis_revision_observation{view: $view, revision, from, relation, to, evidence}
 
+baseline_observation[from, relation, to, evidence] :=
+    frontier[from],
+    *analysis_fact_shard_dependency_observation:by_from{
+        from,
+        producer,
+        owner,
+        version,
+        relation,
+        to,
+        evidence,
+    },
+    *analysis_fact_shard_selection:by_owner{
+        view: $view,
+        owner,
+        producer,
+        version,
+    }
+
 base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
     frontier[from],
     *analysis_revision{view: $view, revision},

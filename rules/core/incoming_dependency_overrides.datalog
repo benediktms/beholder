@@ -24,6 +24,16 @@ base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, 
         provenance,
     }
 
+base_override_exists[from, relation, unresolved_to] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_dependency_override{
+        view: $view,
+        revision,
+        from,
+        relation,
+        unresolved_to,
+    }
+
 base_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] :=
     frontier[resolved_to],
     *analysis_revision{view: $view, revision},
@@ -89,7 +99,7 @@ effective_override[
         confidence,
         provenance,
     },
-    not base_override[from, relation, unresolved_to, _, _, _, _],
+    not base_override_exists[from, relation, unresolved_to],
     kind = 'enrichment_override'
 
 effective_override[
@@ -129,7 +139,7 @@ effective_override[
         producer,
         version,
     },
-    not base_override[from, relation, unresolved_to, _, _, _, _],
+    not base_override_exists[from, relation, unresolved_to],
     kind = 'enrichment_override'
 
 ?[row_kind, entity, hops, edge_from, edge_to, relation, evidence, confidence, provenance] :=
