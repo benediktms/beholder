@@ -691,7 +691,6 @@ fn closure(
                 "revision_edge",
                 "state_enrichment_override_edge",
                 "revision_enrichment_override_edge",
-                "fact_shard_enrichment_override_edge",
                 "enrichment_observation_edge",
                 "grpc_implementation_edge",
             ],
@@ -701,7 +700,6 @@ fn closure(
                 "traversal.incoming.revision",
                 "traversal.incoming.state_enrichment_override",
                 "traversal.incoming.revision_enrichment_override",
-                "traversal.incoming.fact_shard_enrichment_override",
                 "traversal.incoming.enrichment_observation",
                 "traversal.incoming.grpc_implementation",
             ],
@@ -806,7 +804,11 @@ fn closure(
         TraversalDirection::Outgoing => "not dependency_override[from, relation, to, _, _, _, _]",
         TraversalDirection::Incoming => "not dependency_override_key[from, relation, to]",
     };
-    let mut boundary_scripts = edge_rules
+    let mut boundary_edge_rules = edge_rules.clone();
+    if matches!(direction, TraversalDirection::Incoming) {
+        boundary_edge_rules.push("fact_shard_enrichment_override_edge");
+    }
+    let mut boundary_scripts = boundary_edge_rules
         .iter()
         .map(|edge_rule| {
             format!(
