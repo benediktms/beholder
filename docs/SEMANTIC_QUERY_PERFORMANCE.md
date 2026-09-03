@@ -20,13 +20,12 @@ serialization could be timed separately.
 ## Bounded result
 
 The production query now acquires one indexed frontier at a time and performs a
-final boundary probe for exact truncation. All statements in one semantic read
-share a five-second deadline. Blocking database work runs on Tokio's blocking
-pool, so a disconnected client releases its async worker immediately; Mnestic's
-deadline stops the detached database work within five seconds. Mnestic 0.14
-does not expose a request-scoped cancellation handle, so Beholder deliberately
-does not infer a query ID from the global `::running` registry and risk killing
-another concurrent request.
+final boundary probe for exact truncation. Semantic reads emit a warning on
+their trace when they exceed five seconds, but are allowed to finish. Blocking
+database work runs on Tokio's blocking pool, so a disconnected client releases
+its async worker immediately. Mnestic 0.14 does not expose a request-scoped
+cancellation handle, so Beholder deliberately does not infer a query ID from
+the global `::running` registry and risk killing another concurrent request.
 
 | View and query | Revision read | Acquisition | Processing | Hydration | Metadata | Serialization | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -39,10 +38,10 @@ existence lookup; its focused traversal test completes in 0.20 seconds.
 
 An installed release smoke test returned the Beholder depth-4 dependency query
 in 0.69 seconds while automatic indexing was active. Under simultaneous Fresha
-indexing and TypeScript enrichment, slower traversals returned the typed
-`DeadlineExceeded` error instead of continuing indefinitely. While one such
-traversal was running, `beholder daemon status` still answered in 0.46 seconds.
-Those contended measurements are not used as the warm acceptance result above.
+indexing and TypeScript enrichment, slower traversals exceeded the former
+five-second deadline. While one such traversal was running, `beholder daemon
+status` still answered in 0.46 seconds. Those contended measurements are not
+used as the warm acceptance result above.
 
 The branching reference used a 100,000-entity in-memory DAG with fanout 4 and
 depth 4. Loading took 3.529 seconds; direct closure took 4.576 milliseconds,

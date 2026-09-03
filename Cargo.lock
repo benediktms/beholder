@@ -453,7 +453,6 @@ dependencies = [
  "sha2",
  "sqlite",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

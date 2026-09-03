@@ -7,7 +7,7 @@ use super::{
         SnapshotQueryRunner, analysis_metadata, analysis_revision, context, dependencies,
         entity_facts, impact, inspect_grpc_bindings, inspect_observations, inspect_relations,
         inspect_revisions, published_repository_head, repository_revision, trace,
-        within_query_budget,
+        warn_on_slow_semantic_query,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -490,7 +490,7 @@ impl SemanticStore {
     }
 
     pub fn context(&self, view: &str, entity: &str) -> Result<ContextResult, Box<dyn Error>> {
-        within_query_budget(|| {
+        warn_on_slow_semantic_query(|| {
             let result = context(&self.read_db, view, entity)?;
             let entities = relevant_entities(&result, &[entity], &[2]);
             semantic::context(
@@ -526,7 +526,7 @@ impl SemanticStore {
         to: &str,
         max_hops: u32,
     ) -> Result<TraceResult, Box<dyn Error>> {
-        within_query_budget(|| {
+        warn_on_slow_semantic_query(|| {
             let result = trace(&self.read_db, view, from, to, max_hops)?;
             let entities = relevant_traversal_entities(&result, &[from, to], max_hops);
             semantic::trace(
@@ -567,7 +567,7 @@ impl SemanticStore {
         entity: &str,
         max_hops: u32,
     ) -> Result<ImpactResult, Box<dyn Error>> {
-        within_query_budget(|| {
+        warn_on_slow_semantic_query(|| {
             let result = impact(&self.read_db, view, entity, max_hops)?;
             let entities = relevant_traversal_entities(&result, &[entity], max_hops);
             semantic::impact(
@@ -605,7 +605,7 @@ impl SemanticStore {
         entity: &str,
         max_hops: u32,
     ) -> Result<DependenciesResult, Box<dyn Error>> {
-        within_query_budget(|| {
+        warn_on_slow_semantic_query(|| {
             let result = dependencies(&self.read_db, view, entity, max_hops)?;
             let entities = relevant_traversal_entities(&result, &[entity], max_hops);
             semantic::dependencies(
@@ -642,7 +642,7 @@ impl SemanticStore {
         view: &str,
         read: impl FnOnce(&SnapshotQueryRunner<'_>) -> Result<T, Box<dyn Error>>,
     ) -> Result<Revisioned<T>, Box<dyn Error>> {
-        within_query_budget(|| {
+        warn_on_slow_semantic_query(|| {
             let transaction = self.read_db.multi_transaction(false);
             let query_runner = SnapshotQueryRunner::new(&transaction, &self.read_db);
             let analysis_revision = analysis_revision(&query_runner, view)?;

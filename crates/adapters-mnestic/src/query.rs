@@ -6,28 +6,21 @@ use beholder_dto::{
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions,
 };
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const SEMANTIC_QUERY_TIMEOUT_SECONDS: f64 = 5.0;
+const SEMANTIC_QUERY_WARNING_SECONDS: f64 = 5.0;
 const SLOW_QUERY_SECONDS: f64 = 1.0;
 const QUERY_PLAN_TIMEOUT_SECONDS: f64 = 0.25;
 const ANALYSIS_METADATA_RULES: &str = include_str!("../../../rules/core/analysis_metadata.datalog");
-
-thread_local! {
-    static SEMANTIC_QUERY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
-}
 
 pub(super) trait QueryRunner {
     fn run_query(
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
-        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>>;
 
     fn explain_query(
@@ -45,13 +38,12 @@ impl QueryRunner for DbInstance {
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
-        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>> {
         Ok(self.run_script_with_options(
             script,
             params,
             ScriptMutability::Immutable,
-            ScriptRunOptions::new().with_timeout(timeout),
+            ScriptRunOptions::new(),
         )?)
     }
 
@@ -75,9 +67,8 @@ impl QueryRunner for MultiTransaction {
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
-        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>> {
-        Ok(self.run_script(&format!("{script}\n:timeout {timeout}"), params)?)
+        Ok(self.run_script(script, params)?)
     }
 }
 
@@ -100,9 +91,8 @@ impl QueryRunner for SnapshotQueryRunner<'_> {
         &self,
         script: &str,
         params: BTreeMap<String, DataValue>,
-        timeout: f64,
     ) -> Result<NamedRows, Box<dyn Error>> {
-        self.transaction.run_query(script, params, timeout)
+        self.transaction.run_query(script, params)
     }
 
     fn explain_query(
@@ -115,13 +105,22 @@ impl QueryRunner for SnapshotQueryRunner<'_> {
     }
 }
 
-pub(super) fn within_query_budget<T>(read: impl FnOnce() -> T) -> T {
-    let previous = SEMANTIC_QUERY_DEADLINE.replace(Some(
-        Instant::now() + Duration::from_secs_f64(SEMANTIC_QUERY_TIMEOUT_SECONDS),
-    ));
+pub(super) fn warn_on_slow_semantic_query<T>(read: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
     let result = read();
-    SEMANTIC_QUERY_DEADLINE.set(previous);
+    let elapsed = started.elapsed();
+    if semantic_query_is_slow(elapsed) {
+        tracing::warn!(
+            elapsed_ms = elapsed.as_millis(),
+            threshold_seconds = SEMANTIC_QUERY_WARNING_SECONDS,
+            "semantic query exceeded warning threshold"
+        );
+    }
     result
+}
+
+fn semantic_query_is_slow(elapsed: Duration) -> bool {
+    elapsed.as_secs_f64() >= SEMANTIC_QUERY_WARNING_SECONDS
 }
 
 struct QuerySpec<'a> {
@@ -152,41 +151,7 @@ fn query(
             .into_iter()
             .map(|(name, value)| (name.into(), value)),
     );
-    let timeout = remaining_query_budget();
-    if timeout == 0.0 {
-        return Err(query_timeout().into());
-    }
-    db.run_query(script, params, timeout).map_err(|error| {
-        if error.to_string() == "Query exceeded its time budget" {
-            Box::new(query_timeout()) as Box<dyn Error>
-        } else {
-            error
-        }
-    })
-}
-
-fn remaining_query_budget() -> f64 {
-    SEMANTIC_QUERY_DEADLINE.with(|deadline| {
-        deadline
-            .get()
-            .map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_secs_f64()
-            })
-            .unwrap_or(SEMANTIC_QUERY_TIMEOUT_SECONDS)
-    })
-}
-
-fn without_consuming_query_budget<T>(read: impl FnOnce() -> T) -> T {
-    let started = Instant::now();
-    let result = read();
-    SEMANTIC_QUERY_DEADLINE.with(|deadline| {
-        if let Some(deadline_at) = deadline.get() {
-            deadline.set(Some(deadline_at + started.elapsed()));
-        }
-    });
-    result
+    db.run_query(script, params)
 }
 
 fn observed_query(
@@ -235,32 +200,16 @@ fn observed_query(
             db.plan.loaded_relations = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let explain_params = || {
+        let explain = || {
             let mut params = BTreeMap::from([("view".into(), spec.view.into())]);
             params.extend(
                 additions()
                     .into_iter()
                     .map(|(name, value)| (name.into(), value)),
             );
-            params
+            db.explain_query(spec.script, params, QUERY_PLAN_TIMEOUT_SECONDS)
         };
-        let plan = if result.is_ok() {
-            without_consuming_query_budget(|| {
-                db.explain_query(spec.script, explain_params(), QUERY_PLAN_TIMEOUT_SECONDS)
-            })
-        } else {
-            if remaining_query_budget() == 0.0 {
-                span.record("db.plan.outcome", "deadline_exhausted");
-                return result;
-            }
-            let params = explain_params();
-            let plan_timeout = remaining_query_budget().min(QUERY_PLAN_TIMEOUT_SECONDS);
-            if plan_timeout == 0.0 {
-                span.record("db.plan.outcome", "deadline_exhausted");
-                return result;
-            }
-            db.explain_query(spec.script, params, plan_timeout)
-        };
+        let plan = explain();
         match plan {
             Ok(Some(plan)) => record_query_plan(&span, &plan),
             Ok(None) => {
@@ -305,13 +254,6 @@ fn record_query_plan(span: &tracing::Span, plan: &NamedRows) {
         "db.plan.loaded_relations",
         loaded_relations.into_iter().collect::<Vec<_>>().join(","),
     );
-}
-
-fn query_timeout() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::TimedOut,
-        "semantic query exceeded its five-second budget",
-    )
 }
 
 pub(super) fn inspect_relations(db: &DbInstance) -> Result<NamedRows, Box<dyn Error>> {
@@ -436,7 +378,6 @@ pub(super) fn repository_revision(
         "?[source_state, analysis_identity, head, incomplete] := \
              *repository_revision{repository: $repository, source_state, analysis_identity, head, incomplete}",
         params.clone(),
-        SEMANTIC_QUERY_TIMEOUT_SECONDS,
     )?;
     let Some(row) = revision.rows.first() else {
         return Ok(None);
@@ -461,7 +402,6 @@ pub(super) fn repository_revision(
              *repository_revision_diagnostic{repository: $repository, code, severity, path, line, detail}\n\
          :order severity, path, line, code",
         params,
-        SEMANTIC_QUERY_TIMEOUT_SECONDS,
     )?;
     let diagnostics = diagnostics
         .rows
@@ -1178,51 +1118,7 @@ mod tests {
         StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
-    use std::{
-        cell::RefCell,
-        collections::{BTreeMap, BTreeSet},
-        fs, thread,
-        time::Duration,
-        time::SystemTime,
-    };
-
-    struct TimeoutRunner(RefCell<Vec<f64>>);
-
-    impl QueryRunner for TimeoutRunner {
-        fn run_query(
-            &self,
-            _script: &str,
-            _params: BTreeMap<String, DataValue>,
-            timeout: f64,
-        ) -> Result<NamedRows, Box<dyn Error>> {
-            self.0.borrow_mut().push(timeout);
-            Ok(NamedRows::default())
-        }
-    }
-
-    struct ExhaustedPlanRunner(Cell<bool>);
-
-    impl QueryRunner for ExhaustedPlanRunner {
-        fn run_query(
-            &self,
-            _script: &str,
-            _params: BTreeMap<String, DataValue>,
-            _timeout: f64,
-        ) -> Result<NamedRows, Box<dyn Error>> {
-            SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() - Duration::from_millis(1)));
-            Err(query_timeout().into())
-        }
-
-        fn explain_query(
-            &self,
-            _script: &str,
-            _params: BTreeMap<String, DataValue>,
-            _timeout: f64,
-        ) -> Result<Option<NamedRows>, Box<dyn Error>> {
-            self.0.set(true);
-            Ok(None)
-        }
-    }
+    use std::{cell::Cell, collections::BTreeSet, fs, time::Duration, time::SystemTime};
 
     struct DisabledPlanRunner(Cell<bool>);
 
@@ -1231,7 +1127,6 @@ mod tests {
             &self,
             _script: &str,
             _params: BTreeMap<String, DataValue>,
-            _timeout: f64,
         ) -> Result<NamedRows, Box<dyn Error>> {
             Err("query failed".into())
         }
@@ -1247,131 +1142,10 @@ mod tests {
         }
     }
 
-    struct ExpiringPlanRunner(Cell<bool>);
-
-    impl QueryRunner for ExpiringPlanRunner {
-        fn run_query(
-            &self,
-            _script: &str,
-            _params: BTreeMap<String, DataValue>,
-            _timeout: f64,
-        ) -> Result<NamedRows, Box<dyn Error>> {
-            SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() + Duration::from_millis(1)));
-            Err("query failed".into())
-        }
-
-        fn explain_query(
-            &self,
-            _script: &str,
-            _params: BTreeMap<String, DataValue>,
-            _timeout: f64,
-        ) -> Result<Option<NamedRows>, Box<dyn Error>> {
-            self.0.set(true);
-            Ok(None)
-        }
-    }
-
-    fn with_info_spans<T>(read: impl FnOnce() -> T) -> T {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(io::sink)
-            .finish();
-        tracing::subscriber::with_default(subscriber, read)
-    }
-
     #[test]
-    fn one_budget_is_shared_by_every_query_in_a_semantic_read() {
-        let runner = TimeoutRunner(RefCell::new(Vec::new()));
-
-        within_query_budget(|| {
-            query(&runner, "main", "?[value] <- [[1]]", []).unwrap();
-            thread::sleep(Duration::from_millis(5));
-            query(&runner, "main", "?[value] <- [[1]]", []).unwrap();
-        });
-
-        let timeouts = runner.0.into_inner();
-        assert!(timeouts[0] <= SEMANTIC_QUERY_TIMEOUT_SECONDS);
-        assert!(timeouts[1] < timeouts[0]);
-
-        SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() - Duration::from_millis(1)));
-        let error = query(
-            &TimeoutRunner(RefCell::new(Vec::new())),
-            "main",
-            "?[value] <- [[1]]",
-            [],
-        )
-        .unwrap_err();
-        SEMANTIC_QUERY_DEADLINE.set(None);
-        assert_eq!(
-            error.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::TimedOut)
-        );
-    }
-
-    #[test]
-    fn mnestic_stops_work_when_the_query_budget_expires() {
-        let db = memory_database().unwrap();
-        SEMANTIC_QUERY_DEADLINE.set(Some(Instant::now() + Duration::from_millis(1)));
-        let error = query(
-            &db,
-            "main",
-            "?[left, right] := left in int_range(100000), right in int_range(100000)",
-            [],
-        )
-        .unwrap_err();
-        SEMANTIC_QUERY_DEADLINE.set(None);
-
-        assert_eq!(
-            error.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::TimedOut)
-        );
-    }
-
-    #[test]
-    fn exhausted_query_budget_skips_plan_collection() {
-        let runner = ExhaustedPlanRunner(Cell::new(false));
-        let parameter_builds = Cell::new(0);
-
-        let _ = with_info_spans(|| {
-            within_query_budget(|| {
-                observed_query(
-                    &runner,
-                    QuerySpec::new("test", "main", "?[value] <- [[1]]"),
-                    || {
-                        parameter_builds.set(parameter_builds.get() + 1);
-                        Vec::new()
-                    },
-                )
-            })
-        });
-
-        assert!(!runner.0.get());
-        assert_eq!(parameter_builds.get(), 1);
-    }
-
-    #[test]
-    fn parameter_building_cannot_extend_failure_plan_past_the_deadline() {
-        let runner = ExpiringPlanRunner(Cell::new(false));
-        let parameter_builds = Cell::new(0);
-
-        let _ = with_info_spans(|| {
-            within_query_budget(|| {
-                observed_query(
-                    &runner,
-                    QuerySpec::new("test", "main", "?[value] <- [[1]]"),
-                    || {
-                        parameter_builds.set(parameter_builds.get() + 1);
-                        if parameter_builds.get() == 2 {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Vec::new()
-                    },
-                )
-            })
-        });
-
-        assert!(!runner.0.get());
-        assert_eq!(parameter_builds.get(), 2);
+    fn semantic_query_warns_at_five_seconds() {
+        assert!(!semantic_query_is_slow(Duration::from_millis(4_999)));
+        assert!(semantic_query_is_slow(Duration::from_secs(5)));
     }
 
     #[test]
@@ -1379,30 +1153,17 @@ mod tests {
         let runner = DisabledPlanRunner(Cell::new(false));
         let parameter_builds = Cell::new(0);
 
-        let _ = within_query_budget(|| {
-            observed_query(
-                &runner,
-                QuerySpec::new("test", "main", "?[value] <- [[1]]"),
-                || {
-                    parameter_builds.set(parameter_builds.get() + 1);
-                    Vec::new()
-                },
-            )
-        });
+        let _ = observed_query(
+            &runner,
+            QuerySpec::new("test", "main", "?[value] <- [[1]]"),
+            || {
+                parameter_builds.set(parameter_builds.get() + 1);
+                Vec::new()
+            },
+        );
 
         assert!(!runner.0.get());
         assert_eq!(parameter_builds.get(), 1);
-    }
-
-    #[test]
-    fn diagnostics_do_not_consume_the_query_budget() {
-        within_query_budget(|| {
-            let before = SEMANTIC_QUERY_DEADLINE.get().unwrap();
-            without_consuming_query_budget(|| thread::sleep(Duration::from_millis(5)));
-            let after = SEMANTIC_QUERY_DEADLINE.get().unwrap();
-
-            assert!(after > before);
-        });
     }
 
     #[test]
