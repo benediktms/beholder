@@ -1431,7 +1431,7 @@ fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<()
         ("analysis_semantic_fingerprint", "view"),
         (
             "analysis_resolved_dependency",
-            "view, from, relation, to, evidence",
+            "view, from, relation, to, evidence, provenance",
         ),
         ("analysis_fingerprint", "view"),
         ("analysis_verification_fingerprint", "view"),
@@ -3272,9 +3272,11 @@ pub(super) fn rebuild_resolved_dependencies(
                  ['consumed_by'], ['implements'], ['implemented_by'], ['imports'],\n\
                  ['publishes'], ['requires'], ['resolved_by'], ['selects'], ['uses']\n\
              ]\n\
-             ?[view, from, relation, to, evidence, confidence, provenance] := \
+             materialized[view, from, relation, to, evidence, max(confidence), provenance] := \
                  direct[from, to, relation, evidence, confidence, provenance], \
                  dependency_relation[relation], view = $view\n\
+             ?[view, from, relation, to, evidence, confidence, provenance] := \
+                 materialized[view, from, relation, to, evidence, confidence, provenance]\n\
              :put analysis_resolved_dependency {{\
                  view, from, relation, to, evidence, provenance => confidence\
              }}"
@@ -3325,7 +3327,7 @@ fn refresh_resolved_dependencies(
             &format!(
                 "{OUTGOING_DEPENDENCY_RULES}\n\
                  frontier[id] <- $sources\n\
-                 ?[from, to, relation, evidence, confidence, provenance] := \
+                 ?[from, to, relation, evidence, max(confidence), provenance] := \
                      selected_edge[from, to, relation, evidence, confidence, provenance]\n\
                  :reorder written"
             ),
@@ -3336,7 +3338,7 @@ fn refresh_resolved_dependencies(
         &format!(
             "{OUTGOING_FACT_SHARD_DEPENDENCY_RULES}\n\
              frontier[id] <- $sources\n\
-             ?[from, to, relation, evidence, confidence, provenance] := \
+             ?[from, to, relation, evidence, max(confidence), provenance] := \
                  shard_edge[from, to, relation, evidence, confidence, provenance]\n\
              :reorder written"
         ),
@@ -3367,10 +3369,23 @@ fn refresh_resolved_dependencies(
             edges.push(row);
         }
     }
-    let edge_count = edges.len();
-    let rows = edges
+    let mut materialized = BTreeMap::new();
+    for mut edge in edges {
+        let confidence = edge.remove(4);
+        materialized
+            .entry(edge)
+            .and_modify(|existing| {
+                if confidence > *existing {
+                    *existing = confidence.clone();
+                }
+            })
+            .or_insert(confidence);
+    }
+    let edge_count = materialized.len();
+    let rows = materialized
         .into_iter()
-        .map(|mut edge| {
+        .map(|(mut edge, confidence)| {
+            edge.insert(4, confidence);
             let mut row = vec![view.into()];
             row.append(&mut edge);
             DataValue::List(row)
@@ -6534,6 +6549,13 @@ mod tests {
     fn materialized_dependencies_preserve_provenance_variants() {
         let store = SemanticStore::memory().unwrap();
         let source = "repo://example/repo/caller";
+        let mut inferred = Observation::dependency(
+            source,
+            DependencyRelation::Calls,
+            "repo://example/repo/target",
+            "src/lib.rs:1",
+        );
+        inferred.confidence = Confidence::Inferred;
         let mut compiler = Observation::dependency(
             source,
             DependencyRelation::Calls,
@@ -6563,13 +6585,23 @@ mod tests {
                 entities: Vec::new(),
                 observations: vec![compiler],
             },
+            FactShard {
+                repository: "example/repo".into(),
+                producer: "inferred".into(),
+                owner: "inferred".into(),
+                version: "1".into(),
+                entities: Vec::new(),
+                observations: vec![inferred],
+            },
         ];
         let transaction = store.db.multi_transaction(true);
         replace_fact_shards(&transaction, "main", &shards).unwrap();
         rebuild_resolved_dependencies(&transaction, "main").unwrap();
         transaction.commit().unwrap();
 
-        let evidence = store.context("main", source).unwrap().edges[0]
+        let edge = &store.context("main", source).unwrap().edges[0];
+        assert_eq!(edge.confidence, 1.0);
+        let evidence = edge
             .evidence
             .iter()
             .map(|evidence| evidence.source_kind)
