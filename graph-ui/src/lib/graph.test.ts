@@ -136,6 +136,7 @@ test('repository filtering accepts multiple repositories', () => {
 test('entity search prefers exact case-sensitive canonical IDs', () => {
   const candidates = [entity('Example', 'repo-a'), entity('example', 'repo-a')];
   assert.equal(findEntity(candidates, 'example')?.id, 'example');
+  assert.equal(findEntity([entity('INSPECT', 'repo-a')], 'inspect')?.id, 'INSPECT');
   assert.equal(findEntity(candidates, '  '), undefined);
 });
 

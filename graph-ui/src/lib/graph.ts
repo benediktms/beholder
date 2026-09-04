@@ -131,10 +131,10 @@ export function endpointId(endpoint: string | GraphNode): string {
 export function findEntity(nodes: readonly EntityRef[], search: string): EntityRef | undefined {
   const exact = search.trim();
   if (!exact) return undefined;
-  const folded = exact.toLocaleLowerCase();
+  const folded = exact.toLowerCase();
   return nodes.find((node) => node.id === exact)
-    ?? nodes.find((node) => node.id.toLocaleLowerCase() === folded || node.name.toLocaleLowerCase() === folded)
-    ?? nodes.find((node) => node.id.toLocaleLowerCase().includes(folded) || node.name.toLocaleLowerCase().includes(folded));
+    ?? nodes.find((node) => node.id.toLowerCase() === folded || node.name.toLowerCase() === folded)
+    ?? nodes.find((node) => node.id.toLowerCase().includes(folded) || node.name.toLowerCase().includes(folded));
 }
 
 export function projectGraph(
