@@ -71,6 +71,12 @@ func main() {
 	flag.Parse()
 
 	if *socket != "" {
+		shutdown, err := configureTelemetry(context.Background())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "initialize OpenTelemetry export: %v\n", err)
+		} else {
+			defer shutdown(context.Background())
+		}
 		if err := serve(*socket, *cacheDir); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

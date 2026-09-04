@@ -120,7 +120,7 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 	if err := stream.Send(progressEvent(workerv1.AnalysisPhase_ANALYSIS_PHASE_ANALYZING, "querying repository TypeScript compiler")); err != nil {
 		return err
 	}
-	ctx, span := s.telemetry.tracer.Start(stream.Context(), "typescript.compiler.enrichment",
+	ctx, span := s.telemetry.tracer.Start(extractTraceContext(stream.Context()), "typescript.compiler.enrichment",
 		trace.WithAttributes(
 			attribute.String("workspace", snapshot.workspace),
 			attribute.String("repository", target.identity),
