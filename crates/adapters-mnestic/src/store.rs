@@ -5,9 +5,10 @@ use super::{
     inspection::{InspectionResult, inspection_result},
     query::{
         SnapshotQueryRunner, all_entity_facts, analysis_metadata, analysis_revision, context,
-        dependencies, entity_facts, impact, inspect_grpc_bindings, inspect_observations,
-        inspect_relations, inspect_revisions, published_repository_head, repository_revision,
-        trace, warn_on_slow_semantic_query, workspace_topology,
+        dependencies, entity_facts, generated_entity_ids, impact, inspect_grpc_bindings,
+        inspect_observations, inspect_relations, inspect_revisions, published_repository_head,
+        repository_revision, search_entity_facts, trace, warn_on_slow_semantic_query,
+        workspace_topology,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -25,8 +26,9 @@ use beholder_domain::{
     SemanticCandidate, SemanticRelation, WorkspaceView,
 };
 use beholder_dto::{
-    ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
-    RepositoryRevision, Revisioned, TraceResult, WorkspaceTopology,
+    ContextResult, DependenciesResult, EntitySearchResult, GarbageCollection,
+    GarbageCollectionProgress, ImpactResult, RepositoryRevision, Revisioned, TraceResult,
+    WorkspaceTopology,
 };
 use mnestic_engine::{DataValue, DbInstance, NamedRows};
 use std::{
@@ -522,6 +524,41 @@ impl SemanticStore {
 
     pub fn workspace_topology_status(&self, view: &str) -> Result<Revisioned<()>, Box<dyn Error>> {
         self.snapshot(view, |_| Ok(()))
+    }
+
+    pub fn search_entities_snapshot(
+        &self,
+        view: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Revisioned<EntitySearchResult>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            let candidate = query
+                .split(['.', '/', ':'])
+                .max_by_key(|part| part.len())
+                .unwrap_or(query);
+            let mut result = semantic::search_entities(
+                view,
+                query,
+                limit,
+                inspection_result(search_entity_facts(transaction, view, candidate)?),
+            )?;
+            let generated = generated_entity_ids(
+                transaction,
+                view,
+                result
+                    .matches
+                    .iter()
+                    .map(|entity| entity.id.clone())
+                    .collect(),
+            )?;
+            for entity in &mut result.matches {
+                if generated.contains(&entity.id) {
+                    entity.origin = beholder_dto::EntityOrigin::Generated;
+                }
+            }
+            Ok(result)
+        })
     }
 
     pub fn trace(
@@ -1649,6 +1686,59 @@ mod tests {
         assert_eq!(diagnostic.repository, "repo");
         assert_eq!(diagnostic.path, PathBuf::from("src/broken.ts"));
         assert_eq!(diagnostic.line, Some(7));
+    }
+
+    #[test]
+    fn entity_search_uses_one_completed_revision_and_matches_display_names() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let mut repository = facts(&view, Vec::new());
+        repository.entities = vec![
+            EntityFact::new("repo://example/rust/lib/call", EntityKind::Callable, None).unwrap(),
+            EntityFact::new(
+                "grpc://example.v1.ExampleService/Call",
+                EntityKind::GrpcOperation,
+                None,
+            )
+            .unwrap(),
+            EntityFact::new(
+                "grpc://example.v1.ExampleService/Other",
+                EntityKind::GrpcOperation,
+                None,
+            )
+            .unwrap(),
+        ];
+        repository.observations = vec![Observation::generated(
+            "repo://example/rust/lib/call",
+            StructuralRelation::Defines,
+            "grpc://example.v1.ExampleService/Call",
+            "src/lib.rs:1",
+        )];
+        store.publish(&view, &[repository], &[]).unwrap();
+
+        let result = store
+            .search_entities_snapshot("main", "ExampleService.Call", 20)
+            .unwrap();
+
+        assert_eq!(result.analysis_revision, 1);
+        assert_eq!(result.result.metadata.revision, 0);
+        assert_eq!(result.result.matches.len(), 1);
+        assert_eq!(result.result.matches[0].name, "ExampleService.Call");
+        assert_eq!(
+            result.result.matches[0].origin,
+            beholder_dto::EntityOrigin::Generated
+        );
     }
 
     #[test]

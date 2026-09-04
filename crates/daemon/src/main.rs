@@ -516,15 +516,17 @@ fn configured_optional_worker_executable(
 mod tests {
     use super::*;
     use beholder_domain::BeholderErrorCode;
+    use beholder_dto::DEFAULT_ENTITY_SEARCH_LIMIT;
     use beholder_protocol::{
         ERROR_CODE_METADATA_KEY,
         v1::{
-            ClearCacheRequest, DeleteRepositoryRequest, EntityKind, EntityRequest, EvidenceKind,
-            GarbageCollectPhase, GarbageCollectRequest, GetGarbageCollectionStatusRequest,
-            GetJobRequest, GetRepositoryRequest, GetStatusRequest, JobStatus, JobTrigger, JobType,
-            ListJobsRequest, ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest,
-            RegisterWorkspaceRequest, RelationKind, RepositoryIndexTarget, StopRequest,
-            SubmitIndexRequest, TraversalEntityRequest, daemon_client::DaemonClient,
+            ClearCacheRequest, DeleteRepositoryRequest, EntityKind, EntityOrigin, EntityRequest,
+            EvidenceKind, GarbageCollectPhase, GarbageCollectRequest,
+            GetGarbageCollectionStatusRequest, GetJobRequest, GetRepositoryRequest,
+            GetStatusRequest, JobStatus, JobTrigger, JobType, ListJobsRequest,
+            ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest,
+            RegisterWorkspaceRequest, RelationKind, RepositoryIndexTarget, SearchEntitiesRequest,
+            StopRequest, SubmitIndexRequest, TraversalEntityRequest, daemon_client::DaemonClient,
             garbage_collect_event, submit_index_request,
         },
     };
@@ -697,7 +699,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 21);
+        assert_eq!(status.protocol_version, 22);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");
@@ -995,6 +997,22 @@ mod tests {
                     .iter()
                     .all(|evidence| evidence.source == EvidenceKind::Descriptor as i32)
         }));
+        let search = client
+            .search_entities(SearchEntitiesRequest {
+                workspace: "main".into(),
+                query: "Pricing.GetQuote".into(),
+                limit: None,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(search.query.unwrap().limit, DEFAULT_ENTITY_SEARCH_LIMIT);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(
+            search.matches[0].id,
+            "proto-method://pricing.v1.Pricing/GetQuote"
+        );
+        assert_eq!(search.matches[0].origin, EntityOrigin::Source as i32);
         let unchanged = client
             .submit_index(SubmitIndexRequest {
                 target: Some(submit_index_request::Target::Workspace("main".into())),

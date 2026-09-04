@@ -7,7 +7,10 @@ pub const IMPACT_SCHEMA_V2: &str = "beholder.impact.v2";
 pub const TRACE_SCHEMA_V2: &str = "beholder.trace.v2";
 pub const WHY_SCHEMA_V2: &str = "beholder.why.v2";
 pub const WORKSPACE_TOPOLOGY_SCHEMA_V1: &str = "beholder.workspace_topology.v1";
+pub const ENTITY_SEARCH_SCHEMA_V1: &str = "beholder.entity_search.v1";
 pub const DEFAULT_MAX_HOPS: u32 = 32;
+pub const DEFAULT_ENTITY_SEARCH_LIMIT: u32 = 20;
+pub const MAX_ENTITY_SEARCH_LIMIT: u32 = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GarbageCollection {
@@ -380,6 +383,21 @@ pub struct EntityQuery {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EntitySearchQuery {
+    pub query: String,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct EntitySearchResult {
+    pub schema: String,
+    #[serde(flatten)]
+    pub metadata: QueryMetadata,
+    pub query: EntitySearchQuery,
+    pub matches: Vec<EntityRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PathQuery {
     pub from: String,
     pub to: String,
@@ -489,6 +507,7 @@ macro_rules! semantic_result {
 semantic_result!(
     ContextResult,
     DependenciesResult,
+    EntitySearchResult,
     ImpactResult,
     TraceResult,
     WhyResult,

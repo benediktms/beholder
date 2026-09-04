@@ -22,6 +22,7 @@ service Daemon {
   rpc RegisterWorkspace(RegisterWorkspaceRequest) returns (RegisterWorkspaceResponse);
   rpc SetWorkspacePlugin(SetWorkspacePluginRequest) returns (SetWorkspacePluginResponse);
   rpc RegisterRepository(RegisterRepositoryRequest) returns (RepositoryResponse);
+  rpc SearchEntities(SearchEntitiesRequest) returns (SearchEntitiesResponse);
   rpc Stop(StopRequest) returns (StopResponse);
   rpc Trace(PathRequest) returns (TraceResponse);
   rpc Why(PathRequest) returns (WhyResponse);
@@ -76,6 +77,12 @@ message GetGarbageCollectionStatusResponse {
 message EntityRequest {
   string entity = 1;
   string workspace = 2;
+}
+
+message SearchEntitiesRequest {
+  string workspace = 1;
+  string query = 2;
+  optional uint32 limit = 3;
 }
 
 message TraversalEntityRequest {
@@ -283,6 +290,18 @@ message SemanticPath {
 
 message EntityQuery {
   string entity = 1;
+}
+
+message EntitySearchQuery {
+  string query = 1;
+  uint32 limit = 2;
+}
+
+message SearchEntitiesResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  EntitySearchQuery query = 3;
+  repeated Entity matches = 4;
 }
 
 message SemanticPathQuery {

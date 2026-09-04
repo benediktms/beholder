@@ -1,8 +1,9 @@
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
-    ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionEvent,
-    GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus, ImpactResult,
-    QueryMetadata, RepositoryStatus, TraceResult, WhyResult, WorkspaceTopology,
+    ContextResult, DependenciesResult, EntitySearchResult, GarbageCollection,
+    GarbageCollectionEvent, GarbageCollectionPhase, GarbageCollectionProgress,
+    GarbageCollectionStatus, ImpactResult, QueryMetadata, RepositoryStatus, TraceResult, WhyResult,
+    WorkspaceTopology,
 };
 use beholder_protocol::{
     ERROR_CODE_METADATA_KEY,
@@ -14,9 +15,10 @@ use beholder_protocol::{
         GetStatusRequest, GetStatusResponse, GetWorkspaceTopologyRequest,
         GetWorkspaceTopologyStatusRequest, ListJobsRequest, ListJobsResponse,
         ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
-        RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest, SubmitEnrichmentRequest,
-        SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse, TraversalEntityRequest,
-        daemon_client::DaemonClient, garbage_collect_event, submit_index_request,
+        RepositoryIndexTarget, SearchEntitiesRequest, SetWorkspacePluginRequest, StopRequest,
+        SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse,
+        TraversalEntityRequest, daemon_client::DaemonClient, garbage_collect_event,
+        submit_index_request,
     },
 };
 use std::{
@@ -287,6 +289,24 @@ pub async fn workspace_topology_status(workspace: String) -> Result<QueryMetadat
         .into_inner()
         .metadata
         .ok_or("topology status metadata is missing")?
+        .try_into()?)
+}
+
+pub async fn search_entities(
+    workspace: String,
+    query: String,
+    limit: Option<u32>,
+) -> Result<EntitySearchResult, ClientError> {
+    Ok(connect_send()
+        .await?
+        .search_entities(request(SearchEntitiesRequest {
+            workspace,
+            query,
+            limit,
+        }))
+        .await
+        .map_err(operation_error)?
+        .into_inner()
         .try_into()?)
 }
 

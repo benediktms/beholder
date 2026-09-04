@@ -280,6 +280,15 @@ defmodule Beholder.V1.EntityRequest do
   field :workspace, 2, type: :string
 end
 
+defmodule Beholder.V1.SearchEntitiesRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :workspace, 1, type: :string
+  field :query, 2, type: :string
+  field :limit, 3, proto3_optional: true, type: :uint32
+end
+
 defmodule Beholder.V1.TraversalEntityRequest do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -455,6 +464,24 @@ defmodule Beholder.V1.EntityQuery do
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
 
   field :entity, 1, type: :string
+end
+
+defmodule Beholder.V1.EntitySearchQuery do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :query, 1, type: :string
+  field :limit, 2, type: :uint32
+end
+
+defmodule Beholder.V1.SearchEntitiesResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :schema, 1, type: :string
+  field :metadata, 2, type: Beholder.V1.QueryMetadata
+  field :query, 3, type: Beholder.V1.EntitySearchQuery
+  field :matches, 4, repeated: true, type: Beholder.V1.Entity
 end
 
 defmodule Beholder.V1.SemanticPathQuery do
@@ -983,6 +1010,8 @@ defmodule Beholder.V1.Daemon.Service do
     Beholder.V1.RepositoryResponse,
     %{}
   )
+
+  rpc(:SearchEntities, Beholder.V1.SearchEntitiesRequest, Beholder.V1.SearchEntitiesResponse, %{})
 
   rpc(:Stop, Beholder.V1.StopRequest, Beholder.V1.StopResponse, %{})
 
