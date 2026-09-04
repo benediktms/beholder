@@ -6562,6 +6562,8 @@ mod tests {
             .unwrap();
         let input =
             view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler");
+        let resolved_second =
+            EntityFact::new("repo://example/repo/second", EntityKind::Callable, None).unwrap();
         store
             .publish_enrichment(
                 &view.name,
@@ -6572,6 +6574,7 @@ mod tests {
                     version: "1",
                 },
                 EnrichmentPayload {
+                    entities: &[resolved_second],
                     overrides: &[DependencyOverride {
                         from: second.from,
                         relation: DependencyRelation::Calls,
