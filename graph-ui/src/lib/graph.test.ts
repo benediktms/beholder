@@ -146,6 +146,34 @@ test('pinned investigations preserve dependency, impact, and shortest-path direc
   assert.deepEqual([...investigate(snapshot, 'trace', 'a', 'c').edgeIds].sort(), ['e1', 'e3']);
 });
 
+test('impact follows implemented_by from an RPC without crossing between implementations', () => {
+  const rpc = 'grpc://example.Service/Call';
+  const implementationA = 'implementation-a';
+  const implementationB = 'implementation-b';
+  const implementedByA = { ...edge('implemented-a', rpc, implementationA), kind: 'implemented_by' as const };
+  const implementedByB = { ...edge('implemented-b', rpc, implementationB), kind: 'implemented_by' as const };
+  const result = investigate(
+    {
+      ...snapshot,
+      nodes: [entity(rpc, 'repo-a'), entity(implementationA, 'repo-a'), entity(implementationB, 'repo-b')],
+      edges: [implementedByA, implementedByB]
+    },
+    'impact',
+    implementationA
+  );
+  assert.deepEqual([...result.nodeIds], [implementationA]);
+  assert.deepEqual(
+    [...investigate({ ...snapshot, edges: [implementedByA, implementedByB] }, 'impact', rpc).nodeIds],
+    [rpc, implementationA, implementationB]
+  );
+});
+
+test('trace keeps both endpoints when no path exists', () => {
+  const result = investigate(snapshot, 'trace', 'c', 'a');
+  assert.deepEqual([...result.nodeIds], ['c', 'a']);
+  assert.deepEqual([...result.edgeIds], []);
+});
+
 function entity(id: string, repository: string): EntityRef {
   return {
     id,

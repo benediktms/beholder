@@ -220,17 +220,22 @@ export function investigate(
   }
   if (mode === 'trace') return shortestPath(snapshot, root, target ?? '');
   const outgoing = mode === 'dependencies';
+  const adjacent = new Map<string, Array<{ edge: SemanticEdge; next: string }>>();
+  for (const edge of snapshot.edges) {
+    const implementedByImpact =
+      !outgoing && edge.kind === 'implemented_by' && edge.from.startsWith('grpc://');
+    const from = outgoing || implementedByImpact ? edge.from : edge.to;
+    const next = outgoing || implementedByImpact ? edge.to : edge.from;
+    const edges = adjacent.get(from) ?? [];
+    edges.push({ edge, next });
+    adjacent.set(from, edges);
+  }
   const nodeIds = new Set([root]);
   const edgeIds = new Set<string>();
   const queue = [root];
-  while (queue.length) {
-    const current = queue.shift()!;
-    for (const edge of snapshot.edges) {
-      const normal = outgoing ? edge.from === current : edge.to === current;
-      const implementedByImpact =
-        !outgoing && edge.kind === 'implemented_by' && edge.from === current && current.startsWith('grpc://');
-      if (!normal && !implementedByImpact) continue;
-      const next = normal ? (outgoing ? edge.to : edge.from) : edge.to;
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index];
+    for (const { edge, next } of adjacent.get(current) ?? []) {
       edgeIds.add(edge.id);
       if (!nodeIds.has(next)) {
         nodeIds.add(next);
@@ -242,19 +247,25 @@ export function investigate(
 }
 
 export function shortestPath(snapshot: GraphSnapshot, from: string, to: string) {
+  const outgoing = new Map<string, SemanticEdge[]>();
+  for (const edge of snapshot.edges) {
+    const edges = outgoing.get(edge.from) ?? [];
+    edges.push(edge);
+    outgoing.set(edge.from, edges);
+  }
   const parents = new Map<string, { node: string; edge: string }>();
   const seen = new Set([from]);
   const queue = [from];
-  while (queue.length && !seen.has(to)) {
-    const current = queue.shift()!;
-    for (const edge of snapshot.edges.filter((candidate) => candidate.from === current)) {
+  for (let index = 0; index < queue.length && !seen.has(to); index += 1) {
+    const current = queue[index];
+    for (const edge of outgoing.get(current) ?? []) {
       if (seen.has(edge.to)) continue;
       seen.add(edge.to);
       parents.set(edge.to, { node: current, edge: edge.id });
       queue.push(edge.to);
     }
   }
-  if (!seen.has(to)) return { nodeIds: new Set<string>(), edgeIds: new Set<string>() };
+  if (!seen.has(to)) return { nodeIds: new Set([from, to]), edgeIds: new Set<string>() };
   const nodeIds = new Set([to]);
   const edgeIds = new Set<string>();
   for (let cursor = to; cursor !== from;) {
