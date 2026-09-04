@@ -162,7 +162,7 @@ fn rune_name(name: &str) -> bool {
 }
 
 fn is_rune(call: &Call) -> bool {
-    rune_name(&call.name)
+    (call.receiver.is_none() && rune_name(&call.name))
         || call
             .receiver
             .as_deref()
@@ -217,6 +217,7 @@ mod tests {
               const count = $state(load());
               $: result = refresh(count);
               $effect(() => persist(count));
+              api.$state();
             </script>
         "#;
 
@@ -230,12 +231,16 @@ mod tests {
                     .iter()
                     .flat_map(|definition| &definition.calls),
             )
-            .map(|call| call.name.as_str())
             .collect::<Vec<_>>();
 
-        assert!(calls.contains(&"load"));
-        assert!(calls.contains(&"refresh"));
-        assert!(calls.contains(&"persist"));
-        assert!(!calls.iter().any(|name| name.starts_with('$')));
+        for name in ["load", "refresh", "persist"] {
+            assert!(calls.iter().any(|call| call.name == name));
+        }
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.receiver.as_deref() == Some("api") && call.name == "$state")
+        );
+        assert!(!calls.iter().any(|call| is_rune(call)));
     }
 }
