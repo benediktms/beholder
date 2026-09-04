@@ -1547,8 +1547,27 @@ pub fn analyze(
     language: SourceLanguage,
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
     let plugins = built_in_plugins()?;
-    let active = plugins.activate_direct(Path::new("input.ts"));
-    analyze_with_plugins(source, language, Path::new("input.ts"), &plugins, &active)
+    let path = if language == SourceLanguage::Svelte {
+        Path::new("input.svelte")
+    } else {
+        Path::new("input.ts")
+    };
+    let active = plugins.activate_direct(path);
+    analyze_with_plugins(source, language, path, &plugins, &active)
+}
+
+pub(super) fn analyze_core(
+    source: &str,
+    language: SourceLanguage,
+) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
+    let plugins = built_in_plugins()?;
+    analyze_with_plugins(
+        source,
+        language,
+        Path::new("input.ts"),
+        &plugins,
+        &Default::default(),
+    )
 }
 
 pub(super) fn analyze_with_plugins(

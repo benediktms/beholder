@@ -1,7 +1,7 @@
 use super::{SourceLanguage, analysis::source_stem, graphql::GraphqlResolverSource};
 use beholder_adapters_graphql::GraphqlFacts;
 use beholder_domain::{DependencyRelation, EntityFact, EntityKind, Observation};
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 use tree_sitter::{Node, Parser};
 
 struct Resolver {
@@ -183,24 +183,32 @@ fn collect_types(node: Node<'_>, source: &[u8], types: &mut Vec<(String, String)
 }
 
 pub(super) fn types(input: &GraphqlResolverSource<'_>) -> Vec<(String, String)> {
-    let Some(tree) = parser(input).and_then(|mut parser| parser.parse(input.source, None)) else {
+    let Some((mut parser, source)) = parser_and_source(input) else {
+        return Vec::new();
+    };
+    let Some(tree) = parser.parse(source.as_ref(), None) else {
         return Vec::new();
     };
     let mut types = Vec::new();
-    collect_types(tree.root_node(), input.source.as_bytes(), &mut types);
+    collect_types(tree.root_node(), source.as_bytes(), &mut types);
     types
 }
 
-fn parser(input: &GraphqlResolverSource<'_>) -> Option<Parser> {
+fn parser_and_source<'a>(input: &GraphqlResolverSource<'a>) -> Option<(Parser, Cow<'a, str>)> {
     let mut parser = Parser::new();
     let grammar = match input.analysis.language {
         SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
-        SourceLanguage::Svelte => tree_sitter_svelte_ng::LANGUAGE,
+        SourceLanguage::Svelte => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
     parser.set_language(&grammar.into()).ok()?;
-    Some(parser)
+    let source = if input.analysis.language == SourceLanguage::Svelte {
+        Cow::Owned(super::svelte::embedded_source(input.source)?)
+    } else {
+        Cow::Borrowed(input.source)
+    };
+    Some((parser, source))
 }
 
 pub(super) struct FactsInput<'a> {
@@ -218,16 +226,16 @@ pub(super) fn facts(input: FactsInput<'_>) -> GraphqlFacts {
     if !input.source.contains("@gql") {
         return GraphqlFacts::default();
     }
-    let Some(mut parser) = parser(input) else {
+    let Some((mut parser, source)) = parser_and_source(input) else {
         return GraphqlFacts::default();
     };
-    let Some(tree) = parser.parse(input.source, None) else {
+    let Some(tree) = parser.parse(source.as_ref(), None) else {
         return GraphqlFacts::default();
     };
     let mut resolvers = Vec::new();
     collect(
         tree.root_node(),
-        input.source.as_bytes(),
+        source.as_bytes(),
         &mut Vec::new(),
         types,
         &mut resolvers,
@@ -359,6 +367,40 @@ mod tests {
                 && observation.relation
                     == SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
                 && observation.to.as_str() == "repo://example/typescript/src/subscription/loyalty"
+        }));
+    }
+
+    #[test]
+    fn maps_resolvers_from_svelte_instance_scripts() {
+        let annotation = ["/", "** @gqlQueryField */"].concat();
+        let source = format!(
+            r#"
+            <script lang="ts">
+              {annotation}
+              export function greeting() { return "hello" }
+            </script>
+        "#
+        );
+        let analysis = analyze(&source, SourceLanguage::Svelte).unwrap();
+        let source = GraphqlResolverSource {
+            analysis: &analysis,
+            source: &source,
+            path: Path::new("src/greeting.svelte"),
+        };
+
+        let facts = crate::collect_graphql_resolvers(crate::GraphqlResolverInput {
+            repository: "example",
+            sources: std::slice::from_ref(&source),
+            manifests: &[(
+                Path::new("package.json"),
+                r#"{"devDependencies":{"grats":"0.0.34"}}"#,
+            )],
+        });
+
+        assert!(facts.observations.iter().any(|observation| {
+            observation.from.as_str() == "graphql-field://Query/greeting"
+                && observation.to.as_str()
+                    == "repo://example/typescript/src/greeting.svelte/greeting"
         }));
     }
 }

@@ -1,7 +1,7 @@
-use super::{SourceLanguage, analysis::source_stem, graphql::GraphqlResolverSource};
+use super::{SourceLanguage, analysis::source_stem, graphql::GraphqlResolverSource, svelte};
 use beholder_adapters_graphql::GraphqlFacts;
 use beholder_domain::{DependencyRelation, EntityFact, EntityKind, Observation};
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 use tree_sitter::{Node, Parser};
 
 struct Resolver {
@@ -15,7 +15,7 @@ fn parser(language: SourceLanguage) -> Option<Parser> {
     let mut parser = Parser::new();
     let grammar = match language {
         SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
-        SourceLanguage::Svelte => tree_sitter_svelte_ng::LANGUAGE,
+        SourceLanguage::Svelte => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
@@ -198,15 +198,23 @@ pub(super) fn facts(repository: &str, input: &GraphqlResolverSource<'_>) -> Grap
     if aliases.is_empty() {
         return GraphqlFacts::default();
     }
+    let source = if input.analysis.language == SourceLanguage::Svelte {
+        let Some(source) = svelte::embedded_source(input.source) else {
+            return GraphqlFacts::default();
+        };
+        Cow::Owned(source)
+    } else {
+        Cow::Borrowed(input.source)
+    };
     let Some(tree) =
-        parser(input.analysis.language).and_then(|mut parser| parser.parse(input.source, None))
+        parser(input.analysis.language).and_then(|mut parser| parser.parse(source.as_ref(), None))
     else {
         return GraphqlFacts::default();
     };
     let mut resolvers = Vec::new();
     collect(
         tree.root_node(),
-        input.source.as_bytes(),
+        source.as_bytes(),
         &aliases,
         &mut resolvers,
     );
