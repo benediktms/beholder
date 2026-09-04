@@ -918,10 +918,12 @@ macro_rules! ranked_entity_search {
             "\n\
              special[id] := candidate[id, _, _], starts_with(id, 'elixir-module://')\n\
              special[id] := candidate[id, _, _], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$')\n\
              special[id] := candidate[id, _, _], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$')\n\
              special[id] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$')\n\
              display[id, name] := candidate[id, _, _], starts_with(id, 'elixir-module://'), name = regex_replace(id, '^elixir-module://', '')\n\
              display[id, name] := candidate[id, _, _], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$', '$1.$2/$3')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://([^/]+)/([0-9]+)$', '$1/$2')\n\
              display[id, name] := candidate[id, _, _], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$'), name = regex_replace(id, '^(proto-method|grpc)://([^/]*[.])?([^./]+)/([^/]+)$', '$3.$4')\n\
              display[id, name] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$'), name = regex_replace(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$', '$2/$3')\n\
              display[id, name] := candidate[id, _, _], not special[id], regex_matches(id, '^.*[/:]([^/:]+)$'), name = regex_replace(id, '^.*[/:]([^/:]+)$', '$1')\n\

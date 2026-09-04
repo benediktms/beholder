@@ -1726,6 +1726,8 @@ mod tests {
             EntityFact::new("repo://z/rust/lib/RunLater", EntityKind::Callable, None).unwrap(),
             EntityFact::new("repo://a/rust/barbaz", EntityKind::Callable, None).unwrap(),
             EntityFact::new("repo://z/rust/foo/barbaz", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("elixir-call://a/hidden/0", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("elixir-call://hidden/0", EntityKind::Callable, None).unwrap(),
         ];
         repository.observations = vec![Observation::generated(
             "repo://example/rust/lib/call",
@@ -1761,6 +1763,10 @@ mod tests {
             .search_entities_snapshot("main", "oo/barbaz", 1)
             .unwrap();
         assert_eq!(full_query.result.matches[0].id, "repo://z/rust/foo/barbaz");
+        let local_call = store
+            .search_entities_snapshot("main", "hidden/0", 1)
+            .unwrap();
+        assert_eq!(local_call.result.matches[0].id, "elixir-call://hidden/0");
 
         let result = store
             .search_entities_snapshot("main", "ExampleService.Call", 20)
