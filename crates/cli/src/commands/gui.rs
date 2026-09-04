@@ -1,5 +1,9 @@
 use super::daemon;
-use std::{error::Error, path::PathBuf, process::Command};
+use std::{
+    error::Error,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 fn binary() -> Result<PathBuf, Box<dyn Error>> {
     let binary = std::env::current_exe()?.with_file_name(if cfg!(windows) {
@@ -18,18 +22,10 @@ fn binary() -> Result<PathBuf, Box<dyn Error>> {
 
 pub(super) async fn run() -> Result<(), Box<dyn Error>> {
     daemon::start().await?;
-    let binary = binary()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        Err(Command::new(binary).exec().into())
-    }
-    #[cfg(not(unix))]
-    {
-        let status = Command::new(binary).status()?;
-        status
-            .success()
-            .then_some(())
-            .ok_or_else(|| format!("graph UI exited with {status}").into())
-    }
+    Command::new(binary()?)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
 }
