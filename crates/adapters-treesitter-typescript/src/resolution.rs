@@ -2057,19 +2057,24 @@ pub fn unresolved_call_diagnostics(
         let Some(caller) = observation.from.as_str().strip_prefix("repo://") else {
             continue;
         };
-        let Some((repository, _)) = caller
-            .split_once("/typescript/")
-            .or_else(|| caller.split_once("/javascript/"))
-            .or_else(|| caller.split_once("/svelte/"))
-        else {
-            continue;
-        };
         let (path, line) = observation
             .evidence
             .as_str()
             .rsplit_once(':')
             .map(|(path, line)| (path, line.parse().ok()))
             .unwrap_or((observation.evidence.as_str(), None));
+        let module_path = source_stem(Path::new(path));
+        let Some(repository) =
+            ["typescript", "javascript", "svelte"]
+                .into_iter()
+                .find_map(|language| {
+                    caller
+                        .rsplit_once(&format!("/{language}/{module_path}"))
+                        .map(|(repository, _)| repository)
+                })
+        else {
+            continue;
+        };
         unresolved
             .entry((repository.into(), path.into()))
             .and_modify(|(count, _)| *count += 1)
@@ -3485,5 +3490,20 @@ mod tests {
         );
         assert_eq!(diagnostics[1].0, "example");
         assert_eq!(diagnostics[1].1.path, PathBuf::from("src/view.svelte"));
+    }
+
+    #[test]
+    fn unresolved_call_diagnostics_preserve_repository_language_segments() {
+        let observations = vec![Observation::dependency(
+            "repo://acme/svelte/svelte/src/view/run",
+            DependencyRelation::Calls,
+            "typescript-method://api/send",
+            "src/view.svelte:7",
+        )];
+
+        let diagnostics = unresolved_call_diagnostics(&observations);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].0, "acme/svelte");
     }
 }
