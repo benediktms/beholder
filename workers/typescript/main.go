@@ -146,15 +146,20 @@ func repositoryPath(root, path string) (string, error) {
 }
 
 func typescriptExecutable(root string) (string, error) {
-	executable := filepath.Join(root, "node_modules", ".bin", "tsc")
-	info, err := os.Stat(executable)
-	if err != nil {
-		return "", fmt.Errorf("repository TypeScript compiler %q: %w", executable, err)
+	for _, name := range []string{"tsgo", "tsc"} {
+		executable := filepath.Join(root, "node_modules", ".bin", name)
+		info, err := os.Stat(executable)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", fmt.Errorf("repository TypeScript compiler %q: %w", executable, err)
+		}
+		if info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return executable, nil
+		}
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("repository TypeScript compiler %q is not executable", executable)
-	}
-	return executable, nil
+	return "", fmt.Errorf("repository TypeScript compiler is unavailable under %q", filepath.Join(root, "node_modules", ".bin"))
 }
 
 func typescriptVersion(ctx context.Context, executable, root string) (string, error) {

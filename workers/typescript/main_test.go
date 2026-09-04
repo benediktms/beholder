@@ -57,6 +57,20 @@ func TestDefinitionUsesStandardLSP(t *testing.T) {
 	}
 }
 
+func TestTypeScriptExecutablePrefersNativePreview(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "node_modules/.bin/tsc", "", 0o755)
+	writeTestFile(t, root, "node_modules/.bin/tsgo", "", 0o755)
+
+	executable, err := typescriptExecutable(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executable != filepath.Join(root, "node_modules", ".bin", "tsgo") {
+		t.Fatalf("selected %q", executable)
+	}
+}
+
 func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 	root := t.TempDir()
 	caller := "const counter = new Counter(); counter.value();\n"
