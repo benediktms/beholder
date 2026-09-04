@@ -7,7 +7,8 @@ use super::{
         SnapshotQueryRunner, all_entity_facts, analysis_metadata, analysis_revision, context,
         dependencies, entity_facts, impact, inspect_grpc_bindings, inspect_observations,
         inspect_relations, inspect_revisions, published_repository_head, repository_revision,
-        trace, warn_on_slow_semantic_query, workspace_topology,
+        trace, warn_on_slow_semantic_query, workspace_graph_neighborhood,
+        workspace_graph_overview, workspace_topology,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -25,8 +26,9 @@ use beholder_domain::{
     SemanticCandidate, SemanticRelation, WorkspaceView,
 };
 use beholder_dto::{
-    ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
-    RepositoryRevision, Revisioned, TraceResult, WorkspaceTopology,
+    ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress,
+    GraphNeighborhoodFocus, ImpactResult, RepositoryRevision, Revisioned, TraceResult,
+    WorkspaceGraphNeighborhood, WorkspaceGraphOverview, WorkspaceTopology,
 };
 use mnestic_engine::{DataValue, DbInstance, NamedRows};
 use std::{
@@ -516,6 +518,49 @@ impl SemanticStore {
                 view,
                 inspection_result(workspace_topology(transaction, view)?),
                 inspection_result(all_entity_facts(transaction, view)?),
+            )
+        })
+    }
+
+    pub fn workspace_graph_overview_snapshot(
+        &self,
+        view: &str,
+    ) -> Result<Revisioned<WorkspaceGraphOverview>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            let (communities, edges) = workspace_graph_overview(transaction, view)?;
+            semantic::workspace_graph_overview(
+                view,
+                inspection_result(communities),
+                inspection_result(edges),
+            )
+        })
+    }
+
+    pub fn workspace_graph_neighborhood_snapshot(
+        &self,
+        view: &str,
+        focus: GraphNeighborhoodFocus,
+        max_edges: u32,
+    ) -> Result<Revisioned<WorkspaceGraphNeighborhood>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            let (focus_kind, focus_id) = match &focus {
+                GraphNeighborhoodFocus::Repository(repository) => ("repository", repository.as_str()),
+                GraphNeighborhoodFocus::Entity(entity) => ("entity", entity.as_str()),
+                GraphNeighborhoodFocus::External => ("external", ""),
+            };
+            let result = workspace_graph_neighborhood(transaction, view, focus_kind, focus_id)?;
+            let entities = result
+                .rows
+                .iter()
+                .flat_map(|row| [0, 1].into_iter().filter_map(|column| row[column].get_str()))
+                .map(str::to_owned)
+                .collect();
+            semantic::workspace_graph_neighborhood(
+                view,
+                focus.clone(),
+                max_edges,
+                inspection_result(result),
+                inspection_result(entity_facts(transaction, view, &entities)?),
             )
         })
     }

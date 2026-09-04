@@ -6,8 +6,13 @@ pub const DEPENDENCIES_SCHEMA_V2: &str = "beholder.dependencies.v2";
 pub const IMPACT_SCHEMA_V2: &str = "beholder.impact.v2";
 pub const TRACE_SCHEMA_V2: &str = "beholder.trace.v2";
 pub const WHY_SCHEMA_V2: &str = "beholder.why.v2";
+pub const WORKSPACE_GRAPH_NEIGHBORHOOD_SCHEMA_V1: &str =
+    "beholder.workspace_graph_neighborhood.v1";
+pub const WORKSPACE_GRAPH_OVERVIEW_SCHEMA_V1: &str = "beholder.workspace_graph_overview.v1";
 pub const WORKSPACE_TOPOLOGY_SCHEMA_V1: &str = "beholder.workspace_topology.v1";
 pub const DEFAULT_MAX_HOPS: u32 = 32;
+pub const DEFAULT_GRAPH_NEIGHBORHOOD_MAX_EDGES: u32 = 2_000;
+pub const MAX_GRAPH_NEIGHBORHOOD_EDGES: u32 = 10_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GarbageCollection {
@@ -368,6 +373,78 @@ pub struct WorkspaceTopology {
     pub edges: Vec<SemanticEdge>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphCommunityKind {
+    Repository,
+    External,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphCommunity {
+    pub id: String,
+    pub kind: GraphCommunityKind,
+    pub name: String,
+    pub repository: Option<String>,
+    pub entity_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphCommunityEdge {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub kind: RelationKind,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGraphOverview {
+    pub schema: String,
+    #[serde(flatten)]
+    pub metadata: QueryMetadata,
+    pub communities: Vec<GraphCommunity>,
+    pub edges: Vec<GraphCommunityEdge>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "id")]
+pub enum GraphNeighborhoodFocus {
+    Repository(String),
+    Entity(String),
+    External,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GraphNeighborhoodMetadata {
+    pub max_edges: u32,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct WorkspaceGraphNeighborhood {
+    pub schema: String,
+    #[serde(flatten)]
+    pub metadata: QueryMetadata,
+    pub focus: GraphNeighborhoodFocus,
+    pub neighborhood: GraphNeighborhoodMetadata,
+    pub nodes: Vec<EntityRef>,
+    pub edges: Vec<SemanticEdge>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct WorkspaceGraphNeighborhoodBatch {
+    pub schema: String,
+    #[serde(flatten)]
+    pub metadata: QueryMetadata,
+    pub focus: GraphNeighborhoodFocus,
+    pub neighborhood: GraphNeighborhoodMetadata,
+    pub nodes: Vec<EntityRef>,
+    pub edges: Vec<SemanticEdge>,
+    pub batch_index: u32,
+    pub complete: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SemanticPath {
     pub nodes: Vec<String>,
@@ -492,6 +569,8 @@ semantic_result!(
     ImpactResult,
     TraceResult,
     WhyResult,
+    WorkspaceGraphNeighborhood,
+    WorkspaceGraphOverview,
     WorkspaceTopology,
 );
 

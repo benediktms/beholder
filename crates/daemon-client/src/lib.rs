@@ -2,7 +2,8 @@ use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Works
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionEvent,
     GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus, ImpactResult,
-    QueryMetadata, RepositoryStatus, TraceResult, WhyResult, WorkspaceTopology,
+    GraphNeighborhoodFocus, QueryMetadata, RepositoryStatus, TraceResult, WhyResult,
+    WorkspaceGraphNeighborhoodBatch, WorkspaceGraphOverview, WorkspaceTopology,
 };
 use beholder_protocol::{
     ERROR_CODE_METADATA_KEY,
@@ -11,12 +12,15 @@ use beholder_protocol::{
         GarbageCollectEvent as ProtocolGarbageCollectEvent, GarbageCollectPhase,
         GarbageCollectProgress as ProtocolGarbageCollectProgress, GarbageCollectRequest,
         GetGarbageCollectionStatusRequest, GetJobRequest, GetJobResponse, GetRepositoryRequest,
-        GetStatusRequest, GetStatusResponse, GetWorkspaceTopologyRequest,
-        GetWorkspaceTopologyStatusRequest, ListJobsRequest, ListJobsResponse,
+        GetStatusRequest, GetStatusResponse, GetWorkspaceGraphOverviewRequest,
+        GetWorkspaceTopologyRequest, GetWorkspaceTopologyStatusRequest, ListJobsRequest,
+        ListJobsResponse,
         ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
-        RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest, SubmitEnrichmentRequest,
+        RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest,
+        StreamWorkspaceGraphNeighborhoodRequest, SubmitEnrichmentRequest,
         SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse, TraversalEntityRequest,
-        daemon_client::DaemonClient, garbage_collect_event, submit_index_request,
+        daemon_client::DaemonClient, garbage_collect_event,
+        stream_workspace_graph_neighborhood_request, submit_index_request,
     },
 };
 use std::{
@@ -277,6 +281,75 @@ pub async fn workspace_topology(workspace: String) -> Result<WorkspaceTopology, 
         .await?
         .into_inner()
         .try_into()?)
+}
+
+pub async fn workspace_graph_overview(
+    workspace: String,
+) -> Result<WorkspaceGraphOverview, ClientError> {
+    Ok(connect_send()
+        .await?
+        .get_workspace_graph_overview(request(GetWorkspaceGraphOverviewRequest { workspace }))
+        .await?
+        .into_inner()
+        .try_into()?)
+}
+
+pub struct WorkspaceGraphNeighborhoodStream {
+    inner: tonic::Streaming<beholder_protocol::v1::StreamWorkspaceGraphNeighborhoodResponse>,
+    next_batch_index: u32,
+    completed: bool,
+}
+
+impl WorkspaceGraphNeighborhoodStream {
+    pub async fn message(&mut self) -> Result<Option<WorkspaceGraphNeighborhoodBatch>, ClientError> {
+        let Some(batch) = self.inner.message().await? else {
+            return if self.completed {
+                Ok(None)
+            } else {
+                Err("graph neighborhood stream ended before completion".into())
+            };
+        };
+        if batch.batch_index != self.next_batch_index {
+            return Err(format!(
+                "graph neighborhood stream expected batch {}, received {}",
+                self.next_batch_index, batch.batch_index
+            )
+            .into());
+        }
+        self.next_batch_index += 1;
+        self.completed = batch.complete;
+        Ok(Some(
+            beholder_protocol::workspace_graph_neighborhood_batch_from_proto(batch)?,
+        ))
+    }
+}
+
+pub async fn workspace_graph_neighborhood(
+    workspace: String,
+    focus: GraphNeighborhoodFocus,
+    max_edges: Option<u32>,
+) -> Result<WorkspaceGraphNeighborhoodStream, ClientError> {
+    use stream_workspace_graph_neighborhood_request::Focus;
+
+    let focus = Some(match focus {
+        GraphNeighborhoodFocus::Repository(repository) => Focus::Repository(repository),
+        GraphNeighborhoodFocus::Entity(entity) => Focus::Entity(entity),
+        GraphNeighborhoodFocus::External => Focus::External(true),
+    });
+    let inner = connect_send()
+        .await?
+        .stream_workspace_graph_neighborhood(request(StreamWorkspaceGraphNeighborhoodRequest {
+            workspace,
+            focus,
+            max_edges,
+        }))
+        .await?
+        .into_inner();
+    Ok(WorkspaceGraphNeighborhoodStream {
+        inner,
+        next_batch_index: 0,
+        completed: false,
+    })
 }
 
 pub async fn workspace_topology_status(workspace: String) -> Result<QueryMetadata, ClientError> {

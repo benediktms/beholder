@@ -2,9 +2,12 @@ use crate::{InspectionResult, InspectionValue, query::ContextRow};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
     EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
-    GraphqlOperationKind, GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery,
-    ProtoTypeKind, QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath,
-    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata, WORKSPACE_TOPOLOGY_SCHEMA_V1,
+    GraphCommunity, GraphCommunityEdge, GraphCommunityKind, GraphNeighborhoodFocus,
+    GraphNeighborhoodMetadata, GraphqlOperationKind, GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef,
+    ImpactResult, PathQuery, ProtoTypeKind, QueryMetadata, RelationKind, RpcCardinality,
+    SemanticEdge, SemanticPath, TRACE_SCHEMA_V2, TraceResult, TraversalMetadata,
+    WORKSPACE_GRAPH_NEIGHBORHOOD_SCHEMA_V1, WORKSPACE_GRAPH_OVERVIEW_SCHEMA_V1,
+    WORKSPACE_TOPOLOGY_SCHEMA_V1, WorkspaceGraphNeighborhood, WorkspaceGraphOverview,
     WorkspaceTopology,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -17,6 +20,129 @@ type Closure = (Vec<(String, u32)>, GraphOutput, bool);
 enum TraversalDirection {
     Outgoing,
     Incoming,
+}
+
+const EXTERNAL_COMMUNITY_ID: &str = "community://external";
+
+pub(super) fn workspace_graph_overview(
+    view: &str,
+    communities: InspectionResult,
+    edges: InspectionResult,
+) -> Result<WorkspaceGraphOverview, Box<dyn Error>> {
+    let mut communities = communities
+        .rows
+        .iter()
+        .map(|row| {
+            let repository = text(row, 0, "graph community repository")?;
+            let entity_count = integer(row, 1, "graph community entity count")?
+                .try_into()
+                .map_err(|_| "graph community entity count must not be negative")?;
+            Ok(if repository.is_empty() {
+                GraphCommunity {
+                    id: EXTERNAL_COMMUNITY_ID.into(),
+                    kind: GraphCommunityKind::External,
+                    name: "External dependencies".into(),
+                    repository: None,
+                    entity_count,
+                }
+            } else {
+                GraphCommunity {
+                    id: repository_community_id(repository),
+                    kind: GraphCommunityKind::Repository,
+                    name: repository
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(repository)
+                        .to_owned(),
+                    repository: Some(repository.into()),
+                    entity_count,
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    communities.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut edges = edges
+        .rows
+        .iter()
+        .map(|row| {
+            let from = community_id(text(row, 0, "graph edge source community")?);
+            let to = community_id(text(row, 1, "graph edge target community")?);
+            let kind = RelationKind::try_from(text(row, 2, "graph edge relation")?)?;
+            let count = integer(row, 3, "graph edge count")?
+                .try_into()
+                .map_err(|_| "graph edge count must not be negative")?;
+            Ok((from, to, kind, count))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    edges.sort_by(|left, right| (&left.0, &left.1, left.2).cmp(&(&right.0, &right.1, right.2)));
+    let edges = edges
+        .into_iter()
+        .enumerate()
+        .map(|(index, (from, to, kind, count))| GraphCommunityEdge {
+            id: format!("c{}", index + 1),
+            from,
+            to,
+            kind,
+            count,
+        })
+        .collect();
+
+    Ok(WorkspaceGraphOverview {
+        schema: WORKSPACE_GRAPH_OVERVIEW_SCHEMA_V1.into(),
+        metadata: QueryMetadata::completed(view, 0),
+        communities,
+        edges,
+    })
+}
+
+pub(super) fn workspace_graph_neighborhood(
+    view: &str,
+    focus: GraphNeighborhoodFocus,
+    max_edges: u32,
+    result: InspectionResult,
+    entities: InspectionResult,
+) -> Result<WorkspaceGraphNeighborhood, Box<dyn Error>> {
+    let mut graph = GraphBuilder::default();
+    graph.hint_facts(entity_kinds(entities)?);
+    let truncated = result.rows.len() > max_edges as usize;
+    for row in result.rows.iter().take(max_edges as usize) {
+        graph.add_edge(
+            text(row, 0, "neighborhood source")?,
+            text(row, 1, "neighborhood target")?,
+            text(row, 2, "neighborhood relation")?,
+            "",
+            float(row, 3, "neighborhood confidence")? as f32,
+            "",
+        )?;
+    }
+    let mut output = graph.finish();
+    for edge in &mut output.edges {
+        edge.evidence.clear();
+    }
+    Ok(WorkspaceGraphNeighborhood {
+        schema: WORKSPACE_GRAPH_NEIGHBORHOOD_SCHEMA_V1.into(),
+        metadata: QueryMetadata::completed(view, 0),
+        focus,
+        neighborhood: GraphNeighborhoodMetadata {
+            max_edges,
+            truncated,
+        },
+        nodes: output.nodes,
+        edges: output.edges,
+    })
+}
+
+fn repository_community_id(repository: &str) -> String {
+    format!("community://repository/{repository}")
+}
+
+fn community_id(repository: &str) -> String {
+    if repository.is_empty() {
+        EXTERNAL_COMMUNITY_ID.into()
+    } else {
+        repository_community_id(repository)
+    }
 }
 
 pub(super) fn workspace_topology(
@@ -43,13 +169,6 @@ pub(super) fn workspace_topology(
         )?;
     }
     let output = graph.finish();
-    if output
-        .nodes
-        .iter()
-        .any(|node| node.kind == EntityKind::Unknown)
-    {
-        return Err("workspace topology contains an Unknown entity".into());
-    }
     Ok(WorkspaceTopology {
         schema: WORKSPACE_TOPOLOGY_SCHEMA_V1.into(),
         metadata: QueryMetadata::completed(view, 0),
@@ -647,7 +766,8 @@ fn entity_ref_with_origin(
         name: entity_name(id),
         repository: repository(id),
         origin: origin.unwrap_or_else(|| {
-            if id.starts_with("rust-call://")
+            if (kind == EntityKind::Unknown && repository(id).is_none())
+                || id.starts_with("rust-call://")
                 || id.starts_with("rust-method://")
                 || id.starts_with("elixir-call://")
                 || id.starts_with("elixir-module://")
@@ -859,6 +979,12 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
     }
 }
 
+fn integer(row: &[InspectionValue], index: usize, name: &str) -> Result<i64, Box<dyn Error>> {
+    row.get(index)
+        .and_then(InspectionValue::as_i64)
+        .ok_or_else(|| format!("{name} must be an integer").into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity, workspace_topology};
@@ -952,6 +1078,45 @@ mod tests {
             .find(|node| node.id == target)
             .unwrap();
         assert_eq!(target.kind, EntityKind::Callable);
+        assert_eq!(target.origin, EntityOrigin::ExternalDependency);
+    }
+
+    #[test]
+    fn topology_preserves_unclassified_external_endpoints() {
+        let source = "repo://example/elixir/Example/run/0";
+        let target = "vendor-symbol://runtime/opaque";
+        let topology = workspace_topology(
+            "main",
+            InspectionResult {
+                headers: Vec::new(),
+                rows: vec![vec![
+                    InspectionValue::String(source.into()),
+                    InspectionValue::String(target.into()),
+                    InspectionValue::String("uses".into()),
+                    InspectionValue::String("lib/example.ex:1".into()),
+                    InspectionValue::Float(1.0),
+                    InspectionValue::String("ast".into()),
+                ]],
+                next: None,
+            },
+            InspectionResult {
+                headers: Vec::new(),
+                rows: vec![vec![
+                    InspectionValue::String(source.into()),
+                    InspectionValue::String("callable".into()),
+                    InspectionValue::String(String::new()),
+                ]],
+                next: None,
+            },
+        )
+        .unwrap();
+
+        let target = topology
+            .nodes
+            .iter()
+            .find(|node| node.id == target)
+            .unwrap();
+        assert_eq!(target.kind, EntityKind::Unknown);
         assert_eq!(target.origin, EntityOrigin::ExternalDependency);
     }
 

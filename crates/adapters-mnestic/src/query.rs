@@ -947,6 +947,114 @@ pub(super) fn workspace_topology(
     ))
 }
 
+const WORKSPACE_GRAPH_RULES: &str = concat!(
+    include_str!("../../../rules/core/direct.datalog"),
+    "\n",
+    include_str!("../../../rules/core/workspace_graph.datalog")
+);
+
+fn workspace_graph_query(
+    db: &impl QueryRunner,
+    operation: &'static str,
+    view: &str,
+    query: &str,
+    mut params: BTreeMap<String, DataValue>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    params.insert("view".into(), view.into());
+    observed_bound_query(
+        db,
+        QuerySpec::new(operation, view, query),
+        None,
+        || params.clone(),
+    )
+}
+
+pub(super) fn workspace_graph_overview(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<(NamedRows, NamedRows), Box<dyn Error>> {
+    let rows = workspace_graph_query(
+        db,
+        "workspace_graph_overview",
+        view,
+        &format!(
+            "{WORKSPACE_GRAPH_RULES}\n\
+             community_count[repository, count_unique(id)] := \
+                 community_entity[id, repository]\n\
+             edge_count[from_community, to_community, relation, count_unique(edge)] := \
+                 community_edge[from_community, to_community, relation, edge]\n\
+             ?[row_kind, first, second, relation, count] := \
+                 community_count[first, count], row_kind = 'community', second = '', relation = ''\n\
+             ?[row_kind, first, second, relation, count] := \
+                 edge_count[first, second, relation, count], row_kind = 'edge'\n\
+             :order row_kind, first, second, relation"
+        ),
+        BTreeMap::new(),
+    )?;
+    let mut communities = Vec::new();
+    let mut edges = Vec::new();
+    for row in rows.rows {
+        match row.first().and_then(DataValue::get_str) {
+            Some("community") => communities.push(vec![row[1].clone(), row[4].clone()]),
+            Some("edge") => edges.push(vec![
+                row[1].clone(),
+                row[2].clone(),
+                row[3].clone(),
+                row[4].clone(),
+            ]),
+            Some(kind) => return Err(format!("unknown workspace graph row kind: {kind}").into()),
+            None => return Err("workspace graph row kind must be text".into()),
+        }
+    }
+    Ok((
+        NamedRows::new(vec!["repository".into(), "count".into()], communities),
+        NamedRows::new(
+            vec![
+                "from_community".into(),
+                "to_community".into(),
+                "relation".into(),
+                "count".into(),
+            ],
+            edges,
+        ),
+    ))
+}
+
+pub(super) fn workspace_graph_neighborhood(
+    db: &impl QueryRunner,
+    view: &str,
+    focus_kind: &str,
+    focus: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
+    workspace_graph_query(
+        db,
+        "workspace_graph_neighborhood",
+        view,
+        &format!(
+            "{WORKSPACE_GRAPH_RULES}\n\
+             focus_entity[id] := $focus_kind == 'entity', id = $focus\n\
+             focus_entity[id] := $focus_kind == 'repository', \
+                 repository_entity[id, $focus]\n\
+             focus_entity[id] := $focus_kind == 'external', \
+                 observed_entity[id], not owned_entity[id]\n\
+             neighborhood[from, to, relation, confidence] := \
+                 effective_observation[from, to, relation, evidence, confidence, provenance], \
+                 focus_entity[from]\n\
+             neighborhood[from, to, relation, confidence] := \
+                 effective_observation[from, to, relation, evidence, confidence, provenance], \
+                 focus_entity[to]\n\
+             ?[from, to, relation, max(confidence)] := \
+                 neighborhood[from, to, relation, confidence]\n\
+             :order from, to, relation\n\
+             :limit 10001"
+        ),
+        BTreeMap::from([
+            ("focus_kind".into(), focus_kind.into()),
+            ("focus".into(), focus.into()),
+        ]),
+    )
+}
+
 pub(super) fn inspect_observations(
     db: &DbInstance,
     relation: Option<&str>,

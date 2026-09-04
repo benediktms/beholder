@@ -4807,6 +4807,99 @@ mod tests {
     }
 
     #[test]
+    fn graph_overview_aggregates_repositories_without_materializing_topology() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![
+                RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "app-a".into(),
+                    },
+                    head: None,
+                    fingerprint: "state-a".into(),
+                },
+                RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "app-b".into(),
+                    },
+                    head: None,
+                    fingerprint: "state-b".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let source = "repo://app-a/elixir/Producer.publish/1";
+        let second_source = "repo://app-a/elixir/Producer.call/0";
+        let target = "repo://app-b/elixir/Consumer.handle/1";
+        let external = "elixir-call://External.Client/request/1";
+        let facts_a = RepositoryFacts {
+            state: view.repository_states[0].clone(),
+            analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
+            entities: vec![
+                EntityFact::new(source, EntityKind::Callable, None).unwrap(),
+                EntityFact::new(second_source, EntityKind::Callable, None).unwrap(),
+            ],
+            grpc_bindings: Vec::new(),
+            observations: vec![
+                Observation::dependency(
+                    source,
+                    DependencyRelation::Calls,
+                    target,
+                    "lib/producer.ex:3",
+                ),
+                Observation::dependency(
+                    second_source,
+                    DependencyRelation::Calls,
+                    external,
+                    "lib/producer.ex:4",
+                ),
+            ],
+        };
+        let facts_b = RepositoryFacts {
+            state: view.repository_states[1].clone(),
+            analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
+            entities: vec![EntityFact::new(target, EntityKind::Callable, None).unwrap()],
+            grpc_bindings: Vec::new(),
+            observations: Vec::new(),
+        };
+        store
+            .publish_verified_sharded(&view, &[facts_a, facts_b], &[], &[], &[], "verified")
+            .unwrap();
+
+        let overview = store.workspace_graph_overview_snapshot("main").unwrap().result;
+        assert_eq!(overview.communities.len(), 3);
+        assert_eq!(overview.edges.len(), 2);
+        assert!(overview.communities.iter().any(|community| {
+            community.repository.as_deref() == Some("app-a") && community.entity_count == 2
+        }));
+        assert!(overview.communities.iter().any(|community| {
+            community.repository.as_deref() == Some("app-b") && community.entity_count == 1
+        }));
+        assert!(overview.communities.iter().any(|community| {
+            community.kind == beholder_dto::GraphCommunityKind::External
+                && community.entity_count == 1
+        }));
+
+        let neighborhood = store
+            .workspace_graph_neighborhood_snapshot(
+                "main",
+                beholder_dto::GraphNeighborhoodFocus::Repository("app-a".into()),
+                1,
+            )
+            .unwrap()
+            .result;
+        assert_eq!(neighborhood.edges.len(), 1);
+        assert!(neighborhood.neighborhood.truncated);
+        assert!(neighborhood.edges[0].evidence.is_empty());
+    }
+
+    #[test]
     fn stores_entities_across_batch_boundaries() {
         let store = SemanticStore::memory().unwrap();
         let transaction = store.db.multi_transaction(true);

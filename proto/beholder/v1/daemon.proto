@@ -11,6 +11,7 @@ service Daemon {
   rpc Dependencies(TraversalEntityRequest) returns (DependenciesResponse);
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetRepository(GetRepositoryRequest) returns (RepositoryResponse);
+  rpc GetWorkspaceGraphOverview(GetWorkspaceGraphOverviewRequest) returns (GetWorkspaceGraphOverviewResponse);
   rpc GetWorkspaceTopology(GetWorkspaceTopologyRequest) returns (GetWorkspaceTopologyResponse);
   rpc GetWorkspaceTopologyStatus(GetWorkspaceTopologyStatusRequest) returns (GetWorkspaceTopologyStatusResponse);
   rpc Impact(TraversalEntityRequest) returns (ImpactResponse);
@@ -23,6 +24,7 @@ service Daemon {
   rpc SetWorkspacePlugin(SetWorkspacePluginRequest) returns (SetWorkspacePluginResponse);
   rpc RegisterRepository(RegisterRepositoryRequest) returns (RepositoryResponse);
   rpc Stop(StopRequest) returns (StopResponse);
+  rpc StreamWorkspaceGraphNeighborhood(StreamWorkspaceGraphNeighborhoodRequest) returns (stream StreamWorkspaceGraphNeighborhoodResponse);
   rpc Trace(PathRequest) returns (TraceResponse);
   rpc Why(PathRequest) returns (WhyResponse);
 }
@@ -121,6 +123,69 @@ message GetWorkspaceTopologyStatusRequest {
 
 message GetWorkspaceTopologyStatusResponse {
   QueryMetadata metadata = 1;
+}
+
+message GetWorkspaceGraphOverviewRequest {
+  string workspace = 1;
+}
+
+message GetWorkspaceGraphOverviewResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  repeated GraphCommunity communities = 3;
+  repeated GraphCommunityEdge edges = 4;
+}
+
+enum GraphCommunityKind {
+  GRAPH_COMMUNITY_KIND_UNSPECIFIED = 0;
+  GRAPH_COMMUNITY_KIND_REPOSITORY = 1;
+  GRAPH_COMMUNITY_KIND_EXTERNAL = 2;
+}
+
+message GraphCommunity {
+  string id = 1;
+  GraphCommunityKind kind = 2;
+  string name = 3;
+  optional string repository = 4;
+  uint64 entity_count = 5;
+}
+
+message GraphCommunityEdge {
+  string id = 1;
+  string from = 2;
+  string to = 3;
+  RelationKind kind = 4;
+  uint64 count = 5;
+}
+
+message StreamWorkspaceGraphNeighborhoodRequest {
+  string workspace = 1;
+  oneof focus {
+    string repository = 2;
+    string entity = 3;
+    bool external = 5;
+  }
+  optional uint32 max_edges = 4;
+}
+
+message GraphNeighborhoodFocus {
+  oneof focus {
+    string repository = 1;
+    string entity = 2;
+    bool external = 3;
+  }
+}
+
+message StreamWorkspaceGraphNeighborhoodResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  GraphNeighborhoodFocus focus = 3;
+  uint32 max_edges = 4;
+  bool truncated = 5;
+  repeated Entity nodes = 6;
+  repeated Edge edges = 7;
+  uint32 batch_index = 8;
+  bool complete = 9;
 }
 
 message Freshness {

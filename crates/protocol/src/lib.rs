@@ -20,6 +20,10 @@ mod query;
 mod worker;
 mod workspace;
 
+pub use query::{
+    workspace_graph_neighborhood_batch_from_proto, workspace_graph_neighborhood_from_batches,
+};
+
 pub use worker::{
     ContributionAccumulator, WorkspaceSnapshotBuilder, analyze_events, analyze_requests,
     contribution_from_events, descriptor_from_wire, descriptor_to_wire, workspace_snapshot,
