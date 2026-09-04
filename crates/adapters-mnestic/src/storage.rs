@@ -3065,8 +3065,23 @@ pub(super) fn publish_enrichment(
          entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_context{view: $view, revision, target: $repository, analyzer: $analyzer, context}, *analysis_revision_state{view: $view, revision, repository: context, state}, *state_entity{state, id, kind, metadata}\n\
          entity[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, repository: $repository, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
          entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_context{view: $view, revision, target: $repository, analyzer: $analyzer, context}, *analysis_fact_shard_selection{view: $view, repository: context, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
+         incoming[owner] <- $owners\n\
+         entity[id, kind, metadata] := *analysis_enrichment_entity_selection{view: $view, id, owner}, not incoming[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
          ?[id, kind, metadata] := entity[id, kind, metadata]",
-        BTreeMap::from([("view".into(), view.into()), ("repository".into(), repository.into()), ("analyzer".into(), analyzer.into())]),
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("repository".into(), repository.into()),
+            ("analyzer".into(), analyzer.into()),
+            (
+                "owners".into(),
+                DataValue::List(
+                    incoming_owners
+                        .iter()
+                        .map(|owner| DataValue::List(vec![owner.as_str().into()]))
+                        .collect(),
+                ),
+            ),
+        ]),
     )?.rows.into_iter().map(|row| -> Result<EntityFact, Box<dyn Error>> {
         let id = stored_string(&row, 0, "entity ID")?.to_owned();
         Ok(EntityFact::new(id, parse_entity_kind(stored_string(&row, 1, "entity kind")?)?, parse_entity_metadata(stored_string(&row, 2, "entity metadata")?)?)?)
@@ -6618,6 +6633,73 @@ mod tests {
                 beholder_dto::EvidenceKind::Ast,
                 beholder_dto::EvidenceKind::Compiler,
             ])
+        );
+    }
+
+    #[test]
+    fn enrichment_rejects_entities_conflicting_with_other_selected_outputs() {
+        let store = SemanticStore::memory().unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "enrichment-entity-conflict",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: "source".into(),
+                }],
+            )
+            .unwrap(),
+            &["compiler-a", "compiler-b"],
+        );
+        store
+            .publish(&view, &[facts(&view, Vec::new())], &[])
+            .unwrap();
+        let entity = EntityFact::new(
+            "repo://example/repo/generated/shared",
+            EntityKind::Callable,
+            None,
+        )
+        .unwrap();
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler-a");
+        store
+            .publish_enrichment(
+                &view.name,
+                "example/repo",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "compiler-a",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    entities: std::slice::from_ref(&entity),
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let conflicting = EntityFact::new(entity.id.clone(), EntityKind::Namespace, None).unwrap();
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler-b");
+        assert!(
+            store
+                .publish_enrichment(
+                    &view.name,
+                    "example/repo",
+                    &input,
+                    EnrichmentOwner {
+                        analyzer: "compiler-b",
+                        version: "1",
+                    },
+                    EnrichmentPayload {
+                        entities: std::slice::from_ref(&conflicting),
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .is_err()
         );
     }
 
