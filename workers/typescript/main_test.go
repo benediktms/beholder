@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,8 @@ func TestDefinitionUsesStandardLSP(t *testing.T) {
 	}
 	t.Setenv("BEHOLDER_TYPESCRIPT_LSP_HELPER", "1")
 	t.Setenv("BEHOLDER_TYPESCRIPT_EXPECT_MEMORY_LIMIT", "4GiB")
+	t.Setenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST", "65")
+	t.Setenv("BEHOLDER_TYPESCRIPT_SERVER_REQUEST", "1")
 	t.Setenv("GOMEMLIMIT", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -51,6 +54,42 @@ func TestDefinitionUsesStandardLSP(t *testing.T) {
 	definition := definitions[0]
 	if definition.URI != "file:///repo/src/target.ts" || definition.Range.Start.Line != 2 {
 		t.Fatalf("unexpected definition: %+v", definition)
+	}
+}
+
+func TestTypeScriptExecutablePrefersNativePreview(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "node_modules/.bin/tsc", "", 0o755)
+	writeTestFile(t, root, "node_modules/.bin/tsgo", "", 0o755)
+	writeTestFile(t, root, "node_modules/typescript-native/bin/tsc", "", 0o755)
+
+	executable, err := typescriptExecutable(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executable != filepath.Join(root, "node_modules", "typescript-native", "bin", "tsc") {
+		t.Fatalf("selected %q", executable)
+	}
+}
+
+func TestTypeScriptExecutableFallsBackFromBrokenPreferredAlias(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, "node_modules", "typescript-native", "bin", "tsc")
+	if err := os.MkdirAll(filepath.Dir(native), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("tsc", native); err != nil {
+		t.Fatal(err)
+	}
+	fallback := filepath.Join(root, "node_modules", ".bin", "tsc")
+	writeTestFile(t, root, "node_modules/.bin/tsc", "", 0o755)
+
+	executable, err := typescriptExecutable(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executable != fallback {
+		t.Fatalf("selected %q", executable)
 	}
 }
 
@@ -227,6 +266,22 @@ func runLSPHelper() {
 		}
 		switch message.Method {
 		case "initialize":
+			count, _ := strconv.Atoi(os.Getenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST"))
+			for range count {
+				writeHelperMessage(map[string]any{
+					"jsonrpc": "2.0", "method": "window/logMessage", "params": map[string]string{"message": "loading"},
+				})
+			}
+			if os.Getenv("BEHOLDER_TYPESCRIPT_SERVER_REQUEST") == "1" {
+				writeHelperMessage(map[string]any{
+					"jsonrpc": "2.0", "id": 99, "method": "workspace/configuration", "params": map[string]any{"items": []map[string]any{{}, {}}},
+				})
+				response, err := readHelperMessage(reader)
+				var values []any
+				if err != nil || string(response.ID) != "99" || json.Unmarshal(response.Result, &values) != nil || len(values) != 2 {
+					return
+				}
+			}
 			writeHelperMessage(map[string]any{
 				"jsonrpc": "2.0", "id": message.ID,
 				"result": map[string]any{"capabilities": map[string]any{}, "serverInfo": map[string]string{"name": "typescript-go", "version": "7.0.2"}},

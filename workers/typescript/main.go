@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -56,11 +57,12 @@ type client struct {
 	replies chan reply
 	nextID  int
 	opened  map[string]bool
+	writeMu sync.Mutex
 }
 
 func main() {
 	socket := flag.String("socket", "", "worker gRPC Unix socket")
-	cacheDir := flag.String("cache-dir", "", "worker cache directory")
+	flag.String("cache-dir", "", "worker cache directory")
 	root := flag.String("root", ".", "TypeScript repository root")
 	file := flag.String("file", "", "repository-relative TypeScript source path")
 	line := flag.Int("line", 0, "one-based source line")
@@ -69,7 +71,13 @@ func main() {
 	flag.Parse()
 
 	if *socket != "" {
-		if err := serve(*socket, *cacheDir); err != nil {
+		telemetry, err := configureTelemetry(context.Background())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "initialize OpenTelemetry export: %v\n", err)
+		} else {
+			defer telemetry.shutdown(context.Background())
+		}
+		if err := serve(*socket, telemetry.flush); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -144,15 +152,27 @@ func repositoryPath(root, path string) (string, error) {
 }
 
 func typescriptExecutable(root string) (string, error) {
-	executable := filepath.Join(root, "node_modules", ".bin", "tsc")
-	info, err := os.Stat(executable)
-	if err != nil {
-		return "", fmt.Errorf("repository TypeScript compiler %q: %w", executable, err)
+	var unavailable error
+	for _, executable := range []string{
+		filepath.Join(root, "node_modules", "typescript-native", "bin", "tsc"),
+		filepath.Join(root, "node_modules", ".bin", "tsgo"),
+		filepath.Join(root, "node_modules", ".bin", "tsc"),
+	} {
+		info, err := os.Stat(executable)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) && unavailable == nil {
+				unavailable = fmt.Errorf("repository TypeScript compiler %q: %w", executable, err)
+			}
+			continue
+		}
+		if info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return executable, nil
+		}
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("repository TypeScript compiler %q is not executable", executable)
+	if unavailable != nil {
+		return "", unavailable
 	}
-	return executable, nil
+	return "", fmt.Errorf("repository TypeScript compiler is unavailable under %q", filepath.Join(root, "node_modules", ".bin"))
 }
 
 func typescriptVersion(ctx context.Context, executable, root string) (string, error) {
@@ -193,7 +213,7 @@ func startClient(ctx context.Context, executable, root string, arguments ...stri
 		stdin:   stdin,
 		stdout:  bufio.NewReader(stdout),
 		stderr:  stderr,
-		replies: make(chan reply, 64),
+		replies: make(chan reply, 1),
 		opened:  make(map[string]bool),
 	}
 	go c.readLoop()
@@ -314,6 +334,8 @@ func (c *client) notify(method string, params any) error {
 }
 
 func (c *client) write(message any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	payload, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -358,10 +380,42 @@ func (c *client) read() (rpcMessage, error) {
 func (c *client) readLoop() {
 	for {
 		message, err := c.read()
-		c.replies <- reply{message: message, err: err}
 		if err != nil {
+			c.replies <- reply{err: err}
 			return
 		}
+		if message.Method != "" {
+			if len(message.ID) != 0 {
+				response := map[string]any{"jsonrpc": "2.0", "id": message.ID}
+				result, requestError := serverRequestResponse(message)
+				if requestError != nil {
+					response["error"] = requestError
+				} else {
+					response["result"] = result
+				}
+				if err := c.write(response); err != nil {
+					c.replies <- reply{err: err}
+					return
+				}
+			}
+			continue
+		}
+		c.replies <- reply{message: message}
+	}
+}
+
+func serverRequestResponse(message rpcMessage) (any, *rpcError) {
+	switch message.Method {
+	case "workspace/configuration":
+		var params struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return nil, &rpcError{Code: -32602, Message: "invalid workspace/configuration parameters"}
+		}
+		return make([]any, len(params.Items)), nil
+	default:
+		return nil, &rpcError{Code: -32601, Message: "method not found"}
 	}
 }
 

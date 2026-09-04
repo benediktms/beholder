@@ -67,6 +67,7 @@ pub(super) fn is_ignored_directory(name: &str) -> bool {
     matches!(
         name,
         ".git"
+            | ".github"
             | ".moon"
             | ".next"
             | ".next-server"
@@ -627,6 +628,7 @@ mod tests {
             .as_nanos();
         let repository = std::env::temp_dir().join(format!("beholder-typescript-sources-{unique}"));
         for directory in [
+            ".github/scripts",
             "src",
             "node_modules/package",
             "dist",
@@ -665,6 +667,7 @@ mod tests {
         )
         .unwrap();
         for path in [
+            ".github/scripts/coverage-report.js",
             "node_modules/package/index.ts",
             "dist/index.js",
             ".next/index.js",

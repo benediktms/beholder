@@ -347,6 +347,9 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .accept_extension("tsx")
         .accept_extension("js")
         .accept_extension("jsx")
+        .activate_when_path_exists("node_modules/typescript-native/bin/tsc")
+        .activate_when_path_exists("node_modules/.bin/tsgo")
+        .activate_when_path_exists("node_modules/.bin/tsc")
         .accept_extension_as("json", AnalysisInputKind::Configuration)
         .accept_file_name_as("package.json", AnalysisInputKind::Dependency)
         .accept_file_name_as("package-lock.json", AnalysisInputKind::Dependency)
@@ -360,6 +363,26 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .repository_file_identity(
             "$toolchain/typescript",
             "node_modules/typescript/package.json",
+            AnalysisInputKind::Toolchain,
+        )
+        .repository_file_identity(
+            "$toolchain/typescript-native",
+            "node_modules/typescript-native/package.json",
+            AnalysisInputKind::Toolchain,
+        )
+        .repository_file_identity(
+            "$toolchain/typescript-native-executable",
+            "node_modules/typescript-native/bin/tsc",
+            AnalysisInputKind::Toolchain,
+        )
+        .repository_file_identity(
+            "$toolchain/typescript-tsgo-executable",
+            "node_modules/.bin/tsgo",
+            AnalysisInputKind::Toolchain,
+        )
+        .repository_file_identity(
+            "$toolchain/typescript-tsc-executable",
+            "node_modules/.bin/tsc",
             AnalysisInputKind::Toolchain,
         )
         .build()

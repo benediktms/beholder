@@ -16,10 +16,12 @@ use beholder_protocol::{
     ContributionAccumulator, analyze_requests,
     worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -89,6 +91,7 @@ pub struct WorkerAnalyzerBuilder {
     path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
+    activation_paths: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     repository_identity_files: Vec<RepositoryIdentityFile>,
     semantic_entities: BTreeSet<EntityKind>,
@@ -120,6 +123,7 @@ impl WorkerAnalyzerBuilder {
             path_suffixes: BTreeMap::new(),
             parent_suffixes: BTreeMap::new(),
             excluded_path_suffixes: Vec::new(),
+            activation_paths: Vec::new(),
             identity_inputs: Vec::new(),
             repository_identity_files: Vec::new(),
             semantic_entities: BTreeSet::new(),
@@ -199,6 +203,11 @@ impl WorkerAnalyzerBuilder {
         self
     }
 
+    pub fn activate_when_path_exists(mut self, path: impl Into<PathBuf>) -> Self {
+        self.activation_paths.push(path.into());
+        self
+    }
+
     pub fn accept_parent_suffix_as(
         mut self,
         suffix: impl Into<PathBuf>,
@@ -271,6 +280,7 @@ impl WorkerAnalyzerBuilder {
             path_suffixes: self.path_suffixes,
             parent_suffixes: self.parent_suffixes,
             excluded_path_suffixes: self.excluded_path_suffixes,
+            activation_paths: self.activation_paths,
             identity_inputs: self.identity_inputs,
             repository_identity_files: self.repository_identity_files,
             semantic_entities: self.semantic_entities,
@@ -294,6 +304,7 @@ pub struct WorkerAnalyzer {
     path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
+    activation_paths: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     repository_identity_files: Vec<RepositoryIdentityFile>,
     semantic_entities: BTreeSet<EntityKind>,
@@ -333,6 +344,7 @@ pub fn plugin_analyzer(
         path_suffixes: BTreeMap::new(),
         parent_suffixes: BTreeMap::new(),
         excluded_path_suffixes: Vec::new(),
+        activation_paths: Vec::new(),
         identity_inputs: Vec::new(),
         repository_identity_files: Vec::new(),
         semantic_entities: BTreeSet::new(),
@@ -400,8 +412,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         self.repository_identity_files
             .iter()
             .map(|identity| {
-                let content = fs::read(repository.base.join(&identity.file))
-                    .ok()
+                let content = repository_file_digest(&repository.base.join(&identity.file))
                     .unwrap_or_else(|| b"unavailable".to_vec());
                 AnalysisInput {
                     path: identity.path.clone(),
@@ -419,6 +430,14 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     .input_kind(PluginInputScope::Target, &input.path)
                     .is_some()
             });
+        }
+        if !self.activation_paths.is_empty()
+            && !self
+                .activation_paths
+                .iter()
+                .any(|path| repository.base.join(path).is_file())
+        {
+            return false;
         }
         repository
             .inputs
@@ -698,6 +717,19 @@ impl WorkspaceEnricher for WorkerAnalyzer {
     }
 }
 
+fn repository_file_digest(path: &Path) -> Option<Vec<u8>> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            return Some(digest.finalize().to_vec());
+        }
+        digest.update(&buffer[..read]);
+    }
+}
+
 fn resolve_candidate_overrides(
     baseline: &beholder_indexing::SemanticSnapshot,
     contribution: &mut beholder_indexing::AnalyzerContribution,
@@ -842,13 +874,14 @@ impl WorkerAnalyzer {
         let client = loop {
             #[cfg(unix)]
             let connection = tokio::select! {
-                connection = AnalyzerWorkerClient::connect(endpoint.clone()) => connection,
+                biased;
                 event = memory_guard_event(memory_guard.as_mut()) => {
                     let process_group = memory_guard
                         .as_ref()
                         .map(ProcessMemoryGuard::process_group);
                     return Err(terminate_for_memory_event(&mut child, process_group, event).await);
                 }
+                connection = AnalyzerWorkerClient::connect(endpoint.clone()) => connection,
             };
             #[cfg(not(unix))]
             let connection = AnalyzerWorkerClient::connect(endpoint.clone()).await;
@@ -1056,6 +1089,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_requires_a_configured_activation_path() {
+        let root = env::temp_dir().join(format!(
+            "beholder-worker-activation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("typescript", "1")
+            .accept_extension("js")
+            .activate_when_path_exists("node_modules/typescript-native/bin/tsc")
+            .activate_when_path_exists("node_modules/.bin/tsgo")
+            .activate_when_path_exists("node_modules/.bin/tsc")
+            .build()
+            .unwrap();
+        let repository = RepositorySnapshot {
+            base: root.clone(),
+            state: RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example".into(),
+                },
+                head: None,
+                fingerprint: "fingerprint".into(),
+            },
+            inputs: vec![RepositoryInput {
+                path: "script.js".into(),
+                content: Arc::from(Vec::<u8>::new()),
+                kind: InputKind::Source,
+            }],
+        };
+
+        assert!(!worker.is_active(&repository));
+        let compiler = root.join("node_modules/typescript-native/bin/tsc");
+        fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        fs::write(compiler, []).unwrap();
+        assert!(worker.is_active(&repository));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn over_limit_worker_cannot_start_an_analysis_session() {
@@ -1199,7 +1275,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn repository_compiler_package_participates_in_currentness() {
+    fn repository_compiler_identity_participates_in_currentness() {
         let root = std::env::temp_dir().join(format!(
             "beholder-worker-identity-{}-{}",
             std::process::id(),
@@ -1208,15 +1284,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let compiler = root.join("node_modules/typescript/package.json");
+        let compiler = root.join("node_modules/typescript-native/bin/tsc");
         fs::create_dir_all(compiler.parent().unwrap()).unwrap();
-        fs::write(&compiler, r#"{"version":"7.0.2"}"#).unwrap();
+        fs::write(&compiler, "compiler 7.0.2").unwrap();
         let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
             .identity("typescript", "1")
             .accept_extension("ts")
             .repository_file_identity(
-                "$toolchain/typescript",
-                "node_modules/typescript/package.json",
+                "$toolchain/typescript-native-executable",
+                "node_modules/typescript-native/bin/tsc",
                 AnalysisInputKind::Toolchain,
             )
             .build()
@@ -1235,8 +1311,8 @@ mod tests {
 
         let identity = worker.repository_identity_inputs(&repository);
 
-        assert_eq!(identity[0].content.as_ref(), br#"{"version":"7.0.2"}"#);
-        fs::write(&compiler, r#"{"version":"7.0.3"}"#).unwrap();
+        assert_eq!(identity[0].content.len(), 32);
+        fs::write(&compiler, "compiler 7.0.3").unwrap();
         assert_ne!(identity, worker.repository_identity_inputs(&repository));
         fs::remove_dir_all(root).unwrap();
     }
