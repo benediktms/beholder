@@ -1847,23 +1847,61 @@ pub fn entities_from_analysis(
         analysis.language.id_segment(),
         source_stem(path)
     );
-    let mut entities =
-        std::iter::once(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap())
-            .chain(analysis.definitions.iter().map(|definition| {
-                EntityFact::new(
-                    format!("{module_id}/{}", definition.qualified_name),
-                    match definition.kind {
-                        DefinitionKind::Namespace => EntityKind::Namespace,
-                        DefinitionKind::Callable => EntityKind::Callable,
-                    },
-                    None,
-                )
-                .unwrap()
-            }))
-            .collect::<Vec<_>>();
-    entities.sort_by(|left, right| left.id.cmp(&right.id));
-    entities.dedup();
+    let source_id = format!(
+        "repo://{}/{}-source/{}",
+        repository,
+        analysis.language.id_segment(),
+        path.display()
+    );
+    let mut entities = BTreeMap::from([
+        (source_id, EntityKind::Namespace),
+        (module_id.clone(), EntityKind::Namespace),
+    ]);
+    for definition in &analysis.definitions {
+        let id = format!("{module_id}/{}", definition.qualified_name);
+        let kind = match definition.kind {
+            DefinitionKind::Namespace => EntityKind::Namespace,
+            DefinitionKind::Callable => EntityKind::Callable,
+        };
+        entities
+            .entry(id)
+            .and_modify(|selected| {
+                if kind == EntityKind::Callable {
+                    *selected = kind;
+                }
+            })
+            .or_insert(kind);
+    }
     entities
+        .into_iter()
+        .map(|(id, kind)| EntityFact::new(id, kind, None).unwrap())
+        .collect()
+}
+
+pub fn unresolved_endpoint_entities(observations: &[Observation]) -> Vec<EntityFact> {
+    observations
+        .iter()
+        .flat_map(|observation| [&observation.from, &observation.to])
+        .filter(|id| {
+            let id = id.as_str();
+            [
+                "typescript-call://",
+                "typescript-method://",
+                "typescript-constructor://",
+                "javascript-call://",
+                "javascript-method://",
+                "javascript-constructor://",
+                "typescript-returned://",
+                "javascript-returned://",
+            ]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+        })
+        .map(|id| id.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
+        .collect()
 }
 
 #[cfg(test)]

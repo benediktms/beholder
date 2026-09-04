@@ -14,7 +14,7 @@ mod compiler;
 
 pub use compiler::SourceCompiler;
 
-pub const FRONTEND_VERSION: &str = "3";
+pub const FRONTEND_VERSION: &str = "5";
 
 pub struct ProtobufAnalyzer {
     compiler: SourceCompiler,
@@ -257,16 +257,34 @@ fn append_file(file: FileDescriptorProto, facts: &mut ProtobufFacts) -> Result<(
                 method_id.as_str(),
                 &path,
             ));
+            let input_type = message_id(required(method.input_type, "method input type")?);
+            push_entity(
+                facts,
+                input_type.as_str(),
+                EntityKind::ProtoType,
+                Some(EntityMetadata::ProtoType {
+                    kind: ProtoTypeKind::Message,
+                }),
+            )?;
             facts.observations.push(descriptor(
                 method_id.as_str(),
                 StructuralRelation::RequestType,
-                message_id(required(method.input_type, "method input type")?),
+                input_type,
                 &path,
             ));
+            let output_type = message_id(required(method.output_type, "method output type")?);
+            push_entity(
+                facts,
+                output_type.as_str(),
+                EntityKind::ProtoType,
+                Some(EntityMetadata::ProtoType {
+                    kind: ProtoTypeKind::Message,
+                }),
+            )?;
             facts.observations.push(descriptor(
                 method_id.as_str(),
                 StructuralRelation::ResponseType,
-                message_id(required(method.output_type, "method output type")?),
+                output_type,
                 &path,
             ));
         }
@@ -494,6 +512,43 @@ mod tests {
                         cardinality: RpcCardinality::Unary,
                     })
         }));
+    }
+
+    #[test]
+    fn materializes_message_facts_referenced_from_omitted_imports() {
+        let bytes = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("example.proto".into()),
+                package: Some("example".into()),
+                service: vec![ServiceDescriptorProto {
+                    name: Some("Example".into()),
+                    method: vec![MethodDescriptorProto {
+                        name: Some("Get".into()),
+                        input_type: Some(".google.protobuf.Empty".into()),
+                        output_type: Some(".google.protobuf.Empty".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+
+        let facts = facts(&bytes).unwrap();
+        assert!(facts.entities.iter().any(|entity| {
+            entity.id.as_str() == "proto-type://google.protobuf.Empty"
+                && entity.metadata
+                    == Some(EntityMetadata::ProtoType {
+                        kind: ProtoTypeKind::Message,
+                    })
+        }));
+        beholder_domain::validate_entity_complete_semantics(
+            &facts.entities,
+            &facts.observations,
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]

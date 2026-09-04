@@ -21,7 +21,7 @@ use schema::{
     record_field_types, record_root_types, record_source_type, type_entity, union_members,
 };
 
-pub const FRONTEND_VERSION: &str = "9";
+pub const FRONTEND_VERSION: &str = "10";
 
 #[derive(Clone, Copy)]
 pub struct GraphqlSource<'a> {
@@ -440,6 +440,10 @@ pub fn facts(_repository: &str, sources: &[GraphqlSource<'_>]) -> GraphqlFacts {
                 Observation::dependency(gateway, DependencyRelation::ResolvedBy, upstream, evidence)
             }),
     );
+    facts.observations.retain(|observation| {
+        !observation.to.as_str().starts_with("graphql-type://")
+            || entities.contains_key(observation.to.as_str())
+    });
     facts.entities = entities.into_values().collect();
     facts
 }
@@ -598,6 +602,35 @@ mod tests {
             );
         }
         assert!(facts.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn omits_custom_variable_type_relationships_without_a_schema() {
+        let operation = GraphqlSource {
+            path: Path::new("Search.graphql"),
+            source: "query Search($filter: SearchFilter!) { search(filter: $filter) }",
+            owner: None,
+        };
+
+        let facts = facts("client", &[operation]);
+        assert!(
+            facts
+                .entities
+                .iter()
+                .any(|entity| { entity.id.as_str() == "graphql-operation://Search" })
+        );
+        assert!(
+            facts
+                .observations
+                .iter()
+                .all(|observation| { observation.to.as_str() != "graphql-type://SearchFilter" })
+        );
+        beholder_domain::validate_entity_complete_semantics(
+            &facts.entities,
+            &facts.observations,
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]

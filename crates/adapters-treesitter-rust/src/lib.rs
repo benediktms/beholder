@@ -1,5 +1,5 @@
 pub const FRONTEND_VERSION: &str = "11";
-pub const RESOLVER_VERSION: &str = "7";
+pub const RESOLVER_VERSION: &str = "8";
 
 mod analysis;
 mod analyzer;
@@ -13,7 +13,7 @@ mod tonic;
 
 pub use analysis::{
     analyze, diagnostics_from_analysis, entities_from_analysis, observations,
-    observations_from_analysis, source_entity_id,
+    observations_from_analysis, source_entity_id, unresolved_endpoint_entities,
 };
 pub use analyzer::RustAnalyzer;
 pub use manifest::{rust_analysis_input_kind, validate_immutable_rust_inputs};

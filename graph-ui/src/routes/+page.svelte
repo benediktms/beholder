@@ -5,17 +5,17 @@
   import { Badge } from '$lib/components/ui/badge';
   import { Button } from '$lib/components/ui/button';
   import {
-    MAX_VISIBLE_LINKS,
-    MAX_VISIBLE_NODES,
     EXTERNAL_REPOSITORY,
     ORIGINS,
     RELATION_KINDS,
+    findEntity,
     projectGraph,
+    investigate,
     type EntityOrigin,
     type GraphNode,
     type GraphSnapshot,
     type Projection,
-    type RelationKind,
+    type RelationKind, type InvestigationMode, type QueryMetadata,
     type WorkspaceSummary
   } from '$lib/graph';
 
@@ -45,9 +45,20 @@
   let inspectorWidth = 288;
   let loading = true;
   let error = '';
+  let statusError = '';
+  let status: QueryMetadata | null = null;
+  let search = '';
+  let mode: InvestigationMode = 'context';
+  let traceTarget = '';
+  let loadRequest = 0;
+  let pollingStatus = false;
 
-  $: projection = snapshot
-    ? projectGraph(snapshot, {
+  $: investigation = snapshot && rootId ? investigate(snapshot, mode, rootId, traceTarget || undefined) : null;
+  $: visibleSnapshot = snapshot && investigation
+    ? { ...snapshot, nodes: snapshot.nodes.filter((node) => investigation.nodeIds.has(node.id)), edges: snapshot.edges.filter((edge) => investigation.edgeIds.has(edge.id)) }
+    : snapshot;
+  $: projection = visibleSnapshot
+    ? projectGraph(visibleSnapshot, {
         repositories,
         relationKinds,
         includeTests,
@@ -69,32 +80,83 @@
   $: selectedEdges = snapshot && rootId
     ? snapshot.edges.filter((edge) => edge.from === rootId || edge.to === rootId)
     : [];
+  $: pinnedAnalysis = snapshot?.metadata.analysis ?? { completeness: 'complete' as const, diagnostics: [] };
+  $: currentFreshness = status?.freshness ?? snapshot?.metadata.freshness ?? null;
 
-  onMount(async () => {
-    try {
-      workspaces = await invoke<WorkspaceSummary[]>('list_workspaces');
-      selectedWorkspace = workspaces[0]?.name ?? '';
-      if (selectedWorkspace) await loadWorkspace();
-    } catch (cause) {
-      error = String(cause);
-    } finally {
-      loading = false;
-    }
+  onMount(() => {
+    void loadWorkspaces();
+    const poll = window.setInterval(() => void pollStatus(), 3000);
+    return () => window.clearInterval(poll);
   });
 
-  async function loadWorkspace() {
-    if (!selectedWorkspace) return;
+  async function loadWorkspaces() {
+    const request = ++loadRequest;
     loading = true;
     error = '';
     try {
-      snapshot = await invoke<GraphSnapshot>('load_graph', {
-        request: { workspace: selectedWorkspace }
+      const nextWorkspaces = await invoke<WorkspaceSummary[]>('list_workspaces');
+      if (request !== loadRequest) return;
+      workspaces = nextWorkspaces;
+      selectedWorkspace = workspaces.some(({ name }) => name === selectedWorkspace)
+        ? selectedWorkspace
+        : workspaces[0]?.name ?? '';
+      if (selectedWorkspace) await loadWorkspace();
+      else {
+        snapshot = null;
+        status = null;
+      }
+    } catch (cause) {
+      if (request === loadRequest) error = String(cause);
+    } finally {
+      if (request === loadRequest) loading = false;
+    }
+  }
+
+  async function pollStatus() {
+    if (!selectedWorkspace || !snapshot || pollingStatus) return;
+    const generation = loadRequest;
+    const workspace = selectedWorkspace;
+    pollingStatus = true;
+    try {
+      const nextStatus = await invoke<QueryMetadata>('topology_status', { request: { workspace } });
+      if (generation !== loadRequest) return;
+      status = nextStatus;
+      statusError = '';
+    } catch (cause) {
+      if (generation === loadRequest) statusError = String(cause);
+    } finally {
+      pollingStatus = false;
+    }
+  }
+
+  async function loadWorkspace() {
+    if (!selectedWorkspace) return;
+    const request = ++loadRequest;
+    const workspace = selectedWorkspace;
+    loading = true;
+    error = '';
+    try {
+      const nextSnapshot = await invoke<GraphSnapshot>('load_graph', {
+        request: { workspace }
       });
+      if (request !== loadRequest) return;
+      snapshot = nextSnapshot;
+      status = snapshot.metadata;
       returnToWorkspace();
     } catch (cause) {
-      error = String(cause);
+      if (request === loadRequest) error = String(cause);
     } finally {
-      loading = false;
+      if (request === loadRequest) loading = false;
+    }
+  }
+
+  function selectSearch() {
+    const entity = snapshot && findEntity(snapshot.nodes, search);
+    if (entity) {
+      repositories = [];
+      origins = [...ORIGINS];
+      includeTests = true;
+      rootId = entity.id;
     }
   }
 
@@ -117,6 +179,7 @@
 
   function returnToWorkspace() {
     repositories = [];
+    traceTarget = '';
     clearFocus();
   }
 
@@ -224,9 +287,27 @@
     </nav>
 
     <div class="header-meta">
-      <Badge>fixture · rev {snapshot?.metadata.revision ?? '—'}</Badge>
-      <span class:healthy={Boolean(snapshot && !snapshot.metadata.freshness.stale)} class="status-dot"></span>
-      <span>{snapshot?.metadata.freshness.stale ? 'stale' : 'snapshot ready'}</span>
+      <Badge>rev {snapshot?.metadata.revision ?? '—'}</Badge>
+      <span class:healthy={Boolean(snapshot && currentFreshness && !currentFreshness.stale && pinnedAnalysis.completeness === 'complete')} class="status-dot"></span>
+      <span>{!snapshot ? 'no snapshot' : pinnedAnalysis.completeness === 'incomplete' ? 'analysis incomplete' : currentFreshness?.stale ? 'stale' : 'snapshot ready'}</span>
+      {#if pinnedAnalysis.completeness === 'incomplete'}
+        <details class="analysis-diagnostics">
+          <summary>{pinnedAnalysis.diagnostics.length} diagnostics</summary>
+          <ul>
+            {#each pinnedAnalysis.diagnostics as diagnostic}
+              <li>
+                <strong>{diagnostic.code}</strong>
+                <span>{diagnostic.repository}/{diagnostic.path}:{diagnostic.line ?? '—'}</span>
+                {#if diagnostic.detail}<span>{diagnostic.detail}</span>{/if}
+              </li>
+            {/each}
+          </ul>
+        </details>
+      {/if}
+      {#if statusError}<span>{statusError}</span>{/if}
+      {#if status && snapshot && status.revision > snapshot.metadata.revision}
+        <Button size="sm" variant="outline" onclick={loadWorkspace}>Revision {status.revision} available · Refresh</Button>
+      {/if}
     </div>
   </header>
 
@@ -323,11 +404,6 @@
           <span>Include tests</span>
         </Button>
 
-        <div class="guard-note">
-          <span class="eyebrow">Render guard</span>
-          <strong>{MAX_VISIBLE_NODES.toLocaleString()} nodes · {MAX_VISIBLE_LINKS.toLocaleString()} links</strong>
-          <p>The full fixture stays loaded. Oversized projections stop here and ask for narrower filters.</p>
-        </div>
       </div>
     </details>
     {#if filtersOpen}
@@ -353,29 +429,38 @@
           <span><i class="downstream"></i>Downstream</span>
         </div>
         <div class="toolbar-actions">
+          <input aria-label="Search entities" placeholder="Canonical ID or name" bind:value={search} onkeydown={(event) => event.key === 'Enter' && selectSearch()} />
+          <Button variant="outline" onclick={selectSearch}>Find</Button>
+          <select aria-label="Investigation mode" bind:value={mode}>
+            <option value="context">Context</option>
+            <option value="dependencies">Dependencies</option>
+            <option value="impact">Impact</option>
+            <option value="trace">Trace</option>
+          </select>
+          {#if mode === 'trace'}
+            <input aria-label="Trace target" placeholder="Trace target ID" bind:value={traceTarget} />
+          {/if}
           {#if rootId}<Button variant="outline" onclick={clearFocus}>Clear focus</Button>{/if}
           <Badge>{projection.nodes.length} nodes</Badge>
           <Badge>{projection.links.length} links</Badge>
         </div>
       </div>
 
-      {#if projection.truncated}
-        <div class="warning" role="alert">
-          {#if snapshot?.traversal.truncated}
-            <strong>The loaded traversal is incomplete.</strong> Narrow the backend query before treating this view as complete.
-          {:else}
-            <strong>Visible graph truncated.</strong>
-            Omitted {projection.omittedNodes} nodes and {projection.omittedLinks} links.
-            Narrow repository, relationship, origin, or tests before continuing.
-          {/if}
-        </div>
-      {/if}
-
       <div class="canvas-wrap">
         {#if error}
-          <div class="empty"><strong>Could not load the Tauri fixture.</strong><span>{error}</span></div>
+          <div class="empty">
+            <strong>Could not load the workspace graph.</strong>
+            <span>{error}</span>
+            <Button variant="outline" onclick={loadWorkspaces}>Retry</Button>
+          </div>
         {:else if loading}
           <div class="empty"><span class="loader"></span><strong>Loading typed graph…</strong></div>
+        {:else if workspaces.length === 0}
+          <div class="empty">
+            <strong>No workspaces registered.</strong>
+            <span>Register a workspace with the Beholder CLI, then retry.</span>
+            <Button variant="outline" onclick={loadWorkspaces}>Retry</Button>
+          </div>
         {:else}
           <GraphCanvas {projection} selectedId={rootId} onSelect={selectNode} />
           <div class="zoom-hint">Scroll to zoom · hover to preview · click an entity to keep its relationship flow</div>
@@ -423,7 +508,7 @@
           </div>
         {:else}
           <div class="instructions">
-            <div><span>01</span><p>Start with the typed entities across the fixture workspace.</p></div>
+            <div><span>01</span><p>Start with the typed entities across the selected workspace.</p></div>
             <div><span>02</span><p>Use repository, relationship, origin, and test filters to narrow the topology.</p></div>
             <div><span>03</span><p>Select an entity to persist its direct neighbours and directional relationship flow.</p></div>
           </div>

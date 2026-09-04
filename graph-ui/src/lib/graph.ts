@@ -19,8 +19,6 @@ export const RELATION_KINDS = [
 ] as const;
 
 export const ORIGINS = ['source', 'generated', 'external_dependency'] as const;
-export const MAX_VISIBLE_NODES = 10_000;
-export const MAX_VISIBLE_LINKS = 25_000;
 export const MAX_ANIMATED_LINKS = 250;
 export const EXTERNAL_REPOSITORY = 'external/contracts';
 
@@ -62,20 +60,31 @@ export interface SemanticEdge {
 export interface GraphSnapshot {
   schema: string;
   workspace: WorkspaceSummary;
-  metadata: {
-    revision: number;
-    view: string;
-    freshness: {
-      stale: boolean;
-      indexing: boolean;
-      dirty_repositories: string[];
-      enriching_repositories: string[];
-    };
-    analysis: { completeness: 'complete' | 'incomplete'; diagnostics: unknown[] };
-  };
-  traversal: { max_hops: number; truncated: boolean };
+  metadata: QueryMetadata;
   nodes: EntityRef[];
   edges: SemanticEdge[];
+}
+
+export interface QueryMetadata {
+  revision: number;
+  view: string;
+  freshness: {
+    stale: boolean;
+    indexing: boolean;
+    dirty_repositories: string[];
+    enriching_repositories: string[];
+  };
+  analysis?: {
+    completeness: 'complete' | 'incomplete';
+    diagnostics: Array<{
+      code: string;
+      severity: 'known_limitation' | 'warning';
+      repository: string;
+      path: string;
+      line: number | null;
+      detail: string | null;
+    }>;
+  };
 }
 
 export interface GraphNode {
@@ -115,24 +124,22 @@ export interface ProjectionOptions {
   origins: readonly EntityOrigin[];
 }
 
-export interface ProjectionLimits {
-  nodes: number;
-  links: number;
-}
-
-const DEFAULT_LIMITS: ProjectionLimits = {
-  nodes: MAX_VISIBLE_NODES,
-  links: MAX_VISIBLE_LINKS
-};
-
 export function endpointId(endpoint: string | GraphNode): string {
   return typeof endpoint === 'string' ? endpoint : endpoint.id;
 }
 
+export function findEntity(nodes: readonly EntityRef[], search: string): EntityRef | undefined {
+  const exact = search.trim();
+  if (!exact) return undefined;
+  const folded = exact.toLowerCase();
+  return nodes.find((node) => node.id === exact)
+    ?? nodes.find((node) => node.id.toLowerCase() === folded || node.name.toLowerCase() === folded)
+    ?? nodes.find((node) => node.id.toLowerCase().includes(folded) || node.name.toLowerCase().includes(folded));
+}
+
 export function projectGraph(
   snapshot: GraphSnapshot,
-  options: ProjectionOptions,
-  limits: ProjectionLimits = DEFAULT_LIMITS
+  options: ProjectionOptions
 ): Projection {
   const selectedRepositories = new Set(options.repositories);
   const allowedNodes = snapshot.nodes.filter(
@@ -189,22 +196,21 @@ export function projectGraph(
     link.rawEdgeIds.sort();
   }
   const allNodes = [...groups.values()].sort(compareById);
-  const keptNodes = allNodes.slice(0, limits.nodes);
+  const keptNodes = allNodes;
   const keptIds = new Set(keptNodes.map((node) => node.id));
   const allLinks = [...links.values()].sort(compareById);
   const keptLinks = allLinks
     .filter(
       (link) => keptIds.has(endpointId(link.source)) && keptIds.has(endpointId(link.target))
-    )
-    .slice(0, limits.links);
+    );
   for (const link of keptLinks) {
     const source = groups.get(endpointId(link.source));
     const target = groups.get(endpointId(link.target));
     if (source) source.degree += 1;
     if (target) target.degree += 1;
   }
-  const omittedNodes = allNodes.length - keptNodes.length;
-  const omittedLinks = allLinks.length - keptLinks.length;
+  const omittedNodes = 0;
+  const omittedLinks = 0;
   return {
     nodes: keptNodes,
     links: keptLinks,
@@ -212,11 +218,82 @@ export function projectGraph(
     rawLinkCount: filteredEdges.length,
     omittedNodes,
     omittedLinks,
-    truncated:
-      snapshot.traversal.truncated ||
-      omittedNodes > 0 ||
-      omittedLinks > 0
+    truncated: false
   };
+}
+
+export type InvestigationMode = 'context' | 'dependencies' | 'impact' | 'trace';
+
+export function investigate(
+  snapshot: GraphSnapshot,
+  mode: InvestigationMode,
+  root: string,
+  target?: string
+): { nodeIds: Set<string>; edgeIds: Set<string> } {
+  if (mode === 'context') {
+    const edges = snapshot.edges.filter((edge) => edge.from === root || edge.to === root);
+    return {
+      nodeIds: new Set([root, ...edges.flatMap((edge) => [edge.from, edge.to])]),
+      edgeIds: new Set(edges.map((edge) => edge.id))
+    };
+  }
+  if (mode === 'trace') return shortestPath(snapshot, root, target ?? '');
+  const outgoing = mode === 'dependencies';
+  const adjacent = new Map<string, Array<{ edge: SemanticEdge; next: string }>>();
+  for (const edge of snapshot.edges) {
+    const implementedByImpact =
+      !outgoing && edge.kind === 'implemented_by' && edge.from.startsWith('grpc://');
+    const from = outgoing || implementedByImpact ? edge.from : edge.to;
+    const next = outgoing || implementedByImpact ? edge.to : edge.from;
+    const edges = adjacent.get(from) ?? [];
+    edges.push({ edge, next });
+    adjacent.set(from, edges);
+  }
+  const nodeIds = new Set([root]);
+  const edgeIds = new Set<string>();
+  const queue = [root];
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index];
+    for (const { edge, next } of adjacent.get(current) ?? []) {
+      edgeIds.add(edge.id);
+      if (!nodeIds.has(next)) {
+        nodeIds.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  return { nodeIds, edgeIds };
+}
+
+export function shortestPath(snapshot: GraphSnapshot, from: string, to: string) {
+  const outgoing = new Map<string, SemanticEdge[]>();
+  for (const edge of snapshot.edges) {
+    const edges = outgoing.get(edge.from) ?? [];
+    edges.push(edge);
+    outgoing.set(edge.from, edges);
+  }
+  const parents = new Map<string, { node: string; edge: string }>();
+  const seen = new Set([from]);
+  const queue = [from];
+  for (let index = 0; index < queue.length && !seen.has(to); index += 1) {
+    const current = queue[index];
+    for (const edge of outgoing.get(current) ?? []) {
+      if (seen.has(edge.to)) continue;
+      seen.add(edge.to);
+      parents.set(edge.to, { node: current, edge: edge.id });
+      queue.push(edge.to);
+    }
+  }
+  if (!seen.has(to)) return { nodeIds: new Set([from, to]), edgeIds: new Set<string>() };
+  const nodeIds = new Set([to]);
+  const edgeIds = new Set<string>();
+  for (let cursor = to; cursor !== from;) {
+    const parent = parents.get(cursor)!;
+    nodeIds.add(parent.node);
+    edgeIds.add(parent.edge);
+    cursor = parent.node;
+  }
+  return { nodeIds, edgeIds };
 }
 
 export function directHighlight(links: GraphLink[], selectedId: string | null) {

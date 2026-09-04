@@ -444,7 +444,10 @@ pub fn entities_from_analysis(
         "repo://{repository}/csharp/{assembly}/{}",
         source_stem(path)
     );
-    std::iter::once(EntityFact::new(module_id.clone(), EntityKind::Namespace, None).unwrap())
+    let source_id = format!("repo://{repository}/csharp-source/{}", path.display());
+    [source_id, module_id.clone()]
+        .into_iter()
+        .map(|id| EntityFact::new(id, EntityKind::Namespace, None).unwrap())
         .chain(analysis.definitions.iter().map(|definition| {
             EntityFact::new(
                 format!("{module_id}/{}", definition.qualified_name),

@@ -1,6 +1,7 @@
 use crate::{
     FRONTEND_VERSION, RESOLVER_VERSION, RustAnalysis, diagnostics_from_analysis,
     entities_from_analysis, observations_from_analysis, resolve_repository_calls,
+    unresolved_endpoint_entities,
 };
 use crate::{
     incremental::{CacheStatus, IncrementalRust, ShardFingerprint},
@@ -228,6 +229,7 @@ impl WorkspaceAnalyzer for RustAnalyzer {
             observations.extend(enrichment.observations);
             diagnostics.extend(enrichment.diagnostics);
             resolve_repository_calls(&mut observations);
+            entities.extend(unresolved_endpoint_entities(&observations));
             let mut fact_shards = build_fact_shards(
                 &repository.state.repository.identity,
                 analyzed.iter().flat_map(|(_, _, _, shards)| shards),

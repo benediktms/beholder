@@ -634,6 +634,8 @@ dependencies = [
 name = "beholder-graph-ui"
 version = "0.1.0"
 dependencies = [
+ "beholder-daemon-client",
+ "beholder-domain",
  "beholder-dto",
  "serde",
  "tauri",

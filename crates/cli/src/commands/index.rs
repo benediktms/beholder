@@ -2,7 +2,10 @@ use super::job::{enum_name, target as job_target};
 use crate::stdout;
 use beholder_adapters_git::repository_state;
 use beholder_adapters_mnestic::SemanticStore;
-use beholder_adapters_treesitter_rust::{FRONTEND_VERSION, observations};
+use beholder_adapters_treesitter_rust::{
+    FRONTEND_VERSION, analyze, entities_from_analysis, observations_from_analysis,
+    unresolved_endpoint_entities,
+};
 use beholder_daemon_client::{IndexTarget, get_repository, list_workspaces, submit_index};
 use beholder_domain::{
     BeholderError, BeholderErrorKind, RepositoryFacts, Workspace, WorkspaceView,
@@ -17,22 +20,25 @@ pub(super) fn rust(path: &Path, database_path: &Path) -> Result<(usize, bool), B
     let state = repository_state(path.parent().unwrap_or_else(|| Path::new(".")), &sources)?;
     let view = WorkspaceView::new(
         MAIN_VIEW,
-        format!("rust:{FRONTEND_VERSION}:single-file:1"),
+        format!("rust:{FRONTEND_VERSION}:single-file:2"),
         vec![state.clone()],
     )?;
     let store = SemanticStore::persistent(database_path, true)?;
     if store.view_matches(&view)? {
         return Ok((0, false));
     }
-    let observations = observations(&state.repository.identity, &sources[0].1, path)?;
+    let analysis = analyze(&sources[0].1).map_err(|error| -> Box<dyn Error> { error })?;
+    let observations = observations_from_analysis(&state.repository.identity, &analysis, path);
+    let mut entities = entities_from_analysis(&state.repository.identity, &analysis, path);
+    entities.extend(unresolved_endpoint_entities(&observations));
     store.publish(
         &view,
         &[RepositoryFacts {
             state,
-            analysis_identity: format!("rust:{FRONTEND_VERSION}:single-file:1"),
+            analysis_identity: format!("rust:{FRONTEND_VERSION}:single-file:2"),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities,
             grpc_bindings: Vec::new(),
             observations: observations.clone(),
         }],

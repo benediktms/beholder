@@ -3920,7 +3920,7 @@ mod tests {
                         analysis_identity: "analysis".into(),
                         incomplete: false,
                         diagnostics: Vec::new(),
-                        entities: Vec::new(),
+                        entities: analysis.entities.clone(),
                         grpc_bindings: Vec::new(),
                         observations: analysis.observations.clone(),
                     }],

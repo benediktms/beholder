@@ -2,7 +2,7 @@ use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Works
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionEvent,
     GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus, ImpactResult,
-    RepositoryStatus, TraceResult, WhyResult,
+    QueryMetadata, RepositoryStatus, TraceResult, WhyResult, WorkspaceTopology,
 };
 use beholder_protocol::{
     ERROR_CODE_METADATA_KEY,
@@ -11,7 +11,8 @@ use beholder_protocol::{
         GarbageCollectEvent as ProtocolGarbageCollectEvent, GarbageCollectPhase,
         GarbageCollectProgress as ProtocolGarbageCollectProgress, GarbageCollectRequest,
         GetGarbageCollectionStatusRequest, GetJobRequest, GetJobResponse, GetRepositoryRequest,
-        GetStatusRequest, GetStatusResponse, ListJobsRequest, ListJobsResponse,
+        GetStatusRequest, GetStatusResponse, GetWorkspaceTopologyRequest,
+        GetWorkspaceTopologyStatusRequest, ListJobsRequest, ListJobsResponse,
         ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
         RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest, SubmitEnrichmentRequest,
         SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse, TraversalEntityRequest,
@@ -26,6 +27,7 @@ use tonic::{Code, Request, Status, transport::Channel};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const SUBMIT_INDEX_TIMEOUT: Duration = Duration::from_secs(10);
+pub type ClientError = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn socket_path() -> Result<PathBuf, String> {
     Ok(state_dir()?.join("beholder.sock"))
@@ -39,6 +41,12 @@ fn endpoint() -> Result<String, String> {
 }
 
 async fn connect() -> Result<DaemonClient<Channel>, Box<dyn std::error::Error>> {
+    Ok(DaemonClient::connect(endpoint()?)
+        .await?
+        .max_decoding_message_size(MAX_RESPONSE_BYTES))
+}
+
+async fn connect_send() -> Result<DaemonClient<Channel>, ClientError> {
     Ok(DaemonClient::connect(endpoint()?)
         .await?
         .max_decoding_message_size(MAX_RESPONSE_BYTES))
@@ -259,6 +267,26 @@ pub async fn context(
         .context(request(EntityRequest { workspace, entity }))
         .await?
         .into_inner()
+        .try_into()?)
+}
+
+pub async fn workspace_topology(workspace: String) -> Result<WorkspaceTopology, ClientError> {
+    Ok(connect_send()
+        .await?
+        .get_workspace_topology(request(GetWorkspaceTopologyRequest { workspace }))
+        .await?
+        .into_inner()
+        .try_into()?)
+}
+
+pub async fn workspace_topology_status(workspace: String) -> Result<QueryMetadata, ClientError> {
+    Ok(connect_send()
+        .await?
+        .get_workspace_topology_status(request(GetWorkspaceTopologyStatusRequest { workspace }))
+        .await?
+        .into_inner()
+        .metadata
+        .ok_or("topology status metadata is missing")?
         .try_into()?)
 }
 

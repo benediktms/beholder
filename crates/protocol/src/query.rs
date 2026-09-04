@@ -56,6 +56,33 @@ fn edges(values: Vec<v1::Edge>) -> Result<Vec<dto::SemanticEdge>, &'static str> 
     values.into_iter().map(TryInto::try_into).collect()
 }
 
+impl From<dto::WorkspaceTopology> for v1::GetWorkspaceTopologyResponse {
+    fn from(value: dto::WorkspaceTopology) -> Self {
+        Self {
+            schema: value.schema,
+            metadata: Some(value.metadata.into()),
+            nodes: value.nodes.into_iter().map(Into::into).collect(),
+            edges: value.edges.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<v1::GetWorkspaceTopologyResponse> for dto::WorkspaceTopology {
+    type Error = &'static str;
+
+    fn try_from(value: v1::GetWorkspaceTopologyResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema: value.schema,
+            metadata: value
+                .metadata
+                .ok_or("topology metadata is missing")?
+                .try_into()?,
+            nodes: entities(value.nodes)?,
+            edges: edges(value.edges)?,
+        })
+    }
+}
+
 impl From<dto::ContextResult> for v1::ContextResponse {
     fn from(value: dto::ContextResult) -> Self {
         let root = value.root.clone();

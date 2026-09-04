@@ -4,6 +4,8 @@ import {
   EXTERNAL_REPOSITORY,
   ORIGINS,
   directHighlight,
+  findEntity,
+  investigate,
   labelOpacity,
   nodeValue,
   projectGraph,
@@ -43,7 +45,6 @@ const snapshot: GraphSnapshot = {
     },
     analysis: { completeness: 'complete', diagnostics: [] }
   },
-  traversal: { max_hops: 8, truncated: false },
   nodes,
   edges
 };
@@ -132,17 +133,53 @@ test('repository filtering accepts multiple repositories', () => {
   assert.deepEqual(graph.nodes.map((node) => node.id), ['a', 'c']);
 });
 
-test('visible guards keep deterministic topology and report omissions', () => {
-  const graph = projectGraph(
-    snapshot,
-    options,
-    { nodes: 2, links: 1 }
+test('entity search prefers exact case-sensitive canonical IDs', () => {
+  const candidates = [entity('Example', 'repo-a'), entity('example', 'repo-a')];
+  assert.equal(findEntity(candidates, 'example')?.id, 'example');
+  assert.equal(findEntity([entity('INSPECT', 'repo-a')], 'inspect')?.id, 'INSPECT');
+  assert.equal(findEntity(candidates, '  '), undefined);
+});
+
+test('complete projections never apply speculative topology limits', () => {
+  const graph = projectGraph(snapshot, options);
+  assert.deepEqual(graph.nodes.map((node) => node.id), ['a', 'b', 'c']);
+  assert.equal(graph.omittedNodes, 0);
+  assert.equal(graph.omittedLinks, 0);
+  assert.equal(graph.truncated, false);
+});
+
+test('pinned investigations preserve dependency, impact, and shortest-path direction', () => {
+  assert.deepEqual([...investigate(snapshot, 'dependencies', 'a').nodeIds], ['a', 'b', 'c']);
+  assert.deepEqual([...investigate(snapshot, 'impact', 'c').nodeIds], ['c', 'b', 'a']);
+  assert.deepEqual([...investigate(snapshot, 'trace', 'a', 'c').edgeIds].sort(), ['e1', 'e3']);
+});
+
+test('impact follows implemented_by from an RPC without crossing between implementations', () => {
+  const rpc = 'grpc://example.Service/Call';
+  const implementationA = 'implementation-a';
+  const implementationB = 'implementation-b';
+  const implementedByA = { ...edge('implemented-a', rpc, implementationA), kind: 'implemented_by' as const };
+  const implementedByB = { ...edge('implemented-b', rpc, implementationB), kind: 'implemented_by' as const };
+  const result = investigate(
+    {
+      ...snapshot,
+      nodes: [entity(rpc, 'repo-a'), entity(implementationA, 'repo-a'), entity(implementationB, 'repo-b')],
+      edges: [implementedByA, implementedByB]
+    },
+    'impact',
+    implementationA
   );
-  assert.deepEqual(graph.nodes.map((node) => node.id), ['a', 'b']);
-  assert.deepEqual(graph.nodes.map((node) => node.degree), [1, 1]);
-  assert.equal(graph.omittedNodes, 1);
-  assert.equal(graph.omittedLinks, 1);
-  assert.equal(graph.truncated, true);
+  assert.deepEqual([...result.nodeIds], [implementationA]);
+  assert.deepEqual(
+    [...investigate({ ...snapshot, edges: [implementedByA, implementedByB] }, 'impact', rpc).nodeIds],
+    [rpc, implementationA, implementationB]
+  );
+});
+
+test('trace keeps both endpoints when no path exists', () => {
+  const result = investigate(snapshot, 'trace', 'c', 'a');
+  assert.deepEqual([...result.nodeIds], ['c', 'a']);
+  assert.deepEqual([...result.edgeIds], []);
 });
 
 function entity(id: string, repository: string): EntityRef {

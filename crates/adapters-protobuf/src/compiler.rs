@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const COMPILER_ID: &str = "protox-0.9.1-v2";
+const COMPILER_ID: &str = "protox-0.9.1-v3";
 
 pub struct SourceCompiler {
     cache_dir: PathBuf,
@@ -159,7 +159,7 @@ impl SourceCompiler {
             }
             resolver.add(GoogleFileResolver::new());
             let mut compiler = Compiler::with_file_resolver(resolver);
-            compiler.include_imports(false).include_source_info(false);
+            compiler.include_imports(true).include_source_info(false);
             compiler.open_files(&module.protos).map_err(|error| {
                 format!(
                     "failed to compile Protobuf module {}: {error}",
@@ -705,7 +705,7 @@ mod tests {
                 .any(|entity| { entity.id.as_str() == "proto-method://example.Example/Get" })
         );
         assert!(
-            !compiled
+            compiled
                 .entities
                 .iter()
                 .any(|entity| { entity.id.as_str() == "proto-type://fresha.types.UUID" })

@@ -4,7 +4,8 @@ use beholder_dto::{
     EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
     GraphqlOperationKind, GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery,
     ProtoTypeKind, QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath,
-    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata,
+    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata, WORKSPACE_TOPOLOGY_SCHEMA_V1,
+    WorkspaceTopology,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -16,6 +17,51 @@ type Closure = (Vec<(String, u32)>, GraphOutput, bool);
 enum TraversalDirection {
     Outgoing,
     Incoming,
+}
+
+pub(super) fn workspace_topology(
+    view: &str,
+    result: InspectionResult,
+    entities: InspectionResult,
+) -> Result<WorkspaceTopology, Box<dyn Error>> {
+    let facts = entity_kinds(entities)?;
+    let mut graph = GraphBuilder::default();
+    graph.hint_facts(facts.clone());
+    for (id, (kind, _)) in &facts {
+        graph.hint(id, *kind);
+    }
+    for row in result.rows {
+        let from = text(&row, 0, "topology source")?;
+        let to = text(&row, 1, "topology target")?;
+        if !facts.contains_key(from) {
+            return Err(format!("missing entity fact for topology endpoint {from}").into());
+        }
+        if !facts.contains_key(to) {
+            return Err(format!("missing entity fact for topology endpoint {to}").into());
+        }
+        graph.add_edge(
+            from,
+            to,
+            text(&row, 2, "topology relation")?,
+            text(&row, 3, "topology evidence")?,
+            float(&row, 4, "topology confidence")? as f32,
+            text(&row, 5, "topology provenance")?,
+        )?;
+    }
+    let output = graph.finish();
+    if output
+        .nodes
+        .iter()
+        .any(|node| node.kind == EntityKind::Unknown)
+    {
+        return Err("workspace topology contains an Unknown entity".into());
+    }
+    Ok(WorkspaceTopology {
+        schema: WORKSPACE_TOPOLOGY_SCHEMA_V1.into(),
+        metadata: QueryMetadata::completed(view, 0),
+        nodes: output.nodes,
+        edges: output.edges,
+    })
 }
 
 pub(super) fn context(

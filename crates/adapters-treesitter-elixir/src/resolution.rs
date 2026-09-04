@@ -159,6 +159,16 @@ pub fn entities_from_analysis(
                 .unwrap(),
             );
         }
+        for field in &module.struct_fields {
+            entities.push(
+                EntityFact::new(
+                    format!("{module_id}/field/{}", field.name),
+                    EntityKind::Namespace,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
     }
     entities
 }
@@ -308,6 +318,7 @@ fn workspace_module_definitions(
     observations: &[Observation],
 ) -> BTreeMap<String, Option<EntityId>> {
     let mut definitions = BTreeMap::<String, Option<EntityId>>::new();
+
     for observation in observations.iter().filter(|observation| {
         observation.relation == SemanticRelation::Structural(StructuralRelation::Defines)
     }) {
@@ -330,6 +341,26 @@ fn workspace_module_definitions(
             .or_insert_with(|| Some(observation.to.clone()));
     }
     definitions
+}
+
+pub fn unresolved_endpoint_entities(observations: &[Observation]) -> Vec<EntityFact> {
+    observations
+        .iter()
+        .flat_map(|observation| [&observation.from, &observation.to])
+        .filter_map(|id| {
+            let id = id.as_str();
+            if id.starts_with("elixir-call://") || id.starts_with("elixir-dynamic-call://") {
+                Some((id, EntityKind::Callable))
+            } else if id.starts_with("elixir-module://") || id.starts_with("erlang-module://") {
+                Some((id, EntityKind::Namespace))
+            } else {
+                None
+            }
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .map(|(id, kind)| EntityFact::new(id, kind, None).unwrap())
+        .collect()
 }
 
 pub fn resolve_workspace_modules(observations: &[Observation]) -> Vec<DependencyOverride> {

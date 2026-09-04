@@ -318,6 +318,37 @@ defmodule Beholder.V1.QueryMetadata do
   field :diagnostics, 5, repeated: true, type: Beholder.V1.AnalysisDiagnostic
 end
 
+defmodule Beholder.V1.GetWorkspaceTopologyRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :workspace, 1, type: :string
+end
+
+defmodule Beholder.V1.GetWorkspaceTopologyResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :schema, 1, type: :string
+  field :metadata, 2, type: Beholder.V1.QueryMetadata
+  field :nodes, 3, repeated: true, type: Beholder.V1.Entity
+  field :edges, 4, repeated: true, type: Beholder.V1.Edge
+end
+
+defmodule Beholder.V1.GetWorkspaceTopologyStatusRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :workspace, 1, type: :string
+end
+
+defmodule Beholder.V1.GetWorkspaceTopologyStatusResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :metadata, 1, type: Beholder.V1.QueryMetadata
+end
+
 defmodule Beholder.V1.Freshness do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -900,6 +931,20 @@ defmodule Beholder.V1.Daemon.Service do
   rpc(:GetStatus, Beholder.V1.GetStatusRequest, Beholder.V1.GetStatusResponse, %{})
 
   rpc(:GetRepository, Beholder.V1.GetRepositoryRequest, Beholder.V1.RepositoryResponse, %{})
+
+  rpc(
+    :GetWorkspaceTopology,
+    Beholder.V1.GetWorkspaceTopologyRequest,
+    Beholder.V1.GetWorkspaceTopologyResponse,
+    %{}
+  )
+
+  rpc(
+    :GetWorkspaceTopologyStatus,
+    Beholder.V1.GetWorkspaceTopologyStatusRequest,
+    Beholder.V1.GetWorkspaceTopologyStatusResponse,
+    %{}
+  )
 
   rpc(:Impact, Beholder.V1.TraversalEntityRequest, Beholder.V1.ImpactResponse, %{})
 

@@ -243,8 +243,14 @@ defmodule Beholder.Worker.Elixir.EventMapper do
       |> Kernel.++(Map.keys(observations_by_path))
       |> Enum.uniq()
       |> Map.new(fn path ->
-        entities = Map.get(entities_by_path, path, [])
         observations = Map.get(observations_by_path, path, [])
+
+        entities =
+          entities_by_path
+          |> Map.get(path, [])
+          |> Kernel.++(unresolved_endpoint_entities(observations))
+          |> Enum.uniq_by(& &1.id)
+          |> Enum.sort_by(& &1.id)
 
         {path,
          %FactShard{
@@ -258,6 +264,27 @@ defmodule Beholder.Worker.Elixir.EventMapper do
       end)
 
     {shards, dependencies_by_path}
+  end
+
+  defp unresolved_endpoint_entities(observations) do
+    observations
+    |> Enum.flat_map(&[&1.from, &1.to])
+    |> Enum.filter(
+      &String.starts_with?(&1, [
+        "elixir-call://",
+        "elixir-module://",
+        "erlang-module://"
+      ])
+    )
+    |> Enum.uniq()
+    |> Enum.map(fn id ->
+      kind =
+        if String.starts_with?(id, "elixir-call://"),
+          do: :ENTITY_KIND_CALLABLE,
+          else: :ENTITY_KIND_NAMESPACE
+
+      %EntityFact{id: id, kind: kind}
+    end)
   end
 
   defp definition_fingerprints(definitions) do

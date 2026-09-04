@@ -18,13 +18,15 @@ use beholder_protocol::v1::{
     EnrichmentSubmissionDisposition, EntityRequest, GarbageCollectEvent, GarbageCollectPhase,
     GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
     GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetJobRequest,
-    GetJobResponse, GetRepositoryRequest, GetStatusRequest, GetStatusResponse, ImpactResponse,
-    IndexJobOutcome, Job, JobStatus, JobSummary, JobTarget, JobTrigger, JobType, JobWaitReason,
-    ListJobsRequest, ListJobsResponse, ListWorkspacesRequest, ListWorkspacesResponse, PathRequest,
-    RegisterRepositoryRequest, RegisterWorkspaceRequest, RegisterWorkspaceResponse,
-    RepositoryResponse, SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest,
-    StopResponse, SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest,
-    SubmitIndexResponse, TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
+    GetJobResponse, GetRepositoryRequest, GetStatusRequest, GetStatusResponse,
+    GetWorkspaceTopologyRequest, GetWorkspaceTopologyResponse, GetWorkspaceTopologyStatusRequest,
+    GetWorkspaceTopologyStatusResponse, ImpactResponse, IndexJobOutcome, Job, JobStatus,
+    JobSummary, JobTarget, JobTrigger, JobType, JobWaitReason, ListJobsRequest, ListJobsResponse,
+    ListWorkspacesRequest, ListWorkspacesResponse, PathRequest, RegisterRepositoryRequest,
+    RegisterWorkspaceRequest, RegisterWorkspaceResponse, RepositoryResponse,
+    SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest, StopResponse,
+    SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse,
+    TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
     garbage_collect_event, index_destination, job_target, submit_index_request,
 };
 use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::atomic::Ordering};
@@ -289,8 +291,52 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 20,
+            protocol_version: 21,
             pid: std::process::id(),
+        }))
+    }
+
+    #[tracing::instrument(name = "rpc.get_workspace_topology", skip_all, fields(workspace = %request.get_ref().workspace))]
+    async fn get_workspace_topology(
+        &self,
+        request: Request<GetWorkspaceTopologyRequest>,
+    ) -> Result<Response<GetWorkspaceTopologyResponse>, Status> {
+        let workspace = request.into_inner().workspace;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let store = self.store.clone();
+        let query_workspace = workspace.clone();
+        let result =
+            semantic_query(move || store.workspace_topology_snapshot(&query_workspace)).await?;
+        self.query_response(&workspace, enriching, result)
+    }
+
+    #[tracing::instrument(name = "rpc.get_workspace_topology_status", skip_all, fields(workspace = %request.get_ref().workspace))]
+    async fn get_workspace_topology_status(
+        &self,
+        request: Request<GetWorkspaceTopologyStatusRequest>,
+    ) -> Result<Response<GetWorkspaceTopologyStatusResponse>, Status> {
+        let workspace = request.into_inner().workspace;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let store = self.store.clone();
+        let query_workspace = workspace.clone();
+        let revisioned =
+            semantic_query(move || store.workspace_topology_status(&query_workspace)).await?;
+        let metadata = self.scheduler.query_metadata_with_enrichments(
+            &workspace,
+            revisioned.analysis_revision,
+            revisioned.analysis,
+            Some(enriching),
+        );
+        Ok(Response::new(GetWorkspaceTopologyStatusResponse {
+            metadata: Some(metadata.into()),
         }))
     }
 

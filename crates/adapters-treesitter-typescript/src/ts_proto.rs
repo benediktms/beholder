@@ -3,8 +3,8 @@ use super::{
     model::{DefinitionKind, TypescriptAnalysis},
 };
 use beholder_domain::{
-    Confidence, DependencyRelation, GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance,
-    RpcCardinality, SemanticRelation,
+    Confidence, DependencyRelation, EntityFact, EntityKind, EntityMetadata, GrpcBindingCandidate,
+    GrpcBindingRole, Observation, ProtoTypeKind, Provenance, RpcCardinality, SemanticRelation,
 };
 use std::{collections::BTreeMap, path::Path};
 
@@ -159,6 +159,29 @@ pub(super) fn message_observations(
         .collect()
 }
 
+pub(super) fn message_entities(observations: &[Observation]) -> Vec<EntityFact> {
+    observations
+        .iter()
+        .filter(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::BindsContract)
+                && observation.to.as_str().starts_with("proto-type://")
+        })
+        .map(|observation| observation.to.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|id| {
+            EntityFact::new(
+                id,
+                EntityKind::ProtoType,
+                Some(EntityMetadata::ProtoType {
+                    kind: ProtoTypeKind::Message,
+                }),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +250,18 @@ mod tests {
                 && observation.to.as_str()
                     == "proto-type://example.checkout.v1.InitializeOrderRequest"
         }));
+        assert_eq!(
+            message_entities(&observations),
+            vec![
+                EntityFact::new(
+                    "proto-type://example.checkout.v1.InitializeOrderRequest",
+                    EntityKind::ProtoType,
+                    Some(EntityMetadata::ProtoType {
+                        kind: ProtoTypeKind::Message,
+                    }),
+                )
+                .unwrap()
+            ]
+        );
     }
 }

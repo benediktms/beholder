@@ -848,6 +848,107 @@ pub(super) fn entity_facts(
     ))
 }
 
+struct AllEntityFactsQuery;
+
+impl MnesticQuery for AllEntityFactsQuery {
+    const OPERATION: &'static str = "entity_facts.all";
+    const SCRIPT: &'static str = "selected_state[state] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_state{view: $view, revision, state}\n\
+         selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
+         baseline_id[id] := selected_state[state], *state_entity{state, id}\n\
+         baseline_id[id] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_entity{view: $view, revision, id}\n\
+         baseline_id[id] := *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id}\n\
+         ?[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}\n\
+         ?[id, kind, metadata] := *analysis_revision{view: $view, revision}, \
+             *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
+         ?[id, kind, metadata] := \
+             *analysis_fact_shard_selection{view: $view, producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
+         ?[id, kind, metadata] := \
+             *analysis_enrichment_entity_selection{view: $view, id, owner}, \
+             selected_enrichment[owner], \
+             *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, \
+             not baseline_id[id]\n\
+         :order id";
+    const HEADERS: &'static [&'static str] = ENTITY_FACT_HEADERS;
+
+    type Params = ();
+    type Row = EntityFactRow;
+
+    fn bind(_: &Self::Params) -> BTreeMap<String, DataValue> {
+        BTreeMap::new()
+    }
+
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        BaselineEntityFacts::decode(headers, row)
+    }
+}
+
+pub(super) fn all_entity_facts(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
+    Ok(NamedRows::new(
+        ENTITY_FACT_HEADERS
+            .iter()
+            .map(|header| (*header).into())
+            .collect(),
+        db.run::<AllEntityFactsQuery>(view, ())?
+            .into_iter()
+            .map(EntityFactRow::into_values)
+            .collect(),
+    ))
+}
+
+const WORKSPACE_TOPOLOGY_HEADERS: &[&str] = &[
+    "from",
+    "to",
+    "relation",
+    "evidence",
+    "confidence",
+    "provenance",
+];
+
+struct WorkspaceTopologyQuery;
+
+impl MnesticQuery for WorkspaceTopologyQuery {
+    const OPERATION: &'static str = "workspace_topology";
+    const SCRIPT: &'static str = concat!(
+        include_str!("../../../rules/core/direct.datalog"),
+        "\n?[from, to, relation, evidence, confidence, provenance] := \
+             effective_observation[from, to, relation, evidence, confidence, provenance]\n\
+         :order from, to, relation, evidence"
+    );
+    const HEADERS: &'static [&'static str] = WORKSPACE_TOPOLOGY_HEADERS;
+
+    type Params = ();
+    type Row = Vec<DataValue>;
+
+    fn bind(_: &Self::Params) -> BTreeMap<String, DataValue> {
+        BTreeMap::new()
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        Ok(row.to_vec())
+    }
+}
+
+pub(super) fn workspace_topology(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
+    Ok(NamedRows::new(
+        WORKSPACE_TOPOLOGY_HEADERS
+            .iter()
+            .map(|header| (*header).into())
+            .collect(),
+        db.run::<WorkspaceTopologyQuery>(view, ())?,
+    ))
+}
+
 pub(super) fn inspect_observations(
     db: &DbInstance,
     relation: Option<&str>,
@@ -1312,8 +1413,8 @@ mod tests {
     use crate::schema::DIRECT_RULES;
     use crate::{SemanticStore, database::memory_database};
     use beholder_domain::{
-        DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
-        StructuralRelation, WorkspaceView,
+        DependencyRelation, EntityFact, EntityKind, LogicalRepository, Observation,
+        RepositoryFacts, RepositoryState, StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
     use std::{cell::Cell, collections::BTreeSet, fs, time::Duration, time::SystemTime};
@@ -1472,12 +1573,19 @@ mod tests {
     }
 
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
+        let entities = observations
+            .iter()
+            .flat_map(|observation| [&observation.from, &observation.to])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|id| EntityFact::new(id.clone(), EntityKind::Callable, None).unwrap())
+            .collect();
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities,
             grpc_bindings: Vec::new(),
             observations,
         }

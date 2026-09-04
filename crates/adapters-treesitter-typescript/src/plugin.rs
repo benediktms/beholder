@@ -23,7 +23,7 @@ impl Plugin<TypescriptLanguage> for TsProtoPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "typescript.ts-proto".into(),
-            version: "2".into(),
+            version: "3".into(),
         }
     }
 
@@ -72,14 +72,16 @@ impl RepositoryEnricher<TypescriptLanguage> for TsProtoPlugin {
             .map(|(path, analysis)| (path.as_path(), analysis.as_ref()))
             .collect::<Vec<_>>();
         let generated = ts_proto::grpc_methods(&repository.repository, &sources);
+        let observations = sources
+            .iter()
+            .flat_map(|(path, analysis)| {
+                ts_proto::message_observations(&repository.repository, analysis, path)
+            })
+            .collect::<Vec<_>>();
         Ok(RepositoryEnrichment {
             grpc_bindings: ts_proto::client_bindings(&generated, base.observations),
-            observations: sources
-                .iter()
-                .flat_map(|(path, analysis)| {
-                    ts_proto::message_observations(&repository.repository, analysis, path)
-                })
-                .collect(),
+            entities: ts_proto::message_entities(&observations),
+            observations,
             ..Default::default()
         })
     }
@@ -215,11 +217,11 @@ mod tests {
         let active = plugins.activate(&repository, true);
         assert_eq!(
             active.identity(),
-            "17:typescript.nestjs1:219:typescript.ts-proto1:2"
+            "17:typescript.nestjs1:219:typescript.ts-proto1:3"
         );
         assert_eq!(
             plugins.source_identity(&active),
-            "17:typescript.nestjs1:219:typescript.ts-proto1:2"
+            "17:typescript.nestjs1:219:typescript.ts-proto1:3"
         );
         let evidence = active
             .plugins()

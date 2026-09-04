@@ -1152,6 +1152,7 @@ fn refresh_semantic_noop(
     store_revision_inputs(&transaction, view)?;
     let obsolete = reconcile_obsolete_enrichments(&transaction, &view.name)?;
     let affected_sources = enrichment_dependency_sources(&transaction, &view.name, &obsolete)?;
+    validate_selected_semantics(&transaction, &view.name)?;
     refresh_resolved_dependencies(&transaction, &view.name, &affected_sources)?;
     transaction.commit()?;
     Ok(true)
@@ -2263,6 +2264,7 @@ pub(super) fn publish_observations(
         obsolete_selections = obsolete.len(),
         "Mnestic publication stage completed"
     );
+    validate_selected_semantics(&transaction, &view.name)?;
     if report_shard_changes {
         refresh_resolved_dependencies(&transaction, &view.name, &affected_sources)?;
     } else {
@@ -2493,6 +2495,44 @@ fn carry_forward_enrichment_selections(
         BTreeMap::from([("view".into(), view.into())]),
     )?;
     Ok(())
+}
+
+fn validate_selected_semantics(
+    transaction: &MultiTransaction,
+    view: &str,
+) -> Result<(), Box<dyn Error>> {
+    let entities = transaction.run_script(
+        &format!(
+            "{DIRECT_RULES}\n\
+             entity[id, kind, metadata] := selected_state[state], *state_entity{{state, id, kind, metadata}}\n\
+             entity[id, kind, metadata] := selected_shard[producer, owner, version], *analysis_fact_shard_entity{{producer, owner, version, id, kind, metadata}}\n\
+             entity[id, kind, metadata] := *analysis_revision{{view: $view, revision}}, *analysis_revision_entity{{view: $view, revision, id, kind, metadata}}\n\
+             entity[id, kind, metadata] := selected_enrichment[owner, _, _, _, _], *enrichment_entity_contribution{{view: $view, owner, id, kind, metadata}}\n\
+             ?[id, kind, metadata] := entity[id, kind, metadata]"
+        ),
+        BTreeMap::from([("view".into(), view.into())]),
+    )?.rows.into_iter().map(|row| -> Result<EntityFact, Box<dyn Error>> {
+        Ok(EntityFact::new(
+            stored_string(&row, 0, "entity ID")?.to_owned(),
+            parse_entity_kind(stored_string(&row, 1, "entity kind")?)?,
+            parse_entity_metadata(stored_string(&row, 2, "entity metadata")?)?,
+        )?)
+    }).collect::<Result<Vec<_>, _>>()?;
+    let observations = transaction.run_script(
+        &format!("{DIRECT_RULES}\n\n?[from, relation, to, evidence, confidence, provenance] := effective_observation[from, to, relation, evidence, confidence, provenance]"),
+        BTreeMap::from([("view".into(), view.into())]),
+    )?.rows.into_iter().map(|row| -> Result<Observation, Box<dyn Error>> {
+        Ok(Observation { from: stored_string(&row, 0, "observation source")?.into(), relation: parse_relation(stored_string(&row, 1, "observation relation")?)?, to: stored_string(&row, 2, "observation target")?.into(), evidence: stored_string(&row, 3, "observation evidence")?.into(), confidence: parse_confidence(row[4].get_float().ok_or("stored confidence is not a float")?)?, provenance: parse_provenance(stored_string(&row, 5, "observation provenance")?)? })
+    }).collect::<Result<Vec<_>, _>>()?;
+    let overrides = transaction.run_script(
+        &format!("{DIRECT_RULES}\n\n?[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := dependency_override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance]"),
+        BTreeMap::from([("view".into(), view.into())]),
+    )?.rows.into_iter().map(|row| -> Result<DependencyOverride, Box<dyn Error>> {
+        let SemanticRelation::Dependency(relation) = parse_relation(stored_string(&row, 1, "override relation")?)? else { return Err("stored override relation is not a dependency relation".into()); };
+        Ok(DependencyOverride { from: stored_string(&row, 0, "override source")?.into(), relation, unresolved_to: stored_string(&row, 2, "override unresolved target")?.into(), resolved_to: stored_string(&row, 3, "override resolved target")?.into(), evidence: stored_string(&row, 4, "override evidence")?.into(), confidence: parse_confidence(row[5].get_float().ok_or("stored confidence is not a float")?)?, provenance: parse_provenance(stored_string(&row, 6, "override provenance")?)? })
+    }).collect::<Result<Vec<_>, _>>()?;
+    beholder_domain::validate_entity_complete_semantics(&entities, &observations, &overrides)
+        .map_err(Into::into)
 }
 
 fn remove_obsolete_enrichment_selections(
@@ -3228,6 +3268,7 @@ pub(super) fn publish_enrichment(
         params,
     )?;
     let affected_sources = enrichment_dependency_sources(&transaction, view, &changed_owners)?;
+    validate_selected_semantics(&transaction, view)?;
     refresh_resolved_dependencies(&transaction, view, &affected_sources)?;
     let started = Instant::now();
     transaction.commit()?;
@@ -4470,12 +4511,19 @@ mod tests {
         time::{Instant, SystemTime},
     };
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
+        let entities = observations
+            .iter()
+            .flat_map(|observation| [&observation.from, &observation.to])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|id| EntityFact::new(id.clone(), EntityKind::Callable, None).unwrap())
+            .collect();
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities,
             grpc_bindings: Vec::new(),
             observations,
         }
@@ -4655,6 +4703,7 @@ mod tests {
             )
             .unwrap(),
             EntityFact::new("kafka-topic://events", EntityKind::KafkaTopic, None).unwrap(),
+            EntityFact::new("kafka-topic://external", EntityKind::KafkaTopic, None).unwrap(),
             EntityFact::new(
                 "proto-type://events.Envelope",
                 EntityKind::ProtoType,
@@ -4703,10 +4752,58 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(entities.len(), 3);
+        assert_eq!(entities.len(), 4);
         assert_eq!(observations.len(), 2);
         assert_eq!(candidates, vec![candidate]);
         assert_eq!(observations[0].relation.as_str(), "publishes");
+    }
+
+    #[test]
+    fn topology_includes_structural_observations() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "app".into(),
+                },
+                head: None,
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let mut facts = facts(
+            &view,
+            vec![Observation::structural(
+                "repo://app/elixir/Producer",
+                StructuralRelation::Defines,
+                "repo://app/elixir/Producer.publish/1",
+                "lib/producer.ex:3",
+            )],
+        );
+        facts.entities = vec![
+            EntityFact::new("repo://app/elixir/Producer", EntityKind::Namespace, None).unwrap(),
+            EntityFact::new(
+                "repo://app/elixir/Producer.publish/1",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        ];
+        store
+            .publish_verified_sharded(&view, &[facts], &[], &[], &[], "verified")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .workspace_topology_snapshot("main")
+                .unwrap()
+                .result
+                .edges
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -4815,7 +4912,13 @@ mod tests {
             analysis_identity: "rust".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities: [
+                "repo://application/rust/client/get_quote",
+                "repo://application/rust/server/get_quote",
+            ]
+            .into_iter()
+            .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
+            .collect(),
             grpc_bindings: vec![
                 candidate(
                     "repo://application/rust/client/get_quote",
@@ -5031,6 +5134,10 @@ mod tests {
             "repo/target",
             "src/lib.rs:1",
         );
+        let entities = ["repo/source", "repo/target"]
+            .into_iter()
+            .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
+            .collect::<Vec<_>>();
         for (name, analysis_identity) in [("first", "analysis-v1"), ("second", "analysis-v2")] {
             let view = with_enrichment_analyzers(
                 WorkspaceView::new(name, format!("workspace-rules:{name}"), vec![state.clone()])
@@ -5045,7 +5152,7 @@ mod tests {
                         analysis_identity: analysis_identity.into(),
                         incomplete: false,
                         diagnostics: Vec::new(),
-                        entities: Vec::new(),
+                        entities: entities.clone(),
                         grpc_bindings: Vec::new(),
                         observations: vec![observation.clone()],
                     }],
@@ -5101,6 +5208,15 @@ mod tests {
             std::slice::from_ref(&observation),
         )
         .unwrap();
+        store_entities(
+            &transaction,
+            legacy_state,
+            &[
+                EntityFact::new("repo/source", EntityKind::Callable, None).unwrap(),
+                EntityFact::new("repo/target", EntityKind::Callable, None).unwrap(),
+            ],
+        )
+        .unwrap();
         transaction
             .run_script(
                 "?[fingerprint, repository, head] <- [[$state, 'repo', 'head']] \
@@ -5133,7 +5249,10 @@ mod tests {
                     analysis_identity: "analysis-v2".into(),
                     incomplete: false,
                     diagnostics: Vec::new(),
-                    entities: Vec::new(),
+                    entities: vec![
+                        EntityFact::new("repo/source", EntityKind::Callable, None).unwrap(),
+                        EntityFact::new("repo/target", EntityKind::Callable, None).unwrap(),
+                    ],
                     grpc_bindings: Vec::new(),
                     observations: vec![observation],
                 }],
@@ -5285,7 +5404,14 @@ mod tests {
                         analysis_identity: "analysis".into(),
                         incomplete: false,
                         diagnostics: Vec::new(),
-                        entities: Vec::new(),
+                        entities: vec![
+                            EntityFact::new(
+                                "repo://source/rust/lib/caller",
+                                EntityKind::Callable,
+                                None,
+                            )
+                            .unwrap(),
+                        ],
                         grpc_bindings: Vec::new(),
                         observations: vec![unresolved.clone()],
                     },
@@ -5294,7 +5420,11 @@ mod tests {
                         analysis_identity: "analysis".into(),
                         incomplete: false,
                         diagnostics: Vec::new(),
-                        entities: Vec::new(),
+                        entities: vec![
+                            EntityFact::new("repo://target/rust/lib", EntityKind::Namespace, None)
+                                .unwrap(),
+                            EntityFact::new(resolved, EntityKind::Callable, None).unwrap(),
+                        ],
                         grpc_bindings: Vec::new(),
                         observations: vec![Observation::structural(
                             "repo://target/rust/lib",
@@ -5582,7 +5712,10 @@ mod tests {
             producer: "elixir".into(),
             owner: owner.into(),
             version: version.into(),
-            entities: vec![EntityFact::new(owner, EntityKind::Callable, None).unwrap()],
+            entities: vec![
+                EntityFact::new(owner, EntityKind::Callable, None).unwrap(),
+                EntityFact::new(target, EntityKind::Callable, None).unwrap(),
+            ],
             observations: vec![Observation::dependency(
                 owner,
                 DependencyRelation::Calls,
@@ -6055,6 +6188,14 @@ mod tests {
             "src/lib.rs:2",
         );
         let mut baseline = facts(&view, vec![call.clone()]);
+        baseline.entities.push(
+            EntityFact::new(
+                "repo://example/repo/rust/lib/helper",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
         baseline.diagnostics.push(AnalysisDiagnostic {
             code: "rust.syntax_recovered".into(),
             severity: AnalysisDiagnosticSeverity::Warning,
@@ -6247,6 +6388,8 @@ mod tests {
 
         let generated = "repo://example/repo/elixir/Example/generated/0";
         let entity = EntityFact::new(generated, EntityKind::Callable, None).unwrap();
+        let external =
+            EntityFact::new("elixir-call://External/run/0", EntityKind::Callable, None).unwrap();
         let mut observation = Observation::dependency(
             generated,
             DependencyRelation::Calls,
@@ -6267,7 +6410,7 @@ mod tests {
                         version: "1",
                     },
                     EnrichmentPayload {
-                        entities: &[entity],
+                        entities: &[entity, external],
                         observations: &[observation],
                         ..EnrichmentPayload::default()
                     },
@@ -6367,6 +6510,14 @@ mod tests {
         };
         let mut baseline = facts(&view, vec![observation.clone()]);
         baseline.entities.push(entity.clone());
+        baseline.entities.push(
+            EntityFact::new(
+                "repo://example/repo/baseline-target",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
         baseline.diagnostics.push(diagnostic.clone());
         store
             .publish(&view, &[baseline], std::slice::from_ref(&baseline_override))
@@ -6408,65 +6559,9 @@ mod tests {
                         fact_shards: &[],
                     },
                 )
-                .unwrap()
+                .is_err()
         );
-        assert_eq!(current_revision(&store, "baseline-collision"), 2);
-
-        assert!(
-            store
-                .publish_enrichment(
-                    &view.name,
-                    "example/repo",
-                    &input,
-                    EnrichmentOwner {
-                        analyzer: "compiler",
-                        version: "2",
-                    },
-                    EnrichmentPayload::default(),
-                )
-                .unwrap()
-        );
-        assert_eq!(current_revision(&store, "baseline-collision"), 3);
-        let rows = store
-            .db
-            .run_script(
-                "?[kind, confidence, provenance, resolved_to, override_provenance, detail] := \
-                     *analysis_revision{view: 'baseline-collision', revision}, \
-                     *analysis_revision_state{view: 'baseline-collision', revision, state}, \
-                     *state_entity{state, id: $id, kind}, \
-                     *state_observation_metadata{\
-                         state, from: $id, relation: 'calls', to: 'call://shared', confidence, \
-                         provenance\
-                     }, not *analysis_revision_entity{\
-                         view: 'baseline-collision', revision, id: $id\
-                     }, not *analysis_revision_observation{\
-                         view: 'baseline-collision', revision, from: $id, relation: 'calls', \
-                         to: 'call://shared', evidence: 'src/lib.rs:1'\
-                     }, *analysis_revision_dependency_override{\
-                         view: 'baseline-collision', revision, from: $id, relation: 'calls', \
-                         unresolved_to: 'call://shared', resolved_to\
-                     }, *analysis_revision_dependency_override_metadata{\
-                         view: 'baseline-collision', revision, from: $id, relation: 'calls', \
-                         unresolved_to: 'call://shared', provenance: override_provenance\
-                     }, *analysis_revision_diagnostic{\
-                         view: 'baseline-collision', revision, repository: 'example/repo', \
-                         code: 'shared.warning', severity: 'known_limitation', path: 'src/lib.rs', \
-                         line: 7, detail\
-                     }",
-                BTreeMap::from([("id".into(), entity.id.as_str().into())]),
-                ScriptMutability::Immutable,
-            )
-            .unwrap();
-        assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0][0].get_str(), Some(entity_kind(entity.kind)));
-        assert_eq!(rows.rows[0][1].get_float(), Some(Confidence::Exact.score()));
-        assert_eq!(rows.rows[0][2].get_str(), Some(Provenance::Ast.as_str()));
-        assert_eq!(
-            rows.rows[0][3].get_str(),
-            Some("repo://example/repo/baseline-target")
-        );
-        assert_eq!(rows.rows[0][4].get_str(), Some(Provenance::Ast.as_str()));
-        assert_eq!(rows.rows[0][5].get_str(), Some("baseline detail"));
+        assert_eq!(current_revision(&store, "baseline-collision"), 1);
     }
 
     #[test]
@@ -6500,10 +6595,14 @@ mod tests {
             "call://second",
             "src/lib.rs:2",
         );
+        let mut baseline = facts(&view, vec![first.clone(), second.clone()]);
+        baseline.entities.push(
+            EntityFact::new("repo://example/repo/first", EntityKind::Callable, None).unwrap(),
+        );
         store
             .publish(
                 &view,
-                &[facts(&view, vec![first.clone(), second.clone()])],
+                &[baseline],
                 &[DependencyOverride {
                     from: first.from,
                     relation: DependencyRelation::Calls,
@@ -6517,6 +6616,8 @@ mod tests {
             .unwrap();
         let input =
             view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler");
+        let resolved_second =
+            EntityFact::new("repo://example/repo/second", EntityKind::Callable, None).unwrap();
         store
             .publish_enrichment(
                 &view.name,
@@ -6527,6 +6628,7 @@ mod tests {
                     version: "1",
                 },
                 EnrichmentPayload {
+                    entities: &[resolved_second],
                     overrides: &[DependencyOverride {
                         from: second.from,
                         relation: DependencyRelation::Calls,
@@ -6624,6 +6726,92 @@ mod tests {
                 beholder_dto::EvidenceKind::Ast,
                 beholder_dto::EvidenceKind::Compiler,
             ])
+        );
+    }
+
+    #[test]
+    fn enrichment_rejects_entities_conflicting_with_other_selected_outputs() {
+        let store = SemanticStore::memory().unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "enrichment-entity-conflict",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: "source".into(),
+                }],
+            )
+            .unwrap(),
+            &["compiler-a", "compiler-b"],
+        );
+        store
+            .publish(&view, &[facts(&view, Vec::new())], &[])
+            .unwrap();
+        let entity = EntityFact::new(
+            "repo://example/repo/generated/shared",
+            EntityKind::Callable,
+            None,
+        )
+        .unwrap();
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler-a");
+        store
+            .publish_enrichment(
+                &view.name,
+                "example/repo",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "compiler-a",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    entities: std::slice::from_ref(&entity),
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let corrected = EntityFact::new(entity.id.clone(), EntityKind::Namespace, None).unwrap();
+        assert!(
+            store
+                .publish_enrichment(
+                    &view.name,
+                    "example/repo",
+                    &input,
+                    EnrichmentOwner {
+                        analyzer: "compiler-a",
+                        version: "2",
+                    },
+                    EnrichmentPayload {
+                        entities: std::slice::from_ref(&corrected),
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .unwrap()
+        );
+
+        let conflicting = EntityFact::new(entity.id.clone(), EntityKind::Callable, None).unwrap();
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler-b");
+        assert!(
+            store
+                .publish_enrichment(
+                    &view.name,
+                    "example/repo",
+                    &input,
+                    EnrichmentOwner {
+                        analyzer: "compiler-b",
+                        version: "1",
+                    },
+                    EnrichmentPayload {
+                        entities: std::slice::from_ref(&conflicting),
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .is_err()
         );
     }
 
@@ -6963,9 +7151,12 @@ mod tests {
             "call://target",
             "src/lib.rs:1",
         );
-        store
-            .publish(&view, &[facts(&view, vec![call.clone()])], &[])
-            .unwrap();
+        let mut baseline = facts(&view, vec![call.clone()]);
+        baseline.entities.extend([
+            EntityFact::new("repo://example/repo/target-a", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://example/repo/target-b", EntityKind::Callable, None).unwrap(),
+        ]);
+        store.publish(&view, &[baseline], &[]).unwrap();
         let override_for = |resolved_to: &str, confidence, provenance| DependencyOverride {
             from: call.from.clone(),
             relation: DependencyRelation::Calls,
@@ -7060,6 +7251,87 @@ mod tests {
     }
 
     #[test]
+    fn enrichment_accepts_resolved_context_entities() {
+        let store = SemanticStore::memory().unwrap();
+        let target = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/target".into(),
+            },
+            head: None,
+            fingerprint: "target".into(),
+        };
+        let context = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/context".into(),
+            },
+            head: None,
+            fingerprint: "context".into(),
+        };
+        let view = WorkspaceView::new(
+            "context-override",
+            "analysis",
+            vec![target.clone(), context],
+        )
+        .unwrap()
+        .with_repository_contexts(BTreeMap::from([(
+            "typescript".into(),
+            BTreeMap::from([("example/target".into(), vec!["example/context".into()])]),
+        )]))
+        .unwrap();
+        let call = Observation::dependency(
+            "repo://example/target/typescript/caller",
+            DependencyRelation::Calls,
+            "typescript-method://counter/value",
+            "src/caller.ts:1",
+        );
+        let mut context_facts = facts(&view, Vec::new());
+        context_facts.state = view.repository_states[1].clone();
+        context_facts.entities.push(
+            EntityFact::new(
+                "repo://example/context/typescript/target/Counter/value",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
+        store
+            .publish(
+                &view,
+                &[facts(&view, vec![call.clone()]), context_facts],
+                &[],
+            )
+            .unwrap();
+
+        let input = view.repository_enrichment_input_fingerprint(&target, "typescript");
+        assert!(
+            store
+                .publish_enrichment(
+                    &view.name,
+                    "example/target",
+                    &input,
+                    EnrichmentOwner {
+                        analyzer: "typescript",
+                        version: "1",
+                    },
+                    EnrichmentPayload {
+                        overrides: &[DependencyOverride {
+                            from: call.from,
+                            relation: DependencyRelation::Calls,
+                            unresolved_to: call.to,
+                            resolved_to: "repo://example/context/typescript/target/Counter/value"
+                                .into(),
+                            evidence: "src/caller.ts:1".into(),
+                            confidence: Confidence::Exact,
+                            provenance: Provenance::Compiler,
+                        }],
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn carried_enrichment_uses_current_baseline_evidence() {
         let store = SemanticStore::memory().unwrap();
         let view = |fingerprint: &str| {
@@ -7090,9 +7362,16 @@ mod tests {
             "rust-call://helper",
             "src/lib.rs:2",
         );
-        store
-            .publish(&first, &[facts(&first, vec![call.clone()])], &[])
-            .unwrap();
+        let mut baseline = facts(&first, vec![call.clone()]);
+        baseline.entities.push(
+            EntityFact::new(
+                "repo://example/repo/rust/lib/helper",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
+        store.publish(&first, &[baseline], &[]).unwrap();
         let input =
             first.repository_enrichment_input_fingerprint(&first.repository_states[0], "rust");
         store
@@ -7126,9 +7405,16 @@ mod tests {
             call.to.clone(),
             "src/lib.rs:20",
         );
-        store
-            .publish(&second, &[facts(&second, vec![moved])], &[])
-            .unwrap();
+        let mut refreshed = facts(&second, vec![moved]);
+        refreshed.entities.push(
+            EntityFact::new(
+                "repo://example/repo/rust/lib/helper",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
+        store.publish(&second, &[refreshed], &[]).unwrap();
 
         let rows = store
             .db
@@ -7152,6 +7438,185 @@ mod tests {
             Some("repo://example/repo/rust/lib/helper")
         );
         assert_eq!(rows.rows[0][1].get_str(), Some("src/lib.rs:20"));
+    }
+
+    #[test]
+    fn baseline_refresh_rejects_carried_enrichment_without_endpoint_fact() {
+        let store = SemanticStore::memory().unwrap();
+        let view = |fingerprint: &str| {
+            with_enrichment_analyzers(
+                WorkspaceView::new(
+                    "invalid-carried-enrichment",
+                    "syntax",
+                    vec![RepositoryState {
+                        repository: LogicalRepository {
+                            identity: "example/repo".into(),
+                        },
+                        head: None,
+                        fingerprint: fingerprint.into(),
+                    }],
+                )
+                .unwrap(),
+                &["rust"],
+            )
+        };
+        let first = view("source-1");
+        let call = Observation::dependency(
+            "repo://example/repo/rust/lib/caller",
+            DependencyRelation::Calls,
+            "rust-call://helper",
+            "src/lib.rs:2",
+        );
+        let mut baseline = facts(&first, vec![call.clone()]);
+        baseline.entities.push(
+            EntityFact::new(
+                "repo://example/repo/rust/lib/helper",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
+        store.publish(&first, &[baseline], &[]).unwrap();
+        let input =
+            first.repository_enrichment_input_fingerprint(&first.repository_states[0], "rust");
+        store
+            .publish_enrichment(
+                &first.name,
+                "example/repo",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "rust",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    overrides: &[DependencyOverride {
+                        from: call.from.clone(),
+                        relation: DependencyRelation::Calls,
+                        unresolved_to: call.to.clone(),
+                        resolved_to: "repo://example/repo/rust/lib/helper".into(),
+                        evidence: call.evidence.clone(),
+                        confidence: Confidence::Exact,
+                        provenance: Provenance::Compiler,
+                    }],
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(current_revision(&store, &first.name), 2);
+
+        let second = view("source-2");
+        let moved = Observation::dependency(
+            call.from.clone(),
+            DependencyRelation::Calls,
+            call.to.clone(),
+            "src/lib.rs:20",
+        );
+        assert!(
+            store
+                .publish(&second, &[facts(&second, vec![moved])], &[])
+                .is_err()
+        );
+        assert_eq!(current_revision(&store, &first.name), 2);
+        assert_eq!(
+            store
+                .dependencies(&first.name, call.from.as_str(), 1)
+                .unwrap()
+                .dependencies[0]
+                .entity,
+            "repo://example/repo/rust/lib/helper"
+        );
+    }
+
+    #[test]
+    fn enrichment_validation_includes_unrelated_repository_baselines() {
+        let store = SemanticStore::memory().unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "unrelated-enrichment",
+                "syntax",
+                vec![
+                    RepositoryState {
+                        repository: LogicalRepository {
+                            identity: "example/a".into(),
+                        },
+                        head: None,
+                        fingerprint: "a".into(),
+                    },
+                    RepositoryState {
+                        repository: LogicalRepository {
+                            identity: "example/b".into(),
+                        },
+                        head: None,
+                        fingerprint: "b".into(),
+                    },
+                ],
+            )
+            .unwrap(),
+            &["compiler"],
+        );
+        let a_facts = facts(&view, Vec::new());
+        let mut b_facts = facts(&view, Vec::new());
+        b_facts.state = view.repository_states[1].clone();
+        let b_source = "repo://example/b/source";
+        let b_target = "repo://example/b/target";
+        b_facts.entities = [b_source, b_target]
+            .into_iter()
+            .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
+            .collect();
+        store.publish(&view, &[a_facts, b_facts], &[]).unwrap();
+
+        let b_input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[1], "compiler");
+        store
+            .publish_enrichment(
+                &view.name,
+                "example/b",
+                &b_input,
+                EnrichmentOwner {
+                    analyzer: "compiler",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    observations: &[Observation::dependency(
+                        b_source,
+                        DependencyRelation::Calls,
+                        b_target,
+                        "src/lib.rs:1",
+                    )],
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let a_entity =
+            EntityFact::new("repo://example/a/generated", EntityKind::Callable, None).unwrap();
+        let a_input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler");
+        assert!(
+            store
+                .publish_enrichment(
+                    &view.name,
+                    "example/a",
+                    &a_input,
+                    EnrichmentOwner {
+                        analyzer: "compiler",
+                        version: "1",
+                    },
+                    EnrichmentPayload {
+                        entities: std::slice::from_ref(&a_entity),
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .context(&view.name, a_entity.id.as_str())
+                .unwrap()
+                .root
+                .id,
+            a_entity.id.as_str()
+        );
     }
 
     #[test]

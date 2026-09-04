@@ -376,9 +376,81 @@ impl EntityFact {
     }
 }
 
+/// Validates the entity contract shared by semantic producers and publishers.
+///
+/// A published graph is only useful when entity identity is authoritative: every
+/// relationship endpoint must have one fact, and multiple producers describing
+/// the same entity must agree completely. Keeping this validation in the domain
+/// crate makes workers, the baseline publisher, and enrichment publication use
+/// the same rules.
+pub fn validate_entity_complete_semantics<'a>(
+    entities: impl IntoIterator<Item = &'a EntityFact>,
+    observations: impl IntoIterator<Item = &'a Observation>,
+    overrides: impl IntoIterator<Item = &'a DependencyOverride>,
+) -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut selected = BTreeMap::<&str, (&EntityKind, &Option<EntityMetadata>)>::new();
+    for entity in entities {
+        match selected.get(entity.id.as_str()) {
+            Some((kind, metadata)) if **kind != entity.kind || **metadata != entity.metadata => {
+                return Err(format!("conflicting entity facts for {}", entity.id));
+            }
+            Some(_) => {}
+            None => {
+                selected.insert(entity.id.as_str(), (&entity.kind, &entity.metadata));
+            }
+        }
+    }
+
+    let mut required = BTreeSet::new();
+    for observation in observations {
+        required.insert(observation.from.as_str());
+        required.insert(observation.to.as_str());
+    }
+    for dependency_override in overrides {
+        required.insert(dependency_override.from.as_str());
+        required.insert(dependency_override.resolved_to.as_str());
+    }
+    if let Some(missing) = required.into_iter().find(|id| !selected.contains_key(id)) {
+        return Err(format!(
+            "missing entity fact for relationship endpoint {missing}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod entity_fact_tests {
     use super::*;
+
+    #[test]
+    fn accepts_resolved_overrides_without_facts_for_lookup_keys() {
+        let caller =
+            EntityFact::new("repo://example/rust/caller", EntityKind::Callable, None).unwrap();
+        let target =
+            EntityFact::new("repo://example/rust/target", EntityKind::Callable, None).unwrap();
+        let observation = Observation::dependency(
+            caller.id.clone(),
+            DependencyRelation::Calls,
+            target.id.clone(),
+            "src/lib.rs:1",
+        );
+        let override_ = DependencyOverride {
+            from: caller.id.clone(),
+            relation: DependencyRelation::Calls,
+            unresolved_to: "rust-call://target".into(),
+            resolved_to: target.id.clone(),
+            evidence: observation.evidence.clone(),
+            confidence: Confidence::Inferred,
+            provenance: Provenance::UniqueNameHeuristic,
+        };
+
+        assert!(
+            validate_entity_complete_semantics([&caller, &target], [&observation], [&override_],)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn rejects_incompatible_metadata() {

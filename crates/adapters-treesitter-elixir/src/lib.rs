@@ -1,5 +1,5 @@
-pub const FRONTEND_VERSION: &str = "23";
-pub const RESOLVER_VERSION: &str = "12";
+pub const FRONTEND_VERSION: &str = "24";
+pub const RESOLVER_VERSION: &str = "13";
 
 mod absinthe;
 mod analysis;
@@ -19,5 +19,5 @@ pub use model::{ElixirAnalysis, ElixirRepository};
 pub use resolution::{
     diagnostics_from_analysis, entities_from_analysis, generated_entities, generated_observations,
     observations, observations_from_analysis, resolve_repository_calls, resolve_workspace_modules,
-    workspace_dynamic_dispatch_observations,
+    unresolved_endpoint_entities, workspace_dynamic_dispatch_observations,
 };
