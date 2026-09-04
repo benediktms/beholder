@@ -61,12 +61,13 @@ func TestTypeScriptExecutablePrefersNativePreview(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, root, "node_modules/.bin/tsc", "", 0o755)
 	writeTestFile(t, root, "node_modules/.bin/tsgo", "", 0o755)
+	writeTestFile(t, root, "node_modules/typescript-native/bin/tsc", "", 0o755)
 
 	executable, err := typescriptExecutable(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if executable != filepath.Join(root, "node_modules", ".bin", "tsgo") {
+	if executable != filepath.Join(root, "node_modules", "typescript-native", "bin", "tsc") {
 		t.Fatalf("selected %q", executable)
 	}
 }

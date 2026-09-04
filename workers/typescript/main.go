@@ -152,8 +152,11 @@ func repositoryPath(root, path string) (string, error) {
 }
 
 func typescriptExecutable(root string) (string, error) {
-	for _, name := range []string{"tsgo", "tsc"} {
-		executable := filepath.Join(root, "node_modules", ".bin", name)
+	for _, executable := range []string{
+		filepath.Join(root, "node_modules", "typescript-native", "bin", "tsc"),
+		filepath.Join(root, "node_modules", ".bin", "tsgo"),
+		filepath.Join(root, "node_modules", ".bin", "tsc"),
+	} {
 		info, err := os.Stat(executable)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {

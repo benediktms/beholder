@@ -347,6 +347,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .accept_extension("tsx")
         .accept_extension("js")
         .accept_extension("jsx")
+        .activate_when_path_exists("node_modules/typescript-native/bin/tsc")
         .activate_when_path_exists("node_modules/.bin/tsgo")
         .activate_when_path_exists("node_modules/.bin/tsc")
         .accept_extension_as("json", AnalysisInputKind::Configuration)

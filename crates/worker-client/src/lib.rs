@@ -1089,6 +1089,7 @@ mod tests {
         let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
             .identity("typescript", "1")
             .accept_extension("js")
+            .activate_when_path_exists("node_modules/typescript-native/bin/tsc")
             .activate_when_path_exists("node_modules/.bin/tsgo")
             .activate_when_path_exists("node_modules/.bin/tsc")
             .build()
@@ -1110,7 +1111,7 @@ mod tests {
         };
 
         assert!(!worker.is_active(&repository));
-        let compiler = root.join("node_modules/.bin/tsgo");
+        let compiler = root.join("node_modules/typescript-native/bin/tsc");
         fs::create_dir_all(compiler.parent().unwrap()).unwrap();
         fs::write(compiler, []).unwrap();
         assert!(worker.is_active(&repository));
