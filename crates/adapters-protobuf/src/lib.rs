@@ -14,7 +14,7 @@ mod compiler;
 
 pub use compiler::SourceCompiler;
 
-pub const FRONTEND_VERSION: &str = "3";
+pub const FRONTEND_VERSION: &str = "4";
 
 pub struct ProtobufAnalyzer {
     compiler: SourceCompiler,

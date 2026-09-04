@@ -1152,6 +1152,7 @@ fn refresh_semantic_noop(
     store_revision_inputs(&transaction, view)?;
     let obsolete = reconcile_obsolete_enrichments(&transaction, &view.name)?;
     let affected_sources = enrichment_dependency_sources(&transaction, &view.name, &obsolete)?;
+    validate_selected_semantics(&transaction, &view.name)?;
     refresh_resolved_dependencies(&transaction, &view.name, &affected_sources)?;
     transaction.commit()?;
     Ok(true)

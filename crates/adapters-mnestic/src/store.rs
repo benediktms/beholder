@@ -1339,6 +1339,109 @@ mod tests {
     }
 
     #[test]
+    fn semantic_noop_rejects_obsolete_entity_used_by_retained_enrichment() {
+        let store = SemanticStore::memory().unwrap();
+        let current_revision = || {
+            store
+                .db
+                .run_script(
+                    "?[revision] := *analysis_revision{view: 'semantic-noop-validation', revision}",
+                    BTreeMap::new(),
+                    mnestic_engine::ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows[0][0]
+                .get_int()
+                .unwrap()
+        };
+        let state = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/repository".into(),
+            },
+            head: None,
+            fingerprint: "source".into(),
+        };
+        let view = |analyzers: &[&str]| {
+            WorkspaceView::new("semantic-noop-validation", "analysis", vec![state.clone()])
+                .unwrap()
+                .with_repository_contexts(
+                    analyzers
+                        .iter()
+                        .map(|analyzer| ((*analyzer).into(), BTreeMap::new()))
+                        .collect(),
+                )
+                .unwrap()
+        };
+        let initial = view(&["compiler-a", "compiler-b"]);
+        let source = EntityFact::new("repo/source", EntityKind::Callable, None).unwrap();
+        let baseline = RepositoryFacts {
+            entities: vec![source.clone()],
+            ..facts(&initial, Vec::new())
+        };
+        store
+            .publish_verified_sharded(&initial, &[baseline], &[], &[], &[], "verified-1")
+            .unwrap();
+        let target = EntityFact::new("repo/target", EntityKind::Callable, None).unwrap();
+        let retained_observation = Observation::dependency(
+            source.id.as_str(),
+            DependencyRelation::Calls,
+            target.id.as_str(),
+            "src/lib.rs:1",
+        );
+        for (analyzer, payload) in [
+            (
+                "compiler-a",
+                EnrichmentPayload {
+                    entities: std::slice::from_ref(&target),
+                    ..EnrichmentPayload::default()
+                },
+            ),
+            (
+                "compiler-b",
+                EnrichmentPayload {
+                    observations: std::slice::from_ref(&retained_observation),
+                    ..EnrichmentPayload::default()
+                },
+            ),
+        ] {
+            let input = initial.repository_enrichment_input_fingerprint(&state, analyzer);
+            store
+                .publish_enrichment(
+                    &initial.name,
+                    "example/repository",
+                    &input,
+                    EnrichmentOwner {
+                        analyzer,
+                        version: "1",
+                    },
+                    payload,
+                )
+                .unwrap();
+        }
+        assert_eq!(current_revision(), 3);
+
+        let updated = view(&["compiler-b"]);
+        let baseline = RepositoryFacts {
+            entities: vec![source],
+            ..facts(&updated, Vec::new())
+        };
+        assert!(
+            store
+                .publish_verified_sharded(&updated, &[baseline], &[], &[], &[], "verified-2",)
+                .is_err()
+        );
+        assert_eq!(current_revision(), 3);
+        assert_eq!(
+            store
+                .context(&initial.name, target.id.as_str())
+                .unwrap()
+                .root
+                .id,
+            target.id.as_str()
+        );
+    }
+
+    #[test]
     fn standalone_repository_facts_are_reused_by_a_workspace() {
         let store = SemanticStore::memory().unwrap();
         let state = RepositoryState {
