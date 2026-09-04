@@ -638,7 +638,13 @@ mod tests {
         ] {
             fs::create_dir_all(repository.join(directory)).unwrap();
         }
-        for path in ["src/a.js", "src/b.jsx", "src/c.ts", "src/d.tsx"] {
+        for path in [
+            "src/a.js",
+            "src/b.jsx",
+            "src/c.ts",
+            "src/d.tsx",
+            "src/e.svelte",
+        ] {
             fs::write(repository.join(path), "export function indexed() {}").unwrap();
         }
         fs::write(

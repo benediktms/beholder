@@ -15,6 +15,7 @@ fn parser(language: SourceLanguage) -> Option<Parser> {
     let mut parser = Parser::new();
     let grammar = match language {
         SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
+        SourceLanguage::Svelte => tree_sitter_svelte_ng::LANGUAGE,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };

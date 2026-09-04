@@ -13,6 +13,7 @@ mod nestjs_di;
 mod nestjs_graphql;
 mod plugin;
 mod resolution;
+mod svelte;
 mod ts_proto;
 
 pub use analysis::{

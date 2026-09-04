@@ -9,6 +9,7 @@ use std::{
 pub enum SourceLanguage {
     JavaScript,
     Jsx,
+    Svelte,
     TypeScript,
     Tsx,
 }
@@ -20,6 +21,7 @@ impl SourceLanguage {
             "jsx" => Some(Self::Jsx),
             "ts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
+            "svelte" => Some(Self::Svelte),
             _ => None,
         }
     }
@@ -27,7 +29,7 @@ impl SourceLanguage {
     pub fn id_segment(self) -> &'static str {
         match self {
             Self::JavaScript | Self::Jsx => "javascript",
-            Self::TypeScript | Self::Tsx => "typescript",
+            Self::Svelte | Self::TypeScript | Self::Tsx => "typescript",
         }
     }
 
@@ -35,6 +37,7 @@ impl SourceLanguage {
         match self {
             Self::JavaScript => "21-javascript",
             Self::Jsx => "22-jsx",
+            Self::Svelte => "1-svelte",
             Self::TypeScript => "22-typescript",
             Self::Tsx => "22-tsx",
         }

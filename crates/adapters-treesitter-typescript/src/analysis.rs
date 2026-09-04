@@ -1561,6 +1561,7 @@ pub(super) fn analyze_with_plugins(
     let mut parser = Parser::new();
     let grammar = match language {
         SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
+        SourceLanguage::Svelte => tree_sitter_svelte_ng::LANGUAGE,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
@@ -1919,32 +1920,42 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_four_source_forms_with_their_explicit_grammar() {
-        for (path, source, expected) in [
-            ("src/plain.js", "export function run() {}", "/javascript/"),
+    fn parses_supported_source_forms_with_their_explicit_grammar() {
+        for (path, source, expected_language, expected_name) in [
+            (
+                "src/plain.js",
+                "export function run() {}",
+                "/javascript/",
+                "/run",
+            ),
             (
                 "src/view.jsx",
                 "export const View = () => <main />",
                 "/javascript/",
+                "/View",
             ),
             (
                 "src/plain.ts",
                 "export function run(value: string): string { return value }",
                 "/typescript/",
+                "/run",
             ),
             (
                 "src/view.tsx",
                 "export const View = (): JSX.Element => <main />",
                 "/typescript/",
+                "/View",
+            ),
+            (
+                "src/view.svelte",
+                "<script lang=\"ts\">export function run(value: string) { return value }</script><button>{run('ok')}</button>",
+                "/typescript/",
+                "/run",
             ),
         ] {
             assert!(observations(source, path).iter().any(|observation| {
-                observation.to.as_str().contains(expected)
-                    && observation.to.as_str().ends_with(if path.contains("view") {
-                        "/View"
-                    } else {
-                        "/run"
-                    })
+                observation.to.as_str().contains(expected_language)
+                    && observation.to.as_str().ends_with(expected_name)
             }));
         }
     }

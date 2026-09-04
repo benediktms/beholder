@@ -1,6 +1,6 @@
 use super::{
     SourceLanguage, TypescriptRepository, analysis::recover_syntax, graphql,
-    model::TypescriptAnalysis, nestjs, nestjs_di, ts_proto,
+    model::TypescriptAnalysis, nestjs, nestjs_di, svelte, ts_proto,
 };
 use beholder_indexing::{
     AnalyzerError, AnalyzerLanguage, LanguageAnalyzer, LanguageAnalyzerBuilder, Plugin,
@@ -166,6 +166,7 @@ impl RepositoryEnricher<TypescriptLanguage> for NestjsPlugin {
 
 pub(super) fn built_in_plugins() -> Result<LanguageAnalyzer<TypescriptLanguage>, AnalyzerError> {
     LanguageAnalyzerBuilder::new()
+        .add_plugin(svelte::SveltePlugin)
         .add_plugin(TsProtoPlugin)
         .add_plugin(NestjsPlugin)
         .build()
@@ -249,5 +250,21 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn svelte_plugin_activates_from_svelte_source() {
+        let repository = snapshot(&[(
+            "src/App.svelte",
+            "<script lang=\"ts\">export const app = true</script>",
+        )]);
+
+        let active = built_in_plugins().unwrap().activate(&repository, true);
+        let svelte = active
+            .plugins()
+            .find(|plugin| plugin.metadata.id == "typescript.svelte")
+            .unwrap();
+
+        assert_eq!(svelte.activation.path, PathBuf::from("src/App.svelte"));
     }
 }
