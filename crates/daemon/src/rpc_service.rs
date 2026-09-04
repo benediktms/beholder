@@ -325,14 +325,10 @@ impl Daemon for BeholderDaemon {
             .active_enrichment_repositories(&workspace)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        let revisioned = self
-            .store
-            .workspace_topology_status(&workspace)
-            .map_err(|error| {
-                error
-                    .downcast_ref::<BeholderError>()
-                    .map_or_else(|| Status::internal(error.to_string()), operation_status_ref)
-            })?;
+        let store = self.store.clone();
+        let query_workspace = workspace.clone();
+        let revisioned =
+            semantic_query(move || store.workspace_topology_status(&query_workspace)).await?;
         let metadata = self.scheduler.query_metadata_with_enrichments(
             &workspace,
             revisioned.analysis_revision,
