@@ -533,15 +533,11 @@ impl SemanticStore {
         limit: u32,
     ) -> Result<Revisioned<EntitySearchResult>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
-            let candidate = query
-                .split(['.', '/', ':'])
-                .max_by_key(|part| part.len())
-                .unwrap_or(query);
             let mut result = semantic::search_entities(
                 view,
                 query,
                 limit,
-                inspection_result(search_entity_facts(transaction, view, candidate, limit)?),
+                inspection_result(search_entity_facts(transaction, view, query, limit)?),
             )?;
             let generated = generated_entity_ids(
                 transaction,
@@ -1719,6 +1715,8 @@ mod tests {
                 None,
             )
             .unwrap(),
+            EntityFact::new("repo://example/rust/lib/a", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://example/rust/lib/z", EntityKind::Callable, None).unwrap(),
         ];
         repository.observations = vec![Observation::generated(
             "repo://example/rust/lib/call",
@@ -1734,6 +1732,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(candidates.result.rows.len(), 1);
+        let exact = store
+            .search_entities_snapshot("main", "repo://example/rust/lib/z", 1)
+            .unwrap();
+        assert_eq!(exact.result.matches[0].id, "repo://example/rust/lib/z");
+        let exact_name = store
+            .search_entities_snapshot("main", "ExampleService.Other", 1)
+            .unwrap();
+        assert_eq!(
+            exact_name.result.matches[0].id,
+            "grpc://example.v1.ExampleService/Other"
+        );
 
         let result = store
             .search_entities_snapshot("main", "ExampleService.Call", 20)

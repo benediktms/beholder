@@ -905,17 +905,41 @@ pub(super) fn all_entity_facts(
 
 struct SearchEntityFactsParams {
     candidate: String,
+    query: String,
+    name_patterns: BTreeSet<String>,
     limit: u32,
 }
 
+const SEARCH_ENTITY_FACT_HEADERS: &[&str] = &["id", "kind", "metadata", "rank"];
+
+macro_rules! ranked_entity_search {
+    ($source:literal) => {
+        concat!(
+            $source,
+            "\n\
+             name_pattern[pattern] <- $name_patterns\n\
+             exact_name[id] := candidate[id, _, _], name_pattern[pattern], ends_with(id, pattern)\n\
+             name_prefix[id] := candidate[id, _, _], name_pattern[pattern], str_includes(id, pattern)\n\
+             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], id = $query, rank = 0\n\
+             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], exact_name[id], rank = 1\n\
+             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], starts_with(id, $query), rank = 2\n\
+             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], name_prefix[id], rank = 2\n\
+             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], rank = 3\n\
+             ?[id, kind, metadata, rank] := ranked[id, kind, metadata, rank]\n\
+             :order rank, id\n\
+             :limit $limit"
+        )
+    };
+}
+
 macro_rules! search_entity_facts_query {
-    ($name:ident, $operation:literal, $script:literal) => {
+    ($name:ident, $operation:literal, $script:expr) => {
         struct $name;
 
         impl MnesticQuery for $name {
             const OPERATION: &'static str = $operation;
             const SCRIPT: &'static str = $script;
-            const HEADERS: &'static [&'static str] = ENTITY_FACT_HEADERS;
+            const HEADERS: &'static [&'static str] = SEARCH_ENTITY_FACT_HEADERS;
 
             type Params = SearchEntityFactsParams;
             type Row = EntityFactRow;
@@ -923,6 +947,17 @@ macro_rules! search_entity_facts_query {
             fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
                 BTreeMap::from([
                     ("candidate".into(), params.candidate.as_str().into()),
+                    ("query".into(), params.query.as_str().into()),
+                    (
+                        "name_patterns".into(),
+                        DataValue::List(
+                            params
+                                .name_patterns
+                                .iter()
+                                .map(|pattern| DataValue::List(vec![pattern.as_str().into()]))
+                                .collect(),
+                        ),
+                    ),
                     ("limit".into(), i64::from(params.limit).into()),
                 ])
             }
@@ -937,42 +972,56 @@ macro_rules! search_entity_facts_query {
 search_entity_facts_query!(
     SearchStateEntityFacts,
     "entity_search.state",
-    "selected_state[state] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, state}\n\
-     ?[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id\n\
-     :limit $limit"
+    ranked_entity_search!(
+        "selected_state[state] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, state}\n\
+         candidate[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}, str_includes(id, $candidate)"
+    )
 );
 search_entity_facts_query!(
     SearchRevisionEntityFacts,
     "entity_search.revision",
-    "?[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_entity{view: $view, revision, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id\n\
-     :limit $limit"
+    ranked_entity_search!(
+        "candidate[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_entity{view: $view, revision, id, kind, metadata}, str_includes(id, $candidate)"
+    )
 );
 search_entity_facts_query!(
     SearchShardEntityFacts,
     "entity_search.shard",
-    "?[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id\n\
-     :limit $limit"
+    ranked_entity_search!(
+        "candidate[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}, str_includes(id, $candidate)"
+    )
 );
 search_entity_facts_query!(
     SearchEnrichmentEntityFacts,
     "entity_search.enrichment",
-    "selected_enrichment[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
-     ?[id, kind, metadata] := *analysis_enrichment_entity_selection{view: $view, id, owner}, selected_enrichment[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id\n\
-     :limit $limit"
+    ranked_entity_search!(
+        "selected_enrichment[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
+         candidate[id, kind, metadata] := *analysis_enrichment_entity_selection{view: $view, id, owner}, selected_enrichment[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, str_includes(id, $candidate)"
+    )
 );
 
 pub(super) fn search_entity_facts(
     db: &impl QueryRunner,
     view: &str,
-    candidate: &str,
+    query: &str,
     limit: u32,
 ) -> Result<NamedRows, Box<dyn Error>> {
+    let candidate = query
+        .split(['.', '/', ':'])
+        .max_by_key(|part| part.len())
+        .unwrap_or(query);
+    let mut name_patterns = BTreeSet::from([
+        format!("/{query}"),
+        format!(":{query}"),
+        format!("elixir-module://{query}"),
+    ]);
+    if let Some((namespace, name)) = query.rsplit_once('.') {
+        name_patterns.insert(format!("{namespace}/{name}"));
+    }
     let params = || SearchEntityFactsParams {
         candidate: candidate.into(),
+        query: query.into(),
+        name_patterns: name_patterns.clone(),
         limit,
     };
     let mut rows = db.run::<SearchStateEntityFacts>(view, params())?;
