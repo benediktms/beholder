@@ -153,6 +153,7 @@
 
   function returnToWorkspace() {
     repositories = [];
+    traceTarget = '';
     clearFocus();
   }
 
