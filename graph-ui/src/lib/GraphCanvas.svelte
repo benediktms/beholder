@@ -1,171 +1,214 @@
 <script lang="ts">
-  import ForceGraph from 'force-graph';
+  import { MultiDirectedGraph } from 'graphology';
+  import forceAtlas2 from 'graphology-layout-forceatlas2';
+  import FA2Layout from 'graphology-layout-forceatlas2/worker';
+  import Sigma from 'sigma';
+  import { createEdgeArrowProgram, type NodeHoverDrawingFunction } from 'sigma/rendering';
   import { onMount } from 'svelte';
   import {
-    MAX_ANIMATED_LINKS,
     directHighlight,
-    labelOpacity,
-    nodeValue,
+    endpointId,
     type GraphLink,
     type GraphNode,
     type Projection
   } from './graph';
 
+  type NodeAttributes = Record<string, unknown> & {
+    label: string;
+    x: number;
+    y: number;
+    size: number;
+    color: string;
+  };
+
+  type EdgeAttributes = Record<string, unknown> & {
+    label: string;
+    size: number;
+    color: string;
+    type: string;
+  };
+
   let {
     projection,
     selectedId,
+    viewKey,
+    trail,
     onSelect
   }: {
     projection: Projection;
     selectedId: string | null;
+    viewKey: string;
+    trail: readonly string[];
     onSelect: (node: GraphNode | null) => void;
   } = $props();
 
   let container: HTMLDivElement;
-  let graph: ForceGraph<GraphNode, GraphLink> | null = null;
-  let initialFitPending = true;
+  let renderer: Sigma<NodeAttributes, EdgeAttributes> | null = null;
+  let layout: FA2Layout<NodeAttributes, EdgeAttributes> | null = null;
+  let layoutTimer: number | null = null;
+  let resizeObserver: ResizeObserver | null = null;
+  let renderedProjection: Projection | null = null;
+  let renderedViewKey = '';
   let hoveredId = $state<string | null>(null);
   let keyboardIndex = $state(-1);
-  let activeId: string | null = null;
-  let highlightedUpstreamNodes = new Set<string>();
-  let highlightedDownstreamNodes = new Set<string>();
-  let highlightedUpstreamLinks = new Set<string>();
-  let highlightedDownstreamLinks = new Set<string>();
-  let particleLinks = new Set<string>();
-  const selectedStrength = new Map<string, number>();
-  const upstreamNodeStrength = new Map<string, number>();
-  const downstreamNodeStrength = new Map<string, number>();
-  const upstreamLinkStrength = new Map<string, number>();
-  const downstreamLinkStrength = new Map<string, number>();
-  let transitionFrame: number | null = null;
+  let upstreamNodeIds = new Set<string>();
+  let downstreamNodeIds = new Set<string>();
+  let upstreamLinkIds = new Set<string>();
+  let downstreamLinkIds = new Set<string>();
+  let pathNodeIds = new Set<string>();
+  let pathLinkIds = new Set<string>();
+
+  const drawNodeHover: NodeHoverDrawingFunction<NodeAttributes, EdgeAttributes> = (
+    context,
+    data,
+    settings
+  ) => {
+    if (!data.label) return;
+    context.font = `${settings.labelWeight} ${settings.labelSize}px ${settings.labelFont}`;
+    const padding = 6;
+    const x = data.x + data.size + padding;
+    const width = context.measureText(data.label).width + padding * 2;
+    context.fillStyle = '#0b111b';
+    context.strokeStyle = '#334155';
+    context.beginPath();
+    context.roundRect(x, data.y - settings.labelSize, width, settings.labelSize + padding, 4);
+    context.fill();
+    context.stroke();
+    context.fillStyle = '#e2e8f0';
+    context.fillText(data.label, x + padding, data.y + settings.labelSize / 3);
+  };
 
   onMount(() => {
-    graph = new ForceGraph<GraphNode, GraphLink>(container)
-      .backgroundColor('#080b12')
-      .nodeId('id')
-      .nodeRelSize(4)
-      .nodeVal((node) => nodeValue(node.degree))
-      .nodeLabel((node) => node.label)
-      .nodeColor('#3388bb')
-      .nodePointerAreaPaint(drawNodePointerArea)
-      .nodeCanvasObjectMode(() => 'after')
-      .nodeCanvasObject(drawNodeOverlay)
-      .onRenderFramePre(drawHighlightHalos)
-      .linkLabel((link) => `${link.kind} · ${link.count} relationship${link.count === 1 ? '' : 's'}`)
-      .linkColor(linkColor)
-      .linkWidth((link) => 0.7 + linkHighlight(link.id) * 3.3)
-      .linkDirectionalArrowLength((link) => 2.5 + linkHighlight(link.id) * 2.5)
-      .linkDirectionalArrowRelPos(0.88)
-      .linkDirectionalArrowColor(linkColor)
-      .linkDirectionalParticles((link) => (particleLinks.has(link.id) ? 4 : 0))
-      .linkDirectionalParticleColor(() => '#e2e8f0')
-      .linkDirectionalParticleSpeed(0.006)
-      .linkDirectionalParticleWidth((link) => linkHighlight(link.id) * 3.5)
-      .onNodeHover((node) => (hoveredId = node?.id ?? null))
-      .onNodeClick(onSelect)
-      .onBackgroundClick(() => onSelect(null))
-      .onEngineStop(() => {
-        if (!initialFitPending || !graph?.graphData().nodes.length) return;
-        initialFitPending = false;
-        graph.zoomToFit(400, 36);
-      })
-      .autoPauseRedraw(false)
-      .cooldownTicks(140);
-
-    const resize = new ResizeObserver(([entry]) => {
-      graph?.width(entry.contentRect.width).height(entry.contentRect.height);
-    });
-    resize.observe(container);
-    updateData(projection);
-    return () => {
-      resize.disconnect();
-      if (transitionFrame !== null) cancelAnimationFrame(transitionFrame);
-      graph?._destructor();
-      graph = null;
-    };
+    rebuild(projection);
+    resizeObserver = new ResizeObserver(() => renderer?.resize());
+    resizeObserver.observe(container);
+    return destroy;
   });
 
   $effect(() => {
-    const next = projection;
-    if (graph) updateData(next);
-  });
-
-  $effect(() => {
-    const nextActiveId = hoveredId ?? selectedId;
-    if (graph) setHighlight(nextActiveId);
-  });
-
-  function updateData(next: Projection) {
-    if (!graph) return;
-    const previousById = new Map(graph.graphData().nodes.map((node) => [node.id, node]));
-    for (const node of next.nodes) {
-      const previous = previousById.get(node.id);
-      if (previous?.x !== undefined && previous.y !== undefined) {
-        node.x = previous.x;
-        node.y = previous.y;
-      }
+    const nextProjection = projection;
+    const nextViewKey = viewKey;
+    if (renderer && (nextProjection !== renderedProjection || nextViewKey !== renderedViewKey)) {
+      rebuild(nextProjection);
     }
-    hoveredId = null;
-    keyboardIndex = -1;
-    graph.graphData({ nodes: next.nodes, links: next.links }).d3ReheatSimulation();
-  }
+  });
 
-  function setHighlight(id: string | null) {
-    activeId = id;
-    const next = directHighlight(projection.links, id);
-    highlightedUpstreamNodes = next.upstreamNodeIds;
-    highlightedDownstreamNodes = next.downstreamNodeIds;
-    highlightedUpstreamLinks = next.upstreamLinkIds;
-    highlightedDownstreamLinks = next.downstreamLinkIds;
-    particleLinks = new Set(
-      [...next.upstreamLinkIds, ...next.downstreamLinkIds].slice(0, MAX_ANIMATED_LINKS)
+  $effect(() => {
+    const active = hoveredId ?? selectedId;
+    const nextTrail = trail;
+    if (!renderer) return;
+    const highlight = directHighlight(projection.links, active);
+    upstreamNodeIds = highlight.upstreamNodeIds;
+    downstreamNodeIds = highlight.downstreamNodeIds;
+    upstreamLinkIds = highlight.upstreamLinkIds;
+    downstreamLinkIds = highlight.downstreamLinkIds;
+    pathNodeIds = new Set(nextTrail);
+    const pathPairs = new Set(
+      nextTrail.slice(1).map((node, index) => `${nextTrail[index]}|${node}`)
     );
-    startTransition();
+    pathLinkIds = new Set(
+      projection.links
+        .filter((link) => {
+          const source = endpointId(link.source);
+          const target = endpointId(link.target);
+          return pathPairs.has(`${source}|${target}`) || pathPairs.has(`${target}|${source}`);
+        })
+        .map((link) => link.id)
+    );
+    renderer.refresh();
+  });
+
+  function rebuild(next: Projection) {
+    stopRenderer();
+    const graph = new MultiDirectedGraph<NodeAttributes, EdgeAttributes>();
+    const nodeById = new Map(next.nodes.map((node) => [node.id, node]));
+    const count = Math.max(1, next.nodes.length);
+    next.nodes.forEach((node, index) => {
+      const angle = index * 2.399963229728653;
+      const radius = Math.sqrt((index + 1) / count);
+      graph.addNode(node.id, {
+        label: node.label,
+        x: Math.cos(angle) * radius,
+        y: Math.sin(angle) * radius,
+        size: Math.min(2.5, 0.6 + Math.log2(node.degree + 1) * 0.25),
+        color: communityColor(node.community)
+      });
+    });
+    for (const link of next.links) {
+      const source = endpointId(link.source);
+      const target = endpointId(link.target);
+      if (!graph.hasNode(source) || !graph.hasNode(target)) continue;
+      graph.addDirectedEdgeWithKey(link.id, source, target, {
+        label: `${link.kind} · ${link.count} relationship${link.count === 1 ? '' : 's'}`,
+        size: Math.min(0.35, 0.08 + Math.log2(link.count + 1) * 0.08),
+        color: '#263244',
+        type: 'arrow'
+      });
+    }
+
+    const nextRenderer = new Sigma<NodeAttributes, EdgeAttributes>(graph, container, {
+      allowInvalidContainer: true,
+      defaultEdgeType: 'arrow',
+      defaultDrawNodeHover: drawNodeHover,
+      edgeProgramClasses: { arrow: createEdgeArrowProgram<NodeAttributes, EdgeAttributes>() },
+      hideEdgesOnMove: true,
+      hideLabelsOnMove: true,
+      labelColor: { color: '#e2e8f0' },
+      labelDensity: 0.08,
+      labelGridCellSize: 120,
+      labelRenderedSizeThreshold: 8,
+      minCameraRatio: 0.02,
+      maxCameraRatio: 8,
+      nodeReducer: (node, data) => reduceNode(node, data),
+      edgeReducer: (edge, data) => reduceEdge(edge, data),
+      stagePadding: 48,
+      zIndex: true
+    });
+    renderer = nextRenderer;
+    nextRenderer.on('enterNode', ({ node }) => (hoveredId = node));
+    nextRenderer.on('leaveNode', () => (hoveredId = null));
+    nextRenderer.on('clickNode', ({ node }) => onSelect(nodeById.get(node) ?? null));
+    nextRenderer.on('clickStage', () => onSelect(null));
+
+    if (graph.order > 1 && graph.size > 0) {
+      layout = new FA2Layout(graph, {
+        settings: {
+          ...forceAtlas2.inferSettings(graph),
+          barnesHutOptimize: true,
+          scalingRatio: 20
+        }
+      });
+      layout.start();
+      layoutTimer = window.setTimeout(() => {
+        layout?.stop();
+        layoutTimer = null;
+      }, 20_000);
+    }
+    renderedProjection = next;
+    renderedViewKey = viewKey;
   }
 
-  function startTransition() {
-    if (transitionFrame !== null) return;
-    transitionFrame = requestAnimationFrame(animateHighlight);
+  function reduceNode(node: string, data: NodeAttributes): Partial<NodeAttributes> {
+    const active = hoveredId ?? selectedId;
+    if (node === active) return { ...data, color: '#ef4444', size: 4, forceLabel: true, zIndex: 4 };
+    if (upstreamNodeIds.has(node)) return { ...data, color: '#2dd4bf', size: 2.5, forceLabel: true, zIndex: 3 };
+    if (downstreamNodeIds.has(node)) return { ...data, color: '#f59e0b', size: 2.5, forceLabel: true, zIndex: 3 };
+    if (pathNodeIds.has(node)) return { ...data, color: '#a855f7', size: 2.5, forceLabel: true, zIndex: 2 };
+    return active ? { ...data, color: '#263244', size: Math.min(1, data.size), zIndex: 0 } : data;
   }
 
-  function animateHighlight() {
-    let unsettled = false;
-    for (const node of projection.nodes) {
-      unsettled = tween(selectedStrength, node.id, node.id === activeId ? 1 : 0) || unsettled;
-      unsettled = tween(
-        upstreamNodeStrength,
-        node.id,
-        highlightedUpstreamNodes.has(node.id) ? 1 : 0
-      ) || unsettled;
-      unsettled = tween(
-        downstreamNodeStrength,
-        node.id,
-        highlightedDownstreamNodes.has(node.id) ? 1 : 0
-      ) || unsettled;
-    }
-    for (const link of projection.links) {
-      unsettled = tween(
-        upstreamLinkStrength,
-        link.id,
-        highlightedUpstreamLinks.has(link.id) ? 1 : 0
-      ) || unsettled;
-      unsettled = tween(
-        downstreamLinkStrength,
-        link.id,
-        highlightedDownstreamLinks.has(link.id) ? 1 : 0
-      ) || unsettled;
-    }
-    transitionFrame = unsettled ? requestAnimationFrame(animateHighlight) : null;
+  function reduceEdge(edge: string, data: EdgeAttributes): Partial<EdgeAttributes> {
+    if (pathLinkIds.has(edge)) return { ...data, color: '#a855f7', size: 1.2, zIndex: 4 };
+    if (upstreamLinkIds.has(edge)) return { ...data, color: '#2dd4bf', size: 0.8, zIndex: 3 };
+    if (downstreamLinkIds.has(edge)) return { ...data, color: '#f59e0b', size: 0.8, zIndex: 3 };
+    return selectedId || hoveredId ? { ...data, hidden: true } : data;
   }
 
-  function tween(values: Map<string, number>, id: string, target: number): boolean {
-    const current = strength(values, id);
-    if (Math.abs(target - current) < 0.01) {
-      values.set(id, target);
-      return false;
-    }
-    values.set(id, current + (target - current) * 0.16);
-    return true;
+  function communityColor(community: string): string {
+    const palette = ['#38bdf8', '#2dd4bf', '#a78bfa', '#f59e0b', '#fb7185', '#84cc16'];
+    let hash = 0;
+    for (const character of community) hash = (hash * 31 + character.charCodeAt(0)) | 0;
+    return palette[Math.abs(hash) % palette.length];
   }
 
   function handleKeydown(event: KeyboardEvent) {
@@ -184,102 +227,24 @@
     }
   }
 
-  function strength(values: Map<string, number>, id: string): number {
-    return values.get(id) ?? 0;
+  function stopRenderer() {
+    if (layoutTimer !== null) window.clearTimeout(layoutTimer);
+    layoutTimer = null;
+    layout?.kill();
+    layout = null;
+    renderer?.kill();
+    renderer = null;
   }
 
-  function linkHighlight(id: string): number {
-    return Math.min(
-      1,
-      strength(upstreamLinkStrength, id) + strength(downstreamLinkStrength, id)
-    );
-  }
-
-  function linkColor(link: GraphLink): string {
-    const upstream = strength(upstreamLinkStrength, link.id);
-    const downstream = strength(downstreamLinkStrength, link.id);
-    const base = Math.max(0, 1 - upstream - downstream);
-    const weight = base + upstream + downstream;
-    const red = Math.round((203 * base + 45 * upstream + 245 * downstream) / weight);
-    const green = Math.round((213 * base + 212 * upstream + 158 * downstream) / weight);
-    const blue = Math.round((225 * base + 191 * upstream + 11 * downstream) / weight);
-    return `rgba(${red}, ${green}, ${blue}, ${0.28 + linkHighlight(link.id) * 0.62})`;
-  }
-
-  function drawHighlightHalos(context: CanvasRenderingContext2D, scale: number) {
-    for (const node of graph?.graphData().nodes ?? []) {
-      if (node.x === undefined || node.y === undefined) continue;
-      const nodeRadius = Math.sqrt(nodeValue(node.degree)) * 4;
-      const upstream = strength(upstreamNodeStrength, node.id);
-      const downstream = strength(downstreamNodeStrength, node.id);
-      const selected = strength(selectedStrength, node.id);
-      if (upstream > 0) {
-        context.beginPath();
-        context.arc(node.x, node.y, nodeRadius + 6 / scale, 0, 2 * Math.PI);
-        context.fillStyle = `rgba(45, 212, 191, ${upstream})`;
-        context.fill();
-      }
-      if (downstream > 0) {
-        context.beginPath();
-        context.arc(node.x, node.y, nodeRadius + 4 / scale, 0, 2 * Math.PI);
-        context.fillStyle = `rgba(245, 158, 11, ${downstream})`;
-        context.fill();
-      }
-      if (selected > 0) {
-        context.beginPath();
-        context.arc(node.x, node.y, nodeRadius + 4 / scale, 0, 2 * Math.PI);
-        context.fillStyle = `rgba(239, 68, 68, ${selected})`;
-        context.fill();
-      }
-    }
-  }
-
-  function drawNodeOverlay(
-    node: GraphNode,
-    context: CanvasRenderingContext2D,
-    scale: number
-  ) {
-    if (node.x === undefined || node.y === undefined) return;
-    const radius = Math.sqrt(nodeValue(node.degree)) * 4;
-    const opacity = labelOpacity(
-      scale,
-      Math.max(
-        strength(selectedStrength, node.id),
-        strength(upstreamNodeStrength, node.id),
-        strength(downstreamNodeStrength, node.id)
-      )
-    );
-    if (opacity < 0.01) return;
-    const fontSize = 11 / scale;
-    context.font = `600 ${fontSize}px Inter, ui-sans-serif, system-ui`;
-    context.textAlign = 'center';
-    context.textBaseline = 'top';
-    context.fillStyle = `rgba(226, 232, 240, ${opacity})`;
-    context.fillText(node.label, node.x, node.y + radius + 4 / scale);
-  }
-
-  function drawNodePointerArea(
-    node: GraphNode,
-    color: string,
-    context: CanvasRenderingContext2D,
-    scale: number
-  ) {
-    if (node.x === undefined || node.y === undefined) return;
-    context.beginPath();
-    context.arc(
-      node.x,
-      node.y,
-      Math.max(Math.sqrt(nodeValue(node.degree)) * 4, 8 / scale),
-      0,
-      2 * Math.PI
-    );
-    context.fillStyle = color;
-    context.fill();
+  function destroy() {
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    stopRenderer();
   }
 </script>
 
-<!-- svelte-ignore a11y_no_noninteractive_tabindex (canvas-backed composite widget exposes its keyboard model here) -->
-<!-- svelte-ignore a11y_no_noninteractive_element_interactions (canvas-backed composite widget exposes its keyboard model here) -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex (WebGL composite widget exposes its keyboard model here) -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions (WebGL composite widget exposes its keyboard model here) -->
 <div
   class="graph"
   bind:this={container}
@@ -293,13 +258,7 @@
 </span>
 
 <style>
-  .graph {
-    height: 100%;
-    min-height: 26rem;
-    overflow: hidden;
-    width: 100%;
-  }
-
+  .graph { height: 100%; min-height: 26rem; overflow: hidden; width: 100%; }
   .graph:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
   .sr-only { height: 1px; margin: -1px; overflow: hidden; position: absolute; width: 1px; clip: rect(0, 0, 0, 0); }
 </style>

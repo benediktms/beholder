@@ -74,7 +74,7 @@ button, select, input { font: inherit; }
 .analysis-diagnostics strong { color: var(--foreground); font-family: var(--mono); }
 
 main { display: flex; height: calc(100vh - 4.25rem); }
-.drawer { background: var(--panel); flex: 0 0 auto; max-width: 32rem; min-width: 12rem; overflow: auto; width: 15rem; }
+.drawer { background: var(--panel); flex: 0 0 auto; max-width: 32rem; min-width: 12rem; overflow-x: hidden; overflow-y: auto; width: 15rem; }
 .drawer:not([open]) { max-width: 2.8rem; min-width: 2.8rem; width: 2.8rem !important; }
 .filters { border-right: 1px solid var(--border); }
 .inspector { border-left: 1px solid var(--border); width: 18rem; }
@@ -90,7 +90,7 @@ main { display: flex; height: calc(100vh - 4.25rem); }
 .drawer-label { display: none; font-size: 0.67rem; writing-mode: vertical-rl; }
 .drawer:not([open]) .drawer-heading { display: none; }
 .drawer:not([open]) .drawer-label { display: block; }
-.drawer-content { padding: 0 1rem 1rem; }
+.drawer-content { min-width: 0; overflow: hidden; padding: 0 1rem 1rem; }
 .filter-section { border-top: 1px solid var(--border); }
 .filter-section > summary { align-items: center; color: #b7c2d0; cursor: pointer; display: flex; font-size: 0.73rem; font-weight: 650; justify-content: space-between; list-style: none; min-height: 2.8rem; user-select: none; }
 .filter-section:not([open]) > summary i { transform: rotate(-45deg); }
@@ -141,15 +141,18 @@ select[multiple] option:checked { background: linear-gradient(#1f3548, #1f3548);
 .guard-note strong { display: block; font-family: var(--mono); font-size: 0.68rem; margin-top: 0.35rem; }
 .guard-note p { color: var(--muted-foreground); font-size: 0.66rem; line-height: 1.5; margin: 0.45rem 0 0; }
 
-.workspace { display: grid; flex: 1 1 auto; grid-template-rows: auto auto minmax(0, 1fr); min-width: 20rem; }
-.graph-toolbar { align-items: center; border-bottom: 1px solid var(--border); display: grid; gap: 1rem; grid-template-columns: minmax(12rem, 1fr) auto auto; min-height: 4.75rem; padding: 0.75rem 1rem; }
+.workspace { display: grid; flex: 1 1 auto; grid-template-rows: auto minmax(0, 1fr); min-width: 0; overflow: hidden; }
+.graph-toolbar { align-items: center; border-bottom: 1px solid var(--border); display: grid; gap: 1rem; grid-template-columns: minmax(8rem, 1fr) auto minmax(0, auto); min-height: 4.75rem; min-width: 0; padding: 0.75rem 1rem; }
 .graph-toolbar h1 { font-size: 1rem; margin: 0.28rem 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .legend, .toolbar-actions { gap: 0.7rem; }
+.toolbar-actions { min-width: 0; overflow: hidden; }
+.toolbar-actions input { min-width: 7rem; width: min(15rem, 22vw); }
 .legend span { align-items: center; color: var(--muted-foreground); display: flex; font-size: 0.65rem; gap: 0.3rem; }
 .legend i { border-radius: 50%; display: block; height: 0.45rem; width: 0.45rem; }
 .legend .selected { background: #ef4444; }
 .legend .upstream { background: #2dd4bf; }
 .legend .downstream { background: #f59e0b; }
+.legend .path { background: #a855f7; }
 .warning { background: #3b2510; border-bottom: 1px solid #75461c; color: #fed7aa; font-size: 0.7rem; line-height: 1.4; padding: 0.55rem 1rem; }
 .canvas-wrap { min-height: 0; overflow: hidden; position: relative; }
 .zoom-hint { background: rgba(8, 11, 18, 0.82); border: 1px solid var(--border); border-radius: 999px; bottom: 0.75rem; color: var(--muted-foreground); font-size: 0.65rem; left: 50%; padding: 0.35rem 0.65rem; position: absolute; transform: translateX(-50%); white-space: nowrap; }
@@ -165,10 +168,10 @@ dl div { display: grid; font-size: 0.68rem; gap: 0.6rem; grid-template-columns: 
 dt { color: var(--muted-foreground); }
 dd { margin: 0; overflow-wrap: anywhere; }
 .relationships { display: grid; gap: 0.6rem; }
-.relationships article { background: #090e16; border: 1px solid var(--border); border-radius: 0.5rem; display: grid; gap: 0.35rem; min-width: 0; overflow-x: auto; padding: 0.6rem; }
+.relationships article { background: #090e16; border: 1px solid var(--border); border-radius: 0.5rem; display: grid; gap: 0.35rem; min-width: 0; overflow: hidden; padding: 0.6rem; }
 .relationships article > div { align-items: center; color: var(--muted-foreground); display: flex; font-size: 0.61rem; justify-content: space-between; }
-.relationships strong { font-size: 0.69rem; }
-.relationships small { color: #718096; font-family: var(--mono); font-size: 0.58rem; white-space: nowrap; }
+.relationships strong { font-size: 0.69rem; overflow-wrap: anywhere; }
+.relationships small { color: #718096; font-family: var(--mono); font-size: 0.58rem; overflow-wrap: anywhere; }
 .instructions { display: grid; gap: 1rem; }
 .instructions div { display: grid; gap: 0.65rem; grid-template-columns: 1.6rem 1fr; }
 .instructions span { color: #7dd3fc; font-family: var(--mono); font-size: 0.67rem; padding-top: 0.1rem; }

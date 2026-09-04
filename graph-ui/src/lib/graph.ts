@@ -19,7 +19,6 @@ export const RELATION_KINDS = [
 ] as const;
 
 export const ORIGINS = ['source', 'generated', 'external_dependency'] as const;
-export const MAX_ANIMATED_LINKS = 250;
 export const EXTERNAL_REPOSITORY = 'external/contracts';
 
 export type RelationKind = (typeof RELATION_KINDS)[number];
@@ -91,9 +90,13 @@ export interface GraphNode {
   id: string;
   label: string;
   kind: string;
+  community: string;
+  communityLabel: string;
   degree: number;
   x?: number;
   y?: number;
+  vx?: number;
+  vy?: number;
 }
 
 export interface GraphLink {
@@ -124,6 +127,16 @@ export interface ProjectionOptions {
   origins: readonly EntityOrigin[];
 }
 
+export interface ProjectionLimits {
+  nodes: number;
+  links: number;
+}
+
+const DEFAULT_LIMITS: ProjectionLimits = {
+  nodes: Number.POSITIVE_INFINITY,
+  links: Number.POSITIVE_INFINITY
+};
+
 export function endpointId(endpoint: string | GraphNode): string {
   return typeof endpoint === 'string' ? endpoint : endpoint.id;
 }
@@ -137,9 +150,25 @@ export function findEntity(nodes: readonly EntityRef[], search: string): EntityR
     ?? nodes.find((node) => node.id.toLowerCase().includes(folded) || node.name.toLowerCase().includes(folded));
 }
 
+export function extendTrail(input: {
+  trail: readonly string[];
+  next: string;
+  connected: boolean;
+  limit?: number;
+}): string[] {
+  const existingIndex = input.trail.indexOf(input.next);
+  return (existingIndex >= 0
+    ? input.trail.slice(0, existingIndex + 1)
+    : input.connected
+      ? [...input.trail, input.next]
+      : [input.next]
+  ).slice(-(input.limit ?? 24));
+}
+
 export function projectGraph(
   snapshot: GraphSnapshot,
-  options: ProjectionOptions
+  options: ProjectionOptions,
+  limits: ProjectionLimits = DEFAULT_LIMITS
 ): Projection {
   const selectedRepositories = new Set(options.repositories);
   const allowedNodes = snapshot.nodes.filter(
@@ -158,10 +187,13 @@ export function projectGraph(
   const groups = new Map<string, GraphNode>();
 
   for (const entity of allowedNodes) {
+    const community = entityCommunity(entity);
     groups.set(entity.id, {
       id: entity.id,
       label: entity.name,
       kind: entity.kind,
+      community: community.id,
+      communityLabel: community.label,
       degree: 0
     });
   }
@@ -196,21 +228,22 @@ export function projectGraph(
     link.rawEdgeIds.sort();
   }
   const allNodes = [...groups.values()].sort(compareById);
-  const keptNodes = allNodes;
+  const keptNodes = allNodes.slice(0, limits.nodes);
   const keptIds = new Set(keptNodes.map((node) => node.id));
   const allLinks = [...links.values()].sort(compareById);
   const keptLinks = allLinks
     .filter(
       (link) => keptIds.has(endpointId(link.source)) && keptIds.has(endpointId(link.target))
-    );
+    )
+    .slice(0, limits.links);
   for (const link of keptLinks) {
     const source = groups.get(endpointId(link.source));
     const target = groups.get(endpointId(link.target));
     if (source) source.degree += 1;
     if (target) target.degree += 1;
   }
-  const omittedNodes = 0;
-  const omittedLinks = 0;
+  const omittedNodes = allNodes.length - keptNodes.length;
+  const omittedLinks = allLinks.length - keptLinks.length;
   return {
     nodes: keptNodes,
     links: keptLinks,
@@ -218,82 +251,8 @@ export function projectGraph(
     rawLinkCount: filteredEdges.length,
     omittedNodes,
     omittedLinks,
-    truncated: false
+    truncated: omittedNodes > 0 || omittedLinks > 0
   };
-}
-
-export type InvestigationMode = 'context' | 'dependencies' | 'impact' | 'trace';
-
-export function investigate(
-  snapshot: GraphSnapshot,
-  mode: InvestigationMode,
-  root: string,
-  target?: string
-): { nodeIds: Set<string>; edgeIds: Set<string> } {
-  if (mode === 'context') {
-    const edges = snapshot.edges.filter((edge) => edge.from === root || edge.to === root);
-    return {
-      nodeIds: new Set([root, ...edges.flatMap((edge) => [edge.from, edge.to])]),
-      edgeIds: new Set(edges.map((edge) => edge.id))
-    };
-  }
-  if (mode === 'trace') return shortestPath(snapshot, root, target ?? '');
-  const outgoing = mode === 'dependencies';
-  const adjacent = new Map<string, Array<{ edge: SemanticEdge; next: string }>>();
-  for (const edge of snapshot.edges) {
-    const implementedByImpact =
-      !outgoing && edge.kind === 'implemented_by' && edge.from.startsWith('grpc://');
-    const from = outgoing || implementedByImpact ? edge.from : edge.to;
-    const next = outgoing || implementedByImpact ? edge.to : edge.from;
-    const edges = adjacent.get(from) ?? [];
-    edges.push({ edge, next });
-    adjacent.set(from, edges);
-  }
-  const nodeIds = new Set([root]);
-  const edgeIds = new Set<string>();
-  const queue = [root];
-  for (let index = 0; index < queue.length; index += 1) {
-    const current = queue[index];
-    for (const { edge, next } of adjacent.get(current) ?? []) {
-      edgeIds.add(edge.id);
-      if (!nodeIds.has(next)) {
-        nodeIds.add(next);
-        queue.push(next);
-      }
-    }
-  }
-  return { nodeIds, edgeIds };
-}
-
-export function shortestPath(snapshot: GraphSnapshot, from: string, to: string) {
-  const outgoing = new Map<string, SemanticEdge[]>();
-  for (const edge of snapshot.edges) {
-    const edges = outgoing.get(edge.from) ?? [];
-    edges.push(edge);
-    outgoing.set(edge.from, edges);
-  }
-  const parents = new Map<string, { node: string; edge: string }>();
-  const seen = new Set([from]);
-  const queue = [from];
-  for (let index = 0; index < queue.length && !seen.has(to); index += 1) {
-    const current = queue[index];
-    for (const edge of outgoing.get(current) ?? []) {
-      if (seen.has(edge.to)) continue;
-      seen.add(edge.to);
-      parents.set(edge.to, { node: current, edge: edge.id });
-      queue.push(edge.to);
-    }
-  }
-  if (!seen.has(to)) return { nodeIds: new Set([from, to]), edgeIds: new Set<string>() };
-  const nodeIds = new Set([to]);
-  const edgeIds = new Set<string>();
-  for (let cursor = to; cursor !== from;) {
-    const parent = parents.get(cursor)!;
-    nodeIds.add(parent.node);
-    edgeIds.add(parent.edge);
-    cursor = parent.node;
-  }
-  return { nodeIds, edgeIds };
 }
 
 export function directHighlight(links: GraphLink[], selectedId: string | null) {
@@ -319,13 +278,31 @@ export function directHighlight(links: GraphLink[], selectedId: string | null) {
   return { upstreamNodeIds, downstreamNodeIds, upstreamLinkIds, downstreamLinkIds };
 }
 
-export function nodeValue(degree: number): number {
-  return Math.max(0.25, degree - 0.75);
-}
+export function entityCommunity(entity: EntityRef): { id: string; label: string } {
+  if (!entity.repository) {
+    return { id: EXTERNAL_REPOSITORY, label: 'External contracts' };
+  }
 
-export function labelOpacity(scale: number, highlight: number): number {
-  const zoom = scale <= 1.1 ? 0 : scale >= 1.5 ? 1 : (scale - 1.1) / 0.4;
-  return Math.max(zoom, highlight);
+  const prefix = `repo://${entity.repository}/`;
+  if (!entity.id.startsWith(prefix)) {
+    return {
+      id: entity.repository,
+      label: entity.repository.split('/').at(-1) ?? entity.repository
+    };
+  }
+
+  const [language = 'source', ...path] = entity.id.slice(prefix.length).split('/');
+  const groupedRoots = new Set(['apps', 'crates', 'packages', 'plugins', 'services']);
+  const symbolRoot = /^[A-Z#:]/.test(path[0] ?? '') || (path[0]?.includes('.') ?? false);
+  const area = groupedRoots.has(path[0]) && path[1]
+    ? `${path[0]}/${path[1]}`
+    : symbolRoot
+      ? language
+      : path[0] || language;
+  return {
+    id: `${entity.repository}/${language}/${area}`,
+    label: area
+  };
 }
 
 function compareById<T extends { id: string }>(left: T, right: T): number {

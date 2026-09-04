@@ -5,5 +5,9 @@ tasks:
     command: 'pnpm build'
   check:
     command: 'pnpm check'
+  release:
+    command: 'pnpm tauri build --no-bundle'
+    options:
+      cache: false
   test:
     command: 'pnpm test'

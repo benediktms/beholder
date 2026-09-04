@@ -12,14 +12,17 @@
     "test": "node --test src/lib/graph.test.ts"
   },
   "dependencies": {
+    "@tanstack/svelte-query": "^6.1.48",
     "@tauri-apps/api": "2.10.1",
-    "force-graph": "^1.51.4"
+    "graphology": "0.26.0",
+    "graphology-layout-forceatlas2": "0.10.1",
+    "sigma": "3.0.3"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.0.0",
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.70.3",
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@tailwindcss/vite": "^4.0.0",
     "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^24.0.0",
     "clsx": "^2.1.1",
