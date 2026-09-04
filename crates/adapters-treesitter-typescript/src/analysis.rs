@@ -1487,9 +1487,12 @@ fn mask_jsx_attribute_ampersands(source: &str) -> Option<Vec<u8>> {
 }
 
 fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) {
-    if node.kind() == "program" {
+    if matches!(node.kind(), "program" | "export_statement") {
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in node
+            .named_children(&mut cursor)
+            .filter(|child| node.kind() == "program" || child.kind() != "decorator")
+        {
             collect_top_level_call(child, source, calls);
         }
         return;
@@ -2241,6 +2244,24 @@ mod tests {
                 "missing {expected:?}: {calls:?}"
             );
         }
+    }
+
+    #[test]
+    fn exported_class_calls_are_not_attributed_to_the_module() {
+        let analysis = analyze(
+            "function traced() {} @traced() export class Service { client = connect(); } export const app = build();",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert_eq!(
+            analysis
+                .calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["build"]
+        );
     }
 
     #[test]
