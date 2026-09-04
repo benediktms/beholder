@@ -1733,7 +1733,9 @@ pub(super) fn semantics_from_analysis(
             path,
         );
         observations.push(observation);
-        candidates.extend(candidate);
+        if analysis.language != SourceLanguage::Svelte {
+            candidates.extend(candidate);
+        }
     }
     for definition in &analysis.definitions {
         let id = &ids[&definition.qualified_name];
@@ -1759,7 +1761,9 @@ pub(super) fn semantics_from_analysis(
             let (observation, candidate) =
                 call_semantics(repository, language, id, target, call, path);
             observations.push(observation);
-            candidates.extend(candidate);
+            if analysis.language != SourceLanguage::Svelte {
+                candidates.extend(candidate);
+            }
         }
     }
     if analysis.generated {
@@ -1993,11 +1997,13 @@ mod tests {
 
     #[test]
     fn svelte_modules_keep_typescript_call_semantics() {
-        let observations = observations(
-            "<script>export function run() { external(); }</script>",
-            "src/view.svelte",
-        );
+        let source = "<script>export function run() { external(); }</script>";
+        let path = Path::new("src/view.svelte");
+        let analysis = analyze(source, SourceLanguage::Svelte).unwrap();
+        let (observations, candidates) =
+            semantics_from_analysis("example", &analysis, source, path);
 
+        assert!(candidates.is_empty());
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://example/svelte/src/view/run"
                 && observation.to.as_str() == "typescript-call://external"

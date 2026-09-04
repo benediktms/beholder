@@ -73,6 +73,7 @@ impl RepositoryEnricher<TypescriptLanguage> for TsProtoPlugin {
         let sources = repository
             .sources
             .iter()
+            .filter(|(_, analysis)| analysis.language != SourceLanguage::Svelte)
             .map(|(path, analysis)| (path.as_path(), analysis.as_ref()))
             .collect::<Vec<_>>();
         let generated = ts_proto::grpc_methods(&repository.repository, &sources);
@@ -154,6 +155,7 @@ impl RepositoryEnricher<TypescriptLanguage> for NestjsPlugin {
         let sources = repository
             .sources
             .iter()
+            .filter(|(_, analysis)| analysis.language != SourceLanguage::Svelte)
             .map(|(path, analysis)| (path.as_path(), analysis.as_ref()))
             .collect::<Vec<_>>();
         let generated = ts_proto::grpc_methods(&repository.repository, &sources);
@@ -297,7 +299,9 @@ mod tests {
             <script lang="ts">
               import { Module } from "@nestjs/common";
               @Module({ providers: [Service] })
-              export class AppModule {}
+              export class AppModule {
+                @GrpcMethod("Service", "Call") handle() {}
+              }
             </script>
         "#;
         let repository = snapshot(&[
@@ -321,5 +325,24 @@ mod tests {
 
         assert!(analysis.nest_modules.is_empty());
         assert!(analysis.nest_providers.is_empty());
+
+        let repository = TypescriptRepository::new(
+            "example/repo",
+            vec![(PathBuf::from("src/App.svelte"), analysis)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let enrichment = NestjsPlugin
+            .enrich(
+                &repository,
+                RepositoryFactsView {
+                    entities: &[],
+                    observations: &[],
+                },
+            )
+            .unwrap();
+
+        assert!(enrichment.grpc_bindings.is_empty());
+        assert!(enrichment.diagnostics.is_empty());
     }
 }

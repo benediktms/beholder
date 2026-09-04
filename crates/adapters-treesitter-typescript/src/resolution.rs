@@ -2060,6 +2060,7 @@ pub fn unresolved_call_diagnostics(
         let Some((repository, _)) = caller
             .split_once("/typescript/")
             .or_else(|| caller.split_once("/javascript/"))
+            .or_else(|| caller.split_once("/svelte/"))
         else {
             continue;
         };
@@ -3466,15 +3467,23 @@ mod tests {
                 "typescript-call://external",
                 "src/client.ts:6",
             ),
+            Observation::dependency(
+                "repo://example/svelte/src/view/run",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "src/view.svelte:7",
+            ),
         ];
 
         let diagnostics = unresolved_call_diagnostics(&observations);
 
-        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.len(), 2);
         assert_eq!(diagnostics[0].0, "example");
         assert_eq!(
             diagnostics[0].1.detail.as_deref(),
             Some("2 receiver method call(s) remain unresolved after workspace resolution")
         );
+        assert_eq!(diagnostics[1].0, "example");
+        assert_eq!(diagnostics[1].1.path, PathBuf::from("src/view.svelte"));
     }
 }
