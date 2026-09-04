@@ -307,11 +307,11 @@ impl Daemon for BeholderDaemon {
             .active_enrichment_repositories(&workspace)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        self.query_response(
-            &workspace,
-            enriching,
-            self.store.workspace_topology_snapshot(&workspace),
-        )
+        let store = self.store.clone();
+        let query_workspace = workspace.clone();
+        let result =
+            semantic_query(move || store.workspace_topology_snapshot(&query_workspace)).await?;
+        self.query_response(&workspace, enriching, result)
     }
 
     #[tracing::instrument(name = "rpc.get_workspace_topology_status", skip_all, fields(workspace = %request.get_ref().workspace))]

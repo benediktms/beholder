@@ -848,14 +848,11 @@ pub(super) fn entity_facts(
     ))
 }
 
-pub(super) fn all_entity_facts(
-    db: &impl QueryRunner,
-    view: &str,
-) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        "selected_state[state] := *analysis_revision{view: $view, revision}, \
+struct AllEntityFactsQuery;
+
+impl MnesticQuery for AllEntityFactsQuery {
+    const OPERATION: &'static str = "entity_facts.all";
+    const SCRIPT: &'static str = "selected_state[state] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_state{view: $view, revision, state}\n\
          selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
              *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
@@ -875,26 +872,81 @@ pub(super) fn all_entity_facts(
              selected_enrichment[owner], \
              *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, \
              not baseline_id[id]\n\
-         :order id",
-        [],
-    )
+         :order id";
+    const HEADERS: &'static [&'static str] = ENTITY_FACT_HEADERS;
+
+    type Params = ();
+    type Row = EntityFactRow;
+
+    fn bind(_: &Self::Params) -> BTreeMap<String, DataValue> {
+        BTreeMap::new()
+    }
+
+    fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        BaselineEntityFacts::decode(headers, row)
+    }
+}
+
+pub(super) fn all_entity_facts(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<NamedRows, Box<dyn Error>> {
+    Ok(NamedRows::new(
+        ENTITY_FACT_HEADERS
+            .iter()
+            .map(|header| (*header).into())
+            .collect(),
+        db.run::<AllEntityFactsQuery>(view, ())?
+            .into_iter()
+            .map(EntityFactRow::into_values)
+            .collect(),
+    ))
+}
+
+const WORKSPACE_TOPOLOGY_HEADERS: &[&str] = &[
+    "from",
+    "to",
+    "relation",
+    "evidence",
+    "confidence",
+    "provenance",
+];
+
+struct WorkspaceTopologyQuery;
+
+impl MnesticQuery for WorkspaceTopologyQuery {
+    const OPERATION: &'static str = "workspace_topology";
+    const SCRIPT: &'static str = concat!(
+        include_str!("../../../rules/core/direct.datalog"),
+        "\n?[from, to, relation, evidence, confidence, provenance] := \
+             effective_observation[from, to, relation, evidence, confidence, provenance]\n\
+         :order from, to, relation, evidence"
+    );
+    const HEADERS: &'static [&'static str] = WORKSPACE_TOPOLOGY_HEADERS;
+
+    type Params = ();
+    type Row = Vec<DataValue>;
+
+    fn bind(_: &Self::Params) -> BTreeMap<String, DataValue> {
+        BTreeMap::new()
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        Ok(row.to_vec())
+    }
 }
 
 pub(super) fn workspace_topology(
     db: &impl QueryRunner,
     view: &str,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    query(
-        db,
-        view,
-        &format!(
-            "{DIRECT_RULES}\n\
-             ?[from, to, relation, evidence, confidence, provenance] := \
-                 effective_observation[from, to, relation, evidence, confidence, provenance]\n\
-             :order from, to, relation, evidence"
-        ),
-        [],
-    )
+    Ok(NamedRows::new(
+        WORKSPACE_TOPOLOGY_HEADERS
+            .iter()
+            .map(|header| (*header).into())
+            .collect(),
+        db.run::<WorkspaceTopologyQuery>(view, ())?,
+    ))
 }
 
 pub(super) fn inspect_observations(
