@@ -540,7 +540,7 @@ impl WorkspaceAnalyzer for TypescriptAnalyzer {
             overrides,
             candidate_overrides: Vec::new(),
             graphql_resolvers: Vec::new(),
-            diagnostics: unresolved_call_diagnostics(&all_observations),
+            diagnostics: unresolved_call_diagnostics(&all_observations, &typed_repositories),
             cache,
         })
     }

@@ -2047,6 +2047,7 @@ pub fn resolve_workspace_calls(
 
 pub fn unresolved_call_diagnostics(
     observations: &[Observation],
+    repositories: &[TypescriptRepository],
 ) -> Vec<(String, AnalysisDiagnostic)> {
     let mut unresolved = BTreeMap::<(String, PathBuf), (usize, Option<u32>)>::new();
     for observation in observations.iter().filter(|observation| {
@@ -2057,24 +2058,24 @@ pub fn unresolved_call_diagnostics(
         let Some(caller) = observation.from.as_str().strip_prefix("repo://") else {
             continue;
         };
+        let Some(repository) = repositories
+            .iter()
+            .filter(|repository| {
+                caller
+                    .strip_prefix(&repository.repository)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .max_by_key(|repository| repository.repository.len())
+            .map(|repository| repository.repository.as_str())
+        else {
+            continue;
+        };
         let (path, line) = observation
             .evidence
             .as_str()
             .rsplit_once(':')
             .map(|(path, line)| (path, line.parse().ok()))
             .unwrap_or((observation.evidence.as_str(), None));
-        let module_path = source_stem(Path::new(path));
-        let Some(repository) =
-            ["typescript", "javascript", "svelte"]
-                .into_iter()
-                .find_map(|language| {
-                    caller
-                        .split_once(&format!("/{language}/{module_path}"))
-                        .map(|(repository, _)| repository)
-                })
-        else {
-            continue;
-        };
         unresolved
             .entry((repository.into(), path.into()))
             .and_modify(|(count, _)| *count += 1)
@@ -3480,7 +3481,13 @@ mod tests {
             ),
         ];
 
-        let diagnostics = unresolved_call_diagnostics(&observations);
+        let repositories = vec![TypescriptRepository::new(
+            "example",
+            Vec::<(PathBuf, TypescriptAnalysis)>::new(),
+            vec![],
+            vec![],
+        )];
+        let diagnostics = unresolved_call_diagnostics(&observations, &repositories);
 
         assert_eq!(diagnostics.len(), 2);
         assert_eq!(diagnostics[0].0, "example");
@@ -3502,21 +3509,32 @@ mod tests {
                 "src/view.svelte:7",
             ),
             Observation::dependency(
-                "repo://example/typescript/src/view/typescript/src/view",
+                "repo://gitlab.com/typescript/src/view/typescript/src/view/run",
                 DependencyRelation::Calls,
                 "typescript-method://api/send",
                 "src/view.ts:8",
             ),
         ];
 
-        let diagnostics = unresolved_call_diagnostics(&observations);
+        let repositories = ["acme/svelte", "gitlab.com/typescript/src/view"]
+            .into_iter()
+            .map(|repository| {
+                TypescriptRepository::new(
+                    repository,
+                    Vec::<(PathBuf, TypescriptAnalysis)>::new(),
+                    vec![],
+                    vec![],
+                )
+            })
+            .collect::<Vec<_>>();
+        let diagnostics = unresolved_call_diagnostics(&observations, &repositories);
 
         assert_eq!(
             diagnostics
                 .iter()
                 .map(|(repository, _)| repository.as_str())
                 .collect::<Vec<_>>(),
-            ["acme/svelte", "example"]
+            ["acme/svelte", "gitlab.com/typescript/src/view"]
         );
     }
 }
