@@ -89,6 +89,7 @@ pub struct WorkerAnalyzerBuilder {
     path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
+    activation_paths: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     repository_identity_files: Vec<RepositoryIdentityFile>,
     semantic_entities: BTreeSet<EntityKind>,
@@ -120,6 +121,7 @@ impl WorkerAnalyzerBuilder {
             path_suffixes: BTreeMap::new(),
             parent_suffixes: BTreeMap::new(),
             excluded_path_suffixes: Vec::new(),
+            activation_paths: Vec::new(),
             identity_inputs: Vec::new(),
             repository_identity_files: Vec::new(),
             semantic_entities: BTreeSet::new(),
@@ -199,6 +201,11 @@ impl WorkerAnalyzerBuilder {
         self
     }
 
+    pub fn activate_when_path_exists(mut self, path: impl Into<PathBuf>) -> Self {
+        self.activation_paths.push(path.into());
+        self
+    }
+
     pub fn accept_parent_suffix_as(
         mut self,
         suffix: impl Into<PathBuf>,
@@ -271,6 +278,7 @@ impl WorkerAnalyzerBuilder {
             path_suffixes: self.path_suffixes,
             parent_suffixes: self.parent_suffixes,
             excluded_path_suffixes: self.excluded_path_suffixes,
+            activation_paths: self.activation_paths,
             identity_inputs: self.identity_inputs,
             repository_identity_files: self.repository_identity_files,
             semantic_entities: self.semantic_entities,
@@ -294,6 +302,7 @@ pub struct WorkerAnalyzer {
     path_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     parent_suffixes: BTreeMap<PathBuf, AnalysisInputKind>,
     excluded_path_suffixes: Vec<PathBuf>,
+    activation_paths: Vec<PathBuf>,
     identity_inputs: Vec<AnalysisInput>,
     repository_identity_files: Vec<RepositoryIdentityFile>,
     semantic_entities: BTreeSet<EntityKind>,
@@ -333,6 +342,7 @@ pub fn plugin_analyzer(
         path_suffixes: BTreeMap::new(),
         parent_suffixes: BTreeMap::new(),
         excluded_path_suffixes: Vec::new(),
+        activation_paths: Vec::new(),
         identity_inputs: Vec::new(),
         repository_identity_files: Vec::new(),
         semantic_entities: BTreeSet::new(),
@@ -419,6 +429,14 @@ impl WorkspaceEnricher for WorkerAnalyzer {
                     .input_kind(PluginInputScope::Target, &input.path)
                     .is_some()
             });
+        }
+        if !self.activation_paths.is_empty()
+            && !self
+                .activation_paths
+                .iter()
+                .any(|path| repository.base.join(path).is_file())
+        {
+            return false;
         }
         repository
             .inputs
@@ -1055,6 +1073,48 @@ mod tests {
             soft_memory_limit_bytes(worker.memory_limit_bytes.unwrap()),
             3_758_096_384
         );
+    }
+
+    #[test]
+    fn worker_requires_a_configured_activation_path() {
+        let root = env::temp_dir().join(format!(
+            "beholder-worker-activation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
+            .identity("typescript", "1")
+            .accept_extension("js")
+            .activate_when_path_exists("node_modules/.bin/tsgo")
+            .activate_when_path_exists("node_modules/.bin/tsc")
+            .build()
+            .unwrap();
+        let repository = RepositorySnapshot {
+            base: root.clone(),
+            state: RepositoryState {
+                repository: LogicalRepository {
+                    identity: "example".into(),
+                },
+                head: None,
+                fingerprint: "fingerprint".into(),
+            },
+            inputs: vec![RepositoryInput {
+                path: "script.js".into(),
+                content: Arc::from(Vec::<u8>::new()),
+                kind: InputKind::Source,
+            }],
+        };
+
+        assert!(!worker.is_active(&repository));
+        let compiler = root.join("node_modules/.bin/tsgo");
+        fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        fs::write(compiler, []).unwrap();
+        assert!(worker.is_active(&repository));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
