@@ -377,7 +377,7 @@ mod tests {
             r#"
             <script lang="ts">
               {annotation}
-              export function greeting() { return "hello" }
+              export function greeting() {{ return "hello" }}
             </script>
         "#
         );
