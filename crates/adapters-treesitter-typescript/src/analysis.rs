@@ -1675,12 +1675,8 @@ pub fn diagnostics_from_analysis(
 }
 
 pub(super) fn source_stem(path: &Path) -> String {
-    let path = if path.extension().and_then(|extension| extension.to_str()) == Some("svelte") {
-        path.to_path_buf()
-    } else {
-        path.with_extension("")
-    };
-    path.to_string_lossy()
+    path.with_extension("")
+        .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
@@ -1699,9 +1695,17 @@ pub(super) fn semantics_from_analysis(
     _source: &str,
     path: &Path,
 ) -> (Vec<Observation>, Vec<SemanticCandidate>) {
-    let language = analysis.language.id_segment();
-    let module_id = format!("repo://{repository}/{language}/{}", source_stem(path));
-    let source_id = format!("repo://{repository}/{language}-source/{}", path.display());
+    let language = analysis.language.call_id_segment();
+    let module_id = format!(
+        "repo://{repository}/{}/{}",
+        analysis.language.id_segment(),
+        source_stem(path)
+    );
+    let source_id = format!(
+        "repo://{repository}/{}-source/{}",
+        analysis.language.id_segment(),
+        path.display()
+    );
     let mut observations = vec![Observation::structural(
         source_id,
         StructuralRelation::Defines,
@@ -1976,7 +1980,7 @@ mod tests {
             (
                 "src/view.svelte",
                 "<script lang=\"ts\">export function run(value: string) { return value }</script><button>{run('ok')}</button>",
-                "/typescript/",
+                "/svelte/",
                 "/run",
             ),
         ] {
@@ -1985,6 +1989,19 @@ mod tests {
                     && observation.to.as_str().ends_with(expected_name)
             }));
         }
+    }
+
+    #[test]
+    fn svelte_modules_keep_typescript_call_semantics() {
+        let observations = observations(
+            "<script>export function run() { external(); }</script>",
+            "src/view.svelte",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/svelte/src/view/run"
+                && observation.to.as_str() == "typescript-call://external"
+        }));
     }
 
     #[test]

@@ -399,8 +399,7 @@ mod tests {
 
         assert!(facts.observations.iter().any(|observation| {
             observation.from.as_str() == "graphql-field://Query/greeting"
-                && observation.to.as_str()
-                    == "repo://example/typescript/src/greeting.svelte/greeting"
+                && observation.to.as_str() == "repo://example/svelte/src/greeting/greeting"
         }));
     }
 }

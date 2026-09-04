@@ -823,6 +823,11 @@ mod tests {
             content: Arc::from(&b"<script>export const prerender = true;</script>"[..]),
             kind: InputKind::Source,
         });
+        snapshot.repositories[0].inputs.push(RepositoryInput {
+            path: PathBuf::from("src/+layout.svelte.ts"),
+            content: Arc::from(&b"export const shared = true;"[..]),
+            kind: InputKind::Source,
+        });
 
         let contribution = analyzer.analyze(&snapshot).unwrap();
         let owners = contribution.repositories[0]
@@ -831,7 +836,7 @@ mod tests {
             .map(|shard| shard.owner.as_str())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(owners.len(), 2);
+        assert_eq!(owners.len(), 3);
         let _ = fs::remove_dir_all(cache_dir);
     }
 

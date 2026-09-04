@@ -29,6 +29,14 @@ impl SourceLanguage {
     pub fn id_segment(self) -> &'static str {
         match self {
             Self::JavaScript | Self::Jsx => "javascript",
+            Self::Svelte => "svelte",
+            Self::TypeScript | Self::Tsx => "typescript",
+        }
+    }
+
+    pub fn call_id_segment(self) -> &'static str {
+        match self {
+            Self::JavaScript | Self::Jsx => "javascript",
             Self::Svelte | Self::TypeScript | Self::Tsx => "typescript",
         }
     }
