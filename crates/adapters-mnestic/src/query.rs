@@ -871,8 +871,7 @@ impl MnesticQuery for AllEntityFactsQuery {
              *analysis_enrichment_entity_selection{view: $view, id, owner}, \
              selected_enrichment[owner], \
              *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, \
-             not baseline_id[id]\n\
-         :order id";
+             not baseline_id[id]";
     const HEADERS: &'static [&'static str] = ENTITY_FACT_HEADERS;
 
     type Params = ();
@@ -919,8 +918,7 @@ impl MnesticQuery for WorkspaceTopologyQuery {
     const SCRIPT: &'static str = concat!(
         include_str!("../../../rules/core/direct.datalog"),
         "\n?[from, to, relation, evidence, confidence, provenance] := \
-             effective_observation[from, to, relation, evidence, confidence, provenance]\n\
-         :order from, to, relation, evidence"
+             effective_observation[from, to, relation, evidence, confidence, provenance]"
     );
     const HEADERS: &'static [&'static str] = WORKSPACE_TOPOLOGY_HEADERS;
 

@@ -33,12 +33,6 @@ pub(super) fn workspace_topology(
     for row in result.rows {
         let from = text(&row, 0, "topology source")?;
         let to = text(&row, 1, "topology target")?;
-        if !facts.contains_key(from) {
-            return Err(format!("missing entity fact for topology endpoint {from}").into());
-        }
-        if !facts.contains_key(to) {
-            return Err(format!("missing entity fact for topology endpoint {to}").into());
-        }
         graph.add_edge(
             from,
             to,
@@ -867,7 +861,8 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity};
+    use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity, workspace_topology};
+    use crate::{InspectionResult, InspectionValue};
     use beholder_dto::{EntityKind, EntityOrigin};
     use std::collections::BTreeMap;
 
@@ -919,6 +914,45 @@ mod tests {
         let graph = graph.finish();
         assert_eq!(graph.edges[0].confidence, 1.0);
         assert_eq!(graph.edges[0].evidence.len(), 2);
+    }
+
+    #[test]
+    fn topology_infers_external_endpoints_without_entity_facts() {
+        let source = "repo://example/elixir/Example/run/0";
+        let target = "elixir-call://:elixir_bootstrap/def/2";
+        let topology = workspace_topology(
+            "main",
+            InspectionResult {
+                headers: Vec::new(),
+                rows: vec![vec![
+                    InspectionValue::String(source.into()),
+                    InspectionValue::String(target.into()),
+                    InspectionValue::String("calls".into()),
+                    InspectionValue::String("lib/example.ex:1".into()),
+                    InspectionValue::Float(1.0),
+                    InspectionValue::String("ast".into()),
+                ]],
+                next: None,
+            },
+            InspectionResult {
+                headers: Vec::new(),
+                rows: vec![vec![
+                    InspectionValue::String(source.into()),
+                    InspectionValue::String("callable".into()),
+                    InspectionValue::String(String::new()),
+                ]],
+                next: None,
+            },
+        )
+        .unwrap();
+
+        let target = topology
+            .nodes
+            .iter()
+            .find(|node| node.id == target)
+            .unwrap();
+        assert_eq!(target.kind, EntityKind::Callable);
+        assert_eq!(target.origin, EntityOrigin::ExternalDependency);
     }
 
     #[test]
