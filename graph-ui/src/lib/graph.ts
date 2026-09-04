@@ -128,6 +128,15 @@ export function endpointId(endpoint: string | GraphNode): string {
   return typeof endpoint === 'string' ? endpoint : endpoint.id;
 }
 
+export function findEntity(nodes: readonly EntityRef[], search: string): EntityRef | undefined {
+  const exact = search.trim();
+  if (!exact) return undefined;
+  const folded = exact.toLocaleLowerCase();
+  return nodes.find((node) => node.id === exact)
+    ?? nodes.find((node) => node.id.toLocaleLowerCase() === folded || node.name.toLocaleLowerCase() === folded)
+    ?? nodes.find((node) => node.id.toLocaleLowerCase().includes(folded) || node.name.toLocaleLowerCase().includes(folded));
+}
+
 export function projectGraph(
   snapshot: GraphSnapshot,
   options: ProjectionOptions

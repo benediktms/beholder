@@ -4,6 +4,7 @@ import {
   EXTERNAL_REPOSITORY,
   ORIGINS,
   directHighlight,
+  findEntity,
   investigate,
   labelOpacity,
   nodeValue,
@@ -130,6 +131,12 @@ test('repository filtering accepts multiple repositories', () => {
     repositories: ['repo-a', 'repo-c']
   });
   assert.deepEqual(graph.nodes.map((node) => node.id), ['a', 'c']);
+});
+
+test('entity search prefers exact case-sensitive canonical IDs', () => {
+  const candidates = [entity('Example', 'repo-a'), entity('example', 'repo-a')];
+  assert.equal(findEntity(candidates, 'example')?.id, 'example');
+  assert.equal(findEntity(candidates, '  '), undefined);
 });
 
 test('complete projections never apply speculative topology limits', () => {

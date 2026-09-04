@@ -8,6 +8,7 @@
     EXTERNAL_REPOSITORY,
     ORIGINS,
     RELATION_KINDS,
+    findEntity,
     projectGraph,
     investigate,
     type EntityOrigin,
@@ -50,7 +51,7 @@
   let mode: InvestigationMode = 'context';
   let traceTarget = '';
   let loadRequest = 0;
-  let statusRequest = 0;
+  let pollingStatus = false;
 
   $: investigation = snapshot && rootId ? investigate(snapshot, mode, rootId, traceTarget || undefined) : null;
   $: visibleSnapshot = snapshot && investigation
@@ -112,17 +113,19 @@
   }
 
   async function pollStatus() {
-    if (!selectedWorkspace || !snapshot) return;
-    const request = ++statusRequest;
+    if (!selectedWorkspace || !snapshot || pollingStatus) return;
     const generation = loadRequest;
     const workspace = selectedWorkspace;
+    pollingStatus = true;
     try {
       const nextStatus = await invoke<QueryMetadata>('topology_status', { request: { workspace } });
-      if (request !== statusRequest || generation !== loadRequest) return;
+      if (generation !== loadRequest) return;
       status = nextStatus;
       statusError = '';
     } catch (cause) {
-      if (request === statusRequest && generation === loadRequest) statusError = String(cause);
+      if (generation === loadRequest) statusError = String(cause);
+    } finally {
+      pollingStatus = false;
     }
   }
 
@@ -148,10 +151,7 @@
   }
 
   function selectSearch() {
-    const query = search.trim().toLocaleLowerCase();
-    if (!query) return;
-    const entity = snapshot?.nodes.find((node) => node.id.toLocaleLowerCase() === query || node.name.toLocaleLowerCase() === query)
-      ?? snapshot?.nodes.find((node) => node.id.toLocaleLowerCase().includes(query) || node.name.toLocaleLowerCase().includes(query));
+    const entity = snapshot && findEntity(snapshot.nodes, search);
     if (entity) {
       repositories = [];
       origins = [...ORIGINS];
