@@ -217,11 +217,11 @@ mod tests {
         let active = plugins.activate(&repository, true);
         assert_eq!(
             active.identity(),
-            "17:typescript.nestjs1:219:typescript.ts-proto1:2"
+            "17:typescript.nestjs1:219:typescript.ts-proto1:3"
         );
         assert_eq!(
             plugins.source_identity(&active),
-            "17:typescript.nestjs1:219:typescript.ts-proto1:2"
+            "17:typescript.nestjs1:219:typescript.ts-proto1:3"
         );
         let evidence = active
             .plugins()
