@@ -1545,7 +1545,11 @@ fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) 
     }
     if matches!(
         node.kind(),
-        "function_declaration" | "generator_function_declaration" | "interface_declaration"
+        "arrow_function"
+            | "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "interface_declaration"
     ) {
         return;
     }
@@ -2292,7 +2296,7 @@ mod tests {
     #[test]
     fn class_calls_are_not_attributed_to_the_module() {
         let analysis = analyze(
-            "function traced() {} @traced() export class Service { client = connect(); } const Expression = class { client = reconnect(); }; export const app = build();",
+            "function traced() {} @traced() export class Service { client = connect(); } const Expression = class { client = reconnect(); }; export const app = build(); export default () => hidden();",
             SourceLanguage::TypeScript,
         )
         .unwrap();
