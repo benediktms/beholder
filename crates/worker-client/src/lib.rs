@@ -16,10 +16,12 @@ use beholder_protocol::{
     ContributionAccumulator, analyze_requests,
     worker_v1::{AnalysisPhase, analyze_event, analyzer_worker_client::AnalyzerWorkerClient},
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -410,8 +412,7 @@ impl WorkspaceEnricher for WorkerAnalyzer {
         self.repository_identity_files
             .iter()
             .map(|identity| {
-                let content = fs::read(repository.base.join(&identity.file))
-                    .ok()
+                let content = repository_file_digest(&repository.base.join(&identity.file))
                     .unwrap_or_else(|| b"unavailable".to_vec());
                 AnalysisInput {
                     path: identity.path.clone(),
@@ -713,6 +714,19 @@ impl WorkspaceEnricher for WorkerAnalyzer {
             }
             .instrument(span),
         )
+    }
+}
+
+fn repository_file_digest(path: &Path) -> Option<Vec<u8>> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            return Some(digest.finalize().to_vec());
+        }
+        digest.update(&buffer[..read]);
     }
 }
 
@@ -1297,7 +1311,7 @@ mod tests {
 
         let identity = worker.repository_identity_inputs(&repository);
 
-        assert_eq!(identity[0].content.as_ref(), b"compiler 7.0.2");
+        assert_eq!(identity[0].content.len(), 32);
         fs::write(&compiler, "compiler 7.0.3").unwrap();
         assert_ne!(identity, worker.repository_identity_inputs(&repository));
         fs::remove_dir_all(root).unwrap();

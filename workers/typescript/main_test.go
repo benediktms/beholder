@@ -72,6 +72,27 @@ func TestTypeScriptExecutablePrefersNativePreview(t *testing.T) {
 	}
 }
 
+func TestTypeScriptExecutableFallsBackFromBrokenPreferredAlias(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, "node_modules", "typescript-native", "bin", "tsc")
+	if err := os.MkdirAll(filepath.Dir(native), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("tsc", native); err != nil {
+		t.Fatal(err)
+	}
+	fallback := filepath.Join(root, "node_modules", ".bin", "tsc")
+	writeTestFile(t, root, "node_modules/.bin/tsc", "", 0o755)
+
+	executable, err := typescriptExecutable(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executable != fallback {
+		t.Fatalf("selected %q", executable)
+	}
+}
+
 func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 	root := t.TempDir()
 	caller := "const counter = new Counter(); counter.value();\n"

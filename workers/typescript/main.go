@@ -152,6 +152,7 @@ func repositoryPath(root, path string) (string, error) {
 }
 
 func typescriptExecutable(root string) (string, error) {
+	var unavailable error
 	for _, executable := range []string{
 		filepath.Join(root, "node_modules", "typescript-native", "bin", "tsc"),
 		filepath.Join(root, "node_modules", ".bin", "tsgo"),
@@ -159,14 +160,17 @@ func typescriptExecutable(root string) (string, error) {
 	} {
 		info, err := os.Stat(executable)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
+			if !errors.Is(err, os.ErrNotExist) && unavailable == nil {
+				unavailable = fmt.Errorf("repository TypeScript compiler %q: %w", executable, err)
 			}
-			return "", fmt.Errorf("repository TypeScript compiler %q: %w", executable, err)
+			continue
 		}
 		if info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
 			return executable, nil
 		}
+	}
+	if unavailable != nil {
+		return "", unavailable
 	}
 	return "", fmt.Errorf("repository TypeScript compiler is unavailable under %q", filepath.Join(root, "node_modules", ".bin"))
 }
