@@ -1,5 +1,6 @@
 use crate::{
-    SourceLanguage, TypescriptAnalysis, analysis::analyze_core, plugin::TypescriptLanguage,
+    SourceLanguage, TypescriptAnalysis, analysis::analyze_core, model::Call,
+    plugin::TypescriptLanguage,
 };
 use beholder_adapters_treesitter::recover;
 use beholder_domain::UnsafeTreeRecovery;
@@ -48,6 +49,13 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
 
         let (source, error_lines) = extract_scripts(input.syntax.root_node(), input.text)?;
         let mut embedded = analyze_core(&source, SourceLanguage::TypeScript)?;
+        embedded.calls.retain(|call| !is_rune(call));
+        for definition in &mut embedded.definitions {
+            definition.calls.retain(|call| !is_rune(call));
+            if definition.factory.as_deref().is_some_and(rune_name) {
+                definition.factory = None;
+            }
+        }
         embedded.parse_error_lines.extend(error_lines);
         embedded.parse_error_lines.sort_unstable();
         embedded.parse_error_lines.dedup();
@@ -146,6 +154,21 @@ fn supported_script(node: Node<'_>, source: &[u8]) -> bool {
         })
 }
 
+fn rune_name(name: &str) -> bool {
+    matches!(
+        name,
+        "$state" | "$derived" | "$effect" | "$props" | "$bindable" | "$inspect" | "$host"
+    )
+}
+
+fn is_rune(call: &Call) -> bool {
+    rune_name(&call.name)
+        || call
+            .receiver
+            .as_deref()
+            .is_some_and(|receiver| rune_name(receiver) || receiver.starts_with("$inspect("))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +208,34 @@ mod tests {
                 .any(|definition| definition.qualified_name == "visible")
         );
         assert!(!analysis.parse_error_lines.is_empty());
+    }
+
+    #[test]
+    fn collects_reactive_calls_without_emitting_runes() {
+        let source = r#"
+            <script>
+              const count = $state(load());
+              $: result = refresh(count);
+              $effect(() => persist(count));
+            </script>
+        "#;
+
+        let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
+        let calls = analysis
+            .calls
+            .iter()
+            .chain(
+                analysis
+                    .definitions
+                    .iter()
+                    .flat_map(|definition| &definition.calls),
+            )
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(calls.contains(&"load"));
+        assert!(calls.contains(&"refresh"));
+        assert!(calls.contains(&"persist"));
+        assert!(!calls.iter().any(|name| name.starts_with('$')));
     }
 }

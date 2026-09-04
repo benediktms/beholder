@@ -1494,20 +1494,16 @@ fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) 
         }
         return;
     }
-    if node.kind() != "expression_statement" {
+    if matches!(
+        node.kind(),
+        "class_declaration"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "interface_declaration"
+    ) {
         return;
     }
-    let Some(expression) = node.named_child(0) else {
-        return;
-    };
-    let kind = match expression.kind() {
-        "call_expression" => CallKind::Direct,
-        "new_expression" => CallKind::Constructor,
-        _ => return,
-    };
-    if let Some(found) = call(expression, source, kind) {
-        calls.extend(found);
-    }
+    collect_calls(node, source, node, calls);
 }
 
 fn collect_top_level_aliases(node: Node<'_>, source: &[u8], aliases: &mut Vec<SimpleAlias>) {
