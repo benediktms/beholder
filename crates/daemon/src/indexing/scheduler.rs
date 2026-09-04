@@ -2782,7 +2782,10 @@ fn index_workspace_versioned(
             &mut all_observations,
             &typescript_repositories,
         ));
-        diagnostics.extend(unresolved_typescript_call_diagnostics(&all_observations));
+        diagnostics.extend(unresolved_typescript_call_diagnostics(
+            &all_observations,
+            &typescript_repositories,
+        ));
     }
     let workspace_resolution = workspace_resolution_started.elapsed();
     let publication_started = Instant::now();
