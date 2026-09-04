@@ -948,18 +948,29 @@ fn migrate_enrichment_winners(db: &DbInstance) -> Result<(), Box<dyn Error>> {
 mod tests {
     use crate::{SemanticStore, database::benchmark_database};
     use beholder_domain::{
-        DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
-        StructuralRelation, WorkspaceView,
+        DependencyRelation, EntityFact, EntityKind, LogicalRepository, Observation,
+        RepositoryFacts, RepositoryState, StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
-    use std::{collections::BTreeMap, fs, time::SystemTime};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        time::SystemTime,
+    };
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
+        let entities = observations
+            .iter()
+            .flat_map(|observation| [&observation.from, &observation.to])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|id| EntityFact::new(id.clone(), EntityKind::Callable, None).unwrap())
+            .collect();
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities,
             grpc_bindings: Vec::new(),
             observations,
         }

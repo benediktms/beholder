@@ -1312,8 +1312,8 @@ mod tests {
     use crate::schema::DIRECT_RULES;
     use crate::{SemanticStore, database::memory_database};
     use beholder_domain::{
-        DependencyRelation, LogicalRepository, Observation, RepositoryFacts, RepositoryState,
-        StructuralRelation, WorkspaceView,
+        DependencyRelation, EntityFact, EntityKind, LogicalRepository, Observation,
+        RepositoryFacts, RepositoryState, StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
     use std::{cell::Cell, collections::BTreeSet, fs, time::Duration, time::SystemTime};
@@ -1472,12 +1472,19 @@ mod tests {
     }
 
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
+        let entities = observations
+            .iter()
+            .flat_map(|observation| [&observation.from, &observation.to])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|id| EntityFact::new(id.clone(), EntityKind::Callable, None).unwrap())
+            .collect();
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities,
             grpc_bindings: Vec::new(),
             observations,
         }

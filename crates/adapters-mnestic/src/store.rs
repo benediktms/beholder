@@ -704,12 +704,19 @@ mod tests {
         time::SystemTime,
     };
     fn facts(view: &WorkspaceView, observations: Vec<Observation>) -> RepositoryFacts {
+        let entities = observations
+            .iter()
+            .flat_map(|observation| [&observation.from, &observation.to])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|id| EntityFact::new(id.clone(), EntityKind::Callable, None).unwrap())
+            .collect();
         RepositoryFacts {
             state: view.repository_states[0].clone(),
             analysis_identity: "analysis".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities,
             grpc_bindings: Vec::new(),
             observations,
         }
@@ -1352,7 +1359,10 @@ mod tests {
                 line: Some(3),
                 detail: Some("recovered".into()),
             }],
-            entities: Vec::new(),
+            entities: vec![
+                EntityFact::new("repo/source", EntityKind::Callable, None).unwrap(),
+                EntityFact::new("repo/target", EntityKind::Callable, None).unwrap(),
+            ],
             grpc_bindings: Vec::new(),
             observations: vec![Observation::dependency(
                 "repo/source",

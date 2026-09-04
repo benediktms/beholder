@@ -4863,7 +4863,13 @@ mod tests {
             analysis_identity: "rust".into(),
             incomplete: false,
             diagnostics: Vec::new(),
-            entities: Vec::new(),
+            entities: [
+                "repo://application/rust/client/get_quote",
+                "repo://application/rust/server/get_quote",
+            ]
+            .into_iter()
+            .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
+            .collect(),
             grpc_bindings: vec![
                 candidate(
                     "repo://application/rust/client/get_quote",
@@ -5079,6 +5085,10 @@ mod tests {
             "repo/target",
             "src/lib.rs:1",
         );
+        let entities = ["repo/source", "repo/target"]
+            .into_iter()
+            .map(|id| EntityFact::new(id, EntityKind::Callable, None).unwrap())
+            .collect::<Vec<_>>();
         for (name, analysis_identity) in [("first", "analysis-v1"), ("second", "analysis-v2")] {
             let view = with_enrichment_analyzers(
                 WorkspaceView::new(name, format!("workspace-rules:{name}"), vec![state.clone()])
@@ -5093,7 +5103,7 @@ mod tests {
                         analysis_identity: analysis_identity.into(),
                         incomplete: false,
                         diagnostics: Vec::new(),
-                        entities: Vec::new(),
+                        entities: entities.clone(),
                         grpc_bindings: Vec::new(),
                         observations: vec![observation.clone()],
                     }],
@@ -5149,6 +5159,15 @@ mod tests {
             std::slice::from_ref(&observation),
         )
         .unwrap();
+        store_entities(
+            &transaction,
+            legacy_state,
+            &[
+                EntityFact::new("repo/source", EntityKind::Callable, None).unwrap(),
+                EntityFact::new("repo/target", EntityKind::Callable, None).unwrap(),
+            ],
+        )
+        .unwrap();
         transaction
             .run_script(
                 "?[fingerprint, repository, head] <- [[$state, 'repo', 'head']] \
@@ -5181,7 +5200,10 @@ mod tests {
                     analysis_identity: "analysis-v2".into(),
                     incomplete: false,
                     diagnostics: Vec::new(),
-                    entities: Vec::new(),
+                    entities: vec![
+                        EntityFact::new("repo/source", EntityKind::Callable, None).unwrap(),
+                        EntityFact::new("repo/target", EntityKind::Callable, None).unwrap(),
+                    ],
                     grpc_bindings: Vec::new(),
                     observations: vec![observation],
                 }],
@@ -5333,7 +5355,14 @@ mod tests {
                         analysis_identity: "analysis".into(),
                         incomplete: false,
                         diagnostics: Vec::new(),
-                        entities: Vec::new(),
+                        entities: vec![
+                            EntityFact::new(
+                                "repo://source/rust/lib/caller",
+                                EntityKind::Callable,
+                                None,
+                            )
+                            .unwrap(),
+                        ],
                         grpc_bindings: Vec::new(),
                         observations: vec![unresolved.clone()],
                     },
@@ -5342,7 +5371,11 @@ mod tests {
                         analysis_identity: "analysis".into(),
                         incomplete: false,
                         diagnostics: Vec::new(),
-                        entities: Vec::new(),
+                        entities: vec![
+                            EntityFact::new("repo://target/rust/lib", EntityKind::Namespace, None)
+                                .unwrap(),
+                            EntityFact::new(resolved, EntityKind::Callable, None).unwrap(),
+                        ],
                         grpc_bindings: Vec::new(),
                         observations: vec![Observation::structural(
                             "repo://target/rust/lib",
@@ -6428,6 +6461,14 @@ mod tests {
         };
         let mut baseline = facts(&view, vec![observation.clone()]);
         baseline.entities.push(entity.clone());
+        baseline.entities.push(
+            EntityFact::new(
+                "repo://example/repo/baseline-target",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
         baseline.diagnostics.push(diagnostic.clone());
         store
             .publish(&view, &[baseline], std::slice::from_ref(&baseline_override))
@@ -6505,10 +6546,14 @@ mod tests {
             "call://second",
             "src/lib.rs:2",
         );
+        let mut baseline = facts(&view, vec![first.clone(), second.clone()]);
+        baseline.entities.push(
+            EntityFact::new("repo://example/repo/first", EntityKind::Callable, None).unwrap(),
+        );
         store
             .publish(
                 &view,
-                &[facts(&view, vec![first.clone(), second.clone()])],
+                &[baseline],
                 &[DependencyOverride {
                     from: first.from,
                     relation: DependencyRelation::Calls,
