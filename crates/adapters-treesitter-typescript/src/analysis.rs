@@ -1620,7 +1620,11 @@ pub(super) fn analyze_with_plugins(
         collect_string_constants(root, source.as_bytes(), &mut string_constants);
         collect_graphql_documents(root, source.as_bytes(), &mut graphql_documents);
     }
-    if incomplete && definitions.is_empty() && calls.is_empty() {
+    if language != SourceLanguage::Svelte
+        && incomplete
+        && definitions.is_empty()
+        && calls.is_empty()
+    {
         return Err(UnsafeTreeRecovery::new(
             "JavaScript/TypeScript",
             "no unaffected definitions remain",

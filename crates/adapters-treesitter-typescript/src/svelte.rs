@@ -48,6 +48,8 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
 
         let (source, error_lines) = extract_scripts(input.syntax.root_node(), input.text)?;
         let mut embedded = analyze_core(&source, SourceLanguage::TypeScript)?;
+        embedded.nest_modules.append(&mut analysis.nest_modules);
+        embedded.nest_providers.append(&mut analysis.nest_providers);
         embedded.parse_error_lines.extend(error_lines);
         embedded.parse_error_lines.sort_unstable();
         embedded.parse_error_lines.dedup();
@@ -100,7 +102,11 @@ fn extract_scripts(
 
 fn copy_scripts(node: Node<'_>, source: &[u8], masked: &mut [u8]) {
     if node.kind() == "script_element" {
-        if !supported_script(node, source) {
+        if node
+            .parent()
+            .is_none_or(|parent| parent.kind() != "document")
+            || !supported_script(node, source)
+        {
             return;
         }
         let mut cursor = node.walk();
@@ -152,6 +158,7 @@ mod tests {
             <script module>export function serverOnly() {}</script>
             <script lang="coffee">export function unsupported() {}</script>
             <script lang="ts">export function visible(value: string) { return value }</script>
+            <svelte:head><script type="application/ld+json">export function metadata() {}</script></svelte:head>
         "#;
 
         let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
@@ -162,5 +169,23 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["visible"]);
+    }
+
+    #[test]
+    fn keeps_instance_script_when_template_recovery_is_incomplete() {
+        let source = r#"
+            <script>export function visible() {}</script>
+            {#if}
+        "#;
+
+        let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
+
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .any(|definition| definition.qualified_name == "visible")
+        );
+        assert!(!analysis.parse_error_lines.is_empty());
     }
 }

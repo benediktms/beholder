@@ -128,14 +128,33 @@ impl SourceRecognizer<TypescriptLanguage> for NestjsPlugin {
         input: SourceRecognitionInput<'_, TypescriptLanguage>,
         analysis: &mut TypescriptAnalysis,
     ) -> Result<(), AnalyzerError> {
-        let recovery = recover_syntax(input.syntax.root_node(), input.text.as_bytes())?;
-        for root in recovery.roots {
-            let (modules, providers) = nestjs_di::extract(root, input.text.as_bytes());
-            analysis.nest_modules.extend(modules);
-            analysis.nest_providers.extend(providers);
+        if analysis.language == SourceLanguage::Svelte {
+            let Some(source) = svelte::embedded_source(input.text) else {
+                return Ok(());
+            };
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())?;
+            let Some(tree) = parser.parse(&source, None) else {
+                return Ok(());
+            };
+            return recognize_nestjs(tree.root_node(), source.as_bytes(), analysis);
         }
-        Ok(())
+        recognize_nestjs(input.syntax.root_node(), input.text.as_bytes(), analysis)
     }
+}
+
+fn recognize_nestjs(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    analysis: &mut TypescriptAnalysis,
+) -> Result<(), AnalyzerError> {
+    let recovery = recover_syntax(root, source)?;
+    for root in recovery.roots {
+        let (modules, providers) = nestjs_di::extract(root, source);
+        analysis.nest_modules.extend(modules);
+        analysis.nest_providers.extend(providers);
+    }
+    Ok(())
 }
 
 impl RepositoryEnricher<TypescriptLanguage> for NestjsPlugin {
@@ -266,5 +285,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(svelte.activation.path, PathBuf::from("src/App.svelte"));
+    }
+
+    #[test]
+    fn active_nestjs_plugin_reads_svelte_instance_script() {
+        let source = r#"
+            <script lang="ts">
+              import { Module } from "@nestjs/common";
+              @Module({ providers: [Service] })
+              export class AppModule {}
+            </script>
+        "#;
+        let repository = snapshot(&[
+            ("src/App.svelte", source),
+            (
+                "package.json",
+                r#"{"dependencies":{"@nestjs/common":"11.0.0"}}"#,
+            ),
+        ]);
+        let plugins = built_in_plugins().unwrap();
+        let active = plugins.activate(&repository, true);
+
+        let analysis = crate::analysis::analyze_with_plugins(
+            source,
+            SourceLanguage::Svelte,
+            std::path::Path::new("src/App.svelte"),
+            &plugins,
+            &active,
+        )
+        .unwrap();
+
+        assert_eq!(analysis.nest_modules.len(), 1);
     }
 }
