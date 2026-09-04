@@ -48,8 +48,6 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
 
         let (source, error_lines) = extract_scripts(input.syntax.root_node(), input.text)?;
         let mut embedded = analyze_core(&source, SourceLanguage::TypeScript)?;
-        embedded.nest_modules.append(&mut analysis.nest_modules);
-        embedded.nest_providers.append(&mut analysis.nest_providers);
         embedded.parse_error_lines.extend(error_lines);
         embedded.parse_error_lines.sort_unstable();
         embedded.parse_error_lines.dedup();

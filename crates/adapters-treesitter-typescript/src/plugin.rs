@@ -129,32 +129,16 @@ impl SourceRecognizer<TypescriptLanguage> for NestjsPlugin {
         analysis: &mut TypescriptAnalysis,
     ) -> Result<(), AnalyzerError> {
         if analysis.language == SourceLanguage::Svelte {
-            let Some(source) = svelte::embedded_source(input.text) else {
-                return Ok(());
-            };
-            let mut parser = tree_sitter::Parser::new();
-            parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())?;
-            let Some(tree) = parser.parse(&source, None) else {
-                return Ok(());
-            };
-            return recognize_nestjs(tree.root_node(), source.as_bytes(), analysis);
+            return Ok(());
         }
-        recognize_nestjs(input.syntax.root_node(), input.text.as_bytes(), analysis)
+        let recovery = recover_syntax(input.syntax.root_node(), input.text.as_bytes())?;
+        for root in recovery.roots {
+            let (modules, providers) = nestjs_di::extract(root, input.text.as_bytes());
+            analysis.nest_modules.extend(modules);
+            analysis.nest_providers.extend(providers);
+        }
+        Ok(())
     }
-}
-
-fn recognize_nestjs(
-    root: tree_sitter::Node<'_>,
-    source: &[u8],
-    analysis: &mut TypescriptAnalysis,
-) -> Result<(), AnalyzerError> {
-    let recovery = recover_syntax(root, source)?;
-    for root in recovery.roots {
-        let (modules, providers) = nestjs_di::extract(root, source);
-        analysis.nest_modules.extend(modules);
-        analysis.nest_providers.extend(providers);
-    }
-    Ok(())
 }
 
 impl RepositoryEnricher<TypescriptLanguage> for NestjsPlugin {
@@ -288,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn active_nestjs_plugin_reads_svelte_instance_script() {
+    fn active_nestjs_plugin_ignores_svelte_sources() {
         let source = r#"
             <script lang="ts">
               import { Module } from "@nestjs/common";
@@ -315,6 +299,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(analysis.nest_modules.len(), 1);
+        assert!(analysis.nest_modules.is_empty());
+        assert!(analysis.nest_providers.is_empty());
     }
 }
