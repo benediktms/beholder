@@ -4842,6 +4842,7 @@ mod tests {
             entities: vec![
                 EntityFact::new(source, EntityKind::Callable, None).unwrap(),
                 EntityFact::new(second_source, EntityKind::Callable, None).unwrap(),
+                EntityFact::new(external, EntityKind::Callable, None).unwrap(),
             ],
             grpc_bindings: Vec::new(),
             observations: vec![
@@ -4872,7 +4873,10 @@ mod tests {
             .publish_verified_sharded(&view, &[facts_a, facts_b], &[], &[], &[], "verified")
             .unwrap();
 
-        let overview = store.workspace_graph_overview_snapshot("main").unwrap().result;
+        let overview = store
+            .workspace_graph_overview_snapshot("main")
+            .unwrap()
+            .result;
         assert_eq!(overview.communities.len(), 3);
         assert_eq!(overview.edges.len(), 2);
         assert!(overview.communities.iter().any(|community| {

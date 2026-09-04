@@ -75,7 +75,9 @@ impl From<dto::GraphNeighborhoodFocus> for v1::GraphNeighborhoodFocus {
         use v1::graph_neighborhood_focus::Focus;
         Self {
             focus: Some(match value {
-                dto::GraphNeighborhoodFocus::Repository(repository) => Focus::Repository(repository),
+                dto::GraphNeighborhoodFocus::Repository(repository) => {
+                    Focus::Repository(repository)
+                }
                 dto::GraphNeighborhoodFocus::Entity(entity) => Focus::Entity(entity),
                 dto::GraphNeighborhoodFocus::External => Focus::External(true),
             }),
@@ -221,7 +223,9 @@ impl TryFrom<v1::GetWorkspaceGraphOverviewResponse> for dto::WorkspaceGraphOverv
 pub fn workspace_graph_neighborhood_from_batches(
     batches: Vec<v1::StreamWorkspaceGraphNeighborhoodResponse>,
 ) -> Result<dto::WorkspaceGraphNeighborhood, &'static str> {
-    let first = batches.first().ok_or("graph neighborhood stream returned no batches")?;
+    let first = batches
+        .first()
+        .ok_or("graph neighborhood stream returned no batches")?;
     if !batches.last().is_some_and(|batch| batch.complete) {
         return Err("graph neighborhood stream ended before completion");
     }

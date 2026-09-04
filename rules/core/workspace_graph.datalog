@@ -29,8 +29,22 @@ observed_entity[id] := effective_observation[_, id, _, _, _, _]
 
 owned_entity[id] := repository_entity[id, _]
 
-community_entity[id, repository] := repository_entity[id, repository]
-community_entity[id, ''] := observed_entity[id], not owned_entity[id]
+external_entity[id] := observed_entity[id], starts_with(id, 'rust-call://')
+external_entity[id] := observed_entity[id], starts_with(id, 'rust-method://')
+external_entity[id] := observed_entity[id], starts_with(id, 'elixir-call://')
+external_entity[id] := observed_entity[id], starts_with(id, 'elixir-module://')
+external_entity[id] := observed_entity[id], starts_with(id, 'erlang-module://')
+external_entity[id] := observed_entity[id], starts_with(id, 'unity://')
+
+external_community_entity[id] := external_entity[id]
+external_community_entity[id] := observed_entity[id], not owned_entity[id]
+
+community_entity[id, repository] :=
+    repository_entity[id, repository],
+    not external_entity[id]
+community_entity[id, community] :=
+    external_community_entity[id],
+    community = '__external__'
 
 semantic_edge[from, to, relation] :=
     effective_observation[from, to, relation, _, _, _]

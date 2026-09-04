@@ -1,8 +1,8 @@
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
     ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionEvent,
-    GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus, ImpactResult,
-    GraphNeighborhoodFocus, QueryMetadata, RepositoryStatus, TraceResult, WhyResult,
+    GarbageCollectionPhase, GarbageCollectionProgress, GarbageCollectionStatus,
+    GraphNeighborhoodFocus, ImpactResult, QueryMetadata, RepositoryStatus, TraceResult, WhyResult,
     WorkspaceGraphNeighborhoodBatch, WorkspaceGraphOverview, WorkspaceTopology,
 };
 use beholder_protocol::{
@@ -14,11 +14,10 @@ use beholder_protocol::{
         GetGarbageCollectionStatusRequest, GetJobRequest, GetJobResponse, GetRepositoryRequest,
         GetStatusRequest, GetStatusResponse, GetWorkspaceGraphOverviewRequest,
         GetWorkspaceTopologyRequest, GetWorkspaceTopologyStatusRequest, ListJobsRequest,
-        ListJobsResponse,
-        ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest, RegisterWorkspaceRequest,
-        RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest,
-        StreamWorkspaceGraphNeighborhoodRequest, SubmitEnrichmentRequest,
-        SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse, TraversalEntityRequest,
+        ListJobsResponse, ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest,
+        RegisterWorkspaceRequest, RepositoryIndexTarget, SetWorkspacePluginRequest, StopRequest,
+        StreamWorkspaceGraphNeighborhoodRequest, SubmitEnrichmentRequest, SubmitEnrichmentResponse,
+        SubmitIndexRequest, SubmitIndexResponse, TraversalEntityRequest,
         daemon_client::DaemonClient, garbage_collect_event,
         stream_workspace_graph_neighborhood_request, submit_index_request,
     },
@@ -301,7 +300,9 @@ pub struct WorkspaceGraphNeighborhoodStream {
 }
 
 impl WorkspaceGraphNeighborhoodStream {
-    pub async fn message(&mut self) -> Result<Option<WorkspaceGraphNeighborhoodBatch>, ClientError> {
+    pub async fn message(
+        &mut self,
+    ) -> Result<Option<WorkspaceGraphNeighborhoodBatch>, ClientError> {
         let Some(batch) = self.inner.message().await? else {
             return if self.completed {
                 Ok(None)

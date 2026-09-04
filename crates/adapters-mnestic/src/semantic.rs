@@ -23,6 +23,7 @@ enum TraversalDirection {
 }
 
 const EXTERNAL_COMMUNITY_ID: &str = "community://external";
+const EXTERNAL_COMMUNITY_KEY: &str = "__external__";
 
 pub(super) fn workspace_graph_overview(
     view: &str,
@@ -37,7 +38,7 @@ pub(super) fn workspace_graph_overview(
             let entity_count = integer(row, 1, "graph community entity count")?
                 .try_into()
                 .map_err(|_| "graph community entity count must not be negative")?;
-            Ok(if repository.is_empty() {
+            Ok(if repository == EXTERNAL_COMMUNITY_KEY {
                 GraphCommunity {
                     id: EXTERNAL_COMMUNITY_ID.into(),
                     kind: GraphCommunityKind::External,
@@ -138,7 +139,7 @@ fn repository_community_id(repository: &str) -> String {
 }
 
 fn community_id(repository: &str) -> String {
-    if repository.is_empty() {
+    if repository == EXTERNAL_COMMUNITY_KEY {
         EXTERNAL_COMMUNITY_ID.into()
     } else {
         repository_community_id(repository)

@@ -7,8 +7,8 @@ use super::{
         SnapshotQueryRunner, all_entity_facts, analysis_metadata, analysis_revision, context,
         dependencies, entity_facts, impact, inspect_grpc_bindings, inspect_observations,
         inspect_relations, inspect_revisions, published_repository_head, repository_revision,
-        trace, warn_on_slow_semantic_query, workspace_graph_neighborhood,
-        workspace_graph_overview, workspace_topology,
+        trace, warn_on_slow_semantic_query, workspace_graph_neighborhood, workspace_graph_overview,
+        workspace_topology,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -544,15 +544,23 @@ impl SemanticStore {
     ) -> Result<Revisioned<WorkspaceGraphNeighborhood>, Box<dyn Error>> {
         self.snapshot(view, |transaction| {
             let (focus_kind, focus_id) = match &focus {
-                GraphNeighborhoodFocus::Repository(repository) => ("repository", repository.as_str()),
+                GraphNeighborhoodFocus::Repository(repository) => {
+                    ("repository", repository.as_str())
+                }
                 GraphNeighborhoodFocus::Entity(entity) => ("entity", entity.as_str()),
                 GraphNeighborhoodFocus::External => ("external", ""),
             };
-            let result = workspace_graph_neighborhood(transaction, view, focus_kind, focus_id)?;
+            let result =
+                workspace_graph_neighborhood(transaction, view, focus_kind, focus_id, max_edges)?;
             let entities = result
                 .rows
                 .iter()
-                .flat_map(|row| [0, 1].into_iter().filter_map(|column| row[column].get_str()))
+                .take(max_edges as usize)
+                .flat_map(|row| {
+                    [0, 1]
+                        .into_iter()
+                        .filter_map(|column| row[column].get_str())
+                })
                 .map(str::to_owned)
                 .collect();
             semantic::workspace_graph_neighborhood(

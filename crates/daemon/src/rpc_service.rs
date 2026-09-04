@@ -8,10 +8,9 @@ use crate::rpc::semantic_query;
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
     DEFAULT_GRAPH_NEIGHBORHOOD_MAX_EDGES, DEFAULT_MAX_HOPS, GarbageCollectionPhase,
-    GarbageCollectionProgress as DtoGarbageCollectProgress,
-    GraphNeighborhoodFocus, MAX_GRAPH_NEIGHBORHOOD_EDGES,
-    RepositoryStatus as DtoRepositoryStatus, Revisioned, SemanticQueryResult, WhyResult,
-    WorkspaceGraphNeighborhood,
+    GarbageCollectionProgress as DtoGarbageCollectProgress, GraphNeighborhoodFocus,
+    MAX_GRAPH_NEIGHBORHOOD_EDGES, RepositoryStatus as DtoRepositoryStatus, Revisioned,
+    SemanticQueryResult, WhyResult, WorkspaceGraphNeighborhood,
 };
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
@@ -31,8 +30,8 @@ use beholder_protocol::v1::{
     StreamWorkspaceGraphNeighborhoodRequest, StreamWorkspaceGraphNeighborhoodResponse,
     SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse,
     TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
-    garbage_collect_event, index_destination, job_target, submit_index_request,
-    stream_workspace_graph_neighborhood_request,
+    garbage_collect_event, index_destination, job_target,
+    stream_workspace_graph_neighborhood_request, submit_index_request,
 };
 use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::atomic::Ordering};
 use tokio::sync::mpsc;
@@ -314,10 +313,9 @@ impl Daemon for BeholderDaemon {
             .map_err(|error| Status::internal(error.to_string()))?;
         let store = self.store.clone();
         let query_workspace = workspace.clone();
-        let result = semantic_query(move || {
-            store.workspace_graph_overview_snapshot(&query_workspace)
-        })
-        .await?;
+        let result =
+            semantic_query(move || store.workspace_graph_overview_snapshot(&query_workspace))
+                .await?;
         self.query_response(&workspace, enriching, result)
     }
 
@@ -388,9 +386,10 @@ impl Daemon for BeholderDaemon {
                     .map_err(|_| Status::internal("workspace registry lock poisoned"))?
                     .get(&request.workspace)
                     .is_some_and(|workspace| {
-                        workspace.repositories.iter().any(|candidate| {
-                            candidate.repository.identity == repository
-                        })
+                        workspace
+                            .repositories
+                            .iter()
+                            .any(|candidate| candidate.repository.identity == repository)
                     });
                 if !exists {
                     return Err(Status::invalid_argument(format!(
@@ -409,7 +408,9 @@ impl Daemon for BeholderDaemon {
                 GraphNeighborhoodFocus::External
             }
             Some(stream_workspace_graph_neighborhood_request::Focus::Repository(_)) => {
-                return Err(Status::invalid_argument("repository focus must not be empty"));
+                return Err(Status::invalid_argument(
+                    "repository focus must not be empty",
+                ));
             }
             Some(stream_workspace_graph_neighborhood_request::Focus::Entity(_)) => {
                 return Err(Status::invalid_argument("entity focus must not be empty"));
@@ -417,7 +418,11 @@ impl Daemon for BeholderDaemon {
             Some(stream_workspace_graph_neighborhood_request::Focus::External(false)) => {
                 return Err(Status::invalid_argument("external focus must be true"));
             }
-            None => return Err(Status::invalid_argument("graph neighborhood focus is required")),
+            None => {
+                return Err(Status::invalid_argument(
+                    "graph neighborhood focus is required",
+                ));
+            }
         };
         let max_edges = max_graph_neighborhood_edges(request.max_edges)?;
         let enriching = self
@@ -430,11 +435,7 @@ impl Daemon for BeholderDaemon {
         let query_workspace = workspace.clone();
         let query_focus = focus.clone();
         let mut revisioned = semantic_query(move || {
-            store.workspace_graph_neighborhood_snapshot(
-                &query_workspace,
-                query_focus,
-                max_edges,
-            )
+            store.workspace_graph_neighborhood_snapshot(&query_workspace, query_focus, max_edges)
         })
         .await?;
         *revisioned.result.metadata_mut() = self.scheduler.query_metadata_with_enrichments(
@@ -1289,19 +1290,14 @@ fn graph_neighborhood_batches(
     let mut payloads = result
         .nodes
         .chunks(BATCH_ITEMS)
-        .map(|nodes| {
-            (
-                nodes.iter().cloned().map(Into::into).collect(),
-                Vec::new(),
-            )
-        })
+        .map(|nodes| (nodes.iter().cloned().map(Into::into).collect(), Vec::new()))
         .collect::<Vec<_>>();
-    payloads.extend(result.edges.chunks(BATCH_ITEMS).map(|edges| {
-        (
-            Vec::new(),
-            edges.iter().cloned().map(Into::into).collect(),
-        )
-    }));
+    payloads.extend(
+        result
+            .edges
+            .chunks(BATCH_ITEMS)
+            .map(|edges| (Vec::new(), edges.iter().cloned().map(Into::into).collect())),
+    );
     if payloads.is_empty() {
         payloads.push((Vec::new(), Vec::new()));
     }
@@ -1311,17 +1307,19 @@ fn graph_neighborhood_batches(
     payloads
         .into_iter()
         .enumerate()
-        .map(|(index, (nodes, edges))| StreamWorkspaceGraphNeighborhoodResponse {
-            schema: result.schema.clone(),
-            metadata: Some(metadata.clone()),
-            focus: Some(focus.clone()),
-            max_edges: result.neighborhood.max_edges,
-            truncated: result.neighborhood.truncated,
-            nodes,
-            edges,
-            batch_index: index as u32,
-            complete: index + 1 == batch_count,
-        })
+        .map(
+            |(index, (nodes, edges))| StreamWorkspaceGraphNeighborhoodResponse {
+                schema: result.schema.clone(),
+                metadata: Some(metadata.clone()),
+                focus: Some(focus.clone()),
+                max_edges: result.neighborhood.max_edges,
+                truncated: result.neighborhood.truncated,
+                nodes,
+                edges,
+                batch_index: index as u32,
+                complete: index + 1 == batch_count,
+            },
+        )
         .collect()
 }
 

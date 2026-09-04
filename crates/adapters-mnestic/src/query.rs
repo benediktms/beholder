@@ -961,12 +961,9 @@ fn workspace_graph_query(
     mut params: BTreeMap<String, DataValue>,
 ) -> Result<NamedRows, Box<dyn Error>> {
     params.insert("view".into(), view.into());
-    observed_bound_query(
-        db,
-        QuerySpec::new(operation, view, query),
-        None,
-        || params.clone(),
-    )
+    observed_bound_query(db, QuerySpec::new(operation, view, query), None, || {
+        params.clone()
+    })
 }
 
 pub(super) fn workspace_graph_overview(
@@ -1025,7 +1022,9 @@ pub(super) fn workspace_graph_neighborhood(
     view: &str,
     focus_kind: &str,
     focus: &str,
+    max_edges: u32,
 ) -> Result<NamedRows, Box<dyn Error>> {
+    let row_limit = max_edges.saturating_add(1);
     workspace_graph_query(
         db,
         "workspace_graph_neighborhood",
@@ -1036,7 +1035,7 @@ pub(super) fn workspace_graph_neighborhood(
              focus_entity[id] := $focus_kind == 'repository', \
                  repository_entity[id, $focus]\n\
              focus_entity[id] := $focus_kind == 'external', \
-                 observed_entity[id], not owned_entity[id]\n\
+                 external_community_entity[id]\n\
              neighborhood[from, to, relation, confidence] := \
                  effective_observation[from, to, relation, evidence, confidence, provenance], \
                  focus_entity[from]\n\
@@ -1046,7 +1045,7 @@ pub(super) fn workspace_graph_neighborhood(
              ?[from, to, relation, max(confidence)] := \
                  neighborhood[from, to, relation, confidence]\n\
              :order from, to, relation\n\
-             :limit 10001"
+             :limit {row_limit}"
         ),
         BTreeMap::from([
             ("focus_kind".into(), focus_kind.into()),

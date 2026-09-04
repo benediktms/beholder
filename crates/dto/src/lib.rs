@@ -6,8 +6,7 @@ pub const DEPENDENCIES_SCHEMA_V2: &str = "beholder.dependencies.v2";
 pub const IMPACT_SCHEMA_V2: &str = "beholder.impact.v2";
 pub const TRACE_SCHEMA_V2: &str = "beholder.trace.v2";
 pub const WHY_SCHEMA_V2: &str = "beholder.why.v2";
-pub const WORKSPACE_GRAPH_NEIGHBORHOOD_SCHEMA_V1: &str =
-    "beholder.workspace_graph_neighborhood.v1";
+pub const WORKSPACE_GRAPH_NEIGHBORHOOD_SCHEMA_V1: &str = "beholder.workspace_graph_neighborhood.v1";
 pub const WORKSPACE_GRAPH_OVERVIEW_SCHEMA_V1: &str = "beholder.workspace_graph_overview.v1";
 pub const WORKSPACE_TOPOLOGY_SCHEMA_V1: &str = "beholder.workspace_topology.v1";
 pub const DEFAULT_MAX_HOPS: u32 = 32;
