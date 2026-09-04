@@ -842,13 +842,14 @@ impl WorkerAnalyzer {
         let client = loop {
             #[cfg(unix)]
             let connection = tokio::select! {
-                connection = AnalyzerWorkerClient::connect(endpoint.clone()) => connection,
+                biased;
                 event = memory_guard_event(memory_guard.as_mut()) => {
                     let process_group = memory_guard
                         .as_ref()
                         .map(ProcessMemoryGuard::process_group);
                     return Err(terminate_for_memory_event(&mut child, process_group, event).await);
                 }
+                connection = AnalyzerWorkerClient::connect(endpoint.clone()) => connection,
             };
             #[cfg(not(unix))]
             let connection = AnalyzerWorkerClient::connect(endpoint.clone()).await;
