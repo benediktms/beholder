@@ -7,6 +7,8 @@ tasks:
     command: 'pnpm check'
   release:
     command: 'pnpm tauri build --no-bundle'
+    deps:
+      - 'build'
     options:
       cache: false
   test:
