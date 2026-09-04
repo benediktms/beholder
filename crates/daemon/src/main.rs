@@ -188,6 +188,7 @@ fn join_result<T: std::fmt::Debug>(result: Result<T, tokio::task::JoinError>) ->
 fn rpc_span(request: &tonic::codegen::http::Request<()>) -> tracing::Span {
     let span = tracing::info_span!(
         "rpc.server",
+        otel.name = %request.uri().path(),
         rpc.system = "grpc",
         rpc.route = %request.uri().path()
     );
@@ -697,7 +698,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 21);
+        assert_eq!(status.protocol_version, 22);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");

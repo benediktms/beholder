@@ -871,8 +871,7 @@ impl MnesticQuery for AllEntityFactsQuery {
              *analysis_enrichment_entity_selection{view: $view, id, owner}, \
              selected_enrichment[owner], \
              *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, \
-             not baseline_id[id]\n\
-         :order id";
+             not baseline_id[id]";
     const HEADERS: &'static [&'static str] = ENTITY_FACT_HEADERS;
 
     type Params = ();
@@ -919,8 +918,7 @@ impl MnesticQuery for WorkspaceTopologyQuery {
     const SCRIPT: &'static str = concat!(
         include_str!("../../../rules/core/direct.datalog"),
         "\n?[from, to, relation, evidence, confidence, provenance] := \
-             effective_observation[from, to, relation, evidence, confidence, provenance]\n\
-         :order from, to, relation, evidence"
+             effective_observation[from, to, relation, evidence, confidence, provenance]"
     );
     const HEADERS: &'static [&'static str] = WORKSPACE_TOPOLOGY_HEADERS;
 
@@ -947,6 +945,113 @@ pub(super) fn workspace_topology(
             .collect(),
         db.run::<WorkspaceTopologyQuery>(view, ())?,
     ))
+}
+
+const WORKSPACE_GRAPH_RULES: &str = concat!(
+    include_str!("../../../rules/core/direct.datalog"),
+    "\n",
+    include_str!("../../../rules/core/workspace_graph.datalog")
+);
+
+fn workspace_graph_query(
+    db: &impl QueryRunner,
+    operation: &'static str,
+    view: &str,
+    query: &str,
+    mut params: BTreeMap<String, DataValue>,
+) -> Result<NamedRows, Box<dyn Error>> {
+    params.insert("view".into(), view.into());
+    observed_bound_query(db, QuerySpec::new(operation, view, query), None, || {
+        params.clone()
+    })
+}
+
+pub(super) fn workspace_graph_overview(
+    db: &impl QueryRunner,
+    view: &str,
+) -> Result<(NamedRows, NamedRows), Box<dyn Error>> {
+    let rows = workspace_graph_query(
+        db,
+        "workspace_graph_overview",
+        view,
+        &format!(
+            "{WORKSPACE_GRAPH_RULES}\n\
+             community_count[repository, count_unique(id)] := \
+                 community_entity[id, repository]\n\
+             edge_count[from_community, to_community, relation, count_unique(edge)] := \
+                 community_edge[from_community, to_community, relation, edge]\n\
+             ?[row_kind, first, second, relation, count] := \
+                 community_count[first, count], row_kind = 'community', second = '', relation = ''\n\
+             ?[row_kind, first, second, relation, count] := \
+                 edge_count[first, second, relation, count], row_kind = 'edge'\n\
+             :order row_kind, first, second, relation"
+        ),
+        BTreeMap::new(),
+    )?;
+    let mut communities = Vec::new();
+    let mut edges = Vec::new();
+    for row in rows.rows {
+        match row.first().and_then(DataValue::get_str) {
+            Some("community") => communities.push(vec![row[1].clone(), row[4].clone()]),
+            Some("edge") => edges.push(vec![
+                row[1].clone(),
+                row[2].clone(),
+                row[3].clone(),
+                row[4].clone(),
+            ]),
+            Some(kind) => return Err(format!("unknown workspace graph row kind: {kind}").into()),
+            None => return Err("workspace graph row kind must be text".into()),
+        }
+    }
+    Ok((
+        NamedRows::new(vec!["repository".into(), "count".into()], communities),
+        NamedRows::new(
+            vec![
+                "from_community".into(),
+                "to_community".into(),
+                "relation".into(),
+                "count".into(),
+            ],
+            edges,
+        ),
+    ))
+}
+
+pub(super) fn workspace_graph_neighborhood(
+    db: &impl QueryRunner,
+    view: &str,
+    focus_kind: &str,
+    focus: &str,
+    max_edges: u32,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let row_limit = max_edges.saturating_add(1);
+    workspace_graph_query(
+        db,
+        "workspace_graph_neighborhood",
+        view,
+        &format!(
+            "{WORKSPACE_GRAPH_RULES}\n\
+             focus_entity[id] := $focus_kind == 'entity', id = $focus\n\
+             focus_entity[id] := $focus_kind == 'repository', \
+                 repository_entity[id, $focus]\n\
+             focus_entity[id] := $focus_kind == 'external', \
+                 external_community_entity[id]\n\
+             neighborhood[from, to, relation, confidence] := \
+                 effective_observation[from, to, relation, evidence, confidence, provenance], \
+                 focus_entity[from]\n\
+             neighborhood[from, to, relation, confidence] := \
+                 effective_observation[from, to, relation, evidence, confidence, provenance], \
+                 focus_entity[to]\n\
+             ?[from, to, relation, max(confidence)] := \
+                 neighborhood[from, to, relation, confidence]\n\
+             :order from, to, relation\n\
+             :limit {row_limit}"
+        ),
+        BTreeMap::from([
+            ("focus_kind".into(), focus_kind.into()),
+            ("focus".into(), focus.into()),
+        ]),
+    )
 }
 
 pub(super) fn inspect_observations(

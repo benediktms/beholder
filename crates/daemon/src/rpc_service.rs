@@ -7,9 +7,10 @@ use crate::repository_registry::RegisteredRepository;
 use crate::rpc::semantic_query;
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
-    DEFAULT_MAX_HOPS, GarbageCollectionPhase,
-    GarbageCollectionProgress as DtoGarbageCollectProgress,
-    RepositoryStatus as DtoRepositoryStatus, Revisioned, WhyResult,
+    DEFAULT_GRAPH_NEIGHBORHOOD_MAX_EDGES, DEFAULT_MAX_HOPS, GarbageCollectionPhase,
+    GarbageCollectionProgress as DtoGarbageCollectProgress, GraphNeighborhoodFocus,
+    MAX_GRAPH_NEIGHBORHOOD_EDGES, RepositoryStatus as DtoRepositoryStatus, Revisioned,
+    SemanticQueryResult, WhyResult, WorkspaceGraphNeighborhood,
 };
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
 use beholder_protocol::v1::{
@@ -19,15 +20,18 @@ use beholder_protocol::v1::{
     GarbageCollectProgress, GarbageCollectRequest, GarbageCollectResponse,
     GetGarbageCollectionStatusRequest, GetGarbageCollectionStatusResponse, GetJobRequest,
     GetJobResponse, GetRepositoryRequest, GetStatusRequest, GetStatusResponse,
+    GetWorkspaceGraphOverviewRequest, GetWorkspaceGraphOverviewResponse,
     GetWorkspaceTopologyRequest, GetWorkspaceTopologyResponse, GetWorkspaceTopologyStatusRequest,
     GetWorkspaceTopologyStatusResponse, ImpactResponse, IndexJobOutcome, Job, JobStatus,
     JobSummary, JobTarget, JobTrigger, JobType, JobWaitReason, ListJobsRequest, ListJobsResponse,
     ListWorkspacesRequest, ListWorkspacesResponse, PathRequest, RegisterRepositoryRequest,
     RegisterWorkspaceRequest, RegisterWorkspaceResponse, RepositoryResponse,
     SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest, StopResponse,
+    StreamWorkspaceGraphNeighborhoodRequest, StreamWorkspaceGraphNeighborhoodResponse,
     SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse,
     TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
-    garbage_collect_event, index_destination, job_target, submit_index_request,
+    garbage_collect_event, index_destination, job_target,
+    stream_workspace_graph_neighborhood_request, submit_index_request,
 };
 use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::atomic::Ordering};
 use tokio::sync::mpsc;
@@ -291,9 +295,28 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 21,
+            protocol_version: 22,
             pid: std::process::id(),
         }))
+    }
+
+    #[tracing::instrument(name = "rpc.get_workspace_graph_overview", skip_all, fields(workspace = %request.get_ref().workspace))]
+    async fn get_workspace_graph_overview(
+        &self,
+        request: Request<GetWorkspaceGraphOverviewRequest>,
+    ) -> Result<Response<GetWorkspaceGraphOverviewResponse>, Status> {
+        let workspace = request.into_inner().workspace;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let store = self.store.clone();
+        let query_workspace = workspace.clone();
+        let result =
+            semantic_query(move || store.workspace_graph_overview_snapshot(&query_workspace))
+                .await?;
+        self.query_response(&workspace, enriching, result)
     }
 
     #[tracing::instrument(name = "rpc.get_workspace_topology", skip_all, fields(workspace = %request.get_ref().workspace))]
@@ -338,6 +361,96 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(GetWorkspaceTopologyStatusResponse {
             metadata: Some(metadata.into()),
         }))
+    }
+
+    type StreamWorkspaceGraphNeighborhoodStream =
+        UnboundedReceiverStream<Result<StreamWorkspaceGraphNeighborhoodResponse, Status>>;
+
+    #[tracing::instrument(
+        name = "rpc.stream_workspace_graph_neighborhood",
+        skip_all,
+        fields(workspace = %request.get_ref().workspace)
+    )]
+    async fn stream_workspace_graph_neighborhood(
+        &self,
+        request: Request<StreamWorkspaceGraphNeighborhoodRequest>,
+    ) -> Result<Response<Self::StreamWorkspaceGraphNeighborhoodStream>, Status> {
+        let request = request.into_inner();
+        let focus = match request.focus {
+            Some(stream_workspace_graph_neighborhood_request::Focus::Repository(repository))
+                if !repository.trim().is_empty() =>
+            {
+                let exists = self
+                    .workspaces
+                    .lock()
+                    .map_err(|_| Status::internal("workspace registry lock poisoned"))?
+                    .get(&request.workspace)
+                    .is_some_and(|workspace| {
+                        workspace
+                            .repositories
+                            .iter()
+                            .any(|candidate| candidate.repository.identity == repository)
+                    });
+                if !exists {
+                    return Err(Status::invalid_argument(format!(
+                        "repository is not part of workspace {}: {repository}",
+                        request.workspace
+                    )));
+                }
+                GraphNeighborhoodFocus::Repository(repository)
+            }
+            Some(stream_workspace_graph_neighborhood_request::Focus::Entity(entity))
+                if !entity.trim().is_empty() =>
+            {
+                GraphNeighborhoodFocus::Entity(entity)
+            }
+            Some(stream_workspace_graph_neighborhood_request::Focus::External(true)) => {
+                GraphNeighborhoodFocus::External
+            }
+            Some(stream_workspace_graph_neighborhood_request::Focus::Repository(_)) => {
+                return Err(Status::invalid_argument(
+                    "repository focus must not be empty",
+                ));
+            }
+            Some(stream_workspace_graph_neighborhood_request::Focus::Entity(_)) => {
+                return Err(Status::invalid_argument("entity focus must not be empty"));
+            }
+            Some(stream_workspace_graph_neighborhood_request::Focus::External(false)) => {
+                return Err(Status::invalid_argument("external focus must be true"));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "graph neighborhood focus is required",
+                ));
+            }
+        };
+        let max_edges = max_graph_neighborhood_edges(request.max_edges)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&request.workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let store = self.store.clone();
+        let workspace = request.workspace;
+        let query_workspace = workspace.clone();
+        let query_focus = focus.clone();
+        let mut revisioned = semantic_query(move || {
+            store.workspace_graph_neighborhood_snapshot(&query_workspace, query_focus, max_edges)
+        })
+        .await?;
+        *revisioned.result.metadata_mut() = self.scheduler.query_metadata_with_enrichments(
+            &workspace,
+            revisioned.analysis_revision,
+            revisioned.analysis,
+            Some(enriching),
+        );
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for batch in graph_neighborhood_batches(revisioned.result) {
+            let _ = sender.send(Ok(batch));
+        }
+        drop(sender);
+        Ok(Response::new(UnboundedReceiverStream::new(receiver)))
     }
 
     #[tracing::instrument(name = "rpc.list_jobs", skip_all, err)]
@@ -1155,6 +1268,59 @@ fn max_hops(value: Option<u32>) -> Result<u32, Status> {
         )),
         value => Ok(value),
     }
+}
+
+fn max_graph_neighborhood_edges(value: Option<u32>) -> Result<u32, Status> {
+    match value.unwrap_or(DEFAULT_GRAPH_NEIGHBORHOOD_MAX_EDGES) {
+        0 => Err(Status::invalid_argument(
+            "max_edges must be greater than zero",
+        )),
+        value if value > MAX_GRAPH_NEIGHBORHOOD_EDGES => Err(Status::invalid_argument(format!(
+            "max_edges must not exceed {MAX_GRAPH_NEIGHBORHOOD_EDGES}"
+        ))),
+        value => Ok(value),
+    }
+}
+
+fn graph_neighborhood_batches(
+    result: WorkspaceGraphNeighborhood,
+) -> Vec<StreamWorkspaceGraphNeighborhoodResponse> {
+    const BATCH_ITEMS: usize = 512;
+
+    let mut payloads = result
+        .nodes
+        .chunks(BATCH_ITEMS)
+        .map(|nodes| (nodes.iter().cloned().map(Into::into).collect(), Vec::new()))
+        .collect::<Vec<_>>();
+    payloads.extend(
+        result
+            .edges
+            .chunks(BATCH_ITEMS)
+            .map(|edges| (Vec::new(), edges.iter().cloned().map(Into::into).collect())),
+    );
+    if payloads.is_empty() {
+        payloads.push((Vec::new(), Vec::new()));
+    }
+    let batch_count = payloads.len();
+    let focus = beholder_protocol::v1::GraphNeighborhoodFocus::from(result.focus);
+    let metadata = beholder_protocol::v1::QueryMetadata::from(result.metadata);
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (nodes, edges))| StreamWorkspaceGraphNeighborhoodResponse {
+                schema: result.schema.clone(),
+                metadata: Some(metadata.clone()),
+                focus: Some(focus.clone()),
+                max_edges: result.neighborhood.max_edges,
+                truncated: result.neighborhood.truncated,
+                nodes,
+                edges,
+                batch_index: index as u32,
+                complete: index + 1 == batch_count,
+            },
+        )
+        .collect()
 }
 
 #[cfg(test)]

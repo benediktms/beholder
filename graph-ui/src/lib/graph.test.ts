@@ -4,10 +4,9 @@ import {
   EXTERNAL_REPOSITORY,
   ORIGINS,
   directHighlight,
+  entityCommunity,
+  extendTrail,
   findEntity,
-  investigate,
-  labelOpacity,
-  nodeValue,
   projectGraph,
   type EntityRef,
   type GraphSnapshot,
@@ -78,18 +77,37 @@ test('direct highlighting distinguishes upstream and downstream relationships', 
   assert.deepEqual([...highlight.downstreamLinkIds], ['b|calls|c']);
 });
 
-test('low-degree nodes stay small while connected nodes scale up', () => {
-  assert.equal(nodeValue(0), 0.25);
-  assert.equal(nodeValue(1), 0.25);
-  assert.equal(nodeValue(2), 1.25);
-  assert.equal(nodeValue(3), 2.25);
+test('selection extends only across connected nodes and truncates on backtracking', () => {
+  assert.deepEqual(extendTrail({ trail: ['a'], next: 'b', connected: true }), ['a', 'b']);
+  assert.deepEqual(extendTrail({ trail: ['a', 'b'], next: 'a', connected: true }), ['a']);
+  assert.deepEqual(extendTrail({ trail: ['a', 'b'], next: 'c', connected: false }), ['c']);
 });
 
-test('labels fade in with zoom but highlighted nodes remain labelled', () => {
-  assert.equal(labelOpacity(0.55, 0), 0);
-  assert.ok(Math.abs(labelOpacity(1.3, 0) - 0.5) < Number.EPSILON);
-  assert.equal(labelOpacity(1.5, 0), 1);
-  assert.equal(labelOpacity(0.55, 0.8), 0.8);
+test('filesystem communities use stable package boundaries', () => {
+  assert.deepEqual(
+    entityCommunity(entity(
+      'repo://github.com/benediktms/beholder/rust/crates/daemon/src/rpc_service/start',
+      'github.com/benediktms/beholder'
+    )),
+    {
+      id: 'github.com/benediktms/beholder/rust/crates/daemon',
+      label: 'crates/daemon'
+    }
+  );
+  assert.equal(
+    entityCommunity(entity(
+      'repo://github.com/benediktms/beholder/javascript/graph-ui/src/lib/graph/projectGraph',
+      'github.com/benediktms/beholder'
+    )).label,
+    'graph-ui'
+  );
+  assert.equal(
+    entityCommunity(entity(
+      'repo://github.com/benediktms/beholder/protobuf/Beholder.V1.Daemon.Service/GetWorkspace',
+      'github.com/benediktms/beholder'
+    )).label,
+    'protobuf'
+  );
 });
 
 test('selection-independent projection keeps disconnected nodes visible', () => {
@@ -140,46 +158,13 @@ test('entity search prefers exact case-sensitive canonical IDs', () => {
   assert.equal(findEntity(candidates, '  '), undefined);
 });
 
-test('complete projections never apply speculative topology limits', () => {
-  const graph = projectGraph(snapshot, options);
-  assert.deepEqual(graph.nodes.map((node) => node.id), ['a', 'b', 'c']);
-  assert.equal(graph.omittedNodes, 0);
-  assert.equal(graph.omittedLinks, 0);
-  assert.equal(graph.truncated, false);
-});
-
-test('pinned investigations preserve dependency, impact, and shortest-path direction', () => {
-  assert.deepEqual([...investigate(snapshot, 'dependencies', 'a').nodeIds], ['a', 'b', 'c']);
-  assert.deepEqual([...investigate(snapshot, 'impact', 'c').nodeIds], ['c', 'b', 'a']);
-  assert.deepEqual([...investigate(snapshot, 'trace', 'a', 'c').edgeIds].sort(), ['e1', 'e3']);
-});
-
-test('impact follows implemented_by from an RPC without crossing between implementations', () => {
-  const rpc = 'grpc://example.Service/Call';
-  const implementationA = 'implementation-a';
-  const implementationB = 'implementation-b';
-  const implementedByA = { ...edge('implemented-a', rpc, implementationA), kind: 'implemented_by' as const };
-  const implementedByB = { ...edge('implemented-b', rpc, implementationB), kind: 'implemented_by' as const };
-  const result = investigate(
-    {
-      ...snapshot,
-      nodes: [entity(rpc, 'repo-a'), entity(implementationA, 'repo-a'), entity(implementationB, 'repo-b')],
-      edges: [implementedByA, implementedByB]
-    },
-    'impact',
-    implementationA
-  );
-  assert.deepEqual([...result.nodeIds], [implementationA]);
-  assert.deepEqual(
-    [...investigate({ ...snapshot, edges: [implementedByA, implementedByB] }, 'impact', rpc).nodeIds],
-    [rpc, implementationA, implementationB]
-  );
-});
-
-test('trace keeps both endpoints when no path exists', () => {
-  const result = investigate(snapshot, 'trace', 'c', 'a');
-  assert.deepEqual([...result.nodeIds], ['c', 'a']);
-  assert.deepEqual([...result.edgeIds], []);
+test('visible guards keep deterministic topology and report omissions', () => {
+  const graph = projectGraph(snapshot, options, { nodes: 2, links: 1 });
+  assert.deepEqual(graph.nodes.map((node) => node.id), ['a', 'b']);
+  assert.deepEqual(graph.nodes.map((node) => node.degree), [1, 1]);
+  assert.equal(graph.omittedNodes, 1);
+  assert.equal(graph.omittedLinks, 1);
+  assert.equal(graph.truncated, true);
 });
 
 function entity(id: string, repository: string): EntityRef {

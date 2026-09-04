@@ -1,0 +1,57 @@
+repository_entity[id, repository] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_state{view: $view, revision, repository, state},
+    *state_entity{state, id}
+
+repository_entity[id, repository] :=
+    *analysis_fact_shard_selection{view: $view, producer, repository, owner, version},
+    *analysis_fact_shard_entity{producer, owner, version, id}
+
+repository_entity[id, repository] :=
+    selected_enrichment[owner, repository, _, _, _],
+    *analysis_enrichment_entity_selection{view: $view, id, owner}
+
+repository_entity[from, repository] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_state{view: $view, revision, repository, state},
+    *state_observation{state, from}
+
+repository_entity[from, repository] :=
+    *analysis_fact_shard_selection{view: $view, producer, repository, owner, version},
+    *analysis_fact_shard_observation{producer, owner, version, from}
+
+repository_entity[from, repository] :=
+    selected_enrichment[owner, repository, _, _, _],
+    *analysis_enrichment_observation_selection{view: $view, from, owner}
+
+observed_entity[id] := effective_observation[id, _, _, _, _, _]
+observed_entity[id] := effective_observation[_, id, _, _, _, _]
+
+owned_entity[id] := repository_entity[id, _]
+
+external_entity[id] := observed_entity[id], starts_with(id, 'rust-call://')
+external_entity[id] := observed_entity[id], starts_with(id, 'rust-method://')
+external_entity[id] := observed_entity[id], starts_with(id, 'elixir-call://')
+external_entity[id] := observed_entity[id], starts_with(id, 'elixir-module://')
+external_entity[id] := observed_entity[id], starts_with(id, 'erlang-module://')
+external_entity[id] := observed_entity[id], starts_with(id, 'unity://')
+
+external_community_entity[id] := external_entity[id]
+external_community_entity[id] := observed_entity[id], not owned_entity[id]
+
+community_entity[id, repository] :=
+    repository_entity[id, repository],
+    not external_entity[id]
+community_entity[id, community] :=
+    external_community_entity[id],
+    community = '__external__'
+
+semantic_edge[from, to, relation] :=
+    effective_observation[from, to, relation, _, _, _]
+
+community_edge[from_community, to_community, relation, edge] :=
+    semantic_edge[from, to, relation],
+    community_entity[from, from_community],
+    community_entity[to, to_community],
+    from_community != to_community,
+    edge = [from, to, relation]

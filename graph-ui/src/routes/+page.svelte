@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { QueryClient } from '@tanstack/svelte-query';
   import { onMount } from 'svelte';
   import GraphCanvas from '$lib/GraphCanvas.svelte';
   import { Badge } from '$lib/components/ui/badge';
@@ -8,14 +9,14 @@
     EXTERNAL_REPOSITORY,
     ORIGINS,
     RELATION_KINDS,
+    extendTrail,
     findEntity,
     projectGraph,
-    investigate,
     type EntityOrigin,
     type GraphNode,
     type GraphSnapshot,
     type Projection,
-    type RelationKind, type InvestigationMode, type QueryMetadata,
+    type RelationKind, type QueryMetadata,
     type WorkspaceSummary
   } from '$lib/graph';
 
@@ -30,6 +31,9 @@
   };
   const MIN_DRAWER_WIDTH = 192;
   const MAX_DRAWER_WIDTH = 512;
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { staleTime: Infinity, gcTime: 30 * 60 * 1000 } }
+  });
 
   let workspaces: WorkspaceSummary[] = [];
   let selectedWorkspace = '';
@@ -39,6 +43,7 @@
   let origins: EntityOrigin[] = [...ORIGINS];
   let includeTests = true;
   let rootId: string | null = null;
+  let trail: string[] = [];
   let filtersOpen = true;
   let inspectorOpen = true;
   let filtersWidth = 240;
@@ -48,17 +53,11 @@
   let statusError = '';
   let status: QueryMetadata | null = null;
   let search = '';
-  let mode: InvestigationMode = 'context';
-  let traceTarget = '';
   let loadRequest = 0;
   let pollingStatus = false;
 
-  $: investigation = snapshot && rootId ? investigate(snapshot, mode, rootId, traceTarget || undefined) : null;
-  $: visibleSnapshot = snapshot && investigation
-    ? { ...snapshot, nodes: snapshot.nodes.filter((node) => investigation.nodeIds.has(node.id)), edges: snapshot.edges.filter((edge) => investigation.edgeIds.has(edge.id)) }
-    : snapshot;
-  $: projection = visibleSnapshot
-    ? projectGraph(visibleSnapshot, {
+  $: projection = snapshot
+    ? projectGraph(snapshot, {
         repositories,
         relationKinds,
         includeTests,
@@ -136,8 +135,10 @@
     loading = true;
     error = '';
     try {
-      const nextSnapshot = await invoke<GraphSnapshot>('load_graph', {
-        request: { workspace }
+      const nextStatus = await invoke<QueryMetadata>('topology_status', { request: { workspace } });
+      const nextSnapshot = await queryClient.fetchQuery({
+        queryKey: ['topology', workspace, nextStatus.revision],
+        queryFn: () => invoke<GraphSnapshot>('load_graph', { request: { workspace } })
       });
       if (request !== loadRequest) return;
       snapshot = nextSnapshot;
@@ -152,12 +153,8 @@
 
   function selectSearch() {
     const entity = snapshot && findEntity(snapshot.nodes, search);
-    if (entity) {
-      repositories = [];
-      origins = [...ORIGINS];
-      includeTests = true;
-      rootId = entity.id;
-    }
+    const id = entity?.id ?? search.trim();
+    if (id && snapshot?.nodes.some((node) => node.id === id)) selectEntity(id);
   }
 
   function changeWorkspace(event: Event) {
@@ -170,16 +167,33 @@
       clearFocus();
       return;
     }
-    rootId = node.id;
+    selectEntity(node.id);
+  }
+
+  function selectEntity(entity: string) {
+    if (!snapshot) return;
+    const connected = rootId !== null && snapshot?.edges.some(
+      (edge) =>
+        (edge.from === rootId && edge.to === entity) ||
+        (edge.to === rootId && edge.from === entity)
+    );
+    trail = extendTrail({ trail, next: entity, connected: Boolean(connected) });
+    rootId = entity;
   }
 
   function clearFocus() {
     rootId = null;
+    trail = [];
+  }
+
+  function stepBack() {
+    if (trail.length < 2) return;
+    trail = trail.slice(0, -1);
+    rootId = trail.at(-1) ?? null;
   }
 
   function returnToWorkspace() {
     repositories = [];
-    traceTarget = '';
     clearFocus();
   }
 
@@ -427,22 +441,16 @@
           <span><i class="selected"></i>Selected</span>
           <span><i class="upstream"></i>Upstream</span>
           <span><i class="downstream"></i>Downstream</span>
+          <span><i class="path"></i>Path</span>
         </div>
         <div class="toolbar-actions">
-          <input aria-label="Search entities" placeholder="Canonical ID or name" bind:value={search} onkeydown={(event) => event.key === 'Enter' && selectSearch()} />
+          <input aria-label="Search entities" placeholder="Canonical ID or visible name" bind:value={search} onkeydown={(event) => event.key === 'Enter' && selectSearch()} />
           <Button variant="outline" onclick={selectSearch}>Find</Button>
-          <select aria-label="Investigation mode" bind:value={mode}>
-            <option value="context">Context</option>
-            <option value="dependencies">Dependencies</option>
-            <option value="impact">Impact</option>
-            <option value="trace">Trace</option>
-          </select>
-          {#if mode === 'trace'}
-            <input aria-label="Trace target" placeholder="Trace target ID" bind:value={traceTarget} />
-          {/if}
+          {#if trail.length > 1}<Button variant="outline" onclick={stepBack}>Back</Button>{/if}
           {#if rootId}<Button variant="outline" onclick={clearFocus}>Clear focus</Button>{/if}
-          <Badge>{projection.nodes.length} nodes</Badge>
-          <Badge>{projection.links.length} links</Badge>
+          {#if trail.length > 1}<Badge>{trail.length} nodes in path</Badge>{/if}
+          <Badge>{projection.nodes.length}{projection.omittedNodes ? ` / ${projection.rawNodeCount}` : ''} nodes</Badge>
+          <Badge>{projection.links.length}{projection.omittedLinks ? ` / ${projection.rawLinkCount}` : ''} links</Badge>
         </div>
       </div>
 
@@ -462,8 +470,14 @@
             <Button variant="outline" onclick={loadWorkspaces}>Retry</Button>
           </div>
         {:else}
-          <GraphCanvas {projection} selectedId={rootId} onSelect={selectNode} />
-          <div class="zoom-hint">Scroll to zoom · hover to preview · click an entity to keep its relationship flow</div>
+          <GraphCanvas
+            {projection}
+            selectedId={rootId}
+            viewKey={selectedWorkspace}
+            {trail}
+            onSelect={selectNode}
+          />
+          <div class="zoom-hint">Scroll to zoom · click an entity to highlight its immediate context</div>
         {/if}
       </div>
     </section>
@@ -508,13 +522,13 @@
           </div>
         {:else}
           <div class="instructions">
-            <div><span>01</span><p>Start with the typed entities across the selected workspace.</p></div>
-            <div><span>02</span><p>Use repository, relationship, origin, and test filters to narrow the topology.</p></div>
-            <div><span>03</span><p>Select an entity to persist its direct neighbours and directional relationship flow.</p></div>
+            <div><span>01</span><p>Explore the complete typed topology for the selected workspace.</p></div>
+            <div><span>02</span><p>Use repository, relationship, origin, and test filters to narrow the view.</p></div>
+            <div><span>03</span><p>Select connected entities to preserve a highlighted traversal path.</p></div>
           </div>
           <div class="interaction-key">
             <p><strong>Hover</strong> highlights direct neighbours and incident links.</p>
-            <p><strong>Select</strong> persists upstream/downstream neighbours and relationship flow.</p>
+            <p><strong>Select</strong> highlights immediate context and extends the visible path.</p>
           </div>
         {/if}
       </div>
