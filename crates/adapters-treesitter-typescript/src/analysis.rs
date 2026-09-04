@@ -1652,8 +1652,12 @@ pub fn diagnostics_from_analysis(
 }
 
 pub(super) fn source_stem(path: &Path) -> String {
-    path.with_extension("")
-        .to_string_lossy()
+    let path = if path.extension().and_then(|extension| extension.to_str()) == Some("svelte") {
+        path.to_path_buf()
+    } else {
+        path.with_extension("")
+    };
+    path.to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 

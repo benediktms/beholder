@@ -810,6 +810,32 @@ mod tests {
     }
 
     #[test]
+    fn svelte_and_typescript_siblings_have_distinct_fact_shard_owners() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-typescript-svelte-siblings-{}",
+            std::process::id()
+        ));
+        let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
+        let mut snapshot = snapshot(b"export const load = () => {};", "siblings");
+        snapshot.repositories[0].inputs[0].path = PathBuf::from("src/+layout.ts");
+        snapshot.repositories[0].inputs.push(RepositoryInput {
+            path: PathBuf::from("src/+layout.svelte"),
+            content: Arc::from(&b"<script>export const prerender = true;</script>"[..]),
+            kind: InputKind::Source,
+        });
+
+        let contribution = analyzer.analyze(&snapshot).unwrap();
+        let owners = contribution.repositories[0]
+            .fact_shards
+            .iter()
+            .map(|shard| shard.owner.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(owners.len(), 2);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
     fn semantic_cache_changes_when_a_call_crosses_an_alias_assignment() {
         let cache_dir = std::env::temp_dir().join(format!(
             "beholder-typescript-alias-order-{}",

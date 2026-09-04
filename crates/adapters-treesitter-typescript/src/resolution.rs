@@ -1,4 +1,4 @@
-use super::model::*;
+use super::{analysis::source_stem, model::*};
 use beholder_adapters_graphql::{GraphqlSource, facts as graphql_facts};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
@@ -55,12 +55,6 @@ fn normalized(path: &Path) -> PathBuf {
         }
     }
     result
-}
-
-fn source_stem(path: &Path) -> String {
-    path.with_extension("")
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 #[derive(Clone)]
