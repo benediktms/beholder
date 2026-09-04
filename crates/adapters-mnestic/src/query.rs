@@ -905,6 +905,7 @@ pub(super) fn all_entity_facts(
 
 struct SearchEntityFactsParams {
     candidate: String,
+    limit: u32,
 }
 
 macro_rules! search_entity_facts_query {
@@ -920,7 +921,10 @@ macro_rules! search_entity_facts_query {
             type Row = EntityFactRow;
 
             fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
-                BTreeMap::from([("candidate".into(), params.candidate.as_str().into())])
+                BTreeMap::from([
+                    ("candidate".into(), params.candidate.as_str().into()),
+                    ("limit".into(), i64::from(params.limit).into()),
+                ])
             }
 
             fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
@@ -935,35 +939,41 @@ search_entity_facts_query!(
     "entity_search.state",
     "selected_state[state] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, state}\n\
      ?[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id"
+     :order id\n\
+     :limit $limit"
 );
 search_entity_facts_query!(
     SearchRevisionEntityFacts,
     "entity_search.revision",
     "?[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_entity{view: $view, revision, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id"
+     :order id\n\
+     :limit $limit"
 );
 search_entity_facts_query!(
     SearchShardEntityFacts,
     "entity_search.shard",
     "?[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id"
+     :order id\n\
+     :limit $limit"
 );
 search_entity_facts_query!(
     SearchEnrichmentEntityFacts,
     "entity_search.enrichment",
     "selected_enrichment[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
      ?[id, kind, metadata] := *analysis_enrichment_entity_selection{view: $view, id, owner}, selected_enrichment[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, str_includes(id, $candidate)\n\
-     :order id"
+     :order id\n\
+     :limit $limit"
 );
 
 pub(super) fn search_entity_facts(
     db: &impl QueryRunner,
     view: &str,
     candidate: &str,
+    limit: u32,
 ) -> Result<NamedRows, Box<dyn Error>> {
     let params = || SearchEntityFactsParams {
         candidate: candidate.into(),
+        limit,
     };
     let mut rows = db.run::<SearchStateEntityFacts>(view, params())?;
     rows.extend(db.run::<SearchRevisionEntityFacts>(view, params())?);

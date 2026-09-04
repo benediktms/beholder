@@ -541,7 +541,7 @@ impl SemanticStore {
                 view,
                 query,
                 limit,
-                inspection_result(search_entity_facts(transaction, view, candidate)?),
+                inspection_result(search_entity_facts(transaction, view, candidate, limit)?),
             )?;
             let generated = generated_entity_ids(
                 transaction,
@@ -741,6 +741,7 @@ fn sqlite_pragma(path: &Path, pragma: &str) -> Result<u64, Box<dyn Error>> {
 mod tests {
     use super::{EnrichmentOwner, EnrichmentPayload, relevant_traversal_entities};
     use crate::SemanticStore;
+    use crate::query::search_entity_facts;
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
         Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, FactShard,
@@ -1726,6 +1727,13 @@ mod tests {
             "src/lib.rs:1",
         )];
         store.publish(&view, &[repository], &[]).unwrap();
+
+        let candidates = store
+            .snapshot("main", |transaction| {
+                search_entity_facts(transaction, "main", "ExampleService", 1)
+            })
+            .unwrap();
+        assert_eq!(candidates.result.rows.len(), 1);
 
         let result = store
             .search_entities_snapshot("main", "ExampleService.Call", 20)
