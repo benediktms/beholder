@@ -49,6 +49,7 @@
   let search = '';
   let mode: InvestigationMode = 'context';
   let traceTarget = '';
+  let loadRequest = 0;
 
   $: investigation = snapshot && rootId ? investigate(snapshot, mode, rootId, traceTarget || undefined) : null;
   $: visibleSnapshot = snapshot && investigation
@@ -79,20 +80,33 @@
     : [];
 
   onMount(() => {
-    void (async () => {
-      try {
-        workspaces = await invoke<WorkspaceSummary[]>('list_workspaces');
-        selectedWorkspace = workspaces[0]?.name ?? '';
-        if (selectedWorkspace) await loadWorkspace();
-      } catch (cause) {
-        error = String(cause);
-      } finally {
-        loading = false;
-      }
-    })();
+    void loadWorkspaces();
     const poll = window.setInterval(() => void pollStatus(), 3000);
     return () => window.clearInterval(poll);
   });
+
+  async function loadWorkspaces() {
+    const request = ++loadRequest;
+    loading = true;
+    error = '';
+    try {
+      const nextWorkspaces = await invoke<WorkspaceSummary[]>('list_workspaces');
+      if (request !== loadRequest) return;
+      workspaces = nextWorkspaces;
+      selectedWorkspace = workspaces.some(({ name }) => name === selectedWorkspace)
+        ? selectedWorkspace
+        : workspaces[0]?.name ?? '';
+      if (selectedWorkspace) await loadWorkspace();
+      else {
+        snapshot = null;
+        status = null;
+      }
+    } catch (cause) {
+      if (request === loadRequest) error = String(cause);
+    } finally {
+      if (request === loadRequest) loading = false;
+    }
+  }
 
   async function pollStatus() {
     if (!selectedWorkspace || !snapshot) return;
@@ -109,6 +123,7 @@
 
   async function loadWorkspace() {
     if (!selectedWorkspace) return;
+    const request = ++loadRequest;
     const workspace = selectedWorkspace;
     loading = true;
     error = '';
@@ -116,19 +131,20 @@
       const nextSnapshot = await invoke<GraphSnapshot>('load_graph', {
         request: { workspace }
       });
-      if (workspace !== selectedWorkspace) return;
+      if (request !== loadRequest) return;
       snapshot = nextSnapshot;
       status = snapshot.metadata;
       returnToWorkspace();
     } catch (cause) {
-      if (workspace === selectedWorkspace) error = String(cause);
+      if (request === loadRequest) error = String(cause);
     } finally {
-      if (workspace === selectedWorkspace) loading = false;
+      if (request === loadRequest) loading = false;
     }
   }
 
   function selectSearch() {
     const query = search.trim().toLocaleLowerCase();
+    if (!query) return;
     const entity = snapshot?.nodes.find((node) => node.id.toLocaleLowerCase() === query || node.name.toLocaleLowerCase() === query)
       ?? snapshot?.nodes.find((node) => node.id.toLocaleLowerCase().includes(query) || node.name.toLocaleLowerCase().includes(query));
     if (entity) rootId = entity.id;
@@ -262,8 +278,22 @@
 
     <div class="header-meta">
       <Badge>rev {snapshot?.metadata.revision ?? '—'}</Badge>
-      <span class:healthy={Boolean(snapshot && !snapshot.metadata.freshness.stale)} class="status-dot"></span>
-      <span>{snapshot?.metadata.freshness.stale ? 'stale' : 'snapshot ready'}</span>
+      <span class:healthy={Boolean(snapshot && !snapshot.metadata.freshness.stale && snapshot.metadata.analysis.completeness === 'complete')} class="status-dot"></span>
+      <span>{!snapshot ? 'no snapshot' : snapshot.metadata.analysis.completeness === 'incomplete' ? 'analysis incomplete' : snapshot.metadata.freshness.stale ? 'stale' : 'snapshot ready'}</span>
+      {#if snapshot?.metadata.analysis.completeness === 'incomplete'}
+        <details class="analysis-diagnostics">
+          <summary>{snapshot.metadata.analysis.diagnostics.length} diagnostics</summary>
+          <ul>
+            {#each snapshot.metadata.analysis.diagnostics as diagnostic}
+              <li>
+                <strong>{diagnostic.code}</strong>
+                <span>{diagnostic.repository}/{diagnostic.path}:{diagnostic.line ?? '—'}</span>
+                {#if diagnostic.detail}<span>{diagnostic.detail}</span>{/if}
+              </li>
+            {/each}
+          </ul>
+        </details>
+      {/if}
       {#if statusError}<span>{statusError}</span>{/if}
       {#if status && snapshot && status.revision > snapshot.metadata.revision}
         <Button size="sm" variant="outline" onclick={loadWorkspace}>Revision {status.revision} available · Refresh</Button>
@@ -411,6 +441,12 @@
           <div class="empty"><strong>Could not load the workspace graph.</strong><span>{error}</span></div>
         {:else if loading}
           <div class="empty"><span class="loader"></span><strong>Loading typed graph…</strong></div>
+        {:else if workspaces.length === 0}
+          <div class="empty">
+            <strong>No workspaces registered.</strong>
+            <span>Register a workspace with the Beholder CLI, then retry.</span>
+            <Button variant="outline" onclick={loadWorkspaces}>Retry</Button>
+          </div>
         {:else}
           <GraphCanvas {projection} selectedId={rootId} onSelect={selectNode} />
           <div class="zoom-hint">Scroll to zoom · hover to preview · click an entity to keep its relationship flow</div>

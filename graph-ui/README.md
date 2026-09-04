@@ -1,13 +1,27 @@
 # Beholder graph UI prototype
 
-This Tauri 2 desktop prototype renders a SvelteKit/shadcn-svelte workspace graph with `force-graph`. Its realistic fixture exists only in `../crates/graph-ui/src/fixture.rs` and reaches the frontend through the `list_workspaces` and `load_graph` Tauri commands. It does not add or bypass a Beholder daemon API.
+This Tauri 2 desktop prototype renders a SvelteKit/shadcn-svelte workspace graph with `force-graph`. Its Tauri commands read registered workspaces and typed topology snapshots from the running Beholder daemon.
 
 ## Run
 
-Install the pinned tools from the repository root, then launch the desktop app:
+Install the pinned tools and Beholder binaries from the repository root, then confirm that the daemon is running:
 
 ```sh
 mise install
+just install
+beholder daemon status
+```
+
+The UI needs at least one registered workspace. Inspect the current registry and, if needed, register the repositories that belong to one workspace:
+
+```sh
+beholder workspace list
+beholder workspace register beholder "$PWD"
+```
+
+Then launch the desktop app:
+
+```sh
 just graph-ui
 ```
 
@@ -22,6 +36,4 @@ pnpm --filter @beholder/graph-ui build
 cargo check -p beholder-graph-ui
 ```
 
-## Backend capability required
-
-Replacing the fixture without changing the initial seedless workspace experience needs one bounded, revision-consistent workspace/repository topology query that returns the existing typed entity and semantic-edge DTOs plus explicit truncation metadata. Existing `dependencies`, `impact`, and `context` queries can then serve optional deeper traversal and lazy detail; the missing capability is discovery of a safe initial workspace projection. That belongs in a separate backend ticket after this interaction is validated.
+The app lists workspaces and loads revision-consistent topology snapshots through `beholder-daemon-client`. Its local context, dependency, impact, and trace controls project the pinned snapshot without issuing additional daemon queries.

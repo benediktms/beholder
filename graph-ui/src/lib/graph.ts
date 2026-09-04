@@ -74,7 +74,17 @@ export interface QueryMetadata {
     dirty_repositories: string[];
     enriching_repositories: string[];
   };
-  analysis: { completeness: 'complete' | 'incomplete'; diagnostics: unknown[] };
+  analysis: {
+    completeness: 'complete' | 'incomplete';
+    diagnostics: Array<{
+      code: string;
+      severity: 'known_limitation' | 'warning';
+      repository: string;
+      path: string;
+      line: number | null;
+      detail: string | null;
+    }>;
+  };
 }
 
 export interface GraphNode {
