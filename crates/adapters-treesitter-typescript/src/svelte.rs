@@ -17,7 +17,7 @@ impl Plugin<TypescriptLanguage> for SveltePlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "typescript.svelte".into(),
-            version: "1".into(),
+            version: "2".into(),
         }
     }
 
@@ -47,8 +47,9 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
             return Ok(());
         }
 
-        let (source, error_lines) = extract_scripts(input.syntax.root_node(), input.text)?;
-        let mut embedded = analyze_core(&source, SourceLanguage::TypeScript)?;
+        let (source, language, error_lines) =
+            extract_scripts(input.syntax.root_node(), input.text)?;
+        let mut embedded = analyze_core(&source, language)?;
         embedded.calls.retain(|call| !is_rune(call));
         for definition in &mut embedded.definitions {
             definition.calls.retain(|call| !is_rune(call));
@@ -77,13 +78,13 @@ pub(super) fn embedded_source(source: &str) -> Option<String> {
     let tree = parser.parse(source, None)?;
     extract_scripts(tree.root_node(), source)
         .ok()
-        .map(|(source, _)| source)
+        .map(|(source, _, _)| source)
 }
 
 fn extract_scripts(
     root: Node<'_>,
     source: &str,
-) -> Result<(String, Vec<usize>), beholder_indexing::AnalyzerError> {
+) -> Result<(String, SourceLanguage, Vec<usize>), beholder_indexing::AnalyzerError> {
     let recovery = recover(root).map_err(|_| {
         UnsafeTreeRecovery::new("Svelte", "missing syntax may change script boundaries")
     })?;
@@ -97,61 +98,85 @@ fn extract_scripts(
             }
         })
         .collect::<Vec<_>>();
+    let mut language = None;
     for root in recovery.roots {
-        copy_scripts(root, source.as_bytes(), &mut masked);
+        copy_scripts(root, source.as_bytes(), &mut masked, &mut language)?;
     }
     Ok((
         String::from_utf8(masked).expect("masked Svelte source is valid UTF-8"),
+        language.unwrap_or(SourceLanguage::JavaScript),
         recovery.error_lines,
     ))
 }
 
-fn copy_scripts(node: Node<'_>, source: &[u8], masked: &mut [u8]) {
+fn copy_scripts(
+    node: Node<'_>,
+    source: &[u8],
+    masked: &mut [u8],
+    language: &mut Option<SourceLanguage>,
+) -> Result<(), beholder_indexing::AnalyzerError> {
     if node.kind() == "script_element" {
         if node
             .parent()
             .is_none_or(|parent| parent.kind() != "document")
-            || !supported_script(node, source)
         {
-            return;
+            return Ok(());
         }
+        let Some(script_language) = script_language(node, source) else {
+            return Ok(());
+        };
+        if language
+            .as_ref()
+            .is_some_and(|language| *language != script_language)
+        {
+            return Err(UnsafeTreeRecovery::new(
+                "Svelte",
+                "multiple instance script languages cannot share one syntax tree",
+            )
+            .into());
+        }
+        *language = Some(script_language);
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if child.kind() == "raw_text" {
                 masked[child.byte_range()].copy_from_slice(&source[child.byte_range()]);
             }
         }
-        return;
+        return Ok(());
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        copy_scripts(child, source, masked);
+        copy_scripts(child, source, masked, language)?;
     }
+    Ok(())
 }
 
-fn supported_script(node: Node<'_>, source: &[u8]) -> bool {
-    let Some(start_tag) = node
+fn script_language(node: Node<'_>, source: &[u8]) -> Option<SourceLanguage> {
+    let start_tag = node
         .named_children(&mut node.walk())
-        .find(|child| child.kind() == "start_tag")
-    else {
-        return false;
-    };
-    start_tag
+        .find(|child| child.kind() == "start_tag")?;
+    let mut language = SourceLanguage::JavaScript;
+    for attribute in start_tag
         .named_children(&mut start_tag.walk())
         .filter(|child| child.kind() == "attribute")
-        .all(|attribute| {
-            let Some(attribute) = attribute.utf8_text(source).ok() else {
-                return false;
-            };
-            let (name, value) = attribute.split_once('=').unwrap_or((attribute, ""));
-            let value = value.trim().trim_matches(['\'', '"']);
-            match name.trim() {
-                "module" => false,
-                "context" => value != "module",
-                "lang" => matches!(value, "js" | "javascript" | "ts" | "typescript"),
-                _ => true,
+    {
+        let attribute = attribute.utf8_text(source).ok()?;
+        let (name, value) = attribute.split_once('=').unwrap_or((attribute, ""));
+        let value = value.trim().trim_matches(['\'', '"']);
+        match name.trim() {
+            "module" => return None,
+            "context" if value == "module" => return None,
+            "lang" => {
+                language = match value {
+                    "js" | "javascript" => SourceLanguage::JavaScript,
+                    "ts" | "typescript" => SourceLanguage::TypeScript,
+                    _ => return None,
+                };
             }
-        })
+            _ => {}
+        }
+    }
+    Some(language)
 }
 
 fn rune_name(name: &str) -> bool {
@@ -163,10 +188,12 @@ fn rune_name(name: &str) -> bool {
 
 fn is_rune(call: &Call) -> bool {
     (call.receiver.is_none() && rune_name(&call.name))
-        || call
-            .receiver
-            .as_deref()
-            .is_some_and(|receiver| rune_name(receiver) || receiver.starts_with("$inspect("))
+        || call.receiver.as_deref().is_some_and(|receiver| {
+            rune_name(receiver)
+                || receiver
+                    .strip_prefix("$inspect")
+                    .is_some_and(|suffix| suffix.trim_start().starts_with('('))
+        })
 }
 
 #[cfg(test)]
@@ -190,6 +217,29 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["visible"]);
+    }
+
+    #[test]
+    fn uses_the_declared_instance_script_language() {
+        assert!(
+            crate::analyze(
+                "<script>interface Hidden { run(): void }</script>",
+                SourceLanguage::Svelte,
+            )
+            .is_err()
+        );
+
+        let analysis = crate::analyze(
+            "<script lang=\"ts\">interface Visible { run(): void }</script>",
+            SourceLanguage::Svelte,
+        )
+        .unwrap();
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .any(|definition| definition.qualified_name == "Visible")
+        );
     }
 
     #[test]
@@ -217,6 +267,7 @@ mod tests {
               const count = $state(load());
               $: result = refresh(count);
               $effect(() => persist(count));
+              $inspect (count).with(console.trace);
               api.$state();
             </script>
         "#;
