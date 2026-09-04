@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -56,6 +57,7 @@ type client struct {
 	replies chan reply
 	nextID  int
 	opened  map[string]bool
+	writeMu sync.Mutex
 }
 
 func main() {
@@ -193,7 +195,7 @@ func startClient(ctx context.Context, executable, root string, arguments ...stri
 		stdin:   stdin,
 		stdout:  bufio.NewReader(stdout),
 		stderr:  stderr,
-		replies: make(chan reply, 64),
+		replies: make(chan reply, 1),
 		opened:  make(map[string]bool),
 	}
 	go c.readLoop()
@@ -314,6 +316,8 @@ func (c *client) notify(method string, params any) error {
 }
 
 func (c *client) write(message any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	payload, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -358,10 +362,20 @@ func (c *client) read() (rpcMessage, error) {
 func (c *client) readLoop() {
 	for {
 		message, err := c.read()
-		c.replies <- reply{message: message, err: err}
 		if err != nil {
+			c.replies <- reply{err: err}
 			return
 		}
+		if message.Method != "" {
+			if len(message.ID) != 0 {
+				if err := c.write(map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": nil}); err != nil {
+					c.replies <- reply{err: err}
+					return
+				}
+			}
+			continue
+		}
+		c.replies <- reply{message: message}
 	}
 }
 

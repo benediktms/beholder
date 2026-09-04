@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,8 @@ func TestDefinitionUsesStandardLSP(t *testing.T) {
 	}
 	t.Setenv("BEHOLDER_TYPESCRIPT_LSP_HELPER", "1")
 	t.Setenv("BEHOLDER_TYPESCRIPT_EXPECT_MEMORY_LIMIT", "4GiB")
+	t.Setenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST", "65")
+	t.Setenv("BEHOLDER_TYPESCRIPT_SERVER_REQUEST", "1")
 	t.Setenv("GOMEMLIMIT", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -227,6 +230,21 @@ func runLSPHelper() {
 		}
 		switch message.Method {
 		case "initialize":
+			count, _ := strconv.Atoi(os.Getenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST"))
+			for range count {
+				writeHelperMessage(map[string]any{
+					"jsonrpc": "2.0", "method": "window/logMessage", "params": map[string]string{"message": "loading"},
+				})
+			}
+			if os.Getenv("BEHOLDER_TYPESCRIPT_SERVER_REQUEST") == "1" {
+				writeHelperMessage(map[string]any{
+					"jsonrpc": "2.0", "id": 99, "method": "workspace/configuration", "params": map[string]any{},
+				})
+				response, err := readHelperMessage(reader)
+				if err != nil || string(response.ID) != "99" {
+					return
+				}
+			}
 			writeHelperMessage(map[string]any{
 				"jsonrpc": "2.0", "id": message.ID,
 				"result": map[string]any{"capabilities": map[string]any{}, "serverInfo": map[string]string{"name": "typescript-go", "version": "7.0.2"}},
