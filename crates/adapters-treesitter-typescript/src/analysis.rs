@@ -304,7 +304,11 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
     node != root
         && (matches!(
             node.kind(),
-            "function_declaration" | "generator_function_declaration" | "method_definition"
+            "class"
+                | "class_declaration"
+                | "function_declaration"
+                | "generator_function_declaration"
+                | "method_definition"
         ) || (matches!(node.kind(), "arrow_function" | "function_expression")
             && node
                 .parent()
@@ -1499,7 +1503,8 @@ fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) 
     }
     if matches!(
         node.kind(),
-        "class_declaration"
+        "class"
+            | "class_declaration"
             | "function_declaration"
             | "generator_function_declaration"
             | "interface_declaration"
@@ -2247,9 +2252,9 @@ mod tests {
     }
 
     #[test]
-    fn exported_class_calls_are_not_attributed_to_the_module() {
+    fn class_calls_are_not_attributed_to_the_module() {
         let analysis = analyze(
-            "function traced() {} @traced() export class Service { client = connect(); } export const app = build();",
+            "function traced() {} @traced() export class Service { client = connect(); } const Expression = class { client = reconnect(); }; export const app = build();",
             SourceLanguage::TypeScript,
         )
         .unwrap();
