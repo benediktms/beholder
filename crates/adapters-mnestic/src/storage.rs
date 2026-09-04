@@ -3065,26 +3065,59 @@ pub(super) fn publish_enrichment(
          entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_context{view: $view, revision, target: $repository, analyzer: $analyzer, context}, *analysis_revision_state{view: $view, revision, repository: context, state}, *state_entity{state, id, kind, metadata}\n\
          entity[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, repository: $repository, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
          entity[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_context{view: $view, revision, target: $repository, analyzer: $analyzer, context}, *analysis_fact_shard_selection{view: $view, repository: context, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}\n\
-         incoming[owner] <- $owners\n\
-         entity[id, kind, metadata] := *analysis_enrichment_entity_selection{view: $view, id, owner}, not incoming[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
+         replaced[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner, repository: $repository, analyzer: $analyzer}\n\
+         entity[id, kind, metadata] := *analysis_enrichment_entity_selection{view: $view, id, owner}, not replaced[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
          ?[id, kind, metadata] := entity[id, kind, metadata]",
         BTreeMap::from([
             ("view".into(), view.into()),
             ("repository".into(), repository.into()),
             ("analyzer".into(), analyzer.into()),
-            (
-                "owners".into(),
-                DataValue::List(
-                    incoming_owners
-                        .iter()
-                        .map(|owner| DataValue::List(vec![owner.as_str().into()]))
-                        .collect(),
-                ),
-            ),
         ]),
     )?.rows.into_iter().map(|row| -> Result<EntityFact, Box<dyn Error>> {
         let id = stored_string(&row, 0, "entity ID")?.to_owned();
         Ok(EntityFact::new(id, parse_entity_kind(stored_string(&row, 1, "entity kind")?)?, parse_entity_metadata(stored_string(&row, 2, "entity metadata")?)?)?)
+    }).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let retained_observations = transaction.run_script(
+        "replaced[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner, repository: $repository, analyzer: $analyzer}\n\
+         observation[from, relation, to, evidence, confidence, provenance] := *analysis_enrichment_observation_selection{view: $view, from, relation, to, evidence, owner}, not replaced[owner], *enrichment_observation_contribution{view: $view, owner, from, relation, to, evidence, confidence, provenance}\n\
+         ?[from, relation, to, evidence, confidence, provenance] := observation[from, relation, to, evidence, confidence, provenance]",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("repository".into(), repository.into()),
+            ("analyzer".into(), analyzer.into()),
+        ]),
+    )?.rows.into_iter().map(|row| -> Result<Observation, Box<dyn Error>> {
+        Ok(Observation {
+            from: stored_string(&row, 0, "observation source")?.into(),
+            relation: parse_relation(stored_string(&row, 1, "observation relation")?)?,
+            to: stored_string(&row, 2, "observation target")?.into(),
+            evidence: stored_string(&row, 3, "observation evidence")?.into(),
+            confidence: parse_confidence(row[4].get_float().ok_or("stored confidence is not a float")?)?,
+            provenance: parse_provenance(stored_string(&row, 5, "observation provenance")?)?,
+        })
+    }).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let retained_overrides = transaction.run_script(
+        "replaced[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner, repository: $repository, analyzer: $analyzer}\n\
+         override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := *analysis_enrichment_override_selection{view: $view, from, relation, unresolved_to, owner}, not replaced[owner], *enrichment_override_contribution{view: $view, owner, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance}\n\
+         ?[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] := override[from, relation, unresolved_to, resolved_to, evidence, confidence, provenance]",
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("repository".into(), repository.into()),
+            ("analyzer".into(), analyzer.into()),
+        ]),
+    )?.rows.into_iter().map(|row| -> Result<DependencyOverride, Box<dyn Error>> {
+        let SemanticRelation::Dependency(relation) = parse_relation(stored_string(&row, 1, "override relation")?)? else {
+            return Err("stored override relation is not a dependency relation".into());
+        };
+        Ok(DependencyOverride {
+            from: stored_string(&row, 0, "override source")?.into(),
+            relation,
+            unresolved_to: stored_string(&row, 2, "override unresolved target")?.into(),
+            resolved_to: stored_string(&row, 3, "override resolved target")?.into(),
+            evidence: stored_string(&row, 4, "override evidence")?.into(),
+            confidence: parse_confidence(row[5].get_float().ok_or("stored confidence is not a float")?)?,
+            provenance: parse_provenance(stored_string(&row, 6, "override provenance")?)?,
+        })
     }).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     beholder_domain::validate_entity_complete_semantics(
         baseline_entities
@@ -3096,13 +3129,16 @@ pub(super) fn publish_enrichment(
                     .iter()
                     .flat_map(|shard| shard.entities.iter()),
             ),
-        payload.observations.iter().chain(
-            payload
-                .fact_shards
-                .iter()
-                .flat_map(|shard| shard.observations.iter()),
-        ),
-        payload.overrides.iter(),
+        retained_observations
+            .iter()
+            .chain(payload.observations.iter())
+            .chain(
+                payload
+                    .fact_shards
+                    .iter()
+                    .flat_map(|shard| shard.observations.iter()),
+            ),
+        retained_overrides.iter().chain(payload.overrides.iter()),
     )?;
     let current_selections = transaction
         .run_script(
@@ -6681,7 +6717,26 @@ mod tests {
             )
             .unwrap();
 
-        let conflicting = EntityFact::new(entity.id.clone(), EntityKind::Namespace, None).unwrap();
+        let corrected = EntityFact::new(entity.id.clone(), EntityKind::Namespace, None).unwrap();
+        assert!(
+            store
+                .publish_enrichment(
+                    &view.name,
+                    "example/repo",
+                    &input,
+                    EnrichmentOwner {
+                        analyzer: "compiler-a",
+                        version: "2",
+                    },
+                    EnrichmentPayload {
+                        entities: std::slice::from_ref(&corrected),
+                        ..EnrichmentPayload::default()
+                    },
+                )
+                .unwrap()
+        );
+
+        let conflicting = EntityFact::new(entity.id.clone(), EntityKind::Callable, None).unwrap();
         let input =
             view.repository_enrichment_input_fingerprint(&view.repository_states[0], "compiler-b");
         assert!(
