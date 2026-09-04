@@ -304,11 +304,7 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
     node != root
         && (matches!(
             node.kind(),
-            "class"
-                | "class_declaration"
-                | "function_declaration"
-                | "generator_function_declaration"
-                | "method_definition"
+            "function_declaration" | "generator_function_declaration" | "method_definition"
         ) || (matches!(node.kind(), "arrow_function" | "function_expression")
             && node
                 .parent()
@@ -367,6 +363,10 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
     if is_collection_boundary(node, root) {
         return;
     }
+    if matches!(node.kind(), "class" | "class_declaration") {
+        collect_class_evaluation_calls(node, source, root, calls);
+        return;
+    }
     match node.kind() {
         "call_expression" => {
             if let Some(found) = call(node, source, CallKind::Direct) {
@@ -406,6 +406,48 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_calls(child, source, root, calls);
+    }
+}
+
+fn collect_class_evaluation_calls(
+    node: Node<'_>,
+    source: &[u8],
+    root: Node<'_>,
+    calls: &mut Vec<Call>,
+) {
+    let body = node.child_by_field_name("body");
+    let mut cursor = node.walk();
+    for child in node
+        .named_children(&mut cursor)
+        .filter(|child| Some(*child) != body && child.kind() != "decorator")
+    {
+        collect_calls(child, source, root, calls);
+    }
+    let Some(body) = body else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        if let Some(name) = member
+            .child_by_field_name("name")
+            .or_else(|| member.child_by_field_name("property"))
+            .filter(|name| name.kind() == "computed_property_name")
+        {
+            collect_calls(name, source, root, calls);
+        }
+        match member.kind() {
+            "class_static_block" => collect_calls(member, source, root, calls),
+            "field_definition" | "public_field_definition"
+                if member
+                    .children(&mut member.walk())
+                    .any(|child| child.kind() == "static") =>
+            {
+                if let Some(value) = member.child_by_field_name("value") {
+                    collect_calls(value, source, root, calls);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1503,11 +1545,7 @@ fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) 
     }
     if matches!(
         node.kind(),
-        "class"
-            | "class_declaration"
-            | "function_declaration"
-            | "generator_function_declaration"
-            | "interface_declaration"
+        "function_declaration" | "generator_function_declaration" | "interface_declaration"
     ) {
         return;
     }
@@ -2267,6 +2305,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["build"]
         );
+    }
+
+    #[test]
+    fn class_evaluation_calls_are_attributed_to_the_enclosing_scope() {
+        let analysis = analyze(
+            "function run() { class Local extends decorate(Base) { static value = initialize(); static { register(); } client = connect(); } const Expression = class extends wrap(Base) { static value = prepare(); client = reconnect(); }; }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "run")
+            .unwrap();
+        let calls = run
+            .calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>();
+
+        for name in ["decorate", "initialize", "register", "wrap", "prepare"] {
+            assert!(calls.contains(&name), "missing {name}: {calls:?}");
+        }
+        assert!(!calls.contains(&"connect"));
+        assert!(!calls.contains(&"reconnect"));
     }
 
     #[test]
