@@ -1717,6 +1717,15 @@ mod tests {
             .unwrap(),
             EntityFact::new("repo://example/rust/lib/a", EntityKind::Callable, None).unwrap(),
             EntityFact::new("repo://example/rust/lib/z", EntityKind::Callable, None).unwrap(),
+            EntityFact::new(
+                "repo://a/rust/RunModule/unrelated",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+            EntityFact::new("repo://z/rust/lib/RunLater", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://a/rust/barbaz", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://z/rust/foo/barbaz", EntityKind::Callable, None).unwrap(),
         ];
         repository.observations = vec![Observation::generated(
             "repo://example/rust/lib/call",
@@ -1743,6 +1752,15 @@ mod tests {
             exact_name.result.matches[0].id,
             "grpc://example.v1.ExampleService/Other"
         );
+        let name_prefix = store.search_entities_snapshot("main", "Run", 1).unwrap();
+        assert_eq!(
+            name_prefix.result.matches[0].id,
+            "repo://z/rust/lib/RunLater"
+        );
+        let full_query = store
+            .search_entities_snapshot("main", "oo/barbaz", 1)
+            .unwrap();
+        assert_eq!(full_query.result.matches[0].id, "repo://z/rust/foo/barbaz");
 
         let result = store
             .search_entities_snapshot("main", "ExampleService.Call", 20)

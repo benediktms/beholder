@@ -906,7 +906,6 @@ pub(super) fn all_entity_facts(
 struct SearchEntityFactsParams {
     candidate: String,
     query: String,
-    name_patterns: BTreeSet<String>,
     limit: u32,
 }
 
@@ -917,14 +916,23 @@ macro_rules! ranked_entity_search {
         concat!(
             $source,
             "\n\
-             name_pattern[pattern] <- $name_patterns\n\
-             exact_name[id] := candidate[id, _, _], name_pattern[pattern], ends_with(id, pattern)\n\
-             name_prefix[id] := candidate[id, _, _], name_pattern[pattern], str_includes(id, pattern)\n\
-             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], id = $query, rank = 0\n\
-             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], exact_name[id], rank = 1\n\
-             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], starts_with(id, $query), rank = 2\n\
-             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], name_prefix[id], rank = 2\n\
-             ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata], rank = 3\n\
+             special[id] := candidate[id, _, _], starts_with(id, 'elixir-module://')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$')\n\
+             display[id, name] := candidate[id, _, _], starts_with(id, 'elixir-module://'), name = regex_replace(id, '^elixir-module://', '')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$', '$1.$2/$3')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$'), name = regex_replace(id, '^(proto-method|grpc)://([^/]*[.])?([^./]+)/([^/]+)$', '$3.$4')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$'), name = regex_replace(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$', '$2/$3')\n\
+             display[id, name] := candidate[id, _, _], not special[id], regex_matches(id, '^.*[/:]([^/:]+)$'), name = regex_replace(id, '^.*[/:]([^/:]+)$', '$1')\n\
+             display[id, id] := candidate[id, _, _], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)$')\n\
+             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], str_includes(id, $query)\n\
+             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], str_includes(name, $query)\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, _], id = $query, rank = 0\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], name = $query, rank = 1\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], starts_with(id, $query), rank = 2\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], starts_with(name, $query), rank = 2\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, _], rank = 3\n\
              ?[id, kind, metadata, rank] := ranked[id, kind, metadata, rank]\n\
              :order rank, id\n\
              :limit $limit"
@@ -948,16 +956,6 @@ macro_rules! search_entity_facts_query {
                 BTreeMap::from([
                     ("candidate".into(), params.candidate.as_str().into()),
                     ("query".into(), params.query.as_str().into()),
-                    (
-                        "name_patterns".into(),
-                        DataValue::List(
-                            params
-                                .name_patterns
-                                .iter()
-                                .map(|pattern| DataValue::List(vec![pattern.as_str().into()]))
-                                .collect(),
-                        ),
-                    ),
                     ("limit".into(), i64::from(params.limit).into()),
                 ])
             }
@@ -1010,18 +1008,9 @@ pub(super) fn search_entity_facts(
         .split(['.', '/', ':'])
         .max_by_key(|part| part.len())
         .unwrap_or(query);
-    let mut name_patterns = BTreeSet::from([
-        format!("/{query}"),
-        format!(":{query}"),
-        format!("elixir-module://{query}"),
-    ]);
-    if let Some((namespace, name)) = query.rsplit_once('.') {
-        name_patterns.insert(format!("{namespace}/{name}"));
-    }
     let params = || SearchEntityFactsParams {
         candidate: candidate.into(),
         query: query.into(),
-        name_patterns: name_patterns.clone(),
         limit,
     };
     let mut rows = db.run::<SearchStateEntityFacts>(view, params())?;
