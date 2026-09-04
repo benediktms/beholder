@@ -2069,7 +2069,7 @@ pub fn unresolved_call_diagnostics(
                 .into_iter()
                 .find_map(|language| {
                     caller
-                        .rsplit_once(&format!("/{language}/{module_path}"))
+                        .split_once(&format!("/{language}/{module_path}"))
                         .map(|(repository, _)| repository)
                 })
         else {
@@ -3493,17 +3493,30 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_call_diagnostics_preserve_repository_language_segments() {
-        let observations = vec![Observation::dependency(
-            "repo://acme/svelte/svelte/src/view/run",
-            DependencyRelation::Calls,
-            "typescript-method://api/send",
-            "src/view.svelte:7",
-        )];
+    fn unresolved_call_diagnostics_preserve_repository_and_module_boundaries() {
+        let observations = vec![
+            Observation::dependency(
+                "repo://acme/svelte/svelte/src/view/run",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "src/view.svelte:7",
+            ),
+            Observation::dependency(
+                "repo://example/typescript/src/view/typescript/src/view",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "src/view.ts:8",
+            ),
+        ];
 
         let diagnostics = unresolved_call_diagnostics(&observations);
 
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].0, "acme/svelte");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|(repository, _)| repository.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/svelte", "example"]
+        );
     }
 }
