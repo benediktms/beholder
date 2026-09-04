@@ -16,7 +16,6 @@ const SEMANTIC_QUERY_WARNING_SECONDS: f64 = 5.0;
 const REPOSITORY_QUERY_TIMEOUT_SECONDS: f64 = 5.0;
 const SLOW_QUERY_SECONDS: f64 = 1.0;
 const QUERY_PLAN_TIMEOUT_SECONDS: f64 = 0.25;
-const ANALYSIS_METADATA_RULES: &str = include_str!("../../../rules/core/analysis_metadata.datalog");
 
 pub(super) trait QueryRunner {
     fn run_query(
@@ -24,6 +23,15 @@ pub(super) trait QueryRunner {
         script: &str,
         params: BTreeMap<String, DataValue>,
     ) -> Result<NamedRows, Box<dyn Error>>;
+
+    fn run_query_with_timeout(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        _timeout: Option<f64>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        self.run_query(script, params)
+    }
 
     fn explain_query(
         &self,
@@ -43,9 +51,13 @@ pub(super) trait QueryRunner {
             bound.extend(Q::bind(&params));
             bound
         };
-        let result =
-            observed_bound_query(self, QuerySpec::new(Q::OPERATION, view, Q::SCRIPT), bind)
-                .map_err(|error| QueryError::new(Q::OPERATION, error.to_string()))?;
+        let result = observed_bound_query(
+            self,
+            QuerySpec::new(Q::OPERATION, view, Q::SCRIPT),
+            Q::TIMEOUT_SECONDS,
+            bind,
+        )
+        .map_err(|error| QueryError::new(Q::OPERATION, error.to_string()))?;
         let expected = Q::HEADERS
             .iter()
             .map(|header| (*header).to_owned())
@@ -86,6 +98,7 @@ pub(super) trait MnesticQuery {
     const OPERATION: &'static str;
     const SCRIPT: &'static str;
     const HEADERS: &'static [&'static str];
+    const TIMEOUT_SECONDS: Option<f64> = None;
 
     type Params;
     type Row;
@@ -133,6 +146,18 @@ impl QueryRunner for DbInstance {
             ScriptMutability::Immutable,
             ScriptRunOptions::new(),
         )?)
+    }
+
+    fn run_query_with_timeout(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        timeout: Option<f64>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        let options = timeout.map_or_else(ScriptRunOptions::new, |timeout| {
+            ScriptRunOptions::new().with_timeout(timeout)
+        });
+        Ok(self.run_script_with_options(script, params, ScriptMutability::Immutable, options)?)
     }
 
     fn explain_query(
@@ -183,6 +208,16 @@ impl QueryRunner for SnapshotQueryRunner<'_> {
         self.transaction.run_query(script, params)
     }
 
+    fn run_query_with_timeout(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        timeout: Option<f64>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        self.transaction
+            .run_query_with_timeout(script, params, timeout)
+    }
+
     fn explain_query(
         &self,
         script: &str,
@@ -227,6 +262,7 @@ impl<'a> QuerySpec<'a> {
     }
 }
 
+#[cfg(test)]
 fn query(
     db: &impl QueryRunner,
     view: &str,
@@ -242,26 +278,10 @@ fn query(
     db.run_query(script, params)
 }
 
-fn observed_query(
-    db: &impl QueryRunner,
-    spec: QuerySpec<'_>,
-    additions: impl Fn() -> Vec<(&'static str, DataValue)>,
-) -> Result<NamedRows, Box<dyn Error>> {
-    let view = spec.view;
-    observed_bound_query(db, spec, || {
-        let mut params = BTreeMap::from([("view".into(), view.into())]);
-        params.extend(
-            additions()
-                .into_iter()
-                .map(|(name, value)| (name.into(), value)),
-        );
-        params
-    })
-}
-
 fn observed_bound_query(
     db: &impl QueryRunner,
     spec: QuerySpec<'_>,
+    timeout: Option<f64>,
     params: impl Fn() -> BTreeMap<String, DataValue>,
 ) -> Result<NamedRows, Box<dyn Error>> {
     let (result, elapsed, span_enabled) = {
@@ -279,7 +299,7 @@ fn observed_bound_query(
         );
         let _entered = span.enter();
         let started = Instant::now();
-        let result = db.run_query(spec.script, params());
+        let result = db.run_query_with_timeout(spec.script, params(), timeout);
         let elapsed = started.elapsed();
         span.record("db.outcome", if result.is_ok() { "ok" } else { "error" });
         if let Ok(rows) = &result {
@@ -375,19 +395,105 @@ pub(super) fn inspect_revisions(db: &DbInstance) -> Result<NamedRows, Box<dyn Er
     )?)
 }
 
+struct AnalysisRevisionQuery;
+
+impl MnesticQuery for AnalysisRevisionQuery {
+    const OPERATION: &'static str = "analysis_revision";
+    const SCRIPT: &'static str = "?[revision] := *analysis_revision{view: $view, revision}";
+    const HEADERS: &'static [&'static str] = &["revision"];
+
+    type Params = ();
+    type Row = i64;
+
+    fn bind(_: &Self::Params) -> BTreeMap<String, DataValue> {
+        BTreeMap::new()
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        Ok(row[0].get_int().unwrap_or_default())
+    }
+}
+
 pub(super) fn analysis_revision(db: &impl QueryRunner, view: &str) -> Result<u64, Box<dyn Error>> {
-    let rows = query(
-        db,
-        view,
-        "?[revision] := *analysis_revision{view: $view, revision}",
-        [],
-    )?;
-    Ok(rows
-        .rows
-        .first()
-        .and_then(|row| row[0].get_int())
+    Ok(db
+        .run::<AnalysisRevisionQuery>(view, ())?
+        .into_iter()
+        .next()
         .unwrap_or_default()
         .try_into()?)
+}
+
+struct AnalysisMetadataParams {
+    revision: i64,
+}
+
+struct AnalysisMetadataCompleteness;
+
+impl MnesticQuery for AnalysisMetadataCompleteness {
+    const OPERATION: &'static str = "analysis_metadata.completeness";
+    const SCRIPT: &'static str = "?[incomplete] := *analysis_revision_metadata{view: $view, revision: $revision, incomplete}";
+    const HEADERS: &'static [&'static str] = &["incomplete"];
+
+    type Params = AnalysisMetadataParams;
+    type Row = bool;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        BTreeMap::from([("revision".into(), params.revision.into())])
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        Ok(matches!(row[0], DataValue::Bool(true)))
+    }
+}
+
+struct AnalysisMetadataDiagnostics;
+
+impl MnesticQuery for AnalysisMetadataDiagnostics {
+    const OPERATION: &'static str = "analysis_metadata.diagnostics";
+    const SCRIPT: &'static str = concat!(
+        include_str!("../../../rules/core/analysis_metadata.datalog"),
+        r#"
+baseline_diagnostic[repository, code, severity, path, line, detail] :=
+    *analysis_revision_diagnostic{view: $view, revision: $revision, repository, code, severity, path, line, detail},
+    not selected_diagnostic_replacement[repository, code]
+?[repository, code, severity, path, line, detail] := baseline_diagnostic[repository, code, severity, path, line, detail]
+?[repository, code, severity, path, line, detail] := enrichment_diagnostic[repository, code, severity, path, line, detail],
+    not baseline_diagnostic[repository, code, severity, path, line, _]
+:order severity, repository, path, line, code"#
+    );
+    const HEADERS: &'static [&'static str] =
+        &["repository", "code", "severity", "path", "line", "detail"];
+
+    type Params = AnalysisMetadataParams;
+    type Row = AnalysisDiagnostic;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        AnalysisMetadataCompleteness::bind(params)
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        let severity = match row[2].get_str() {
+            Some("known_limitation") => AnalysisDiagnosticSeverity::KnownLimitation,
+            Some("warning") => AnalysisDiagnosticSeverity::Warning,
+            _ => {
+                return Err(QueryError::new(
+                    Self::OPERATION,
+                    "unknown stored analysis diagnostic severity",
+                ));
+            }
+        };
+        let line = u32::try_from(row[4].get_int().unwrap_or_default())
+            .map_err(|error| QueryError::new(Self::OPERATION, error.to_string()))?;
+        let detail = row[5].get_str().unwrap_or_default();
+        Ok(AnalysisDiagnostic {
+            repository: row[0].get_str().unwrap_or_default().into(),
+            code: row[1].get_str().unwrap_or_default().into(),
+            severity,
+            path: PathBuf::from(row[3].get_str().unwrap_or_default()),
+            line: (line != 0).then_some(line),
+            detail: (!detail.is_empty()).then(|| detail.into()),
+        })
+    }
 }
 
 pub(super) fn analysis_metadata(
@@ -396,65 +502,18 @@ pub(super) fn analysis_metadata(
     revision: u64,
 ) -> Result<AnalysisMetadata, Box<dyn Error>> {
     let revision = i64::try_from(revision)?;
-    let rows = observed_query(
-        db,
-        QuerySpec::new(
-            "analysis_metadata.completeness",
+    let params = AnalysisMetadataParams { revision };
+    let incomplete = db
+        .run::<AnalysisMetadataCompleteness>(
             view,
-            "?[incomplete] := *analysis_revision_metadata{\
-             view: $view, revision: $revision, incomplete\
-         }",
-        ),
-        || vec![("revision", revision.into())],
-    )?;
-    let incomplete = rows
-        .rows
-        .first()
-        .and_then(|row| match row.first() {
-            Some(DataValue::Bool(value)) => Some(*value),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let script = format!(
-        "{ANALYSIS_METADATA_RULES}\n\
-         baseline_diagnostic[repository, code, severity, path, line, detail] := \
-             *analysis_revision_diagnostic{{\
-                 view: $view, revision: $revision, repository, code, severity, path, line, detail\
-             }}, \
-             not selected_diagnostic_replacement[repository, code]\n\
-         ?[repository, code, severity, path, line, detail] := \
-             baseline_diagnostic[repository, code, severity, path, line, detail]\n\
-         ?[repository, code, severity, path, line, detail] := \
-             enrichment_diagnostic[repository, code, severity, path, line, detail], \
-             not baseline_diagnostic[repository, code, severity, path, line, _]\n\
-         :order severity, repository, path, line, code"
-    );
-    let rows = observed_query(
-        db,
-        QuerySpec::new("analysis_metadata.diagnostics", view, &script),
-        || vec![("revision", revision.into())],
-    )?;
-    let diagnostics = rows
-        .rows
+            AnalysisMetadataParams {
+                revision: params.revision,
+            },
+        )?
         .into_iter()
-        .map(|row| {
-            let severity = match row[2].get_str() {
-                Some("known_limitation") => AnalysisDiagnosticSeverity::KnownLimitation,
-                Some("warning") => AnalysisDiagnosticSeverity::Warning,
-                _ => return Err("unknown stored analysis diagnostic severity".into()),
-            };
-            let line = u32::try_from(row[4].get_int().unwrap_or_default())?;
-            let detail = row[5].get_str().unwrap_or_default();
-            Ok(AnalysisDiagnostic {
-                repository: row[0].get_str().unwrap_or_default().into(),
-                code: row[1].get_str().unwrap_or_default().into(),
-                severity,
-                path: PathBuf::from(row[3].get_str().unwrap_or_default()),
-                line: (line != 0).then_some(line),
-                detail: (!detail.is_empty()).then(|| detail.into()),
-            })
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        .next()
+        .unwrap_or_default();
+    let diagnostics = db.run::<AnalysisMetadataDiagnostics>(view, params)?;
     Ok(AnalysisMetadata {
         completeness: if incomplete {
             AnalysisCompleteness::Incomplete
@@ -465,68 +524,139 @@ pub(super) fn analysis_metadata(
     })
 }
 
+struct RepositoryParams {
+    repository: String,
+}
+
+struct RepositoryRevisionQuery;
+
+impl MnesticQuery for RepositoryRevisionQuery {
+    const OPERATION: &'static str = "repository_revision";
+    const SCRIPT: &'static str = "?[source_state, analysis_identity, head, incomplete] := *repository_revision{repository: $repository, source_state, analysis_identity, head, incomplete}";
+    const HEADERS: &'static [&'static str] =
+        &["source_state", "analysis_identity", "head", "incomplete"];
+    const TIMEOUT_SECONDS: Option<f64> = Some(REPOSITORY_QUERY_TIMEOUT_SECONDS);
+
+    type Params = RepositoryParams;
+    type Row = (String, String, String, bool);
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        BTreeMap::from([("repository".into(), params.repository.as_str().into())])
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        let source_state = row[0].get_str().ok_or_else(|| {
+            QueryError::new(
+                Self::OPERATION,
+                "stored repository source state is not a string",
+            )
+        })?;
+        let analysis_identity = row[1].get_str().ok_or_else(|| {
+            QueryError::new(
+                Self::OPERATION,
+                "stored repository analysis identity is not a string",
+            )
+        })?;
+        let head = row[2].get_str().ok_or_else(|| {
+            QueryError::new(Self::OPERATION, "stored repository head is not a string")
+        })?;
+        let incomplete = match row[3] {
+            DataValue::Bool(value) => value,
+            _ => {
+                return Err(QueryError::new(
+                    Self::OPERATION,
+                    "stored repository completeness is not a boolean",
+                ));
+            }
+        };
+        Ok((
+            source_state.into(),
+            analysis_identity.into(),
+            head.into(),
+            incomplete,
+        ))
+    }
+}
+
+struct RepositoryDiagnosticsQuery;
+
+impl MnesticQuery for RepositoryDiagnosticsQuery {
+    const OPERATION: &'static str = "repository_revision.diagnostics";
+    const SCRIPT: &'static str = "?[code, severity, path, line, detail] := *repository_revision_diagnostic{repository: $repository, code, severity, path, line, detail}\n:order severity, path, line, code";
+    const HEADERS: &'static [&'static str] = &["code", "severity", "path", "line", "detail"];
+    const TIMEOUT_SECONDS: Option<f64> = Some(REPOSITORY_QUERY_TIMEOUT_SECONDS);
+
+    type Params = RepositoryParams;
+    type Row = (
+        String,
+        AnalysisDiagnosticSeverity,
+        PathBuf,
+        Option<u32>,
+        Option<String>,
+    );
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        RepositoryRevisionQuery::bind(params)
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        let severity = match row[1].get_str() {
+            Some("known_limitation") => AnalysisDiagnosticSeverity::KnownLimitation,
+            Some("warning") => AnalysisDiagnosticSeverity::Warning,
+            _ => {
+                return Err(QueryError::new(
+                    Self::OPERATION,
+                    "unknown stored repository diagnostic severity",
+                ));
+            }
+        };
+        let line = u32::try_from(row[3].get_int().unwrap_or_default())
+            .map_err(|error| QueryError::new(Self::OPERATION, error.to_string()))?;
+        let detail = row[4].get_str().unwrap_or_default();
+        Ok((
+            row[0].get_str().unwrap_or_default().into(),
+            severity,
+            PathBuf::from(row[2].get_str().unwrap_or_default()),
+            (line != 0).then_some(line),
+            (!detail.is_empty()).then(|| detail.into()),
+        ))
+    }
+}
+
 pub(super) fn repository_revision(
     db: &DbInstance,
     repository: &str,
 ) -> Result<Option<RepositoryRevision>, Box<dyn Error>> {
-    let params = BTreeMap::from([("repository".into(), repository.into())]);
-    let revision = db.run_script_with_options(
-        "?[source_state, analysis_identity, head, incomplete] := \
-             *repository_revision{repository: $repository, source_state, analysis_identity, head, incomplete}",
-        params.clone(),
-        ScriptMutability::Immutable,
-        ScriptRunOptions::new().with_timeout(REPOSITORY_QUERY_TIMEOUT_SECONDS),
-    )?;
-    let Some(row) = revision.rows.first() else {
+    let params = RepositoryParams {
+        repository: repository.into(),
+    };
+    let Some((source_state, analysis_identity, head, incomplete)) = db
+        .run::<RepositoryRevisionQuery>(
+            repository,
+            RepositoryParams {
+                repository: params.repository.clone(),
+            },
+        )?
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
     };
-    let source_state = row[0]
-        .get_str()
-        .ok_or("stored repository source state is not a string")?
-        .to_owned();
-    let analysis_identity = row[1]
-        .get_str()
-        .ok_or("stored repository analysis identity is not a string")?
-        .to_owned();
-    let head = row[2]
-        .get_str()
-        .ok_or("stored repository head is not a string")?;
-    let incomplete = match &row[3] {
-        DataValue::Bool(value) => *value,
-        _ => return Err("stored repository completeness is not a boolean".into()),
-    };
-    let diagnostics = db.run_script_with_options(
-        "?[code, severity, path, line, detail] := \
-             *repository_revision_diagnostic{repository: $repository, code, severity, path, line, detail}\n\
-         :order severity, path, line, code",
-        params,
-        ScriptMutability::Immutable,
-        ScriptRunOptions::new().with_timeout(REPOSITORY_QUERY_TIMEOUT_SECONDS),
-    )?;
-    let diagnostics = diagnostics
-        .rows
+    let diagnostics = db
+        .run::<RepositoryDiagnosticsQuery>(repository, params)?
         .into_iter()
-        .map(|row| {
-            let severity = match row[1].get_str() {
-                Some("known_limitation") => AnalysisDiagnosticSeverity::KnownLimitation,
-                Some("warning") => AnalysisDiagnosticSeverity::Warning,
-                _ => return Err("unknown stored repository diagnostic severity".into()),
-            };
-            let line = u32::try_from(row[3].get_int().unwrap_or_default())?;
-            let detail = row[4].get_str().unwrap_or_default();
-            Ok(AnalysisDiagnostic {
-                repository: repository.into(),
-                code: row[0].get_str().unwrap_or_default().into(),
-                severity,
-                path: PathBuf::from(row[2].get_str().unwrap_or_default()),
-                line: (line != 0).then_some(line),
-                detail: (!detail.is_empty()).then(|| detail.into()),
-            })
+        .map(|(code, severity, path, line, detail)| AnalysisDiagnostic {
+            repository: repository.into(),
+            code,
+            severity,
+            path,
+            line,
+            detail,
         })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        .collect();
     Ok(Some(RepositoryRevision {
         source_state,
-        head: (!head.is_empty()).then(|| head.into()),
+        head: (!head.is_empty()).then_some(head),
         analysis_identity,
         analysis: AnalysisMetadata {
             completeness: if incomplete {
@@ -539,131 +669,183 @@ pub(super) fn repository_revision(
     }))
 }
 
+struct PublishedRepositoryHead;
+
+impl MnesticQuery for PublishedRepositoryHead {
+    const OPERATION: &'static str = "published_repository_head";
+    const SCRIPT: &'static str = r#"selected_head[head] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_repository_head{view: $view, revision, repository: $repository, head}
+selected_head[head] :=
+    *analysis_revision{view: $view, revision},
+    *analysis_revision_state{view: $view, revision, repository: $repository, state},
+    *repository_state{fingerprint: state, repository: $repository, head},
+    not *analysis_revision_repository_head{view: $view, revision, repository: $repository}
+?[head] := selected_head[head]"#;
+    const HEADERS: &'static [&'static str] = &["head"];
+
+    type Params = RepositoryParams;
+    type Row = String;
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        RepositoryRevisionQuery::bind(params)
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        Ok(row[0].get_str().unwrap_or_default().into())
+    }
+}
+
 pub(super) fn published_repository_head(
     db: &impl QueryRunner,
     view: &str,
     repository: &str,
 ) -> Result<Option<String>, Box<dyn Error>> {
-    let rows = query(
-        db,
-        view,
-        "selected_head[head] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_repository_head{\
-                 view: $view, revision, repository: $repository, head\
-             }\n\
-         selected_head[head] := \
-             *analysis_revision{view: $view, revision}, \
-             *analysis_revision_state{view: $view, revision, repository: $repository, state}, \
-             *repository_state{fingerprint: state, repository: $repository, head}, \
-             not *analysis_revision_repository_head{\
-                 view: $view, revision, repository: $repository\
-             }\n\
-         ?[head] := selected_head[head]",
-        [("repository", repository.into())],
-    )?;
-    Ok(rows
-        .rows
-        .first()
-        .and_then(|row| row[0].get_str())
-        .filter(|head| !head.is_empty())
-        .map(str::to_owned))
+    Ok(db
+        .run::<PublishedRepositoryHead>(
+            view,
+            RepositoryParams {
+                repository: repository.into(),
+            },
+        )?
+        .into_iter()
+        .next()
+        .filter(|head| !head.is_empty()))
 }
+
+struct EntityFactsParams {
+    entities: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct EntityFactRow {
+    id: String,
+    kind: DataValue,
+    metadata: DataValue,
+}
+
+impl EntityFactRow {
+    fn into_values(self) -> Vec<DataValue> {
+        vec![self.id.into(), self.kind, self.metadata]
+    }
+}
+
+const ENTITY_FACT_HEADERS: &[&str] = &["id", "kind", "metadata"];
+
+macro_rules! entity_facts_query {
+    ($name:ident, $operation:literal, $script:literal) => {
+        struct $name;
+
+        impl MnesticQuery for $name {
+            const OPERATION: &'static str = $operation;
+            const SCRIPT: &'static str = $script;
+            const HEADERS: &'static [&'static str] = ENTITY_FACT_HEADERS;
+
+            type Params = EntityFactsParams;
+            type Row = EntityFactRow;
+
+            fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+                BTreeMap::from([(
+                    "entities".into(),
+                    DataValue::List(
+                        params
+                            .entities
+                            .iter()
+                            .map(|id| DataValue::List(vec![id.as_str().into()]))
+                            .collect(),
+                    ),
+                )])
+            }
+
+            fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+                Ok(EntityFactRow {
+                    id: row[0]
+                        .get_str()
+                        .ok_or_else(|| {
+                            QueryError::new(Self::OPERATION, "column id is not a string")
+                        })?
+                        .into(),
+                    kind: row[1].clone(),
+                    metadata: row[2].clone(),
+                })
+            }
+        }
+    };
+}
+
+entity_facts_query!(
+    BaselineEntityFacts,
+    "entity_facts.baseline",
+    "requested[id] <- $entities\n\
+     selected_state[state] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, state}\n\
+     ?[id, kind, metadata] := requested[id], selected_state[state], *state_entity{state, id, kind, metadata}\n\
+     ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
+     :order id"
+);
+entity_facts_query!(
+    ShardEntityFacts,
+    "entity_facts.shard",
+    "requested[id] <- $entities\n\
+     ?[id, kind, metadata] := requested[id], *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, *analysis_fact_shard_selection:by_owner{view: $view, owner, producer, version}\n\
+     :order id\n\
+     :reorder written"
+);
+entity_facts_query!(
+    EnrichmentEntityFacts,
+    "entity_facts.enrichment",
+    "requested[id] <- $entities\n\
+     selected_enrichment[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
+     ?[id, kind, metadata] := requested[id], *analysis_enrichment_entity_selection{view: $view, id, owner}, selected_enrichment[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
+     :order id"
+);
 
 pub(super) fn entity_facts(
     db: &impl QueryRunner,
     view: &str,
     entities: &BTreeSet<String>,
 ) -> Result<NamedRows, Box<dyn Error>> {
-    let requested = || {
-        DataValue::List(
-            entities
-                .iter()
-                .map(|id| DataValue::List(vec![id.as_str().into()]))
-                .collect(),
-        )
-    };
-    let mut baseline = observed_query(
-        db,
-        QuerySpec::new(
-            "entity_facts.baseline",
-            view,
-            "requested[id] <- $entities\n\
-         selected_state[state] := *analysis_revision{view: $view, revision}, \
-             *analysis_revision_state{view: $view, revision, state}\n\
-         ?[id, kind, metadata] := requested[id], selected_state[state], \
-             *state_entity{state, id, kind, metadata}\n\
-         ?[id, kind, metadata] := requested[id], *analysis_revision{view: $view, revision}, \
-             *analysis_revision_entity{view: $view, revision, id, kind, metadata}\n\
-         :order id",
-        ),
-        || vec![("entities", requested())],
-    )?;
-    let mut baseline_ids = baseline
-        .rows
-        .iter()
-        .filter_map(|row| row[0].get_str().map(str::to_owned))
-        .collect::<BTreeSet<_>>();
-
-    let nested = observed_query(
-        db,
-        QuerySpec::new(
-            "entity_facts.shard",
-            view,
-            "requested[id] <- $entities\n\
-         ?[id, kind, metadata] := requested[id], \
-             *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, \
-             *analysis_fact_shard_selection:by_owner{\
-                 view: $view, owner, producer, version\
-             }\n\
-         :order id\n\
-         :reorder written",
-        ),
-        || {
-            vec![(
-                "entities",
-                DataValue::List(
-                    entities
-                        .iter()
-                        .filter(|id| !baseline_ids.contains(*id))
-                        .map(|id| DataValue::List(vec![id.as_str().into()]))
-                        .collect(),
-                ),
-            )]
+    let mut baseline = db.run::<BaselineEntityFacts>(
+        view,
+        EntityFactsParams {
+            entities: entities.clone(),
         },
     )?;
-    baseline_ids.extend(
-        nested
-            .rows
-            .iter()
-            .filter_map(|row| row[0].get_str().map(str::to_owned)),
-    );
-    baseline.rows.extend(nested.rows);
-
-    let enrichment = observed_query(
-        db,
-        QuerySpec::new(
-            "entity_facts.enrichment",
-            view,
-            "requested[id] <- $entities\n\
-         selected_enrichment[owner] := *analysis_revision{view: $view, revision}, \
-             *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
-         ?[id, kind, metadata] := requested[id], \
-             *analysis_enrichment_entity_selection{view: $view, id, owner}, \
-             selected_enrichment[owner], \
-             *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}\n\
-         :order id",
-        ),
-        || vec![("entities", requested())],
+    let mut baseline_ids = baseline
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<BTreeSet<_>>();
+    let nested = db.run::<ShardEntityFacts>(
+        view,
+        EntityFactsParams {
+            entities: entities
+                .iter()
+                .filter(|id| !baseline_ids.contains(*id))
+                .cloned()
+                .collect(),
+        },
     )?;
-    baseline
-        .rows
-        .extend(enrichment.rows.into_iter().filter(|row| {
-            row[0]
-                .get_str()
-                .is_some_and(|id| !baseline_ids.contains(id))
-        }));
-    Ok(baseline)
+    baseline_ids.extend(nested.iter().map(|row| row.id.clone()));
+    baseline.extend(nested);
+    baseline.extend(
+        db.run::<EnrichmentEntityFacts>(
+            view,
+            EntityFactsParams {
+                entities: entities.clone(),
+            },
+        )?
+        .into_iter()
+        .filter(|row| !baseline_ids.contains(&row.id)),
+    );
+    Ok(NamedRows::new(
+        ENTITY_FACT_HEADERS
+            .iter()
+            .map(|header| (*header).into())
+            .collect(),
+        baseline
+            .into_iter()
+            .map(EntityFactRow::into_values)
+            .collect(),
+    ))
 }
 
 pub(super) fn inspect_observations(
@@ -1170,6 +1352,33 @@ mod tests {
         }
     }
 
+    struct WrongScalarWidthRunner;
+
+    impl QueryRunner for WrongScalarWidthRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            Ok(NamedRows::new(vec!["revision".into()], vec![Vec::new()]))
+        }
+    }
+
+    struct WrongEntityHeadersRunner;
+
+    impl QueryRunner for WrongEntityHeadersRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            Ok(NamedRows::new(
+                vec!["kind".into(), "id".into(), "metadata".into()],
+                Vec::new(),
+            ))
+        }
+    }
+
     #[test]
     fn typed_query_rejects_an_incorrect_output_shape() {
         let error = WrongShapeRunner
@@ -1190,6 +1399,36 @@ mod tests {
     }
 
     #[test]
+    fn analysis_revision_rejects_an_incorrect_row_width() {
+        let error = WrongScalarWidthRunner
+            .run::<AnalysisRevisionQuery>("main", ())
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Mnestic query analysis_revision failed: unexpected row width at row 0: expected 1, got 0"
+        );
+    }
+
+    #[test]
+    fn entity_facts_rejects_an_incorrect_output_shape() {
+        let error = WrongEntityHeadersRunner
+            .run::<BaselineEntityFacts>(
+                "main",
+                EntityFactsParams {
+                    entities: BTreeSet::new(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().starts_with(
+                "Mnestic query entity_facts.baseline failed: unexpected output headers"
+            )
+        );
+    }
+
+    #[test]
     fn semantic_query_warns_at_five_seconds() {
         assert!(!semantic_query_is_slow(Duration::from_millis(4_999)));
         assert!(semantic_query_is_slow(Duration::from_secs(5)));
@@ -1203,6 +1442,7 @@ mod tests {
         let _ = observed_bound_query(
             &runner,
             QuerySpec::new("test", "main", "?[value] <- [[1]]"),
+            None,
             || {
                 parameter_builds.set(parameter_builds.get() + 1);
                 BTreeMap::new()
