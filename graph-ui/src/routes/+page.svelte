@@ -50,6 +50,7 @@
   let mode: InvestigationMode = 'context';
   let traceTarget = '';
   let loadRequest = 0;
+  let statusRequest = 0;
 
   $: investigation = snapshot && rootId ? investigate(snapshot, mode, rootId, traceTarget || undefined) : null;
   $: visibleSnapshot = snapshot && investigation
@@ -78,6 +79,8 @@
   $: selectedEdges = snapshot && rootId
     ? snapshot.edges.filter((edge) => edge.from === rootId || edge.to === rootId)
     : [];
+  $: pinnedAnalysis = snapshot?.metadata.analysis ?? { completeness: 'complete' as const, diagnostics: [] };
+  $: currentFreshness = status?.freshness ?? snapshot?.metadata.freshness ?? null;
 
   onMount(() => {
     void loadWorkspaces();
@@ -110,14 +113,16 @@
 
   async function pollStatus() {
     if (!selectedWorkspace || !snapshot) return;
+    const request = ++statusRequest;
+    const generation = loadRequest;
     const workspace = selectedWorkspace;
     try {
       const nextStatus = await invoke<QueryMetadata>('topology_status', { request: { workspace } });
-      if (workspace !== selectedWorkspace) return;
+      if (request !== statusRequest || generation !== loadRequest) return;
       status = nextStatus;
       statusError = '';
     } catch (cause) {
-      if (workspace === selectedWorkspace) statusError = String(cause);
+      if (request === statusRequest && generation === loadRequest) statusError = String(cause);
     }
   }
 
@@ -147,7 +152,12 @@
     if (!query) return;
     const entity = snapshot?.nodes.find((node) => node.id.toLocaleLowerCase() === query || node.name.toLocaleLowerCase() === query)
       ?? snapshot?.nodes.find((node) => node.id.toLocaleLowerCase().includes(query) || node.name.toLocaleLowerCase().includes(query));
-    if (entity) rootId = entity.id;
+    if (entity) {
+      repositories = [];
+      origins = [...ORIGINS];
+      includeTests = true;
+      rootId = entity.id;
+    }
   }
 
   function changeWorkspace(event: Event) {
@@ -278,13 +288,13 @@
 
     <div class="header-meta">
       <Badge>rev {snapshot?.metadata.revision ?? '—'}</Badge>
-      <span class:healthy={Boolean(snapshot && !snapshot.metadata.freshness.stale && snapshot.metadata.analysis.completeness === 'complete')} class="status-dot"></span>
-      <span>{!snapshot ? 'no snapshot' : snapshot.metadata.analysis.completeness === 'incomplete' ? 'analysis incomplete' : snapshot.metadata.freshness.stale ? 'stale' : 'snapshot ready'}</span>
-      {#if snapshot?.metadata.analysis.completeness === 'incomplete'}
+      <span class:healthy={Boolean(snapshot && currentFreshness && !currentFreshness.stale && pinnedAnalysis.completeness === 'complete')} class="status-dot"></span>
+      <span>{!snapshot ? 'no snapshot' : pinnedAnalysis.completeness === 'incomplete' ? 'analysis incomplete' : currentFreshness?.stale ? 'stale' : 'snapshot ready'}</span>
+      {#if pinnedAnalysis.completeness === 'incomplete'}
         <details class="analysis-diagnostics">
-          <summary>{snapshot.metadata.analysis.diagnostics.length} diagnostics</summary>
+          <summary>{pinnedAnalysis.diagnostics.length} diagnostics</summary>
           <ul>
-            {#each snapshot.metadata.analysis.diagnostics as diagnostic}
+            {#each pinnedAnalysis.diagnostics as diagnostic}
               <li>
                 <strong>{diagnostic.code}</strong>
                 <span>{diagnostic.repository}/{diagnostic.path}:{diagnostic.line ?? '—'}</span>
@@ -438,7 +448,11 @@
 
       <div class="canvas-wrap">
         {#if error}
-          <div class="empty"><strong>Could not load the workspace graph.</strong><span>{error}</span></div>
+          <div class="empty">
+            <strong>Could not load the workspace graph.</strong>
+            <span>{error}</span>
+            <Button variant="outline" onclick={loadWorkspaces}>Retry</Button>
+          </div>
         {:else if loading}
           <div class="empty"><span class="loader"></span><strong>Loading typed graph…</strong></div>
         {:else if workspaces.length === 0}

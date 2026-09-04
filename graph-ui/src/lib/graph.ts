@@ -74,7 +74,7 @@ export interface QueryMetadata {
     dirty_repositories: string[];
     enriching_repositories: string[];
   };
-  analysis: {
+  analysis?: {
     completeness: 'complete' | 'incomplete';
     diagnostics: Array<{
       code: string;
