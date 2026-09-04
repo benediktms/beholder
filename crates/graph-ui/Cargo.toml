@@ -10,5 +10,7 @@ tauri-build = { version = "2", features = [] }
 beholder-dto.workspace = true
 beholder-daemon-client.workspace = true
 beholder-domain.workspace = true
+beholder-observability.workspace = true
 serde.workspace = true
 tauri = { version = "2", features = [] }
+tracing = "0.1.44"
