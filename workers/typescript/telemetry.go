@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -13,23 +14,35 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-func configureTelemetry(ctx context.Context) (func(context.Context) error, error) {
+type telemetryProvider struct {
+	shutdown func(context.Context) error
+	flush    func(context.Context) error
+}
+
+func disabledTelemetry() telemetryProvider {
+	return telemetryProvider{
+		shutdown: func(context.Context) error { return nil },
+		flush:    func(context.Context) error { return nil },
+	}
+}
+
+func configureTelemetry(ctx context.Context) (telemetryProvider, error) {
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{}, propagation.Baggage{},
 	))
 	if !telemetryEnabled() {
-		return func(context.Context) error { return nil }, nil
+		return disabledTelemetry(), nil
 	}
 	exporter, err := otlptracehttp.New(ctx)
 	if err != nil {
-		return nil, err
+		return disabledTelemetry(), err
 	}
 	provider := trace.NewTracerProvider(
-		trace.WithSyncer(exporter),
+		trace.WithBatcher(exporter, trace.WithExportTimeout(time.Second)),
 		trace.WithResource(resource.Default()),
 	)
 	otel.SetTracerProvider(provider)
-	return provider.Shutdown, nil
+	return telemetryProvider{shutdown: provider.Shutdown, flush: provider.ForceFlush}, nil
 }
 
 func telemetryEnabled() bool {

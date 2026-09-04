@@ -62,7 +62,7 @@ type client struct {
 
 func main() {
 	socket := flag.String("socket", "", "worker gRPC Unix socket")
-	cacheDir := flag.String("cache-dir", "", "worker cache directory")
+	flag.String("cache-dir", "", "worker cache directory")
 	root := flag.String("root", ".", "TypeScript repository root")
 	file := flag.String("file", "", "repository-relative TypeScript source path")
 	line := flag.Int("line", 0, "one-based source line")
@@ -71,13 +71,13 @@ func main() {
 	flag.Parse()
 
 	if *socket != "" {
-		shutdown, err := configureTelemetry(context.Background())
+		telemetry, err := configureTelemetry(context.Background())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "initialize OpenTelemetry export: %v\n", err)
 		} else {
-			defer shutdown(context.Background())
+			defer telemetry.shutdown(context.Background())
 		}
-		if err := serve(*socket, *cacheDir); err != nil {
+		if err := serve(*socket, telemetry.flush); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

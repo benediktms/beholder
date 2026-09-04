@@ -39,6 +39,7 @@ type analyzerServer struct {
 
 type workerTelemetry struct {
 	tracer              trace.Tracer
+	flush               func(context.Context) error
 	compilerInvocations metric.Int64Counter
 	candidates          metric.Int64Counter
 	overrides           metric.Int64Counter
@@ -86,7 +87,7 @@ type lspRange struct {
 
 type compilerRequestError struct{ error }
 
-func serve(socket, _ string) error {
+func serve(socket string, flush func(context.Context) error) error {
 	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
 		return fmt.Errorf("create socket directory: %w", err)
 	}
@@ -99,7 +100,7 @@ func serve(socket, _ string) error {
 		grpc.MaxRecvMsgSize(64<<20),
 		grpc.MaxSendMsgSize(64<<20),
 	)
-	workerv1.RegisterAnalyzerWorkerServer(server, &analyzerServer{telemetry: newWorkerTelemetry()})
+	workerv1.RegisterAnalyzerWorkerServer(server, &analyzerServer{telemetry: newWorkerTelemetry(flush)})
 	slog.Info("TypeScript enrichment worker started", "socket", socket)
 	return server.Serve(listener)
 }
@@ -162,6 +163,11 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 		attribute.Int("diagnostic.count", len(result.diagnostics)),
 	)
 	span.End()
+	flushContext, cancelFlush := context.WithTimeout(context.Background(), time.Second)
+	if err := s.telemetry.flush(flushContext); err != nil {
+		slog.Warn("flush TypeScript telemetry", "error", err)
+	}
+	cancelFlush()
 	if result.failureCode != "" {
 		slog.Error("TypeScript compiler enrichment failed",
 			"workspace", snapshot.workspace,
@@ -212,7 +218,7 @@ func (s *analyzerServer) Analyze(stream grpc.BidiStreamingServer[workerv1.Analyz
 	}}})
 }
 
-func newWorkerTelemetry() workerTelemetry {
+func newWorkerTelemetry(flush func(context.Context) error) workerTelemetry {
 	meter := otel.Meter("beholder.worker.typescript")
 	compilerInvocations, _ := meter.Int64Counter("beholder.typescript.compiler.invocations")
 	candidates, _ := meter.Int64Counter("beholder.typescript.candidates")
@@ -223,6 +229,7 @@ func newWorkerTelemetry() workerTelemetry {
 	runtimeMemory, _ := meter.Int64Histogram("beholder.typescript.runtime.memory", metric.WithUnit("By"))
 	return workerTelemetry{
 		tracer:              otel.Tracer("beholder.worker.typescript"),
+		flush:               flush,
 		compilerInvocations: compilerInvocations,
 		candidates:          candidates,
 		overrides:           overrides,

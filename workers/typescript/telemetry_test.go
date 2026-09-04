@@ -38,13 +38,16 @@ func TestConfigureTelemetryExportsOTLPTraces(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", collector.URL+"/v1/traces")
 
-	shutdown, err := configureTelemetry(context.Background())
+	telemetry, err := configureTelemetry(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, span := otel.Tracer("test").Start(context.Background(), "worker.test")
 	span.End()
-	if err := shutdown(context.Background()); err != nil {
+	if err := telemetry.flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := telemetry.shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	select {
