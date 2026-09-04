@@ -25,7 +25,7 @@ func configureTelemetry(ctx context.Context) (func(context.Context) error, error
 		return nil, err
 	}
 	provider := trace.NewTracerProvider(
-		trace.WithBatcher(exporter),
+		trace.WithSyncer(exporter),
 		trace.WithResource(resource.Default()),
 	)
 	otel.SetTracerProvider(provider)

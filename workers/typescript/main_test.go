@@ -253,10 +253,11 @@ func runLSPHelper() {
 			}
 			if os.Getenv("BEHOLDER_TYPESCRIPT_SERVER_REQUEST") == "1" {
 				writeHelperMessage(map[string]any{
-					"jsonrpc": "2.0", "id": 99, "method": "workspace/configuration", "params": map[string]any{},
+					"jsonrpc": "2.0", "id": 99, "method": "workspace/configuration", "params": map[string]any{"items": []map[string]any{{}, {}}},
 				})
 				response, err := readHelperMessage(reader)
-				if err != nil || string(response.ID) != "99" {
+				var values []any
+				if err != nil || string(response.ID) != "99" || json.Unmarshal(response.Result, &values) != nil || len(values) != 2 {
 					return
 				}
 			}

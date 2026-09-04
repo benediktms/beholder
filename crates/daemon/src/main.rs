@@ -365,6 +365,26 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
             "node_modules/typescript/package.json",
             AnalysisInputKind::Toolchain,
         )
+        .repository_file_identity(
+            "$toolchain/typescript-native",
+            "node_modules/typescript-native/package.json",
+            AnalysisInputKind::Toolchain,
+        )
+        .repository_file_identity(
+            "$toolchain/typescript-native-executable",
+            "node_modules/typescript-native/bin/tsc",
+            AnalysisInputKind::Toolchain,
+        )
+        .repository_file_identity(
+            "$toolchain/typescript-tsgo-executable",
+            "node_modules/.bin/tsgo",
+            AnalysisInputKind::Toolchain,
+        )
+        .repository_file_identity(
+            "$toolchain/typescript-tsc-executable",
+            "node_modules/.bin/tsc",
+            AnalysisInputKind::Toolchain,
+        )
         .build()
         .map_err(|error| error.to_string())?;
         builder.add_enricher(worker)

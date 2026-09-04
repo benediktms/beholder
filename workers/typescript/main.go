@@ -382,7 +382,14 @@ func (c *client) readLoop() {
 		}
 		if message.Method != "" {
 			if len(message.ID) != 0 {
-				if err := c.write(map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": nil}); err != nil {
+				response := map[string]any{"jsonrpc": "2.0", "id": message.ID}
+				result, requestError := serverRequestResponse(message)
+				if requestError != nil {
+					response["error"] = requestError
+				} else {
+					response["result"] = result
+				}
+				if err := c.write(response); err != nil {
 					c.replies <- reply{err: err}
 					return
 				}
@@ -390,6 +397,21 @@ func (c *client) readLoop() {
 			continue
 		}
 		c.replies <- reply{message: message}
+	}
+}
+
+func serverRequestResponse(message rpcMessage) (any, *rpcError) {
+	switch message.Method {
+	case "workspace/configuration":
+		var params struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return nil, &rpcError{Code: -32602, Message: "invalid workspace/configuration parameters"}
+		}
+		return make([]any, len(params.Items)), nil
+	default:
+		return nil, &rpcError{Code: -32601, Message: "method not found"}
 	}
 }
 

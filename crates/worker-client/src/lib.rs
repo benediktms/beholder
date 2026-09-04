@@ -1261,7 +1261,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn repository_compiler_package_participates_in_currentness() {
+    fn repository_compiler_identity_participates_in_currentness() {
         let root = std::env::temp_dir().join(format!(
             "beholder-worker-identity-{}-{}",
             std::process::id(),
@@ -1270,15 +1270,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let compiler = root.join("node_modules/typescript/package.json");
+        let compiler = root.join("node_modules/typescript-native/bin/tsc");
         fs::create_dir_all(compiler.parent().unwrap()).unwrap();
-        fs::write(&compiler, r#"{"version":"7.0.2"}"#).unwrap();
+        fs::write(&compiler, "compiler 7.0.2").unwrap();
         let worker = WorkerAnalyzerBuilder::new("worker", "sockets")
             .identity("typescript", "1")
             .accept_extension("ts")
             .repository_file_identity(
-                "$toolchain/typescript",
-                "node_modules/typescript/package.json",
+                "$toolchain/typescript-native-executable",
+                "node_modules/typescript-native/bin/tsc",
                 AnalysisInputKind::Toolchain,
             )
             .build()
@@ -1297,8 +1297,8 @@ mod tests {
 
         let identity = worker.repository_identity_inputs(&repository);
 
-        assert_eq!(identity[0].content.as_ref(), br#"{"version":"7.0.2"}"#);
-        fs::write(&compiler, r#"{"version":"7.0.3"}"#).unwrap();
+        assert_eq!(identity[0].content.as_ref(), b"compiler 7.0.2");
+        fs::write(&compiler, "compiler 7.0.3").unwrap();
         assert_ne!(identity, worker.repository_identity_inputs(&repository));
         fs::remove_dir_all(root).unwrap();
     }
