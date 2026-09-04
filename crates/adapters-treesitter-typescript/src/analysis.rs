@@ -305,10 +305,12 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
         && (matches!(
             node.kind(),
             "function_declaration" | "generator_function_declaration" | "method_definition"
-        ) || (matches!(node.kind(), "arrow_function" | "function_expression")
-            && node
-                .parent()
-                .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
+        ) || (matches!(
+            node.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) && node
+            .parent()
+            .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
 }
 
 fn callable_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
@@ -1548,6 +1550,7 @@ fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) 
         "arrow_function"
             | "function_declaration"
             | "function_expression"
+            | "generator_function"
             | "generator_function_declaration"
             | "interface_declaration"
     ) {
@@ -2296,7 +2299,7 @@ mod tests {
     #[test]
     fn class_calls_are_not_attributed_to_the_module() {
         let analysis = analyze(
-            "function traced() {} @traced() export class Service { client = connect(); } const Expression = class { client = reconnect(); }; export const app = build(); export default () => hidden();",
+            "function traced() {} @traced() export class Service { client = connect(); } const Expression = class { client = reconnect(); }; const iter = function* () { delayed(); }; export const app = build(); export default () => hidden();",
             SourceLanguage::TypeScript,
         )
         .unwrap();
