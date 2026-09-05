@@ -186,12 +186,23 @@ fn rune_name(name: &str) -> bool {
     )
 }
 
+fn rune_method(receiver: &str, name: &str) -> bool {
+    matches!(
+        (receiver, name),
+        ("$state", "raw" | "snapshot" | "eager")
+            | ("$derived", "by")
+            | ("$effect", "pre" | "tracking" | "pending" | "root")
+            | ("$props", "id")
+            | ("$inspect", "trace")
+    )
+}
+
 fn is_rune(call: &Call) -> bool {
     (call.receiver.is_none() && rune_name(&call.name))
         || call
             .receiver
             .as_deref()
-            .is_some_and(|receiver| rune_name(receiver) || inspect_receiver(receiver))
+            .is_some_and(|receiver| rune_method(receiver, &call.name) || inspect_receiver(receiver))
 }
 
 fn inspect_receiver(receiver: &str) -> bool {
@@ -291,10 +302,12 @@ mod tests {
         let source = r#"
             <script>
               const count = $state(load());
+              const raw = $state.raw(loadRaw());
               $: result = refresh(count);
               $effect(() => persist(count));
               $inspect (count).with(console.trace);
               $inspect /* reason */ (count).with(console.trace);
+              $state.refresh();
               api.$state();
             </script>
         "#;
@@ -311,13 +324,18 @@ mod tests {
             )
             .collect::<Vec<_>>();
 
-        for name in ["load", "refresh", "persist"] {
+        for name in ["load", "loadRaw", "refresh", "persist"] {
             assert!(calls.iter().any(|call| call.name == name));
         }
         assert!(
             calls
                 .iter()
                 .any(|call| call.receiver.as_deref() == Some("api") && call.name == "$state")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.receiver.as_deref() == Some("$state") && call.name == "refresh")
         );
         assert!(!calls.iter().any(|call| is_rune(call)));
     }
