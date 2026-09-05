@@ -383,7 +383,7 @@ fn collect_calls_with_owner(
         return;
     }
     if matches!(node.kind(), "class" | "class_declaration") {
-        collect_class_evaluation_calls(node, source, root, calls);
+        collect_class_evaluation_calls(node, source, root, calls, owner);
         return;
     }
     match node.kind() {
@@ -436,6 +436,7 @@ fn collect_class_evaluation_calls(
     source: &[u8],
     root: Node<'_>,
     calls: &mut Vec<Call>,
+    outer_owner: Option<&str>,
 ) {
     let owner = node
         .child_by_field_name("name")
@@ -447,7 +448,7 @@ fn collect_class_evaluation_calls(
         .named_children(&mut cursor)
         .filter(|child| Some(*child) != body && child.kind() != "decorator")
     {
-        collect_calls_with_owner(child, source, root, calls, owner.as_deref());
+        collect_calls_with_owner(child, source, root, calls, outer_owner);
     }
     let Some(body) = body else {
         return;
@@ -1837,6 +1838,10 @@ pub(super) fn semantics_from_analysis(
         }
         let scope = parent_name.unwrap_or_default();
         for call in &definition.calls {
+            let scope = call
+                .owner
+                .as_ref()
+                .map_or(scope, |_| definition.qualified_name.as_str());
             let target = observation_target(language, &ids, scope, call);
             let (observation, candidate) =
                 call_semantics(repository, language, id, target, call, path);
@@ -1947,7 +1952,7 @@ fn observation_target(
                 .unwrap_or_else(|| {
                     format!(
                         "{language}-method://{}/{}",
-                        call.owner.as_deref().unwrap_or("this"),
+                        call.owner.as_ref().map_or("this", |_| owner.as_str()),
                         call.name
                     )
                 })
@@ -2427,6 +2432,32 @@ mod tests {
 
         assert_eq!(calls.len(), 1);
         assert!(calls[0].owner.is_none());
+    }
+
+    #[test]
+    fn nested_class_static_calls_include_the_callable_scope() {
+        let observations = observations(
+            "function run() { class Local { static value = this.load(); static load() {} } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config/run"
+                && observation.to.as_str() == "repo://example/typescript/src/config/run/Local/load"
+        }));
+    }
+
+    #[test]
+    fn nested_class_heritage_keeps_the_outer_this_owner() {
+        let observations = observations(
+            "class Outer { makeBase() {} run() { class Inner extends this.makeBase() {} } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config/Outer/run"
+                && observation.to.as_str() == "repo://example/typescript/src/config/Outer/makeBase"
+        }));
     }
 
     #[test]
