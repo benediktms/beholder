@@ -54,7 +54,12 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
         let store_bindings = embedded
             .definitions
             .iter()
-            .filter(|definition| definition.factory.is_some())
+            .filter(|definition| {
+                definition
+                    .factory
+                    .as_deref()
+                    .is_some_and(|factory| !rune_name(factory))
+            })
             .filter_map(|definition| definition.qualified_name.rsplit('/').next())
             .chain(
                 embedded
@@ -69,6 +74,7 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
             .calls
             .retain(|call| !is_rune(call, &store_bindings));
         for definition in &mut embedded.definitions {
+            definition.exported = false;
             definition
                 .calls
                 .retain(|call| !is_rune(call, &store_bindings));
@@ -300,6 +306,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["visible"]);
+        assert!(!analysis.definitions[0].exported);
     }
 
     #[test]
@@ -348,6 +355,7 @@ mod tests {
         let source = r#"
             <script>
               const count = $state(load());
+              const state = $state(0);
               const raw = $state.raw(loadRaw());
               $: result = refresh(count);
               $effect(() => persist(count));
