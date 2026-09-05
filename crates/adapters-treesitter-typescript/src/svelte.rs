@@ -188,12 +188,38 @@ fn rune_name(name: &str) -> bool {
 
 fn is_rune(call: &Call) -> bool {
     (call.receiver.is_none() && rune_name(&call.name))
-        || call.receiver.as_deref().is_some_and(|receiver| {
-            rune_name(receiver)
-                || receiver
-                    .strip_prefix("$inspect")
-                    .is_some_and(|suffix| suffix.trim_start().starts_with('('))
-        })
+        || call
+            .receiver
+            .as_deref()
+            .is_some_and(|receiver| rune_name(receiver) || inspect_receiver(receiver))
+}
+
+fn inspect_receiver(receiver: &str) -> bool {
+    let Some(mut suffix) = receiver.strip_prefix("$inspect") else {
+        return false;
+    };
+    loop {
+        suffix = suffix.trim_start();
+        if suffix.starts_with('(') {
+            return true;
+        }
+        if let Some(rest) = suffix
+            .strip_prefix("/*")
+            .and_then(|comment| comment.split_once("*/").map(|(_, rest)| rest))
+        {
+            suffix = rest;
+            continue;
+        }
+        if let Some(rest) = suffix.strip_prefix("//").and_then(|comment| {
+            comment
+                .find(['\r', '\n'])
+                .map(|end| &comment[end.saturating_add(1)..])
+        }) {
+            suffix = rest;
+            continue;
+        }
+        return false;
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +294,7 @@ mod tests {
               $: result = refresh(count);
               $effect(() => persist(count));
               $inspect (count).with(console.trace);
+              $inspect /* reason */ (count).with(console.trace);
               api.$state();
             </script>
         "#;
