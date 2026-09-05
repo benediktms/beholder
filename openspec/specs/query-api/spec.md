@@ -9,7 +9,7 @@ Define Beholder's typed semantic query and presentation contracts from
 
 ### Requirement: Query-specific typed results
 
-`context`, `dependencies`, `impact`, `trace`, and `why` SHALL return
+`entity search`, `context`, `dependencies`, `impact`, `trace`, and `why` SHALL return
 query-specific Beholder DTOs rather than storage rows or a generic value table.
 
 #### Scenario: gRPC query response
@@ -20,13 +20,23 @@ query-specific Beholder DTOs rather than storage rows or a generic value table.
 ### Requirement: Versioned JSON contracts
 
 Each JSON query document SHALL carry its query-specific schema identifier:
-`beholder.context.v1`, `beholder.dependencies.v2`, `beholder.impact.v2`,
-`beholder.trace.v2`, or `beholder.why.v2`.
+`beholder.entity_search.v1`, `beholder.context.v1`, `beholder.dependencies.v2`,
+`beholder.impact.v2`, `beholder.trace.v2`, or `beholder.why.v2`.
 
 #### Scenario: Requesting JSON output
 
 - **WHEN** a user selects JSON or pretty JSON output
 - **THEN** the complete typed result is serialized under that query's current stable schema
+
+### Requirement: Bounded entity search
+
+Entity search SHALL reject an empty trimmed query, default to 20 matches when no
+limit is supplied, and accept explicit limits from 1 through 100.
+
+#### Scenario: Searching without an explicit limit
+
+- **WHEN** a consumer searches for a non-empty entity query without a limit
+- **THEN** the daemon returns at most 20 matches under `beholder.entity_search.v1`
 
 ### Requirement: Lossless JSON and evidence-oriented raw projection
 

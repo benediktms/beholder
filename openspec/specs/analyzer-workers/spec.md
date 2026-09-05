@@ -53,8 +53,8 @@ matches the current baseline and worker identity.
 
 ### Requirement: Coalesced analyzer work
 
-Worker jobs SHALL be coalesced per workspace and analyzer so queued obsolete
-snapshots are replaced by the newest eligible input.
+Worker jobs SHALL be coalesced per workspace, repository, and analyzer so queued
+obsolete snapshots for the same target are replaced by the newest eligible input.
 
 #### Scenario: Several baseline revisions arrive quickly
 
@@ -79,9 +79,9 @@ single-writer lifecycle and explicit rebuild triggers.
 
 ### Requirement: Installed built-in workers are trusted
 
-The daemon SHALL automatically schedule an installed built-in compiler worker for
-repositories containing its accepted inputs, including workers that may execute
-repository-controlled build or macro code.
+The daemon SHALL automatically schedule an installed built-in compiler worker when
+its activation criteria are satisfied for a repository containing accepted inputs,
+including workers that may execute repository-controlled build or macro code.
 
 #### Scenario: Registering an Elixir repository
 

@@ -46,11 +46,12 @@ OpenTelemetry span context.
 ### Requirement: End-to-end job traces
 
 Background job attempts and analyzer workers SHALL continue the enqueue trace through
-W3C trace context while using distinct service names for the daemon and workers.
+W3C trace context. The daemon and workers SHALL use their distinct default service
+names unless `OTEL_SERVICE_NAME` globally overrides them.
 
 #### Scenario: Rust worker analyzes an indexing result
 
-- **WHEN** OTLP export is configured
+- **WHEN** OTLP export is configured without a global service-name override
 - **THEN** its `beholder-worker-rust` spans connect to the originating `beholderd` trace
 
 ### Requirement: Outcome-based severity
