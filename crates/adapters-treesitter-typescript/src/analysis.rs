@@ -461,6 +461,13 @@ fn collect_class_evaluation_calls(
     };
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
+        let mut cursor = member.walk();
+        for decorator in member
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "decorator")
+        {
+            collect_calls_with_owner(decorator, source, root, calls, outer_owner);
+        }
         if let Some(name) = member
             .child_by_field_name("name")
             .or_else(|| member.child_by_field_name("property"))
@@ -2502,6 +2509,18 @@ mod tests {
         .unwrap();
 
         assert!(analysis.calls.iter().any(|call| call.name == "load"));
+        assert!(!analysis.calls.iter().any(|call| call.name == "connect"));
+    }
+
+    #[test]
+    fn class_member_decorators_are_class_evaluation_calls() {
+        let analysis = analyze(
+            "class Service { @register() static value = 1; client = connect(); }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert!(analysis.calls.iter().any(|call| call.name == "register"));
         assert!(!analysis.calls.iter().any(|call| call.name == "connect"));
     }
 
