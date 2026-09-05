@@ -27,7 +27,10 @@ fn qualified(scope: &[String], name: &str) -> String {
 }
 
 fn callable_value(node: Node<'_>) -> bool {
-    matches!(node.kind(), "arrow_function" | "function_expression")
+    matches!(
+        node.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    )
 }
 
 fn is_exported(mut node: Node<'_>) -> bool {
@@ -158,6 +161,7 @@ fn call_target(
     let call = Call {
         kind,
         receiver,
+        owner: None,
         returned_context: None,
         returned_receiver: None,
         name,
@@ -304,7 +308,10 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
     node != root
         && (matches!(
             node.kind(),
-            "function_declaration" | "generator_function_declaration" | "method_definition"
+            "function_declaration"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
         ) || (matches!(node.kind(), "arrow_function" | "function_expression")
             && node
                 .parent()
@@ -319,6 +326,7 @@ fn callable_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
                 "arrow_function"
                     | "function_declaration"
                     | "function_expression"
+                    | "generator_function"
                     | "generator_function_declaration"
                     | "method_definition"
             )
@@ -340,6 +348,7 @@ fn lexical_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
                     | "arrow_function"
                     | "function_declaration"
                     | "function_expression"
+                    | "generator_function"
                     | "generator_function_declaration"
                     | "method_definition"
             )
@@ -360,13 +369,31 @@ fn declaration_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
 }
 
 fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
+    collect_calls_with_owner(node, source, root, calls, None);
+}
+
+fn collect_calls_with_owner(
+    node: Node<'_>,
+    source: &[u8],
+    root: Node<'_>,
+    calls: &mut Vec<Call>,
+    owner: Option<&str>,
+) {
     if is_collection_boundary(node, root) {
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "class" | "class_declaration" | "abstract_class_declaration"
+    ) {
+        collect_class_evaluation_calls(node, source, root, calls, owner);
         return;
     }
     match node.kind() {
         "call_expression" => {
             if let Some(found) = call(node, source, CallKind::Direct) {
                 for mut call in found {
+                    call.owner = owner.map(str::to_owned);
                     (call.scope_start, call.scope_end) = lexical_scope(node, root);
                     calls.push(call);
                 }
@@ -375,6 +402,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
         "new_expression" => {
             if let Some(found) = call(node, source, CallKind::Constructor) {
                 for mut call in found {
+                    call.owner = owner.map(str::to_owned);
                     (call.scope_start, call.scope_end) = lexical_scope(node, root);
                     calls.push(call);
                 }
@@ -392,6 +420,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
                 .and_then(|target| call_target(node, target, source, CallKind::Direct))
             {
                 for mut call in found {
+                    call.owner = owner.map(str::to_owned);
                     (call.scope_start, call.scope_end) = lexical_scope(node, root);
                     calls.push(call);
                 }
@@ -401,7 +430,66 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_calls(child, source, root, calls);
+        collect_calls_with_owner(child, source, root, calls, owner);
+    }
+}
+
+fn collect_class_evaluation_calls(
+    node: Node<'_>,
+    source: &[u8],
+    root: Node<'_>,
+    calls: &mut Vec<Call>,
+    outer_owner: Option<&str>,
+) {
+    let owner = node
+        .child_by_field_name("name")
+        .and_then(|name| text(name, source))
+        .map(|name| match outer_owner {
+            Some(outer_owner) => format!("{outer_owner}/{name}"),
+            None => name.to_owned(),
+        });
+    let body = node.child_by_field_name("body");
+    let mut cursor = node.walk();
+    for child in node
+        .named_children(&mut cursor)
+        .filter(|child| Some(*child) != body && child.kind() != "decorator")
+    {
+        collect_calls_with_owner(child, source, root, calls, outer_owner);
+    }
+    let Some(body) = body else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        let mut cursor = member.walk();
+        for decorator in member
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "decorator")
+        {
+            collect_calls_with_owner(decorator, source, root, calls, outer_owner);
+        }
+        if let Some(name) = member
+            .child_by_field_name("name")
+            .or_else(|| member.child_by_field_name("property"))
+            .filter(|name| name.kind() == "computed_property_name")
+        {
+            collect_calls_with_owner(name, source, root, calls, outer_owner);
+        }
+        match member.kind() {
+            "class_static_block" => {
+                collect_calls_with_owner(member, source, root, calls, owner.as_deref())
+            }
+            "field_definition" | "public_field_definition"
+                if member
+                    .children(&mut member.walk())
+                    .any(|child| child.kind() == "static") =>
+            {
+                if let Some(value) = member.child_by_field_name("value") {
+                    collect_calls_with_owner(value, source, root, calls, owner.as_deref());
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -569,6 +657,7 @@ fn has_conditional_ancestor(node: Node<'_>, source: &[u8], root: Node<'_>) -> bo
                     | "catch_clause"
                     | "arrow_function"
                     | "function_expression"
+                    | "generator_function"
                     | "switch_case"
                     | "switch_default"
                     | "ternary_expression"
@@ -691,6 +780,7 @@ fn returned_constructor_node<'tree>(node: Node<'tree>, root: Node<'tree>) -> Opt
             "arrow_function"
                 | "function_declaration"
                 | "function_expression"
+                | "generator_function"
                 | "generator_function_declaration"
                 | "method_definition"
         )
@@ -768,6 +858,7 @@ fn local_callable_inner<'tree>(
             "arrow_function"
                 | "function_declaration"
                 | "function_expression"
+                | "generator_function"
                 | "generator_function_declaration"
                 | "method_definition"
         )
@@ -859,6 +950,7 @@ fn collect_returned_constructors<'tree>(
             "arrow_function"
                 | "function_declaration"
                 | "function_expression"
+                | "generator_function"
                 | "generator_function_declaration"
                 | "method_definition"
         )
@@ -1487,27 +1579,28 @@ fn mask_jsx_attribute_ampersands(source: &str) -> Option<Vec<u8>> {
 }
 
 fn collect_top_level_call(node: Node<'_>, source: &[u8], calls: &mut Vec<Call>) {
-    if node.kind() == "program" {
+    if matches!(node.kind(), "program" | "export_statement") {
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in node
+            .named_children(&mut cursor)
+            .filter(|child| node.kind() == "program" || child.kind() != "decorator")
+        {
             collect_top_level_call(child, source, calls);
         }
         return;
     }
-    if node.kind() != "expression_statement" {
+    if matches!(
+        node.kind(),
+        "arrow_function"
+            | "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "interface_declaration"
+    ) {
         return;
     }
-    let Some(expression) = node.named_child(0) else {
-        return;
-    };
-    let kind = match expression.kind() {
-        "call_expression" => CallKind::Direct,
-        "new_expression" => CallKind::Constructor,
-        _ => return,
-    };
-    if let Some(found) = call(expression, source, kind) {
-        calls.extend(found);
-    }
+    collect_calls(node, source, node, calls);
 }
 
 fn collect_top_level_aliases(node: Node<'_>, source: &[u8], aliases: &mut Vec<SimpleAlias>) {
@@ -1518,6 +1611,7 @@ fn collect_top_level_aliases(node: Node<'_>, source: &[u8], aliases: &mut Vec<Si
             | "method_definition"
             | "arrow_function"
             | "function_expression"
+            | "generator_function"
             | "class_declaration"
     ) {
         return;
@@ -1547,8 +1641,27 @@ pub fn analyze(
     language: SourceLanguage,
 ) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
     let plugins = built_in_plugins()?;
-    let active = plugins.activate_direct(Path::new("input.ts"));
-    analyze_with_plugins(source, language, Path::new("input.ts"), &plugins, &active)
+    let path = if language == SourceLanguage::Svelte {
+        Path::new("input.svelte")
+    } else {
+        Path::new("input.ts")
+    };
+    let active = plugins.activate_direct(path);
+    analyze_with_plugins(source, language, path, &plugins, &active)
+}
+
+pub(super) fn analyze_core(
+    source: &str,
+    language: SourceLanguage,
+) -> Result<TypescriptAnalysis, Box<dyn Error + Send + Sync>> {
+    let plugins = built_in_plugins()?;
+    analyze_with_plugins(
+        source,
+        language,
+        Path::new("input.ts"),
+        &plugins,
+        &Default::default(),
+    )
 }
 
 pub(super) fn analyze_with_plugins(
@@ -1561,6 +1674,7 @@ pub(super) fn analyze_with_plugins(
     let mut parser = Parser::new();
     let grammar = match language {
         SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
+        SourceLanguage::Svelte => tree_sitter_svelte_ng::LANGUAGE,
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         SourceLanguage::Jsx | SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
     };
@@ -1600,7 +1714,11 @@ pub(super) fn analyze_with_plugins(
         collect_string_constants(root, source.as_bytes(), &mut string_constants);
         collect_graphql_documents(root, source.as_bytes(), &mut graphql_documents);
     }
-    if incomplete && definitions.is_empty() && calls.is_empty() {
+    if language != SourceLanguage::Svelte
+        && incomplete
+        && definitions.is_empty()
+        && calls.is_empty()
+    {
         return Err(UnsafeTreeRecovery::new(
             "JavaScript/TypeScript",
             "no unaffected definitions remain",
@@ -1671,9 +1789,17 @@ pub(super) fn semantics_from_analysis(
     _source: &str,
     path: &Path,
 ) -> (Vec<Observation>, Vec<SemanticCandidate>) {
-    let language = analysis.language.id_segment();
-    let module_id = format!("repo://{repository}/{language}/{}", source_stem(path));
-    let source_id = format!("repo://{repository}/{language}-source/{}", path.display());
+    let language = analysis.language.call_id_segment();
+    let module_id = format!(
+        "repo://{repository}/{}/{}",
+        analysis.language.id_segment(),
+        source_stem(path)
+    );
+    let source_id = format!(
+        "repo://{repository}/{}-source/{}",
+        analysis.language.id_segment(),
+        path.display()
+    );
     let mut observations = vec![Observation::structural(
         source_id,
         StructuralRelation::Defines,
@@ -1701,7 +1827,9 @@ pub(super) fn semantics_from_analysis(
             path,
         );
         observations.push(observation);
-        candidates.extend(candidate);
+        if analysis.language != SourceLanguage::Svelte {
+            candidates.extend(candidate);
+        }
     }
     for definition in &analysis.definitions {
         let id = &ids[&definition.qualified_name];
@@ -1723,11 +1851,17 @@ pub(super) fn semantics_from_analysis(
         }
         let scope = parent_name.unwrap_or_default();
         for call in &definition.calls {
+            let scope = call
+                .owner
+                .as_ref()
+                .map_or(scope, |_| definition.qualified_name.as_str());
             let target = observation_target(language, &ids, scope, call);
             let (observation, candidate) =
                 call_semantics(repository, language, id, target, call, path);
             observations.push(observation);
-            candidates.extend(candidate);
+            if analysis.language != SourceLanguage::Svelte {
+                candidates.extend(candidate);
+            }
         }
     }
     if analysis.generated {
@@ -1820,10 +1954,22 @@ fn observation_target(
             .or_else(|| ids.get(&call.name))
             .cloned()
             .unwrap_or_else(|| format!("{language}-call://{}", call.name)),
-        CallKind::Member if call.receiver.as_deref() == Some("this") => ids
-            .get(&format!("{scope}/{}", call.name))
-            .cloned()
-            .unwrap_or_else(|| format!("{language}-method://this/{}", call.name)),
+        CallKind::Member if call.receiver.as_deref() == Some("this") => {
+            let owner = match (scope.is_empty(), call.owner.as_deref()) {
+                (true, Some(owner)) => owner.to_owned(),
+                (false, Some(owner)) => format!("{scope}/{owner}"),
+                (_, None) => scope.to_owned(),
+            };
+            ids.get(&format!("{owner}/{}", call.name))
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "{language}-method://{}/{}",
+                        call.owner.as_ref().map_or("this", |_| owner.as_str()),
+                        call.name
+                    )
+                })
+        }
         CallKind::Member => format!(
             "{language}-method://{}/{}",
             call.receiver.as_deref().unwrap_or("_"),
@@ -1919,34 +2065,59 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_four_source_forms_with_their_explicit_grammar() {
-        for (path, source, expected) in [
-            ("src/plain.js", "export function run() {}", "/javascript/"),
+    fn parses_supported_source_forms_with_their_explicit_grammar() {
+        for (path, source, expected_language, expected_name) in [
+            (
+                "src/plain.js",
+                "export function run() {}",
+                "/javascript/",
+                "/run",
+            ),
             (
                 "src/view.jsx",
                 "export const View = () => <main />",
                 "/javascript/",
+                "/View",
             ),
             (
                 "src/plain.ts",
                 "export function run(value: string): string { return value }",
                 "/typescript/",
+                "/run",
             ),
             (
                 "src/view.tsx",
                 "export const View = (): JSX.Element => <main />",
                 "/typescript/",
+                "/View",
+            ),
+            (
+                "src/view.svelte",
+                "<script lang=\"ts\">export function run(value: string) { return value }</script><button>{run('ok')}</button>",
+                "/svelte/",
+                "/run",
             ),
         ] {
             assert!(observations(source, path).iter().any(|observation| {
-                observation.to.as_str().contains(expected)
-                    && observation.to.as_str().ends_with(if path.contains("view") {
-                        "/View"
-                    } else {
-                        "/run"
-                    })
+                observation.to.as_str().contains(expected_language)
+                    && observation.to.as_str().ends_with(expected_name)
             }));
         }
+    }
+
+    #[test]
+    fn svelte_modules_keep_typescript_call_semantics() {
+        let source = "<script>export function run() { external(); }</script>";
+        let path = Path::new("src/view.svelte");
+        let analysis = analyze(source, SourceLanguage::Svelte).unwrap();
+        let (observations, candidates) =
+            semantics_from_analysis("example", &analysis, source, path);
+
+        assert!(candidates.is_empty());
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/svelte/src/view/run"
+                && observation.to.as_str() == "typescript-call://external"
+        }));
     }
 
     #[test]
@@ -2184,6 +2355,173 @@ mod tests {
                 "missing {expected:?}: {calls:?}"
             );
         }
+    }
+
+    #[test]
+    fn class_calls_are_not_attributed_to_the_module() {
+        let analysis = analyze(
+            "function traced() {} @traced() export class Service { client = connect(); } const Expression = class { client = reconnect(); }; const iter = function* () { delayed(); }; export const app = build(); export default () => hidden();",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert_eq!(
+            analysis
+                .calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["build"]
+        );
+    }
+
+    #[test]
+    fn class_evaluation_calls_are_attributed_to_the_enclosing_scope() {
+        let analysis = analyze(
+            "function run() { class Local extends decorate(Base) { static value = initialize(); static { register(); } client = connect(); } const Expression = class extends wrap(Base) { static value = prepare(); client = reconnect(); }; }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "run")
+            .unwrap();
+        let calls = run
+            .calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>();
+
+        for name in ["decorate", "initialize", "register", "wrap", "prepare"] {
+            assert!(calls.contains(&name), "missing {name}: {calls:?}");
+        }
+        assert!(!calls.contains(&"connect"));
+        assert!(!calls.contains(&"reconnect"));
+    }
+
+    #[test]
+    fn returned_generator_calls_stay_inside_the_generator() {
+        let analysis = analyze(
+            "function run() { return function* () { delayed(); }; }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "run")
+            .unwrap();
+
+        assert!(run.calls.is_empty());
+    }
+
+    #[test]
+    fn class_static_this_calls_resolve_to_the_class_member() {
+        let observations = observations(
+            "class Config { static value = this.load(); static load() {} }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config"
+                && observation.to.as_str() == "repo://example/typescript/src/config/Config/load"
+        }));
+    }
+
+    #[test]
+    fn anonymous_classes_do_not_inherit_the_outer_class_owner() {
+        let analysis = analyze(
+            "class Outer { static Inner = class extends Base { static value = this.load() }; static load() {} }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        let calls = analysis
+            .calls
+            .iter()
+            .filter(|call| call.receiver.as_deref() == Some("this") && call.name == "load")
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].owner.is_none());
+    }
+
+    #[test]
+    fn nested_class_static_calls_include_the_callable_scope() {
+        let observations = observations(
+            "function run() { class Local { static value = this.load(); static load() {} } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config/run"
+                && observation.to.as_str() == "repo://example/typescript/src/config/run/Local/load"
+        }));
+    }
+
+    #[test]
+    fn nested_class_heritage_keeps_the_outer_this_owner() {
+        let observations = observations(
+            "class Outer { makeBase() {} run() { class Inner extends this.makeBase() {} } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config/Outer/run"
+                && observation.to.as_str() == "repo://example/typescript/src/config/Outer/makeBase"
+        }));
+    }
+
+    #[test]
+    fn nested_class_computed_keys_keep_the_outer_this_owner() {
+        let observations = observations(
+            "class Outer { key() {} run() { class Inner { [this.key()]() {} } } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config/Outer/run"
+                && observation.to.as_str() == "repo://example/typescript/src/config/Outer/key"
+        }));
+    }
+
+    #[test]
+    fn classes_in_static_blocks_include_the_outer_class_owner() {
+        let observations = observations(
+            "class Outer { static { class Inner { static value = this.load(); static load() {} } } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config"
+                && observation.to.as_str()
+                    == "repo://example/typescript/src/config/Outer/Inner/load"
+        }));
+    }
+
+    #[test]
+    fn abstract_instance_initializers_are_not_module_calls() {
+        let analysis = analyze(
+            "abstract class Service { client = connect(); static current = load(); }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert!(analysis.calls.iter().any(|call| call.name == "load"));
+        assert!(!analysis.calls.iter().any(|call| call.name == "connect"));
+    }
+
+    #[test]
+    fn class_member_decorators_are_class_evaluation_calls() {
+        let analysis = analyze(
+            "class Service { @register() static value = 1; client = connect(); }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert!(analysis.calls.iter().any(|call| call.name == "register"));
+        assert!(!analysis.calls.iter().any(|call| call.name == "connect"));
     }
 
     #[test]

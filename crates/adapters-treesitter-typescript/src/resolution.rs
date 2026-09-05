@@ -1,4 +1,4 @@
-use super::model::*;
+use super::{analysis::source_stem, model::*};
 use beholder_adapters_graphql::{GraphqlSource, facts as graphql_facts};
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
@@ -55,12 +55,6 @@ fn normalized(path: &Path) -> PathBuf {
         }
     }
     result
-}
-
-fn source_stem(path: &Path) -> String {
-    path.with_extension("")
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 #[derive(Clone)]
@@ -309,6 +303,15 @@ fn import_bases(caller: &Path, source: &str, packages: &BTreeMap<String, Package
 }
 
 fn source_candidates(base: PathBuf) -> Vec<PathBuf> {
+    if base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".svelte.js"))
+    {
+        let mut typescript = base.clone();
+        typescript.set_extension("ts");
+        return vec![base, typescript];
+    }
     if SourceLanguage::from_path(&base).is_some() {
         return vec![base];
     }
@@ -2053,6 +2056,7 @@ pub fn resolve_workspace_calls(
 
 pub fn unresolved_call_diagnostics(
     observations: &[Observation],
+    repositories: &[TypescriptRepository],
 ) -> Vec<(String, AnalysisDiagnostic)> {
     let mut unresolved = BTreeMap::<(String, PathBuf), (usize, Option<u32>)>::new();
     for observation in observations.iter().filter(|observation| {
@@ -2063,20 +2067,32 @@ pub fn unresolved_call_diagnostics(
         let Some(caller) = observation.from.as_str().strip_prefix("repo://") else {
             continue;
         };
-        let Some((repository, _)) = caller
-            .split_once("/typescript/")
-            .or_else(|| caller.split_once("/javascript/"))
-        else {
-            continue;
-        };
         let (path, line) = observation
             .evidence
             .as_str()
             .rsplit_once(':')
             .map(|(path, line)| (path, line.parse().ok()))
             .unwrap_or((observation.evidence.as_str(), None));
+        let Some(repository) = repositories.iter().find(|repository| {
+            repository.sources.iter().any(|(source_path, analysis)| {
+                source_path == Path::new(path) && {
+                    let module = format!(
+                        "{}/{}/{}",
+                        repository.repository,
+                        analysis.language.id_segment(),
+                        source_stem(source_path)
+                    );
+                    caller == module
+                        || caller
+                            .strip_prefix(&module)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                }
+            })
+        }) else {
+            continue;
+        };
         unresolved
-            .entry((repository.into(), path.into()))
+            .entry((repository.repository.clone(), path.into()))
             .and_modify(|(count, _)| *count += 1)
             .or_insert((1, line));
     }
@@ -2103,6 +2119,17 @@ pub fn unresolved_call_diagnostics(
 mod tests {
     use super::*;
     use crate::{analyze, observations_from_analysis};
+
+    #[test]
+    fn svelte_js_specifiers_include_the_typescript_companion() {
+        assert_eq!(
+            source_candidates(PathBuf::from("src/state.svelte.js")),
+            [
+                PathBuf::from("src/state.svelte.js"),
+                PathBuf::from("src/state.svelte.ts"),
+            ]
+        );
+    }
 
     #[test]
     fn rejects_ambiguous_repository_package_names() {
@@ -3434,6 +3461,21 @@ mod tests {
     }
 
     #[test]
+    fn resolves_static_this_calls_through_the_declaring_class_base() {
+        let source = "class Base { static load() {} } class Child extends Base { static value = this.load(); }";
+        let path = Path::new("src/config.ts");
+        let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
+        let mut observations = observations_from_analysis("example", &analysis, source, path);
+
+        resolve_repository_calls("example", &mut observations, &[(path, &analysis)], &[], &[]);
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config"
+                && observation.to.as_str() == "repo://example/typescript/src/config/Base/load"
+        }));
+    }
+
+    #[test]
     fn skips_workspace_resolution_for_one_repository() {
         let source = "export function run() { missing(); }";
         let analysis = analyze(source, SourceLanguage::TypeScript).unwrap();
@@ -3472,15 +3514,100 @@ mod tests {
                 "typescript-call://external",
                 "src/client.ts:6",
             ),
+            Observation::dependency(
+                "repo://example/svelte/src/view/run",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "src/view.svelte:7",
+            ),
         ];
 
-        let diagnostics = unresolved_call_diagnostics(&observations);
+        let repositories = vec![TypescriptRepository::new(
+            "example",
+            vec![
+                (
+                    PathBuf::from("src/client.ts"),
+                    analyze("client.send()", SourceLanguage::TypeScript).unwrap(),
+                ),
+                (
+                    PathBuf::from("src/view.svelte"),
+                    analyze("<script>api.send()</script>", SourceLanguage::Svelte).unwrap(),
+                ),
+            ],
+            vec![],
+            vec![],
+        )];
+        let diagnostics = unresolved_call_diagnostics(&observations, &repositories);
 
-        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.len(), 2);
         assert_eq!(diagnostics[0].0, "example");
         assert_eq!(
             diagnostics[0].1.detail.as_deref(),
             Some("2 receiver method call(s) remain unresolved after workspace resolution")
+        );
+        assert_eq!(diagnostics[1].0, "example");
+        assert_eq!(diagnostics[1].1.path, PathBuf::from("src/view.svelte"));
+    }
+
+    #[test]
+    fn unresolved_call_diagnostics_preserve_repository_and_module_boundaries() {
+        let observations = vec![
+            Observation::dependency(
+                "repo://acme/svelte/svelte/src/view/run",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "src/view.svelte:7",
+            ),
+            Observation::dependency(
+                "repo://gitlab.com/typescript/src/view/typescript/src/view/run",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "src/view.ts:8",
+            ),
+            Observation::dependency(
+                "repo://acme/typescript/typescript/view/run",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "typescript/view.ts:9",
+            ),
+        ];
+
+        let typescript = analyze("api.send()", SourceLanguage::TypeScript).unwrap();
+        let svelte = analyze("<script>api.send()</script>", SourceLanguage::Svelte).unwrap();
+        let repositories = vec![
+            TypescriptRepository::new(
+                "acme",
+                vec![(PathBuf::from("typescript/view.ts"), typescript.clone())],
+                vec![],
+                vec![],
+            ),
+            TypescriptRepository::new(
+                "acme/svelte",
+                vec![(PathBuf::from("src/view.svelte"), svelte)],
+                vec![],
+                vec![],
+            ),
+            TypescriptRepository::new(
+                "acme/typescript",
+                vec![(PathBuf::from("view.ts"), typescript.clone())],
+                vec![],
+                vec![],
+            ),
+            TypescriptRepository::new(
+                "gitlab.com/typescript/src/view",
+                vec![(PathBuf::from("src/view.ts"), typescript)],
+                vec![],
+                vec![],
+            ),
+        ];
+        let diagnostics = unresolved_call_diagnostics(&observations, &repositories);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|(repository, _)| repository.as_str())
+                .collect::<Vec<_>>(),
+            ["acme", "acme/svelte", "gitlab.com/typescript/src/view"]
         );
     }
 }

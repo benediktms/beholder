@@ -500,6 +500,10 @@ mod tests {
             Some(AnalysisInputKind::Source)
         );
         assert_eq!(
+            typescript_analysis_input_kind(Path::new("src/app.svelte")),
+            Some(AnalysisInputKind::Source)
+        );
+        assert_eq!(
             typescript_analysis_input_kind(Path::new("tsconfig.base.json")),
             Some(AnalysisInputKind::Configuration)
         );

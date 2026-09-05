@@ -109,6 +109,7 @@ pub(super) fn is_index_input(path: &Path) -> bool {
                         | "jsx"
                         | "ts"
                         | "tsx"
+                        | "svelte"
                         | "graphql"
                         | "gql"
                         | "proto"
@@ -638,7 +639,13 @@ mod tests {
         ] {
             fs::create_dir_all(repository.join(directory)).unwrap();
         }
-        for path in ["src/a.js", "src/b.jsx", "src/c.ts", "src/d.tsx"] {
+        for path in [
+            "src/a.js",
+            "src/b.jsx",
+            "src/c.ts",
+            "src/d.tsx",
+            "src/e.svelte",
+        ] {
             fs::write(repository.join(path), "export function indexed() {}").unwrap();
         }
         fs::write(
@@ -678,7 +685,7 @@ mod tests {
         }
 
         let sources = repository_sources(&repository, &[]).unwrap();
-        assert_eq!(sources.typescript.len(), 4);
+        assert_eq!(sources.typescript.len(), 5);
         assert_eq!(sources.typescript_manifests.len(), 1);
         assert_eq!(sources.typescript_configs.len(), 1);
         assert_eq!(sources.graphql.len(), 2);

@@ -1,5 +1,5 @@
-pub const FRONTEND_VERSION: &str = "46";
-pub const RESOLVER_VERSION: &str = "29";
+pub const FRONTEND_VERSION: &str = "53";
+pub const RESOLVER_VERSION: &str = "30";
 
 mod analysis;
 mod analyzer;
@@ -13,6 +13,7 @@ mod nestjs_di;
 mod nestjs_graphql;
 mod plugin;
 mod resolution;
+mod svelte;
 mod ts_proto;
 
 pub use analysis::{
