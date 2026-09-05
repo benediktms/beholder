@@ -1,5 +1,9 @@
 # ADR 0005: Runtime analyzer plugins
 
+> [!NOTE]
+> This ADR is retained for architectural rationale and rejected alternatives. The
+> current behavioral contract is [`runtime-plugins`](../../openspec/specs/runtime-plugins/spec.md).
+
 - Status: proposed
 - Date: 2026-08-24
 

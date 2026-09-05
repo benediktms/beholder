@@ -23,7 +23,23 @@ Instead of treating source files as isolated text, Beholder records semantic ent
 Beholder is written in Rust and is designed around a **workspace** rather than a single repository. A workspace can contain services, clients, shared contracts, registries, and multiple languages while still being queried as one coherent semantic graph.
 
 > [!NOTE]
-> Beholder is under active development. The architecture below describes the current implementation first; longer-term design work lives in [`docs/VISION.md`](docs/VISION.md) and the ADRs under [`docs/adr`](docs/adr).
+> Beholder is under active development. Current behavioral contracts live in
+> [`openspec/specs`](openspec/specs). Longer-term direction, rationale, rejected
+> alternatives, and measurements remain in [`docs/VISION.md`](docs/VISION.md) and
+> [`docs/adr`](docs/adr).
+
+## Specifications
+
+Beholder uses [OpenSpec](https://openspec.dev/) through repository-local Codex
+skills. Start uncertain work with `$openspec-explore`; create a reviewable change
+with `$openspec-propose`; then use `$openspec-apply-change` and
+`$openspec-archive-change` after approval. The pinned CLI in `mise.toml` supports
+setup and validation, while the normal authoring workflow stays skill-based.
+
+The main specs describe current behavior. A proposed change belongs under
+`openspec/changes/` as a delta until it is implemented and archived. Existing
+design documents remain supporting context rather than a second normative spec.
+See the [migration crosswalk](openspec/README.md) for source-to-capability coverage.
 
 ## Architecture
 
@@ -293,7 +309,9 @@ consumer
 
 Beholder should be able to traverse that as one evidence-backed path even when the nodes are spread across languages and repositories.
 
-For the deeper design, rationale, and planned capabilities, start with [`docs/VISION.md`](docs/VISION.md). Architectural decisions for language-native enrichment are recorded in [`docs/adr`](docs/adr).
+For current contracts, start with [`openspec/specs`](openspec/specs). For deeper
+design, rationale, and planned capabilities, continue to
+[`docs/VISION.md`](docs/VISION.md) and [`docs/adr`](docs/adr).
 
 ## Status
 

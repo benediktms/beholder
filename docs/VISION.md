@@ -1,5 +1,10 @@
 # Beholder — Initial Architecture and Project Plan
 
+> [!NOTE]
+> This document retains product rationale and future direction. Current behavioral
+> contracts are normative in [`openspec/specs`](../openspec/specs); future sections
+> here remain roadmap until introduced through an OpenSpec change.
+
 ## 1. Purpose
 
 **Beholder** is a multi-repository static-analysis and architecture-intelligence platform.

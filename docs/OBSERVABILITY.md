@@ -1,5 +1,9 @@
 # Local observability
 
+> [!NOTE]
+> This document remains the local setup and environment-variable guide. The current
+> behavioral contract is [`observability`](../openspec/specs/observability/spec.md).
+
 `beholderd` can export its existing structured spans and events as OpenTelemetry
 traces and logs over OTLP/HTTP. Export is opt-in: local rolling JSON logs remain
 the only sink unless an OTLP endpoint is configured.

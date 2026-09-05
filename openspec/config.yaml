@@ -1,0 +1,36 @@
+schema: spec-driven
+
+context: |
+  Beholder is a local-first semantic code-intelligence system built primarily in Rust.
+  It indexes multiple repositories into revision-consistent workspace graphs stored by
+  the Mnestic adapter, exposes typed gRPC and CLI queries, and enriches syntax facts
+  through isolated language-native workers and runtime analyzer plugins.
+
+  Current behavior is normative in openspec/specs. docs/VISION.md and docs/adr retain
+  roadmap, rationale, rejected alternatives, measurements, and historical context;
+  they do not make proposed behavior current. Preserve Beholder-owned domain and DTO
+  boundaries and keep Mnestic types inside beholder-adapters-mnestic.
+
+  Use Conventional Commits. Run only focused tests locally; CI owns the full suite.
+
+rules:
+  proposal:
+    - Distinguish current behavior from proposed behavior and explicit non-goals.
+    - Link relevant architecture decisions and performance evidence when they constrain the change.
+  specs:
+    - Describe observable behavior and stable contracts, not implementation aspirations.
+    - Give every requirement at least one concrete scenario.
+    - Preserve freshness, completeness, provenance, and revision semantics where relevant.
+  design:
+    - Reuse existing Beholder boundaries before introducing a new abstraction.
+    - Record rejected alternatives only when they explain a non-obvious constraint.
+  tasks:
+    - Keep tasks independently verifiable and include the narrowest relevant check.
+
+operations:
+  apply:
+    guidance:
+      - Keep each implementation change minimal and run only targeted tests locally.
+  archive:
+    guidance:
+      - Confirm the main specs describe shipped behavior before syncing the change.

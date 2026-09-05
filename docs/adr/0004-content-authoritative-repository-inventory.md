@@ -1,5 +1,9 @@
 # ADR 0004: Content-authoritative repository inventory
 
+> [!NOTE]
+> This ADR is retained for architectural rationale and historical evidence. The
+> current behavioral contract is [`workspace-state`](../../openspec/specs/workspace-state/spec.md).
+
 - Status: accepted
 - Date: 2026-08-22
 - Tracking: https://github.com/benediktms/beholder/issues/86

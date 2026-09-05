@@ -1,5 +1,9 @@
 # Indexing API proposal
 
+> [!NOTE]
+> This document retains extraction design and migration rationale. The current
+> behavioral contract is [`indexing-pipeline`](../openspec/specs/indexing-pipeline/spec.md).
+
 This proposal completes the scheduler boundary described by
 https://github.com/benediktms/beholder/issues/43 without reopening the analyzer
 architecture established by https://github.com/benediktms/beholder/issues/45.

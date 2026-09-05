@@ -1,5 +1,9 @@
 # Semantic query performance
 
+> [!NOTE]
+> This document retains query measurements and index evidence. The current behavioral
+> contract is [`query-api`](../openspec/specs/query-api/spec.md).
+
 Measurements below were taken on 2026-09-03 against the installed daemon's
 SQLite database with the daemon stopped. The database contained the `beholder`
 view at revision 1028 and the seven-repository `fresha` view at revision 183.
