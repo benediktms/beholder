@@ -132,7 +132,7 @@ Archive a completed change in the experimental workflow.
    left to apply for each selected capability:
    - ADDED requirements present
    - MODIFIED requirements exactly matching the complete post-change block in the delta
-   - REMOVED requirements gone — and where this sync retired a capability (removed its last requirement, leaving `## Requirements` empty), its main spec deleted rather than left empty; a spec the sync deliberately kept and reported is also a match
+   - REMOVED requirements gone — and where this sync retired a capability (removed its last requirement, leaving `## Requirements` empty), its main spec deleted rather than left empty. A blocked retirement that deliberately kept the main spec is a mismatch and MUST stop archiving.
    - RENAMED requirements present under the new name and absent under the old one
 
    If the sync failed, or any capability does not match, report what differs and stop — do not archive. Nothing has moved and `changeRoot` is intact, so the user can fix the mismatch or re-run the sync and start the archive again.

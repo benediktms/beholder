@@ -73,14 +73,21 @@ jobs as warnings.
 
 ### Requirement: Structured job telemetry
 
-Job and worker telemetry SHALL use structured identifiers, counts, timings, outcomes,
-attempt information, and trace correlation. Failure events currently preserve the
-upstream error display without a size or content bound.
+Completed job and worker attempt paths SHALL use structured identifiers, counts,
+timings, outcomes, attempt information, and trace correlation. Failure events
+currently preserve the upstream error display without a size or content bound.
+A blocking task panic or cancellation MAY return before outcome and error fields are
+recorded.
 
 #### Scenario: Reporting a failed attempt
 
-- **WHEN** a job attempt fails
+- **WHEN** a job attempt returns a failure result
 - **THEN** its event identifies the job kind, stable target, attempt, outcome, duration, and upstream error text
+
+#### Scenario: Blocking task panics or is cancelled
+
+- **WHEN** awaiting blocking work returns a join error before an attempt result exists
+- **THEN** the span may close without a structured outcome or upstream-error event
 
 ### Requirement: Flush on shutdown
 

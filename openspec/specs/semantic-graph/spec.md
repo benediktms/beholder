@@ -63,13 +63,15 @@ dependency-traversal edges.
 
 ### Requirement: Generated and test origin
 
-Entities SHALL distinguish first-party source, generated source, external
-dependencies, and test/specification/benchmark symbols.
+Entities SHALL expose origin classifications inferred from recognized path and name
+markers for first-party source, generated source, external dependencies, and
+test/specification/benchmark symbols. Unrecognized test naming conventions MAY
+remain classified as first-party source.
 
 #### Scenario: Default compact query
 
 - **WHEN** compact output is requested without tests
-- **THEN** presentation may hide tests and supporting entities while the typed result remains complete
+- **THEN** presentation may hide entities classified as tests and supporting entities while the typed result remains complete
 
 ### Requirement: Owner-scoped replacement
 
