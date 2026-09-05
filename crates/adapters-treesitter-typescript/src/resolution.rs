@@ -303,6 +303,15 @@ fn import_bases(caller: &Path, source: &str, packages: &BTreeMap<String, Package
 }
 
 fn source_candidates(base: PathBuf) -> Vec<PathBuf> {
+    if base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".svelte.js"))
+    {
+        let mut typescript = base.clone();
+        typescript.set_extension("ts");
+        return vec![base, typescript];
+    }
     if SourceLanguage::from_path(&base).is_some() {
         return vec![base];
     }
@@ -2110,6 +2119,17 @@ pub fn unresolved_call_diagnostics(
 mod tests {
     use super::*;
     use crate::{analyze, observations_from_analysis};
+
+    #[test]
+    fn svelte_js_specifiers_include_the_typescript_companion() {
+        assert_eq!(
+            source_candidates(PathBuf::from("src/state.svelte.js")),
+            [
+                PathBuf::from("src/state.svelte.js"),
+                PathBuf::from("src/state.svelte.ts"),
+            ]
+        );
+    }
 
     #[test]
     fn rejects_ambiguous_repository_package_names() {
