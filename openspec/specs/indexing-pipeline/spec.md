@@ -52,7 +52,7 @@ reserved read engine.
 #### Scenario: Query during publication or garbage collection
 
 - **WHEN** a mutation operation holds the semantic-store write gate
-- **THEN** a semantic query may proceed against the last complete revision
+- **THEN** a semantic query may proceed against the last atomically published revision
 
 ### Requirement: Incremental immutable fact publication
 
@@ -67,12 +67,18 @@ and selection manifests so unchanged semantic owners retain their existing facts
 ### Requirement: Independently selected enrichment
 
 Enrichment payloads SHALL be immutable snapshots selected independently per
-repository and analyzer, with freshness derived from their stored input identity.
+repository and analyzer. Query freshness currently reflects active indexing or
+enrichment work rather than a terminal job's retained input identity.
 
 #### Scenario: Baseline changes before enrichment catches up
 
-- **WHEN** a compatible previous enrichment snapshot no longer matches current inputs
-- **THEN** queries may retain it as stale and SHALL report that staleness explicitly
+- **WHEN** a compatible previous enrichment snapshot no longer matches current inputs while replacement work remains active
+- **THEN** queries may retain it and report the active work as stale
+
+#### Scenario: Replacement enrichment fails terminally
+
+- **WHEN** the replacement job exhausts its attempts and the previous contribution remains selected
+- **THEN** queries may retain that contribution without reporting stale enrichment
 
 ### Requirement: Bounded parallel analysis
 

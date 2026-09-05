@@ -57,13 +57,19 @@ names unless `OTEL_SERVICE_NAME` globally overrides them.
 ### Requirement: Outcome-based severity
 
 Job telemetry severity SHALL reflect material outcomes: expected coalescing and
-supersession are not errors, retryable failures are warnings, and terminal failures
-are errors.
+supersession are not errors, retryable failures are warnings, and attempt-path
+terminal failures are errors. Crash recovery currently logs even terminally killed
+jobs as warnings.
 
 #### Scenario: Automatic job is superseded
 
 - **WHEN** a newer generation replaces queued work
 - **THEN** telemetry records the normal outcome without error severity
+
+#### Scenario: Final attempt is consumed during crash recovery
+
+- **WHEN** daemon restart marks the interrupted job terminally killed
+- **THEN** recovery records the terminal failure count and emits a warning
 
 ### Requirement: Structured job telemetry
 

@@ -42,6 +42,12 @@ This is an **agent-driven** operation - you will read delta specs and directly e
 
    The JSON includes `planningHome.root`. Main specs live under `<planningHome.root>/openspec/specs/` — use that (store-aware) root for every main-spec path below, not a hardcoded repo path. When a store is selected it points at the store, not the current repository.
 
+   Before continuing, require every entry in `artifacts` to be `done` or
+   `skipped`. Then read the tasks file when one exists and require every task to
+   be checked (`- [x]`). If an artifact or task is incomplete, report it and stop
+   without writing a main spec. A direct sync cannot publish unfinished behavior;
+   complete the change first or archive it without syncing.
+
 3. **Find delta specs**
 
    Use `artifactPaths.specs.existingOutputPaths` from the status JSON as the
