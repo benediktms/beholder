@@ -139,6 +139,13 @@ Archive a completed change in the experimental workflow.
 
 5. **Perform the archive**
 
+   Before moving anything, validate the selected change:
+   ```bash
+   openspec validate "<name>" --type change --strict
+   ```
+   Keep the selected-store flag when applicable. If validation fails, report the
+   errors and stop without moving `changeRoot`.
+
    Create an `archive` directory under `planningHome.changesDir` if it doesn't exist:
    ```bash
    mkdir -p "<planningHome.changesDir>/archive"

@@ -43,6 +43,12 @@ When the user is ready to implement, they must start the apply workflow explicit
 
    If the request contains ambiguity that would materially affect scope, externally observable behavior, compatibility, or acceptance criteria, ask the user before creating the change. For minor details, make a reasonable assumption and record it in the planning artifacts.
 
+   Run `openspec list --json` with the selected-store flag when applicable and
+   check whether the derived name already exists. If it does, ask whether to
+   continue that change or use a new unused name. Continuing an existing change
+   skips steps 2 and 3 and proceeds directly to status and artifact generation in
+   step 4. Creating a new change requires an unused name.
+
 2. **Determine the workflow schema**
 
    Use the configured default schema unless the user explicitly requests a different workflow.
@@ -83,7 +89,7 @@ When the user is ready to implement, they must start the apply workflow explicit
 
    Loop through artifacts in dependency order (artifacts with no pending dependencies first):
 
-   a. **For each artifact that is `ready` (dependencies satisfied)**:
+   a. **For each artifact that is `ready`, or `blocked` only by recorded conditional skips**:
       - Get instructions:
         ```bash
         openspec instructions <artifact-id> --change "<name>" --json
@@ -113,7 +119,7 @@ When the user is ready to implement, they must start the apply workflow explicit
       - An artifact already reading `status: "skipped"` is satisfied: the change declares `skip_specs` in `.openspec.yaml`, so its files must NOT exist. Never try to create one
       - Create every artifact in the required set that is missing, then re-check - creating one can unblock others
       - Skip one only when `status` already reports it `skipped`, or when its own `instruction` says it is conditional: run `openspec instructions <artifact-id> --change "<name>" --json` and skip only if its `instruction` field marks it optional (e.g. "create only if..."). Spec-driven's `design.md` qualifies; `specs` qualifies only via the `skipped` status above, never by your own judgment. Tell the user, and do not reconsider it
-      - Dependencies are enablers, not gates: if a required artifact is still `blocked` only because you skipped a conditional dependency, write it anyway
+      - Dependencies are enablers, not gates: if a required artifact is still `blocked` only because you skipped a conditional dependency, return to step a, fetch that blocked artifact's instructions, and apply its template and rules before writing it
       - Stop when every artifact in the required set is `done`, `skipped`, or was deliberately skipped
 
    c. **If an artifact requires user input** (unclear context):
@@ -149,5 +155,5 @@ After completing all artifacts, summarize:
 - Create every artifact the apply phase transitively depends on, not just the ids listed in `apply.requires`
 - Always read dependency artifacts before creating a new one - re-read from disk, not from conversation memory (files may have changed since you last saw them)
 - Ask about ambiguities that would materially change scope, externally observable behavior, compatibility, or acceptance criteria; for minor details, make reasonable assumptions and record them
-- If a change with that name already exists, ask if user wants to continue it or create a new one
+- If a change with that name already exists, follow the continuation or unused-name branch in step 1; never run `openspec new change` for the existing name
 - Verify each artifact file exists after writing before proceeding to next
