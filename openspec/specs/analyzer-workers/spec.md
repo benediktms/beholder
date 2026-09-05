@@ -61,15 +61,16 @@ snapshots are replaced by the newest eligible input.
 - **WHEN** an analyzer has not started the older queued revisions
 - **THEN** it runs against the newest compatible snapshot rather than each obsolete revision
 
-### Requirement: Bounded persistent compiler state
+### Requirement: Bounded persistent compiler workspace
 
-A worker SHALL retain compiler state only when its frontend defines a bounded,
-single-writer lifecycle and rebuild triggers.
+The persistent Rust worker SHALL retain one compiler workspace for its current
+target, containing one rust-analyzer database per discovered Cargo root, with a
+single-writer lifecycle and explicit rebuild triggers.
 
 #### Scenario: Rust source-only change
 
-- **WHEN** accepted membership and Cargo configuration are unchanged
-- **THEN** the persistent Rust worker applies source changes to its one retained rust-analyzer database
+- **WHEN** accepted membership, Cargo roots, and Cargo configuration are unchanged
+- **THEN** the persistent Rust worker applies source changes to the retained database for each Cargo root
 
 #### Scenario: Rust project structure changes
 

@@ -35,11 +35,12 @@ standard OpenTelemetry environment variables.
 ### Requirement: Correlated local and exported events
 
 Structured events emitted inside an instrumented span SHALL include trace and span
-identifiers in local logs and exported telemetry.
+identifiers in local logs when trace export is enabled and provides a valid
+OpenTelemetry span context.
 
 #### Scenario: Event occurs outside a span
 
-- **WHEN** no active correlation context exists
+- **WHEN** trace export is disabled or no active correlation context exists
 - **THEN** local output omits `trace_id` and `span_id` rather than fabricating them
 
 ### Requirement: End-to-end job traces
@@ -63,16 +64,16 @@ are errors.
 - **WHEN** a newer generation replaces queued work
 - **THEN** telemetry records the normal outcome without error severity
 
-### Requirement: Bounded telemetry fields
+### Requirement: Structured job telemetry
 
-Job and worker telemetry SHALL use stable identifiers, counts, timings, outcomes,
-attempt information, and trace correlation without logging source contents or
-unbounded payloads.
+Job and worker telemetry SHALL use structured identifiers, counts, timings, outcomes,
+attempt information, and trace correlation. Failure events currently preserve the
+upstream error display without a size or content bound.
 
 #### Scenario: Reporting a failed attempt
 
 - **WHEN** a job attempt fails
-- **THEN** its event identifies the job kind, stable target, attempt, outcome, duration, and bounded error information
+- **THEN** its event identifies the job kind, stable target, attempt, outcome, duration, and upstream error text
 
 ### Requirement: Flush on shutdown
 

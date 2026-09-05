@@ -9,13 +9,14 @@ in `docs/VISION.md`.
 
 ### Requirement: Stable semantic identity
 
-Every semantic entity SHALL have a canonical identifier derived from its semantic
-identity rather than a transient database row, response position, or local path.
+Every semantic entity SHALL have a canonical identifier defined by its frontend
+rather than a transient database row or response position. Contract identities are
+path-independent; source-scoped frontends may include a repository-relative path.
 
 #### Scenario: Same symbol in a later revision
 
-- **WHEN** a symbol's semantic identity is unchanged across revisions
-- **THEN** queries return the same canonical entity identifier
+- **WHEN** a path-scoped C# definition moves to another source file
+- **THEN** its canonical identifier may change with the source-derived module prefix
 
 ### Requirement: Closed typed ontology
 
@@ -29,13 +30,14 @@ directional semantics.
 
 ### Requirement: Repository attribution
 
-Source-owned entities, observations, evidence, and analyzer contributions SHALL
-retain logical repository attribution.
+Source-owned entities, observations, and analyzer contributions SHALL retain logical
+repository attribution. Public evidence attribution is derived from its endpoints
+and may be absent when both endpoints use ownership-neutral contract identities.
 
 #### Scenario: Cross-repository relationship
 
-- **WHEN** an edge connects entities from two repositories
-- **THEN** each endpoint and each evidence record retains its owning repository
+- **WHEN** descriptor evidence connects canonical `proto-*://` endpoints
+- **THEN** the evidence retains its descriptor path but may not expose a repository in the public DTO
 
 ### Requirement: Provenance and confidence
 

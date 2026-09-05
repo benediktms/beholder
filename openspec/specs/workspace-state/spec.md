@@ -47,7 +47,7 @@ semantic currentness.
 #### Scenario: Watcher misses an event
 
 - **WHEN** an event is missed, coalesced, or occurs while the daemon is stopped
-- **THEN** startup or periodic authoritative reconciliation eventually detects the changed content
+- **THEN** startup or watcher-error reconciliation can detect the changed content; no periodic reconciliation loop is guaranteed
 
 ### Requirement: Immutable analysis snapshots
 

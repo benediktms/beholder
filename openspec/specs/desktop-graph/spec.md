@@ -17,15 +17,16 @@ evidence, traversal, and query-state DTOs rather than define a second semantic m
 - **WHEN** the Tauri bridge returns a graph snapshot
 - **THEN** the frontend retains the raw DTO arrays alongside its renderer projection
 
-### Requirement: Stable topology during interaction
+### Requirement: Investigation-driven topology
 
-Selection, hover, zoom, and pan SHALL NOT change visible graph topology, replace
-renderer data, reheat the force simulation, or move the camera implicitly.
+Selecting an investigation root SHALL project the snapshot to the nodes and edges
+for the active context, dependencies, impact, or trace mode, replace renderer data,
+and reheat the force simulation while preserving positions for retained nodes.
 
 #### Scenario: Selecting a node
 
-- **WHEN** a user clicks a visible node
-- **THEN** node and link identities and positions remain stable while its direct neighborhood is highlighted
+- **WHEN** a user clicks a visible node in the default context mode
+- **THEN** the graph replaces its visible data with that node's direct neighborhood and reheats the simulation
 
 ### Requirement: Directional neighborhood highlighting
 
@@ -59,13 +60,14 @@ endpoints remain visible, without applying speculative client-side size limits.
 
 ### Requirement: Response-local edge identity
 
-Client-side merges SHALL identify a raw relationship by `(from, to, kind)` and merge
-evidence rather than treating response-local edge IDs as durable identity.
+Client-side projection SHALL group raw relationships by `(from, to, kind)`, retain
+their response-local edge IDs, count their evidence records, and keep their maximum
+confidence rather than treating one response edge ID as durable identity.
 
 #### Scenario: Same relationship arrives with a different response edge ID
 
-- **WHEN** two query results describe the same endpoints and relationship kind
-- **THEN** the client merges their evidence into one projected link
+- **WHEN** several raw edges describe the same endpoints and relationship kind
+- **THEN** the client emits one projected link with the raw IDs, edge count, evidence count, and maximum confidence
 
 ### Requirement: Live workspace topology
 
@@ -79,10 +81,10 @@ topology through the daemon's workspace topology APIs.
 
 ### Requirement: Revision-state visibility
 
-A production graph snapshot SHALL expose revision, freshness, completeness,
-diagnostics, and truncation so the client can reject unsafe merges and display warnings.
+A graph snapshot SHALL expose revision, freshness, completeness, and diagnostics so
+the client can report analysis state and offer a manual refresh when a newer revision exists.
 
-#### Scenario: Snapshot is stale or truncated
+#### Scenario: Snapshot is stale or incomplete
 
 - **WHEN** the backend reports stale or incomplete graph state
-- **THEN** the UI displays that state without presenting the projection as complete
+- **THEN** the UI displays the state and its diagnostics without claiming truncation metadata
