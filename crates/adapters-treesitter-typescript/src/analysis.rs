@@ -27,7 +27,10 @@ fn qualified(scope: &[String], name: &str) -> String {
 }
 
 fn callable_value(node: Node<'_>) -> bool {
-    matches!(node.kind(), "arrow_function" | "function_expression")
+    matches!(
+        node.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    )
 }
 
 fn is_exported(mut node: Node<'_>) -> bool {
@@ -304,13 +307,14 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
     node != root
         && (matches!(
             node.kind(),
-            "function_declaration" | "generator_function_declaration" | "method_definition"
-        ) || (matches!(
-            node.kind(),
-            "arrow_function" | "function_expression" | "generator_function"
-        ) && node
-            .parent()
-            .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
+            "function_declaration"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) || (matches!(node.kind(), "arrow_function" | "function_expression")
+            && node
+                .parent()
+                .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
 }
 
 fn callable_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
@@ -321,6 +325,7 @@ fn callable_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
                 "arrow_function"
                     | "function_declaration"
                     | "function_expression"
+                    | "generator_function"
                     | "generator_function_declaration"
                     | "method_definition"
             )
@@ -342,6 +347,7 @@ fn lexical_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
                     | "arrow_function"
                     | "function_declaration"
                     | "function_expression"
+                    | "generator_function"
                     | "generator_function_declaration"
                     | "method_definition"
             )
@@ -617,6 +623,7 @@ fn has_conditional_ancestor(node: Node<'_>, source: &[u8], root: Node<'_>) -> bo
                     | "catch_clause"
                     | "arrow_function"
                     | "function_expression"
+                    | "generator_function"
                     | "switch_case"
                     | "switch_default"
                     | "ternary_expression"
@@ -739,6 +746,7 @@ fn returned_constructor_node<'tree>(node: Node<'tree>, root: Node<'tree>) -> Opt
             "arrow_function"
                 | "function_declaration"
                 | "function_expression"
+                | "generator_function"
                 | "generator_function_declaration"
                 | "method_definition"
         )
@@ -816,6 +824,7 @@ fn local_callable_inner<'tree>(
             "arrow_function"
                 | "function_declaration"
                 | "function_expression"
+                | "generator_function"
                 | "generator_function_declaration"
                 | "method_definition"
         )
@@ -907,6 +916,7 @@ fn collect_returned_constructors<'tree>(
             "arrow_function"
                 | "function_declaration"
                 | "function_expression"
+                | "generator_function"
                 | "generator_function_declaration"
                 | "method_definition"
         )
@@ -1567,6 +1577,7 @@ fn collect_top_level_aliases(node: Node<'_>, source: &[u8], aliases: &mut Vec<Si
             | "method_definition"
             | "arrow_function"
             | "function_expression"
+            | "generator_function"
             | "class_declaration"
     ) {
         return;
@@ -2337,6 +2348,22 @@ mod tests {
         }
         assert!(!calls.contains(&"connect"));
         assert!(!calls.contains(&"reconnect"));
+    }
+
+    #[test]
+    fn returned_generator_calls_stay_inside_the_generator() {
+        let analysis = analyze(
+            "function run() { return function* () { delayed(); }; }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "run")
+            .unwrap();
+
+        assert!(run.calls.is_empty());
     }
 
     #[test]
