@@ -104,26 +104,17 @@ fn strip_runes(analysis: &mut TypescriptAnalysis) {
             .or_default()
             .insert(name.to_owned());
     }
-    let empty = BTreeSet::new();
     analysis
         .calls
-        .retain(|call| !is_rune(call, store_bindings.get("").unwrap_or(&empty)));
+        .retain(|call| !is_rune(call, "", &store_bindings));
     for definition in &mut analysis.definitions {
-        let parent = definition
-            .qualified_name
-            .rsplit_once('/')
-            .map_or("", |(parent, _)| parent);
-        definition.calls.retain(|call| {
-            !is_rune(
-                call,
-                store_bindings
-                    .get(&definition.qualified_name)
-                    .unwrap_or(&empty),
-            )
-        });
+        let scope = definition.qualified_name.clone();
+        let parent = scope.rsplit_once('/').map_or("", |(parent, _)| parent);
+        definition
+            .calls
+            .retain(|call| !is_rune(call, &scope, &store_bindings));
         if definition.factory.as_deref().is_some_and(|factory| {
-            rune_factory(factory)
-                && !legacy_store(factory, store_bindings.get(parent).unwrap_or(&empty))
+            rune_factory(factory) && !legacy_store(factory, parent, &store_bindings)
         }) {
             definition.factory = None;
         }
@@ -285,17 +276,36 @@ fn store_factory(name: &str) -> bool {
     )
 }
 
-fn is_rune(call: &Call, store_bindings: &BTreeSet<String>) -> bool {
-    (call.receiver.is_none() && rune_name(&call.name) && !legacy_store(&call.name, store_bindings))
+fn is_rune(call: &Call, scope: &str, store_bindings: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    (call.receiver.is_none()
+        && rune_name(&call.name)
+        && !legacy_store(&call.name, scope, store_bindings))
         || call
             .receiver
             .as_deref()
             .is_some_and(|receiver| rune_method(receiver, &call.name) || inspect_receiver(receiver))
 }
 
-fn legacy_store(name: &str, store_bindings: &BTreeSet<String>) -> bool {
-    name.strip_prefix('$')
-        .is_some_and(|name| store_bindings.contains(name))
+fn legacy_store(
+    name: &str,
+    mut scope: &str,
+    store_bindings: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let Some(name) = name.strip_prefix('$') else {
+        return false;
+    };
+    loop {
+        if store_bindings
+            .get(scope)
+            .is_some_and(|bindings| bindings.contains(name))
+        {
+            return true;
+        }
+        if scope.is_empty() {
+            return false;
+        }
+        scope = scope.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
 }
 
 fn inspect_receiver(receiver: &str) -> bool {
@@ -508,13 +518,13 @@ mod tests {
                     .as_deref()
                     .is_some_and(|receiver| receiver.starts_with("$inspect"))
         }));
-        assert!(!calls.iter().any(|call| is_rune(call, &BTreeSet::new())));
+        assert!(!calls.iter().any(|call| is_rune(call, "", &BTreeMap::new())));
     }
 
     #[test]
     fn preserves_callable_legacy_store_subscriptions() {
         let analysis = crate::analyze(
-            "<script>import { writable } from 'svelte/store'; const state = writable(load); const current = $state();</script>",
+            "<script>import { writable } from 'svelte/store'; const state = writable(load); const current = $state(); function invoke() { return $state(); }</script>",
             SourceLanguage::Svelte,
         )
         .unwrap();
@@ -523,6 +533,10 @@ mod tests {
         assert!(analysis.definitions.iter().any(|definition| {
             definition.qualified_name == "current"
                 && definition.factory.as_deref() == Some("$state")
+        }));
+        assert!(analysis.definitions.iter().any(|definition| {
+            definition.qualified_name == "invoke"
+                && definition.calls.iter().any(|call| call.name == "$state")
         }));
     }
 
@@ -582,7 +596,7 @@ mod tests {
             !analysis
                 .calls
                 .iter()
-                .any(|call| is_rune(call, &BTreeSet::new()))
+                .any(|call| is_rune(call, "", &BTreeMap::new()))
         );
     }
 }
