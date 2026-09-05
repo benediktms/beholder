@@ -340,6 +340,27 @@ impl Daemon for BeholderDaemon {
         }))
     }
 
+    #[tracing::instrument(name = "rpc.traverse_graph", skip_all, fields(workspace = %request.get_ref().workspace))]
+    async fn traverse_graph(
+        &self,
+        request: Request<beholder_protocol::v1::TraverseGraphRequest>,
+    ) -> Result<Response<beholder_protocol::v1::TraverseGraphResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = request.workspace.clone();
+        let query = beholder_dto::TraverseGraphQuery::try_from(request)
+            .map_err(Status::invalid_argument)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let store = self.store.clone();
+        let query_workspace = workspace.clone();
+        let result =
+            semantic_query(move || store.traverse_graph_snapshot(&query_workspace, query)).await?;
+        self.query_response(&workspace, enriching, result)
+    }
+
     #[tracing::instrument(name = "rpc.search_entities", skip_all, fields(workspace = %request.get_ref().workspace))]
     async fn search_entities(
         &self,

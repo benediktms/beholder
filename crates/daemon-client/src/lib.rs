@@ -310,6 +310,19 @@ pub async fn search_entities(
         .try_into()?)
 }
 
+/// Traverse one immutable workspace revision with bounded multi-path semantics.
+pub async fn traverse_graph(
+    request: beholder_protocol::v1::TraverseGraphRequest,
+) -> Result<beholder_dto::TraverseGraphResult, ClientError> {
+    Ok(connect_send()
+        .await?
+        .traverse_graph(crate::request(request))
+        .await
+        .map_err(operation_error)?
+        .into_inner()
+        .try_into()?)
+}
+
 pub async fn dependencies(
     workspace: String,
     entity: String,

@@ -264,6 +264,18 @@ fn graph(
     Ok(graph.finish())
 }
 
+fn traversal_endpoints(edge: &SemanticEdge, direction: TraversalDirection) -> (&str, &str) {
+    match direction {
+        TraversalDirection::Outgoing => (&edge.from, &edge.to),
+        TraversalDirection::Incoming
+            if edge.kind == RelationKind::ImplementedBy && edge.from.starts_with("grpc://") =>
+        {
+            (&edge.from, &edge.to)
+        }
+        TraversalDirection::Incoming => (&edge.to, &edge.from),
+    }
+}
+
 fn distances(
     root: &str,
     edges: &[SemanticEdge],
@@ -272,15 +284,7 @@ fn distances(
 ) -> (BTreeMap<String, u32>, bool) {
     let mut adjacent = BTreeMap::<&str, Vec<&str>>::new();
     for edge in edges {
-        let (from, to) = match direction {
-            TraversalDirection::Outgoing => (edge.from.as_str(), edge.to.as_str()),
-            TraversalDirection::Incoming
-                if edge.kind == RelationKind::ImplementedBy && edge.from.starts_with("grpc://") =>
-            {
-                (edge.from.as_str(), edge.to.as_str())
-            }
-            TraversalDirection::Incoming => (edge.to.as_str(), edge.from.as_str()),
-        };
+        let (from, to) = traversal_endpoints(edge, direction);
         adjacent.entry(from).or_default().push(to);
     }
 
@@ -341,6 +345,167 @@ pub(super) fn trace(
         edges: output.edges,
         paths,
     })
+}
+
+pub(super) fn traverse_graph(
+    view: &str,
+    query: beholder_dto::TraverseGraphQuery,
+    result: InspectionResult,
+    entities: InspectionResult,
+    incomplete: BTreeSet<String>,
+) -> Result<beholder_dto::TraverseGraphResult, Box<dyn Error>> {
+    use beholder_dto::*;
+    let mut output = graph(result, entities, &[&query.start])?;
+    let mut adjacent = BTreeMap::<&str, Vec<(&str, &str)>>::new();
+    let direction = match query.direction {
+        GraphDirection::Dependencies => TraversalDirection::Outgoing,
+        GraphDirection::Dependents => TraversalDirection::Incoming,
+    };
+    for edge in &output.edges {
+        let (from, to) = traversal_endpoints(edge, direction);
+        adjacent.entry(from).or_default().push((to, &edge.id));
+    }
+    for neighbours in adjacent.values_mut() {
+        neighbours.sort();
+    }
+    let mut search = PathSearch {
+        query: &query,
+        adjacent,
+        incomplete: &incomplete,
+        paths: Vec::new(),
+        reasons: BTreeSet::new(),
+        steps: 0,
+    };
+    if !incomplete.is_empty() {
+        search.reasons.insert(TruncationReason::AcquisitionLimit);
+    }
+    search.visit(&mut vec![query.start.clone()], &mut Vec::new());
+    let PathSearch { paths, reasons, .. } = search;
+    let nodes: BTreeSet<_> = paths
+        .iter()
+        .flat_map(|path| path.nodes.iter())
+        .chain(std::iter::once(&query.start))
+        .collect();
+    output.nodes.retain(|node| nodes.contains(&node.id));
+    output
+        .edges
+        .retain(|edge| nodes.contains(&edge.from) && nodes.contains(&edge.to));
+    Ok(TraverseGraphResult {
+        schema: TRAVERSE_GRAPH_SCHEMA_V1.into(),
+        metadata: QueryMetadata::completed(view, 0),
+        traversal: GraphTraversalMetadata {
+            max_hops: query.max_hops,
+            max_paths: query.max_paths,
+            max_rows: MAX_TRAVERSAL_ROWS,
+            max_steps: MAX_TRAVERSAL_STEPS,
+            acquisition_timeout_ms: TRAVERSAL_ACQUISITION_TIMEOUT_MS,
+            truncated: !reasons.is_empty(),
+            truncation_reasons: reasons.into_iter().collect(),
+        },
+        query,
+        nodes: output.nodes,
+        edges: output.edges,
+        paths,
+    })
+}
+
+struct PathSearch<'a> {
+    query: &'a beholder_dto::TraverseGraphQuery,
+    adjacent: BTreeMap<&'a str, Vec<(&'a str, &'a str)>>,
+    incomplete: &'a BTreeSet<String>,
+    paths: Vec<beholder_dto::TraversalPath>,
+    reasons: BTreeSet<beholder_dto::TruncationReason>,
+    steps: u32,
+}
+
+impl PathSearch<'_> {
+    fn emit(
+        &mut self,
+        nodes: &[String],
+        edges: &[String],
+        termination: beholder_dto::PathTermination,
+    ) {
+        if self.paths.len() == self.query.max_paths as usize {
+            self.reasons
+                .insert(beholder_dto::TruncationReason::MaxPaths);
+        } else {
+            self.paths.push(beholder_dto::TraversalPath {
+                nodes: nodes.to_vec(),
+                edges: edges.to_vec(),
+                termination,
+            });
+        }
+    }
+
+    fn visit(&mut self, nodes: &mut Vec<String>, edges: &mut Vec<String>) {
+        use beholder_dto::{MAX_TRAVERSAL_STEPS, PathTermination::*, TruncationReason};
+        if self.reasons.contains(&TruncationReason::MaxPaths)
+            || self.reasons.contains(&TruncationReason::WorkLimit)
+        {
+            return;
+        }
+        if self.steps == MAX_TRAVERSAL_STEPS {
+            self.reasons.insert(TruncationReason::WorkLimit);
+            return;
+        }
+        self.steps += 1;
+        let node = nodes.last().unwrap().clone();
+        if self.query.destination.as_ref() == Some(&node) {
+            self.emit(nodes, edges, Destination);
+            return;
+        }
+        let neighbours = self
+            .adjacent
+            .get(node.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if neighbours.len() > (MAX_TRAVERSAL_STEPS - self.steps) as usize {
+            self.reasons.insert(TruncationReason::WorkLimit);
+            return;
+        }
+        self.steps += neighbours.len() as u32;
+        let neighbours = neighbours.to_vec();
+        let has_extension = neighbours
+            .iter()
+            .any(|(to, _)| !nodes.iter().any(|id| id == to));
+        if !has_extension {
+            if self.query.destination.is_none() && !self.incomplete.contains(&node) {
+                self.emit(
+                    nodes,
+                    edges,
+                    if neighbours.is_empty() { Leaf } else { Cycle },
+                );
+            }
+            return;
+        }
+        if edges.len() == self.query.max_hops as usize {
+            self.reasons.insert(TruncationReason::MaxHops);
+            if self.query.destination.is_none() {
+                self.emit(nodes, edges, MaxHops);
+            }
+            return;
+        }
+        for (to, edge) in neighbours {
+            if self.steps == MAX_TRAVERSAL_STEPS {
+                self.reasons.insert(TruncationReason::WorkLimit);
+                break;
+            }
+            self.steps += 1;
+            if nodes.iter().any(|id| id == to) {
+                continue;
+            }
+            nodes.push(to.to_owned());
+            edges.push(edge.to_owned());
+            self.visit(nodes, edges);
+            nodes.pop();
+            edges.pop();
+            if self.reasons.contains(&TruncationReason::MaxPaths)
+                || self.reasons.contains(&TruncationReason::WorkLimit)
+            {
+                break;
+            }
+        }
+    }
 }
 
 fn shortest_path(

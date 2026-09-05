@@ -578,6 +578,25 @@ impl SemanticStore {
         })
     }
 
+    pub fn traverse_graph_snapshot(
+        &self,
+        view: &str,
+        query: beholder_dto::TraverseGraphQuery,
+    ) -> Result<Revisioned<beholder_dto::TraverseGraphResult>, Box<dyn Error>> {
+        query.validate()?;
+        self.snapshot(view, |transaction| {
+            let (rows, incomplete) = crate::query::multipath_rows(transaction, view, &query)?;
+            let entities = relevant_traversal_entities(&rows, &[&query.start], query.max_hops + 1);
+            semantic::traverse_graph(
+                view,
+                query,
+                inspection_result(rows),
+                inspection_result(entity_facts(transaction, view, &entities)?),
+                incomplete,
+            )
+        })
+    }
+
     pub fn trace_snapshot(
         &self,
         view: &str,
@@ -771,6 +790,378 @@ mod tests {
             grpc_bindings: Vec::new(),
             observations,
         }
+    }
+
+    fn multipath_fixture(observations: Vec<Observation>) -> (SemanticStore, WorkspaceView) {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let repository = facts(&view, observations);
+        let shard = FactShard {
+            repository: "repo".into(),
+            producer: "rust".into(),
+            owner: "root".into(),
+            version: "v1".into(),
+            entities: repository.entities.clone(),
+            observations: repository.observations.clone(),
+        };
+        store
+            .publish_verified_sharded(
+                &view,
+                &[facts(&view, Vec::new())],
+                &[],
+                &[shard],
+                &[],
+                "verified",
+            )
+            .unwrap();
+        (store, view)
+    }
+
+    fn multipath_query(start: &str) -> beholder_dto::TraverseGraphQuery {
+        beholder_dto::TraverseGraphQuery {
+            start: start.into(),
+            direction: beholder_dto::GraphDirection::Dependencies,
+            destination: None,
+            max_hops: 8,
+            max_paths: 50,
+        }
+    }
+
+    fn call(from: &str, to: &str) -> Observation {
+        Observation::dependency(from, DependencyRelation::Calls, to, "source.rs:1")
+    }
+
+    #[test]
+    fn multipath_preserves_diamonds_convergence_parallel_evidence_and_order() {
+        use beholder_dto::PathTermination;
+        let mut observations = vec![
+            call("a", "b"),
+            call("a", "c"),
+            call("b", "d"),
+            call("c", "d"),
+            call("d", "e"),
+        ];
+        observations.push(Observation::dependency(
+            "a",
+            DependencyRelation::Calls,
+            "b",
+            "other.rs:2",
+        ));
+        observations.push(Observation::dependency(
+            "a",
+            DependencyRelation::Uses,
+            "b",
+            "source.rs:3",
+        ));
+        let (store, _) = multipath_fixture(observations.clone());
+        let query = multipath_query("a");
+        let snapshot = store
+            .traverse_graph_snapshot("main", query.clone())
+            .unwrap();
+        assert_eq!(snapshot.analysis_revision, 1);
+        assert_eq!(snapshot.result.paths.len(), 3);
+        assert!(!snapshot.result.traversal.truncated);
+        assert!(
+            snapshot
+                .result
+                .paths
+                .iter()
+                .all(|path| path.termination == PathTermination::Leaf
+                    && path.nodes.last().unwrap() == "e")
+        );
+        assert_eq!(
+            snapshot
+                .result
+                .edges
+                .iter()
+                .find(|edge| edge.from == "a"
+                    && edge.to == "b"
+                    && edge.kind == beholder_dto::RelationKind::Calls)
+                .unwrap()
+                .evidence
+                .len(),
+            2
+        );
+        for path in &snapshot.result.paths {
+            assert_eq!(path.nodes.len(), path.edges.len() + 1);
+            assert_eq!(
+                path.nodes.iter().collect::<BTreeSet<_>>().len(),
+                path.nodes.len()
+            );
+            for edge in &path.edges {
+                assert!(snapshot.result.edges.iter().any(|item| &item.id == edge));
+            }
+        }
+        observations.reverse();
+        let (reversed, _) = multipath_fixture(observations);
+        assert_eq!(
+            snapshot.result,
+            reversed
+                .traverse_graph_snapshot("main", query)
+                .unwrap()
+                .result
+        );
+        let mut destination = multipath_query("a");
+        destination.destination = Some("d".into());
+        let result = store
+            .traverse_graph_snapshot("main", destination.clone())
+            .unwrap()
+            .result;
+        assert_eq!(result.paths.len(), 3);
+        assert!(
+            result
+                .paths
+                .iter()
+                .all(|path| path.termination == PathTermination::Destination
+                    && path.nodes.last().unwrap() == "d")
+        );
+        destination.destination = Some("missing".into());
+        let result = store
+            .traverse_graph_snapshot("main", destination)
+            .unwrap()
+            .result;
+        assert!(result.paths.is_empty());
+        assert!(!result.traversal.truncated);
+    }
+
+    #[test]
+    fn multipath_cycles_depth_and_exact_path_limit() {
+        use beholder_dto::{PathTermination, TruncationReason};
+        let (store, _) = multipath_fixture(vec![
+            call("a", "b"),
+            call("b", "a"),
+            call("a", "c"),
+            call("c", "d"),
+        ]);
+        let mut query = multipath_query("a");
+        let result = store
+            .traverse_graph_snapshot("main", query.clone())
+            .unwrap()
+            .result;
+        assert_eq!(result.paths.len(), 2);
+        assert_eq!(result.paths[0].nodes, ["a", "b"]);
+        assert_eq!(result.paths[0].termination, PathTermination::Cycle);
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| edge.from == "b" && edge.to == "a")
+        );
+        query.max_paths = 2;
+        assert!(
+            !store
+                .traverse_graph_snapshot("main", query.clone())
+                .unwrap()
+                .result
+                .traversal
+                .truncated
+        );
+        query.max_paths = 1;
+        let result = store
+            .traverse_graph_snapshot("main", query.clone())
+            .unwrap()
+            .result;
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [TruncationReason::MaxPaths]
+        );
+        query.max_paths = 50;
+        query.max_hops = 1;
+        let result = store
+            .traverse_graph_snapshot("main", query.clone())
+            .unwrap()
+            .result;
+        assert_eq!(result.paths[0].termination, PathTermination::Cycle);
+        assert_eq!(result.paths[1].termination, PathTermination::MaxHops);
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [TruncationReason::MaxHops]
+        );
+        query.destination = Some("d".into());
+        assert!(
+            store
+                .traverse_graph_snapshot("main", query.clone())
+                .unwrap()
+                .result
+                .paths
+                .is_empty()
+        );
+        query.destination = Some("a".into());
+        query.max_hops = 0;
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert_eq!(result.paths[0].nodes, ["a"]);
+        assert_eq!(result.paths[0].termination, PathTermination::Destination);
+    }
+
+    #[test]
+    fn multipath_dependents_follow_grpc_implementation_and_reverse_calls() {
+        let (store, _) = multipath_fixture(vec![
+            Observation::dependency(
+                "grpc://service/Call",
+                DependencyRelation::ImplementedBy,
+                "handler",
+                "service.proto:1",
+            ),
+            call("caller", "handler"),
+        ]);
+        let mut query = multipath_query("grpc://service/Call");
+        query.direction = beholder_dto::GraphDirection::Dependents;
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(
+            result.paths[0].nodes,
+            ["grpc://service/Call", "handler", "caller"]
+        );
+    }
+
+    #[test]
+    fn multipath_bounds_exponential_search_even_when_destination_is_missing() {
+        let mut observations = Vec::new();
+        for layer in 0..18 {
+            for from in 0..2 {
+                for to in 0..2 {
+                    observations.push(call(
+                        &format!("n{layer}-{from}"),
+                        &format!("n{}-{to}", layer + 1),
+                    ));
+                }
+            }
+        }
+        let (store, _) = multipath_fixture(observations);
+        for (hops, paths) in [(8, 50), (32, 200)] {
+            let mut query = multipath_query("n0-0");
+            query.max_hops = hops;
+            query.max_paths = paths;
+            let start = std::time::Instant::now();
+            let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+            eprintln!(
+                "branching multipath hops={hops}, paths={paths}: {:?}",
+                start.elapsed()
+            );
+            assert_eq!(result.paths.len(), paths as usize);
+            assert!(
+                result
+                    .traversal
+                    .truncation_reasons
+                    .contains(&beholder_dto::TruncationReason::MaxPaths)
+            );
+        }
+        let mut query = multipath_query("n0-0");
+        query.max_hops = 32;
+        query.destination = Some("missing".into());
+        let start = std::time::Instant::now();
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        eprintln!(
+            "branching multipath acquisition + processing + hydration + metadata: {:?}",
+            start.elapsed()
+        );
+        assert!(result.paths.is_empty());
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [beholder_dto::TruncationReason::WorkLimit]
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn multipath_snapshot_keeps_old_graph_hydration_and_metadata_during_publication() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("beholder-multipath-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let store = SemanticStore::persistent(&directory.join("beholder.db"), true).unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: None,
+                fingerprint: "state-1".into(),
+            }],
+        )
+        .unwrap();
+        let mut repository = facts(&view, vec![call("a", "old")]);
+        repository.incomplete = true;
+        store.publish(&view, &[repository], &[]).unwrap();
+        let query = multipath_query("a");
+        let snapshot = store
+            .snapshot("main", |transaction| {
+                let (rows, incomplete) = crate::query::multipath_rows(transaction, "main", &query)?;
+                let mut next = view.clone();
+                next.repository_states[0].fingerprint = "state-2".into();
+                store.publish(&next, &[facts(&next, vec![call("a", "new")])], &[])?;
+                let ids = super::relevant_traversal_entities(&rows, &["a"], 9);
+                super::semantic::traverse_graph(
+                    "main",
+                    query.clone(),
+                    super::inspection_result(rows),
+                    super::inspection_result(crate::query::entity_facts(
+                        transaction,
+                        "main",
+                        &ids,
+                    )?),
+                    incomplete,
+                )
+            })
+            .unwrap();
+        assert_eq!(snapshot.analysis_revision, 1);
+        assert_eq!(
+            snapshot.analysis.completeness,
+            AnalysisCompleteness::Incomplete
+        );
+        assert_eq!(snapshot.result.paths[0].nodes, ["a", "old"]);
+        assert_eq!(
+            snapshot
+                .result
+                .nodes
+                .iter()
+                .find(|node| node.id == "old")
+                .unwrap()
+                .kind,
+            beholder_dto::EntityKind::Callable
+        );
+        let current = store.traverse_graph_snapshot("main", query).unwrap();
+        assert_eq!(current.analysis_revision, 2);
+        assert_eq!(
+            current.analysis.completeness,
+            AnalysisCompleteness::Complete
+        );
+        assert_eq!(current.result.paths[0].nodes, ["a", "new"]);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn multipath_bounds_acquisition_without_inventing_leaves() {
+        let observations = (0..=beholder_dto::MAX_TRAVERSAL_ROWS)
+            .map(|index| call("root", &format!("node{index:05}")))
+            .collect();
+        let (store, _) = multipath_fixture(observations);
+        let result = store
+            .traverse_graph_snapshot("main", multipath_query("root"))
+            .unwrap()
+            .result;
+        assert!(result.paths.is_empty());
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [beholder_dto::TruncationReason::AcquisitionLimit]
+        );
     }
 
     #[test]
@@ -1153,6 +1544,28 @@ mod tests {
         crate::storage::rebuild_resolved_dependencies(&transaction, &view.name).unwrap();
         transaction.commit().unwrap();
 
+        let mut query = multipath_query(source);
+        query.max_hops = 1;
+        let traversal = store
+            .traverse_graph_snapshot(&view.name, query)
+            .unwrap()
+            .result;
+        assert!(traversal.edges.iter().any(|edge| edge.to == base_resolved));
+        assert!(
+            traversal
+                .edges
+                .iter()
+                .any(|edge| edge.to == enrichment_resolved && edge.evidence.len() == 2)
+        );
+        assert!(!traversal.nodes.iter().any(|node| {
+            [
+                base_unresolved,
+                enrichment_unresolved,
+                structural_target,
+                losing_enrichment_resolved,
+            ]
+            .contains(&node.id.as_str())
+        }));
         let dependencies = store.dependencies(&view.name, source, 1).unwrap();
         assert!(
             !dependencies
