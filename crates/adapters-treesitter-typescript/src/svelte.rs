@@ -214,6 +214,26 @@ fn inspect_receiver(receiver: &str) -> bool {
         if suffix.starts_with('(') {
             return true;
         }
+        if suffix.starts_with('<') {
+            let mut depth = 0;
+            let Some(end) = suffix.char_indices().find_map(|(index, character)| {
+                match character {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(index + character.len_utf8());
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            }) else {
+                return false;
+            };
+            suffix = &suffix[end..];
+            continue;
+        }
         if let Some(rest) = suffix
             .strip_prefix("/*")
             .and_then(|comment| comment.split_once("*/").map(|(_, rest)| rest))
@@ -307,6 +327,7 @@ mod tests {
               $effect(() => persist(count));
               $inspect (count).with(console.trace);
               $inspect /* reason */ (count).with(console.trace);
+              $inspect<[number]>(count).with(console.trace);
               $state.refresh();
               api.$state();
             </script>
@@ -337,6 +358,13 @@ mod tests {
                 .iter()
                 .any(|call| call.receiver.as_deref() == Some("$state") && call.name == "refresh")
         );
+        assert!(!calls.iter().any(|call| {
+            call.name == "with"
+                && call
+                    .receiver
+                    .as_deref()
+                    .is_some_and(|receiver| receiver.starts_with("$inspect"))
+        }));
         assert!(!calls.iter().any(|call| is_rune(call)));
     }
 }
