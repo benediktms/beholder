@@ -263,18 +263,16 @@ mod tests {
 
     #[test]
     fn svelte_plugin_activates_from_svelte_source() {
-        let repository = snapshot(&[(
-            "src/App.svelte",
-            "<script lang=\"ts\">export const app = true</script>",
-        )]);
+        for path in ["src/App.svelte", "src/state.svelte.ts"] {
+            let repository = snapshot(&[(path, "export const state = $state(0)")]);
+            let active = built_in_plugins().unwrap().activate(&repository, true);
+            let svelte = active
+                .plugins()
+                .find(|plugin| plugin.metadata.id == "typescript.svelte")
+                .unwrap();
 
-        let active = built_in_plugins().unwrap().activate(&repository, true);
-        let svelte = active
-            .plugins()
-            .find(|plugin| plugin.metadata.id == "typescript.svelte")
-            .unwrap();
-
-        assert_eq!(svelte.activation.path, PathBuf::from("src/App.svelte"));
+            assert_eq!(svelte.activation.path, PathBuf::from(path));
+        }
     }
 
     #[test]

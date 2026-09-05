@@ -44,45 +44,20 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
         input: SourceRecognitionInput<'_, TypescriptLanguage>,
         analysis: &mut TypescriptAnalysis,
     ) -> Result<(), beholder_indexing::AnalyzerError> {
-        if !is_svelte(input.path) {
+        if is_svelte_module(input.path) {
+            strip_runes(analysis);
+            return Ok(());
+        }
+        if !is_svelte_component(input.path) {
             return Ok(());
         }
 
         let (source, language, error_lines) =
             extract_scripts(input.syntax.root_node(), input.text)?;
         let mut embedded = analyze_core(&source, language)?;
-        let store_bindings = embedded
-            .definitions
-            .iter()
-            .filter(|definition| {
-                definition
-                    .factory
-                    .as_deref()
-                    .is_some_and(|factory| !rune_name(factory))
-            })
-            .filter_map(|definition| definition.qualified_name.rsplit('/').next())
-            .chain(
-                embedded
-                    .imports
-                    .iter()
-                    .flat_map(|import| &import.bindings)
-                    .map(|binding| binding.local.as_str()),
-            )
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        embedded
-            .calls
-            .retain(|call| !is_rune(call, &store_bindings));
+        strip_runes(&mut embedded);
         for definition in &mut embedded.definitions {
             definition.exported = false;
-            definition
-                .calls
-                .retain(|call| !is_rune(call, &store_bindings));
-            if definition.factory.as_deref().is_some_and(|factory| {
-                rune_name(factory) && !legacy_store(factory, &store_bindings)
-            }) {
-                definition.factory = None;
-            }
         }
         embedded.parse_error_lines.extend(error_lines);
         embedded.parse_error_lines.sort_unstable();
@@ -93,8 +68,55 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
     }
 }
 
+fn strip_runes(analysis: &mut TypescriptAnalysis) {
+    let store_bindings = analysis
+        .definitions
+        .iter()
+        .filter(|definition| {
+            definition
+                .factory
+                .as_deref()
+                .is_some_and(|factory| !rune_factory(factory))
+        })
+        .filter_map(|definition| definition.qualified_name.rsplit('/').next())
+        .chain(
+            analysis
+                .imports
+                .iter()
+                .flat_map(|import| &import.bindings)
+                .map(|binding| binding.local.as_str()),
+        )
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    analysis
+        .calls
+        .retain(|call| !is_rune(call, &store_bindings));
+    for definition in &mut analysis.definitions {
+        definition
+            .calls
+            .retain(|call| !is_rune(call, &store_bindings));
+        if definition
+            .factory
+            .as_deref()
+            .is_some_and(|factory| rune_factory(factory) && !legacy_store(factory, &store_bindings))
+        {
+            definition.factory = None;
+        }
+    }
+}
+
 fn is_svelte(path: &std::path::Path) -> bool {
+    is_svelte_component(path) || is_svelte_module(path)
+}
+
+fn is_svelte_component(path: &std::path::Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("svelte")
+}
+
+fn is_svelte_module(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".svelte.ts") || name.ends_with(".svelte.js"))
 }
 
 pub(super) fn embedded_source(source: &str) -> Option<String> {
@@ -224,6 +246,13 @@ fn rune_method(receiver: &str, name: &str) -> bool {
     )
 }
 
+fn rune_factory(name: &str) -> bool {
+    rune_name(name)
+        || name
+            .rsplit_once('.')
+            .is_some_and(|(receiver, name)| rune_method(receiver, name))
+}
+
 fn is_rune(call: &Call, store_bindings: &BTreeSet<String>) -> bool {
     (call.receiver.is_none() && rune_name(&call.name) && !legacy_store(&call.name, store_bindings))
         || call
@@ -248,8 +277,21 @@ fn inspect_receiver(receiver: &str) -> bool {
         }
         if suffix.starts_with('<') {
             let mut depth = 0;
+            let mut quote = None;
+            let mut escaped = false;
             let Some(end) = suffix.char_indices().find_map(|(index, character)| {
+                if let Some(delimiter) = quote {
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == delimiter {
+                        quote = None;
+                    }
+                    return None;
+                }
                 match character {
+                    '\'' | '"' | '`' => quote = Some(character),
                     '<' => depth += 1,
                     '>' if !suffix[..index].ends_with('=') => {
                         depth -= 1;
@@ -356,6 +398,7 @@ mod tests {
             <script>
               const count = $state(load());
               const state = $state(0);
+              const rawState = $state.raw(0);
               const raw = $state.raw(loadRaw());
               $: result = refresh(count);
               $effect(() => persist(count));
@@ -363,6 +406,7 @@ mod tests {
               $inspect /* reason */ (count).with(console.trace);
               $inspect<[number]>(count).with(console.trace);
               $inspect<(value: number) => number>(format).with(console.trace);
+              $inspect<">">(count).with(console.trace);
               $state.refresh();
               api.$state();
             </script>
@@ -416,5 +460,40 @@ mod tests {
             definition.qualified_name == "current"
                 && definition.factory.as_deref() == Some("$state")
         }));
+    }
+
+    #[test]
+    fn processes_svelte_rune_modules_without_clearing_exports() {
+        let source = "export const state = $state.raw(0); export const other = $state(1);";
+        let path = std::path::Path::new("state.svelte.ts");
+        let plugins = crate::plugin::built_in_plugins().unwrap();
+        let active = plugins.activate_direct(path);
+        let analysis = crate::analysis::analyze_with_plugins(
+            source,
+            SourceLanguage::TypeScript,
+            path,
+            &plugins,
+            &active,
+        )
+        .unwrap();
+
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .all(|definition| definition.exported)
+        );
+        assert!(
+            analysis
+                .definitions
+                .iter()
+                .all(|definition| definition.factory.is_none())
+        );
+        assert!(
+            !analysis
+                .calls
+                .iter()
+                .any(|call| is_rune(call, &BTreeSet::new()))
+        );
     }
 }
