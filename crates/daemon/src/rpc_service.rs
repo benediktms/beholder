@@ -7,8 +7,8 @@ use crate::repository_registry::RegisteredRepository;
 use crate::rpc::semantic_query;
 use beholder_domain::{BeholderError, BeholderErrorCode, BeholderErrorKind, Workspace};
 use beholder_dto::{
-    DEFAULT_MAX_HOPS, GarbageCollectionPhase,
-    GarbageCollectionProgress as DtoGarbageCollectProgress,
+    DEFAULT_ENTITY_SEARCH_LIMIT, DEFAULT_MAX_HOPS, GarbageCollectionPhase,
+    GarbageCollectionProgress as DtoGarbageCollectProgress, MAX_ENTITY_SEARCH_LIMIT,
     RepositoryStatus as DtoRepositoryStatus, Revisioned, WhyResult,
 };
 use beholder_protocol::ERROR_CODE_METADATA_KEY;
@@ -23,10 +23,10 @@ use beholder_protocol::v1::{
     GetWorkspaceTopologyStatusResponse, ImpactResponse, IndexJobOutcome, Job, JobStatus,
     JobSummary, JobTarget, JobTrigger, JobType, JobWaitReason, ListJobsRequest, ListJobsResponse,
     ListWorkspacesRequest, ListWorkspacesResponse, PathRequest, RegisterRepositoryRequest,
-    RegisterWorkspaceRequest, RegisterWorkspaceResponse, RepositoryResponse,
-    SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest, StopResponse,
-    SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest, SubmitIndexResponse,
-    TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
+    RegisterWorkspaceRequest, RegisterWorkspaceResponse, RepositoryResponse, SearchEntitiesRequest,
+    SearchEntitiesResponse, SetWorkspacePluginRequest, SetWorkspacePluginResponse, StopRequest,
+    StopResponse, SubmitEnrichmentRequest, SubmitEnrichmentResponse, SubmitIndexRequest,
+    SubmitIndexResponse, TraceResponse, TraversalEntityRequest, WhyResponse, daemon_server::Daemon,
     garbage_collect_event, index_destination, job_target, submit_index_request,
 };
 use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::atomic::Ordering};
@@ -291,7 +291,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 21,
+            protocol_version: 22,
             pid: std::process::id(),
         }))
     }
@@ -338,6 +338,28 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(GetWorkspaceTopologyStatusResponse {
             metadata: Some(metadata.into()),
         }))
+    }
+
+    #[tracing::instrument(name = "rpc.search_entities", skip_all, fields(workspace = %request.get_ref().workspace))]
+    async fn search_entities(
+        &self,
+        request: Request<SearchEntitiesRequest>,
+    ) -> Result<Response<SearchEntitiesResponse>, Status> {
+        let request = request.into_inner();
+        let query = entity_search_query(&request.query)?;
+        let limit = entity_search_limit(request.limit)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&request.workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let store = self.store.clone();
+        let workspace = request.workspace.clone();
+        let query = query.to_owned();
+        let result =
+            semantic_query(move || store.search_entities_snapshot(&workspace, &query, limit))
+                .await?;
+        self.query_response(&request.workspace, enriching, result)
     }
 
     #[tracing::instrument(name = "rpc.list_jobs", skip_all, err)]
@@ -1157,6 +1179,23 @@ fn max_hops(value: Option<u32>) -> Result<u32, Status> {
     }
 }
 
+fn entity_search_limit(value: Option<u32>) -> Result<u32, Status> {
+    match value.unwrap_or(DEFAULT_ENTITY_SEARCH_LIMIT) {
+        0 => Err(Status::invalid_argument("limit must be greater than zero")),
+        value if value > MAX_ENTITY_SEARCH_LIMIT => Err(Status::invalid_argument(format!(
+            "limit must not exceed {MAX_ENTITY_SEARCH_LIMIT}"
+        ))),
+        value => Ok(value),
+    }
+}
+
+fn entity_search_query(value: &str) -> Result<&str, Status> {
+    match value.trim() {
+        "" => Err(Status::invalid_argument("query must not be empty")),
+        query => Ok(query),
+    }
+}
+
 #[cfg(test)]
 mod manual_enrichment_tests {
     use super::*;
@@ -1633,6 +1672,29 @@ mod tests {
         );
         assert_eq!(
             decode_job_page_token("42:not-a-ulid").unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn entity_search_limits_are_bounded() {
+        assert_eq!(entity_search_query("  run  ").unwrap(), "run");
+        assert_eq!(
+            entity_search_query(" \t ").unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            entity_search_limit(None).unwrap(),
+            DEFAULT_ENTITY_SEARCH_LIMIT
+        );
+        assert_eq!(
+            entity_search_limit(Some(0)).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(
+            entity_search_limit(Some(MAX_ENTITY_SEARCH_LIMIT + 1))
+                .unwrap_err()
+                .code(),
             Code::InvalidArgument
         );
     }

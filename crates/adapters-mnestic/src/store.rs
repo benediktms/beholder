@@ -5,9 +5,10 @@ use super::{
     inspection::{InspectionResult, inspection_result},
     query::{
         SnapshotQueryRunner, all_entity_facts, analysis_metadata, analysis_revision, context,
-        dependencies, entity_facts, impact, inspect_grpc_bindings, inspect_observations,
-        inspect_relations, inspect_revisions, published_repository_head, repository_revision,
-        trace, warn_on_slow_semantic_query, workspace_topology,
+        dependencies, entity_facts, generated_entity_ids, impact, inspect_grpc_bindings,
+        inspect_observations, inspect_relations, inspect_revisions, published_repository_head,
+        repository_revision, search_entity_facts, trace, warn_on_slow_semantic_query,
+        workspace_topology,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -25,8 +26,9 @@ use beholder_domain::{
     SemanticCandidate, SemanticRelation, WorkspaceView,
 };
 use beholder_dto::{
-    ContextResult, DependenciesResult, GarbageCollection, GarbageCollectionProgress, ImpactResult,
-    RepositoryRevision, Revisioned, TraceResult, WorkspaceTopology,
+    ContextResult, DependenciesResult, EntitySearchResult, GarbageCollection,
+    GarbageCollectionProgress, ImpactResult, RepositoryRevision, Revisioned, TraceResult,
+    WorkspaceTopology,
 };
 use mnestic_engine::{DataValue, DbInstance, NamedRows};
 use std::{
@@ -524,6 +526,37 @@ impl SemanticStore {
         self.snapshot(view, |_| Ok(()))
     }
 
+    pub fn search_entities_snapshot(
+        &self,
+        view: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Revisioned<EntitySearchResult>, Box<dyn Error>> {
+        self.snapshot(view, |transaction| {
+            let mut result = semantic::search_entities(
+                view,
+                query,
+                limit,
+                inspection_result(search_entity_facts(transaction, view, query, limit)?),
+            )?;
+            let generated = generated_entity_ids(
+                transaction,
+                view,
+                result
+                    .matches
+                    .iter()
+                    .map(|entity| entity.id.clone())
+                    .collect(),
+            )?;
+            for entity in &mut result.matches {
+                if generated.contains(&entity.id) {
+                    entity.origin = beholder_dto::EntityOrigin::Generated;
+                }
+            }
+            Ok(result)
+        })
+    }
+
     pub fn trace(
         &self,
         view: &str,
@@ -704,6 +737,7 @@ fn sqlite_pragma(path: &Path, pragma: &str) -> Result<u64, Box<dyn Error>> {
 mod tests {
     use super::{EnrichmentOwner, EnrichmentPayload, relevant_traversal_entities};
     use crate::SemanticStore;
+    use crate::query::search_entity_facts;
     use beholder_domain::{
         AnalysisDiagnostic, AnalysisDiagnosticSeverity, BeholderError, BeholderErrorCode,
         Confidence, DependencyOverride, DependencyRelation, EntityFact, EntityKind, FactShard,
@@ -1649,6 +1683,103 @@ mod tests {
         assert_eq!(diagnostic.repository, "repo");
         assert_eq!(diagnostic.path, PathBuf::from("src/broken.ts"));
         assert_eq!(diagnostic.line, Some(7));
+    }
+
+    #[test]
+    fn entity_search_uses_one_completed_revision_and_matches_display_names() {
+        let store = SemanticStore::memory().unwrap();
+        let view = WorkspaceView::new(
+            "main",
+            "analysis",
+            vec![RepositoryState {
+                repository: LogicalRepository {
+                    identity: "repo".into(),
+                },
+                head: Some("head".into()),
+                fingerprint: "state".into(),
+            }],
+        )
+        .unwrap();
+        let mut repository = facts(&view, Vec::new());
+        repository.entities = vec![
+            EntityFact::new("repo://example/rust/lib/call", EntityKind::Callable, None).unwrap(),
+            EntityFact::new(
+                "grpc://example.v1.ExampleService/Call",
+                EntityKind::GrpcOperation,
+                None,
+            )
+            .unwrap(),
+            EntityFact::new(
+                "grpc://example.v1.ExampleService/Other",
+                EntityKind::GrpcOperation,
+                None,
+            )
+            .unwrap(),
+            EntityFact::new("repo://example/rust/lib/a", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://example/rust/lib/z", EntityKind::Callable, None).unwrap(),
+            EntityFact::new(
+                "repo://a/rust/RunModule/unrelated",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+            EntityFact::new("repo://z/rust/lib/RunLater", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://a/rust/barbaz", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://z/rust/foo/barbaz", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("elixir-call://a/hidden/0", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("elixir-call://hidden/0", EntityKind::Callable, None).unwrap(),
+        ];
+        repository.observations = vec![Observation::generated(
+            "repo://example/rust/lib/call",
+            StructuralRelation::Defines,
+            "grpc://example.v1.ExampleService/Call",
+            "src/lib.rs:1",
+        )];
+        store.publish(&view, &[repository], &[]).unwrap();
+
+        let candidates = store
+            .snapshot("main", |transaction| {
+                search_entity_facts(transaction, "main", "ExampleService", 1)
+            })
+            .unwrap();
+        assert_eq!(candidates.result.rows.len(), 1);
+        let exact = store
+            .search_entities_snapshot("main", "repo://example/rust/lib/z", 1)
+            .unwrap();
+        assert_eq!(exact.result.matches[0].id, "repo://example/rust/lib/z");
+        let exact_name = store
+            .search_entities_snapshot("main", "ExampleService.Other", 1)
+            .unwrap();
+        assert_eq!(
+            exact_name.result.matches[0].id,
+            "grpc://example.v1.ExampleService/Other"
+        );
+        let name_prefix = store.search_entities_snapshot("main", "Run", 1).unwrap();
+        assert_eq!(
+            name_prefix.result.matches[0].id,
+            "repo://z/rust/lib/RunLater"
+        );
+        let full_query = store
+            .search_entities_snapshot("main", "oo/barbaz", 1)
+            .unwrap();
+        assert_eq!(full_query.result.matches[0].id, "repo://z/rust/foo/barbaz");
+        let local_call = store
+            .search_entities_snapshot("main", "hidden/0", 1)
+            .unwrap();
+        assert_eq!(local_call.result.matches[0].id, "elixir-call://hidden/0");
+
+        let result = store
+            .search_entities_snapshot("main", "ExampleService.Call", 20)
+            .unwrap();
+
+        assert_eq!(result.analysis_revision, 1);
+        assert_eq!(result.result.metadata.revision, 0);
+        assert_eq!(result.result.matches.len(), 1);
+        assert_eq!(result.result.matches[0].name, "ExampleService.Call");
+        assert_eq!(
+            result.result.matches[0].origin,
+            beholder_dto::EntityOrigin::Generated
+        );
     }
 
     #[test]

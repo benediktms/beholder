@@ -17,6 +17,24 @@ impl From<v1::EntityQuery> for dto::EntityQuery {
     }
 }
 
+impl From<dto::EntitySearchQuery> for v1::EntitySearchQuery {
+    fn from(value: dto::EntitySearchQuery) -> Self {
+        Self {
+            query: value.query,
+            limit: value.limit,
+        }
+    }
+}
+
+impl From<v1::EntitySearchQuery> for dto::EntitySearchQuery {
+    fn from(value: v1::EntitySearchQuery) -> Self {
+        Self {
+            query: value.query,
+            limit: value.limit,
+        }
+    }
+}
+
 impl From<dto::PathQuery> for v1::SemanticPathQuery {
     fn from(value: dto::PathQuery) -> Self {
         Self {
@@ -54,6 +72,33 @@ fn entities(values: Vec<v1::Entity>) -> Result<Vec<dto::EntityRef>, &'static str
 
 fn edges(values: Vec<v1::Edge>) -> Result<Vec<dto::SemanticEdge>, &'static str> {
     values.into_iter().map(TryInto::try_into).collect()
+}
+
+impl From<dto::EntitySearchResult> for v1::SearchEntitiesResponse {
+    fn from(value: dto::EntitySearchResult) -> Self {
+        Self {
+            schema: value.schema,
+            metadata: Some(value.metadata.into()),
+            query: Some(value.query.into()),
+            matches: value.matches.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<v1::SearchEntitiesResponse> for dto::EntitySearchResult {
+    type Error = &'static str;
+
+    fn try_from(value: v1::SearchEntitiesResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema: value.schema,
+            metadata: value
+                .metadata
+                .ok_or("entity search metadata is missing")?
+                .try_into()?,
+            query: value.query.ok_or("entity search query is missing")?.into(),
+            matches: entities(value.matches)?,
+        })
+    }
 }
 
 impl From<dto::WorkspaceTopology> for v1::GetWorkspaceTopologyResponse {

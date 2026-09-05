@@ -903,6 +903,191 @@ pub(super) fn all_entity_facts(
     ))
 }
 
+struct SearchEntityFactsParams {
+    candidate: String,
+    query: String,
+    limit: u32,
+}
+
+const SEARCH_ENTITY_FACT_HEADERS: &[&str] = &["id", "kind", "metadata", "rank"];
+
+macro_rules! ranked_entity_search {
+    ($source:literal) => {
+        concat!(
+            $source,
+            "\n\
+             special[id] := candidate[id, _, _], starts_with(id, 'elixir-module://')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$')\n\
+             special[id] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$')\n\
+             display[id, name] := candidate[id, _, _], starts_with(id, 'elixir-module://'), name = regex_replace(id, '^elixir-module://', '')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$', '$1.$2/$3')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://([^/]+)/([0-9]+)$', '$1/$2')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$'), name = regex_replace(id, '^(proto-method|grpc)://([^/]*[.])?([^./]+)/([^/]+)$', '$3.$4')\n\
+             display[id, name] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$'), name = regex_replace(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$', '$2/$3')\n\
+             display[id, name] := candidate[id, _, _], not special[id], regex_matches(id, '^.*[/:]([^/:]+)$'), name = regex_replace(id, '^.*[/:]([^/:]+)$', '$1')\n\
+             display[id, id] := candidate[id, _, _], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)$')\n\
+             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], str_includes(id, $query)\n\
+             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], str_includes(name, $query)\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, _], id = $query, rank = 0\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], name = $query, rank = 1\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], starts_with(id, $query), rank = 2\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], starts_with(name, $query), rank = 2\n\
+             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, _], rank = 3\n\
+             ?[id, kind, metadata, rank] := ranked[id, kind, metadata, rank]\n\
+             :order rank, id\n\
+             :limit $limit"
+        )
+    };
+}
+
+macro_rules! search_entity_facts_query {
+    ($name:ident, $operation:literal, $script:expr) => {
+        struct $name;
+
+        impl MnesticQuery for $name {
+            const OPERATION: &'static str = $operation;
+            const SCRIPT: &'static str = $script;
+            const HEADERS: &'static [&'static str] = SEARCH_ENTITY_FACT_HEADERS;
+
+            type Params = SearchEntityFactsParams;
+            type Row = EntityFactRow;
+
+            fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+                BTreeMap::from([
+                    ("candidate".into(), params.candidate.as_str().into()),
+                    ("query".into(), params.query.as_str().into()),
+                    ("limit".into(), i64::from(params.limit).into()),
+                ])
+            }
+
+            fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+                BaselineEntityFacts::decode(headers, row)
+            }
+        }
+    };
+}
+
+search_entity_facts_query!(
+    SearchStateEntityFacts,
+    "entity_search.state",
+    ranked_entity_search!(
+        "selected_state[state] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, state}\n\
+         candidate[id, kind, metadata] := selected_state[state], *state_entity{state, id, kind, metadata}, str_includes(id, $candidate)"
+    )
+);
+search_entity_facts_query!(
+    SearchRevisionEntityFacts,
+    "entity_search.revision",
+    ranked_entity_search!(
+        "candidate[id, kind, metadata] := *analysis_revision{view: $view, revision}, *analysis_revision_entity{view: $view, revision, id, kind, metadata}, str_includes(id, $candidate)"
+    )
+);
+search_entity_facts_query!(
+    SearchShardEntityFacts,
+    "entity_search.shard",
+    ranked_entity_search!(
+        "candidate[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}, str_includes(id, $candidate)"
+    )
+);
+search_entity_facts_query!(
+    SearchEnrichmentEntityFacts,
+    "entity_search.enrichment",
+    ranked_entity_search!(
+        "selected_enrichment[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
+         candidate[id, kind, metadata] := *analysis_enrichment_entity_selection{view: $view, id, owner}, selected_enrichment[owner], *enrichment_entity_contribution{view: $view, owner, id, kind, metadata}, str_includes(id, $candidate)"
+    )
+);
+
+pub(super) fn search_entity_facts(
+    db: &impl QueryRunner,
+    view: &str,
+    query: &str,
+    limit: u32,
+) -> Result<NamedRows, Box<dyn Error>> {
+    let candidate = query
+        .split(['.', '/', ':'])
+        .max_by_key(|part| part.len())
+        .unwrap_or(query);
+    let params = || SearchEntityFactsParams {
+        candidate: candidate.into(),
+        query: query.into(),
+        limit,
+    };
+    let mut rows = db.run::<SearchStateEntityFacts>(view, params())?;
+    rows.extend(db.run::<SearchRevisionEntityFacts>(view, params())?);
+    let mut baseline_ids = rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<BTreeSet<_>>();
+    let shard = db
+        .run::<SearchShardEntityFacts>(view, params())?
+        .into_iter()
+        .filter(|row| !baseline_ids.contains(&row.id))
+        .collect::<Vec<_>>();
+    baseline_ids.extend(shard.iter().map(|row| row.id.clone()));
+    rows.extend(shard);
+    rows.extend(
+        db.run::<SearchEnrichmentEntityFacts>(view, params())?
+            .into_iter()
+            .filter(|row| !baseline_ids.contains(&row.id)),
+    );
+    Ok(NamedRows::new(
+        ENTITY_FACT_HEADERS
+            .iter()
+            .map(|header| (*header).into())
+            .collect(),
+        rows.into_iter().map(EntityFactRow::into_values).collect(),
+    ))
+}
+
+pub(super) fn generated_entity_ids(
+    db: &impl QueryRunner,
+    view: &str,
+    entities: BTreeSet<String>,
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let mut generated = BTreeSet::new();
+    // ponytail: search returns at most 100 entities; batch only if these exact lookups measure slow.
+    for entity in entities {
+        let mut baseline = BTreeSet::new();
+        let rows = db.run::<StateStructuralContext>(view, context_params(&entity))?;
+        baseline.extend(rows.iter().map(ContextRow::edge_key));
+        if rows.iter().any(marks_generated_origin) {
+            generated.insert(entity.clone());
+            continue;
+        }
+        let rows = db.run::<RevisionStructuralContext>(view, context_params(&entity))?;
+        baseline.extend(rows.iter().map(ContextRow::edge_key));
+        if rows.iter().any(marks_generated_origin) {
+            generated.insert(entity.clone());
+            continue;
+        }
+        let rows = db.run::<FactShardStructuralContext>(view, context_params(&entity))?;
+        baseline.extend(rows.iter().map(ContextRow::edge_key));
+        if rows.iter().any(marks_generated_origin) {
+            generated.insert(entity.clone());
+            continue;
+        }
+        if db
+            .run::<EnrichmentStructuralContext>(view, context_params(&entity))?
+            .iter()
+            .any(|row| !baseline.contains(&row.edge_key()) && marks_generated_origin(row))
+        {
+            generated.insert(entity);
+        }
+    }
+    Ok(generated)
+}
+
+fn marks_generated_origin(row: &ContextRow) -> bool {
+    row.provenance == "generated"
+        && matches!(
+            (row.direction.as_str(), row.relation.as_str()),
+            ("incoming", "defines") | ("outgoing", "field_of")
+        )
+}
+
 const WORKSPACE_TOPOLOGY_HEADERS: &[&str] = &[
     "from",
     "to",

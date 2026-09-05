@@ -1,11 +1,11 @@
 use crate::{InspectionResult, InspectionValue, query::ContextRow};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
-    EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef, EvidenceKind, EvidenceRef,
-    GraphqlOperationKind, GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery,
-    ProtoTypeKind, QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath,
-    TRACE_SCHEMA_V2, TraceResult, TraversalMetadata, WORKSPACE_TOPOLOGY_SCHEMA_V1,
-    WorkspaceTopology,
+    ENTITY_SEARCH_SCHEMA_V1, EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef,
+    EntitySearchQuery, EntitySearchResult, EvidenceKind, EvidenceRef, GraphqlOperationKind,
+    GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, ProtoTypeKind,
+    QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath, TRACE_SCHEMA_V2,
+    TraceResult, TraversalMetadata, WORKSPACE_TOPOLOGY_SCHEMA_V1, WorkspaceTopology,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -62,6 +62,46 @@ pub(super) fn workspace_topology(
         nodes: output.nodes,
         edges: output.edges,
     })
+}
+
+pub(super) fn search_entities(
+    view: &str,
+    query: &str,
+    limit: u32,
+    entities: InspectionResult,
+) -> Result<EntitySearchResult, Box<dyn Error>> {
+    let mut matches = entity_kinds(entities)?
+        .into_iter()
+        .map(|(id, (kind, metadata))| entity_ref_with_origin(&id, kind, None, metadata))
+        .filter(|entity| entity.id.contains(query) || entity.name.contains(query))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        search_rank(left, query)
+            .cmp(&search_rank(right, query))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    matches.truncate(limit as usize);
+    Ok(EntitySearchResult {
+        schema: ENTITY_SEARCH_SCHEMA_V1.into(),
+        metadata: QueryMetadata::completed(view, 0),
+        query: EntitySearchQuery {
+            query: query.into(),
+            limit,
+        },
+        matches,
+    })
+}
+
+fn search_rank(entity: &EntityRef, query: &str) -> u8 {
+    if entity.id == query {
+        0
+    } else if entity.name == query {
+        1
+    } else if entity.id.starts_with(query) || entity.name.starts_with(query) {
+        2
+    } else {
+        3
+    }
 }
 
 pub(super) fn context(
@@ -867,9 +907,49 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity};
+    use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity, search_entities};
+    use crate::{InspectionResult, InspectionValue};
     use beholder_dto::{EntityKind, EntityOrigin};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn entity_search_ranks_canonical_id_then_name_then_prefix() {
+        let entities = InspectionResult {
+            headers: vec!["id".into(), "kind".into(), "metadata".into()],
+            rows: [
+                "Run",
+                "repo://example/rust/lib/Run",
+                "RunLater",
+                "repo://example/rust/lib/RunLater",
+            ]
+            .into_iter()
+            .map(|id| {
+                vec![
+                    InspectionValue::String(id.into()),
+                    InspectionValue::String("callable".into()),
+                    InspectionValue::String(String::new()),
+                ]
+            })
+            .collect(),
+            next: None,
+        };
+
+        let result = search_entities("main", "Run", 4, entities).unwrap();
+
+        assert_eq!(
+            result
+                .matches
+                .iter()
+                .map(|entity| entity.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Run",
+                "repo://example/rust/lib/Run",
+                "RunLater",
+                "repo://example/rust/lib/RunLater",
+            ]
+        );
+    }
 
     #[test]
     fn typed_entity_facts_override_relation_hints() {

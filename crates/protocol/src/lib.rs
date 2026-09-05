@@ -225,4 +225,29 @@ mod tests {
         assert!(!protocol.contains("message QueryResult"));
         assert!(!protocol.contains("repeated string headers"));
     }
+
+    #[test]
+    fn entity_search_round_trips_typed_matches() {
+        let result = dto::EntitySearchResult {
+            schema: dto::ENTITY_SEARCH_SCHEMA_V1.into(),
+            metadata: dto::QueryMetadata::completed("main", 3),
+            query: dto::EntitySearchQuery {
+                query: "run".into(),
+                limit: 20,
+            },
+            matches: vec![dto::EntityRef {
+                id: "repo://example/rust/lib/run".into(),
+                kind: dto::EntityKind::Callable,
+                name: "run".into(),
+                repository: Some("example".into()),
+                origin: dto::EntityOrigin::Source,
+                test: false,
+                metadata: None,
+            }],
+        };
+
+        let response = v1::SearchEntitiesResponse::from(result.clone());
+
+        assert_eq!(dto::EntitySearchResult::try_from(response).unwrap(), result);
+    }
 }
