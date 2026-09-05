@@ -1,5 +1,9 @@
 # Protobuf registry
 
+> [!NOTE]
+> This document retains contract examples and query guidance. The current behavioral
+> contract is [`protobuf-grpc`](../openspec/specs/protobuf-grpc/spec.md).
+
 Phase 3 adds canonical Protobuf contract facts. Phase 5 resolves application
 gRPC bindings against those facts at workspace publication time.
 

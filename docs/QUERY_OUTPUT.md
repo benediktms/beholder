@@ -1,5 +1,9 @@
 # Typed query output
 
+> [!NOTE]
+> This document retains the typed presentation architecture. The current behavioral
+> contract is [`query-api`](../openspec/specs/query-api/spec.md).
+
 Beholder query output has four layers:
 
 ```text

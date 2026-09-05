@@ -1,5 +1,10 @@
 # ADR 0007: Incremental semantic computation
 
+> [!NOTE]
+> This ADR is retained for incremental-computation rationale. Current behavioral
+> contracts are [`indexing-pipeline`](../../openspec/specs/indexing-pipeline/spec.md)
+> and [`analyzer-workers`](../../openspec/specs/analyzer-workers/spec.md).
+
 - Status: accepted
 - Date: 2026-08-27
 

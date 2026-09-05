@@ -1,5 +1,9 @@
 # ADR 0001: Native analyzer workers
 
+> [!NOTE]
+> This ADR is retained for architectural rationale and historical evidence. The
+> current behavioral contract is [`analyzer-workers`](../../openspec/specs/analyzer-workers/spec.md).
+
 - Status: accepted
 - Date: 2026-08-20
 - Tracking: https://github.com/benediktms/beholder/issues/58

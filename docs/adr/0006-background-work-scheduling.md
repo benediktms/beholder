@@ -1,5 +1,10 @@
 # ADR 0006: Adopt Apalis for durable background work execution
 
+> [!NOTE]
+> This ADR is retained for queue-selection and rollout rationale. Current behavioral
+> contracts are [`indexing-pipeline`](../../openspec/specs/indexing-pipeline/spec.md)
+> and [`observability`](../../openspec/specs/observability/spec.md).
+
 - Status: accepted
 - Date: 2026-08-25
 - Tracking: https://github.com/benediktms/beholder/issues/126

@@ -1,5 +1,9 @@
 # ADR 0002: Elixir compiler-tracer worker
 
+> [!NOTE]
+> This ADR is retained for architectural rationale and rejected alternatives. The
+> current behavioral contract is [`analyzer-workers`](../../openspec/specs/analyzer-workers/spec.md).
+
 - Status: proposed
 - Date: 2026-08-20
 

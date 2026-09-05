@@ -1,5 +1,9 @@
 # ADR 0008: Desktop workspace graph prototype
 
+> [!NOTE]
+> This ADR is retained for renderer evaluation and prototype design. The current
+> behavioral contract is [`desktop-graph`](../../openspec/specs/desktop-graph/spec.md).
+
 - Status: accepted
 - Date: 2026-08-30
 

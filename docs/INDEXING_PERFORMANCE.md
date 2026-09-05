@@ -1,5 +1,9 @@
 # Indexing performance
 
+> [!NOTE]
+> This document retains reproducible measurements and tuning evidence. The current
+> behavioral contract is [`indexing-pipeline`](../openspec/specs/indexing-pipeline/spec.md).
+
 This report records the bounded indexing spike tracked by
 https://github.com/benediktms/beholder/issues/6. Measurements were taken on
 2026-08-16 using an Apple M3 Max with 36 GiB RAM on arm64 macOS.
