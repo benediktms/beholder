@@ -76,13 +76,13 @@ repository and analyzer, with freshness derived from their stored input identity
 
 ### Requirement: Bounded parallel analysis
 
-Source analysis SHALL default to a bounded four-worker pool capped by available
-parallelism and SHALL allow `BEHOLDER_INDEX_WORKERS` to override the worker count.
+Source analysis SHALL default to the host's available parallelism and SHALL allow a
+positive `BEHOLDER_INDEX_WORKERS` value to override the worker count.
 
 #### Scenario: Constrained machine
 
-- **WHEN** `BEHOLDER_INDEX_WORKERS` specifies fewer workers
-- **THEN** indexing uses that bounded worker count without changing serialized semantic output
+- **WHEN** `BEHOLDER_INDEX_WORKERS` specifies fewer workers than the host exposes
+- **THEN** indexing uses that explicit worker count without changing serialized semantic output
 
 ### Requirement: Batched Mnestic publication
 

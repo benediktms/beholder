@@ -17,8 +17,8 @@ executables while baseline syntax analysis remains in-process.
 
 #### Scenario: Compiler toolchain fails
 
-- **WHEN** a native compiler worker fails
-- **THEN** the published syntax graph remains queryable and Beholder emits a typed non-fatal diagnostic
+- **WHEN** a native compiler executable, version probe, language service, or analysis attempt fails
+- **THEN** the published syntax graph remains queryable while the durable enrichment job retries and may end in a terminal failure
 
 ### Requirement: Typed bidirectional protocol
 
@@ -76,16 +76,16 @@ single-writer lifecycle and rebuild triggers.
 - **WHEN** Cargo configuration, target, workspace, or accepted membership changes
 - **THEN** the Rust worker rebuilds the compiler database
 
-### Requirement: Explicit trust for code-executing enrichment
+### Requirement: Installed built-in workers are trusted
 
-Compiler enrichment that executes repository-controlled build or macro code SHALL
-require explicit user invocation or opt-in and SHALL NOT be activated merely by
-repository configuration.
+The daemon SHALL automatically schedule an installed built-in compiler worker for
+repositories containing its accepted inputs, including workers that may execute
+repository-controlled build or macro code.
 
 #### Scenario: Registering an Elixir repository
 
-- **WHEN** the repository has not been explicitly approved for compiler execution
-- **THEN** Beholder indexes syntax without automatically running Mix compilation
+- **WHEN** the Elixir worker is installed and a registered repository contains accepted Elixir inputs
+- **THEN** automatic enrichment may run Mix compilation without a separate per-repository approval gate
 
 ### Requirement: Stable worker diagnostics and ownership
 

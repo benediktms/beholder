@@ -19,23 +19,30 @@ query-specific Beholder DTOs rather than storage rows or a generic value table.
 
 ### Requirement: Versioned JSON contracts
 
-Each JSON query document SHALL carry its query-specific `beholder.<query>.v1`
-schema identifier.
+Each JSON query document SHALL carry its query-specific schema identifier:
+`beholder.context.v1`, `beholder.dependencies.v2`, `beholder.impact.v2`,
+`beholder.trace.v2`, or `beholder.why.v2`.
 
 #### Scenario: Requesting JSON output
 
 - **WHEN** a user selects JSON or pretty JSON output
-- **THEN** the complete typed result is serialized under the query's stable versioned schema
+- **THEN** the complete typed result is serialized under that query's current stable schema
 
-### Requirement: Lossless raw projection
+### Requirement: Lossless JSON and evidence-oriented raw projection
 
-Raw and JSON projections SHALL retain every mapped entity, edge, path, confidence
-value, evidence record, and analysis-state field returned by the semantic query.
+JSON projection SHALL retain every typed query field. Raw projection SHALL retain
+schema, revision, core freshness and completeness state, graph topology, paths,
+confidence, and evidence while remaining a human-oriented subset of the DTO.
 
 #### Scenario: Compact output collapses support nodes
 
 - **WHEN** compact presentation hides a generated or structural support node
-- **THEN** raw and JSON output still include that node and its relationships
+- **THEN** raw and JSON output still include that node, its relationships, and evidence
+
+#### Scenario: Caller needs every DTO field
+
+- **WHEN** a caller needs entity names, repositories, typed metadata, or complete freshness details
+- **THEN** it uses JSON because raw output does not promise every DTO field
 
 ### Requirement: Revision and completeness metadata
 

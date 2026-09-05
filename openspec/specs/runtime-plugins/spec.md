@@ -68,7 +68,7 @@ activate executables.
 #### Scenario: Workspace names an unavailable plugin
 
 - **WHEN** an enabled plugin has no valid managed executable
-- **THEN** the daemon serves the baseline graph and reports a typed plugin diagnostic
+- **THEN** the daemon omits that enricher, serves the baseline graph, and emits a startup warning
 
 ### Requirement: Public Rust authoring SDK
 

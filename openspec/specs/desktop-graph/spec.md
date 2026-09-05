@@ -47,16 +47,15 @@ origin while retaining nodes that pass node filters even if edge filters disconn
 - **WHEN** a relationship kind is disabled
 - **THEN** matching links disappear without dropping otherwise visible isolated nodes
 
-### Requirement: Honest visible guards
+### Requirement: Complete client projection
 
-The prototype SHALL cap a projection at 10,000 visible nodes, 25,000 visible links,
-and 250 animated incident links, choosing omissions deterministically and reporting
-their counts.
+The client projection SHALL retain every filtered node and every relationship whose
+endpoints remain visible, without applying speculative client-side size limits.
 
-#### Scenario: Projection exceeds a guard
+#### Scenario: Large topology snapshot
 
-- **WHEN** filters produce more elements than a renderer guard permits
-- **THEN** the UI keeps a deterministic subset and asks the user to narrow the available filters
+- **WHEN** filters produce a large set of nodes and links
+- **THEN** the projection reports zero client omissions and leaves truncation false
 
 ### Requirement: Response-local edge identity
 
@@ -68,16 +67,15 @@ evidence rather than treating response-local edge IDs as durable identity.
 - **WHEN** two query results describe the same endpoints and relationship kind
 - **THEN** the client merges their evidence into one projected link
 
-### Requirement: Fixture-bounded prototype
+### Requirement: Live workspace topology
 
-The prototype SHALL remain fixture-backed until a bounded, revision-consistent
-workspace topology API exists; it SHALL expose this limitation rather than infer a
-whole workspace graph through repeated context calls.
+The desktop graph SHALL load registered workspaces and their revision-consistent
+topology through the daemon's workspace topology APIs.
 
-#### Scenario: No topology RPC exists
+#### Scenario: Opening a registered workspace
 
-- **WHEN** the user opens the current prototype
-- **THEN** it uses realistic product-neutral fixture data and does not issue an N+1 query sequence
+- **WHEN** the user selects a registered workspace
+- **THEN** the Tauri bridge calls `workspace_topology` and returns its typed nodes, edges, and query metadata
 
 ### Requirement: Revision-state visibility
 
