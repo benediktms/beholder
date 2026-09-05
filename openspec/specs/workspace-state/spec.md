@@ -32,7 +32,7 @@ metadata hints, and verified content digests separately from semantic graph stat
 #### Scenario: Corrupt inventory
 
 - **WHEN** an inventory manifest is unknown, incomplete, corrupt, or incompatible
-- **THEN** the daemon ignores and rebuilds it while preserving the last complete graph revision
+- **THEN** the daemon ignores and rebuilds it while preserving the last atomically published graph revision and its completeness
 
 ### Requirement: Advisory filesystem events
 

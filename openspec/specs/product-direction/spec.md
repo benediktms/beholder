@@ -48,7 +48,7 @@ the authority from which analysis state can be rebuilt.
 #### Scenario: Losing rebuildable caches
 
 - **WHEN** a frontend or inventory cache is missing or invalid
-- **THEN** Beholder rebuilds it without changing the last complete semantic revision
+- **THEN** Beholder rebuilds it without changing the last atomically published semantic revision or its completeness
 
 ### Requirement: Bounded first release
 
