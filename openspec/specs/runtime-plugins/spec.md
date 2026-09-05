@@ -49,15 +49,21 @@ plugin API version.
 - **WHEN** the executable digest changes for an enabled plugin
 - **THEN** prior output becomes stale and the new contribution cannot reuse the old executable identity
 
-### Requirement: Checked canonical output
+### Requirement: Layered plugin output validation
 
-Plugins SHALL extend recognition only through checked Beholder entities,
-relationships, evidence, and diagnostics.
+The Rust plugin SDK SHALL check canonical entity addresses and relationship
+compatibility. For plugins that implement the protocol directly, the daemon SHALL
+check declared output kinds and endpoint membership before publication.
 
 #### Scenario: Plugin references an invalid endpoint
 
-- **WHEN** an output edge refers to an unknown or invalid entity reference
-- **THEN** SDK or daemon validation rejects it before publication
+- **WHEN** an output edge refers to an endpoint absent from baseline and contributed entities
+- **THEN** daemon validation rejects it before publication
+
+#### Scenario: Protocol-native plugin bypasses the Rust SDK
+
+- **WHEN** a plugin emits a declared kind with a malformed canonical address or incompatible relationship
+- **THEN** current daemon validation may accept it if its kinds are declared and its endpoints are known
 
 ### Requirement: Explicit administrative installation
 

@@ -31,12 +31,18 @@ and reheat the force simulation while preserving positions for retained nodes.
 ### Requirement: Directional neighborhood highlighting
 
 The selected node SHALL have a red halo, upstream neighbors teal halos, downstream
-neighbors orange halos, and incident visible links animated from source to target.
+neighbors orange halos, and at most 250 incident visible links animated from source
+to target.
 
 #### Scenario: Clearing focus
 
 - **WHEN** the user clicks the background or `Clear focus`
 - **THEN** persistent selection highlights and particles are removed
+
+#### Scenario: More than 250 incident links
+
+- **WHEN** a selected node has more than 250 incident visible links
+- **THEN** every incident link remains highlighted while only the first 250 animate
 
 ### Requirement: Minimal deterministic filters
 
@@ -50,13 +56,19 @@ origin while retaining nodes that pass node filters even if edge filters disconn
 
 ### Requirement: Complete client projection
 
-The client projection SHALL retain every filtered node and every relationship whose
-endpoints remain visible, without applying speculative client-side size limits.
+The client projection SHALL retain every filtered node and every non-self
+relationship whose endpoints remain visible, without applying speculative
+client-side size limits.
 
 #### Scenario: Large topology snapshot
 
 - **WHEN** filters produce a large set of nodes and links
 - **THEN** the projection reports zero client omissions and leaves truncation false
+
+#### Scenario: Self-relationship
+
+- **WHEN** a relationship has the same visible source and target
+- **THEN** the projection drops that relationship without counting it as an omission
 
 ### Requirement: Response-local edge identity
 
@@ -84,7 +96,12 @@ topology through the daemon's workspace topology APIs.
 A graph snapshot SHALL expose revision, freshness, completeness, and diagnostics so
 the client can report analysis state and offer a manual refresh when a newer revision exists.
 
-#### Scenario: Snapshot is stale or incomplete
+#### Scenario: Snapshot is incomplete
 
-- **WHEN** the backend reports stale or incomplete graph state
-- **THEN** the UI displays the state and its diagnostics without claiming truncation metadata
+- **WHEN** the pinned analysis is incomplete
+- **THEN** the UI displays the incomplete state and its diagnostics
+
+#### Scenario: Complete snapshot is stale
+
+- **WHEN** a complete snapshot becomes stale
+- **THEN** the UI displays stale status but does not expose any attached diagnostic details
