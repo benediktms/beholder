@@ -369,6 +369,16 @@ fn declaration_scope(node: Node<'_>, root: Node<'_>) -> (usize, usize) {
 }
 
 fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
+    collect_calls_with_owner(node, source, root, calls, None);
+}
+
+fn collect_calls_with_owner(
+    node: Node<'_>,
+    source: &[u8],
+    root: Node<'_>,
+    calls: &mut Vec<Call>,
+    owner: Option<&str>,
+) {
     if is_collection_boundary(node, root) {
         return;
     }
@@ -380,6 +390,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
         "call_expression" => {
             if let Some(found) = call(node, source, CallKind::Direct) {
                 for mut call in found {
+                    call.owner = owner.map(str::to_owned);
                     (call.scope_start, call.scope_end) = lexical_scope(node, root);
                     calls.push(call);
                 }
@@ -388,6 +399,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
         "new_expression" => {
             if let Some(found) = call(node, source, CallKind::Constructor) {
                 for mut call in found {
+                    call.owner = owner.map(str::to_owned);
                     (call.scope_start, call.scope_end) = lexical_scope(node, root);
                     calls.push(call);
                 }
@@ -405,6 +417,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
                 .and_then(|target| call_target(node, target, source, CallKind::Direct))
             {
                 for mut call in found {
+                    call.owner = owner.map(str::to_owned);
                     (call.scope_start, call.scope_end) = lexical_scope(node, root);
                     calls.push(call);
                 }
@@ -414,7 +427,7 @@ fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_calls(child, source, root, calls);
+        collect_calls_with_owner(child, source, root, calls, owner);
     }
 }
 
@@ -428,14 +441,13 @@ fn collect_class_evaluation_calls(
         .child_by_field_name("name")
         .and_then(|name| text(name, source))
         .map(str::to_owned);
-    let first_call = calls.len();
     let body = node.child_by_field_name("body");
     let mut cursor = node.walk();
     for child in node
         .named_children(&mut cursor)
         .filter(|child| Some(*child) != body && child.kind() != "decorator")
     {
-        collect_calls(child, source, root, calls);
+        collect_calls_with_owner(child, source, root, calls, owner.as_deref());
     }
     let Some(body) = body else {
         return;
@@ -447,27 +459,22 @@ fn collect_class_evaluation_calls(
             .or_else(|| member.child_by_field_name("property"))
             .filter(|name| name.kind() == "computed_property_name")
         {
-            collect_calls(name, source, root, calls);
+            collect_calls_with_owner(name, source, root, calls, owner.as_deref());
         }
         match member.kind() {
-            "class_static_block" => collect_calls(member, source, root, calls),
+            "class_static_block" => {
+                collect_calls_with_owner(member, source, root, calls, owner.as_deref())
+            }
             "field_definition" | "public_field_definition"
                 if member
                     .children(&mut member.walk())
                     .any(|child| child.kind() == "static") =>
             {
                 if let Some(value) = member.child_by_field_name("value") {
-                    collect_calls(value, source, root, calls);
+                    collect_calls_with_owner(value, source, root, calls, owner.as_deref());
                 }
             }
             _ => {}
-        }
-    }
-    if let Some(owner) = owner {
-        for call in &mut calls[first_call..] {
-            if call.owner.is_none() {
-                call.owner = Some(owner.clone());
-            }
         }
     }
 }
@@ -2402,6 +2409,24 @@ mod tests {
             observation.from.as_str() == "repo://example/typescript/src/config"
                 && observation.to.as_str() == "repo://example/typescript/src/config/Config/load"
         }));
+    }
+
+    #[test]
+    fn anonymous_classes_do_not_inherit_the_outer_class_owner() {
+        let analysis = analyze(
+            "class Outer { static Inner = class extends Base { static value = this.load() }; static load() {} }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        let calls = analysis
+            .calls
+            .iter()
+            .filter(|call| call.receiver.as_deref() == Some("this") && call.name == "load")
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].owner.is_none());
     }
 
     #[test]
