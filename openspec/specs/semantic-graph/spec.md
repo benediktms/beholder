@@ -41,12 +41,14 @@ and may be absent when both endpoints use ownership-neutral contract identities.
 
 ### Requirement: Provenance and confidence
 
-Relationships SHALL preserve all corroborating evidence and expose the strongest
-supported confidence without discarding weaker evidence.
+Relationships SHALL expose the strongest stored confidence and preserve
+corroborating evidence that remains distinct after analyzer and storage aggregation.
+Unsharded observations with the same source, relation, and target MAY retain only
+one evidence record.
 
 #### Scenario: Exact and inferred evidence agree
 
-- **WHEN** an exact generated binding and an inferred source shape support the same edge
+- **WHEN** an exact generated binding and an inferred source shape remain distinct stored observations for the same edge
 - **THEN** the edge reports exact confidence and retains both evidence records
 
 ### Requirement: Structural and traversal semantics

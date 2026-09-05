@@ -17,16 +17,21 @@ query-specific Beholder DTOs rather than storage rows or a generic value table.
 - **WHEN** the daemon serves a semantic query
 - **THEN** Mnestic rows stop at the storage adapter and the public response contains only typed Beholder fields
 
-### Requirement: Versioned JSON contracts
+### Requirement: Versioned query contracts
 
-Each JSON query document SHALL carry its query-specific schema identifier:
+Each typed query response SHALL carry its query-specific schema identifier:
 `beholder.entity_search.v1`, `beholder.context.v1`, `beholder.dependencies.v2`,
 `beholder.impact.v2`, `beholder.trace.v2`, or `beholder.why.v2`.
 
 #### Scenario: Requesting JSON output
 
-- **WHEN** a user selects JSON or pretty JSON output
+- **WHEN** a user selects JSON or pretty JSON output for `context`, `dependencies`, `impact`, `trace`, or `why`
 - **THEN** the complete typed result is serialized under that query's current stable schema
+
+#### Scenario: Consumer searches entities over gRPC
+
+- **WHEN** a consumer calls `SearchEntities`
+- **THEN** the typed gRPC response carries `beholder.entity_search.v1` without promising a CLI JSON renderer
 
 ### Requirement: Bounded entity search
 

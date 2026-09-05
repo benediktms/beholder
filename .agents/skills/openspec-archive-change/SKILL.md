@@ -71,7 +71,7 @@ Archive a completed change in the experimental workflow.
    **If any artifacts are neither `done` nor `skipped`** (skipped artifacts satisfy the requirement - the change declares skip_specs):
    - Display warning listing incomplete artifacts
    - Ask the user to confirm they want to proceed
-   - Proceed if user confirms
+   - If the user confirms, record that the change is incomplete and proceed without allowing delta-spec sync
 
 3. **Check task completion status**
 
@@ -82,7 +82,7 @@ Archive a completed change in the experimental workflow.
    **If incomplete tasks found:**
    - Display warning showing count of incomplete tasks
    - Ask the user to confirm they want to proceed
-   - Proceed if user confirms
+   - If the user confirms, record that the change is incomplete and proceed without allowing delta-spec sync
 
    **If no tasks file exists:** Proceed without task-related warning.
 
@@ -99,7 +99,8 @@ Archive a completed change in the experimental workflow.
    - Show a combined summary before prompting
 
    **Prompt options:**
-   - If changes needed: "Sync now (recommended)", "Archive without syncing"
+   - If the change is incomplete: "Archive without syncing", "Cancel"; do not offer or perform sync
+   - Otherwise, if changes needed: "Sync now (recommended)", "Archive without syncing"
    - If already synced: "Archive now", "Sync anyway", "Cancel"
 
    Route on the answer:

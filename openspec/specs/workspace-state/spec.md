@@ -61,9 +61,15 @@ its identity and scheduler generation remain current.
 
 ### Requirement: Atomic revision visibility
 
-Beholder SHALL expose only complete analysis revisions.
+Beholder SHALL publish each analysis revision atomically as a self-consistent
+snapshot. A published revision MAY be complete or incomplete.
 
 #### Scenario: Replacement revision is being built
 
 - **WHEN** refresh, analysis, enrichment, or publication is in progress
-- **THEN** queries continue to use the last complete revision and report current freshness state
+- **THEN** queries continue to use the last published revision and report current freshness state
+
+#### Scenario: Frontend recovers from malformed source
+
+- **WHEN** safe parse recovery produces usable facts and diagnostics
+- **THEN** Beholder atomically publishes a queryable revision marked incomplete
