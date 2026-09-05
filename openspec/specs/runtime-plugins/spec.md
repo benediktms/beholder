@@ -20,8 +20,9 @@ versioned analyzer gRPC protocol and SHALL NOT load into the daemon process.
 
 ### Requirement: Declarative discovery
 
-Each plugin SHALL describe its stable ID, exact API version, target and context
-selectors, required baseline kinds, and permitted output kinds before activation.
+Each plugin SHALL describe its stable ID, exact API version, target selectors,
+required baseline kinds, and permitted output kinds before activation. Context
+selectors are optional.
 
 #### Scenario: Plugin emits an undeclared relationship kind
 
@@ -71,9 +72,9 @@ Plugin installation, replacement, removal, enablement, and disablement SHALL be
 explicit local administrative actions; repository contents SHALL NOT install or
 activate executables.
 
-#### Scenario: Workspace names an unavailable plugin
+#### Scenario: Registered plugin executable disappears
 
-- **WHEN** an enabled plugin has no valid managed executable
+- **WHEN** an enabled registered plugin has no valid managed executable
 - **THEN** the daemon omits that enricher, serves the baseline graph, and emits a startup warning
 
 ### Requirement: Public Rust authoring SDK

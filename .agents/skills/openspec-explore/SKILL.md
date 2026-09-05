@@ -113,10 +113,15 @@ You have full context of the OpenSpec system. Use it naturally, don't force it.
 
 At the start, quickly check what exists:
 ```bash
+openspec context --json
 openspec list --json
 ```
 
-This tells you:
+Use the same selected-store flag on both commands when applicable. The context
+result resolves roots selected through a local `store:` pointer or the global
+default store. Together these commands tell you:
+
+- The authoritative `root.path`
 - If there are active changes
 - Their names, schemas, and status
 - What the user might be working on
