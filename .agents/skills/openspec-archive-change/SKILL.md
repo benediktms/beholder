@@ -80,7 +80,11 @@ Archive a completed change in the experimental workflow.
 
 3. **Check task completion status**
 
-   Read the tasks file (typically `tasks.md`) to check for incomplete tasks.
+   For every artifact in the required set, use its current instructions and
+   template to identify task-bearing outputs, then inspect every concrete path in
+   that artifact's `artifactPaths.<id>.existingOutputPaths`. Do not assume the
+   artifact id or filename is `tasks` or `tasks.md`; custom schemas and glob
+   artifacts may place implementation checklists elsewhere.
 
    Count tasks marked with `- [ ]` (incomplete) vs `- [x]` (complete).
 
@@ -89,7 +93,7 @@ Archive a completed change in the experimental workflow.
    - Ask the user to confirm they want to proceed
    - If the user confirms, record that the change is incomplete and proceed without allowing delta-spec sync
 
-   **If no tasks file exists:** Proceed without task-related warning.
+   **If no task-bearing output exists:** Proceed without task-related warning.
 
 4. **Assess delta spec sync state**
 
@@ -130,7 +134,7 @@ Archive a completed change in the experimental workflow.
    widen verification back to every entry in
    `artifactPaths.specs.existingOutputPaths`. A successful sync leaves nothing
    left to apply for each selected capability:
-   - ADDED requirements present
+   - ADDED requirements exactly matching the complete delta block, including when the requirement existed before sync and was treated as implicitly MODIFIED
    - MODIFIED requirements exactly matching the complete post-change block in the delta
    - REMOVED requirements gone — and where this sync retired a capability (removed its last requirement, leaving `## Requirements` empty), its main spec deleted rather than left empty. A blocked retirement that deliberately kept the main spec is a mismatch and MUST stop archiving.
    - RENAMED requirements present under the new name and absent under the old one

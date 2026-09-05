@@ -31,9 +31,10 @@ multiple logical repositories rather than as an isolated source tree.
 
 ### Requirement: Evidence-backed results
 
-Beholder SHALL attach source evidence, confidence, provenance, and analysis-state
-metadata to semantic results so users can distinguish exact, inferred, stale,
-incomplete, and unresolved findings.
+Beholder SHALL attach source evidence, confidence, and provenance to
+relationship-bearing semantic graph results. Semantic results SHALL carry the
+applicable analysis-state metadata so users can distinguish exact, inferred, stale,
+incomplete, and unresolved findings where those states apply.
 
 #### Scenario: Returning an inferred relationship
 
