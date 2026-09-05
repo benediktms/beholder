@@ -119,12 +119,15 @@
   });
 
   function rebuild(next: Projection) {
-    const previousGraph = renderer?.getGraph();
+    const preserveView = viewKey === renderedViewKey;
+    const previousGraph = preserveView ? renderer?.getGraph() : null;
     const previousPositions = new Map<string, { x: number; y: number }>();
     previousGraph?.forEachNode((node, attributes) => {
       previousPositions.set(node, { x: attributes.x, y: attributes.y });
     });
-    const previousCamera = renderer?.getCamera().getState();
+    const previousCamera = preserveView ? renderer?.getCamera().getState() : null;
+    hoveredId = null;
+    keyboardIndex = -1;
     stopRenderer();
     const graph = new MultiDirectedGraph<NodeAttributes, EdgeAttributes>();
     const nodeById = new Map(next.nodes.map((node) => [node.id, node]));

@@ -107,10 +107,21 @@ pub(super) fn workspace_graph_neighborhood(
     let mut graph = GraphBuilder::default();
     graph.hint_facts(entity_kinds(entities)?);
     let truncated = result.rows.len() > max_edges as usize;
+    let mut repositories = BTreeMap::new();
     for row in result.rows.iter().take(max_edges as usize) {
+        let from = text(row, 0, "neighborhood source")?;
+        let to = text(row, 1, "neighborhood target")?;
+        repositories.insert(
+            from.to_owned(),
+            community_repository(text(row, 4, "neighborhood source community")?),
+        );
+        repositories.insert(
+            to.to_owned(),
+            community_repository(text(row, 5, "neighborhood target community")?),
+        );
         graph.add_edge(
-            text(row, 0, "neighborhood source")?,
-            text(row, 1, "neighborhood target")?,
+            from,
+            to,
             text(row, 2, "neighborhood relation")?,
             "",
             float(row, 3, "neighborhood confidence")? as f32,
@@ -118,6 +129,11 @@ pub(super) fn workspace_graph_neighborhood(
         )?;
     }
     let mut output = graph.finish();
+    for node in &mut output.nodes {
+        if let Some(repository) = repositories.remove(&node.id) {
+            node.repository = repository;
+        }
+    }
     for edge in &mut output.edges {
         edge.evidence.clear();
     }
@@ -132,6 +148,10 @@ pub(super) fn workspace_graph_neighborhood(
         nodes: output.nodes,
         edges: output.edges,
     })
+}
+
+fn community_repository(community: &str) -> Option<String> {
+    (community != EXTERNAL_COMMUNITY_KEY).then(|| community.to_owned())
 }
 
 fn repository_community_id(repository: &str) -> String {

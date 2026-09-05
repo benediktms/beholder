@@ -368,6 +368,15 @@ export function projectLevelOfDetail(
       return neighborhood.focus.kind === 'external' ? ['community://external'] : [];
     })
   );
+  const truncatedExpandedCommunities = new Set(
+    neighborhoods.flatMap((neighborhood) => {
+      if (!neighborhood.truncated) return [];
+      if (neighborhood.focus.kind === 'repository') {
+        return [`community://repository/${neighborhood.focus.id}`];
+      }
+      return neighborhood.focus.kind === 'external' ? ['community://external'] : [];
+    })
+  );
   const entityNeighborhoodIds = new Set(
     neighborhoods
       .filter((neighborhood) => neighborhood.focus.kind === 'entity')
@@ -399,16 +408,18 @@ export function projectLevelOfDetail(
     options.origins.includes(entity.origin);
   const nodes = new Map<string, GraphNode>();
   for (const community of overview.communities) {
-    if (expandedCommunities.has(community.id) || !communityAllowed(community)) continue;
+    if ((expandedCommunities.has(community.id) && !truncatedExpandedCommunities.has(community.id)) ||
+      !communityAllowed(community)) continue;
+    const remainder = truncatedExpandedCommunities.has(community.id);
     nodes.set(community.id, {
       id: community.id,
-      label: community.name,
+      label: remainder ? `${community.name} (remaining)` : community.name,
       kind: community.kind === 'external' ? 'external_community' : 'repository_community',
       community: community.id,
       communityLabel: community.name,
       degree: 0,
       aggregate: true,
-      entityCount: community.entity_count
+      entityCount: remainder ? undefined : community.entity_count
     });
   }
   for (const id of concreteIds) {
@@ -455,9 +466,27 @@ export function projectLevelOfDetail(
       });
     }
   };
+  const materializedCommunityEdges = new Map<string, number>();
+  for (const neighborhood of neighborhoods) {
+    for (const edge of neighborhood.edges) {
+      const fromEntity = entities.get(edge.from);
+      const toEntity = entities.get(edge.to);
+      if (!fromEntity || !toEntity) continue;
+      const key = `${communityIdForEntity(fromEntity)}|${edge.kind}|${communityIdForEntity(toEntity)}`;
+      materializedCommunityEdges.set(key, (materializedCommunityEdges.get(key) ?? 0) + 1);
+    }
+  }
   for (const edge of overview.edges) {
-    if (expandedCommunities.has(edge.from) || expandedCommunities.has(edge.to)) continue;
-    addLink(edge.from, edge.to, edge.kind, edge.count, edge.id);
+    const touchesExpanded = expandedCommunities.has(edge.from) || expandedCommunities.has(edge.to);
+    if (!touchesExpanded) {
+      addLink(edge.from, edge.to, edge.kind, edge.count, edge.id);
+      continue;
+    }
+    if (!truncatedExpandedCommunities.has(edge.from) &&
+      !truncatedExpandedCommunities.has(edge.to)) continue;
+    const materialized = materializedCommunityEdges.get(`${edge.from}|${edge.kind}|${edge.to}`) ?? 0;
+    const remainder = Math.max(0, edge.count - materialized);
+    if (remainder > 0) addLink(edge.from, edge.to, edge.kind, remainder, `${edge.id}:remaining`);
   }
   for (const neighborhood of neighborhoods) {
     for (const edge of neighborhood.edges) {

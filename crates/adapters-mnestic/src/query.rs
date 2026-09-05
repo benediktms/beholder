@@ -1036,14 +1036,18 @@ pub(super) fn workspace_graph_neighborhood(
                  repository_entity[id, $focus]\n\
              focus_entity[id] := $focus_kind == 'external', \
                  external_community_entity[id]\n\
-             neighborhood[from, to, relation, confidence] := \
+             neighborhood[from, to, relation, confidence, from_community, to_community] := \
                  effective_observation[from, to, relation, evidence, confidence, provenance], \
-                 focus_entity[from]\n\
-             neighborhood[from, to, relation, confidence] := \
+                 focus_entity[from], \
+                 community_entity[from, from_community], \
+                 community_entity[to, to_community]\n\
+             neighborhood[from, to, relation, confidence, from_community, to_community] := \
                  effective_observation[from, to, relation, evidence, confidence, provenance], \
-                 focus_entity[to]\n\
-             ?[from, to, relation, max(confidence)] := \
-                 neighborhood[from, to, relation, confidence]\n\
+                 focus_entity[to], \
+                 community_entity[from, from_community], \
+                 community_entity[to, to_community]\n\
+             ?[from, to, relation, max(confidence), from_community, to_community] := \
+                 neighborhood[from, to, relation, confidence, from_community, to_community]\n\
              :order from, to, relation\n\
              :limit {row_limit}"
         ),

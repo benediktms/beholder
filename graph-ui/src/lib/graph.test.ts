@@ -200,6 +200,38 @@ test('repository expansion replaces only its aggregate and collapses boundary en
   );
 });
 
+test('repository expansion trusts authoritative ownership for contract entity IDs', () => {
+  const neighborhood = repositoryNeighborhood();
+  neighborhood.nodes[0] = {
+    ...neighborhood.nodes[0],
+    id: 'proto-method://booking.v1.Booking/Create',
+    name: 'Create',
+    repository: 'repo-a'
+  };
+  neighborhood.edges = neighborhood.edges.map((candidate) => ({
+    ...candidate,
+    from: candidate.from === 'a1' ? neighborhood.nodes[0].id : candidate.from
+  }));
+  const graph = projectLevelOfDetail(overview(), [neighborhood], options);
+  assert.equal(graph.nodes.some((node) => node.id === neighborhood.nodes[0].id), true);
+});
+
+test('truncated expansion retains the unmaterialized overview boundary', () => {
+  const neighborhood = { ...repositoryNeighborhood(), truncated: true };
+  const graph = projectLevelOfDetail(overview(), [neighborhood], options);
+  assert.equal(
+    graph.nodes.find((node) => node.id === 'community://repository/repo-a')?.label,
+    'repo-a (remaining)'
+  );
+  assert.equal(
+    graph.links.find((link) =>
+      link.source === 'community://repository/repo-a' &&
+      link.target === 'community://repository/repo-b'
+    )?.count,
+    2
+  );
+});
+
 test('stream batches validate order and assemble one cached neighborhood', () => {
   const neighborhood = repositoryNeighborhood();
   const batches: GraphNeighborhoodBatch[] = [

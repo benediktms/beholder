@@ -220,6 +220,7 @@
 
   async function expandNeighborhood(focus: GraphNeighborhoodFocus) {
     if (!overview) return;
+    const request = ++neighborhoodRequest;
     const workspace = selectedWorkspace;
     const revision = overview.metadata.revision;
     const key = graphFocusKey(focus);
@@ -229,7 +230,6 @@
       replaceNeighborhood(cached);
       return;
     }
-    const request = ++neighborhoodRequest;
     detailError = '';
     loadingNeighborhoods = new Set([...loadingNeighborhoods, key]);
     const batches: GraphNeighborhoodBatch[] = [];
