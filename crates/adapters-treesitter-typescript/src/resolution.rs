@@ -2063,7 +2063,11 @@ pub fn unresolved_call_diagnostics(
             .filter(|repository| {
                 caller
                     .strip_prefix(&repository.repository)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
+                    .is_some_and(|suffix| {
+                        ["/javascript/", "/svelte/", "/typescript/"]
+                            .iter()
+                            .any(|language| suffix.starts_with(language))
+                    })
             })
             .max_by_key(|repository| repository.repository.len())
             .map(|repository| repository.repository.as_str())
@@ -3514,19 +3518,30 @@ mod tests {
                 "typescript-method://api/send",
                 "src/view.ts:8",
             ),
+            Observation::dependency(
+                "repo://acme/typescript/src/view/run",
+                DependencyRelation::Calls,
+                "typescript-method://api/send",
+                "src/view.ts:9",
+            ),
         ];
 
-        let repositories = ["acme/svelte", "gitlab.com/typescript/src/view"]
-            .into_iter()
-            .map(|repository| {
-                TypescriptRepository::new(
-                    repository,
-                    Vec::<(PathBuf, TypescriptAnalysis)>::new(),
-                    vec![],
-                    vec![],
-                )
-            })
-            .collect::<Vec<_>>();
+        let repositories = [
+            "acme",
+            "acme/svelte",
+            "acme/typescript",
+            "gitlab.com/typescript/src/view",
+        ]
+        .into_iter()
+        .map(|repository| {
+            TypescriptRepository::new(
+                repository,
+                Vec::<(PathBuf, TypescriptAnalysis)>::new(),
+                vec![],
+                vec![],
+            )
+        })
+        .collect::<Vec<_>>();
         let diagnostics = unresolved_call_diagnostics(&observations, &repositories);
 
         assert_eq!(
@@ -3534,7 +3549,7 @@ mod tests {
                 .iter()
                 .map(|(repository, _)| repository.as_str())
                 .collect::<Vec<_>>(),
-            ["acme/svelte", "gitlab.com/typescript/src/view"]
+            ["acme", "acme/svelte", "gitlab.com/typescript/src/view"]
         );
     }
 }
