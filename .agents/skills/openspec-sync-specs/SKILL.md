@@ -42,11 +42,14 @@ This is an **agent-driven** operation - you will read delta specs and directly e
 
    The JSON includes `planningHome.root`. Main specs live under `<planningHome.root>/openspec/specs/` — use that (store-aware) root for every main-spec path below, not a hardcoded repo path. When a store is selected it points at the store, not the current repository.
 
-   Before continuing, require every entry in `artifacts` to be `done` or
-   `skipped`. Then read the tasks file when one exists and require every task to
-   be checked (`- [x]`). If an artifact or task is incomplete, report it and stop
-   without writing a main spec. A direct sync cannot publish unfinished behavior;
-   complete the change first or archive it without syncing.
+   Before continuing, compute the required artifact set as `applyRequires` plus
+   its transitive `requires` closure. Ignore artifacts outside that set. Require
+   each artifact in the set to be `done`, CLI-level `skipped`, or deliberately
+   skipped because its current `openspec instructions` condition does not apply.
+   Verify each deliberate skip from the current instruction instead of inferring
+   it. Read task-bearing files in the required set and require every task to be
+   checked (`- [x]`). If a required artifact or task is incomplete, report it and
+   stop without writing a main spec.
 
 3. **Find delta specs**
 
@@ -110,11 +113,8 @@ This is an **agent-driven** operation - you will read delta specs and directly e
 
       **MODIFIED Requirements:**
       - Find the requirement in main spec
-      - Apply the changes - this can be:
-        - Adding new scenarios the main spec does not have yet
-        - Modifying existing scenarios
-        - Changing the requirement description
-      - Preserve scenarios/content not mentioned in the delta
+      - Replace the entire existing requirement with the complete MODIFIED block
+      - Treat omitted scenarios and content as intentionally removed
 
       **REMOVED Requirements:**
       - Remove the entire requirement block from main spec
@@ -231,9 +231,9 @@ The system SHALL do something new.
 
 **Key Principle: Intelligent Merging**
 
-Unlike programmatic merging, you merge rather than overwrite:
-- A MODIFIED block carries the whole requirement - body plus every scenario that survives the change. `openspec validate` and `openspec archive` both reject one that drops a scenario the main spec still has.
-- Keep anything the delta does not mention, in the main spec's existing order
+Apply each delta operation semantically:
+- A MODIFIED block is the complete post-change requirement - body plus every scenario that survives the change. Replace the existing block; omitted scenarios are removed.
+- Keep requirements the delta does not name, in the main spec's existing order
 - Use your judgment to merge changes sensibly
 
 **Output On Success**

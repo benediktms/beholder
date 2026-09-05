@@ -68,8 +68,13 @@ Archive a completed change in the experimental workflow.
    - `planningHome`, `changeRoot`, `artifactPaths`, and `actionContext`: path and scope context
    - `artifacts`: List of artifacts with their status (`done`, `skipped`, or other)
 
-   **If any artifacts are neither `done` nor `skipped`** (skipped artifacts satisfy the requirement - the change declares skip_specs):
-   - Display warning listing incomplete artifacts
+   Compute the required artifact set as `applyRequires` plus its transitive
+   `requires` closure. Ignore artifacts outside that set. A required artifact is
+   complete when it is `done`, CLI-level `skipped`, or deliberately skipped
+   because its current `openspec instructions` condition does not apply.
+
+   **If any required artifacts are incomplete:**
+   - Display warning listing them
    - Ask the user to confirm they want to proceed
    - If the user confirms, record that the change is incomplete and proceed without allowing delta-spec sync
 
@@ -120,9 +125,13 @@ Archive a completed change in the experimental workflow.
 
    Then run the `openspec-sync-specs` workflow inline (agent-driven intelligent merge) for change '<name>', passing the delta spec analysis and the fetched specs-rule snapshot from above, and wait for it to finish. The inline sync must reuse that snapshot without fetching `specs` instructions again. Do not delegate it to a background task — step 5 would move `changeRoot` out from under a sync that is still reading it, leaving the change archived and the main specs never updated. If your agent can only run it by delegation, delegate synchronously and wait for the result.
 
-   Then re-run the comparison from the top of this step against every capability that has a delta spec in `artifactPaths.specs.existingOutputPaths` — not only the ones the sync reports it touched. A successful sync leaves nothing left to apply, so each capability must now read as already synced:
+   Then re-run the comparison from the top of this step against exactly the delta
+   paths selected for this sync. Preserve a narrowed caller-supplied list; never
+   widen verification back to every entry in
+   `artifactPaths.specs.existingOutputPaths`. A successful sync leaves nothing
+   left to apply for each selected capability:
    - ADDED requirements present
-   - MODIFIED requirements carrying the scenario and description changes named in the delta, with their other scenarios intact
+   - MODIFIED requirements exactly matching the complete post-change block in the delta
    - REMOVED requirements gone — and where this sync retired a capability (removed its last requirement, leaving `## Requirements` empty), its main spec deleted rather than left empty; a spec the sync deliberately kept and reported is also a match
    - RENAMED requirements present under the new name and absent under the old one
 
