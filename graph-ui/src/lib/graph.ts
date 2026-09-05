@@ -64,6 +64,59 @@ export interface GraphSnapshot {
   edges: SemanticEdge[];
 }
 
+export type GraphCommunityKind = 'repository' | 'external';
+
+export interface GraphCommunity {
+  id: string;
+  kind: GraphCommunityKind;
+  name: string;
+  repository: string | null;
+  entity_count: number;
+}
+
+export interface GraphCommunityEdge {
+  id: string;
+  from: string;
+  to: string;
+  kind: RelationKind;
+  count: number;
+}
+
+export interface GraphOverviewSnapshot {
+  schema: string;
+  workspace: WorkspaceSummary;
+  metadata: QueryMetadata;
+  communities: GraphCommunity[];
+  edges: GraphCommunityEdge[];
+}
+
+export type GraphNeighborhoodFocus =
+  | { kind: 'repository'; id: string }
+  | { kind: 'entity'; id: string }
+  | { kind: 'external' };
+
+export interface GraphNeighborhoodBatch {
+  schema: string;
+  metadata: QueryMetadata;
+  focus: GraphNeighborhoodFocus;
+  maxEdges: number;
+  truncated: boolean;
+  nodes: EntityRef[];
+  edges: SemanticEdge[];
+  batchIndex: number;
+  complete: boolean;
+}
+
+export interface GraphNeighborhood {
+  schema: string;
+  metadata: QueryMetadata;
+  focus: GraphNeighborhoodFocus;
+  maxEdges: number;
+  truncated: boolean;
+  nodes: EntityRef[];
+  edges: SemanticEdge[];
+}
+
 export interface QueryMetadata {
   revision: number;
   view: string;
@@ -93,6 +146,8 @@ export interface GraphNode {
   community: string;
   communityLabel: string;
   degree: number;
+  aggregate: boolean;
+  entityCount?: number;
   x?: number;
   y?: number;
   vx?: number;
@@ -194,7 +249,8 @@ export function projectGraph(
       kind: entity.kind,
       community: community.id,
       communityLabel: community.label,
-      degree: 0
+      degree: 0,
+      aggregate: false
     });
   }
 
@@ -255,6 +311,184 @@ export function projectGraph(
   };
 }
 
+export function graphFocusKey(focus: GraphNeighborhoodFocus): string {
+  return focus.kind === 'external' ? focus.kind : `${focus.kind}:${focus.id}`;
+}
+
+export function communityIdForEntity(entity: EntityRef): string {
+  return entity.repository
+    ? `community://repository/${entity.repository}`
+    : 'community://external';
+}
+
+export function mergeNeighborhoodBatches(
+  batches: readonly GraphNeighborhoodBatch[],
+  requireComplete = true
+): GraphNeighborhood {
+  const first = batches[0];
+  const last = batches.at(-1);
+  if (!first || (requireComplete && !last?.complete)) {
+    throw new Error('graph neighborhood stream ended before completion');
+  }
+  batches.forEach((batch, index) => {
+    if (batch.batchIndex !== index) {
+      throw new Error(`graph neighborhood stream expected batch ${index}, received ${batch.batchIndex}`);
+    }
+    if (graphFocusKey(batch.focus) !== graphFocusKey(first.focus)) {
+      throw new Error('graph neighborhood stream changed focus');
+    }
+    if (batch.metadata.revision !== first.metadata.revision) {
+      throw new Error('graph neighborhood stream changed revision');
+    }
+  });
+  return {
+    schema: first.schema,
+    metadata: first.metadata,
+    focus: first.focus,
+    maxEdges: first.maxEdges,
+    truncated: first.truncated,
+    nodes: deduplicateById(batches.flatMap((batch) => batch.nodes)),
+    edges: deduplicateById(batches.flatMap((batch) => batch.edges))
+  };
+}
+
+export function projectLevelOfDetail(
+  overview: GraphOverviewSnapshot,
+  neighborhoods: readonly GraphNeighborhood[],
+  options: ProjectionOptions
+): Projection {
+  const selectedRepositories = new Set(options.repositories);
+  const allowedKinds = new Set(options.relationKinds);
+  const communityById = new Map(overview.communities.map((community) => [community.id, community]));
+  const expandedCommunities = new Set(
+    neighborhoods.flatMap((neighborhood) => {
+      if (neighborhood.focus.kind === 'repository') {
+        return [`community://repository/${neighborhood.focus.id}`];
+      }
+      return neighborhood.focus.kind === 'external' ? ['community://external'] : [];
+    })
+  );
+  const entityNeighborhoodIds = new Set(
+    neighborhoods
+      .filter((neighborhood) => neighborhood.focus.kind === 'entity')
+      .map((neighborhood) => (neighborhood.focus as { kind: 'entity'; id: string }).id)
+  );
+  const entities = new Map(
+    neighborhoods.flatMap((neighborhood) => neighborhood.nodes.map((node) => [node.id, node] as const))
+  );
+  const concreteIds = new Set<string>();
+  for (const entity of entities.values()) {
+    const community = communityIdForEntity(entity);
+    if (expandedCommunities.has(community) || entityNeighborhoodIds.has(entity.id)) {
+      concreteIds.add(entity.id);
+    }
+  }
+  for (const neighborhood of neighborhoods) {
+    if (neighborhood.focus.kind === 'entity') {
+      neighborhood.nodes.forEach((node) => concreteIds.add(node.id));
+    }
+  }
+
+  const communityAllowed = (community: GraphCommunity): boolean =>
+    selectedRepositories.size === 0 ||
+    selectedRepositories.has(community.repository ?? EXTERNAL_REPOSITORY);
+  const entityAllowed = (entity: EntityRef): boolean =>
+    (selectedRepositories.size === 0 ||
+      selectedRepositories.has(entity.repository ?? EXTERNAL_REPOSITORY)) &&
+    (options.includeTests || !entity.test) &&
+    options.origins.includes(entity.origin);
+  const nodes = new Map<string, GraphNode>();
+  for (const community of overview.communities) {
+    if (expandedCommunities.has(community.id) || !communityAllowed(community)) continue;
+    nodes.set(community.id, {
+      id: community.id,
+      label: community.name,
+      kind: community.kind === 'external' ? 'external_community' : 'repository_community',
+      community: community.id,
+      communityLabel: community.name,
+      degree: 0,
+      aggregate: true,
+      entityCount: community.entity_count
+    });
+  }
+  for (const id of concreteIds) {
+    const entity = entities.get(id);
+    if (!entity || !entityAllowed(entity)) continue;
+    const community = communityById.get(communityIdForEntity(entity));
+    nodes.set(id, {
+      id,
+      label: entity.name,
+      kind: entity.kind,
+      community: community?.id ?? communityIdForEntity(entity),
+      communityLabel: community?.name ?? entity.repository ?? 'External dependencies',
+      degree: 0,
+      aggregate: false
+    });
+  }
+
+  const links = new Map<string, GraphLink>();
+  const addLink = (
+    from: string,
+    to: string,
+    kind: RelationKind,
+    count: number,
+    rawId: string,
+    confidence = 1
+  ) => {
+    if (from === to || !nodes.has(from) || !nodes.has(to) || !allowedKinds.has(kind)) return;
+    const id = `${from}|${kind}|${to}`;
+    const existing = links.get(id);
+    if (existing) {
+      existing.count += count;
+      existing.confidence = Math.max(existing.confidence, confidence);
+      existing.rawEdgeIds.push(rawId);
+    } else {
+      links.set(id, {
+        id,
+        source: from,
+        target: to,
+        kind,
+        count,
+        confidence,
+        evidenceCount: 0,
+        rawEdgeIds: [rawId]
+      });
+    }
+  };
+  for (const edge of overview.edges) {
+    if (expandedCommunities.has(edge.from) || expandedCommunities.has(edge.to)) continue;
+    addLink(edge.from, edge.to, edge.kind, edge.count, edge.id);
+  }
+  for (const neighborhood of neighborhoods) {
+    for (const edge of neighborhood.edges) {
+      const fromEntity = entities.get(edge.from);
+      const toEntity = entities.get(edge.to);
+      if (!fromEntity || !toEntity) continue;
+      const from = concreteIds.has(edge.from) ? edge.from : communityIdForEntity(fromEntity);
+      const to = concreteIds.has(edge.to) ? edge.to : communityIdForEntity(toEntity);
+      addLink(from, to, edge.kind, 1, edge.id, edge.confidence);
+    }
+  }
+  for (const link of links.values()) {
+    const source = nodes.get(endpointId(link.source));
+    const target = nodes.get(endpointId(link.target));
+    if (source) source.degree += 1;
+    if (target) target.degree += 1;
+    link.rawEdgeIds.sort();
+  }
+  const projectedNodes = [...nodes.values()].sort(compareById);
+  const projectedLinks = [...links.values()].sort(compareById);
+  return {
+    nodes: projectedNodes,
+    links: projectedLinks,
+    rawNodeCount: projectedNodes.reduce((count, node) => count + (node.entityCount ?? 1), 0),
+    rawLinkCount: projectedLinks.reduce((count, link) => count + link.count, 0),
+    omittedNodes: 0,
+    omittedLinks: 0,
+    truncated: neighborhoods.some((neighborhood) => neighborhood.truncated)
+  };
+}
+
 export function directHighlight(links: GraphLink[], selectedId: string | null) {
   const upstreamNodeIds = new Set<string>();
   const downstreamNodeIds = new Set<string>();
@@ -307,4 +541,8 @@ export function entityCommunity(entity: EntityRef): { id: string; label: string 
 
 function compareById<T extends { id: string }>(left: T, right: T): number {
   return left.id.localeCompare(right.id);
+}
+
+function deduplicateById<T extends { id: string }>(items: readonly T[]): T[] {
+  return [...new Map(items.map((item) => [item.id, item])).values()];
 }

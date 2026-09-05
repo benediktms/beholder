@@ -76,9 +76,11 @@ published.
 
 ## Follow-up
 
-The desktop client should cache overviews and expansions by workspace revision,
-replace an expanded virtual node with streamed detail without replacing the
-whole view, preserve the selected traversal path, and prune unrelated detail
-when focus changes. Response bytes and daemon/query/client timings should be
-recorded for both a small workspace and a large multi-repository workspace
-before adding community detection, WASM layout, or more GPU work.
+The desktop client caches overviews and completed expansions by workspace
+revision, replaces an expanded virtual node with streamed detail without
+replacing the whole view, preserves the selected traversal path, and prunes
+unrelated entity expansions when focus changes.
+
+Response bytes and daemon/query/client timings should still be recorded for
+both a small workspace and a large multi-repository workspace before adding
+community detection, WASM layout, or more GPU work.

@@ -1,8 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use beholder_domain::Workspace;
-use beholder_dto::{EntityRef, QueryMetadata, SemanticEdge, WorkspaceTopology};
+use beholder_dto::{
+    EntityRef, GraphCommunity, GraphCommunityEdge, GraphNeighborhoodFocus, QueryMetadata,
+    SemanticEdge, WorkspaceGraphNeighborhoodBatch, WorkspaceGraphOverview, WorkspaceTopology,
+};
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +51,53 @@ struct GraphSnapshot {
     edges: Vec<SemanticEdge>,
 }
 
+#[derive(Debug, Serialize)]
+struct GraphOverviewSnapshot {
+    workspace: WorkspaceSummary,
+    schema: String,
+    metadata: QueryMetadata,
+    communities: Vec<GraphCommunity>,
+    edges: Vec<GraphCommunityEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphNeighborhoodRequest {
+    workspace: String,
+    focus: GraphNeighborhoodFocus,
+    max_edges: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphNeighborhoodBatch {
+    schema: String,
+    metadata: QueryMetadata,
+    focus: GraphNeighborhoodFocus,
+    max_edges: u32,
+    truncated: bool,
+    nodes: Vec<EntityRef>,
+    edges: Vec<SemanticEdge>,
+    batch_index: u32,
+    complete: bool,
+}
+
+impl From<WorkspaceGraphNeighborhoodBatch> for GraphNeighborhoodBatch {
+    fn from(batch: WorkspaceGraphNeighborhoodBatch) -> Self {
+        Self {
+            schema: batch.schema,
+            metadata: batch.metadata,
+            focus: batch.focus,
+            max_edges: batch.neighborhood.max_edges,
+            truncated: batch.neighborhood.truncated,
+            nodes: batch.nodes,
+            edges: batch.edges,
+            batch_index: batch.batch_index,
+            complete: batch.complete,
+        }
+    }
+}
+
 #[tauri::command]
 #[tracing::instrument(name = "tauri.list_workspaces", skip_all, err)]
 async fn list_workspaces() -> Result<Vec<WorkspaceSummary>, String> {
@@ -89,6 +140,63 @@ async fn load_graph(request: GraphRequest) -> Result<GraphSnapshot, String> {
 
 #[tauri::command]
 #[tracing::instrument(
+    name = "tauri.load_graph_overview",
+    skip_all,
+    err,
+    fields(workspace = %request.workspace)
+)]
+async fn load_graph_overview(request: GraphRequest) -> Result<GraphOverviewSnapshot, String> {
+    let workspace = beholder_daemon_client::list_workspaces()
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|workspace| workspace.name == request.workspace)
+        .ok_or_else(|| format!("unknown workspace: {}", request.workspace))?;
+    let WorkspaceGraphOverview {
+        schema,
+        metadata,
+        communities,
+        edges,
+    } = beholder_daemon_client::workspace_graph_overview(request.workspace)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(GraphOverviewSnapshot {
+        workspace: workspace.into(),
+        schema,
+        metadata,
+        communities,
+        edges,
+    })
+}
+
+#[tauri::command]
+#[tracing::instrument(
+    name = "tauri.stream_graph_neighborhood",
+    skip_all,
+    err,
+    fields(workspace = %request.workspace)
+)]
+async fn stream_graph_neighborhood(
+    request: GraphNeighborhoodRequest,
+    on_batch: Channel<GraphNeighborhoodBatch>,
+) -> Result<(), String> {
+    let mut stream = beholder_daemon_client::workspace_graph_neighborhood(
+        request.workspace,
+        request.focus,
+        request.max_edges,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    while let Some(batch) = stream.message().await.map_err(|error| error.to_string())? {
+        on_batch
+            .send(batch.into())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[tracing::instrument(
     name = "tauri.topology_status",
     skip_all,
     err,
@@ -109,6 +217,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_workspaces,
             load_graph,
+            load_graph_overview,
+            stream_graph_neighborhood,
             topology_status
         ])
         .run(tauri::generate_context!())

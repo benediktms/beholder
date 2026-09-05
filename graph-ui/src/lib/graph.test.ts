@@ -7,8 +7,13 @@ import {
   entityCommunity,
   extendTrail,
   findEntity,
+  mergeNeighborhoodBatches,
   projectGraph,
+  projectLevelOfDetail,
   type EntityRef,
+  type GraphNeighborhood,
+  type GraphNeighborhoodBatch,
+  type GraphOverviewSnapshot,
   type GraphSnapshot,
   type ProjectionOptions,
   type SemanticEdge
@@ -167,6 +172,59 @@ test('visible guards keep deterministic topology and report omissions', () => {
   assert.equal(graph.truncated, true);
 });
 
+test('level-of-detail projection starts with aggregate communities', () => {
+  const graph = projectLevelOfDetail(overview(), [], options);
+  assert.deepEqual(graph.nodes.map((node) => node.id), [
+    'community://repository/repo-a',
+    'community://repository/repo-b'
+  ]);
+  assert.equal(graph.nodes.every((node) => node.aggregate), true);
+  assert.equal(graph.links[0].count, 3);
+  assert.equal(graph.rawNodeCount, 30);
+});
+
+test('repository expansion replaces only its aggregate and collapses boundary entities', () => {
+  const graph = projectLevelOfDetail(overview(), [repositoryNeighborhood()], options);
+  assert.deepEqual(graph.nodes.map((node) => node.id), [
+    'a1',
+    'a2',
+    'community://repository/repo-b'
+  ]);
+  assert.equal(graph.nodes.some((node) => node.id === 'community://repository/repo-a'), false);
+  assert.equal(graph.nodes.some((node) => node.id === 'b1'), false);
+  assert.equal(
+    graph.links.some(
+      (link) => link.source === 'a1' && link.target === 'community://repository/repo-b'
+    ),
+    true
+  );
+});
+
+test('stream batches validate order and assemble one cached neighborhood', () => {
+  const neighborhood = repositoryNeighborhood();
+  const batches: GraphNeighborhoodBatch[] = [
+    {
+      ...neighborhood,
+      nodes: neighborhood.nodes.slice(0, 2),
+      edges: [],
+      batchIndex: 0,
+      complete: false
+    },
+    {
+      ...neighborhood,
+      nodes: neighborhood.nodes.slice(2),
+      edges: neighborhood.edges,
+      batchIndex: 1,
+      complete: true
+    }
+  ];
+  assert.deepEqual(mergeNeighborhoodBatches(batches), neighborhood);
+  assert.throws(
+    () => mergeNeighborhoodBatches([{ ...batches[1], batchIndex: 1 }]),
+    /expected batch 0/
+  );
+});
+
 function entity(id: string, repository: string): EntityRef {
   return {
     id,
@@ -187,5 +245,48 @@ function edge(id: string, from: string, to: string): SemanticEdge {
     kind: 'calls',
     confidence: 1,
     evidence: []
+  };
+}
+
+function overview(): GraphOverviewSnapshot {
+  return {
+    schema: 'overview',
+    workspace: snapshot.workspace,
+    metadata: snapshot.metadata,
+    communities: [
+      {
+        id: 'community://repository/repo-a',
+        kind: 'repository',
+        name: 'repo-a',
+        repository: 'repo-a',
+        entity_count: 10
+      },
+      {
+        id: 'community://repository/repo-b',
+        kind: 'repository',
+        name: 'repo-b',
+        repository: 'repo-b',
+        entity_count: 20
+      }
+    ],
+    edges: [{
+      id: 'c1',
+      from: 'community://repository/repo-a',
+      to: 'community://repository/repo-b',
+      kind: 'calls',
+      count: 3
+    }]
+  };
+}
+
+function repositoryNeighborhood(): GraphNeighborhood {
+  return {
+    schema: 'neighborhood',
+    metadata: snapshot.metadata,
+    focus: { kind: 'repository', id: 'repo-a' },
+    maxEdges: 2000,
+    truncated: false,
+    nodes: [entity('a1', 'repo-a'), entity('a2', 'repo-a'), entity('b1', 'repo-b')],
+    edges: [edge('n1', 'a1', 'a2'), edge('n2', 'a1', 'b1')]
   };
 }

@@ -119,6 +119,12 @@
   });
 
   function rebuild(next: Projection) {
+    const previousGraph = renderer?.getGraph();
+    const previousPositions = new Map<string, { x: number; y: number }>();
+    previousGraph?.forEachNode((node, attributes) => {
+      previousPositions.set(node, { x: attributes.x, y: attributes.y });
+    });
+    const previousCamera = renderer?.getCamera().getState();
     stopRenderer();
     const graph = new MultiDirectedGraph<NodeAttributes, EdgeAttributes>();
     const nodeById = new Map(next.nodes.map((node) => [node.id, node]));
@@ -126,11 +132,17 @@
     next.nodes.forEach((node, index) => {
       const angle = index * 2.399963229728653;
       const radius = Math.sqrt((index + 1) / count);
+      const previous = previousPositions.get(node.id)
+        ?? previousPositions.get(node.community);
       graph.addNode(node.id, {
-        label: node.label,
-        x: Math.cos(angle) * radius,
-        y: Math.sin(angle) * radius,
-        size: Math.min(2.5, 0.6 + Math.log2(node.degree + 1) * 0.25),
+        label: node.aggregate && node.entityCount
+          ? `${node.label} · ${node.entityCount.toLocaleString()} entities`
+          : node.label,
+        x: previous?.x ?? Math.cos(angle) * radius,
+        y: previous?.y ?? Math.sin(angle) * radius,
+        size: node.aggregate
+          ? Math.min(12, 7.5 + Math.log10((node.entityCount ?? 0) + 1))
+          : Math.min(2.5, 0.6 + Math.log2(node.degree + 1) * 0.25),
         color: communityColor(node.community)
       });
     });
@@ -165,6 +177,7 @@
       zIndex: true
     });
     renderer = nextRenderer;
+    if (previousCamera) nextRenderer.getCamera().setState(previousCamera);
     nextRenderer.on('enterNode', ({ node }) => (hoveredId = node));
     nextRenderer.on('leaveNode', () => (hoveredId = null));
     nextRenderer.on('clickNode', ({ node }) => onSelect(nodeById.get(node) ?? null));

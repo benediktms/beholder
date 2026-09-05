@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
+  import { Channel, invoke } from '@tauri-apps/api/core';
   import { QueryClient } from '@tanstack/svelte-query';
   import { onMount } from 'svelte';
   import GraphCanvas from '$lib/GraphCanvas.svelte';
@@ -11,12 +11,20 @@
     RELATION_KINDS,
     extendTrail,
     findEntity,
-    projectGraph,
+    graphFocusKey,
+    mergeNeighborhoodBatches,
+    projectLevelOfDetail,
     type EntityOrigin,
+    type EntityRef,
+    type GraphNeighborhood,
+    type GraphNeighborhoodBatch,
+    type GraphNeighborhoodFocus,
     type GraphNode,
-    type GraphSnapshot,
+    type GraphOverviewSnapshot,
     type Projection,
-    type RelationKind, type QueryMetadata,
+    type QueryMetadata,
+    type RelationKind,
+    type SemanticEdge,
     type WorkspaceSummary
   } from '$lib/graph';
 
@@ -37,7 +45,8 @@
 
   let workspaces: WorkspaceSummary[] = [];
   let selectedWorkspace = '';
-  let snapshot: GraphSnapshot | null = null;
+  let overview: GraphOverviewSnapshot | null = null;
+  let neighborhoods: GraphNeighborhood[] = [];
   let repositories: string[] = [];
   let relationKinds: RelationKind[] = [...RELATION_KINDS];
   let origins: EntityOrigin[] = [...ORIGINS];
@@ -50,14 +59,17 @@
   let inspectorWidth = 288;
   let loading = true;
   let error = '';
+  let detailError = '';
   let statusError = '';
   let status: QueryMetadata | null = null;
   let search = '';
   let loadRequest = 0;
   let pollingStatus = false;
+  let neighborhoodRequest = 0;
+  let loadingNeighborhoods = new Set<string>();
 
-  $: projection = snapshot
-    ? projectGraph(snapshot, {
+  $: projection = overview
+    ? projectLevelOfDetail(overview, neighborhoods, {
         repositories,
         relationKinds,
         includeTests,
@@ -65,8 +77,8 @@
       })
     : emptyProjection;
   $: repositoryOptions = [
-    ...(snapshot?.workspace.repositories ?? []),
-    ...(snapshot?.nodes.some((node) => node.repository === null)
+    ...(overview?.workspace.repositories ?? []),
+    ...(overview?.communities.some((community) => community.kind === 'external')
       ? [{ identity: EXTERNAL_REPOSITORY, displayName: 'External contracts' }]
       : [])
   ];
@@ -75,12 +87,14 @@
     : repositories.length === 1
       ? repositoryOptions.find((item) => item.identity === repositories[0])?.displayName ?? repositories[0]
       : `${repositories.length} repositories`;
-  $: selectedEntity = snapshot?.nodes.find((node) => node.id === rootId) ?? null;
-  $: selectedEdges = snapshot && rootId
-    ? snapshot.edges.filter((edge) => edge.from === rootId || edge.to === rootId)
+  $: loadedNodes = deduplicateEntities(neighborhoods.flatMap((neighborhood) => neighborhood.nodes));
+  $: loadedEdges = deduplicateEdges(neighborhoods.flatMap((neighborhood) => neighborhood.edges));
+  $: selectedEntity = loadedNodes.find((node) => node.id === rootId) ?? null;
+  $: selectedEdges = rootId
+    ? loadedEdges.filter((edge) => edge.from === rootId || edge.to === rootId)
     : [];
-  $: pinnedAnalysis = snapshot?.metadata.analysis ?? { completeness: 'complete' as const, diagnostics: [] };
-  $: currentFreshness = status?.freshness ?? snapshot?.metadata.freshness ?? null;
+  $: pinnedAnalysis = overview?.metadata.analysis ?? { completeness: 'complete' as const, diagnostics: [] };
+  $: currentFreshness = status?.freshness ?? overview?.metadata.freshness ?? null;
 
   onMount(() => {
     void loadWorkspaces();
@@ -92,6 +106,7 @@
     const request = ++loadRequest;
     loading = true;
     error = '';
+    detailError = '';
     try {
       const nextWorkspaces = await invoke<WorkspaceSummary[]>('list_workspaces');
       if (request !== loadRequest) return;
@@ -101,7 +116,8 @@
         : workspaces[0]?.name ?? '';
       if (selectedWorkspace) await loadWorkspace();
       else {
-        snapshot = null;
+        overview = null;
+        neighborhoods = [];
         status = null;
       }
     } catch (cause) {
@@ -112,7 +128,7 @@
   }
 
   async function pollStatus() {
-    if (!selectedWorkspace || !snapshot || pollingStatus) return;
+    if (!selectedWorkspace || !overview || pollingStatus) return;
     const generation = loadRequest;
     const workspace = selectedWorkspace;
     pollingStatus = true;
@@ -131,18 +147,25 @@
   async function loadWorkspace() {
     if (!selectedWorkspace) return;
     const request = ++loadRequest;
+    ++neighborhoodRequest;
     const workspace = selectedWorkspace;
     loading = true;
     error = '';
+    detailError = '';
     try {
       const nextStatus = await invoke<QueryMetadata>('topology_status', { request: { workspace } });
-      const nextSnapshot = await queryClient.fetchQuery({
-        queryKey: ['topology', workspace, nextStatus.revision],
-        queryFn: () => invoke<GraphSnapshot>('load_graph', { request: { workspace } })
+      const nextOverview = await queryClient.fetchQuery({
+        queryKey: ['graph-overview', workspace, nextStatus.revision],
+        queryFn: () => invoke<GraphOverviewSnapshot>('load_graph_overview', { request: { workspace } })
       });
       if (request !== loadRequest) return;
-      snapshot = nextSnapshot;
-      status = snapshot.metadata;
+      queryClient.setQueryData(
+        ['graph-overview', workspace, nextOverview.metadata.revision],
+        nextOverview
+      );
+      overview = nextOverview;
+      neighborhoods = [];
+      status = overview.metadata;
       returnToWorkspace();
     } catch (cause) {
       if (request === loadRequest) error = String(cause);
@@ -152,9 +175,9 @@
   }
 
   function selectSearch() {
-    const entity = snapshot && findEntity(snapshot.nodes, search);
+    const entity = findEntity(loadedNodes, search);
     const id = entity?.id ?? search.trim();
-    if (id && snapshot?.nodes.some((node) => node.id === id)) selectEntity(id);
+    if (id) selectEntity(id);
   }
 
   function changeWorkspace(event: Event) {
@@ -167,18 +190,93 @@
       clearFocus();
       return;
     }
-    selectEntity(node.id);
+    if (node.aggregate) void expandCommunity(node.id);
+    else selectEntity(node.id);
   }
 
   function selectEntity(entity: string) {
-    if (!snapshot) return;
-    const connected = rootId !== null && snapshot?.edges.some(
+    if (!overview) return;
+    const connected = rootId !== null && loadedEdges.some(
       (edge) =>
         (edge.from === rootId && edge.to === entity) ||
         (edge.to === rootId && edge.from === entity)
     );
     trail = extendTrail({ trail, next: entity, connected: Boolean(connected) });
     rootId = entity;
+    pruneNeighborhoods();
+    void expandNeighborhood({ kind: 'entity', id: entity });
+  }
+
+  async function expandCommunity(community: string) {
+    const aggregate = overview?.communities.find((candidate) => candidate.id === community);
+    if (!aggregate) return;
+    clearFocus();
+    neighborhoods = [];
+    const focus: GraphNeighborhoodFocus = aggregate.kind === 'external'
+      ? { kind: 'external' }
+      : { kind: 'repository', id: aggregate.repository as string };
+    await expandNeighborhood(focus);
+  }
+
+  async function expandNeighborhood(focus: GraphNeighborhoodFocus) {
+    if (!overview) return;
+    const workspace = selectedWorkspace;
+    const revision = overview.metadata.revision;
+    const key = graphFocusKey(focus);
+    const cacheKey = ['graph-neighborhood', workspace, revision, key] as const;
+    const cached = queryClient.getQueryData<GraphNeighborhood>(cacheKey);
+    if (cached) {
+      replaceNeighborhood(cached);
+      return;
+    }
+    const request = ++neighborhoodRequest;
+    detailError = '';
+    loadingNeighborhoods = new Set([...loadingNeighborhoods, key]);
+    const batches: GraphNeighborhoodBatch[] = [];
+    let streamError = '';
+    const onBatch = new Channel<GraphNeighborhoodBatch>();
+    onBatch.onmessage = (batch) => {
+      if (request !== neighborhoodRequest || workspace !== selectedWorkspace) return;
+      if (batch.metadata.revision !== revision) {
+        streamError = `Workspace graph advanced from revision ${revision} to ${batch.metadata.revision}; refresh before expanding.`;
+        return;
+      }
+      batches.push(batch);
+      replaceNeighborhood(mergeNeighborhoodBatches(batches, false));
+    };
+    try {
+      await invoke('stream_graph_neighborhood', {
+        request: { workspace, focus, maxEdges: 2000 },
+        onBatch
+      });
+      if (request !== neighborhoodRequest || workspace !== selectedWorkspace) return;
+      if (streamError) throw new Error(streamError);
+      const neighborhood = mergeNeighborhoodBatches(batches);
+      queryClient.setQueryData(cacheKey, neighborhood);
+      replaceNeighborhood(neighborhood);
+    } catch (cause) {
+      if (request === neighborhoodRequest) detailError = String(cause);
+    } finally {
+      loadingNeighborhoods = new Set(
+        [...loadingNeighborhoods].filter((candidate) => candidate !== key)
+      );
+    }
+  }
+
+  function replaceNeighborhood(neighborhood: GraphNeighborhood) {
+    const key = graphFocusKey(neighborhood.focus);
+    neighborhoods = [
+      ...neighborhoods.filter((candidate) => graphFocusKey(candidate.focus) !== key),
+      neighborhood
+    ];
+  }
+
+  function pruneNeighborhoods() {
+    const retainedEntities = new Set(trail);
+    neighborhoods = neighborhoods.filter(
+      (neighborhood) =>
+        neighborhood.focus.kind !== 'entity' || retainedEntities.has(neighborhood.focus.id)
+    );
   }
 
   function clearFocus() {
@@ -190,10 +288,13 @@
     if (trail.length < 2) return;
     trail = trail.slice(0, -1);
     rootId = trail.at(-1) ?? null;
+    pruneNeighborhoods();
   }
 
   function returnToWorkspace() {
+    ++neighborhoodRequest;
     repositories = [];
+    neighborhoods = [];
     clearFocus();
   }
 
@@ -272,6 +373,14 @@
     const current = side === 'filters' ? filtersWidth : inspectorWidth;
     setDrawerWidth(side, current + direction * (side === 'filters' ? 16 : -16));
   }
+
+  function deduplicateEntities(nodes: EntityRef[]): EntityRef[] {
+    return [...new Map(nodes.map((node) => [node.id, node])).values()];
+  }
+
+  function deduplicateEdges(edges: SemanticEdge[]): SemanticEdge[] {
+    return [...new Map(edges.map((edge) => [edge.id, edge])).values()];
+  }
 </script>
 
 <svelte:head><title>Beholder Graph</title></svelte:head>
@@ -301,9 +410,9 @@
     </nav>
 
     <div class="header-meta">
-      <Badge>rev {snapshot?.metadata.revision ?? '—'}</Badge>
-      <span class:healthy={Boolean(snapshot && currentFreshness && !currentFreshness.stale && pinnedAnalysis.completeness === 'complete')} class="status-dot"></span>
-      <span>{!snapshot ? 'no snapshot' : pinnedAnalysis.completeness === 'incomplete' ? 'analysis incomplete' : currentFreshness?.stale ? 'stale' : 'snapshot ready'}</span>
+      <Badge>rev {overview?.metadata.revision ?? '—'}</Badge>
+      <span class:healthy={Boolean(overview && currentFreshness && !currentFreshness.stale && pinnedAnalysis.completeness === 'complete')} class="status-dot"></span>
+      <span>{!overview ? 'no snapshot' : pinnedAnalysis.completeness === 'incomplete' ? 'analysis incomplete' : currentFreshness?.stale ? 'stale' : 'snapshot ready'}</span>
       {#if pinnedAnalysis.completeness === 'incomplete'}
         <details class="analysis-diagnostics">
           <summary>{pinnedAnalysis.diagnostics.length} diagnostics</summary>
@@ -319,7 +428,7 @@
         </details>
       {/if}
       {#if statusError}<span>{statusError}</span>{/if}
-      {#if status && snapshot && status.revision > snapshot.metadata.revision}
+      {#if status && overview && status.revision > overview.metadata.revision}
         <Button size="sm" variant="outline" onclick={loadWorkspace}>Revision {status.revision} available · Refresh</Button>
       {/if}
     </div>
@@ -435,7 +544,7 @@
       <div class="graph-toolbar">
         <div>
           <span class="eyebrow">{rootId ? 'Relationship focus' : 'Workspace topology'}</span>
-          <h1>{selectedEntity?.name ?? snapshot?.workspace.name ?? 'Loading graph'}</h1>
+          <h1>{selectedEntity?.name ?? overview?.workspace.name ?? 'Loading graph'}</h1>
         </div>
         <div class="legend" aria-label="Highlight colors">
           <span><i class="selected"></i>Selected</span>
@@ -451,6 +560,9 @@
           {#if trail.length > 1}<Badge>{trail.length} nodes in path</Badge>{/if}
           <Badge>{projection.nodes.length}{projection.omittedNodes ? ` / ${projection.rawNodeCount}` : ''} nodes</Badge>
           <Badge>{projection.links.length}{projection.omittedLinks ? ` / ${projection.rawLinkCount}` : ''} links</Badge>
+          {#if loadingNeighborhoods.size}<Badge>Streaming detail…</Badge>{/if}
+          {#if projection.truncated}<Badge>Detail truncated</Badge>{/if}
+          {#if detailError}<Badge title={detailError}>Detail failed</Badge>{/if}
         </div>
       </div>
 
@@ -477,7 +589,7 @@
             {trail}
             onSelect={selectNode}
           />
-          <div class="zoom-hint">Scroll to zoom · click an entity to highlight its immediate context</div>
+          <div class="zoom-hint">Scroll to zoom · click a repository to expand · click an entity to load its context</div>
         {/if}
       </div>
     </section>
@@ -513,7 +625,7 @@
             {#each selectedEdges as edge}
               <article>
                 <div><Badge>{edge.kind}</Badge><span>{edge.from === rootId ? 'downstream' : 'upstream'}</span></div>
-                <strong>{snapshot?.nodes.find((node) => node.id === (edge.from === rootId ? edge.to : edge.from))?.name}</strong>
+                <strong>{loadedNodes.find((node) => node.id === (edge.from === rootId ? edge.to : edge.from))?.name}</strong>
                 {#if edge.evidence[0]?.path}
                   <small>{edge.evidence[0].path}:{edge.evidence[0].line ?? '—'}</small>
                 {/if}
@@ -522,9 +634,9 @@
           </div>
         {:else}
           <div class="instructions">
-            <div><span>01</span><p>Explore the complete typed topology for the selected workspace.</p></div>
-            <div><span>02</span><p>Use repository, relationship, origin, and test filters to narrow the view.</p></div>
-            <div><span>03</span><p>Select connected entities to preserve a highlighted traversal path.</p></div>
+            <div><span>01</span><p>Open on repository communities without loading the complete raw topology.</p></div>
+            <div><span>02</span><p>Select a community to stream its bounded detail into the current view.</p></div>
+            <div><span>03</span><p>Select connected entities to extend the highlighted path and load nearby detail.</p></div>
           </div>
           <div class="interaction-key">
             <p><strong>Hover</strong> highlights direct neighbours and incident links.</p>
