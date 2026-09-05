@@ -441,7 +441,10 @@ fn collect_class_evaluation_calls(
     let owner = node
         .child_by_field_name("name")
         .and_then(|name| text(name, source))
-        .map(str::to_owned);
+        .map(|name| match outer_owner {
+            Some(outer_owner) => format!("{outer_owner}/{name}"),
+            None => name.to_owned(),
+        });
     let body = node.child_by_field_name("body");
     let mut cursor = node.walk();
     for child in node
@@ -2470,6 +2473,20 @@ mod tests {
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://example/typescript/src/config/Outer/run"
                 && observation.to.as_str() == "repo://example/typescript/src/config/Outer/key"
+        }));
+    }
+
+    #[test]
+    fn classes_in_static_blocks_include_the_outer_class_owner() {
+        let observations = observations(
+            "class Outer { static { class Inner { static value = this.load(); static load() {} } } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config"
+                && observation.to.as_str()
+                    == "repo://example/typescript/src/config/Outer/Inner/load"
         }));
     }
 
