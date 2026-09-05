@@ -382,7 +382,10 @@ fn collect_calls_with_owner(
     if is_collection_boundary(node, root) {
         return;
     }
-    if matches!(node.kind(), "class" | "class_declaration") {
+    if matches!(
+        node.kind(),
+        "class" | "class_declaration" | "abstract_class_declaration"
+    ) {
         collect_class_evaluation_calls(node, source, root, calls, owner);
         return;
     }
@@ -2488,6 +2491,18 @@ mod tests {
                 && observation.to.as_str()
                     == "repo://example/typescript/src/config/Outer/Inner/load"
         }));
+    }
+
+    #[test]
+    fn abstract_instance_initializers_are_not_module_calls() {
+        let analysis = analyze(
+            "abstract class Service { client = connect(); static current = load(); }",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        assert!(analysis.calls.iter().any(|call| call.name == "load"));
+        assert!(!analysis.calls.iter().any(|call| call.name == "connect"));
     }
 
     #[test]
