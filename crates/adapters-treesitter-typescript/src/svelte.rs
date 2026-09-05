@@ -8,7 +8,7 @@ use beholder_indexing::{
     LanguageAnalyzerBuilder, Plugin, PluginActivation, PluginMetadata, RepositorySnapshot,
     SourceRecognitionInput, SourceRecognizer,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy)]
@@ -59,6 +59,7 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
         for definition in &mut embedded.definitions {
             definition.exported = false;
         }
+        embedded.exports.clear();
         embedded.parse_error_lines.extend(error_lines);
         embedded.parse_error_lines.sort_unstable();
         embedded.parse_error_lines.dedup();
@@ -69,37 +70,61 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
 }
 
 fn strip_runes(analysis: &mut TypescriptAnalysis) {
-    let store_bindings = analysis
-        .definitions
+    let mut store_factories = BTreeSet::new();
+    for binding in analysis
+        .imports
         .iter()
-        .filter(|definition| {
-            definition
-                .factory
-                .as_deref()
-                .is_some_and(|factory| !rune_factory(factory))
-        })
-        .filter_map(|definition| definition.qualified_name.rsplit('/').next())
-        .chain(
-            analysis
-                .imports
-                .iter()
-                .flat_map(|import| &import.bindings)
-                .map(|binding| binding.local.as_str()),
-        )
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+        .filter(|import| import.source == "svelte/store")
+        .flat_map(|import| &import.bindings)
+    {
+        if binding.imported == "*" {
+            store_factories.extend(
+                ["derived", "readable", "readonly", "toStore", "writable"]
+                    .map(|factory| format!("{}.{factory}", binding.local)),
+            );
+        } else if store_factory(&binding.imported) {
+            store_factories.insert(binding.local.clone());
+        }
+    }
+    let mut store_bindings = BTreeMap::<String, BTreeSet<String>>::new();
+    for definition in &analysis.definitions {
+        if !definition
+            .factory
+            .as_ref()
+            .is_some_and(|factory| store_factories.contains(factory))
+        {
+            continue;
+        }
+        let (scope, name) = definition
+            .qualified_name
+            .rsplit_once('/')
+            .unwrap_or(("", &definition.qualified_name));
+        store_bindings
+            .entry(scope.to_owned())
+            .or_default()
+            .insert(name.to_owned());
+    }
+    let empty = BTreeSet::new();
     analysis
         .calls
-        .retain(|call| !is_rune(call, &store_bindings));
+        .retain(|call| !is_rune(call, store_bindings.get("").unwrap_or(&empty)));
     for definition in &mut analysis.definitions {
-        definition
-            .calls
-            .retain(|call| !is_rune(call, &store_bindings));
-        if definition
-            .factory
-            .as_deref()
-            .is_some_and(|factory| rune_factory(factory) && !legacy_store(factory, &store_bindings))
-        {
+        let parent = definition
+            .qualified_name
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+        definition.calls.retain(|call| {
+            !is_rune(
+                call,
+                store_bindings
+                    .get(&definition.qualified_name)
+                    .unwrap_or(&empty),
+            )
+        });
+        if definition.factory.as_deref().is_some_and(|factory| {
+            rune_factory(factory)
+                && !legacy_store(factory, store_bindings.get(parent).unwrap_or(&empty))
+        }) {
             definition.factory = None;
         }
     }
@@ -253,6 +278,13 @@ fn rune_factory(name: &str) -> bool {
             .is_some_and(|(receiver, name)| rune_method(receiver, name))
 }
 
+fn store_factory(name: &str) -> bool {
+    matches!(
+        name,
+        "derived" | "readable" | "readonly" | "toStore" | "writable"
+    )
+}
+
 fn is_rune(call: &Call, store_bindings: &BTreeSet<String>) -> bool {
     (call.receiver.is_none() && rune_name(&call.name) && !legacy_store(&call.name, store_bindings))
         || call
@@ -279,7 +311,25 @@ fn inspect_receiver(receiver: &str) -> bool {
             let mut depth = 0;
             let mut quote = None;
             let mut escaped = false;
+            let mut line_comment = false;
+            let mut block_comment = false;
+            let mut previous = None;
             let Some(end) = suffix.char_indices().find_map(|(index, character)| {
+                if line_comment {
+                    if matches!(character, '\r' | '\n') {
+                        line_comment = false;
+                    }
+                    return None;
+                }
+                if block_comment {
+                    if previous == Some('*') && character == '/' {
+                        block_comment = false;
+                        previous = None;
+                    } else {
+                        previous = Some(character);
+                    }
+                    return None;
+                }
                 if let Some(delimiter) = quote {
                     if escaped {
                         escaped = false;
@@ -290,8 +340,20 @@ fn inspect_receiver(receiver: &str) -> bool {
                     }
                     return None;
                 }
+                if previous == Some('/') && character == '/' {
+                    line_comment = true;
+                    previous = None;
+                    return None;
+                }
+                if previous == Some('/') && character == '*' {
+                    block_comment = true;
+                    previous = None;
+                    return None;
+                }
                 match character {
-                    '\'' | '"' | '`' => quote = Some(character),
+                    '\'' | '"' | '`' => {
+                        quote = Some(character);
+                    }
                     '<' => depth += 1,
                     '>' if !suffix[..index].ends_with('=') => {
                         depth -= 1;
@@ -301,6 +363,7 @@ fn inspect_receiver(receiver: &str) -> bool {
                     }
                     _ => {}
                 }
+                previous = Some(character);
                 None
             }) else {
                 return false;
@@ -407,6 +470,7 @@ mod tests {
               $inspect<[number]>(count).with(console.trace);
               $inspect<(value: number) => number>(format).with(console.trace);
               $inspect<">">(count).with(console.trace);
+              $inspect<Foo /* > */>(count).with(console.trace);
               $state.refresh();
               api.$state();
             </script>
@@ -450,7 +514,7 @@ mod tests {
     #[test]
     fn preserves_callable_legacy_store_subscriptions() {
         let analysis = crate::analyze(
-            "<script>const state = writable(load); const current = $state();</script>",
+            "<script>import { writable } from 'svelte/store'; const state = writable(load); const current = $state();</script>",
             SourceLanguage::Svelte,
         )
         .unwrap();
@@ -460,6 +524,31 @@ mod tests {
             definition.qualified_name == "current"
                 && definition.factory.as_deref() == Some("$state")
         }));
+    }
+
+    #[test]
+    fn unrelated_factories_do_not_disguise_runes_as_stores() {
+        let analysis = crate::analyze(
+            "<script>const state = load(); function nested() { const state = createStore(); } const reactive = $state(0);</script>",
+            SourceLanguage::Svelte,
+        )
+        .unwrap();
+
+        assert!(!analysis.calls.iter().any(|call| call.name == "$state"));
+        assert!(analysis.definitions.iter().any(|definition| {
+            definition.qualified_name == "reactive" && definition.factory.is_none()
+        }));
+    }
+
+    #[test]
+    fn clears_instance_export_clauses() {
+        let analysis = crate::analyze(
+            "<script>function save() {} export { save };</script>",
+            SourceLanguage::Svelte,
+        )
+        .unwrap();
+
+        assert!(analysis.exports.is_empty());
     }
 
     #[test]
