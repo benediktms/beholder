@@ -9,8 +9,9 @@ Define Beholder's typed semantic query and presentation contracts from
 
 ### Requirement: Query-specific typed results
 
-`entity search`, `context`, `dependencies`, `impact`, `trace`, and `why` SHALL return
-query-specific Beholder DTOs rather than storage rows or a generic value table.
+`entity search`, `workspace topology`, `context`, `dependencies`, `impact`, `trace`,
+and `why` SHALL return query-specific Beholder DTOs rather than storage rows or a
+generic value table.
 
 #### Scenario: gRPC query response
 
@@ -20,8 +21,9 @@ query-specific Beholder DTOs rather than storage rows or a generic value table.
 ### Requirement: Versioned query contracts
 
 Each typed query response SHALL carry its query-specific schema identifier:
-`beholder.entity_search.v1`, `beholder.context.v1`, `beholder.dependencies.v2`,
-`beholder.impact.v2`, `beholder.trace.v2`, or `beholder.why.v2`.
+`beholder.entity_search.v1`, `beholder.workspace_topology.v1`,
+`beholder.context.v1`, `beholder.dependencies.v2`, `beholder.impact.v2`,
+`beholder.trace.v2`, or `beholder.why.v2`.
 
 #### Scenario: Requesting JSON output
 
@@ -66,12 +68,12 @@ freshness, completeness, diagnostics, bounds, and truncation state where applica
 
 #### Scenario: New generation pending
 
-- **WHEN** a query reads the last complete revision while newer work is pending
+- **WHEN** a query reads the last atomically published revision while newer work is pending
 - **THEN** the result remains usable and reports that it is stale
 
 ### Requirement: Bounded traversals
 
-`dependencies`, `impact`, and `trace` SHALL acquire graph frontiers up to the
+`dependencies`, `impact`, `trace`, and `why` SHALL acquire graph frontiers up to the
 requested hop limit and perform the boundary probe needed to report exact truncation.
 
 #### Scenario: Reachable graph extends beyond the limit
