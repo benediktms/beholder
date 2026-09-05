@@ -1937,7 +1937,13 @@ fn observation_target(
             };
             ids.get(&format!("{owner}/{}", call.name))
                 .cloned()
-                .unwrap_or_else(|| format!("{language}-method://this/{}", call.name))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{language}-method://{}/{}",
+                        call.owner.as_deref().unwrap_or("this"),
+                        call.name
+                    )
+                })
         }
         CallKind::Member => format!(
             "{language}-method://{}/{}",
