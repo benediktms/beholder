@@ -460,7 +460,7 @@ fn collect_class_evaluation_calls(
             .or_else(|| member.child_by_field_name("property"))
             .filter(|name| name.kind() == "computed_property_name")
         {
-            collect_calls_with_owner(name, source, root, calls, owner.as_deref());
+            collect_calls_with_owner(name, source, root, calls, outer_owner);
         }
         match member.kind() {
             "class_static_block" => {
@@ -2457,6 +2457,19 @@ mod tests {
         assert!(observations.iter().any(|observation| {
             observation.from.as_str() == "repo://example/typescript/src/config/Outer/run"
                 && observation.to.as_str() == "repo://example/typescript/src/config/Outer/makeBase"
+        }));
+    }
+
+    #[test]
+    fn nested_class_computed_keys_keep_the_outer_this_owner() {
+        let observations = observations(
+            "class Outer { key() {} run() { class Inner { [this.key()]() {} } } }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config/Outer/run"
+                && observation.to.as_str() == "repo://example/typescript/src/config/Outer/key"
         }));
     }
 
