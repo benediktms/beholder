@@ -8,6 +8,7 @@ use beholder_indexing::{
     LanguageAnalyzerBuilder, Plugin, PluginActivation, PluginMetadata, RepositorySnapshot,
     SourceRecognitionInput, SourceRecognizer,
 };
+use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy)]
@@ -50,10 +51,30 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
         let (source, language, error_lines) =
             extract_scripts(input.syntax.root_node(), input.text)?;
         let mut embedded = analyze_core(&source, language)?;
-        embedded.calls.retain(|call| !is_rune(call));
+        let store_bindings = embedded
+            .definitions
+            .iter()
+            .filter(|definition| definition.factory.is_some())
+            .filter_map(|definition| definition.qualified_name.rsplit('/').next())
+            .chain(
+                embedded
+                    .imports
+                    .iter()
+                    .flat_map(|import| &import.bindings)
+                    .map(|binding| binding.local.as_str()),
+            )
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        embedded
+            .calls
+            .retain(|call| !is_rune(call, &store_bindings));
         for definition in &mut embedded.definitions {
-            definition.calls.retain(|call| !is_rune(call));
-            if definition.factory.as_deref().is_some_and(rune_name) {
+            definition
+                .calls
+                .retain(|call| !is_rune(call, &store_bindings));
+            if definition.factory.as_deref().is_some_and(|factory| {
+                rune_name(factory) && !legacy_store(factory, &store_bindings)
+            }) {
                 definition.factory = None;
             }
         }
@@ -197,12 +218,17 @@ fn rune_method(receiver: &str, name: &str) -> bool {
     )
 }
 
-fn is_rune(call: &Call) -> bool {
-    (call.receiver.is_none() && rune_name(&call.name))
+fn is_rune(call: &Call, store_bindings: &BTreeSet<String>) -> bool {
+    (call.receiver.is_none() && rune_name(&call.name) && !legacy_store(&call.name, store_bindings))
         || call
             .receiver
             .as_deref()
             .is_some_and(|receiver| rune_method(receiver, &call.name) || inspect_receiver(receiver))
+}
+
+fn legacy_store(name: &str, store_bindings: &BTreeSet<String>) -> bool {
+    name.strip_prefix('$')
+        .is_some_and(|name| store_bindings.contains(name))
 }
 
 fn inspect_receiver(receiver: &str) -> bool {
@@ -219,7 +245,7 @@ fn inspect_receiver(receiver: &str) -> bool {
             let Some(end) = suffix.char_indices().find_map(|(index, character)| {
                 match character {
                     '<' => depth += 1,
-                    '>' => {
+                    '>' if !suffix[..index].ends_with('=') => {
                         depth -= 1;
                         if depth == 0 {
                             return Some(index + character.len_utf8());
@@ -328,6 +354,7 @@ mod tests {
               $inspect (count).with(console.trace);
               $inspect /* reason */ (count).with(console.trace);
               $inspect<[number]>(count).with(console.trace);
+              $inspect<(value: number) => number>(format).with(console.trace);
               $state.refresh();
               api.$state();
             </script>
@@ -365,6 +392,21 @@ mod tests {
                     .as_deref()
                     .is_some_and(|receiver| receiver.starts_with("$inspect"))
         }));
-        assert!(!calls.iter().any(|call| is_rune(call)));
+        assert!(!calls.iter().any(|call| is_rune(call, &BTreeSet::new())));
+    }
+
+    #[test]
+    fn preserves_callable_legacy_store_subscriptions() {
+        let analysis = crate::analyze(
+            "<script>const state = writable(load); const current = $state();</script>",
+            SourceLanguage::Svelte,
+        )
+        .unwrap();
+
+        assert!(analysis.calls.iter().any(|call| call.name == "$state"));
+        assert!(analysis.definitions.iter().any(|definition| {
+            definition.qualified_name == "current"
+                && definition.factory.as_deref() == Some("$state")
+        }));
     }
 }
