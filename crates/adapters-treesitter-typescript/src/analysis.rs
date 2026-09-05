@@ -161,6 +161,7 @@ fn call_target(
     let call = Call {
         kind,
         receiver,
+        owner: None,
         returned_context: None,
         returned_receiver: None,
         name,
@@ -423,6 +424,11 @@ fn collect_class_evaluation_calls(
     root: Node<'_>,
     calls: &mut Vec<Call>,
 ) {
+    let owner = node
+        .child_by_field_name("name")
+        .and_then(|name| text(name, source))
+        .map(str::to_owned);
+    let first_call = calls.len();
     let body = node.child_by_field_name("body");
     let mut cursor = node.walk();
     for child in node
@@ -455,6 +461,13 @@ fn collect_class_evaluation_calls(
                 }
             }
             _ => {}
+        }
+    }
+    if let Some(owner) = owner {
+        for call in &mut calls[first_call..] {
+            if call.owner.is_none() {
+                call.owner = Some(owner.clone());
+            }
         }
     }
 }
@@ -1916,10 +1929,16 @@ fn observation_target(
             .or_else(|| ids.get(&call.name))
             .cloned()
             .unwrap_or_else(|| format!("{language}-call://{}", call.name)),
-        CallKind::Member if call.receiver.as_deref() == Some("this") => ids
-            .get(&format!("{scope}/{}", call.name))
-            .cloned()
-            .unwrap_or_else(|| format!("{language}-method://this/{}", call.name)),
+        CallKind::Member if call.receiver.as_deref() == Some("this") => {
+            let owner = match (scope.is_empty(), call.owner.as_deref()) {
+                (true, Some(owner)) => owner.to_owned(),
+                (false, Some(owner)) => format!("{scope}/{owner}"),
+                (_, None) => scope.to_owned(),
+            };
+            ids.get(&format!("{owner}/{}", call.name))
+                .cloned()
+                .unwrap_or_else(|| format!("{language}-method://this/{}", call.name))
+        }
         CallKind::Member => format!(
             "{language}-method://{}/{}",
             call.receiver.as_deref().unwrap_or("_"),
@@ -2364,6 +2383,19 @@ mod tests {
             .unwrap();
 
         assert!(run.calls.is_empty());
+    }
+
+    #[test]
+    fn class_static_this_calls_resolve_to_the_class_member() {
+        let observations = observations(
+            "class Config { static value = this.load(); static load() {} }",
+            "src/config.ts",
+        );
+
+        assert!(observations.iter().any(|observation| {
+            observation.from.as_str() == "repo://example/typescript/src/config"
+                && observation.to.as_str() == "repo://example/typescript/src/config/Config/load"
+        }));
     }
 
     #[test]
