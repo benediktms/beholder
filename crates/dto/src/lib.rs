@@ -606,6 +606,7 @@ pub struct GraphTraversalMetadata {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TraverseGraphResult {
     pub schema: String,
+    #[serde(flatten)]
     pub metadata: QueryMetadata,
     pub query: TraverseGraphQuery,
     pub nodes: Vec<EntityRef>,

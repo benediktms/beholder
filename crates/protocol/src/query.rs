@@ -565,6 +565,15 @@ mod multipath_tests {
                 ],
             },
         };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["revision"], 42);
+        assert_eq!(json["view"], "main");
+        assert!(json.get("freshness").is_some());
+        assert!(json.get("metadata").is_none());
+        assert_eq!(
+            serde_json::from_value::<dto::TraverseGraphResult>(json).unwrap(),
+            result
+        );
         let wire = v1::TraverseGraphResponse::from(result.clone());
         assert_eq!(
             dto::TraverseGraphResult::try_from(wire.clone()).unwrap(),

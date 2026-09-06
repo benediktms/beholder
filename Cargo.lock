@@ -701,6 +701,7 @@ dependencies = [
  "beholder-dto",
  "beholder-indexing",
  "prost",
+ "serde_json",
  "sha2",
  "tonic",
  "tonic-prost",
