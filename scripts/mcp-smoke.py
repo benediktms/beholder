@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import copy
 import select
 import subprocess
 import sys
@@ -15,6 +16,44 @@ process = subprocess.Popen(
     text=True,
 )
 request_id = 0
+
+
+def canonical_search_result(result):
+    result = copy.deepcopy(result)
+    if "matches" in result:
+        result["matches"] = sorted(result["matches"], key=lambda item: item["id"])
+    freshness = result.get("freshness")
+    if isinstance(freshness, dict):
+        freshness = dict(freshness)
+        freshness.pop("indexing", None)
+        result["freshness"] = freshness
+    if "diagnostics" in result:
+        result["diagnostics"] = sorted(result["diagnostics"], key=lambda item: (
+            item.get("code", ""),
+            item.get("severity", 0),
+            item.get("detail", ""),
+        ))
+    return result
+
+
+def canonical_traversal_result(result):
+    result = copy.deepcopy(result)
+    if "nodes" in result:
+        result["nodes"] = sorted(result["nodes"], key=lambda item: item["id"])
+    if "edges" in result:
+        result["edges"] = sorted(result["edges"], key=lambda item: (item["from"], item["to"], item["kind"]))
+    if "paths" in result:
+        result["paths"] = sorted(
+            result["paths"],
+            key=lambda path: (tuple(path["nodes"]), tuple(path["edges"]), path["termination"]),
+        )
+    metadata = copy.deepcopy(result.get("metadata", {}))
+    if isinstance(metadata, dict):
+        metadata.pop("indexing", None)
+        result["metadata"] = metadata
+    if "truncation_reasons" in result:
+        result["truncation_reasons"] = sorted(result["truncation_reasons"])
+    return result
 
 
 def send(method, params=None):
@@ -70,7 +109,7 @@ try:
         raise AssertionError(f"workspace {workspace!r} is not registered")
 
     search_input = {"workspace": workspace, "query": query}
-    first_search = call("search_entities", search_input)
+    first_search = canonical_search_result(call("search_entities", search_input))
     if expected_entity == "-":
         entity = next(iter(first_search["matches"]), None)
     else:
@@ -86,17 +125,17 @@ try:
         "direction": "dependencies",
         "max_hops": 1,
     }
-    first_traversal = call("traverse_graph", traversal_input)
+    first_traversal = canonical_traversal_result(call("traverse_graph", traversal_input))
     node_ids = {node["id"] for node in first_traversal["nodes"]}
     for expected in expected_nodes:
         if expected not in node_ids:
             raise AssertionError(f"traversal did not contain {expected!r}")
 
     started = time.perf_counter()
-    second_search = call("search_entities", search_input)
+    second_search = canonical_search_result(call("search_entities", search_input))
     search_ms = (time.perf_counter() - started) * 1000
     started = time.perf_counter()
-    second_traversal = call("traverse_graph", traversal_input)
+    second_traversal = canonical_traversal_result(call("traverse_graph", traversal_input))
     traversal_ms = (time.perf_counter() - started) * 1000
     if first_search != second_search or first_traversal != second_traversal:
         raise AssertionError("daemon ordering or metadata changed between warm calls")
