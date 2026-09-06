@@ -2,9 +2,8 @@
 
 ## Purpose
 
-Define organization- and framework-specific recognition from
-`docs/adr/0005-runtime-analyzer-plugins.md` without opening Beholder's ontology or
-parser internals.
+Define trusted executable plugins for organization- and framework-specific
+recognition without opening Beholder's ontology, parser internals, or storage.
 
 ## Requirements
 

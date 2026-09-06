@@ -2,9 +2,8 @@
 
 ## Purpose
 
-Define content-authoritative workspace identity and coherent revision publication.
-The rationale is retained in `docs/adr/0004-content-authoritative-repository-inventory.md`
-and the Git and workspace model in `docs/VISION.md`.
+Define content-authoritative repository inventory, immutable analysis snapshots, and
+coherent workspace revision publication.
 
 ## Requirements
 

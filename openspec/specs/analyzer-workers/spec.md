@@ -2,11 +2,8 @@
 
 ## Purpose
 
-Define language-native semantic enrichment from
-`docs/adr/0001-native-analyzer-workers.md`,
-`docs/adr/0002-elixir-compiler-tracer-worker.md`,
-`docs/adr/0003-typescript-native-semantic-worker.md`, and the incremental worker
-sections of `docs/adr/0007-incremental-semantic-computation.md`.
+Define isolated language-native semantic enrichment, including worker protocol,
+publication, lifecycle, trust, diagnostics, and contribution ownership.
 
 ## Requirements
 

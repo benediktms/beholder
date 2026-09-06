@@ -36,6 +36,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: jdx/mise-action@v4
+      - name: Validate OpenSpec
+        if: runner.os == 'Linux'
+        run: mise exec -- openspec validate --all --strict
       - run: mise exec -- pnpm install --frozen-lockfile
       - name: Install Tauri Linux dependencies
         if: runner.os == 'Linux'

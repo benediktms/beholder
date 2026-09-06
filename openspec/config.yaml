@@ -6,17 +6,19 @@ context: |
   the Mnestic adapter, exposes typed gRPC and CLI queries, and enriches syntax facts
   through isolated language-native workers and runtime analyzer plugins.
 
-  Current behavior is normative in openspec/specs. docs/VISION.md and docs/adr retain
-  roadmap, rationale, rejected alternatives, measurements, and historical context;
-  they do not make proposed behavior current. Preserve Beholder-owned domain and DTO
-  boundaries and keep Mnestic types inside beholder-adapters-mnestic.
+  Current behavior is normative in openspec/specs. Proposed behavior and architecture
+  decisions belong in active OpenSpec changes; completed rationale and rejected
+  alternatives remain in archived changes. docs/VISION.md and focused documents under
+  docs retain non-normative roadmap, measurements, operational guidance, and explanatory
+  material. Preserve Beholder-owned domain and DTO boundaries and keep Mnestic types
+  inside beholder-adapters-mnestic.
 
   Use Conventional Commits. Run only focused tests locally; CI owns the full suite.
 
 rules:
   proposal:
     - Distinguish current behavior from proposed behavior and explicit non-goals.
-    - Link relevant architecture decisions and performance evidence when they constrain the change.
+    - Link relevant archived changes and performance evidence when they constrain the change.
   specs:
     - Describe observable behavior and stable contracts, not implementation aspirations.
     - Give every requirement at least one concrete scenario.
@@ -24,6 +26,7 @@ rules:
   design:
     - Reuse existing Beholder boundaries before introducing a new abstraction.
     - Record rejected alternatives only when they explain a non-obvious constraint.
+    - Record non-obvious architecture decisions here so the archived change remains the decision history; do not create a parallel decision record.
   tasks:
     - Keep tasks independently verifiable and include the narrowest relevant check.
 
