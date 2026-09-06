@@ -1,9 +1,10 @@
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Workspace {
     pub name: String,
     pub repositories: Vec<WorkspaceRepository>,
@@ -100,13 +101,13 @@ impl Workspace {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProtobufDescriptorSource {
     pub repository: LogicalRepository,
     pub path: PathBuf,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceRepository {
     pub repository: LogicalRepository,
     pub display_name: String,
@@ -114,7 +115,7 @@ pub struct WorkspaceRepository {
     pub alternatives: Vec<PathBuf>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LogicalRepository {
     pub identity: String,
 }

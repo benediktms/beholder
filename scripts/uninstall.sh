@@ -16,6 +16,7 @@ fi
 rm -f \
     "$install_dir/beholder" \
     "$install_dir/beholderd" \
+    "$install_dir/beholder-mcp" \
     "$install_dir/beholder-worker-rust" \
     "$install_dir/beholder-graph-ui" \
     "$install_dir/beholder-worker-elixir" \

@@ -62,6 +62,7 @@ tasks:
       -p beholder-daemon-client
       -p beholder-graph-ui
       -p beholder-indexing
+      -p beholder-mcp
       -p beholder-worker-rust
       -p shell-mnestic
     inputs:
@@ -88,7 +89,7 @@ tasks:
       runInCI: false
 
   release:
-    command: 'cargo build --release -p beholder-cli -p beholder-daemon -p beholder-worker-rust -p beholder-graph-ui'
+    command: 'cargo build --release -p beholder-cli -p beholder-daemon -p beholder-mcp -p beholder-worker-rust -p beholder-graph-ui'
     deps:
       - 'graph-ui:build'
     inputs:
@@ -128,6 +129,8 @@ tasks:
 
   integration-test:
     command: 'bash scripts/integration-test.sh'
+    deps:
+      - 'mcp-integration-test'
     inputs:
       - '@group(sources)'
       - 'scripts/integration-test.sh'
@@ -143,6 +146,15 @@ tasks:
     options:
       cache: false
       runInCI: false
+
+  mcp-integration-test:
+    command: 'bash scripts/test-mcp-integration.sh'
+    inputs:
+      - '@group(sources)'
+      - 'scripts/mcp-smoke.py'
+      - 'scripts/test-mcp-integration.sh'
+    options:
+      cache: false
 
   index-bench:
     command: 'bash scripts/benchmark-indexing.sh'

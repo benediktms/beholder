@@ -65,6 +65,11 @@ uninstall:
 integration-test:
     moon run beholder:integration-test
 
+# Start an isolated daemon and exercise MCP discovery followed by traversal.
+[group('manual')]
+mcp-integration-test:
+    moon run beholder:mcp-integration-test
+
 # Install locked dependencies and launch the desktop graph prototype.
 [group('manual')]
 graph-ui:
