@@ -122,3 +122,43 @@ A repository-keyed shard-selection index was also discarded after correcting
 the owner/version index made direct entity-ID candidate validation faster and
 preserved non-repository entity schemes. It took 1.97 seconds to build and used
 88,162,304 bytes before being dropped.
+
+
+## Multi-path traversal limits (2026-09-05)
+
+The new `TraverseGraph` operation retains defaults of 8 hops and 50 paths, with
+hard maxima of 32 hops and 200 paths. The indexed acquisition implementation and
+representative Beholder/Fresha measurements above are reused. New in-memory,
+unoptimized measurements use the production fact-shard publication and traversal
+queries on an 18-layer DAG with two nodes per layer and every adjacent layer
+fully connected. Setup/publication is excluded; timings include acquisition,
+entity hydration, enumeration, and snapshot metadata.
+
+| Request | Time | Result |
+| --- | ---: | --- |
+| 8 hops, 50 paths | 12.3 ms | 50 paths; depth/path truncation |
+| 32 hops, 200 paths | 20.0 ms | 200 paths; path truncation |
+| 32 hops, unreachable destination | 37.2 ms | No paths; work truncation |
+
+These are synthetic local measurements, not a new installed-daemon Fresha run.
+They support retaining the provisional hop/path limits while bounding exponential
+search independently of the number of returned paths. Reproduce with:
+
+```sh
+cargo test -p beholder-adapters-mnestic --features sqlite --lib \
+  store::tests::multipath_bounds_exponential_search_even_when_destination_is_missing -- --nocapture
+```
+
+Acquisition admits at most 10,000 evidence rows across indexed frontiers, plus one
+probe row used to detect overflow. It drops the entire boundary edge if its
+evidence would be partial, and marks unexpanded frontiers incomplete. A shared
+five-second acquisition deadline also bounds database evaluation and sorting;
+expiration returns a deadline error. Enumeration counts node visits, adjacency
+inspection, and edge attempts against a 100,000-step ceiling. All limits are
+reported in traversal metadata. No new indexes are needed.
+
+Focused tests additionally cover SQLite publication between acquisition and
+hydration, database interruption followed by a successful query on the same
+transaction, evidence-preserving overrides, and a 10,001-edge star that cannot
+be misreported as known leaf paths when acquisition is capped. Legacy query
+schemas, defaults, and slow-warning policy are unchanged.

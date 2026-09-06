@@ -24,6 +24,7 @@ service Daemon {
   rpc RegisterRepository(RegisterRepositoryRequest) returns (RepositoryResponse);
   rpc SearchEntities(SearchEntitiesRequest) returns (SearchEntitiesResponse);
   rpc Stop(StopRequest) returns (StopResponse);
+  rpc TraverseGraph(TraverseGraphRequest) returns (TraverseGraphResponse);
   rpc Trace(PathRequest) returns (TraceResponse);
   rpc Why(PathRequest) returns (WhyResponse);
 }
@@ -620,4 +621,62 @@ message Job {
   repeated string warnings = 10;
   optional IndexJobResult index_result = 11;
   optional EnrichmentJobResult enrichment_result = 12;
+}
+
+enum GraphDirection {
+  GRAPH_DIRECTION_UNSPECIFIED = 0;
+  GRAPH_DIRECTION_DEPENDENCIES = 1;
+  GRAPH_DIRECTION_DEPENDENTS = 2;
+}
+message TraverseGraphRequest {
+  string workspace = 1;
+  string start = 2;
+  GraphDirection direction = 3;
+  optional string destination = 4;
+  optional uint32 max_hops = 5;
+  optional uint32 max_paths = 6;
+}
+message TraverseGraphQuery {
+  string start = 1;
+  GraphDirection direction = 2;
+  optional string destination = 3;
+  uint32 max_hops = 4;
+  uint32 max_paths = 5;
+}
+enum PathTermination {
+  PATH_TERMINATION_UNSPECIFIED = 0;
+  PATH_TERMINATION_DESTINATION = 1;
+  PATH_TERMINATION_LEAF = 2;
+  PATH_TERMINATION_CYCLE = 3;
+  PATH_TERMINATION_MAX_HOPS = 4;
+}
+enum TruncationReason {
+  TRUNCATION_REASON_UNSPECIFIED = 0;
+  TRUNCATION_REASON_MAX_HOPS = 1;
+  TRUNCATION_REASON_MAX_PATHS = 2;
+  TRUNCATION_REASON_ACQUISITION_LIMIT = 3;
+  TRUNCATION_REASON_WORK_LIMIT = 4;
+}
+message TraversalPath {
+  repeated string nodes = 1;
+  repeated string edges = 2;
+  PathTermination termination = 3;
+}
+message GraphTraversalMetadata {
+  uint32 max_hops = 1;
+  uint32 max_paths = 2;
+  uint32 max_rows = 3;
+  uint32 max_steps = 4;
+  bool truncated = 5;
+  repeated TruncationReason truncation_reasons = 6;
+  uint32 acquisition_timeout_ms = 7;
+}
+message TraverseGraphResponse {
+  string schema = 1;
+  QueryMetadata metadata = 2;
+  TraverseGraphQuery query = 3;
+  repeated Entity nodes = 4;
+  repeated Edge edges = 5;
+  repeated TraversalPath paths = 6;
+  GraphTraversalMetadata traversal = 7;
 }

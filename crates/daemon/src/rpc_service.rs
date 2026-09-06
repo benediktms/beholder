@@ -291,7 +291,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 22,
+            protocol_version: 23,
             pid: std::process::id(),
         }))
     }
@@ -338,6 +338,27 @@ impl Daemon for BeholderDaemon {
         Ok(Response::new(GetWorkspaceTopologyStatusResponse {
             metadata: Some(metadata.into()),
         }))
+    }
+
+    #[tracing::instrument(name = "rpc.traverse_graph", skip_all, fields(workspace = %request.get_ref().workspace))]
+    async fn traverse_graph(
+        &self,
+        request: Request<beholder_protocol::v1::TraverseGraphRequest>,
+    ) -> Result<Response<beholder_protocol::v1::TraverseGraphResponse>, Status> {
+        let request = request.into_inner();
+        let workspace = request.workspace.clone();
+        let query = beholder_dto::TraverseGraphQuery::try_from(request)
+            .map_err(Status::invalid_argument)?;
+        let enriching = self
+            .jobs
+            .active_enrichment_repositories(&workspace)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let store = self.store.clone();
+        let query_workspace = workspace.clone();
+        let result =
+            semantic_query(move || store.traverse_graph_snapshot(&query_workspace, query)).await?;
+        self.query_response(&workspace, enriching, result)
     }
 
     #[tracing::instrument(name = "rpc.search_entities", skip_all, fields(workspace = %request.get_ref().workspace))]
@@ -1603,6 +1624,7 @@ fn operation_status(error: BeholderError) -> Status {
 
 pub(super) fn operation_status_ref(error: &BeholderError) -> Status {
     let code = match error.kind() {
+        BeholderErrorKind::DeadlineExceeded => Code::DeadlineExceeded,
         BeholderErrorKind::InvalidInput => Code::InvalidArgument,
         BeholderErrorKind::NotFound => Code::NotFound,
         BeholderErrorKind::FailedPrecondition => Code::FailedPrecondition,
@@ -1631,6 +1653,7 @@ mod tests {
     #[test]
     fn operation_errors_map_to_grpc_codes_and_preserve_stable_codes() {
         for (kind, expected) in [
+            (BeholderErrorKind::DeadlineExceeded, Code::DeadlineExceeded),
             (BeholderErrorKind::InvalidInput, Code::InvalidArgument),
             (BeholderErrorKind::NotFound, Code::NotFound),
             (

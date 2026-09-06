@@ -1374,6 +1374,7 @@ enum TraversalDirection {
 
 struct ResolvedDependencyParams {
     frontier: BTreeSet<String>,
+    limit: i64,
 }
 
 #[derive(Debug)]
@@ -1420,7 +1421,8 @@ impl MnesticQuery for OutgoingResolvedDependencies {
              *analysis_resolved_dependency{\
                  view: $view, from, relation, to, evidence, confidence, provenance\
              }\n\
-         :order from, to, relation\n\
+         :order from, to, relation, evidence, confidence, provenance\n\
+         :limit $limit\n\
          :reorder written";
     const HEADERS: &'static [&'static str] = RESOLVED_DEPENDENCY_HEADERS;
 
@@ -1451,7 +1453,8 @@ impl MnesticQuery for IncomingResolvedDependencies {
                  view: $view, from, relation: 'implemented_by', to, evidence, \
                  confidence, provenance\
              }, relation = 'implemented_by'\n\
-         :order from, to, relation\n\
+         :order from, to, relation, evidence, confidence, provenance\n\
+         :limit $limit\n\
          :reorder written";
     const HEADERS: &'static [&'static str] = RESOLVED_DEPENDENCY_HEADERS;
 
@@ -1470,16 +1473,19 @@ impl MnesticQuery for IncomingResolvedDependencies {
 fn bind_resolved_dependency_params(
     params: &ResolvedDependencyParams,
 ) -> BTreeMap<String, DataValue> {
-    BTreeMap::from([(
-        "frontier".into(),
-        DataValue::List(
-            params
-                .frontier
-                .iter()
-                .map(|entity| DataValue::List(vec![entity.as_str().into()]))
-                .collect(),
+    BTreeMap::from([
+        ("limit".into(), params.limit.into()),
+        (
+            "frontier".into(),
+            DataValue::List(
+                params
+                    .frontier
+                    .iter()
+                    .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                    .collect(),
+            ),
         ),
-    )])
+    ])
 }
 
 fn decode_resolved_dependency(
@@ -1534,6 +1540,7 @@ fn closure(
         let _entered = hop_span.enter();
         let params = ResolvedDependencyParams {
             frontier: frontier.clone(),
+            limit: i64::MAX,
         };
         let result = match direction {
             TraversalDirection::Outgoing => db.run::<OutgoingResolvedDependencies>(view, params)?,
@@ -1577,6 +1584,130 @@ fn closure(
         .map(str::to_owned)
         .collect(),
         rows,
+    ))
+}
+
+/// Row limits bound returned data; the deadline also bounds sorting a very wide frontier.
+struct TraversalQueryBudget<'a, Q> {
+    inner: &'a Q,
+    deadline: std::time::Instant,
+}
+
+impl<Q: QueryRunner> QueryRunner for TraversalQueryBudget<'_, Q> {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "graph acquisition deadline exceeded",
+            )
+            .into());
+        }
+        self.inner.run_query(
+            &format!("{script}\n:timeout {}", remaining.as_secs_f64()),
+            params,
+        )
+    }
+}
+
+/// Acquire the boundary frontier too, so path-local cycles and depth are exact.
+/// The row cap bounds materialization; incomplete frontiers never imply leaves.
+pub(super) fn multipath_rows(
+    db: &impl QueryRunner,
+    view: &str,
+    query: &beholder_dto::TraverseGraphQuery,
+) -> Result<(NamedRows, BTreeSet<String>), Box<dyn Error>> {
+    let deadline = std::time::Instant::now()
+        + Duration::from_millis(u64::from(beholder_dto::TRAVERSAL_ACQUISITION_TIMEOUT_MS));
+    let db = TraversalQueryBudget {
+        inner: db,
+        deadline,
+    };
+    let direction = match query.direction {
+        beholder_dto::GraphDirection::Dependencies => TraversalDirection::Outgoing,
+        beholder_dto::GraphDirection::Dependents => TraversalDirection::Incoming,
+    };
+    let mut frontier = BTreeSet::from([query.start.clone()]);
+    let mut visited = frontier.clone();
+    let mut rows = Vec::new();
+    let mut incomplete = BTreeSet::new();
+    for hops in 0..=query.max_hops {
+        if let Some(destination) = &query.destination {
+            frontier.remove(destination);
+        }
+        if frontier.is_empty() {
+            break;
+        }
+
+        let remaining = beholder_dto::MAX_TRAVERSAL_ROWS as usize - rows.len();
+        let params = ResolvedDependencyParams {
+            frontier: frontier.clone(),
+            limit: (remaining + 1) as i64,
+        };
+        let mut result = match direction {
+            TraversalDirection::Outgoing => db.run::<OutgoingResolvedDependencies>(view, params),
+            TraversalDirection::Incoming => db.run::<IncomingResolvedDependencies>(view, params),
+        }
+        .map_err(|error| -> Box<dyn Error> {
+            if std::time::Instant::now() >= deadline {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "graph acquisition deadline exceeded",
+                )
+                .into()
+            } else {
+                Box::new(error)
+            }
+        })?;
+        if result.len() > remaining {
+            let cut = &result[remaining];
+            let key = (cut.from.clone(), cut.to.clone(), cut.relation.clone());
+            result.truncate(remaining);
+            result.retain(|row| (&row.from, &row.to, &row.relation) != (&key.0, &key.1, &key.2));
+            incomplete.extend(frontier.iter().cloned());
+        }
+        let mut next = BTreeSet::new();
+        for row in &result {
+            let entity = next_entity(row, direction);
+            if visited.insert(entity.to_owned()) {
+                next.insert(entity.to_owned());
+            }
+        }
+        rows.extend(result.into_iter().map(|row| row.into_values(hops)));
+        if !incomplete.is_empty() {
+            incomplete.extend(next);
+            break;
+        }
+        if hops == query.max_hops || next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok((
+        NamedRows::new(
+            [
+                "row_kind",
+                "entity",
+                "hops",
+                "edge_from",
+                "edge_to",
+                "relation",
+                "evidence",
+                "confidence",
+                "provenance",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            rows,
+        ),
+        incomplete,
     ))
 }
 
@@ -1671,6 +1802,7 @@ mod tests {
             .run::<OutgoingResolvedDependencies>(
                 "main",
                 ResolvedDependencyParams {
+                    limit: i64::MAX,
                     frontier: BTreeSet::new(),
                 },
             )
@@ -1712,6 +1844,33 @@ mod tests {
                 "Mnestic query entity_facts.baseline failed: unexpected output headers"
             )
         );
+    }
+
+    #[test]
+    fn multipath_acquisition_deadline_interrupts_database_work() {
+        let db = DbInstance::new("mem", "", Default::default()).unwrap();
+        let transaction = db.multi_transaction(false);
+        let budget = TraversalQueryBudget {
+            inner: &transaction,
+            deadline: std::time::Instant::now() + Duration::from_millis(10),
+        };
+        let error = budget.run_query(
+            "n[x] := x = 0\nn[y] := n[x], y = x + 1, y < 100000000\n?[x] := n[x]\n:order -x\n:limit 1",
+            BTreeMap::new(),
+        ).unwrap_err();
+        assert!(
+            error.to_string().contains("time budget") || error.to_string().contains("deadline"),
+            "{error}"
+        );
+        assert_eq!(
+            transaction
+                .run_script("?[x] <- [[1]]", BTreeMap::new())
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        transaction.abort().unwrap();
     }
 
     #[test]

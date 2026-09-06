@@ -85,6 +85,7 @@ impl std::str::FromStr for BeholderErrorCode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BeholderErrorKind {
+    DeadlineExceeded,
     InvalidInput,
     NotFound,
     FailedPrecondition,

@@ -210,6 +210,37 @@ defmodule Beholder.V1.EnrichmentJobOutcome do
   field :ENRICHMENT_JOB_OUTCOME_SUPERSEDED, 4
 end
 
+defmodule Beholder.V1.GraphDirection do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :GRAPH_DIRECTION_UNSPECIFIED, 0
+  field :GRAPH_DIRECTION_DEPENDENCIES, 1
+  field :GRAPH_DIRECTION_DEPENDENTS, 2
+end
+
+defmodule Beholder.V1.PathTermination do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :PATH_TERMINATION_UNSPECIFIED, 0
+  field :PATH_TERMINATION_DESTINATION, 1
+  field :PATH_TERMINATION_LEAF, 2
+  field :PATH_TERMINATION_CYCLE, 3
+  field :PATH_TERMINATION_MAX_HOPS, 4
+end
+
+defmodule Beholder.V1.TruncationReason do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :TRUNCATION_REASON_UNSPECIFIED, 0
+  field :TRUNCATION_REASON_MAX_HOPS, 1
+  field :TRUNCATION_REASON_MAX_PATHS, 2
+  field :TRUNCATION_REASON_ACQUISITION_LIMIT, 3
+  field :TRUNCATION_REASON_WORK_LIMIT, 4
+end
+
 defmodule Beholder.V1.ClearCacheRequest do
   @moduledoc false
   use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
@@ -924,6 +955,70 @@ defmodule Beholder.V1.Job do
     json_name: "enrichmentResult"
 end
 
+defmodule Beholder.V1.TraverseGraphRequest do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :workspace, 1, type: :string
+  field :start, 2, type: :string
+  field :direction, 3, type: Beholder.V1.GraphDirection, enum: true
+  field :destination, 4, proto3_optional: true, type: :string
+  field :max_hops, 5, proto3_optional: true, type: :uint32, json_name: "maxHops"
+  field :max_paths, 6, proto3_optional: true, type: :uint32, json_name: "maxPaths"
+end
+
+defmodule Beholder.V1.TraverseGraphQuery do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :start, 1, type: :string
+  field :direction, 2, type: Beholder.V1.GraphDirection, enum: true
+  field :destination, 3, proto3_optional: true, type: :string
+  field :max_hops, 4, type: :uint32, json_name: "maxHops"
+  field :max_paths, 5, type: :uint32, json_name: "maxPaths"
+end
+
+defmodule Beholder.V1.TraversalPath do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :nodes, 1, repeated: true, type: :string
+  field :edges, 2, repeated: true, type: :string
+  field :termination, 3, type: Beholder.V1.PathTermination, enum: true
+end
+
+defmodule Beholder.V1.GraphTraversalMetadata do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :max_hops, 1, type: :uint32, json_name: "maxHops"
+  field :max_paths, 2, type: :uint32, json_name: "maxPaths"
+  field :max_rows, 3, type: :uint32, json_name: "maxRows"
+  field :max_steps, 4, type: :uint32, json_name: "maxSteps"
+  field :truncated, 5, type: :bool
+
+  field :truncation_reasons, 6,
+    repeated: true,
+    type: Beholder.V1.TruncationReason,
+    json_name: "truncationReasons",
+    enum: true
+
+  field :acquisition_timeout_ms, 7, type: :uint32, json_name: "acquisitionTimeoutMs"
+end
+
+defmodule Beholder.V1.TraverseGraphResponse do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :schema, 1, type: :string
+  field :metadata, 2, type: Beholder.V1.QueryMetadata
+  field :query, 3, type: Beholder.V1.TraverseGraphQuery
+  field :nodes, 4, repeated: true, type: Beholder.V1.Entity
+  field :edges, 5, repeated: true, type: Beholder.V1.Edge
+  field :paths, 6, repeated: true, type: Beholder.V1.TraversalPath
+  field :traversal, 7, type: Beholder.V1.GraphTraversalMetadata
+end
+
 defmodule Beholder.V1.Daemon.Service do
   @moduledoc false
   use GRPC.Service, name: "beholder.v1.Daemon", protoc_gen_elixir_version: "0.17.0"
@@ -1014,6 +1109,8 @@ defmodule Beholder.V1.Daemon.Service do
   rpc(:SearchEntities, Beholder.V1.SearchEntitiesRequest, Beholder.V1.SearchEntitiesResponse, %{})
 
   rpc(:Stop, Beholder.V1.StopRequest, Beholder.V1.StopResponse, %{})
+
+  rpc(:TraverseGraph, Beholder.V1.TraverseGraphRequest, Beholder.V1.TraverseGraphResponse, %{})
 
   rpc(:Trace, Beholder.V1.PathRequest, Beholder.V1.TraceResponse, %{})
 

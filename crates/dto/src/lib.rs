@@ -520,3 +520,98 @@ pub struct Revisioned<T> {
     pub analysis_revision: u64,
     pub analysis: AnalysisMetadata,
 }
+
+/// Limits apply to the new multi-path operation; legacy query contracts are unchanged.
+pub const TRAVERSE_GRAPH_SCHEMA_V1: &str = "beholder.traverse_graph.v1";
+pub const DEFAULT_TRAVERSAL_HOPS: u32 = 8;
+pub const MAX_TRAVERSAL_HOPS: u32 = 32;
+pub const DEFAULT_MAX_PATHS: u32 = 50;
+pub const MAX_PATHS: u32 = 200;
+pub const MAX_TRAVERSAL_ROWS: u32 = 10_000;
+pub const MAX_TRAVERSAL_STEPS: u32 = 100_000;
+pub const TRAVERSAL_ACQUISITION_TIMEOUT_MS: u32 = 5_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphDirection {
+    Dependencies,
+    Dependents,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraverseGraphQuery {
+    pub start: String,
+    pub direction: GraphDirection,
+    pub destination: Option<String>,
+    pub max_hops: u32,
+    pub max_paths: u32,
+}
+
+impl TraverseGraphQuery {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.start.trim().is_empty()
+            || self
+                .destination
+                .as_ref()
+                .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err("start and destination must be non-empty canonical entity IDs");
+        }
+        if self.max_hops > MAX_TRAVERSAL_HOPS {
+            return Err("max_hops must be between 0 and 32");
+        }
+        if self.max_paths == 0 || self.max_paths > MAX_PATHS {
+            return Err("max_paths must be between 1 and 200");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathTermination {
+    Destination,
+    Leaf,
+    Cycle,
+    MaxHops,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationReason {
+    MaxHops,
+    MaxPaths,
+    AcquisitionLimit,
+    WorkLimit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraversalPath {
+    pub nodes: Vec<String>,
+    pub edges: Vec<String>,
+    pub termination: PathTermination,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphTraversalMetadata {
+    pub max_hops: u32,
+    pub max_paths: u32,
+    pub max_rows: u32,
+    pub max_steps: u32,
+    pub acquisition_timeout_ms: u32,
+    pub truncated: bool,
+    pub truncation_reasons: Vec<TruncationReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TraverseGraphResult {
+    pub schema: String,
+    #[serde(flatten)]
+    pub metadata: QueryMetadata,
+    pub query: TraverseGraphQuery,
+    pub nodes: Vec<EntityRef>,
+    pub edges: Vec<SemanticEdge>,
+    pub paths: Vec<TraversalPath>,
+    pub traversal: GraphTraversalMetadata,
+}
+semantic_result!(TraverseGraphResult);

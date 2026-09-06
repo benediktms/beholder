@@ -310,6 +310,19 @@ pub async fn search_entities(
         .try_into()?)
 }
 
+/// Traverse one immutable workspace revision with bounded multi-path semantics.
+pub async fn traverse_graph(
+    request: beholder_protocol::v1::TraverseGraphRequest,
+) -> Result<beholder_dto::TraverseGraphResult, ClientError> {
+    Ok(connect_send()
+        .await?
+        .traverse_graph(crate::request(request))
+        .await
+        .map_err(operation_error)?
+        .into_inner()
+        .try_into()?)
+}
+
 pub async fn dependencies(
     workspace: String,
     entity: String,
@@ -406,6 +419,7 @@ async fn operation_client() -> Result<DaemonClient<Channel>, BeholderError> {
 
 fn operation_error(status: Status) -> BeholderError {
     let kind = match status.code() {
+        Code::DeadlineExceeded => BeholderErrorKind::DeadlineExceeded,
         Code::InvalidArgument => BeholderErrorKind::InvalidInput,
         Code::NotFound => BeholderErrorKind::NotFound,
         Code::FailedPrecondition => BeholderErrorKind::FailedPrecondition,
@@ -557,6 +571,7 @@ mod tests {
     #[test]
     fn operation_errors_preserve_codes_independently_from_messages() {
         for (grpc, expected) in [
+            (Code::DeadlineExceeded, BeholderErrorKind::DeadlineExceeded),
             (Code::InvalidArgument, BeholderErrorKind::InvalidInput),
             (Code::NotFound, BeholderErrorKind::NotFound),
             (
@@ -577,6 +592,20 @@ mod tests {
             assert_eq!(error.message(), "wording can change");
             assert!(std::error::Error::source(&error).is_some());
         }
+
+        let deadline = operation_error(Status::deadline_exceeded(
+            "graph acquisition deadline exceeded",
+        ));
+        assert_eq!(deadline.kind(), BeholderErrorKind::DeadlineExceeded);
+        assert_eq!(deadline.code(), BeholderErrorCode::TransportGrpc);
+        assert_eq!(
+            std::error::Error::source(&deadline)
+                .unwrap()
+                .downcast_ref::<Status>()
+                .unwrap()
+                .code(),
+            Code::DeadlineExceeded
+        );
 
         assert_eq!(
             operation_error(Status::permission_denied("denied")).code(),
