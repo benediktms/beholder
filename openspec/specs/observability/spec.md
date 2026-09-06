@@ -2,8 +2,8 @@
 
 ## Purpose
 
-Define local logs, OpenTelemetry export, and correlated worker telemetry from
-`docs/OBSERVABILITY.md` and the observability contracts in the worker and job ADRs.
+Define local logs, OpenTelemetry export, correlated worker telemetry, structured job
+events, outcome severity, and shutdown flushing.
 
 ## Requirements
 

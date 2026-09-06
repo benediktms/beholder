@@ -140,8 +140,8 @@ requires mutable repository facts or a generic cache layer.
 
 ## Incremental Rust slice
 
-ADR 0007 replaces Rust repository-wide semantic publication with Salsa-backed
-file queries and immutable fact shards selected per stable semantic owner. A
+The [`indexing-pipeline`](../openspec/specs/indexing-pipeline/spec.md) contract uses
+Salsa-backed Rust file queries and immutable fact shards selected per stable semantic owner. A
 source edit propagates through parsing, file summary, and shard production only
 while each semantic output changes. Mnestic retains unchanged shard versions and
 advances a selection manifest without rebuilding a workspace baseline.

@@ -2,8 +2,8 @@
 
 ## Purpose
 
-Define the accepted desktop graph prototype and its production boundary from
-`docs/adr/0008-desktop-workspace-graph-prototype.md`.
+Define the desktop workspace graph's typed projection, investigation interactions,
+production data boundary, and bounded rendering behavior.
 
 ## Requirements
 

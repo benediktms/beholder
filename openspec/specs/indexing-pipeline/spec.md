@@ -2,10 +2,8 @@
 
 ## Purpose
 
-Define the observable indexing, durable-job, cache, and publication contracts drawn
-from `docs/INDEXING_API_PROPOSAL.md`, `docs/INDEXING_PERFORMANCE.md`,
-`docs/adr/0006-background-work-scheduling.md`, and
-`docs/adr/0007-incremental-semantic-computation.md`.
+Define observable indexing, durable-job, cache, incremental-computation, and atomic
+publication contracts for repository and workspace analysis.
 
 ## Requirements
 

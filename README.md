@@ -24,9 +24,10 @@ Beholder is written in Rust and is designed around a **workspace** rather than a
 
 > [!NOTE]
 > Beholder is under active development. Current behavioral contracts live in
-> [`openspec/specs`](openspec/specs). Longer-term direction, rationale, rejected
-> alternatives, and measurements remain in [`docs/VISION.md`](docs/VISION.md) and
-> [`docs/adr`](docs/adr).
+> [`openspec/specs`](openspec/specs). Proposed work and completed architecture
+> decisions live in [`openspec/changes`](openspec/changes). Longer-term direction,
+> measurements, operational guidance, and explanatory material remain under
+> [`docs`](docs).
 
 ## Specifications
 
@@ -37,9 +38,11 @@ with `$openspec-propose`; then use `$openspec-apply-change` and
 setup and validation, while the normal authoring workflow stays skill-based.
 
 The main specs describe current behavior. A proposed change belongs under
-`openspec/changes/` as a delta until it is implemented and archived. Existing
-design documents remain supporting context rather than a second normative spec.
-See the [migration crosswalk](openspec/README.md) for source-to-capability coverage.
+`openspec/changes/` as a delta until it is implemented and archived. Architecture
+rationale belongs in the change's design and remains available in the archive after
+completion. Existing documents under `docs/` remain supporting context rather than
+a second normative spec. See the [OpenSpec workflow](openspec/README.md) for the
+ownership model and commands.
 
 ## Architecture
 
@@ -146,7 +149,11 @@ The CLI currently exposes daemon lifecycle management, workspace registration/re
 
 Tree-sitter is the fast baseline, not the ceiling for language understanding.
 
-Beholder's native analyzer worker architecture allows language-specific semantic analyzers to enrich an existing repository state without coupling those analyzers to the daemon process. The current workspace contains a Rust worker and worker client; ADR 0001 documents the worker model.
+Beholder's native analyzer worker architecture allows language-specific semantic
+analyzers to enrich an existing repository state without coupling those analyzers
+to the daemon process. The repository contains built-in Rust, Elixir, and TypeScript
+workers behind the shared typed worker protocol. The current contract lives in the
+[`analyzer-workers`](openspec/specs/analyzer-workers/spec.md) specification.
 
 The intended pattern is:
 
@@ -162,7 +169,19 @@ more precise semantic contribution
 new coherent graph revision
 ```
 
-This is particularly important for languages where syntax alone cannot reliably resolve aliases, imports, macros, generated code, or dynamic conventions. [`ADR 0002`](docs/adr/0002-elixir-compiler-tracer-worker.md) proposes an Elixir compiler-tracer worker; it is design work and should not be confused with the currently implemented CLI surface.
+This is particularly important for languages where syntax alone cannot reliably
+resolve aliases, imports, macros, generated code, or dynamic conventions. The Elixir
+worker uses compiler tracing in a dedicated BEAM process, while the TypeScript worker
+uses the native compiler language-service boundary. Installed built-in workers are
+scheduled through the same durable enrichment lifecycle and publish independently
+owned contributions.
+
+Beholder also exposes a runtime analyzer plugin boundary for organization- and
+framework-specific recognition. Plugins are explicitly installed trusted
+executables, use the versioned analyzer protocol, and can be authored through the
+Rust `plugin-sdk`; the daemon registry owns discovery, activation, validation, and
+job scheduling. See the
+[`runtime-plugins`](openspec/specs/runtime-plugins/spec.md) specification.
 
 ## Crate layout
 
@@ -176,7 +195,8 @@ The workspace is deliberately split by responsibility:
 | Persistence | `shell-mnestic`, `adapters-mnestic` | Mnestic/SQLite integration |
 | Source adapters | `adapters-treesitter-*`, `adapters-git` | Syntax and repository observations |
 | Contract adapters | `adapters-protobuf`, `adapters-graphql` | Protocol and schema observations |
-| Semantic workers | `worker-client`, `worker-rust` | Optional language-native enrichment |
+| Semantic workers | `worker-client`, `worker-rust`, `workers/elixir`, `workers/typescript` | Built-in language-native enrichment |
+| Runtime plugins | `plugin-sdk`, `worker-client`, daemon plugin registry | Trusted executable analyzer extensions |
 
 The important dependency direction is inward: adapters and delivery mechanisms depend on Beholder's core concepts, while the domain model should not depend on a particular CLI, parser, or storage backend.
 
@@ -309,9 +329,10 @@ consumer
 
 Beholder should be able to traverse that as one evidence-backed path even when the nodes are spread across languages and repositories.
 
-For current contracts, start with [`openspec/specs`](openspec/specs). For deeper
-design, rationale, and planned capabilities, continue to
-[`docs/VISION.md`](docs/VISION.md) and [`docs/adr`](docs/adr).
+For current contracts, start with [`openspec/specs`](openspec/specs). For completed
+architecture rationale, inspect [`openspec/changes/archive`](openspec/changes/archive).
+For longer-term direction and planned capabilities, continue to
+[`docs/VISION.md`](docs/VISION.md).
 
 ## Status
 
