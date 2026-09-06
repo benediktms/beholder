@@ -60,7 +60,36 @@ struct TraverseGraphInput {
 
 #[derive(Serialize)]
 struct WorkspaceList {
-    workspaces: Vec<beholder_domain::Workspace>,
+    workspaces: Vec<WorkspaceSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSummary {
+    name: String,
+    repositories: Vec<WorkspaceRepositorySummary>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceRepositorySummary {
+    identity: String,
+    display_name: String,
+}
+
+impl From<beholder_domain::Workspace> for WorkspaceSummary {
+    fn from(workspace: beholder_domain::Workspace) -> Self {
+        Self {
+            name: workspace.name,
+            repositories: workspace
+                .repositories
+                .into_iter()
+                .map(|repository| WorkspaceRepositorySummary {
+                    identity: repository.repository.identity,
+                    display_name: repository.display_name,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +110,12 @@ impl BeholderMcp {
     #[tool(description = "List registered Beholder workspaces and their repository summaries.")]
     async fn list_workspaces(&self) -> CallToolResult {
         match beholder_daemon_client::list_workspaces().await {
-            Ok(workspaces) => structured(WorkspaceList { workspaces }),
+            Ok(workspaces) => structured(WorkspaceList {
+                workspaces: workspaces
+                    .into_iter()
+                    .map(WorkspaceSummary::from)
+                    .collect(),
+            }),
             Err(error) => structured_error(error.as_ref()),
         }
     }

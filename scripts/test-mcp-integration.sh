@@ -62,6 +62,10 @@ if ! grep -Fq "$helper" <<<"$context"; then
     printf 'controlled daemon did not index the MCP fixture:\n%s\n' "$context" >&2
     exit 1
 fi
+if ! grep -Fq '"stale":false' <<<"$context"; then
+    printf 'MCP fixture workspace context remained stale:\n%s\n' "$context" >&2
+    exit 1
+fi
 
 python3 "$root/scripts/mcp-smoke.py" \
     "$root/target/debug/beholder-mcp" mcp-smoke caller "$caller" "$helper"

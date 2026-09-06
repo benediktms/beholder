@@ -48,10 +48,8 @@ async fn connect() -> Result<DaemonClient<Channel>, Box<dyn std::error::Error>> 
         .max_decoding_message_size(MAX_RESPONSE_BYTES))
 }
 
-async fn connect_send() -> Result<DaemonClient<Channel>, ClientError> {
-    Ok(DaemonClient::connect(endpoint()?)
-        .await?
-        .max_decoding_message_size(MAX_RESPONSE_BYTES))
+async fn connect_send() -> Result<DaemonClient<Channel>, BeholderError> {
+    operation_client().await
 }
 
 pub fn state_dir() -> Result<PathBuf, String> {
