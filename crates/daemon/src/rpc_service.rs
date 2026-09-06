@@ -1624,6 +1624,7 @@ fn operation_status(error: BeholderError) -> Status {
 
 pub(super) fn operation_status_ref(error: &BeholderError) -> Status {
     let code = match error.kind() {
+        BeholderErrorKind::DeadlineExceeded => Code::DeadlineExceeded,
         BeholderErrorKind::InvalidInput => Code::InvalidArgument,
         BeholderErrorKind::NotFound => Code::NotFound,
         BeholderErrorKind::FailedPrecondition => Code::FailedPrecondition,
@@ -1652,6 +1653,7 @@ mod tests {
     #[test]
     fn operation_errors_map_to_grpc_codes_and_preserve_stable_codes() {
         for (kind, expected) in [
+            (BeholderErrorKind::DeadlineExceeded, Code::DeadlineExceeded),
             (BeholderErrorKind::InvalidInput, Code::InvalidArgument),
             (BeholderErrorKind::NotFound, Code::NotFound),
             (
