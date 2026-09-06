@@ -111,10 +111,7 @@ impl BeholderMcp {
     async fn list_workspaces(&self) -> CallToolResult {
         match beholder_daemon_client::list_workspaces().await {
             Ok(workspaces) => structured(WorkspaceList {
-                workspaces: workspaces
-                    .into_iter()
-                    .map(WorkspaceSummary::from)
-                    .collect(),
+                workspaces: workspaces.into_iter().map(WorkspaceSummary::from).collect(),
             }),
             Err(error) => structured_error(error.as_ref()),
         }
