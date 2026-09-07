@@ -1689,6 +1689,14 @@ struct TraversalState {
     completion_repository: Option<String>,
 }
 
+type TargetReachability = BTreeMap<String, BTreeSet<String>>;
+type MultipathAcquisition = (
+    NamedRows,
+    BTreeSet<String>,
+    BTreeSet<String>,
+    TargetReachability,
+);
+
 fn target_prefix(repository: &str) -> String {
     format!("repo://{repository}/")
 }
@@ -1818,10 +1826,10 @@ fn reverse_frontier(
     )
 }
 
-fn traversal_predecessor<'a>(
-    row: &'a ResolvedDependencyRow,
+fn traversal_predecessor(
+    row: &ResolvedDependencyRow,
     direction: TraversalDirection,
-) -> (&'a str, &'a str) {
+) -> (&str, &str) {
     match direction {
         TraversalDirection::Outgoing => (&row.from, &row.to),
         TraversalDirection::Incoming
@@ -1839,7 +1847,7 @@ fn target_reachability(
     query: &beholder_dto::TraverseGraphQuery,
     direction: TraversalDirection,
     remaining_rows: &mut usize,
-) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, Box<dyn Error>> {
+) -> Result<Option<TargetReachability>, Box<dyn Error>> {
     let mut reachable = BTreeMap::<String, BTreeSet<String>>::new();
     for target in &query.target_repositories {
         if super::semantic::repository(&query.start).as_deref() == Some(target) {
@@ -2044,15 +2052,7 @@ fn filtered_multipath_rows(
     view: &str,
     query: &beholder_dto::TraverseGraphQuery,
     direction: TraversalDirection,
-) -> Result<
-    (
-        NamedRows,
-        BTreeSet<String>,
-        BTreeSet<String>,
-        BTreeMap<String, BTreeSet<String>>,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<MultipathAcquisition, Box<dyn Error>> {
     let targets = query
         .target_repositories
         .iter()
@@ -2235,15 +2235,7 @@ pub(super) fn multipath_rows(
     db: &impl QueryRunner,
     view: &str,
     query: &beholder_dto::TraverseGraphQuery,
-) -> Result<
-    (
-        NamedRows,
-        BTreeSet<String>,
-        BTreeSet<String>,
-        BTreeMap<String, BTreeSet<String>>,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<MultipathAcquisition, Box<dyn Error>> {
     let deadline = std::time::Instant::now()
         + Duration::from_millis(u64::from(beholder_dto::TRAVERSAL_ACQUISITION_TIMEOUT_MS));
     let db = TraversalQueryBudget {
