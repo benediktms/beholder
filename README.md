@@ -243,6 +243,25 @@ Deletion is rejected while a workspace references the repository. It never delet
 
 Re-run `just install` after rebuilding Beholder. `just uninstall` removes the installed binaries and service.
 
+### Codex MCP server
+
+`just install` also installs `beholder-mcp`, a stdio server backed by the same
+daemon as the CLI. Register it with Codex after confirming that the daemon is
+ready:
+
+```bash
+beholder daemon status
+codex mcp add beholder -- "$HOME/.local/bin/beholder-mcp"
+```
+
+The server exposes only `list_workspaces`, `search_entities`, and
+`traverse_graph`. Search results provide the canonical entity IDs accepted by
+traversal. `traverse_graph` follows dependencies (outgoing entities used by the
+start entity) or dependents (incoming callers or users affected by the start
+entity). It defaults to 8 hops and 50 paths, with hard limits of 32 hops and 200
+paths. Results retain daemon revision, freshness, diagnostics, evidence, paths,
+and truncation metadata; daemon failures are returned as structured tool errors.
+
 Installed TypeScript compiler workers are discovered automatically beside the
 daemon. They enforce a 6 GiB aggregate RSS ceiling across the worker and compiler
 process tree. Override the path for development or the limit when local capacity

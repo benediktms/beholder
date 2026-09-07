@@ -1,0 +1,17 @@
+[package]
+name = "beholder-mcp"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "beholder-mcp"
+path = "src/main.rs"
+
+[dependencies]
+beholder-daemon-client.workspace = true
+beholder-domain.workspace = true
+beholder-protocol.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
