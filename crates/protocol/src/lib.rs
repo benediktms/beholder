@@ -81,6 +81,11 @@ mod tests {
                 analysis_identity: "analysis".into(),
                 analysis: dto::AnalysisMetadata {
                     completeness: dto::AnalysisCompleteness::Incomplete,
+                    diagnostic_counts: dto::DiagnosticCounts {
+                        total: 1,
+                        known_limitations: 0,
+                        warnings: 1,
+                    },
                     diagnostics: vec![dto::AnalysisDiagnostic {
                         code: "syntax.recovered".into(),
                         severity: dto::AnalysisDiagnosticSeverity::Warning,
@@ -193,6 +198,11 @@ mod tests {
         };
         trace.metadata.analysis = dto::AnalysisMetadata {
             completeness: dto::AnalysisCompleteness::Incomplete,
+            diagnostic_counts: dto::DiagnosticCounts {
+                total: 1,
+                known_limitations: 0,
+                warnings: 1,
+            },
             diagnostics: vec![dto::AnalysisDiagnostic {
                 code: "typescript.syntax_recovered".into(),
                 severity: dto::AnalysisDiagnosticSeverity::Warning,
@@ -229,7 +239,7 @@ mod tests {
     #[test]
     fn entity_search_round_trips_typed_matches() {
         let result = dto::EntitySearchResult {
-            schema: dto::ENTITY_SEARCH_SCHEMA_V1.into(),
+            schema: dto::ENTITY_SEARCH_SCHEMA_V2.into(),
             metadata: dto::QueryMetadata::completed("main", 3),
             query: dto::EntitySearchQuery {
                 query: "run".into(),

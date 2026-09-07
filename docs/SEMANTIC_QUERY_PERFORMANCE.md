@@ -123,6 +123,36 @@ the owner/version index made direct entity-ID candidate validation faster and
 preserved non-repository entity schemes. It took 1.97 seconds to build and used
 88,162,304 bytes before being dropped.
 
+### Indexed entity-name search (2026-09-07)
+
+The version-2 entity search stores each fact-shard entity's display name and
+uses a name-leading index for exact and prefix candidates. On a disposable APFS
+clone of the installed 19 GB database, `EXPLAIN` changed candidate acquisition
+from a scan of selected entity shards to a `stored_prefix_join` on
+`analysis_fact_shard_entity_name:by_name`, followed by the existing
+`analysis_fact_shard_selection:by_owner` lookup. The retained plan contains no
+primary selected-shard entity scan.
+
+Creating the relation took 3 ms, backfilling selected versions took 7.334
+seconds, and building the name index took 1.673 seconds. The relation plus index
+allocated 136,920 4 KiB pages, or 560,824,320 bytes. Opening the same clone with
+the production migration, including display-name calculation and its atomic
+migration marker, took 26.448 seconds once and 6-8 ms thereafter.
+
+Warm release measurements used summary diagnostics on the existing
+seven-repository workspace:
+
+| Query | Warm run 1 | Warm run 2 | Result |
+| --- | ---: | ---: | --- |
+| Entity search, `package`, limit 20 | 410 ms | 403 ms | 20 matches |
+| One target repository, start already in target | 109 ms | 108 ms | 15 bounded paths |
+| Two target repositories with no common path | 128 ms | 130 ms | No paths |
+
+The single-target case does not run reverse reachability for the target already
+visited by the start entity. The impossible two-target case performs bounded
+reverse acquisition and stops before forward entity hydration; it does not
+compute and discard unrelated paths.
+
 
 ## Multi-path traversal limits (2026-09-05)
 
@@ -161,4 +191,4 @@ Focused tests additionally cover SQLite publication between acquisition and
 hydration, database interruption followed by a successful query on the same
 transaction, evidence-preserving overrides, and a 10,001-edge star that cannot
 be misreported as known leaf paths when acquisition is capped. Legacy query
-schemas, defaults, and slow-warning policy are unchanged.
+defaults and the slow-warning policy are unchanged.

@@ -178,6 +178,7 @@ fn replace_fact_shards(
     }
 
     let mut entity_rows = Vec::new();
+    let mut entity_name_rows = Vec::new();
     let mut observation_rows = Vec::new();
     let mut dependency_rows = Vec::new();
     let mut selection_rows = Vec::new();
@@ -215,6 +216,15 @@ fn replace_fact_shards(
                 entity_metadata(entity.metadata).into(),
             ]);
             DataValue::List(row)
+        }));
+        entity_name_rows.extend(shard.entities.iter().map(|entity| {
+            DataValue::List(vec![
+                shard.producer.as_str().into(),
+                shard.owner.as_str().into(),
+                shard.version.as_str().into(),
+                entity.id.as_str().into(),
+                super::semantic::entity_name(entity.id.as_str()).into(),
+            ])
         }));
         observation_rows.extend(shard.observations.iter().map(|observation| {
             let mut row = scope.to_vec();
@@ -259,6 +269,13 @@ fn replace_fact_shards(
                  producer, owner, version, id => kind, metadata\
              }",
             entity_rows,
+        ),
+        (
+            "?[producer, owner, version, id, name] <- $rows \
+             :put analysis_fact_shard_entity_name {\
+                 producer, owner, version, id => name\
+             }",
+            entity_name_rows,
         ),
         (
             "?[producer, owner, version, from, relation, to, evidence, confidence, provenance] \
@@ -4190,6 +4207,38 @@ fn sweep_unselected_enrichment_snapshots(
     }
 }
 
+fn sweep_unselected_fact_shard_entity_names(
+    db: &DbInstance,
+    writer: &Mutex<()>,
+    progress: &mut impl FnMut(GarbageCollectionProgress) -> bool,
+    stale_states: u32,
+    repositories: u32,
+) -> Result<bool, Box<dyn Error>> {
+    sweep_relation(
+        db,
+        writer,
+        progress,
+        RelationCleanup {
+            step: "unselected fact shard entity names".into(),
+            select_script: "selected[producer, owner, version] := \
+                 *analysis_fact_shard_selection{producer, owner, version}\n\
+             ?[producer, owner, version, id] := \
+                 *analysis_fact_shard_entity_name{producer, owner, version, id}, \
+                 not selected[producer, owner, version]"
+                .into(),
+            relation: "analysis_fact_shard_entity_name",
+            keys: "producer, owner, version, id",
+            parameters: BTreeMap::new(),
+            guard_repository_state: false,
+            guard_enrichment_snapshot: false,
+            stale_states,
+            repositories,
+            completed_steps: 0,
+            total_steps: 1,
+        },
+    )
+}
+
 pub(super) fn sweep_garbage_collection(
     db: &DbInstance,
     writer: &Mutex<()>,
@@ -4485,6 +4534,10 @@ pub(super) fn sweep_garbage_collection(
         )? {
             return Ok(states_resolved.into());
         }
+    }
+    if !sweep_unselected_fact_shard_entity_names(db, writer, progress, stale_states, repositories)?
+    {
+        return Ok(states_resolved.into());
     }
     if !sweep_unselected_enrichment_snapshots(db, writer, progress, stale_states, repositories)? {
         return Ok(states_resolved.into());
@@ -5847,6 +5900,93 @@ mod tests {
             affected_sources,
             BTreeSet::from(["repo://example/repo/rust/a".to_owned()])
         );
+    }
+
+    #[test]
+    fn fact_shard_entity_names_backfill_publish_and_collect_selected_versions() {
+        let database = std::env::temp_dir().join(format!(
+            "beholder-entity-names-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let store = SemanticStore::persistent(&database, true).unwrap();
+            store
+                .db
+                .run_script(
+                    "?[producer, owner, version, id, kind, metadata] <- [\
+                         ['rust', 'owner', 'v1', 'repo://example/repo/rust/lib/Stale', 'callable', ''],\
+                         ['rust', 'owner', 'v2', 'repo://example/repo/rust/lib/Selected', 'callable', '']\
+                     ] :put analysis_fact_shard_entity {producer, owner, version, id => kind, metadata}",
+                    BTreeMap::new(),
+                    ScriptMutability::Mutable,
+                )
+                .unwrap();
+            store
+                .db
+                .run_script(
+                    "?[view, producer, repository, owner, version] <- [\
+                         ['main', 'rust', 'example/repo', 'owner', 'v2']\
+                     ] :put analysis_fact_shard_selection {view, producer, repository, owner => version}",
+                    BTreeMap::new(),
+                    ScriptMutability::Mutable,
+                )
+                .unwrap();
+            store
+                .db
+                .run_script(
+                    "?[name] <- [['fact-shard-entity-name']] :rm schema_migration {name}",
+                    BTreeMap::new(),
+                    ScriptMutability::Mutable,
+                )
+                .unwrap();
+        }
+
+        let store = SemanticStore::persistent(&database, true).unwrap();
+        let names = || {
+            store
+                .db
+                .run_script(
+                    "?[version, name] := *analysis_fact_shard_entity_name{version, name} :order version",
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows
+        };
+        assert_eq!(names().len(), 1);
+        assert_eq!(names()[0][0].get_str(), Some("v2"));
+        assert_eq!(names()[0][1].get_str(), Some("Selected"));
+
+        let shard = FactShard {
+            repository: "example/repo".into(),
+            producer: "rust".into(),
+            owner: "owner".into(),
+            version: "v3".into(),
+            entities: vec![
+                EntityFact::new(
+                    "repo://example/repo/rust/lib/Current",
+                    EntityKind::Callable,
+                    None,
+                )
+                .unwrap(),
+            ],
+            observations: Vec::new(),
+        };
+        let transaction = store.db.multi_transaction(true);
+        replace_fact_shards(&transaction, "main", &[shard]).unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(names().len(), 2);
+
+        store.sweep_garbage_collection(|_| true).unwrap();
+        assert_eq!(names().len(), 1);
+        assert_eq!(names()[0][0].get_str(), Some("v3"));
+        assert_eq!(names()[0][1].get_str(), Some("Current"));
+        drop(store);
+        let _ = fs::remove_file(database);
     }
 
     #[test]

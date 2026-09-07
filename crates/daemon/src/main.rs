@@ -523,11 +523,11 @@ mod tests {
             ClearCacheRequest, DeleteRepositoryRequest, EntityKind, EntityOrigin, EntityRequest,
             EvidenceKind, GarbageCollectPhase, GarbageCollectRequest,
             GetGarbageCollectionStatusRequest, GetJobRequest, GetRepositoryRequest,
-            GetStatusRequest, JobStatus, JobTrigger, JobType, ListJobsRequest,
+            GetStatusRequest, GraphDirection, JobStatus, JobTrigger, JobType, ListJobsRequest,
             ListWorkspacesRequest, PathRequest, RegisterRepositoryRequest,
             RegisterWorkspaceRequest, RelationKind, RepositoryIndexTarget, SearchEntitiesRequest,
-            StopRequest, SubmitIndexRequest, TraversalEntityRequest, daemon_client::DaemonClient,
-            garbage_collect_event, submit_index_request,
+            StopRequest, SubmitIndexRequest, TraversalEntityRequest, TraverseGraphRequest,
+            daemon_client::DaemonClient, garbage_collect_event, submit_index_request,
         },
     };
     use std::{env, fs, path::Path, time::Duration};
@@ -699,7 +699,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 23);
+        assert_eq!(status.protocol_version, 24);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");
@@ -878,6 +878,17 @@ mod tests {
             .workspace
             .unwrap();
         assert_eq!(registered.name, "main");
+        let unknown_target = client
+            .traverse_graph(TraverseGraphRequest {
+                workspace: "main".into(),
+                start: caller.clone(),
+                direction: GraphDirection::Dependencies as i32,
+                target_repositories: vec!["unknown/repository".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(unknown_target.code(), tonic::Code::InvalidArgument);
         let referenced = client
             .delete_repository(DeleteRepositoryRequest {
                 identity: first_identity.clone(),
@@ -1002,6 +1013,7 @@ mod tests {
                 workspace: "main".into(),
                 query: "Pricing.GetQuote".into(),
                 limit: None,
+                include_diagnostics: None,
             })
             .await
             .unwrap()

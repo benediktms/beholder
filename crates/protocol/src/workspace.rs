@@ -128,6 +128,7 @@ impl TryFrom<v1::RepositoryStatus> for RepositoryStatus {
                         } else {
                             AnalysisCompleteness::Complete
                         },
+                        diagnostic_counts: Default::default(),
                         diagnostics: revision
                             .diagnostics
                             .into_iter()

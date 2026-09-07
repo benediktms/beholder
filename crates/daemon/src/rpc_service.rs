@@ -291,7 +291,7 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<GetStatusResponse>, Status> {
         Ok(Response::new(GetStatusResponse {
             status: "ready".into(),
-            protocol_version: 23,
+            protocol_version: 24,
             pid: std::process::id(),
         }))
     }
@@ -347,8 +347,30 @@ impl Daemon for BeholderDaemon {
     ) -> Result<Response<beholder_protocol::v1::TraverseGraphResponse>, Status> {
         let request = request.into_inner();
         let workspace = request.workspace.clone();
+        let include_diagnostics = request.include_diagnostics.unwrap_or(true);
         let query = beholder_dto::TraverseGraphQuery::try_from(request)
             .map_err(Status::invalid_argument)?;
+        let registered = self
+            .workspaces
+            .lock()
+            .map_err(|_| Status::internal("workspace registry lock poisoned"))?
+            .get(&workspace)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("workspace not registered: {workspace}")))?;
+        let repositories = registered
+            .repositories
+            .iter()
+            .map(|repository| repository.repository.identity.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(unknown) = query
+            .target_repositories
+            .iter()
+            .find(|repository| !repositories.contains(repository.as_str()))
+        {
+            return Err(Status::invalid_argument(format!(
+                "target repository is not registered in workspace: {unknown}"
+            )));
+        }
         let enriching = self
             .jobs
             .active_enrichment_repositories(&workspace)
@@ -356,8 +378,16 @@ impl Daemon for BeholderDaemon {
             .map_err(|error| Status::internal(error.to_string()))?;
         let store = self.store.clone();
         let query_workspace = workspace.clone();
-        let result =
-            semantic_query(move || store.traverse_graph_snapshot(&query_workspace, query)).await?;
+        let result = semantic_query(move || {
+            store.traverse_graph_snapshot_with_options(
+                &query_workspace,
+                query,
+                beholder_adapters_mnestic::QueryOptions {
+                    include_diagnostics,
+                },
+            )
+        })
+        .await?;
         self.query_response(&workspace, enriching, result)
     }
 
@@ -369,6 +399,7 @@ impl Daemon for BeholderDaemon {
         let request = request.into_inner();
         let query = entity_search_query(&request.query)?;
         let limit = entity_search_limit(request.limit)?;
+        let include_diagnostics = request.include_diagnostics.unwrap_or(true);
         let enriching = self
             .jobs
             .active_enrichment_repositories(&request.workspace)
@@ -377,9 +408,17 @@ impl Daemon for BeholderDaemon {
         let store = self.store.clone();
         let workspace = request.workspace.clone();
         let query = query.to_owned();
-        let result =
-            semantic_query(move || store.search_entities_snapshot(&workspace, &query, limit))
-                .await?;
+        let result = semantic_query(move || {
+            store.search_entities_snapshot_with_options(
+                &workspace,
+                &query,
+                limit,
+                beholder_adapters_mnestic::QueryOptions {
+                    include_diagnostics,
+                },
+            )
+        })
+        .await?;
         self.query_response(&request.workspace, enriching, result)
     }
 

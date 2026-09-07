@@ -111,6 +111,11 @@ try:
 
     search_input = {"workspace": workspace, "query": query}
     first_search = canonical_search_result(call("search_entities", search_input))
+    detailed_search = canonical_search_result(call(
+        "search_entities", {**search_input, "include_diagnostics": True}
+    ))
+    if first_search != detailed_search:
+        raise AssertionError("summary and detailed search disagree without diagnostics")
     if expected_entity == "-":
         entity = next(iter(first_search["matches"]), None)
     else:
@@ -127,10 +132,22 @@ try:
         "max_hops": 1,
     }
     first_traversal = canonical_traversal_result(call("traverse_graph", traversal_input))
+    detailed_traversal = canonical_traversal_result(call(
+        "traverse_graph", {**traversal_input, "include_diagnostics": True}
+    ))
+    if first_traversal != detailed_traversal:
+        raise AssertionError("summary and detailed traversal disagree without diagnostics")
     node_ids = {node["id"] for node in first_traversal["nodes"]}
     for expected in expected_nodes:
         if expected not in node_ids:
             raise AssertionError(f"traversal did not contain {expected!r}")
+    repository = entity["id"].removeprefix("repo://").split("/rust/", 1)[0]
+    filtered = call("traverse_graph", {
+        **traversal_input,
+        "target_repositories": [repository],
+    })
+    if filtered["query"]["target_repositories"] != [repository]:
+        raise AssertionError("repository target was not preserved")
 
     started = time.perf_counter()
     second_search = canonical_search_result(call("search_entities", search_input))

@@ -1,7 +1,7 @@
 use super::schema::*;
 use beholder_dto::{
     AnalysisCompleteness, AnalysisDiagnostic, AnalysisDiagnosticSeverity, AnalysisMetadata,
-    RepositoryRevision,
+    DiagnosticCounts, RepositoryRevision,
 };
 use mnestic_engine::{
     DataValue, DbInstance, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions,
@@ -496,10 +496,68 @@ baseline_diagnostic[repository, code, severity, path, line, detail] :=
     }
 }
 
+struct AnalysisMetadataDiagnosticCounts;
+
+impl MnesticQuery for AnalysisMetadataDiagnosticCounts {
+    const OPERATION: &'static str = "analysis_metadata.diagnostic_counts";
+    const SCRIPT: &'static str = concat!(
+        include_str!("../../../rules/core/analysis_metadata.datalog"),
+        r#"
+baseline_diagnostic[repository, code, severity, path, line, detail] :=
+    *analysis_revision_diagnostic{view: $view, revision: $revision, repository, code, severity, path, line, detail},
+    not selected_diagnostic_replacement[repository, code]
+diagnostic[repository, code, severity, path, line, detail] := baseline_diagnostic[repository, code, severity, path, line, detail]
+diagnostic[repository, code, severity, path, line, detail] := enrichment_diagnostic[repository, code, severity, path, line, detail],
+    not baseline_diagnostic[repository, code, severity, path, line, _]
+?[severity, count(code)] := diagnostic[repository, code, severity, path, line, detail]
+:order severity"#
+    );
+    const HEADERS: &'static [&'static str] = &["severity", "count(code)"];
+
+    type Params = AnalysisMetadataParams;
+    type Row = (AnalysisDiagnosticSeverity, u64);
+
+    fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+        AnalysisMetadataCompleteness::bind(params)
+    }
+
+    fn decode(_: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+        let severity = match row[0].get_str() {
+            Some("known_limitation") => AnalysisDiagnosticSeverity::KnownLimitation,
+            Some("warning") => AnalysisDiagnosticSeverity::Warning,
+            _ => {
+                return Err(QueryError::new(
+                    Self::OPERATION,
+                    "unknown stored analysis diagnostic severity",
+                ));
+            }
+        };
+        let count = row[1]
+            .get_int()
+            .and_then(|count| u64::try_from(count).ok())
+            .ok_or_else(|| QueryError::new(Self::OPERATION, "diagnostic count is invalid"))?;
+        Ok((severity, count))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AnalysisMetadataOptions {
+    pub include_diagnostics: bool,
+}
+
+impl Default for AnalysisMetadataOptions {
+    fn default() -> Self {
+        Self {
+            include_diagnostics: true,
+        }
+    }
+}
+
 pub(super) fn analysis_metadata(
     db: &impl QueryRunner,
     view: &str,
     revision: u64,
+    options: AnalysisMetadataOptions,
 ) -> Result<AnalysisMetadata, Box<dyn Error>> {
     let revision = i64::try_from(revision)?;
     let params = AnalysisMetadataParams { revision };
@@ -513,13 +571,28 @@ pub(super) fn analysis_metadata(
         .into_iter()
         .next()
         .unwrap_or_default();
-    let diagnostics = db.run::<AnalysisMetadataDiagnostics>(view, params)?;
+    let (diagnostics, diagnostic_counts) = if options.include_diagnostics {
+        let diagnostics = db.run::<AnalysisMetadataDiagnostics>(view, params)?;
+        let counts = diagnostic_counts(&diagnostics);
+        (diagnostics, counts)
+    } else {
+        let mut counts = DiagnosticCounts::default();
+        for (severity, count) in db.run::<AnalysisMetadataDiagnosticCounts>(view, params)? {
+            counts.total += count;
+            match severity {
+                AnalysisDiagnosticSeverity::KnownLimitation => counts.known_limitations = count,
+                AnalysisDiagnosticSeverity::Warning => counts.warnings = count,
+            }
+        }
+        (Vec::new(), counts)
+    };
     Ok(AnalysisMetadata {
         completeness: if incomplete {
             AnalysisCompleteness::Incomplete
         } else {
             AnalysisCompleteness::Complete
         },
+        diagnostic_counts,
         diagnostics,
     })
 }
@@ -653,7 +726,8 @@ pub(super) fn repository_revision(
             line,
             detail,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let diagnostic_counts = diagnostic_counts(&diagnostics);
     Ok(Some(RepositoryRevision {
         source_state,
         head: (!head.is_empty()).then_some(head),
@@ -664,9 +738,24 @@ pub(super) fn repository_revision(
             } else {
                 AnalysisCompleteness::Complete
             },
+            diagnostic_counts,
             diagnostics,
         },
     }))
+}
+
+fn diagnostic_counts(diagnostics: &[AnalysisDiagnostic]) -> DiagnosticCounts {
+    let mut counts = DiagnosticCounts {
+        total: diagnostics.len() as u64,
+        ..Default::default()
+    };
+    for diagnostic in diagnostics {
+        match diagnostic.severity {
+            AnalysisDiagnosticSeverity::KnownLimitation => counts.known_limitations += 1,
+            AnalysisDiagnosticSeverity::Warning => counts.warnings += 1,
+        }
+    }
+    counts
 }
 
 struct PublishedRepositoryHead;
@@ -928,13 +1017,12 @@ macro_rules! ranked_entity_search {
              display[id, name] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$'), name = regex_replace(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$', '$2/$3')\n\
              display[id, name] := candidate[id, _, _], not special[id], regex_matches(id, '^.*[/:]([^/:]+)$'), name = regex_replace(id, '^.*[/:]([^/:]+)$', '$1')\n\
              display[id, id] := candidate[id, _, _], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)$')\n\
-             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], str_includes(id, $query)\n\
-             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], str_includes(name, $query)\n\
+             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], starts_with(id, $query)\n\
+             matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], starts_with(name, $query)\n\
              ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, _], id = $query, rank = 0\n\
              ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], name = $query, rank = 1\n\
              ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], starts_with(id, $query), rank = 2\n\
              ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, name], starts_with(name, $query), rank = 2\n\
-             ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, _], rank = 3\n\
              ?[id, kind, metadata, rank] := ranked[id, kind, metadata, rank]\n\
              :order rank, id\n\
              :limit $limit"
@@ -988,7 +1076,8 @@ search_entity_facts_query!(
     SearchShardEntityFacts,
     "entity_search.shard",
     ranked_entity_search!(
-        "candidate[id, kind, metadata] := *analysis_fact_shard_selection{view: $view, producer, owner, version}, *analysis_fact_shard_entity{producer, owner, version, id, kind, metadata}, str_includes(id, $candidate)"
+        "candidate[id, kind, metadata] := *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, starts_with(id, $query), *analysis_fact_shard_selection:by_owner{view: $view, owner, producer, version}\n\
+         candidate[id, kind, metadata] := *analysis_fact_shard_entity_name:by_name{name, producer, owner, version, id}, starts_with(name, $query), *analysis_fact_shard_selection:by_owner{view: $view, owner, producer, version}, *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}"
     )
 );
 search_entity_facts_query!(
@@ -1593,6 +1682,530 @@ struct TraversalQueryBudget<'a, Q> {
     deadline: std::time::Instant,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TraversalState {
+    entity: String,
+    visited_targets: BTreeSet<String>,
+    completion_repository: Option<String>,
+}
+
+fn target_prefix(repository: &str) -> String {
+    format!("repo://{repository}/")
+}
+
+fn dependency_rows(
+    rows: NamedRows,
+    offset: usize,
+    operation: &'static str,
+) -> Result<Vec<ResolvedDependencyRow>, Box<dyn Error>> {
+    rows.rows
+        .iter()
+        .map(|row| decode_resolved_dependency(operation, &rows.headers[offset..], &row[offset..]))
+        .collect::<Result<_, _>>()
+        .map_err(Into::into)
+}
+
+fn reverse_seed(
+    db: &impl QueryRunner,
+    view: &str,
+    target: &str,
+    direction: TraversalDirection,
+    limit: usize,
+) -> Result<Vec<ResolvedDependencyRow>, Box<dyn Error>> {
+    let prefix = target_prefix(target);
+    let script = match direction {
+        TraversalDirection::Outgoing => {
+            "?[from, to, relation, evidence, confidence, provenance] := \
+                 *analysis_resolved_dependency:by_to{\
+                     view: $view, to, from, relation, evidence, confidence, provenance\
+                 }, starts_with(to, $prefix)\n\
+             :order from, to, relation, evidence, confidence, provenance\n\
+             :limit $limit\n\
+             :reorder written"
+        }
+        TraversalDirection::Incoming => {
+            "regular[from, to, relation, evidence, confidence, provenance] := \
+                 *analysis_resolved_dependency{\
+                     view: $view, from, relation, to, evidence, confidence, provenance\
+                 }, starts_with(from, $prefix), relation != 'implemented_by'\n\
+             regular[from, to, relation, evidence, confidence, provenance] := \
+                 *analysis_resolved_dependency{\
+                     view: $view, from, relation: 'implemented_by', to, evidence, confidence, provenance\
+                 }, starts_with(from, $prefix), not starts_with(from, 'grpc://'), relation = 'implemented_by'\n\
+             regular[from, to, relation, evidence, confidence, provenance] := \
+                 *analysis_resolved_dependency:by_to{\
+                     view: $view, to, from, relation: 'implemented_by', evidence, confidence, provenance\
+                 }, starts_with(to, $prefix), starts_with(from, 'grpc://'), relation = 'implemented_by'\n\
+             ?[from, to, relation, evidence, confidence, provenance] := \
+                 regular[from, to, relation, evidence, confidence, provenance]\n\
+             :order from, to, relation, evidence, confidence, provenance\n\
+             :limit $limit\n\
+             :reorder written"
+        }
+    };
+    dependency_rows(
+        db.run_query(
+            script,
+            BTreeMap::from([
+                ("view".into(), view.into()),
+                ("prefix".into(), prefix.into()),
+                ("limit".into(), i64::try_from(limit)?.into()),
+            ]),
+        )?,
+        0,
+        "traversal.repository_reachability.seed",
+    )
+}
+
+fn reverse_frontier(
+    db: &impl QueryRunner,
+    view: &str,
+    frontier: &BTreeSet<String>,
+    direction: TraversalDirection,
+    limit: usize,
+) -> Result<Vec<ResolvedDependencyRow>, Box<dyn Error>> {
+    let script = match direction {
+        TraversalDirection::Outgoing => {
+            "frontier[id] <- $frontier\n\
+             ?[from, to, relation, evidence, confidence, provenance] := frontier[to], \
+                 *analysis_resolved_dependency:by_to{\
+                     view: $view, to, from, relation, evidence, confidence, provenance\
+                 }\n\
+             :order from, to, relation, evidence, confidence, provenance\n\
+             :limit $limit\n\
+             :reorder written"
+        }
+        TraversalDirection::Incoming => {
+            "frontier[id] <- $frontier\n\
+             regular[from, to, relation, evidence, confidence, provenance] := frontier[from], \
+                 *analysis_resolved_dependency{\
+                     view: $view, from, relation, to, evidence, confidence, provenance\
+                 }, relation != 'implemented_by'\n\
+             regular[from, to, relation, evidence, confidence, provenance] := frontier[from], \
+                 *analysis_resolved_dependency{\
+                     view: $view, from, relation: 'implemented_by', to, evidence, confidence, provenance\
+                 }, not starts_with(from, 'grpc://'), relation = 'implemented_by'\n\
+             regular[from, to, relation, evidence, confidence, provenance] := frontier[to], \
+                 *analysis_resolved_dependency:by_to{\
+                     view: $view, to, from, relation: 'implemented_by', evidence, confidence, provenance\
+                 }, starts_with(from, 'grpc://'), relation = 'implemented_by'\n\
+             ?[from, to, relation, evidence, confidence, provenance] := \
+                 regular[from, to, relation, evidence, confidence, provenance]\n\
+             :order from, to, relation, evidence, confidence, provenance\n\
+             :limit $limit\n\
+             :reorder written"
+        }
+    };
+    dependency_rows(
+        db.run_query(
+            script,
+            BTreeMap::from([
+                ("view".into(), view.into()),
+                (
+                    "frontier".into(),
+                    DataValue::List(
+                        frontier
+                            .iter()
+                            .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                            .collect(),
+                    ),
+                ),
+                ("limit".into(), i64::try_from(limit)?.into()),
+            ]),
+        )?,
+        0,
+        "traversal.repository_reachability.frontier",
+    )
+}
+
+fn traversal_predecessor<'a>(
+    row: &'a ResolvedDependencyRow,
+    direction: TraversalDirection,
+) -> (&'a str, &'a str) {
+    match direction {
+        TraversalDirection::Outgoing => (&row.from, &row.to),
+        TraversalDirection::Incoming
+            if row.relation == "implemented_by" && row.from.starts_with("grpc://") =>
+        {
+            (&row.from, &row.to)
+        }
+        TraversalDirection::Incoming => (&row.to, &row.from),
+    }
+}
+
+fn target_reachability(
+    db: &impl QueryRunner,
+    view: &str,
+    query: &beholder_dto::TraverseGraphQuery,
+    direction: TraversalDirection,
+    remaining_rows: &mut usize,
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>, Box<dyn Error>> {
+    let mut reachable = BTreeMap::<String, BTreeSet<String>>::new();
+    for target in &query.target_repositories {
+        if super::semantic::repository(&query.start).as_deref() == Some(target) {
+            reachable
+                .entry(query.start.clone())
+                .or_default()
+                .insert(target.clone());
+            continue;
+        }
+        let seed = reverse_seed(db, view, target, direction, *remaining_rows + 1)?;
+        if seed.len() > *remaining_rows {
+            return Ok(None);
+        }
+        *remaining_rows -= seed.len();
+        let mut frontier = BTreeSet::<String>::new();
+        let mut visited = BTreeSet::<String>::new();
+        for row in seed {
+            let (predecessor, destination) = traversal_predecessor(&row, direction);
+            reachable
+                .entry(destination.into())
+                .or_default()
+                .insert(target.clone());
+            reachable
+                .entry(predecessor.into())
+                .or_default()
+                .insert(target.clone());
+            visited.insert(destination.into());
+            if visited.insert(predecessor.into()) {
+                frontier.insert(predecessor.into());
+            }
+        }
+        for _ in 1..query.max_hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let rows = reverse_frontier(db, view, &frontier, direction, *remaining_rows + 1)?;
+            if rows.len() > *remaining_rows {
+                return Ok(None);
+            }
+            *remaining_rows -= rows.len();
+            let mut next = BTreeSet::new();
+            for row in rows {
+                let (predecessor, _) = traversal_predecessor(&row, direction);
+                reachable
+                    .entry(predecessor.into())
+                    .or_default()
+                    .insert(target.clone());
+                if visited.insert(predecessor.into()) {
+                    next.insert(predecessor.into());
+                }
+            }
+            frontier = next;
+        }
+    }
+    Ok(Some(reachable))
+}
+
+struct ForwardAcquisition {
+    edges: Vec<ResolvedDependencyRow>,
+    boundaries: BTreeSet<String>,
+}
+
+fn filtered_forward(
+    db: &impl QueryRunner,
+    view: &str,
+    states: &BTreeSet<TraversalState>,
+    targets: &BTreeSet<String>,
+    reachable: &BTreeMap<String, BTreeSet<String>>,
+    direction: TraversalDirection,
+    limit: usize,
+) -> Result<ForwardAcquisition, Box<dyn Error>> {
+    let mut active_rows = Vec::new();
+    let mut incomplete_rows = Vec::new();
+    let mut missing_rows = Vec::new();
+    let mut completed_rows = Vec::new();
+    for (index, state) in states.iter().enumerate() {
+        let index = i64::try_from(index)?;
+        active_rows.push(DataValue::List(vec![
+            index.into(),
+            state.entity.as_str().into(),
+        ]));
+        if let Some(repository) = &state.completion_repository {
+            completed_rows.push(DataValue::List(vec![
+                index.into(),
+                state.entity.as_str().into(),
+                target_prefix(repository).into(),
+            ]));
+        } else {
+            incomplete_rows.push(DataValue::List(vec![
+                index.into(),
+                state.entity.as_str().into(),
+            ]));
+            missing_rows.extend(
+                targets
+                    .difference(&state.visited_targets)
+                    .map(|target| DataValue::List(vec![index.into(), target.as_str().into()])),
+            );
+        }
+    }
+    let reachable_rows = reachable
+        .iter()
+        .flat_map(|(entity, targets)| {
+            targets
+                .iter()
+                .map(|target| DataValue::List(vec![entity.as_str().into(), target.as_str().into()]))
+        })
+        .collect();
+    let adjacency = match direction {
+        TraversalDirection::Outgoing => {
+            "candidate[state, current, next, from, to, relation, evidence, confidence, provenance] := \
+                 active[state, from], current = from, next = to, \
+                 *analysis_resolved_dependency{\
+                     view: $view, from, relation, to, evidence, confidence, provenance\
+                 }"
+        }
+        TraversalDirection::Incoming => {
+            "candidate[state, current, next, from, to, relation, evidence, confidence, provenance] := \
+                 active[state, to], current = to, next = from, \
+                 *analysis_resolved_dependency:by_to{\
+                     view: $view, to, from, relation, evidence, confidence, provenance\
+                 }, relation != 'implemented_by'\n\
+             candidate[state, current, next, from, to, relation, evidence, confidence, provenance] := \
+                 active[state, to], current = to, next = from, \
+                 *analysis_resolved_dependency:by_to{\
+                     view: $view, to, from, relation: 'implemented_by', evidence, confidence, provenance\
+                 }, not starts_with(from, 'grpc://'), relation = 'implemented_by'\n\
+             candidate[state, current, next, from, to, relation, evidence, confidence, provenance] := \
+                 active[state, from], starts_with(from, 'grpc://'), current = from, next = to, \
+                 *analysis_resolved_dependency{\
+                     view: $view, from, relation: 'implemented_by', to, evidence, confidence, provenance\
+                 }, relation = 'implemented_by'"
+        }
+    };
+    let script = format!(
+        "active[state, current] <- $active\n\
+         incomplete[state, current] <- $incomplete\n\
+         missing[state, target] <- $missing\n\
+         reachable[next, target] <- $reachable\n\
+         completed[state, current, prefix] <- $completed\n\
+         {adjacency}\n\
+         blocked[state, next] := \
+             candidate[state, _, next, _, _, _, _, _, _], \
+             missing[state, target], not reachable[next, target]\n\
+         allowed[from, to, relation, evidence, confidence, provenance] := \
+             candidate[state, _, next, from, to, relation, evidence, confidence, provenance], \
+             incomplete[state, _], not blocked[state, next]\n\
+         allowed[from, to, relation, evidence, confidence, provenance] := \
+             candidate[state, _, next, from, to, relation, evidence, confidence, provenance], \
+             completed[state, _, prefix], starts_with(next, prefix)\n\
+         allowed[from, to, relation, evidence, confidence, provenance] := \
+             candidate[state, _, next, from, to, relation, evidence, confidence, provenance], \
+             completed[state, _, _], not starts_with(next, 'repo://')\n\
+         boundary[current] := candidate[state, current, next, _, _, _, _, _, _], \
+             completed[state, current, prefix], starts_with(next, 'repo://'), \
+             not starts_with(next, prefix)\n\
+         ?[row_kind, from, to, relation, evidence, confidence, provenance] := \
+             allowed[from, to, relation, evidence, confidence, provenance], row_kind = 'edge'\n\
+         ?[row_kind, from, to, relation, evidence, confidence, provenance] := \
+             boundary[from], row_kind = 'boundary', to = '', relation = '', evidence = '', \
+             confidence = 0.0, provenance = ''\n\
+         :order row_kind, from, to, relation, evidence, confidence, provenance\n\
+         :limit $limit\n\
+         :reorder written"
+    );
+    let rows = db.run_query(
+        &script,
+        BTreeMap::from([
+            ("view".into(), view.into()),
+            ("active".into(), DataValue::List(active_rows)),
+            ("incomplete".into(), DataValue::List(incomplete_rows)),
+            ("missing".into(), DataValue::List(missing_rows)),
+            ("reachable".into(), DataValue::List(reachable_rows)),
+            ("completed".into(), DataValue::List(completed_rows)),
+            ("limit".into(), i64::try_from(limit)?.into()),
+        ]),
+    )?;
+    let mut edges = Vec::new();
+    let mut boundaries = BTreeSet::new();
+    for row in &rows.rows {
+        match row.first().and_then(DataValue::get_str) {
+            Some("edge") => edges.push(decode_resolved_dependency(
+                "traversal.repository_filter.forward",
+                &rows.headers[1..],
+                &row[1..],
+            )?),
+            Some("boundary") => {
+                boundaries.insert(
+                    row.get(1)
+                        .and_then(DataValue::get_str)
+                        .ok_or("repository boundary entity is not a string")?
+                        .into(),
+                );
+            }
+            _ => return Err("unknown repository-filtered traversal row".into()),
+        }
+    }
+    Ok(ForwardAcquisition { edges, boundaries })
+}
+
+fn filtered_multipath_rows(
+    db: &impl QueryRunner,
+    view: &str,
+    query: &beholder_dto::TraverseGraphQuery,
+    direction: TraversalDirection,
+) -> Result<
+    (
+        NamedRows,
+        BTreeSet<String>,
+        BTreeSet<String>,
+        BTreeMap<String, BTreeSet<String>>,
+    ),
+    Box<dyn Error>,
+> {
+    let targets = query
+        .target_repositories
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut remaining_rows = beholder_dto::MAX_TRAVERSAL_ROWS as usize;
+    let Some(reachable) = target_reachability(db, view, query, direction, &mut remaining_rows)?
+    else {
+        return Ok((
+            empty_multipath_rows(),
+            BTreeSet::from([query.start.clone()]),
+            BTreeSet::new(),
+            BTreeMap::new(),
+        ));
+    };
+    let mut visited_targets = BTreeSet::new();
+    if let Some(repository) = super::semantic::repository(&query.start)
+        && targets.contains(&repository)
+    {
+        visited_targets.insert(repository);
+    }
+    let missing = targets
+        .difference(&visited_targets)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !missing.is_subset(reachable.get(&query.start).unwrap_or(&BTreeSet::new())) {
+        return Ok((
+            empty_multipath_rows(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            reachable,
+        ));
+    }
+    let completion_repository = missing
+        .is_empty()
+        .then(|| super::semantic::repository(&query.start))
+        .flatten();
+    let initial = TraversalState {
+        entity: query.start.clone(),
+        visited_targets,
+        completion_repository,
+    };
+    let mut found_completion = initial.completion_repository.is_some();
+    let mut states = BTreeSet::from([initial.clone()]);
+    let mut visited_states = BTreeSet::from([initial]);
+    let mut rows = Vec::new();
+    let mut incomplete = BTreeSet::new();
+    let mut boundaries = BTreeSet::new();
+    for hops in 0..=query.max_hops {
+        if states.is_empty() {
+            break;
+        }
+        let result = filtered_forward(
+            db,
+            view,
+            &states,
+            &targets,
+            &reachable,
+            direction,
+            remaining_rows + states.len() + 1,
+        )?;
+        boundaries.extend(result.boundaries);
+        if result.edges.len() > remaining_rows {
+            incomplete.extend(states.iter().map(|state| state.entity.clone()));
+            break;
+        }
+        remaining_rows -= result.edges.len();
+        let mut next_states = BTreeSet::new();
+        for row in &result.edges {
+            let (current, next) = match direction {
+                TraversalDirection::Outgoing => (row.from.as_str(), row.to.as_str()),
+                TraversalDirection::Incoming
+                    if row.relation == "implemented_by" && row.from.starts_with("grpc://") =>
+                {
+                    (row.from.as_str(), row.to.as_str())
+                }
+                TraversalDirection::Incoming => (row.to.as_str(), row.from.as_str()),
+            };
+            for state in states.iter().filter(|state| state.entity == current) {
+                let mut next_state = state.clone();
+                next_state.entity = next.into();
+                if let Some(completion) = &state.completion_repository {
+                    if super::semantic::repository(next).as_deref() != Some(completion) {
+                        continue;
+                    }
+                } else if let Some(repository) = super::semantic::repository(next)
+                    && targets.contains(&repository)
+                {
+                    next_state.visited_targets.insert(repository.clone());
+                    if next_state.visited_targets == targets {
+                        next_state.completion_repository = Some(repository);
+                        found_completion = true;
+                    }
+                }
+                let missing = targets
+                    .difference(&next_state.visited_targets)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if !missing.is_empty()
+                    && !missing.is_subset(reachable.get(next).unwrap_or(&BTreeSet::new()))
+                {
+                    continue;
+                }
+                if visited_states.insert(next_state.clone()) {
+                    next_states.insert(next_state);
+                }
+            }
+        }
+        rows.extend(result.edges.into_iter().map(|row| row.into_values(hops)));
+        if hops == query.max_hops {
+            if !next_states.is_empty() {
+                incomplete.extend(next_states.iter().map(|state| state.entity.clone()));
+            }
+            break;
+        }
+        states = next_states;
+    }
+    if !found_completion {
+        rows.clear();
+        boundaries.clear();
+    }
+    Ok((
+        multipath_named_rows(rows),
+        incomplete,
+        boundaries,
+        reachable,
+    ))
+}
+
+fn empty_multipath_rows() -> NamedRows {
+    multipath_named_rows(Vec::new())
+}
+
+fn multipath_named_rows(rows: Vec<Vec<DataValue>>) -> NamedRows {
+    NamedRows::new(
+        [
+            "row_kind",
+            "entity",
+            "hops",
+            "edge_from",
+            "edge_to",
+            "relation",
+            "evidence",
+            "confidence",
+            "provenance",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        rows,
+    )
+}
+
 impl<Q: QueryRunner> QueryRunner for TraversalQueryBudget<'_, Q> {
     fn run_query(
         &self,
@@ -1622,7 +2235,15 @@ pub(super) fn multipath_rows(
     db: &impl QueryRunner,
     view: &str,
     query: &beholder_dto::TraverseGraphQuery,
-) -> Result<(NamedRows, BTreeSet<String>), Box<dyn Error>> {
+) -> Result<
+    (
+        NamedRows,
+        BTreeSet<String>,
+        BTreeSet<String>,
+        BTreeMap<String, BTreeSet<String>>,
+    ),
+    Box<dyn Error>,
+> {
     let deadline = std::time::Instant::now()
         + Duration::from_millis(u64::from(beholder_dto::TRAVERSAL_ACQUISITION_TIMEOUT_MS));
     let db = TraversalQueryBudget {
@@ -1633,6 +2254,9 @@ pub(super) fn multipath_rows(
         beholder_dto::GraphDirection::Dependencies => TraversalDirection::Outgoing,
         beholder_dto::GraphDirection::Dependents => TraversalDirection::Incoming,
     };
+    if !query.target_repositories.is_empty() {
+        return filtered_multipath_rows(&db, view, query, direction);
+    }
     let mut frontier = BTreeSet::from([query.start.clone()]);
     let mut visited = frontier.clone();
     let mut rows = Vec::new();
@@ -1690,24 +2314,10 @@ pub(super) fn multipath_rows(
         frontier = next;
     }
     Ok((
-        NamedRows::new(
-            [
-                "row_kind",
-                "entity",
-                "hops",
-                "edge_from",
-                "edge_to",
-                "relation",
-                "evidence",
-                "confidence",
-                "provenance",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            rows,
-        ),
+        multipath_named_rows(rows),
         incomplete,
+        BTreeSet::new(),
+        BTreeMap::new(),
     ))
 }
 
@@ -1794,6 +2404,87 @@ mod tests {
                 Vec::new(),
             ))
         }
+    }
+
+    struct SummaryMetadataRunner;
+
+    impl QueryRunner for SummaryMetadataRunner {
+        fn run_query(
+            &self,
+            script: &str,
+            _params: BTreeMap<String, DataValue>,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            if script.contains("count(code)") {
+                return Ok(NamedRows::new(
+                    vec!["severity".into(), "count(code)".into()],
+                    vec![vec!["warning".into(), 2_i64.into()]],
+                ));
+            }
+            if script.contains(":order severity, repository") {
+                panic!("summary metadata must not load diagnostic details");
+            }
+            Ok(NamedRows::new(
+                vec!["incomplete".into()],
+                vec![vec![DataValue::Bool(true)]],
+            ))
+        }
+    }
+
+    struct UnexpectedQueryRunner;
+
+    impl QueryRunner for UnexpectedQueryRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            panic!("target already visited by start must not query reverse reachability");
+        }
+    }
+
+    #[test]
+    fn target_reachability_skips_a_repository_visited_by_start() {
+        let start = "repo://example/a/rust/lib/start";
+        let query = beholder_dto::TraverseGraphQuery {
+            start: start.into(),
+            direction: beholder_dto::GraphDirection::Dependencies,
+            destination: None,
+            target_repositories: vec!["example/a".into()],
+            max_hops: 8,
+            max_paths: 50,
+        };
+        let mut remaining = beholder_dto::MAX_TRAVERSAL_ROWS as usize;
+
+        let reachable = target_reachability(
+            &UnexpectedQueryRunner,
+            "main",
+            &query,
+            TraversalDirection::Outgoing,
+            &mut remaining,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(reachable[start], BTreeSet::from(["example/a".into()]));
+        assert_eq!(remaining, beholder_dto::MAX_TRAVERSAL_ROWS as usize);
+    }
+
+    #[test]
+    fn summary_analysis_metadata_counts_without_loading_details() {
+        let metadata = analysis_metadata(
+            &SummaryMetadataRunner,
+            "main",
+            1,
+            AnalysisMetadataOptions {
+                include_diagnostics: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(metadata.completeness, AnalysisCompleteness::Incomplete);
+        assert!(metadata.diagnostics.is_empty());
+        assert_eq!(metadata.diagnostic_counts.total, 2);
+        assert_eq!(metadata.diagnostic_counts.warnings, 2);
     }
 
     #[test]

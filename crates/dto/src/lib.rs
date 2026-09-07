@@ -7,7 +7,7 @@ pub const IMPACT_SCHEMA_V2: &str = "beholder.impact.v2";
 pub const TRACE_SCHEMA_V2: &str = "beholder.trace.v2";
 pub const WHY_SCHEMA_V2: &str = "beholder.why.v2";
 pub const WORKSPACE_TOPOLOGY_SCHEMA_V1: &str = "beholder.workspace_topology.v1";
-pub const ENTITY_SEARCH_SCHEMA_V1: &str = "beholder.entity_search.v1";
+pub const ENTITY_SEARCH_SCHEMA_V2: &str = "beholder.entity_search.v2";
 pub const DEFAULT_MAX_HOPS: u32 = 32;
 pub const DEFAULT_ENTITY_SEARCH_LIMIT: u32 = 20;
 pub const MAX_ENTITY_SEARCH_LIMIT: u32 = 100;
@@ -106,7 +106,16 @@ pub struct AnalysisDiagnostic {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AnalysisMetadata {
     pub completeness: AnalysisCompleteness,
+    #[serde(default)]
+    pub diagnostic_counts: DiagnosticCounts,
     pub diagnostics: Vec<AnalysisDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DiagnosticCounts {
+    pub total: u64,
+    pub known_limitations: u64,
+    pub warnings: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -129,7 +138,9 @@ pub struct RepositoryStatus {
 
 impl AnalysisMetadata {
     fn is_complete(&self) -> bool {
-        self.completeness == AnalysisCompleteness::Complete && self.diagnostics.is_empty()
+        self.completeness == AnalysisCompleteness::Complete
+            && self.diagnostic_counts.total == 0
+            && self.diagnostics.is_empty()
     }
 }
 
@@ -522,7 +533,7 @@ pub struct Revisioned<T> {
 }
 
 /// Limits apply to the new multi-path operation; legacy query contracts are unchanged.
-pub const TRAVERSE_GRAPH_SCHEMA_V1: &str = "beholder.traverse_graph.v1";
+pub const TRAVERSE_GRAPH_SCHEMA_V2: &str = "beholder.traverse_graph.v2";
 pub const DEFAULT_TRAVERSAL_HOPS: u32 = 8;
 pub const MAX_TRAVERSAL_HOPS: u32 = 32;
 pub const DEFAULT_MAX_PATHS: u32 = 50;
@@ -543,11 +554,18 @@ pub struct TraverseGraphQuery {
     pub start: String,
     pub direction: GraphDirection,
     pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_repositories: Vec<String>,
     pub max_hops: u32,
     pub max_paths: u32,
 }
 
 impl TraverseGraphQuery {
+    pub fn normalize(&mut self) {
+        self.target_repositories.sort();
+        self.target_repositories.dedup();
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.start.trim().is_empty()
             || self
@@ -556,6 +574,16 @@ impl TraverseGraphQuery {
                 .is_some_and(|id| id.trim().is_empty())
         {
             return Err("start and destination must be non-empty canonical entity IDs");
+        }
+        if self.destination.is_some() && !self.target_repositories.is_empty() {
+            return Err("destination and target_repositories are mutually exclusive");
+        }
+        if self
+            .target_repositories
+            .iter()
+            .any(|repository| repository.trim().is_empty())
+        {
+            return Err("target repository identities must be non-empty");
         }
         if self.max_hops > MAX_TRAVERSAL_HOPS {
             return Err("max_hops must be between 0 and 32");
@@ -571,6 +599,7 @@ impl TraverseGraphQuery {
 #[serde(rename_all = "snake_case")]
 pub enum PathTermination {
     Destination,
+    RepositoryBoundary,
     Leaf,
     Cycle,
     MaxHops,
@@ -615,3 +644,41 @@ pub struct TraverseGraphResult {
     pub traversal: GraphTraversalMetadata,
 }
 semantic_result!(TraverseGraphResult);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn traversal() -> TraverseGraphQuery {
+        TraverseGraphQuery {
+            start: "repo://example/root".into(),
+            direction: GraphDirection::Dependencies,
+            destination: None,
+            target_repositories: Vec::new(),
+            max_hops: DEFAULT_TRAVERSAL_HOPS,
+            max_paths: DEFAULT_MAX_PATHS,
+        }
+    }
+
+    #[test]
+    fn traversal_normalizes_and_validates_repository_targets() {
+        let mut query = traversal();
+        query.target_repositories = vec!["repo-b".into(), "repo-a".into(), "repo-b".into()];
+        query.normalize();
+        assert_eq!(query.target_repositories, ["repo-a", "repo-b"]);
+        assert_eq!(query.validate(), Ok(()));
+
+        query.destination = Some("repo://example/destination".into());
+        assert_eq!(
+            query.validate(),
+            Err("destination and target_repositories are mutually exclusive")
+        );
+
+        query.destination = None;
+        query.target_repositories = vec!["".into()];
+        assert_eq!(
+            query.validate(),
+            Err("target repository identities must be non-empty")
+        );
+    }
+}

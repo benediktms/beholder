@@ -291,17 +291,11 @@ pub async fn workspace_topology_status(workspace: String) -> Result<QueryMetadat
 }
 
 pub async fn search_entities(
-    workspace: String,
-    query: String,
-    limit: Option<u32>,
+    search: SearchEntitiesRequest,
 ) -> Result<EntitySearchResult, ClientError> {
     Ok(connect_send()
         .await?
-        .search_entities(request(SearchEntitiesRequest {
-            workspace,
-            query,
-            limit,
-        }))
+        .search_entities(request(search))
         .await
         .map_err(operation_error)?
         .into_inner()
@@ -626,6 +620,11 @@ mod tests {
                 line: Some(7),
                 detail: None,
             }],
+            diagnostic_counts: Some(v1::DiagnosticCounts {
+                total: 1,
+                known_limitations: 0,
+                warnings: 1,
+            }),
         };
 
         let metadata = QueryMetadata::try_from(metadata).unwrap();

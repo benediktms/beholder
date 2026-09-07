@@ -84,6 +84,7 @@ message SearchEntitiesRequest {
   string workspace = 1;
   string query = 2;
   optional uint32 limit = 3;
+  optional bool include_diagnostics = 4;
 }
 
 message TraversalEntityRequest {
@@ -110,6 +111,13 @@ message QueryMetadata {
   Freshness freshness = 3;
   AnalysisCompleteness completeness = 4;
   repeated AnalysisDiagnostic diagnostics = 5;
+  DiagnosticCounts diagnostic_counts = 6;
+}
+
+message DiagnosticCounts {
+  uint64 total = 1;
+  uint64 known_limitations = 2;
+  uint64 warnings = 3;
 }
 
 message GetWorkspaceTopologyRequest {
@@ -635,6 +643,8 @@ message TraverseGraphRequest {
   optional string destination = 4;
   optional uint32 max_hops = 5;
   optional uint32 max_paths = 6;
+  repeated string target_repositories = 7;
+  optional bool include_diagnostics = 8;
 }
 message TraverseGraphQuery {
   string start = 1;
@@ -642,6 +652,7 @@ message TraverseGraphQuery {
   optional string destination = 3;
   uint32 max_hops = 4;
   uint32 max_paths = 5;
+  repeated string target_repositories = 6;
 }
 enum PathTermination {
   PATH_TERMINATION_UNSPECIFIED = 0;
@@ -649,6 +660,7 @@ enum PathTermination {
   PATH_TERMINATION_LEAF = 2;
   PATH_TERMINATION_CYCLE = 3;
   PATH_TERMINATION_MAX_HOPS = 4;
+  PATH_TERMINATION_REPOSITORY_BOUNDARY = 5;
 }
 enum TruncationReason {
   TRUNCATION_REASON_UNSPECIFIED = 0;
