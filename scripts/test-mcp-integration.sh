@@ -67,5 +67,18 @@ if ! grep -Fq '"stale":false' <<<"$context"; then
     exit 1
 fi
 
+jobs=''
+for _ in {1..600}; do
+    jobs="$("$root/target/debug/beholder" job list 2>/dev/null || true)"
+    if ! grep -Eq $'\t(Queued|Waiting|Running)\t' <<<"$jobs"; then
+        break
+    fi
+    sleep 0.1
+done
+if grep -Eq $'\t(Queued|Waiting|Running)\t' <<<"$jobs"; then
+    printf 'MCP fixture jobs did not settle:\n%s\n' "$jobs" >&2
+    exit 1
+fi
+
 python3 "$root/scripts/mcp-smoke.py" \
     "$root/target/debug/beholder-mcp" mcp-smoke caller "$caller" "$helper"
