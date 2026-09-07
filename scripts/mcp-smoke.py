@@ -47,10 +47,11 @@ def canonical_traversal_result(result):
             result["paths"],
             key=lambda path: (tuple(path["nodes"]), tuple(path["edges"]), path["termination"]),
         )
-    metadata = copy.deepcopy(result.get("metadata", {}))
-    if isinstance(metadata, dict):
-        metadata.pop("indexing", None)
-        result["metadata"] = metadata
+    freshness = result.get("freshness")
+    if isinstance(freshness, dict):
+        freshness = dict(freshness)
+        freshness.pop("indexing", None)
+        result["freshness"] = freshness
     if "truncation_reasons" in result:
         result["truncation_reasons"] = sorted(result["truncation_reasons"])
     return result

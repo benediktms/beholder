@@ -64,13 +64,13 @@ struct WorkspaceList {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WorkspaceSummary {
     name: String,
     repositories: Vec<WorkspaceRepositorySummary>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceRepositorySummary {
     identity: String,
     display_name: String,
