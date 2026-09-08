@@ -229,7 +229,10 @@ mod tests {
             response.edges[0].evidence[0].source,
             v1::EvidenceKind::Inference as i32
         );
-        assert_eq!(dto::TraceResult::try_from(response).unwrap(), trace);
+        assert_eq!(dto::TraceResult::try_from(response.clone()).unwrap(), trace);
+        let mut legacy_response = response;
+        legacy_response.metadata.as_mut().unwrap().diagnostic_counts = None;
+        assert_eq!(dto::TraceResult::try_from(legacy_response).unwrap(), trace);
         assert!(relation_kind(v1::RelationKind::Unspecified as i32).is_err());
         let protocol = include_str!("../../../proto/beholder/v1/daemon.proto");
         assert!(!protocol.contains("message QueryResult"));

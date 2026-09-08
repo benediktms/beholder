@@ -119,6 +119,11 @@ impl TryFrom<v1::QueryMetadata> for dto::QueryMetadata {
     type Error = &'static str;
 
     fn try_from(value: v1::QueryMetadata) -> Result<Self, Self::Error> {
+        let diagnostics = value
+            .diagnostics
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<dto::AnalysisDiagnostic>, _>>()?;
         Ok(Self {
             revision: value.revision,
             view: value.view,
@@ -132,12 +137,20 @@ impl TryFrom<v1::QueryMetadata> for dto::QueryMetadata {
                         known_limitations: counts.known_limitations,
                         warnings: counts.warnings,
                     })
-                    .unwrap_or_default(),
-                diagnostics: value
-                    .diagnostics
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<_, _>>()?,
+                    .unwrap_or_else(|| dto::DiagnosticCounts {
+                        total: diagnostics.len() as u64,
+                        known_limitations: diagnostics
+                            .iter()
+                            .filter(|row| {
+                                row.severity == dto::AnalysisDiagnosticSeverity::KnownLimitation
+                            })
+                            .count() as u64,
+                        warnings: diagnostics
+                            .iter()
+                            .filter(|row| row.severity == dto::AnalysisDiagnosticSeverity::Warning)
+                            .count() as u64,
+                    }),
+                diagnostics,
             },
         })
     }
