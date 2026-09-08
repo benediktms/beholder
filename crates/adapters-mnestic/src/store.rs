@@ -1110,6 +1110,24 @@ mod tests {
     }
 
     #[test]
+    fn filtered_multipath_depth_limit_is_not_an_acquisition_limit() {
+        use beholder_dto::TruncationReason;
+        let start = "repo://org/A/rust/lib/start";
+        let next = "repo://org/A/rust/lib/next";
+        let (store, _) = multipath_fixture(vec![call(start, next)]);
+        let mut query = multipath_query(start);
+        query.target_repositories = vec!["org/A".into()];
+        query.max_hops = 0;
+
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [TruncationReason::MaxHops]
+        );
+    }
+
+    #[test]
     fn multipath_cycles_depth_and_exact_path_limit() {
         use beholder_dto::{PathTermination, TruncationReason};
         let (store, _) = multipath_fixture(vec![
@@ -2336,6 +2354,7 @@ mod tests {
             EntityFact::new("repo://z/rust/foo/barbaz", EntityKind::Callable, None).unwrap(),
             EntityFact::new("elixir-call://a/hidden/0", EntityKind::Callable, None).unwrap(),
             EntityFact::new("elixir-call://hidden/0", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://example/custom/bar/", EntityKind::Callable, None).unwrap(),
         ];
         repository.observations = vec![Observation::generated(
             "repo://example/rust/lib/call",
@@ -2383,6 +2402,14 @@ mod tests {
             .search_entities_snapshot("main", "hidden/0", 1)
             .unwrap();
         assert_eq!(local_call.result.matches[0].id, "elixir-call://hidden/0");
+        let trailing_slash_name = store.search_entities_snapshot("main", "bar", 20).unwrap();
+        assert!(
+            trailing_slash_name
+                .result
+                .matches
+                .iter()
+                .any(|entity| entity.id == "repo://example/custom/bar/")
+        );
 
         let result = store
             .search_entities_snapshot("main", "ExampleService.Call", 20)

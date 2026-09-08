@@ -1015,8 +1015,8 @@ macro_rules! ranked_entity_search {
              display[id, name] := candidate[id, _, _], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://([^/]+)/([0-9]+)$', '$1/$2')\n\
              display[id, name] := candidate[id, _, _], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$'), name = regex_replace(id, '^(proto-method|grpc)://([^/]*[.])?([^./]+)/([^/]+)$', '$3.$4')\n\
              display[id, name] := candidate[id, _, _], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$'), name = regex_replace(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$', '$2/$3')\n\
-             display[id, name] := candidate[id, _, _], not special[id], regex_matches(id, '^.*[/:]([^/:]+)$'), name = regex_replace(id, '^.*[/:]([^/:]+)$', '$1')\n\
-             display[id, id] := candidate[id, _, _], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)$')\n\
+             display[id, name] := candidate[id, _, _], not special[id], regex_matches(id, '^.*[/:]([^/:]+)/?$'), name = regex_replace(id, '^.*[/:]([^/:]+)/?$', '$1')\n\
+             display[id, id] := candidate[id, _, _], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)/?$')\n\
              matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], starts_with(id, $query)\n\
              matched[id, kind, metadata, name] := candidate[id, kind, metadata], display[id, name], starts_with(name, $query)\n\
              ranked[id, kind, metadata, min(rank)] := matched[id, kind, metadata, _], id = $query, rank = 0\n\
@@ -1075,10 +1075,15 @@ search_entity_facts_query!(
 search_entity_facts_query!(
     SearchShardEntityFacts,
     "entity_search.shard",
-    ranked_entity_search!(
-        "candidate[id, kind, metadata] := *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, starts_with(id, $query), *analysis_fact_shard_selection:by_owner{view: $view, owner, producer, version}\n\
-         candidate[id, kind, metadata] := *analysis_fact_shard_entity_name:by_name{name, producer, owner, version, id}, starts_with(name, $query), *analysis_fact_shard_selection:by_owner{view: $view, owner, producer, version}, *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}"
-    )
+    "candidate[id, kind, metadata, name] := *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}, starts_with(id, $query), *analysis_fact_shard_entity_name{producer, owner, version, id, name}, *analysis_fact_shard_selection:by_owner{view: $view, owner, producer, version}\n\
+     candidate[id, kind, metadata, name] := *analysis_fact_shard_entity_name:by_name{name, producer, owner, version, id}, starts_with(name, $query), *analysis_fact_shard_selection:by_owner{view: $view, owner, producer, version}, *analysis_fact_shard_entity:by_id{id, producer, owner, version, kind, metadata}\n\
+     ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata, _], id = $query, rank = 0\n\
+     ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata, name], name = $query, rank = 1\n\
+     ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata, _], starts_with(id, $query), rank = 2\n\
+     ranked[id, kind, metadata, min(rank)] := candidate[id, kind, metadata, name], starts_with(name, $query), rank = 2\n\
+     ?[id, kind, metadata, rank] := ranked[id, kind, metadata, rank]\n\
+     :order rank, id\n\
+     :limit $limit"
 );
 search_entity_facts_query!(
     SearchEnrichmentEntityFacts,
@@ -2170,9 +2175,6 @@ fn filtered_multipath_rows(
         }
         rows.extend(result.edges.into_iter().map(|row| row.into_values(hops)));
         if hops == query.max_hops {
-            if !next_states.is_empty() {
-                incomplete.extend(next_states.iter().map(|state| state.entity.clone()));
-            }
             break;
         }
         states = next_states;
