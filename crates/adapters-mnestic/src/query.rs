@@ -2055,7 +2055,7 @@ fn filtered_forward(
 }
 
 fn filtered_multipath_rows(
-    db: &impl QueryRunner,
+    db: &TraversalQueryBudget<'_, impl QueryRunner>,
     view: &str,
     query: &beholder_dto::TraverseGraphQuery,
     direction: TraversalDirection,
@@ -2108,7 +2108,8 @@ fn filtered_multipath_rows(
     let mut rows = Vec::new();
     let mut incomplete = BTreeSet::new();
     let mut boundaries = BTreeSet::new();
-    for hops in 0..=query.max_hops {
+    let mut remaining_steps = beholder_dto::MAX_TRAVERSAL_STEPS;
+    'acquisition: for hops in 0..=query.max_hops {
         if states.is_empty() {
             break;
         }
@@ -2138,7 +2139,14 @@ fn filtered_multipath_rows(
                 }
                 TraversalDirection::Incoming => (row.to.as_str(), row.from.as_str()),
             };
-            for state in states.iter().filter(|state| state.entity == current) {
+            for state in &states {
+                if !db.consume_step(&mut remaining_steps)? {
+                    incomplete.extend(states.iter().map(|state| state.entity.clone()));
+                    break 'acquisition;
+                }
+                if state.entity != current {
+                    continue;
+                }
                 let mut next_state = state.clone();
                 next_state.entity = next.into();
                 if state.completion_repository.is_some() && !next.starts_with("repo://") {
@@ -2215,12 +2223,17 @@ fn multipath_named_rows(rows: Vec<Vec<DataValue>>) -> NamedRows {
     )
 }
 
-impl<Q: QueryRunner> QueryRunner for TraversalQueryBudget<'_, Q> {
-    fn run_query(
-        &self,
-        script: &str,
-        params: BTreeMap<String, DataValue>,
-    ) -> Result<NamedRows, Box<dyn Error>> {
+impl<Q> TraversalQueryBudget<'_, Q> {
+    fn consume_step(&self, remaining_steps: &mut u32) -> Result<bool, Box<dyn Error>> {
+        self.remaining_time()?;
+        let Some(remaining) = remaining_steps.checked_sub(1) else {
+            return Ok(false);
+        };
+        *remaining_steps = remaining;
+        Ok(true)
+    }
+
+    fn remaining_time(&self) -> Result<Duration, Box<dyn Error>> {
         let remaining = self
             .deadline
             .saturating_duration_since(std::time::Instant::now());
@@ -2231,6 +2244,17 @@ impl<Q: QueryRunner> QueryRunner for TraversalQueryBudget<'_, Q> {
             )
             .into());
         }
+        Ok(remaining)
+    }
+}
+
+impl<Q: QueryRunner> QueryRunner for TraversalQueryBudget<'_, Q> {
+    fn run_query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows, Box<dyn Error>> {
+        let remaining = self.remaining_time()?;
         self.inner
             .run_query(
                 &format!("{script}\n:timeout {}", remaining.as_secs_f64()),
@@ -2496,6 +2520,26 @@ mod tests {
 
         assert_eq!(reachable[start], BTreeSet::from(["example/a".into()]));
         assert_eq!(remaining, beholder_dto::MAX_TRAVERSAL_ROWS as usize);
+    }
+
+    #[test]
+    fn filtered_state_steps_are_bounded_without_database_calls() {
+        let budget = TraversalQueryBudget {
+            inner: &UnexpectedQueryRunner,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+        };
+        let mut remaining = 1;
+        assert!(budget.consume_step(&mut remaining).unwrap());
+        assert!(!budget.consume_step(&mut remaining).unwrap());
+        let expired = TraversalQueryBudget {
+            inner: &UnexpectedQueryRunner,
+            deadline: std::time::Instant::now(),
+        };
+        let error = expired.consume_step(&mut remaining).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 
     #[test]
