@@ -252,7 +252,11 @@ mod tests {
         let json = trace(&result, OutputMode::Json.into()).unwrap();
         assert!(json.starts_with(r#"{"schema":"beholder.trace.v2","revision":42,"view":"main""#));
         assert!(json.contains(r#""traversal":{"max_hops":32,"truncated":false}"#));
-        assert!(!json.contains(r#""analysis""#));
+        assert!(
+            json.contains(
+                r#""analysis":{"completeness":"complete","diagnostic_counts":{"total":0"#
+            )
+        );
         assert_eq!(
             trace(&result, OutputMode::Human.into()).unwrap(),
             "repo · CheckoutPage\n  → repo · Pricing.GetPrice [calls_rpc]\n\n1 hop · 1 repositories · confidence 1.00\ntraversal complete · max depth 32\nview main · revision 42 · stale=false · indexing=false"
