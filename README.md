@@ -259,8 +259,12 @@ The server exposes only `list_workspaces`, `search_entities`, and
 traversal. `traverse_graph` follows dependencies (outgoing entities used by the
 start entity) or dependents (incoming callers or users affected by the start
 entity). It defaults to 8 hops and 50 paths, with hard limits of 32 hops and 200
-paths. Results retain daemon revision, freshness, diagnostics, evidence, paths,
-and truncation metadata; daemon failures are returned as structured tool errors.
+paths. Its optional `target_repositories` list keeps only paths that visit every
+listed repository, in any order, and prunes branches during acquisition. MCP
+queries return diagnostic counts by default; set `include_diagnostics` to true
+for the detailed rows. Results retain daemon revision, freshness, evidence,
+paths, and truncation metadata; daemon failures are returned as structured tool
+errors.
 
 Installed TypeScript compiler workers are discovered automatically beside the
 daemon. They enforce a 6 GiB aggregate RSS ceiling across the worker and compiler

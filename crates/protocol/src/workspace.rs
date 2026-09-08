@@ -3,7 +3,10 @@ use beholder_domain::{
     LogicalRepository, ProtobufDescriptorSource, Workspace as DomainWorkspace,
     WorkspaceRepository as DomainRepository,
 };
-use beholder_dto::{AnalysisCompleteness, AnalysisMetadata, RepositoryRevision, RepositoryStatus};
+use beholder_dto::{
+    AnalysisCompleteness, AnalysisDiagnosticSeverity, AnalysisMetadata, DiagnosticCounts,
+    RepositoryRevision, RepositoryStatus,
+};
 use std::path::PathBuf;
 
 impl From<DomainRepository> for v1::WorkspaceRepository {
@@ -118,6 +121,11 @@ impl TryFrom<v1::RepositoryStatus> for RepositoryStatus {
         let revision = status
             .revision
             .map(|revision| -> Result<RepositoryRevision, &'static str> {
+                let diagnostics = revision
+                    .diagnostics
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<beholder_dto::AnalysisDiagnostic>, _>>()?;
                 Ok(RepositoryRevision {
                     source_state: revision.source_state,
                     head: revision.head,
@@ -128,11 +136,23 @@ impl TryFrom<v1::RepositoryStatus> for RepositoryStatus {
                         } else {
                             AnalysisCompleteness::Complete
                         },
-                        diagnostics: revision
-                            .diagnostics
-                            .into_iter()
-                            .map(TryInto::try_into)
-                            .collect::<Result<_, _>>()?,
+                        diagnostic_counts: DiagnosticCounts {
+                            total: diagnostics.len() as u64,
+                            known_limitations: diagnostics
+                                .iter()
+                                .filter(|diagnostic| {
+                                    diagnostic.severity
+                                        == AnalysisDiagnosticSeverity::KnownLimitation
+                                })
+                                .count() as u64,
+                            warnings: diagnostics
+                                .iter()
+                                .filter(|diagnostic| {
+                                    diagnostic.severity == AnalysisDiagnosticSeverity::Warning
+                                })
+                                .count() as u64,
+                        },
+                        diagnostics,
                     },
                 })
             })

@@ -106,6 +106,11 @@ impl From<dto::QueryMetadata> for v1::QueryMetadata {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            diagnostic_counts: Some(v1::DiagnosticCounts {
+                total: value.analysis.diagnostic_counts.total,
+                known_limitations: value.analysis.diagnostic_counts.known_limitations,
+                warnings: value.analysis.diagnostic_counts.warnings,
+            }),
         }
     }
 }
@@ -114,17 +119,38 @@ impl TryFrom<v1::QueryMetadata> for dto::QueryMetadata {
     type Error = &'static str;
 
     fn try_from(value: v1::QueryMetadata) -> Result<Self, Self::Error> {
+        let diagnostics = value
+            .diagnostics
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<dto::AnalysisDiagnostic>, _>>()?;
         Ok(Self {
             revision: value.revision,
             view: value.view,
             freshness: value.freshness.ok_or("query freshness is missing")?.into(),
             analysis: dto::AnalysisMetadata {
                 completeness: analysis_completeness(value.completeness)?,
-                diagnostics: value
-                    .diagnostics
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<_, _>>()?,
+                diagnostic_counts: value
+                    .diagnostic_counts
+                    .map(|counts| dto::DiagnosticCounts {
+                        total: counts.total,
+                        known_limitations: counts.known_limitations,
+                        warnings: counts.warnings,
+                    })
+                    .unwrap_or_else(|| dto::DiagnosticCounts {
+                        total: diagnostics.len() as u64,
+                        known_limitations: diagnostics
+                            .iter()
+                            .filter(|row| {
+                                row.severity == dto::AnalysisDiagnosticSeverity::KnownLimitation
+                            })
+                            .count() as u64,
+                        warnings: diagnostics
+                            .iter()
+                            .filter(|row| row.severity == dto::AnalysisDiagnosticSeverity::Warning)
+                            .count() as u64,
+                    }),
+                diagnostics,
             },
         })
     }

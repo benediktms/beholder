@@ -1,5 +1,7 @@
 use beholder_domain::{BeholderError, BeholderErrorKind};
-use beholder_protocol::v1::{GraphDirection as ProtocolDirection, TraverseGraphRequest};
+use beholder_protocol::v1::{
+    GraphDirection as ProtocolDirection, SearchEntitiesRequest, TraverseGraphRequest,
+};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,6 +24,8 @@ struct SearchEntitiesInput {
         description = "Maximum matches. Defaults to 20; hard limit 100."
     )]
     limit: Option<u32>,
+    #[schemars(description = "Include full diagnostic records. Defaults to false.")]
+    include_diagnostics: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
@@ -46,6 +50,9 @@ struct TraverseGraphInput {
     direction: Direction,
     #[schemars(description = "Optional canonical entity ID at which matching paths terminate")]
     destination: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Unordered repository identities every returned path must visit")]
+    target_repositories: Vec<String>,
     #[schemars(
         range(min = 0, max = 32),
         description = "Maximum edge depth. Defaults to 8; hard limit 32."
@@ -56,6 +63,8 @@ struct TraverseGraphInput {
         description = "Maximum returned paths. Defaults to 50; hard limit 200."
     )]
     max_paths: Option<u32>,
+    #[schemars(description = "Include full diagnostic records. Defaults to false.")]
+    include_diagnostics: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -124,8 +133,13 @@ impl BeholderMcp {
         &self,
         Parameters(input): Parameters<SearchEntitiesInput>,
     ) -> CallToolResult {
-        match beholder_daemon_client::search_entities(input.workspace, input.query, input.limit)
-            .await
+        match beholder_daemon_client::search_entities(SearchEntitiesRequest {
+            workspace: input.workspace,
+            query: input.query,
+            limit: input.limit,
+            include_diagnostics: Some(input.include_diagnostics.unwrap_or(false)),
+        })
+        .await
         {
             Ok(result) => structured(result),
             Err(error) => structured_error(error.as_ref()),
@@ -150,6 +164,8 @@ impl BeholderMcp {
             destination: input.destination,
             max_hops: input.max_hops,
             max_paths: input.max_paths,
+            target_repositories: input.target_repositories,
+            include_diagnostics: Some(input.include_diagnostics.unwrap_or(false)),
         })
         .await
         {
@@ -250,6 +266,11 @@ mod tests {
         assert_eq!(search.input_schema["type"], "object");
         assert_eq!(search.input_schema["properties"]["limit"]["maximum"], 100);
         assert!(
+            search.input_schema["properties"]
+                .get("include_diagnostics")
+                .is_some()
+        );
+        assert!(
             search.input_schema["properties"]["query"]["description"]
                 .as_str()
                 .unwrap()
@@ -264,6 +285,16 @@ mod tests {
         assert_eq!(
             traversal.input_schema["properties"]["max_paths"]["maximum"],
             200
+        );
+        assert!(
+            traversal.input_schema["properties"]
+                .get("target_repositories")
+                .is_some()
+        );
+        assert!(
+            traversal.input_schema["properties"]
+                .get("include_diagnostics")
+                .is_some()
         );
         assert!(
             traversal.input_schema["properties"]["direction"]["description"]

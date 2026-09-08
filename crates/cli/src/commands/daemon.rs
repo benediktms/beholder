@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 
-const STOP_TIMEOUT: Duration = Duration::from_secs(300);
+const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) async fn run(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
     match command {
@@ -70,7 +71,7 @@ pub(super) async fn start() -> Result<(), Box<dyn Error>> {
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()?;
-    for _ in 0..50 {
+    for _ in 0..STARTUP_TIMEOUT.as_secs() * 10 {
         if let Some(status) = child.try_wait()? {
             return Err(
                 format!("beholderd exited with {status}; see {}", log_path.display()).into(),
@@ -112,7 +113,7 @@ async fn wait_for_lock() -> Result<(), Box<dyn Error>> {
 
 async fn wait_to_start() -> Result<Option<u32>, Box<dyn Error>> {
     let path = state_dir()?.join("beholderd.pid");
-    match tokio::time::timeout(STOP_TIMEOUT, async {
+    match tokio::time::timeout(STARTUP_TIMEOUT, async {
         let mut reported = false;
         loop {
             if let Ok(status) = get_status().await {
@@ -132,7 +133,7 @@ async fn wait_to_start() -> Result<Option<u32>, Box<dyn Error>> {
     {
         Ok(result) => result,
         Err(_) => Err(format!(
-            "timed out waiting for beholderd to stop or become ready after {STOP_TIMEOUT:?}"
+            "timed out waiting for beholderd to stop or become ready after {STARTUP_TIMEOUT:?}"
         )
         .into()),
     }
@@ -171,6 +172,9 @@ async fn wait_for_lock_at(path: &Path, timeout: Duration) -> Result<(), Box<dyn 
 }
 
 async fn stop_for_service_change() -> Result<(), Box<dyn Error>> {
+    if std::env::var_os("BEHOLDER_STATE_DIR").is_none() {
+        service::stop()?;
+    }
     if matches!(
         tokio::time::timeout(Duration::from_millis(500), get_status()).await,
         Ok(Ok(_))
@@ -202,7 +206,7 @@ async fn install_service() -> Result<(), Box<dyn Error>> {
     let state = state_dir()?;
     let outcome = service::install(&service::installed_daemon_path()?, &state)?;
     if std::env::var("BEHOLDER_LAUNCHER").as_deref() != Ok("fake") {
-        for _ in 0..50 {
+        for _ in 0..STARTUP_TIMEOUT.as_secs() * 10 {
             if get_status().await.is_ok() {
                 break;
             }

@@ -418,6 +418,17 @@ pub(super) const CREATE_FACT_SHARD_ENTITY_SCHEMA: &str = r#"
 }
 "#;
 
+pub(super) const CREATE_FACT_SHARD_ENTITY_NAME_SCHEMA: &str = r#"
+:create analysis_fact_shard_entity_name {
+    producer: String,
+    owner: String,
+    version: String,
+    id: String,
+    =>
+    name: String,
+}
+"#;
+
 pub(super) const CREATE_FACT_SHARD_OBSERVATION_SCHEMA: &str = r#"
 :create analysis_fact_shard_observation {
     producer: String,
@@ -502,6 +513,8 @@ pub(super) const CREATE_ENRICHMENT_OBSERVATION_SELECTION_TO_INDEX: &str = "::ind
      {view, to, from, relation, evidence, owner}";
 pub(super) const CREATE_FACT_SHARD_ENTITY_ID_INDEX: &str = "::index create analysis_fact_shard_entity:by_id \
      {id, producer, owner, version, kind, metadata}";
+pub(super) const CREATE_FACT_SHARD_ENTITY_NAME_INDEX: &str = "::index create analysis_fact_shard_entity_name:by_name \
+     {name, producer, owner, version, id}";
 pub(super) const CREATE_FACT_SHARD_SELECTION_OWNER_INDEX: &str = "::index create analysis_fact_shard_selection:by_owner \
      {view, owner, producer, version, repository}";
 pub(super) const CREATE_FACT_SHARD_OBSERVATION_TO_INDEX: &str = "::index create analysis_fact_shard_observation:by_to \

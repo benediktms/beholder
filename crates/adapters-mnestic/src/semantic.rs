@@ -1,7 +1,7 @@
 use crate::{InspectionResult, InspectionValue, query::ContextRow};
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
-    ENTITY_SEARCH_SCHEMA_V1, EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef,
+    ENTITY_SEARCH_SCHEMA_V2, EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef,
     EntitySearchQuery, EntitySearchResult, EvidenceKind, EvidenceRef, GraphqlOperationKind,
     GraphqlTypeKind, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, ProtoTypeKind,
     QueryMetadata, RelationKind, RpcCardinality, SemanticEdge, SemanticPath, TRACE_SCHEMA_V2,
@@ -73,7 +73,7 @@ pub(super) fn search_entities(
     let mut matches = entity_kinds(entities)?
         .into_iter()
         .map(|(id, (kind, metadata))| entity_ref_with_origin(&id, kind, None, metadata))
-        .filter(|entity| entity.id.contains(query) || entity.name.contains(query))
+        .filter(|entity| entity.id.starts_with(query) || entity.name.starts_with(query))
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
         search_rank(left, query)
@@ -82,7 +82,7 @@ pub(super) fn search_entities(
     });
     matches.truncate(limit as usize);
     Ok(EntitySearchResult {
-        schema: ENTITY_SEARCH_SCHEMA_V1.into(),
+        schema: ENTITY_SEARCH_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
         query: EntitySearchQuery {
             query: query.into(),
@@ -353,6 +353,8 @@ pub(super) fn traverse_graph(
     result: InspectionResult,
     entities: InspectionResult,
     incomplete: BTreeSet<String>,
+    repository_boundaries: BTreeSet<String>,
+    target_reachability: BTreeMap<String, BTreeSet<String>>,
 ) -> Result<beholder_dto::TraverseGraphResult, Box<dyn Error>> {
     use beholder_dto::*;
     let mut output = graph(result, entities, &[&query.start])?;
@@ -372,6 +374,8 @@ pub(super) fn traverse_graph(
         query: &query,
         adjacent,
         incomplete: &incomplete,
+        repository_boundaries: &repository_boundaries,
+        target_reachability: &target_reachability,
         paths: Vec::new(),
         reasons: BTreeSet::new(),
         steps: 0,
@@ -391,7 +395,7 @@ pub(super) fn traverse_graph(
         .edges
         .retain(|edge| nodes.contains(&edge.from) && nodes.contains(&edge.to));
     Ok(TraverseGraphResult {
-        schema: TRAVERSE_GRAPH_SCHEMA_V1.into(),
+        schema: TRAVERSE_GRAPH_SCHEMA_V2.into(),
         metadata: QueryMetadata::completed(view, 0),
         traversal: GraphTraversalMetadata {
             max_hops: query.max_hops,
@@ -413,12 +417,60 @@ struct PathSearch<'a> {
     query: &'a beholder_dto::TraverseGraphQuery,
     adjacent: BTreeMap<&'a str, Vec<(&'a str, &'a str)>>,
     incomplete: &'a BTreeSet<String>,
+    repository_boundaries: &'a BTreeSet<String>,
+    target_reachability: &'a BTreeMap<String, BTreeSet<String>>,
     paths: Vec<beholder_dto::TraversalPath>,
     reasons: BTreeSet<beholder_dto::TruncationReason>,
     steps: u32,
 }
 
 impl PathSearch<'_> {
+    fn repository_state(&self, nodes: &[String]) -> (BTreeSet<String>, Option<String>) {
+        let targets = self
+            .query
+            .target_repositories
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut visited = BTreeSet::new();
+        let mut completion = None;
+        for node in nodes {
+            if let Some(repository) = target_repository(node, &targets) {
+                visited.insert(repository.to_owned());
+                if completion.is_none() && visited == targets {
+                    completion = Some(repository.to_owned());
+                }
+            }
+        }
+        (visited, completion)
+    }
+
+    fn can_follow(&self, nodes: &[String], next: &str) -> bool {
+        if self.query.target_repositories.is_empty() {
+            return true;
+        }
+        let targets = self
+            .query
+            .target_repositories
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let (mut visited, completion) = self.repository_state(nodes);
+        if let Some(completion) = completion {
+            return !next.starts_with("repo://")
+                || target_repository(next, &targets) == Some(completion.as_str());
+        }
+        if let Some(owner) = target_repository(next, &targets) {
+            visited.insert(owner.to_owned());
+        }
+        let missing = targets.difference(&visited).collect::<BTreeSet<_>>();
+        missing.is_empty()
+            || self
+                .target_reachability
+                .get(next)
+                .is_some_and(|reachable| missing.iter().all(|target| reachable.contains(*target)))
+    }
+
     fn emit(
         &mut self,
         nodes: &[String],
@@ -454,22 +506,45 @@ impl PathSearch<'_> {
             self.emit(nodes, edges, Destination);
             return;
         }
+        let (_, completion) = self.repository_state(nodes);
+        if completion.is_some() && !node.starts_with("repo://") {
+            if !self.incomplete.contains(&node) {
+                self.emit(nodes, edges, RepositoryBoundary);
+            }
+            return;
+        }
+        let emitted_boundary = completion.is_some()
+            && self.repository_boundaries.contains(&node)
+            && !self.incomplete.contains(&node);
+        if emitted_boundary {
+            self.emit(nodes, edges, RepositoryBoundary);
+            if self.reasons.contains(&TruncationReason::MaxPaths) {
+                return;
+            }
+        }
         let neighbours = self
             .adjacent
             .get(node.as_str())
             .map(Vec::as_slice)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|(next, _)| self.can_follow(nodes, next))
+            .collect::<Vec<_>>();
         if neighbours.len() > (MAX_TRAVERSAL_STEPS - self.steps) as usize {
             self.reasons.insert(TruncationReason::WorkLimit);
             return;
         }
         self.steps += neighbours.len() as u32;
-        let neighbours = neighbours.to_vec();
         let has_extension = neighbours
             .iter()
             .any(|(to, _)| !nodes.iter().any(|id| id == to));
         if !has_extension {
-            if self.query.destination.is_none() && !self.incomplete.contains(&node) {
+            if self.query.destination.is_none()
+                && !self.incomplete.contains(&node)
+                && (self.query.target_repositories.is_empty() || completion.is_some())
+                && !emitted_boundary
+            {
                 self.emit(
                     nodes,
                     edges,
@@ -480,7 +555,9 @@ impl PathSearch<'_> {
         }
         if edges.len() == self.query.max_hops as usize {
             self.reasons.insert(TruncationReason::MaxHops);
-            if self.query.destination.is_none() {
+            if self.query.destination.is_none()
+                && (self.query.target_repositories.is_empty() || completion.is_some())
+            {
                 self.emit(nodes, edges, MaxHops);
             }
             return;
@@ -963,7 +1040,7 @@ fn relation_kind_hint(relation: &str, source: bool, id: &str) -> EntityKind {
     }
 }
 
-fn entity_name(id: &str) -> String {
+pub(super) fn entity_name(id: &str) -> String {
     if let Some(module) = id.strip_prefix("elixir-module://") {
         return module.into();
     }
@@ -1004,7 +1081,7 @@ fn entity_name(id: &str) -> String {
         .to_owned()
 }
 
-fn repository(id: &str) -> Option<String> {
+pub(super) fn repository(id: &str) -> Option<String> {
     id.strip_prefix("repo://").and_then(|rest| {
         rest.rsplit_once("/elixir-source/")
             .or_else(|| rest.rsplit_once("/typescript-source/"))
@@ -1017,6 +1094,15 @@ fn repository(id: &str) -> Option<String> {
             .or_else(|| rest.rsplit_once("/javascript/"))
             .or_else(|| rest.rsplit_once("/csharp/"))
             .map(|(repository, _)| repository.into())
+    })
+}
+
+pub(super) fn target_repository<'a>(id: &str, targets: &'a BTreeSet<String>) -> Option<&'a str> {
+    let rest = id.strip_prefix("repo://")?;
+    targets.iter().find_map(|target| {
+        rest.strip_prefix(target.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+            .then_some(target.as_str())
     })
 }
 
@@ -1072,10 +1158,48 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity, search_entities};
+    use super::{
+        GraphBuilder, PathSearch, entity_ref, infer_kind, is_test_entity, search_entities,
+    };
     use crate::{InspectionResult, InspectionValue};
-    use beholder_dto::{EntityKind, EntityOrigin};
-    use std::collections::BTreeMap;
+    use beholder_dto::{
+        EntityKind, EntityOrigin, GraphDirection, PathTermination, TraverseGraphQuery,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn repository_filter_recognises_arbitrary_target_segments() {
+        let start = "repo://example/a/semantic/generated";
+        let query = TraverseGraphQuery {
+            start: start.into(),
+            direction: GraphDirection::Dependencies,
+            destination: None,
+            target_repositories: vec!["example/a".into()],
+            max_hops: 8,
+            max_paths: 50,
+        };
+        let incomplete = BTreeSet::new();
+        let boundaries = BTreeSet::new();
+        let reachability = BTreeMap::new();
+        let mut search = PathSearch {
+            query: &query,
+            adjacent: BTreeMap::new(),
+            incomplete: &incomplete,
+            repository_boundaries: &boundaries,
+            target_reachability: &reachability,
+            paths: Vec::new(),
+            reasons: BTreeSet::new(),
+            steps: 0,
+        };
+
+        assert!(search.can_follow(&[start.into()], "repo://example/a/custom/entity"));
+        assert!(!search.can_follow(&[start.into()], "repo://example/b/custom/entity"));
+        search.visit(&mut vec![start.into()], &mut Vec::new());
+
+        assert_eq!(search.paths.len(), 1);
+        assert_eq!(search.paths[0].nodes, [start]);
+        assert_eq!(search.paths[0].termination, PathTermination::Leaf);
+    }
 
     #[test]
     fn entity_search_ranks_canonical_id_then_name_then_prefix() {

@@ -113,6 +113,7 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
         CREATE_BASELINE_DIAGNOSTIC_SCHEMA,
         CREATE_FACT_SHARD_SELECTION_SCHEMA,
         CREATE_FACT_SHARD_ENTITY_SCHEMA,
+        CREATE_FACT_SHARD_ENTITY_NAME_SCHEMA,
         CREATE_FACT_SHARD_OBSERVATION_SCHEMA,
         CREATE_FACT_SHARD_DEPENDENCY_SCHEMA,
         CREATE_RESOLVED_DEPENDENCY_SCHEMA,
@@ -144,6 +145,11 @@ pub(super) fn memory_database() -> Result<DbInstance, Box<dyn Error>> {
     )?;
     db.run_script(
         CREATE_FACT_SHARD_ENTITY_ID_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_FACT_SHARD_ENTITY_NAME_INDEX,
         BTreeMap::new(),
         ScriptMutability::Mutable,
     )?;
@@ -455,6 +461,10 @@ pub(super) fn persistent_database(
             CREATE_FACT_SHARD_ENTITY_SCHEMA,
         ),
         (
+            "analysis_fact_shard_entity_name",
+            CREATE_FACT_SHARD_ENTITY_NAME_SCHEMA,
+        ),
+        (
             "analysis_fact_shard_observation",
             CREATE_FACT_SHARD_OBSERVATION_SCHEMA,
         ),
@@ -613,6 +623,10 @@ pub(super) fn persistent_database(
                 CREATE_FACT_SHARD_ENTITY_ID_INDEX,
             ),
             (
+                "analysis_fact_shard_entity_name:by_name",
+                CREATE_FACT_SHARD_ENTITY_NAME_INDEX,
+            ),
+            (
                 "analysis_fact_shard_selection:by_owner",
                 CREATE_FACT_SHARD_SELECTION_OWNER_INDEX,
             ),
@@ -680,6 +694,10 @@ pub(super) fn persistent_database(
 }
 
 fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    if !migration_applied(db, "fact-shard-entity-name", 2)? || fact_shard_entity_names_missing(db)?
+    {
+        migrate_fact_shard_entity_names(db)?;
+    }
     if !migration_applied(db, "enrichment-ownership", 1)? {
         migrate_enrichment_ownership_to_contributions(db)?;
     }
@@ -695,6 +713,49 @@ fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
     if !migration_applied(db, "resolved-dependencies", 2)? {
         migrate_resolved_dependencies(db)?;
     }
+    Ok(())
+}
+
+fn fact_shard_entity_names_missing(db: &DbInstance) -> Result<bool, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[missing] := *analysis_fact_shard_selection{producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id}, \
+             not *analysis_fact_shard_entity_name{producer, owner, version, id}, missing = true\n\
+         :limit 1",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(!rows.rows.is_empty())
+}
+
+fn migrate_fact_shard_entity_names(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    transaction.run_script(
+        "candidate[producer, owner, version, id] := \
+             *analysis_fact_shard_selection{producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id}\n\
+         special[id] := candidate[_, _, _, id], starts_with(id, 'elixir-module://')\n\
+         special[id] := candidate[_, _, _, id], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$')\n\
+         special[id] := candidate[_, _, _, id], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$')\n\
+         special[id] := candidate[_, _, _, id], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$')\n\
+         special[id] := candidate[_, _, _, id], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$')\n\
+         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], starts_with(id, 'elixir-module://'), name = regex_replace(id, '^elixir-module://', '')\n\
+         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], regex_matches(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://(.+)/([^/]+)/([0-9]+)$', '$1.$2/$3')\n\
+         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://([^/]+)/([0-9]+)$', '$1/$2')\n\
+         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$'), name = regex_replace(id, '^(proto-method|grpc)://([^/]*[.])?([^./]+)/([^/]+)$', '$3.$4')\n\
+         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$'), name = regex_replace(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$', '$2/$3')\n\
+         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], not special[id], regex_matches(id, '^.*[/:]([^/:]+)/?$'), name = regex_replace(id, '^.*[/:]([^/:]+)/?$', '$1')\n\
+         display[producer, owner, version, id, id] := candidate[producer, owner, version, id], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)/?$')\n\
+         ?[producer, owner, version, id, name] := display[producer, owner, version, id, name]\n\
+         :put analysis_fact_shard_entity_name {producer, owner, version, id => name}",
+        BTreeMap::new(),
+    )?;
+    transaction.run_script(
+        "?[name, version] <- [['fact-shard-entity-name', 2]] \
+         :put schema_migration {name => version}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 

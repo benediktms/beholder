@@ -347,6 +347,7 @@ impl From<dto::PathTermination> for v1::PathTermination {
     fn from(value: dto::PathTermination) -> Self {
         match value {
             dto::PathTermination::Destination => Self::Destination,
+            dto::PathTermination::RepositoryBoundary => Self::RepositoryBoundary,
             dto::PathTermination::Leaf => Self::Leaf,
             dto::PathTermination::Cycle => Self::Cycle,
             dto::PathTermination::MaxHops => Self::MaxHops,
@@ -358,6 +359,7 @@ impl TryFrom<v1::PathTermination> for dto::PathTermination {
     fn try_from(value: v1::PathTermination) -> Result<Self, Self::Error> {
         match value {
             v1::PathTermination::Destination => Ok(Self::Destination),
+            v1::PathTermination::RepositoryBoundary => Ok(Self::RepositoryBoundary),
             v1::PathTermination::Leaf => Ok(Self::Leaf),
             v1::PathTermination::Cycle => Ok(Self::Cycle),
             v1::PathTermination::MaxHops => Ok(Self::MaxHops),
@@ -396,6 +398,7 @@ impl TryFrom<v1::TraverseGraphRequest> for dto::TraverseGraphQuery {
             start: value.start,
             direction: value.direction,
             destination: value.destination,
+            target_repositories: value.target_repositories,
             max_hops: value.max_hops.unwrap_or(dto::DEFAULT_TRAVERSAL_HOPS),
             max_paths: value.max_paths.unwrap_or(dto::DEFAULT_MAX_PATHS),
         }
@@ -408,6 +411,7 @@ impl From<dto::TraverseGraphQuery> for v1::TraverseGraphQuery {
         Self {
             start: value.start,
             destination: value.destination,
+            target_repositories: value.target_repositories,
             direction: v1::GraphDirection::from(value.direction) as i32,
             max_hops: value.max_hops,
             max_paths: value.max_paths,
@@ -417,15 +421,17 @@ impl From<dto::TraverseGraphQuery> for v1::TraverseGraphQuery {
 impl TryFrom<v1::TraverseGraphQuery> for dto::TraverseGraphQuery {
     type Error = &'static str;
     fn try_from(value: v1::TraverseGraphQuery) -> Result<Self, Self::Error> {
-        let query = Self {
+        let mut query = Self {
             start: value.start,
             destination: value.destination,
+            target_repositories: value.target_repositories,
             direction: v1::GraphDirection::try_from(value.direction)
                 .map_err(|_| "invalid graph direction")?
                 .try_into()?,
             max_hops: value.max_hops,
             max_paths: value.max_paths,
         };
+        query.normalize();
         query.validate()?;
         Ok(query)
     }
@@ -535,12 +541,13 @@ mod multipath_tests {
         let query = dto::TraverseGraphQuery {
             start: "repo://example/root".into(),
             direction: dto::GraphDirection::Dependents,
-            destination: Some("repo://example/end".into()),
+            destination: None,
+            target_repositories: vec!["repo-a".into(), "repo-b".into()],
             max_hops: 32,
             max_paths: 200,
         };
         let result = dto::TraverseGraphResult {
-            schema: dto::TRAVERSE_GRAPH_SCHEMA_V1.into(),
+            schema: dto::TRAVERSE_GRAPH_SCHEMA_V2.into(),
             metadata: dto::QueryMetadata::completed("main", 42),
             query: query.clone(),
             nodes: Vec::new(),
@@ -548,7 +555,7 @@ mod multipath_tests {
             paths: vec![dto::TraversalPath {
                 nodes: vec![query.start.clone()],
                 edges: Vec::new(),
-                termination: dto::PathTermination::Cycle,
+                termination: dto::PathTermination::RepositoryBoundary,
             }],
             traversal: dto::GraphTraversalMetadata {
                 max_hops: 32,
@@ -604,5 +611,22 @@ mod multipath_tests {
         let mut invalid = query;
         invalid.destination = Some("  ".into());
         assert!(invalid.validate().is_err());
+
+        let mut invalid = v1::TraverseGraphRequest {
+            start: "root".into(),
+            direction: v1::GraphDirection::Dependencies as i32,
+            destination: Some("end".into()),
+            target_repositories: vec!["repo-a".into()],
+            ..Default::default()
+        };
+        assert!(dto::TraverseGraphQuery::try_from(invalid.clone()).is_err());
+        invalid.destination = None;
+        invalid.target_repositories = vec!["repo-b".into(), "repo-a".into(), "repo-b".into()];
+        assert_eq!(
+            dto::TraverseGraphQuery::try_from(invalid)
+                .unwrap()
+                .target_repositories,
+            ["repo-a", "repo-b"]
+        );
     }
 }

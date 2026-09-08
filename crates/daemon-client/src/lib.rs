@@ -291,34 +291,74 @@ pub async fn workspace_topology_status(workspace: String) -> Result<QueryMetadat
 }
 
 pub async fn search_entities(
-    workspace: String,
-    query: String,
-    limit: Option<u32>,
+    search: SearchEntitiesRequest,
 ) -> Result<EntitySearchResult, ClientError> {
-    Ok(connect_send()
+    let include_diagnostics = search.include_diagnostics;
+    let result: EntitySearchResult = connect_send()
         .await?
-        .search_entities(request(SearchEntitiesRequest {
-            workspace,
-            query,
-            limit,
-        }))
+        .search_entities(request(search))
         .await
         .map_err(operation_error)?
         .into_inner()
-        .try_into()?)
+        .try_into()?;
+    validate_query_schema(&result.schema, beholder_dto::ENTITY_SEARCH_SCHEMA_V2)?;
+    validate_diagnostic_preference(include_diagnostics, &result.metadata)?;
+    Ok(result)
 }
 
 /// Traverse one immutable workspace revision with bounded multi-path semantics.
 pub async fn traverse_graph(
     request: beholder_protocol::v1::TraverseGraphRequest,
 ) -> Result<beholder_dto::TraverseGraphResult, ClientError> {
-    Ok(connect_send()
+    let requested_targets = request.target_repositories.clone();
+    let include_diagnostics = request.include_diagnostics;
+    let result: beholder_dto::TraverseGraphResult = connect_send()
         .await?
         .traverse_graph(crate::request(request))
         .await
         .map_err(operation_error)?
         .into_inner()
-        .try_into()?)
+        .try_into()?;
+    validate_query_schema(&result.schema, beholder_dto::TRAVERSE_GRAPH_SCHEMA_V2)?;
+    validate_repository_targets(&requested_targets, &result.query.target_repositories)?;
+    validate_diagnostic_preference(include_diagnostics, &result.metadata)?;
+    Ok(result)
+}
+
+fn validate_query_schema(actual: &str, expected: &str) -> Result<(), ClientError> {
+    if actual != expected {
+        return Err(format!("daemon returned unsupported schema {actual}; expected {expected}; upgrade and restart the daemon").into());
+    }
+    Ok(())
+}
+
+fn validate_diagnostic_preference(
+    include_diagnostics: Option<bool>,
+    metadata: &QueryMetadata,
+) -> Result<(), ClientError> {
+    if include_diagnostics == Some(false) && !metadata.analysis.diagnostics.is_empty() {
+        return Err(
+            "daemon ignored the diagnostic-detail preference; upgrade and restart the daemon"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_repository_targets(
+    requested: &[String],
+    returned: &[String],
+) -> Result<(), ClientError> {
+    if !requested.is_empty()
+        && requested.iter().collect::<std::collections::BTreeSet<_>>()
+            != returned.iter().collect::<std::collections::BTreeSet<_>>()
+    {
+        return Err(
+            "daemon did not preserve requested repository filters; upgrade and restart the daemon"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub async fn dependencies(
@@ -567,6 +607,52 @@ mod tests {
     use tonic::metadata::MetadataValue;
 
     #[test]
+    fn rejects_legacy_query_schemas_without_diagnostics() {
+        for (legacy, current) in [
+            (
+                "beholder.entity_search.v1",
+                beholder_dto::ENTITY_SEARCH_SCHEMA_V2,
+            ),
+            (
+                "beholder.traverse_graph.v1",
+                beholder_dto::TRAVERSE_GRAPH_SCHEMA_V2,
+            ),
+        ] {
+            assert!(validate_query_schema(legacy, current).is_err());
+            assert!(validate_query_schema(current, current).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_diagnostics_when_counts_only_were_requested() {
+        let mut metadata = QueryMetadata::completed("main", 1);
+        assert!(validate_diagnostic_preference(Some(false), &metadata).is_ok());
+        metadata
+            .analysis
+            .diagnostics
+            .push(beholder_dto::AnalysisDiagnostic {
+                code: "example".into(),
+                severity: AnalysisDiagnosticSeverity::Warning,
+                repository: "example".into(),
+                path: "example.rs".into(),
+                line: None,
+                detail: None,
+            });
+        assert!(validate_diagnostic_preference(Some(false), &metadata).is_err());
+        assert!(validate_diagnostic_preference(Some(true), &metadata).is_ok());
+        assert!(validate_diagnostic_preference(None, &metadata).is_ok());
+    }
+
+    #[test]
+    fn traversal_rejects_ignored_repository_targets() {
+        let requested = vec!["b".into(), "a".into(), "a".into()];
+        assert!(validate_repository_targets(&requested, &[]).is_err());
+        assert!(validate_repository_targets(&requested, &["a".into()]).is_err());
+        assert!(validate_repository_targets(&requested, &["a".into(), "b".into()]).is_ok());
+        assert!(validate_repository_targets(&[], &[]).is_ok());
+    }
+
+    #[test]
     fn operation_errors_preserve_codes_independently_from_messages() {
         for (grpc, expected) in [
             (Code::DeadlineExceeded, BeholderErrorKind::DeadlineExceeded),
@@ -626,6 +712,11 @@ mod tests {
                 line: Some(7),
                 detail: None,
             }],
+            diagnostic_counts: Some(v1::DiagnosticCounts {
+                total: 1,
+                known_limitations: 0,
+                warnings: 1,
+            }),
         };
 
         let metadata = QueryMetadata::try_from(metadata).unwrap();

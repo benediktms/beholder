@@ -4,11 +4,11 @@ use super::{
     database::{benchmark_database, memory_database, persistent_database},
     inspection::{InspectionResult, inspection_result},
     query::{
-        SnapshotQueryRunner, all_entity_facts, analysis_metadata, analysis_revision, context,
-        dependencies, entity_facts, generated_entity_ids, impact, inspect_grpc_bindings,
-        inspect_observations, inspect_relations, inspect_revisions, published_repository_head,
-        repository_revision, search_entity_facts, trace, warn_on_slow_semantic_query,
-        workspace_topology,
+        AnalysisMetadataOptions, SnapshotQueryRunner, all_entity_facts, analysis_metadata,
+        analysis_revision, context, dependencies, entity_facts, generated_entity_ids, impact,
+        inspect_grpc_bindings, inspect_observations, inspect_relations, inspect_revisions,
+        published_repository_head, repository_revision, search_entity_facts, trace,
+        warn_on_slow_semantic_query, workspace_topology,
     },
     storage::{
         SelectedBaselineSemantics, claim_garbage_collection, delete_repository_revision,
@@ -37,6 +37,19 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct QueryOptions {
+    pub include_diagnostics: bool,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            include_diagnostics: true,
+        }
+    }
+}
 
 fn relevant_traversal_entities(
     result: &NamedRows,
@@ -532,7 +545,17 @@ impl SemanticStore {
         query: &str,
         limit: u32,
     ) -> Result<Revisioned<EntitySearchResult>, Box<dyn Error>> {
-        self.snapshot(view, |transaction| {
+        self.search_entities_snapshot_with_options(view, query, limit, Default::default())
+    }
+
+    pub fn search_entities_snapshot_with_options(
+        &self,
+        view: &str,
+        query: &str,
+        limit: u32,
+        options: QueryOptions,
+    ) -> Result<Revisioned<EntitySearchResult>, Box<dyn Error>> {
+        self.snapshot_with_options(view, options, |transaction| {
             let mut result = semantic::search_entities(
                 view,
                 query,
@@ -583,17 +606,60 @@ impl SemanticStore {
         view: &str,
         query: beholder_dto::TraverseGraphQuery,
     ) -> Result<Revisioned<beholder_dto::TraverseGraphResult>, Box<dyn Error>> {
+        self.traverse_graph_snapshot_with_options(view, query, Default::default())
+    }
+
+    pub fn traverse_graph_snapshot_with_options(
+        &self,
+        view: &str,
+        query: beholder_dto::TraverseGraphQuery,
+        options: QueryOptions,
+    ) -> Result<Revisioned<beholder_dto::TraverseGraphResult>, Box<dyn Error>> {
         query.validate()?;
-        self.snapshot(view, |transaction| {
-            let (rows, incomplete) = crate::query::multipath_rows(transaction, view, &query)?;
+        self.snapshot_with_options(view, options, |transaction| {
+            let (rows, incomplete, boundaries, target_reachability, work_limited) =
+                crate::query::multipath_rows(transaction, view, &query)?;
             let entities = relevant_traversal_entities(&rows, &[&query.start], query.max_hops + 1);
-            semantic::traverse_graph(
+            let targets = query
+                .target_repositories
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let start_satisfies_targets =
+                targets.len() == 1 && semantic::target_repository(&query.start, &targets).is_some();
+            let entity_rows = if !query.target_repositories.is_empty()
+                && rows.rows.is_empty()
+                && !start_satisfies_targets
+            {
+                NamedRows::new(
+                    ["id", "kind", "metadata"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    Vec::new(),
+                )
+            } else {
+                entity_facts(transaction, view, &entities)?
+            };
+            let mut result = semantic::traverse_graph(
                 view,
                 query,
                 inspection_result(rows),
-                inspection_result(entity_facts(transaction, view, &entities)?),
+                inspection_result(entity_rows),
                 incomplete,
-            )
+                boundaries,
+                target_reachability,
+            )?;
+            if work_limited {
+                for reason in &mut result.traversal.truncation_reasons {
+                    if *reason == beholder_dto::TruncationReason::AcquisitionLimit {
+                        *reason = beholder_dto::TruncationReason::WorkLimit;
+                    }
+                }
+                result.traversal.truncation_reasons.sort();
+                result.traversal.truncation_reasons.dedup();
+            }
+            Ok(result)
         })
     }
 
@@ -699,6 +765,15 @@ impl SemanticStore {
         view: &str,
         read: impl FnOnce(&SnapshotQueryRunner<'_>) -> Result<T, Box<dyn Error>>,
     ) -> Result<Revisioned<T>, Box<dyn Error>> {
+        self.snapshot_with_options(view, Default::default(), read)
+    }
+
+    fn snapshot_with_options<T>(
+        &self,
+        view: &str,
+        options: QueryOptions,
+        read: impl FnOnce(&SnapshotQueryRunner<'_>) -> Result<T, Box<dyn Error>>,
+    ) -> Result<Revisioned<T>, Box<dyn Error>> {
         warn_on_slow_semantic_query(|| {
             let transaction = self.read_db.multi_transaction(false);
             let query_runner = SnapshotQueryRunner::new(&transaction, &self.read_db);
@@ -712,7 +787,14 @@ impl SemanticStore {
                 )) as Box<dyn Error>);
             }
             let result = read(&query_runner)?;
-            let analysis = analysis_metadata(&query_runner, view, analysis_revision)?;
+            let analysis = analysis_metadata(
+                &query_runner,
+                view,
+                analysis_revision,
+                AnalysisMetadataOptions {
+                    include_diagnostics: options.include_diagnostics,
+                },
+            )?;
             transaction.abort()?;
             Ok(Revisioned {
                 result,
@@ -754,7 +836,7 @@ fn sqlite_pragma(path: &Path, pragma: &str) -> Result<u64, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnrichmentOwner, EnrichmentPayload, relevant_traversal_entities};
+    use super::{EnrichmentOwner, EnrichmentPayload, QueryOptions, relevant_traversal_entities};
     use crate::SemanticStore;
     use crate::query::search_entity_facts;
     use beholder_domain::{
@@ -833,6 +915,7 @@ mod tests {
             start: start.into(),
             direction: beholder_dto::GraphDirection::Dependencies,
             destination: None,
+            target_repositories: Vec::new(),
             max_hops: 8,
             max_paths: 50,
         }
@@ -933,6 +1016,146 @@ mod tests {
             .result;
         assert!(result.paths.is_empty());
         assert!(!result.traversal.truncated);
+    }
+
+    #[test]
+    fn multipath_repository_targets_are_unordered_conjunctive_and_prune_branches() {
+        use beholder_dto::PathTermination;
+        let entity = |repository: &str| format!("repo://org/{repository}/rust/lib/{repository}");
+        let [origin, a, b, c, d] = ["O", "A", "B", "C", "D"].map(entity);
+        let (store, _) = multipath_fixture(vec![
+            call(&origin, &a),
+            call(&a, &b),
+            call(&a, &c),
+            call(&b, &d),
+        ]);
+        let paths = |targets: &[&str]| {
+            let mut query = multipath_query(&origin);
+            query.target_repositories = targets
+                .iter()
+                .map(|target| format!("org/{target}"))
+                .collect();
+            query.normalize();
+            store
+                .traverse_graph_snapshot("main", query)
+                .unwrap()
+                .result
+                .paths
+        };
+
+        assert_eq!(paths(&["A", "B"]), paths(&["B"]));
+        assert_eq!(paths(&["A", "D"]), paths(&["D", "B", "A"]));
+        assert_eq!(paths(&["C"])[0].nodes, [origin.clone(), a.clone(), c]);
+        assert_eq!(paths(&["C"])[0].termination, PathTermination::Leaf);
+        assert!(paths(&["B", "C"]).is_empty());
+        assert_eq!(
+            paths(&["B"])[0].nodes,
+            [origin.clone(), a.clone(), b.clone()]
+        );
+        assert_eq!(
+            paths(&["B"])[0].termination,
+            PathTermination::RepositoryBoundary
+        );
+    }
+
+    #[test]
+    fn multipath_repository_scope_stops_at_contracts_and_works_for_dependents() {
+        use beholder_dto::{GraphDirection, PathTermination};
+        let a = "repo://org/A/rust/lib/a";
+        let a_internal = "repo://org/A/rust/lib/internal";
+        let contract = "grpc://example.Service/Call";
+        let downstream_contract = "grpc://example.Other/Call";
+        let b = "repo://org/B/rust/lib/b";
+        let (store, _) = multipath_fixture(vec![
+            call(a, a_internal),
+            call(a_internal, contract),
+            call(contract, downstream_contract),
+            call(downstream_contract, b),
+        ]);
+        let mut query = multipath_query(a);
+        query.target_repositories = vec!["org/A".into()];
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].nodes, [a, a_internal, contract]);
+        assert_eq!(
+            result.paths[0].termination,
+            PathTermination::RepositoryBoundary
+        );
+        assert!(result.edges.iter().all(|edge| edge.from != contract));
+
+        let (store, _) = multipath_fixture(vec![call(a, b)]);
+        let mut query = multipath_query(b);
+        query.direction = GraphDirection::Dependents;
+        query.target_repositories = vec!["org/A".into()];
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].nodes, [b, a]);
+        assert_eq!(result.paths[0].termination, PathTermination::Leaf);
+    }
+
+    #[test]
+    fn filtered_zero_edge_path_hydrates_only_a_valid_start() {
+        use beholder_dto::{EntityKind, PathTermination};
+        let start = "repo://org/A/rust/lib/start";
+        let blocked = "repo://org/B/rust/lib/blocked";
+        let (store, _) = multipath_fixture(vec![call(start, blocked)]);
+
+        let mut query = multipath_query(start);
+        query.target_repositories = vec!["org/A".into()];
+        let result = store
+            .traverse_graph_snapshot("main", query.clone())
+            .unwrap()
+            .result;
+        assert_eq!(result.paths[0].nodes, [start]);
+        assert_eq!(
+            result.paths[0].termination,
+            PathTermination::RepositoryBoundary
+        );
+        assert_eq!(result.nodes[0].kind, EntityKind::Callable);
+
+        query.target_repositories.push("org/C".into());
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert!(result.paths.is_empty());
+        assert_eq!(result.nodes[0].kind, EntityKind::Unknown);
+    }
+
+    #[test]
+    fn filtered_state_exhaustion_reports_work_limit() {
+        let start = "repo://org/A/rust/lib/start";
+        let end = "repo://org/A/rust/lib/end";
+        let mut edges = Vec::new();
+        for index in 0..320 {
+            let middle = format!("repo://org/A/rust/lib/middle{index}");
+            edges.push(call(start, &middle));
+            edges.push(call(&middle, end));
+        }
+        let (store, _) = multipath_fixture(edges);
+        let mut query = multipath_query(start);
+        query.target_repositories = vec!["org/A".into()];
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert!(result.traversal.truncated);
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [beholder_dto::TruncationReason::WorkLimit]
+        );
+    }
+
+    #[test]
+    fn filtered_multipath_depth_limit_is_not_an_acquisition_limit() {
+        use beholder_dto::TruncationReason;
+        let start = "repo://org/A/rust/lib/start";
+        let next = "repo://org/A/rust/lib/next";
+        let (store, _) = multipath_fixture(vec![call(start, next)]);
+        let mut query = multipath_query(start);
+        query.target_repositories = vec!["org/A".into()];
+        query.max_hops = 0;
+
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [TruncationReason::MaxHops]
+        );
     }
 
     #[test]
@@ -1102,7 +1325,8 @@ mod tests {
         let query = multipath_query("a");
         let snapshot = store
             .snapshot("main", |transaction| {
-                let (rows, incomplete) = crate::query::multipath_rows(transaction, "main", &query)?;
+                let (rows, incomplete, boundaries, target_reachability, _) =
+                    crate::query::multipath_rows(transaction, "main", &query)?;
                 let mut next = view.clone();
                 next.repository_states[0].fingerprint = "state-2".into();
                 store.publish(&next, &[facts(&next, vec![call("a", "new")])], &[])?;
@@ -1117,6 +1341,8 @@ mod tests {
                         &ids,
                     )?),
                     incomplete,
+                    boundaries,
+                    target_reachability,
                 )
             })
             .unwrap();
@@ -2096,6 +2322,24 @@ mod tests {
         assert_eq!(diagnostic.repository, "repo");
         assert_eq!(diagnostic.path, PathBuf::from("src/broken.ts"));
         assert_eq!(diagnostic.line, Some(7));
+        assert_eq!(snapshot.analysis.diagnostic_counts.total, 1);
+        assert_eq!(snapshot.analysis.diagnostic_counts.warnings, 1);
+
+        let summary = store
+            .search_entities_snapshot_with_options(
+                "main",
+                "missing",
+                20,
+                QueryOptions {
+                    include_diagnostics: false,
+                },
+            )
+            .unwrap();
+        assert!(summary.analysis.diagnostics.is_empty());
+        assert_eq!(
+            summary.analysis.diagnostic_counts,
+            snapshot.analysis.diagnostic_counts
+        );
     }
 
     #[test]
@@ -2141,6 +2385,7 @@ mod tests {
             EntityFact::new("repo://z/rust/foo/barbaz", EntityKind::Callable, None).unwrap(),
             EntityFact::new("elixir-call://a/hidden/0", EntityKind::Callable, None).unwrap(),
             EntityFact::new("elixir-call://hidden/0", EntityKind::Callable, None).unwrap(),
+            EntityFact::new("repo://example/custom/bar/", EntityKind::Callable, None).unwrap(),
         ];
         repository.observations = vec![Observation::generated(
             "repo://example/rust/lib/call",
@@ -2175,11 +2420,27 @@ mod tests {
         let full_query = store
             .search_entities_snapshot("main", "oo/barbaz", 1)
             .unwrap();
-        assert_eq!(full_query.result.matches[0].id, "repo://z/rust/foo/barbaz");
+        assert!(full_query.result.matches.is_empty());
+        assert!(
+            store
+                .search_entities_snapshot("main", "run", 20)
+                .unwrap()
+                .result
+                .matches
+                .is_empty()
+        );
         let local_call = store
             .search_entities_snapshot("main", "hidden/0", 1)
             .unwrap();
         assert_eq!(local_call.result.matches[0].id, "elixir-call://hidden/0");
+        let trailing_slash_name = store.search_entities_snapshot("main", "bar", 20).unwrap();
+        assert!(
+            trailing_slash_name
+                .result
+                .matches
+                .iter()
+                .any(|entity| entity.id == "repo://example/custom/bar/")
+        );
 
         let result = store
             .search_entities_snapshot("main", "ExampleService.Call", 20)

@@ -14,7 +14,8 @@ use traversal::{dependencies_human, impact_human};
 
 #[cfg(test)]
 use beholder_dto::{
-    EntityKind, EntityOrigin, EntityRef, EvidenceRef, SemanticEdge, SemanticPath, TraversalMetadata,
+    DiagnosticCounts, EntityKind, EntityOrigin, EntityRef, EvidenceRef, SemanticEdge, SemanticPath,
+    TraversalMetadata,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +272,11 @@ mod tests {
         let mut result = trace_result();
         result.metadata.analysis = AnalysisMetadata {
             completeness: AnalysisCompleteness::Incomplete,
+            diagnostic_counts: DiagnosticCounts {
+                total: 2,
+                known_limitations: 1,
+                warnings: 1,
+            },
             diagnostics: vec![
                 AnalysisDiagnostic {
                     code: "z-last".into(),
