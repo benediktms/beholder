@@ -3978,6 +3978,7 @@ struct RelationCleanup<'a> {
     parameters: BTreeMap<String, DataValue>,
     guard_repository_state: bool,
     guard_enrichment_snapshot: bool,
+    guard_fact_shard_selection: bool,
     stale_states: u32,
     repositories: u32,
     completed_steps: u32,
@@ -4096,10 +4097,21 @@ fn remove_garbage_collection_batch_once(
         transaction.abort()?;
         return Ok(false);
     }
+    let removal_query = if cleanup.guard_fact_shard_selection {
+        "selected[producer, owner, version] := \
+             *analysis_fact_shard_selection{producer, owner, version}\n\
+         candidates[producer, owner, version, id] <- $rows\n\
+         ?[producer, owner, version, id] := \
+             candidates[producer, owner, version, id], \
+             not selected[producer, owner, version]"
+            .into()
+    } else {
+        format!("?[{}] <- $rows", cleanup.keys)
+    };
     transaction.run_script(
         &format!(
-            "?[{}] <- $rows\n:rm {} {{{}}}",
-            cleanup.keys, cleanup.relation, cleanup.keys
+            "{}\n:rm {} {{{}}}",
+            removal_query, cleanup.relation, cleanup.keys
         ),
         BTreeMap::from([(
             "rows".into(),
@@ -4171,6 +4183,7 @@ fn sweep_unselected_enrichment_snapshots(
                     parameters: params.clone(),
                     guard_repository_state: false,
                     guard_enrichment_snapshot: true,
+                    guard_fact_shard_selection: false,
                     stale_states,
                     repositories,
                     completed_steps: index.try_into()?,
@@ -4231,6 +4244,7 @@ fn sweep_unselected_fact_shard_entity_names(
             parameters: BTreeMap::new(),
             guard_repository_state: false,
             guard_enrichment_snapshot: false,
+            guard_fact_shard_selection: true,
             stale_states,
             repositories,
             completed_steps: 0,
@@ -4418,6 +4432,7 @@ pub(super) fn sweep_garbage_collection(
                     parameters: BTreeMap::from([("state".into(), state.into())]),
                     guard_repository_state: true,
                     guard_enrichment_snapshot: false,
+                    guard_fact_shard_selection: false,
                     stale_states,
                     repositories,
                     completed_steps: states_resolved,
@@ -4477,6 +4492,7 @@ pub(super) fn sweep_garbage_collection(
                     ]),
                     guard_repository_state: false,
                     guard_enrichment_snapshot: false,
+                    guard_fact_shard_selection: false,
                     stale_states,
                     repositories,
                     completed_steps,
@@ -4526,6 +4542,7 @@ pub(super) fn sweep_garbage_collection(
                 parameters: BTreeMap::new(),
                 guard_repository_state: false,
                 guard_enrichment_snapshot: false,
+                guard_fact_shard_selection: false,
                 stale_states,
                 repositories,
                 completed_steps: 0,
@@ -5987,6 +6004,76 @@ mod tests {
         assert_eq!(names()[0][1].get_str(), Some("Current"));
         drop(store);
         let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn fact_shard_name_removal_rechecks_current_selection() {
+        let store = SemanticStore::memory().unwrap();
+        store
+            .db
+            .run_script(
+                "?[producer, owner, version, id, name] <- [[\
+                     'rust', 'owner', 'v1', 'repo://example/repo/rust/lib/Current', 'Current'\
+                 ]] :put analysis_fact_shard_entity_name {\
+                     producer, owner, version, id => name\
+                 }",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+        let cleanup = RelationCleanup {
+            step: "unselected fact shard entity names".into(),
+            select_script: "selected[producer, owner, version] := \
+                 *analysis_fact_shard_selection{producer, owner, version}\n\
+             ?[producer, owner, version, id] := \
+                 *analysis_fact_shard_entity_name{producer, owner, version, id}, \
+                 not selected[producer, owner, version]"
+                .into(),
+            relation: "analysis_fact_shard_entity_name",
+            keys: "producer, owner, version, id",
+            parameters: BTreeMap::new(),
+            guard_repository_state: false,
+            guard_enrichment_snapshot: false,
+            guard_fact_shard_selection: true,
+            stale_states: 0,
+            repositories: 0,
+            completed_steps: 0,
+            total_steps: 1,
+        };
+        let batch = store
+            .db
+            .run_script(
+                &cleanup.select_script,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(batch.len(), 1);
+        store
+            .db
+            .run_script(
+                "?[view, producer, repository, owner, version] <- [[\
+                     'main', 'rust', 'example/repo', 'owner', 'v1'\
+                 ]] :put analysis_fact_shard_selection {\
+                     view, producer, repository, owner => version\
+                 }",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+
+        remove_garbage_collection_batch_once(&store.db, &cleanup, &batch).unwrap();
+
+        let names = store
+            .db
+            .run_script(
+                "?[id] := *analysis_fact_shard_entity_name{id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(names.rows.len(), 1);
     }
 
     #[test]
