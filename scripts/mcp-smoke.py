@@ -27,12 +27,7 @@ def canonical_search_result(result):
         freshness = dict(freshness)
         freshness.pop("indexing", None)
         result["freshness"] = freshness
-    if "diagnostics" in result:
-        result["diagnostics"] = sorted(result["diagnostics"], key=lambda item: (
-            item.get("code", ""),
-            item.get("severity", 0),
-            item.get("detail", ""),
-        ))
+    result.pop("diagnostics", None)
     return result
 
 
@@ -54,6 +49,7 @@ def canonical_traversal_result(result):
         result["freshness"] = freshness
     if "truncation_reasons" in result:
         result["truncation_reasons"] = sorted(result["truncation_reasons"])
+    result.pop("diagnostics", None)
     return result
 
 
