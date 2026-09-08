@@ -293,13 +293,16 @@ pub async fn workspace_topology_status(workspace: String) -> Result<QueryMetadat
 pub async fn search_entities(
     search: SearchEntitiesRequest,
 ) -> Result<EntitySearchResult, ClientError> {
-    Ok(connect_send()
+    let include_diagnostics = search.include_diagnostics;
+    let result: EntitySearchResult = connect_send()
         .await?
         .search_entities(request(search))
         .await
         .map_err(operation_error)?
         .into_inner()
-        .try_into()?)
+        .try_into()?;
+    validate_diagnostic_preference(include_diagnostics, &result.metadata)?;
+    Ok(result)
 }
 
 /// Traverse one immutable workspace revision with bounded multi-path semantics.
@@ -307,6 +310,7 @@ pub async fn traverse_graph(
     request: beholder_protocol::v1::TraverseGraphRequest,
 ) -> Result<beholder_dto::TraverseGraphResult, ClientError> {
     let requested_targets = request.target_repositories.clone();
+    let include_diagnostics = request.include_diagnostics;
     let result: beholder_dto::TraverseGraphResult = connect_send()
         .await?
         .traverse_graph(crate::request(request))
@@ -315,7 +319,21 @@ pub async fn traverse_graph(
         .into_inner()
         .try_into()?;
     validate_repository_targets(&requested_targets, &result.query.target_repositories)?;
+    validate_diagnostic_preference(include_diagnostics, &result.metadata)?;
     Ok(result)
+}
+
+fn validate_diagnostic_preference(
+    include_diagnostics: Option<bool>,
+    metadata: &QueryMetadata,
+) -> Result<(), ClientError> {
+    if include_diagnostics == Some(false) && !metadata.analysis.diagnostics.is_empty() {
+        return Err(
+            "daemon ignored the diagnostic-detail preference; upgrade and restart the daemon"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_repository_targets(
@@ -578,6 +596,26 @@ mod tests {
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity, QueryMetadata};
     use beholder_protocol::v1;
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn rejects_diagnostics_when_counts_only_were_requested() {
+        let mut metadata = QueryMetadata::completed("main", 1);
+        assert!(validate_diagnostic_preference(Some(false), &metadata).is_ok());
+        metadata
+            .analysis
+            .diagnostics
+            .push(beholder_dto::AnalysisDiagnostic {
+                code: "example".into(),
+                severity: AnalysisDiagnosticSeverity::Warning,
+                repository: "example".into(),
+                path: "example.rs".into(),
+                line: None,
+                detail: None,
+            });
+        assert!(validate_diagnostic_preference(Some(false), &metadata).is_err());
+        assert!(validate_diagnostic_preference(Some(true), &metadata).is_ok());
+        assert!(validate_diagnostic_preference(None, &metadata).is_ok());
+    }
 
     #[test]
     fn traversal_rejects_ignored_repository_targets() {
