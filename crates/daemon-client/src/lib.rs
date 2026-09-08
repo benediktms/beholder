@@ -301,6 +301,7 @@ pub async fn search_entities(
         .map_err(operation_error)?
         .into_inner()
         .try_into()?;
+    validate_query_schema(&result.schema, beholder_dto::ENTITY_SEARCH_SCHEMA_V2)?;
     validate_diagnostic_preference(include_diagnostics, &result.metadata)?;
     Ok(result)
 }
@@ -318,9 +319,17 @@ pub async fn traverse_graph(
         .map_err(operation_error)?
         .into_inner()
         .try_into()?;
+    validate_query_schema(&result.schema, beholder_dto::TRAVERSE_GRAPH_SCHEMA_V2)?;
     validate_repository_targets(&requested_targets, &result.query.target_repositories)?;
     validate_diagnostic_preference(include_diagnostics, &result.metadata)?;
     Ok(result)
+}
+
+fn validate_query_schema(actual: &str, expected: &str) -> Result<(), ClientError> {
+    if actual != expected {
+        return Err(format!("daemon returned unsupported schema {actual}; expected {expected}; upgrade and restart the daemon").into());
+    }
+    Ok(())
 }
 
 fn validate_diagnostic_preference(
@@ -596,6 +605,23 @@ mod tests {
     use beholder_dto::{AnalysisCompleteness, AnalysisDiagnosticSeverity, QueryMetadata};
     use beholder_protocol::v1;
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn rejects_legacy_query_schemas_without_diagnostics() {
+        for (legacy, current) in [
+            (
+                "beholder.entity_search.v1",
+                beholder_dto::ENTITY_SEARCH_SCHEMA_V2,
+            ),
+            (
+                "beholder.traverse_graph.v1",
+                beholder_dto::TRAVERSE_GRAPH_SCHEMA_V2,
+            ),
+        ] {
+            assert!(validate_query_schema(legacy, current).is_err());
+            assert!(validate_query_schema(current, current).is_ok());
+        }
+    }
 
     #[test]
     fn rejects_diagnostics_when_counts_only_were_requested() {
