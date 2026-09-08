@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 
-const STOP_TIMEOUT: Duration = Duration::from_secs(300);
+const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) async fn run(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
     match command {
@@ -171,6 +172,9 @@ async fn wait_for_lock_at(path: &Path, timeout: Duration) -> Result<(), Box<dyn 
 }
 
 async fn stop_for_service_change() -> Result<(), Box<dyn Error>> {
+    if std::env::var_os("BEHOLDER_STATE_DIR").is_none() {
+        service::stop()?;
+    }
     if matches!(
         tokio::time::timeout(Duration::from_millis(500), get_status()).await,
         Ok(Ok(_))
@@ -202,7 +206,7 @@ async fn install_service() -> Result<(), Box<dyn Error>> {
     let state = state_dir()?;
     let outcome = service::install(&service::installed_daemon_path()?, &state)?;
     if std::env::var("BEHOLDER_LAUNCHER").as_deref() != Ok("fake") {
-        for _ in 0..STOP_TIMEOUT.as_secs() * 10 {
+        for _ in 0..STARTUP_TIMEOUT.as_secs() * 10 {
             if get_status().await.is_ok() {
                 break;
             }
