@@ -113,7 +113,7 @@ async fn wait_for_lock() -> Result<(), Box<dyn Error>> {
 
 async fn wait_to_start() -> Result<Option<u32>, Box<dyn Error>> {
     let path = state_dir()?.join("beholderd.pid");
-    match tokio::time::timeout(STOP_TIMEOUT, async {
+    match tokio::time::timeout(STARTUP_TIMEOUT, async {
         let mut reported = false;
         loop {
             if let Ok(status) = get_status().await {
@@ -133,7 +133,7 @@ async fn wait_to_start() -> Result<Option<u32>, Box<dyn Error>> {
     {
         Ok(result) => result,
         Err(_) => Err(format!(
-            "timed out waiting for beholderd to stop or become ready after {STOP_TIMEOUT:?}"
+            "timed out waiting for beholderd to stop or become ready after {STARTUP_TIMEOUT:?}"
         )
         .into()),
     }
