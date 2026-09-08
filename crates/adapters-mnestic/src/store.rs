@@ -1054,11 +1054,13 @@ mod tests {
         let a = "repo://org/A/rust/lib/a";
         let a_internal = "repo://org/A/rust/lib/internal";
         let contract = "grpc://example.Service/Call";
+        let downstream_contract = "grpc://example.Other/Call";
         let b = "repo://org/B/rust/lib/b";
         let (store, _) = multipath_fixture(vec![
             call(a, a_internal),
             call(a_internal, contract),
-            call(contract, b),
+            call(contract, downstream_contract),
+            call(downstream_contract, b),
         ]);
         let mut query = multipath_query(a);
         query.target_repositories = vec!["org/A".into()];
@@ -1069,12 +1071,7 @@ mod tests {
             result.paths[0].termination,
             PathTermination::RepositoryBoundary
         );
-        assert!(
-            result
-                .edges
-                .iter()
-                .all(|edge| !(edge.from == contract && edge.to == b))
-        );
+        assert!(result.edges.iter().all(|edge| edge.from != contract));
 
         let (store, _) = multipath_fixture(vec![call(a, b)]);
         let mut query = multipath_query(b);

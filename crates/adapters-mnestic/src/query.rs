@@ -2136,6 +2136,9 @@ fn filtered_multipath_rows(
             for state in states.iter().filter(|state| state.entity == current) {
                 let mut next_state = state.clone();
                 next_state.entity = next.into();
+                if state.completion_repository.is_some() && !next.starts_with("repo://") {
+                    continue;
+                }
                 if let Some(completion) = &state.completion_repository {
                     if next.starts_with("repo://")
                         && super::semantic::target_repository(next, &targets)
