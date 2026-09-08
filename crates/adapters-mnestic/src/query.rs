@@ -1141,34 +1141,37 @@ pub(super) fn generated_entity_ids(
     view: &str,
     entities: BTreeSet<String>,
 ) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    if entities.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let params = || BatchContextParams {
+        entities: entities.clone(),
+    };
+    let baseline_rows = [
+        db.run::<BatchStateStructuralContext>(view, params())?,
+        db.run::<BatchRevisionStructuralContext>(view, params())?,
+        db.run::<BatchFactShardStructuralContext>(view, params())?,
+    ];
+    let mut baseline = BTreeMap::<String, BTreeSet<_>>::new();
     let mut generated = BTreeSet::new();
-    // ponytail: search returns at most 100 entities; batch only if these exact lookups measure slow.
-    for entity in entities {
-        let mut baseline = BTreeSet::new();
-        let rows = db.run::<StateStructuralContext>(view, context_params(&entity))?;
-        baseline.extend(rows.iter().map(ContextRow::edge_key));
-        if rows.iter().any(marks_generated_origin) {
-            generated.insert(entity.clone());
-            continue;
+    for rows in baseline_rows {
+        for row in rows {
+            baseline
+                .entry(row.entity.clone())
+                .or_default()
+                .insert(row.context.edge_key());
+            if marks_generated_origin(&row.context) {
+                generated.insert(row.entity);
+            }
         }
-        let rows = db.run::<RevisionStructuralContext>(view, context_params(&entity))?;
-        baseline.extend(rows.iter().map(ContextRow::edge_key));
-        if rows.iter().any(marks_generated_origin) {
-            generated.insert(entity.clone());
-            continue;
-        }
-        let rows = db.run::<FactShardStructuralContext>(view, context_params(&entity))?;
-        baseline.extend(rows.iter().map(ContextRow::edge_key));
-        if rows.iter().any(marks_generated_origin) {
-            generated.insert(entity.clone());
-            continue;
-        }
-        if db
-            .run::<EnrichmentStructuralContext>(view, context_params(&entity))?
-            .iter()
-            .any(|row| !baseline.contains(&row.edge_key()) && marks_generated_origin(row))
-        {
-            generated.insert(entity);
+    }
+    for row in db.run::<BatchEnrichmentStructuralContext>(view, params())? {
+        let shadowed = baseline
+            .get(&row.entity)
+            .is_some_and(|edges| edges.contains(&row.context.edge_key()));
+        if !shadowed && marks_generated_origin(&row.context) {
+            generated.insert(row.entity);
         }
     }
     Ok(generated)
@@ -1285,6 +1288,10 @@ struct ContextParams {
     entity: String,
 }
 
+struct BatchContextParams {
+    entities: BTreeSet<String>,
+}
+
 #[derive(Debug, PartialEq)]
 pub(super) struct ContextRow {
     pub(super) direction: String,
@@ -1362,6 +1369,106 @@ context_query!(
     EnrichmentStructuralContext,
     "context.structural.enrichment",
     include_str!("../../../rules/core/context_structural_enrichment.datalog")
+);
+
+#[derive(Debug)]
+struct BatchContextRow {
+    entity: String,
+    context: ContextRow,
+}
+
+const BATCH_CONTEXT_HEADERS: &[&str] = &[
+    "entity",
+    "direction",
+    "relation",
+    "related",
+    "evidence",
+    "confidence",
+    "provenance",
+];
+
+macro_rules! batch_context_query {
+    ($name:ident, $operation:literal, $script:literal) => {
+        struct $name;
+
+        impl MnesticQuery for $name {
+            const OPERATION: &'static str = $operation;
+            const SCRIPT: &'static str = $script;
+            const HEADERS: &'static [&'static str] = BATCH_CONTEXT_HEADERS;
+
+            type Params = BatchContextParams;
+            type Row = BatchContextRow;
+
+            fn bind(params: &Self::Params) -> BTreeMap<String, DataValue> {
+                BTreeMap::from([(
+                    "entities".into(),
+                    DataValue::List(
+                        params
+                            .entities
+                            .iter()
+                            .map(|entity| DataValue::List(vec![entity.as_str().into()]))
+                            .collect(),
+                    ),
+                )])
+            }
+
+            fn decode(headers: &[String], row: &[DataValue]) -> Result<Self::Row, QueryError> {
+                Ok(BatchContextRow {
+                    entity: row[0]
+                        .get_str()
+                        .ok_or_else(|| {
+                            QueryError::new(Self::OPERATION, "column entity is not a string")
+                        })?
+                        .into(),
+                    context: decode_context(Self::OPERATION, &headers[1..], &row[1..])?,
+                })
+            }
+        }
+    };
+}
+
+batch_context_query!(
+    BatchStateStructuralContext,
+    "context.structural.state.batch",
+    "requested[entity] <- $entities\n\
+     structural_relation[relation] <- [['defines'], ['field_of'], ['request_type'], ['response_type']]\n\
+     selected_state[state] := *analysis_revision{view: $view, revision}, *analysis_revision_state{view: $view, revision, state}\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], selected_state[state], *state_observation{state, from: entity, relation, to: related, evidence}, *state_observation_metadata{state, from: entity, relation, to: related, confidence, provenance}, structural_relation[relation], direction = 'outgoing'\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], selected_state[state], *state_observation:by_to{state, from: related, relation, to: entity, evidence}, *state_observation_metadata:by_to{state, from: related, relation, to: entity, confidence, provenance}, structural_relation[relation], direction = 'incoming'\n\
+     :order entity, direction, relation, related\n\
+     :reorder written"
+);
+batch_context_query!(
+    BatchRevisionStructuralContext,
+    "context.structural.revision.batch",
+    "requested[entity] <- $entities\n\
+     structural_relation[relation] <- [['defines'], ['field_of'], ['request_type'], ['response_type']]\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], *analysis_revision{view: $view, revision}, *analysis_revision_observation{view: $view, revision, from: entity, relation, to: related, evidence, confidence, provenance}, structural_relation[relation], direction = 'outgoing'\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], *analysis_revision{view: $view, revision}, *analysis_revision_observation:by_to{view: $view, revision, from: related, relation, to: entity, evidence, confidence, provenance}, structural_relation[relation], direction = 'incoming'\n\
+     :order entity, direction, relation, related\n\
+     :reorder written"
+);
+batch_context_query!(
+    BatchFactShardStructuralContext,
+    "context.structural.fact_shard.batch",
+    "requested[entity] <- $entities\n\
+     structural_relation[relation] <- [['defines'], ['field_of'], ['request_type'], ['response_type']]\n\
+     selected_shard[producer, owner, version] := *analysis_fact_shard_selection{view: $view, producer, owner, version}\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], *analysis_fact_shard_observation:by_from{producer, owner, version, from: entity, relation, to: related, evidence, confidence, provenance}, selected_shard[producer, owner, version], structural_relation[relation], direction = 'outgoing'\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], *analysis_fact_shard_observation:by_to{producer, owner, version, from: related, relation, to: entity, evidence, confidence, provenance}, selected_shard[producer, owner, version], structural_relation[relation], direction = 'incoming'\n\
+     :order entity, direction, relation, related\n\
+     :reorder written"
+);
+batch_context_query!(
+    BatchEnrichmentStructuralContext,
+    "context.structural.enrichment.batch",
+    "requested[entity] <- $entities\n\
+     structural_relation[relation] <- [['defines'], ['field_of'], ['request_type'], ['response_type']]\n\
+     selected_enrichment[owner] := *analysis_revision{view: $view, revision}, *analysis_revision_repository_enrichment{view: $view, revision, owner}\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], *analysis_enrichment_observation_selection{view: $view, from: entity, relation, to: related, evidence, owner}, selected_enrichment[owner], *enrichment_observation_contribution{view: $view, owner, from: entity, relation, to: related, evidence, confidence, provenance}, structural_relation[relation], direction = 'outgoing'\n\
+     ?[entity, direction, relation, related, evidence, confidence, provenance] := requested[entity], *analysis_enrichment_observation_selection:by_to{view: $view, from: related, relation, to: entity, evidence, owner}, selected_enrichment[owner], *enrichment_observation_contribution{view: $view, owner, from: related, relation, to: entity, evidence, confidence, provenance}, structural_relation[relation], direction = 'incoming'\n\
+     :order entity, direction, relation, related\n\
+     :reorder written"
 );
 
 fn decode_context(
