@@ -136,13 +136,34 @@ pub struct RepositoryStatus {
     pub indexing: bool,
 }
 
+impl AnalysisMetadata {
+    fn is_complete(&self) -> bool {
+        self.completeness == AnalysisCompleteness::Complete
+            && self.diagnostic_counts.total == 0
+            && self.diagnostics.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueryMetadata {
     pub revision: u64,
     pub view: String,
     pub freshness: Freshness,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "AnalysisMetadata::is_complete")]
     pub analysis: AnalysisMetadata,
+}
+
+fn serialize_metadata_with_counts<S: serde::Serializer>(
+    metadata: &QueryMetadata,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    let mut value = serializer.serialize_struct("QueryMetadata", 4)?;
+    value.serialize_field("revision", &metadata.revision)?;
+    value.serialize_field("view", &metadata.view)?;
+    value.serialize_field("freshness", &metadata.freshness)?;
+    value.serialize_field("analysis", &metadata.analysis)?;
+    value.end()
 }
 
 impl QueryMetadata {
@@ -394,7 +415,7 @@ pub struct EntitySearchQuery {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EntitySearchResult {
     pub schema: String,
-    #[serde(flatten)]
+    #[serde(flatten, serialize_with = "serialize_metadata_with_counts")]
     pub metadata: QueryMetadata,
     pub query: EntitySearchQuery,
     pub matches: Vec<EntityRef>,
@@ -627,7 +648,7 @@ pub struct GraphTraversalMetadata {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TraverseGraphResult {
     pub schema: String,
-    #[serde(flatten)]
+    #[serde(flatten, serialize_with = "serialize_metadata_with_counts")]
     pub metadata: QueryMetadata,
     pub query: TraverseGraphQuery,
     pub nodes: Vec<EntityRef>,
@@ -678,8 +699,42 @@ mod tests {
     fn completed_metadata_serializes_zero_diagnostic_counts() {
         let metadata = QueryMetadata::completed("main", 1);
 
-        let value = serde_json::to_value(metadata).unwrap();
+        assert!(
+            serde_json::to_value(&metadata)
+                .unwrap()
+                .get("analysis")
+                .is_none()
+        );
+        let result = EntitySearchResult {
+            schema: "test".into(),
+            metadata,
+            query: EntitySearchQuery {
+                query: "example".into(),
+                limit: 1,
+            },
+            matches: Vec::new(),
+        };
+        let value = serde_json::to_value(result).unwrap();
 
+        assert_eq!(value["analysis"]["diagnostic_counts"]["total"], 0);
+        let result = TraverseGraphResult {
+            schema: "test".into(),
+            metadata: QueryMetadata::completed("main", 1),
+            query: traversal(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            paths: Vec::new(),
+            traversal: GraphTraversalMetadata {
+                max_hops: 1,
+                max_paths: 1,
+                max_rows: 1,
+                max_steps: 1,
+                acquisition_timeout_ms: 1,
+                truncated: false,
+                truncation_reasons: Vec::new(),
+            },
+        };
+        let value = serde_json::to_value(result).unwrap();
         assert_eq!(value["analysis"]["diagnostic_counts"]["total"], 0);
     }
 }
