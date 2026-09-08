@@ -1700,6 +1700,7 @@ type MultipathAcquisition = (
     BTreeSet<String>,
     BTreeSet<String>,
     TargetReachability,
+    bool,
 );
 
 fn target_prefix(repository: &str) -> String {
@@ -2074,6 +2075,7 @@ fn filtered_multipath_rows(
             BTreeSet::from([query.start.clone()]),
             BTreeSet::new(),
             BTreeMap::new(),
+            false,
         ));
     };
     let mut visited_targets = BTreeSet::new();
@@ -2091,6 +2093,7 @@ fn filtered_multipath_rows(
             BTreeSet::new(),
             BTreeSet::new(),
             reachable,
+            false,
         ));
     }
     let completion_repository = missing
@@ -2109,6 +2112,7 @@ fn filtered_multipath_rows(
     let mut incomplete = BTreeSet::new();
     let mut boundaries = BTreeSet::new();
     let mut remaining_steps = beholder_dto::MAX_TRAVERSAL_STEPS;
+    let mut work_limited = false;
     'acquisition: for hops in 0..=query.max_hops {
         if states.is_empty() {
             break;
@@ -2141,6 +2145,7 @@ fn filtered_multipath_rows(
             };
             for state in &states {
                 if !db.consume_step(&mut remaining_steps)? {
+                    work_limited = true;
                     incomplete.extend(states.iter().map(|state| state.entity.clone()));
                     break 'acquisition;
                 }
@@ -2196,6 +2201,7 @@ fn filtered_multipath_rows(
         incomplete,
         boundaries,
         reachable,
+        work_limited,
     ))
 }
 
@@ -2355,6 +2361,7 @@ pub(super) fn multipath_rows(
         incomplete,
         BTreeSet::new(),
         BTreeMap::new(),
+        false,
     ))
 }
 

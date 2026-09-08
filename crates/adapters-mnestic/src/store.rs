@@ -617,7 +617,7 @@ impl SemanticStore {
     ) -> Result<Revisioned<beholder_dto::TraverseGraphResult>, Box<dyn Error>> {
         query.validate()?;
         self.snapshot_with_options(view, options, |transaction| {
-            let (rows, incomplete, boundaries, target_reachability) =
+            let (rows, incomplete, boundaries, target_reachability, work_limited) =
                 crate::query::multipath_rows(transaction, view, &query)?;
             let entities = relevant_traversal_entities(&rows, &[&query.start], query.max_hops + 1);
             let targets = query
@@ -641,7 +641,7 @@ impl SemanticStore {
             } else {
                 entity_facts(transaction, view, &entities)?
             };
-            semantic::traverse_graph(
+            let mut result = semantic::traverse_graph(
                 view,
                 query,
                 inspection_result(rows),
@@ -649,7 +649,17 @@ impl SemanticStore {
                 incomplete,
                 boundaries,
                 target_reachability,
-            )
+            )?;
+            if work_limited {
+                for reason in &mut result.traversal.truncation_reasons {
+                    if *reason == beholder_dto::TruncationReason::AcquisitionLimit {
+                        *reason = beholder_dto::TruncationReason::WorkLimit;
+                    }
+                }
+                result.traversal.truncation_reasons.sort();
+                result.traversal.truncation_reasons.dedup();
+            }
+            Ok(result)
         })
     }
 
@@ -1110,6 +1120,27 @@ mod tests {
     }
 
     #[test]
+    fn filtered_state_exhaustion_reports_work_limit() {
+        let start = "repo://org/A/rust/lib/start";
+        let end = "repo://org/A/rust/lib/end";
+        let mut edges = Vec::new();
+        for index in 0..320 {
+            let middle = format!("repo://org/A/rust/lib/middle{index}");
+            edges.push(call(start, &middle));
+            edges.push(call(&middle, end));
+        }
+        let (store, _) = multipath_fixture(edges);
+        let mut query = multipath_query(start);
+        query.target_repositories = vec!["org/A".into()];
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert!(result.traversal.truncated);
+        assert_eq!(
+            result.traversal.truncation_reasons,
+            [beholder_dto::TruncationReason::WorkLimit]
+        );
+    }
+
+    #[test]
     fn filtered_multipath_depth_limit_is_not_an_acquisition_limit() {
         use beholder_dto::TruncationReason;
         let start = "repo://org/A/rust/lib/start";
@@ -1294,7 +1325,7 @@ mod tests {
         let query = multipath_query("a");
         let snapshot = store
             .snapshot("main", |transaction| {
-                let (rows, incomplete, boundaries, target_reachability) =
+                let (rows, incomplete, boundaries, target_reachability, _) =
                     crate::query::multipath_rows(transaction, "main", &query)?;
                 let mut next = view.clone();
                 next.repository_states[0].fingerprint = "state-2".into();
