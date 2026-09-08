@@ -435,12 +435,10 @@ impl PathSearch<'_> {
         let mut visited = BTreeSet::new();
         let mut completion = None;
         for node in nodes {
-            if let Some(repository) = repository(node)
-                && targets.contains(&repository)
-            {
-                visited.insert(repository.clone());
+            if let Some(repository) = target_repository(node, &targets) {
+                visited.insert(repository.to_owned());
                 if completion.is_none() && visited == targets {
-                    completion = Some(repository);
+                    completion = Some(repository.to_owned());
                 }
             }
         }
@@ -459,14 +457,11 @@ impl PathSearch<'_> {
             .collect::<BTreeSet<_>>();
         let (mut visited, completion) = self.repository_state(nodes);
         if let Some(completion) = completion {
-            return repository(next)
-                .as_deref()
-                .is_none_or(|owner| owner == completion);
+            return !next.starts_with("repo://")
+                || target_repository(next, &targets) == Some(completion.as_str());
         }
-        if let Some(owner) = repository(next)
-            && targets.contains(&owner)
-        {
-            visited.insert(owner);
+        if let Some(owner) = target_repository(next, &targets) {
+            visited.insert(owner.to_owned());
         }
         let missing = targets.difference(&visited).collect::<BTreeSet<_>>();
         missing.is_empty()
@@ -512,7 +507,7 @@ impl PathSearch<'_> {
             return;
         }
         let (_, completion) = self.repository_state(nodes);
-        if completion.is_some() && repository(&node).is_none() {
+        if completion.is_some() && !node.starts_with("repo://") {
             if !self.incomplete.contains(&node) {
                 self.emit(nodes, edges, RepositoryBoundary);
             }
@@ -1102,6 +1097,15 @@ pub(super) fn repository(id: &str) -> Option<String> {
     })
 }
 
+pub(super) fn target_repository<'a>(id: &str, targets: &'a BTreeSet<String>) -> Option<&'a str> {
+    let rest = id.strip_prefix("repo://")?;
+    targets.iter().find_map(|target| {
+        rest.strip_prefix(target.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+            .then_some(target.as_str())
+    })
+}
+
 fn evidence_ref(from: &str, to: &str, evidence: &str, provenance: &str) -> EvidenceRef {
     let (mut path, line) = evidence
         .rsplit_once(':')
@@ -1154,10 +1158,48 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphBuilder, entity_ref, infer_kind, is_test_entity, search_entities};
+    use super::{
+        GraphBuilder, PathSearch, entity_ref, infer_kind, is_test_entity, search_entities,
+    };
     use crate::{InspectionResult, InspectionValue};
-    use beholder_dto::{EntityKind, EntityOrigin};
-    use std::collections::BTreeMap;
+    use beholder_dto::{
+        EntityKind, EntityOrigin, GraphDirection, PathTermination, TraverseGraphQuery,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn repository_filter_recognises_arbitrary_target_segments() {
+        let start = "repo://example/a/semantic/generated";
+        let query = TraverseGraphQuery {
+            start: start.into(),
+            direction: GraphDirection::Dependencies,
+            destination: None,
+            target_repositories: vec!["example/a".into()],
+            max_hops: 8,
+            max_paths: 50,
+        };
+        let incomplete = BTreeSet::new();
+        let boundaries = BTreeSet::new();
+        let reachability = BTreeMap::new();
+        let mut search = PathSearch {
+            query: &query,
+            adjacent: BTreeMap::new(),
+            incomplete: &incomplete,
+            repository_boundaries: &boundaries,
+            target_reachability: &reachability,
+            paths: Vec::new(),
+            reasons: BTreeSet::new(),
+            steps: 0,
+        };
+
+        assert!(search.can_follow(&[start.into()], "repo://example/a/custom/entity"));
+        assert!(!search.can_follow(&[start.into()], "repo://example/b/custom/entity"));
+        search.visit(&mut vec![start.into()], &mut Vec::new());
+
+        assert_eq!(search.paths.len(), 1);
+        assert_eq!(search.paths[0].nodes, [start]);
+        assert_eq!(search.paths[0].termination, PathTermination::Leaf);
+    }
 
     #[test]
     fn entity_search_ranks_canonical_id_then_name_then_prefix() {

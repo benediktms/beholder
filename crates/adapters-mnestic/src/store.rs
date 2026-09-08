@@ -620,7 +620,17 @@ impl SemanticStore {
             let (rows, incomplete, boundaries, target_reachability) =
                 crate::query::multipath_rows(transaction, view, &query)?;
             let entities = relevant_traversal_entities(&rows, &[&query.start], query.max_hops + 1);
-            let entity_rows = if !query.target_repositories.is_empty() && rows.rows.is_empty() {
+            let targets = query
+                .target_repositories
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let start_satisfies_targets =
+                targets.len() == 1 && semantic::target_repository(&query.start, &targets).is_some();
+            let entity_rows = if !query.target_repositories.is_empty()
+                && rows.rows.is_empty()
+                && !start_satisfies_targets
+            {
                 NamedRows::new(
                     ["id", "kind", "metadata"]
                         .into_iter()
@@ -1074,6 +1084,32 @@ mod tests {
         assert_eq!(result.paths.len(), 1);
         assert_eq!(result.paths[0].nodes, [b, a]);
         assert_eq!(result.paths[0].termination, PathTermination::Leaf);
+    }
+
+    #[test]
+    fn filtered_zero_edge_path_hydrates_only_a_valid_start() {
+        use beholder_dto::{EntityKind, PathTermination};
+        let start = "repo://org/A/rust/lib/start";
+        let blocked = "repo://org/B/rust/lib/blocked";
+        let (store, _) = multipath_fixture(vec![call(start, blocked)]);
+
+        let mut query = multipath_query(start);
+        query.target_repositories = vec!["org/A".into()];
+        let result = store
+            .traverse_graph_snapshot("main", query.clone())
+            .unwrap()
+            .result;
+        assert_eq!(result.paths[0].nodes, [start]);
+        assert_eq!(
+            result.paths[0].termination,
+            PathTermination::RepositoryBoundary
+        );
+        assert_eq!(result.nodes[0].kind, EntityKind::Callable);
+
+        query.target_repositories.push("org/C".into());
+        let result = store.traverse_graph_snapshot("main", query).unwrap().result;
+        assert!(result.paths.is_empty());
+        assert_eq!(result.nodes[0].kind, EntityKind::Unknown);
     }
 
     #[test]

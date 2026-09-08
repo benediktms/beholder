@@ -1845,12 +1845,14 @@ fn target_reachability(
     db: &impl QueryRunner,
     view: &str,
     query: &beholder_dto::TraverseGraphQuery,
+    targets: &BTreeSet<String>,
     direction: TraversalDirection,
     remaining_rows: &mut usize,
 ) -> Result<Option<TargetReachability>, Box<dyn Error>> {
     let mut reachable = BTreeMap::<String, BTreeSet<String>>::new();
-    for target in &query.target_repositories {
-        if super::semantic::repository(&query.start).as_deref() == Some(target) {
+    let start_repository = super::semantic::target_repository(&query.start, targets);
+    for target in targets {
+        if start_repository == Some(target.as_str()) {
             reachable
                 .entry(query.start.clone())
                 .or_default()
@@ -2059,7 +2061,8 @@ fn filtered_multipath_rows(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut remaining_rows = beholder_dto::MAX_TRAVERSAL_ROWS as usize;
-    let Some(reachable) = target_reachability(db, view, query, direction, &mut remaining_rows)?
+    let Some(reachable) =
+        target_reachability(db, view, query, &targets, direction, &mut remaining_rows)?
     else {
         return Ok((
             empty_multipath_rows(),
@@ -2069,10 +2072,9 @@ fn filtered_multipath_rows(
         ));
     };
     let mut visited_targets = BTreeSet::new();
-    if let Some(repository) = super::semantic::repository(&query.start)
-        && targets.contains(&repository)
-    {
-        visited_targets.insert(repository);
+    let start_repository = super::semantic::target_repository(&query.start, &targets);
+    if let Some(repository) = start_repository {
+        visited_targets.insert(repository.to_owned());
     }
     let missing = targets
         .difference(&visited_targets)
@@ -2088,7 +2090,7 @@ fn filtered_multipath_rows(
     }
     let completion_repository = missing
         .is_empty()
-        .then(|| super::semantic::repository(&query.start))
+        .then(|| start_repository.map(str::to_owned))
         .flatten();
     let initial = TraversalState {
         entity: query.start.clone(),
@@ -2135,15 +2137,17 @@ fn filtered_multipath_rows(
                 let mut next_state = state.clone();
                 next_state.entity = next.into();
                 if let Some(completion) = &state.completion_repository {
-                    if super::semantic::repository(next).as_deref() != Some(completion) {
+                    if next.starts_with("repo://")
+                        && super::semantic::target_repository(next, &targets)
+                            != Some(completion.as_str())
+                    {
                         continue;
                     }
-                } else if let Some(repository) = super::semantic::repository(next)
-                    && targets.contains(&repository)
+                } else if let Some(repository) = super::semantic::target_repository(next, &targets)
                 {
-                    next_state.visited_targets.insert(repository.clone());
+                    next_state.visited_targets.insert(repository.to_owned());
                     if next_state.visited_targets == targets {
-                        next_state.completion_repository = Some(repository);
+                        next_state.completion_repository = Some(repository.to_owned());
                         found_completion = true;
                     }
                 }
@@ -2222,10 +2226,22 @@ impl<Q: QueryRunner> QueryRunner for TraversalQueryBudget<'_, Q> {
             )
             .into());
         }
-        self.inner.run_query(
-            &format!("{script}\n:timeout {}", remaining.as_secs_f64()),
-            params,
-        )
+        self.inner
+            .run_query(
+                &format!("{script}\n:timeout {}", remaining.as_secs_f64()),
+                params,
+            )
+            .map_err(|error| {
+                if std::time::Instant::now() >= self.deadline {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "graph acquisition deadline exceeded",
+                    )
+                    .into()
+                } else {
+                    error
+                }
+            })
     }
 }
 
@@ -2434,9 +2450,23 @@ mod tests {
         }
     }
 
+    struct ExpiringQueryRunner(Cell<bool>);
+
+    impl QueryRunner for ExpiringQueryRunner {
+        fn run_query(
+            &self,
+            _script: &str,
+            _params: BTreeMap<String, DataValue>,
+        ) -> Result<NamedRows, Box<dyn Error>> {
+            self.0.set(true);
+            std::thread::sleep(Duration::from_millis(20));
+            Err("engine timeout".into())
+        }
+    }
+
     #[test]
     fn target_reachability_skips_a_repository_visited_by_start() {
-        let start = "repo://example/a/rust/lib/start";
+        let start = "repo://example/a/semantic/generated";
         let query = beholder_dto::TraverseGraphQuery {
             start: start.into(),
             direction: beholder_dto::GraphDirection::Dependencies,
@@ -2445,12 +2475,14 @@ mod tests {
             max_hops: 8,
             max_paths: 50,
         };
+        let targets = BTreeSet::from(["example/a".into()]);
         let mut remaining = beholder_dto::MAX_TRAVERSAL_ROWS as usize;
 
         let reachable = target_reachability(
             &UnexpectedQueryRunner,
             "main",
             &query,
+            &targets,
             TraversalDirection::Outgoing,
             &mut remaining,
         )
@@ -2459,6 +2491,43 @@ mod tests {
 
         assert_eq!(reachable[start], BTreeSet::from(["example/a".into()]));
         assert_eq!(remaining, beholder_dto::MAX_TRAVERSAL_ROWS as usize);
+    }
+
+    #[test]
+    fn filtered_reachability_timeout_is_a_deadline_error() {
+        let runner = ExpiringQueryRunner(Cell::new(false));
+        let db = TraversalQueryBudget {
+            inner: &runner,
+            deadline: std::time::Instant::now() + Duration::from_millis(10),
+        };
+        let query = beholder_dto::TraverseGraphQuery {
+            start: "grpc://example.Service/Call".into(),
+            direction: beholder_dto::GraphDirection::Dependencies,
+            destination: None,
+            target_repositories: vec!["example/a".into()],
+            max_hops: 8,
+            max_paths: 50,
+        };
+        let targets = BTreeSet::from(["example/a".into()]);
+        let mut remaining = beholder_dto::MAX_TRAVERSAL_ROWS as usize;
+
+        let error = target_reachability(
+            &db,
+            "main",
+            &query,
+            &targets,
+            TraversalDirection::Outgoing,
+            &mut remaining,
+        )
+        .unwrap_err();
+
+        assert!(runner.0.get());
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::TimedOut)
+        );
     }
 
     #[test]
