@@ -2443,17 +2443,26 @@ mod tests {
         );
 
         let result = store
-            .search_entities_snapshot("main", "ExampleService.Call", 20)
+            .search_entities_snapshot("main", "ExampleService", 20)
             .unwrap();
 
         assert_eq!(result.analysis_revision, 1);
         assert_eq!(result.result.metadata.revision, 0);
-        assert_eq!(result.result.matches.len(), 1);
-        assert_eq!(result.result.matches[0].name, "ExampleService.Call");
-        assert_eq!(
-            result.result.matches[0].origin,
-            beholder_dto::EntityOrigin::Generated
-        );
+        assert_eq!(result.result.matches.len(), 2);
+        let generated = result
+            .result
+            .matches
+            .iter()
+            .find(|entity| entity.id == "grpc://example.v1.ExampleService/Call")
+            .unwrap();
+        assert_eq!(generated.origin, beholder_dto::EntityOrigin::Generated);
+        let source = result
+            .result
+            .matches
+            .iter()
+            .find(|entity| entity.id == "grpc://example.v1.ExampleService/Other")
+            .unwrap();
+        assert_eq!(source.origin, beholder_dto::EntityOrigin::Source);
     }
 
     #[test]
