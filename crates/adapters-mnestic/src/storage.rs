@@ -5940,7 +5940,7 @@ mod tests {
                 .run_script(
                     "?[producer, owner, version, id, kind, metadata] <- [\
                          ['rust', 'owner', 'v1', 'repo://example/repo/rust/lib/Stale', 'callable', ''],\
-                         ['rust', 'owner', 'v2', 'repo://example/repo/rust/lib/Selected', 'callable', '']\
+                         ['rust', 'owner', 'v2', 'repo://example/repo/custom/Selected/', 'callable', '']\
                      ] :put analysis_fact_shard_entity {producer, owner, version, id => kind, metadata}",
                     BTreeMap::new(),
                     ScriptMutability::Mutable,
@@ -5959,7 +5959,19 @@ mod tests {
             store
                 .db
                 .run_script(
-                    "?[name] <- [['fact-shard-entity-name']] :rm schema_migration {name}",
+                    "?[producer, owner, version, id, name] <- [[\
+                         'rust', 'owner', 'v2', 'repo://example/repo/custom/Selected/', \
+                         'repo://example/repo/custom/Selected/'\
+                     ]] :put analysis_fact_shard_entity_name {producer, owner, version, id => name}",
+                    BTreeMap::new(),
+                    ScriptMutability::Mutable,
+                )
+                .unwrap();
+            store
+                .db
+                .run_script(
+                    "?[name, version] <- [['fact-shard-entity-name', 1]] \
+                     :put schema_migration {name => version}",
                     BTreeMap::new(),
                     ScriptMutability::Mutable,
                 )

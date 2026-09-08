@@ -694,7 +694,7 @@ pub(super) fn persistent_database(
 }
 
 fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
-    if !migration_applied(db, "fact-shard-entity-name", 1)? {
+    if !migration_applied(db, "fact-shard-entity-name", 2)? {
         migrate_fact_shard_entity_names(db)?;
     }
     if !migration_applied(db, "enrichment-ownership", 1)? {
@@ -731,14 +731,14 @@ fn migrate_fact_shard_entity_names(db: &DbInstance) -> Result<(), Box<dyn Error>
          display[producer, owner, version, id, name] := candidate[producer, owner, version, id], regex_matches(id, '^elixir-call://([^/]+)/([0-9]+)$'), name = regex_replace(id, '^elixir-call://([^/]+)/([0-9]+)$', '$1/$2')\n\
          display[producer, owner, version, id, name] := candidate[producer, owner, version, id], regex_matches(id, '^(proto-method|grpc)://([^/]+)/([^/]+)$'), name = regex_replace(id, '^(proto-method|grpc)://([^/]*[.])?([^./]+)/([^/]+)$', '$3.$4')\n\
          display[producer, owner, version, id, name] := candidate[producer, owner, version, id], regex_matches(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$'), name = regex_replace(id, '^.*/elixir/(.*/)?([^/]+)/([0-9]+)$', '$2/$3')\n\
-         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], not special[id], regex_matches(id, '^.*[/:]([^/:]+)$'), name = regex_replace(id, '^.*[/:]([^/:]+)$', '$1')\n\
-         display[producer, owner, version, id, id] := candidate[producer, owner, version, id], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)$')\n\
+         display[producer, owner, version, id, name] := candidate[producer, owner, version, id], not special[id], regex_matches(id, '^.*[/:]([^/:]+)/?$'), name = regex_replace(id, '^.*[/:]([^/:]+)/?$', '$1')\n\
+         display[producer, owner, version, id, id] := candidate[producer, owner, version, id], not special[id], not regex_matches(id, '^.*[/:]([^/:]+)/?$')\n\
          ?[producer, owner, version, id, name] := display[producer, owner, version, id, name]\n\
          :put analysis_fact_shard_entity_name {producer, owner, version, id => name}",
         BTreeMap::new(),
     )?;
     transaction.run_script(
-        "?[name, version] <- [['fact-shard-entity-name', 1]] \
+        "?[name, version] <- [['fact-shard-entity-name', 2]] \
          :put schema_migration {name => version}",
         BTreeMap::new(),
     )?;
