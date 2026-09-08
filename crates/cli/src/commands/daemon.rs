@@ -202,7 +202,7 @@ async fn install_service() -> Result<(), Box<dyn Error>> {
     let state = state_dir()?;
     let outcome = service::install(&service::installed_daemon_path()?, &state)?;
     if std::env::var("BEHOLDER_LAUNCHER").as_deref() != Ok("fake") {
-        for _ in 0..50 {
+        for _ in 0..STOP_TIMEOUT.as_secs() * 10 {
             if get_status().await.is_ok() {
                 break;
             }
