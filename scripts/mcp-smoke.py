@@ -27,7 +27,7 @@ def canonical_search_result(result):
         freshness = dict(freshness)
         freshness.pop("indexing", None)
         result["freshness"] = freshness
-    result.pop("diagnostics", None)
+    result.get("analysis", {}).pop("diagnostics", None)
     return result
 
 
@@ -49,7 +49,7 @@ def canonical_traversal_result(result):
         result["freshness"] = freshness
     if "truncation_reasons" in result:
         result["truncation_reasons"] = sorted(result["truncation_reasons"])
-    result.pop("diagnostics", None)
+    result.get("analysis", {}).pop("diagnostics", None)
     return result
 
 
