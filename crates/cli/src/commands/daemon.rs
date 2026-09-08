@@ -71,7 +71,7 @@ pub(super) async fn start() -> Result<(), Box<dyn Error>> {
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()?;
-    for _ in 0..50 {
+    for _ in 0..STARTUP_TIMEOUT.as_secs() * 10 {
         if let Some(status) = child.try_wait()? {
             return Err(
                 format!("beholderd exited with {status}; see {}", log_path.display()).into(),

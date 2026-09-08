@@ -694,7 +694,8 @@ pub(super) fn persistent_database(
 }
 
 fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
-    if !migration_applied(db, "fact-shard-entity-name", 2)? {
+    if !migration_applied(db, "fact-shard-entity-name", 2)? || fact_shard_entity_names_missing(db)?
+    {
         migrate_fact_shard_entity_names(db)?;
     }
     if !migration_applied(db, "enrichment-ownership", 1)? {
@@ -713,6 +714,18 @@ fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
         migrate_resolved_dependencies(db)?;
     }
     Ok(())
+}
+
+fn fact_shard_entity_names_missing(db: &DbInstance) -> Result<bool, Box<dyn Error>> {
+    let rows = db.run_script(
+        "?[missing] := *analysis_fact_shard_selection{producer, owner, version}, \
+             *analysis_fact_shard_entity{producer, owner, version, id}, \
+             not *analysis_fact_shard_entity_name{producer, owner, version, id}, missing = true\n\
+         :limit 1",
+        BTreeMap::new(),
+        ScriptMutability::Immutable,
+    )?;
+    Ok(!rows.rows.is_empty())
 }
 
 fn migrate_fact_shard_entity_names(db: &DbInstance) -> Result<(), Box<dyn Error>> {

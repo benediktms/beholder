@@ -136,20 +136,12 @@ pub struct RepositoryStatus {
     pub indexing: bool,
 }
 
-impl AnalysisMetadata {
-    fn is_complete(&self) -> bool {
-        self.completeness == AnalysisCompleteness::Complete
-            && self.diagnostic_counts.total == 0
-            && self.diagnostics.is_empty()
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueryMetadata {
     pub revision: u64,
     pub view: String,
     pub freshness: Freshness,
-    #[serde(default, skip_serializing_if = "AnalysisMetadata::is_complete")]
+    #[serde(default)]
     pub analysis: AnalysisMetadata,
 }
 
@@ -680,5 +672,14 @@ mod tests {
             query.validate(),
             Err("target repository identities must be non-empty")
         );
+    }
+
+    #[test]
+    fn completed_metadata_serializes_zero_diagnostic_counts() {
+        let metadata = QueryMetadata::completed("main", 1);
+
+        let value = serde_json::to_value(metadata).unwrap();
+
+        assert_eq!(value["analysis"]["diagnostic_counts"]["total"], 0);
     }
 }

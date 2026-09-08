@@ -5993,6 +5993,32 @@ mod tests {
         assert_eq!(names().len(), 1);
         assert_eq!(names()[0][0].get_str(), Some("v2"));
         assert_eq!(names()[0][1].get_str(), Some("Selected"));
+        store
+            .db
+            .run_script(
+                "?[producer, owner, version, id] <- [[\
+                     'rust', 'owner', 'v2', 'repo://example/repo/custom/Selected/'\
+                 ]] :rm analysis_fact_shard_entity_name {producer, owner, version, id}",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+        drop(store);
+
+        let store = SemanticStore::persistent(&database, true).unwrap();
+        let names = || {
+            store
+                .db
+                .run_script(
+                    "?[version, name] := *analysis_fact_shard_entity_name{version, name} :order version",
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap()
+                .rows
+        };
+        assert_eq!(names().len(), 1);
+        assert_eq!(names()[0][1].get_str(), Some("Selected"));
 
         let shard = FactShard {
             repository: "example/repo".into(),
