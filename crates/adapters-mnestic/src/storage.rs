@@ -3928,6 +3928,10 @@ pub(super) fn garbage_collection_pending(db: &DbInstance) -> Result<bool, Box<dy
              pending[key] := *analysis_baseline_observation{view}, key = view\n\
              pending[key] := *analysis_baseline_dependency_override{view}, key = view\n\
              pending[key] := *analysis_baseline_diagnostic{view}, key = view\n\
+             selected_fact_shard[producer, owner, version] := \
+                 *analysis_fact_shard_selection{producer, owner, version}\n\
+             pending[key] := *analysis_fact_shard_entity_name{producer, owner, version, id}, \
+                 not selected_fact_shard[producer, owner, version], key = owner\n\
              ?[key] := pending[key]\n\
              :limit 1",
             BTreeMap::new(),
@@ -6021,6 +6025,7 @@ mod tests {
                 ScriptMutability::Mutable,
             )
             .unwrap();
+        assert!(garbage_collection_pending(&store.db).unwrap());
         let cleanup = RelationCleanup {
             step: "unselected fact shard entity names".into(),
             select_script: "selected[producer, owner, version] := \
@@ -7892,6 +7897,19 @@ mod tests {
         assert!(store.garbage_collection_pending().unwrap());
         store.sweep_garbage_collection(|_| true).unwrap();
         assert!(!store.garbage_collection_pending().unwrap());
+        store
+            .db
+            .run_script(
+                "?[producer, owner, version, id, name] <- [[\
+                     'rust', 'stale', 'v1', 'repo://example/stale/rust/lib/Old', 'Old'\
+                 ]] :put analysis_fact_shard_entity_name {\
+                     producer, owner, version, id => name\
+                 }",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+        assert!(store.garbage_collection_pending().unwrap());
         let old = store
             .db
             .run_script(
