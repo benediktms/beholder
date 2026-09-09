@@ -230,6 +230,148 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     end
   end
 
+  test "preserves multiline case and cond clause heads" do
+    source = """
+    defmodule Example do
+      def call(value) do
+        case value do
+          %{
+            kind: kind
+          } when
+              is_atom(kind) ->
+            case_hit(kind)
+        end
+
+        cond do
+          ready?() and
+              active?() ->
+            cond_hit()
+        end
+      end
+    end
+    """
+
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    events = [
+      event(:module, %{target: "Example", definitions: [{"call", 1}]}),
+      event(:local_function, %{name: "case_hit", arity: 1, line: 8, column: 9}),
+      event(:local_function, %{name: "cond_hit", arity: 0, line: 14, column: 9})
+    ]
+
+    observations =
+      repository
+      |> EventMapper.contribution(%{status: :ok, diagnostics: [], events: events})
+      |> Map.fetch!(:fact_shards)
+      |> Enum.flat_map(& &1.observations)
+
+    case_hit = Enum.find(observations, &String.ends_with?(&1.to, "/case_hit/1"))
+
+    assert %{context: {:pattern_arm, arm}} = Enum.at(case_hit.contexts, 1)
+    assert arm.pattern.text == "%{\n        kind: kind\n      }"
+    assert arm.pattern.range.start == source_position(3, 6)
+    assert arm.pattern.range.end == source_position(5, 7)
+    assert arm.guard.text == "is_atom(kind)"
+    assert arm.guard.range.start == source_position(6, 10)
+    assert arm.guard.range.end == source_position(6, 23)
+
+    cond_hit = Enum.find(observations, &String.ends_with?(&1.to, "/cond_hit/0"))
+
+    assert %{context: {:condition_arm, arm}} = Enum.at(cond_hit.contexts, 1)
+    assert arm.condition.text == "ready?() and\n          active?()"
+    assert arm.condition.range.start == source_position(11, 6)
+    assert arm.condition.range.end == source_position(12, 19)
+  end
+
+  test "adds callable contexts to direct calls in macro definitions" do
+    source = """
+    defmodule Example do
+      defmacro instrument(value) do
+        inspect(value)
+      end
+
+      defmacrop private(value) do
+        to_string(value)
+      end
+    end
+    """
+
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    events = [
+      event(:module, %{target: "Example", definitions: [{"instrument", 1}, {"private", 1}]}),
+      event(:imported_function, %{
+        target: "Kernel",
+        name: "inspect",
+        arity: 1,
+        line: 3,
+        column: 5,
+        caller_function: {"instrument", 1}
+      }),
+      event(:imported_function, %{
+        target: "Kernel",
+        name: "to_string",
+        arity: 1,
+        line: 7,
+        column: 5,
+        caller_function: {"private", 1}
+      })
+    ]
+
+    signatures =
+      repository
+      |> EventMapper.contribution(%{status: :ok, diagnostics: [], events: events})
+      |> Map.fetch!(:fact_shards)
+      |> Enum.flat_map(& &1.observations)
+      |> Enum.map(fn observation ->
+        assert [%{context: {:callable_clause, clause}}] = observation.contexts
+        clause.signature.text
+      end)
+
+    assert Enum.sort(signatures) == ["instrument(value)", "private(value)"]
+  end
+
+  test "converts parser code-point columns to UTF-16 positions" do
+    source = """
+    defmodule Example do
+      def call(value) do
+        e\u0301; unique(value)
+      end
+    end
+    """
+
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    unique =
+      repository
+      |> EventMapper.contribution(%{
+        status: :ok,
+        diagnostics: [],
+        events: [
+          event(:module, %{target: "Example", definitions: [{"call", 1}, {"unique", 1}]}),
+          event(:local_function, %{name: "unique", arity: 1, line: 3, column: 9})
+        ]
+      })
+      |> Map.fetch!(:fact_shards)
+      |> Enum.flat_map(& &1.observations)
+      |> Enum.find(&String.ends_with?(&1.to, "/unique/1"))
+
+    assert unique.range.start == source_position(2, 8)
+    assert unique.range.end == source_position(2, 21)
+  end
+
   test "reuses unchanged source shards and invalidates definition dependants" do
     EventMapper.start_cache()
     :ets.delete_all_objects(EventMapper)
@@ -355,5 +497,9 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
       },
       extra
     )
+  end
+
+  defp source_position(line, character) do
+    %Beholder.V1.SourcePosition{line: line, character: character}
   end
 end

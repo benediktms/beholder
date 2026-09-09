@@ -13,8 +13,8 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     SourceRange
   }
 
-  @definitions [:def, :defp, :defdelegate]
-  @non_calls @definitions ++ [:defmodule, :defmacro, :defmacrop, :case, :cond, :fn, :quote]
+  @definitions [:def, :defp, :defdelegate, :defmacro, :defmacrop]
+  @non_calls @definitions ++ [:defmodule, :case, :cond, :fn, :quote]
 
   def build(repository) do
     Repository.source_inputs(repository)
@@ -131,9 +131,9 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
          %PatternArmContext{
            construct: :PATTERN_CONSTRUCT_CASE,
            selector: selector,
-           pattern: clause_excerpt(meta, :pattern, state),
-           guard: clause_excerpt(meta, :guard, state),
-           is_default: clause_text(meta, :pattern, state) == "_",
+           pattern: clause_excerpt(meta, pattern, :pattern, state),
+           guard: clause_excerpt(meta, guard, :guard, state),
+           is_default: clause_text(meta, pattern, :pattern, state) == "_",
            arm_range: arm_range(meta, body, state)
          }}
     }
@@ -153,7 +153,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
          %ConditionArmContext{
            construct: :CONDITION_CONSTRUCT_COND,
            arm: :CONDITION_ARM_KIND_CLAUSE,
-           condition: clause_excerpt(meta, :condition, state),
+           condition: clause_excerpt(meta, condition, :condition, state),
            arm_range: arm_range(meta, body, state)
          }}
     }
@@ -193,6 +193,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   defp split_guard(value), do: {value, nil}
 
   defp clauses({:__block__, _meta, clauses}) when is_list(clauses), do: clauses
+  defp clauses(clauses) when is_list(clauses), do: clauses
   defp clauses(nil), do: []
   defp clauses(clause), do: [clause]
 
@@ -229,7 +230,12 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
 
   defp expression_start({:when, _meta, [signature, _guard]}), do: expression_start(signature)
 
-  defp expression_start({_name, meta, _arguments}), do: metadata_position(meta)
+  defp expression_start({_name, meta, arguments}) when is_list(meta) do
+    Enum.reduce(arguments || [], metadata_position(meta), fn argument, start ->
+      min_position(start, expression_start(argument))
+    end)
+  end
+
   defp expression_start(_ast), do: nil
 
   defp expression_end({_name, meta, _arguments} = ast) when is_list(meta) do
@@ -275,15 +281,16 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     end
   end
 
-  defp clause_excerpt(meta, part, state) do
-    case clause_segment(meta, state) do
-      {pattern, guard} -> segment_excerpt(if(part == :guard, do: guard, else: pattern), state)
-      nil -> nil
-    end
+  defp clause_excerpt(meta, ast, part, state) do
+    excerpt(ast, state) ||
+      case clause_segment(meta, state) do
+        {pattern, guard} -> segment_excerpt(if(part == :guard, do: guard, else: pattern), state)
+        nil -> nil
+      end
   end
 
-  defp clause_text(meta, part, state) do
-    case clause_excerpt(meta, part, state) do
+  defp clause_text(meta, ast, part, state) do
+    case clause_excerpt(meta, ast, part, state) do
       nil -> nil
       excerpt -> excerpt.text
     end
@@ -292,7 +299,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   defp clause_segment(meta, state) do
     with {line, arrow_column} <- metadata_position(meta),
          source_line when is_binary(source_line) <- Enum.at(state.lines, line - 1) do
-      before_arrow = String.slice(source_line, 0, arrow_column - 1)
+      before_arrow = codepoint_prefix(source_line, arrow_column - 1)
       leading = String.length(before_arrow) - String.length(String.trim_leading(before_arrow))
       head = String.trim(before_arrow)
 
@@ -336,7 +343,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   end
 
   defp source_position({line, column}, state) do
-    prefix = state.lines |> Enum.at(line - 1, "") |> String.slice(0, max(column - 1, 0))
+    prefix = state.lines |> Enum.at(line - 1, "") |> codepoint_prefix(max(column - 1, 0))
 
     utf16 =
       prefix |> :unicode.characters_to_binary(:utf8, {:utf16, :little}) |> byte_size() |> div(2)
@@ -400,5 +407,12 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   defp max_position(nil, position), do: position
   defp max_position(position, nil), do: position
   defp max_position(left, right), do: max(left, right)
+  defp min_position(nil, position), do: position
+  defp min_position(position, nil), do: position
+  defp min_position(left, right), do: min(left, right)
+
+  defp codepoint_prefix(text, length),
+    do: text |> String.to_charlist() |> Enum.take(length) |> List.to_string()
+
   defp normalize_path(path), do: String.replace(path, "\\", "/")
 end
