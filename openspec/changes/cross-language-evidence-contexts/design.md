@@ -28,6 +28,7 @@ their emitted facts change.
 - Control-flow graphs, path-condition evaluation, or symbolic execution.
 - Runtime claims about which branch or overload executed.
 - New entities or relations for branches, patterns, or clauses.
+- A new C# compiler or Roslyn worker.
 - Rust `if let`, Elixir `with`/`receive`/`try`, standalone pattern bindings, or
   general Svelte component/tag reference indexing in this change.
 - GUI rendering.
@@ -133,7 +134,8 @@ range for that exact call coordinate:
   alone is insufficient.
 - TypeScript/JavaScript: the language service must identify one resolved signature
   declaration, not merely an overload set.
-- C#: compiler enrichment must identify one declaration signature/range.
+- C#: the existing repository resolver must identify one uniquely best parsed
+  declaration with an exact signature/range.
 
 Heuristic resolution, ambiguous overloads, macro-generated calls, and events that
 cannot be correlated to one source coordinate emit no selected-target context.
@@ -147,8 +149,9 @@ This avoids turning resolution confidence into false source precision.
    overrides, and Tonic-derived observations.
 3. Elixir: clause-preserving definitions/calls, guarded heads, `case`, `cond`,
    and exact-coordinate compiler correlation.
-4. JavaScript/TypeScript: ternary, switch statement/expression, framework and
-   GraphQL propagation, and exact overload selection.
+4. JavaScript/TypeScript: ternary, switch statements, framework and GraphQL
+   propagation, and exact overload selection. JavaScript and TypeScript have no
+   switch-expression syntax.
 5. Svelte: retain script analysis and additionally parse calls from template
    expressions with template-if/ternary context owned by the component module.
 6. C#: switch statement/expression context, `when` guards, DI propagation, and

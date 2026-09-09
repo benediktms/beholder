@@ -19,7 +19,7 @@
 
 ## 4. JavaScript and TypeScript selections and overloads
 
-- [ ] 4.1 Extract ternary and switch-statement/switch-expression contexts on JavaScript and TypeScript call occurrences; verify focused `beholder-adapters-treesitter-typescript` tests cover condition/selector exclusions, nested ternaries, default cases, fall-through ownership, and multibyte ranges.
+- [ ] 4.1 Extract ternary and switch-statement contexts on JavaScript and TypeScript call occurrences; verify focused `beholder-adapters-treesitter-typescript` tests cover condition/selector exclusions, nested ternaries, default cases, fall-through ownership, and multibyte ranges.
 - [ ] 4.2 Propagate structured evidence through repository, GraphQL, gRPC, and framework enrichers and add selected-target context only for one compiler-resolved overload declaration; verify focused adapter and `workers/typescript` tests cover exact overloads, ambiguous signatures, heuristic resolution, and derived observations.
 - [ ] 4.3 Advance affected JavaScript/TypeScript frontend, resolver, worker, and plugin fingerprints; verify daemon indexing tests invalidate prior cached facts and republish structured evidence.
 
@@ -31,7 +31,7 @@
 ## 6. C# switches and overloads
 
 - [ ] 6.1 Extract switch-statement and switch-expression pattern arms with optional `when` guards on C# calls; verify focused `beholder-adapters-treesitter-csharp` tests cover selector/guard exclusions, discard cases, explicit defaults, nesting, and exact ranges.
-- [ ] 6.2 Propagate structured evidence through C# resolution and dependency-injection observations, add selected-target context only for one exact declaration signature/range, and advance affected fingerprints; verify focused adapter tests cover overload success, inferred ties, DI-derived calls, and stale cache rejection.
+- [ ] 6.2 Propagate structured evidence through C# resolution and dependency-injection observations, add selected-target context only when the existing repository resolver identifies one uniquely best parsed declaration with an exact signature/range, and advance affected fingerprints; verify focused adapter tests cover overload success, inferred ties, DI-derived calls, and stale cache rejection without adding a compiler worker.
 
 ## 7. End-to-end validation
 

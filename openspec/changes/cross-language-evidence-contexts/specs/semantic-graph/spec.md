@@ -81,7 +81,8 @@ emitted only for an exact, uniquely identified declaration range.
 
 #### Scenario: Exact callable selection
 
-- **WHEN** a compiler uniquely resolves an Elixir clause or overloaded Rust, TypeScript, JavaScript, or C# declaration to an exact source range
+- **WHEN** a compiler uniquely resolves an Elixir clause or overloaded Rust, TypeScript, or JavaScript declaration to an exact source range
+- **OR** the C# repository resolver identifies one uniquely best parsed declaration with an exact signature and source range
 - **THEN** the call evidence includes that declaration as a selected-target context
 
 #### Scenario: Ambiguous callable selection
