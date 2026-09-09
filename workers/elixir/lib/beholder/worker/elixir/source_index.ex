@@ -380,7 +380,8 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   end
 
   defp anonymous_clause_context(meta, patterns, body, state) do
-    with signature when not is_nil(signature) <- excerpt(patterns, state),
+    with signature when not is_nil(signature) <-
+           excerpt(patterns, state) || empty_clause_head(meta, state),
          start when not is_nil(start) <- expression_start(patterns) || metadata_position(meta),
          finish when not is_nil(finish) <- expression_end(body) do
       %EvidenceContext{
@@ -392,6 +393,13 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
              definition_range: source_range(start, finish, state)
            }}
       }
+    end
+  end
+
+  defp empty_clause_head(meta, state) do
+    with position when not is_nil(position) <- metadata_position(meta) do
+      range = source_range(position, position, state)
+      %SourceExcerpt{text: "", range: range}
     end
   end
 

@@ -327,6 +327,31 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
            ] = Map.fetch!(calls, {"lib/example.ex", 18, 21})
   end
 
+  test "indexes zero-argument anonymous clauses with an empty callable head" do
+    source = """
+    defmodule Example do
+      def run do
+        fn -> helper() end
+      end
+    end
+    """
+
+    calls =
+      SourceIndex.build(%Repository{
+        identity: "example",
+        base: "/tmp/example",
+        inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+      }).calls
+
+    assert [%{contexts: [%{context: {:callable_clause, clause}}]}] =
+             Map.fetch!(calls, {"lib/example.ex", 3, 11})
+
+    assert clause.role == :CALLABLE_CLAUSE_ROLE_ENCLOSING
+    assert clause.signature.text == ""
+    assert clause.signature.range.start == source_position(2, 7)
+    assert clause.signature.range.end == source_position(2, 7)
+  end
+
   test "preserves multiline case and cond clause heads" do
     source = """
     defmodule Example do
