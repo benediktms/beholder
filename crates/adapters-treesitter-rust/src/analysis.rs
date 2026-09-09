@@ -136,9 +136,6 @@ fn condition_context(
     lines: &[usize],
 ) -> Option<EvidenceContext> {
     let condition = selection.child_by_field_name("condition")?;
-    if condition.kind() == "let_condition" {
-        return None;
-    }
     if contains(condition, call) {
         return None;
     }
@@ -1021,6 +1018,28 @@ mod recovery_tests {
             panic!("fallback should be in an else arm")
         };
         assert_eq!(condition.as_ref().unwrap().text, "retry()");
+    }
+
+    #[test]
+    fn records_if_let_and_let_chain_bodies_without_tagging_condition_calls() {
+        let source = r#"fn run() {
+    if let Some(value) = load() { found(value); }
+    if ready() && let Some(value) = reload() { refreshed(value); }
+}"#;
+        let arms = |name| {
+            call_payload(source, name)
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>()
+        };
+
+        for name in ["load", "ready", "reload"] {
+            assert!(arms(name).is_empty());
+        }
+        for name in ["found", "refreshed"] {
+            assert_eq!(arms(name), [ConditionArmKind::Then]);
+        }
     }
 
     #[test]
