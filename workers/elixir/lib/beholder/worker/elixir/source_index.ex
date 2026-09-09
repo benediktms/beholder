@@ -14,14 +14,18 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   }
 
   @definitions [:def, :defp, :defdelegate, :defmacro, :defmacrop]
-  @non_calls @definitions ++ [:defmodule, :case, :cond, :fn, :quote]
+  @non_calls @definitions ++ [:defmodule, :case, :cond, :fn, :quote, :__block__]
 
   def build(repository) do
     Repository.source_inputs(repository)
     |> Enum.filter(&(Path.extname(&1.path) in [".ex", ".exs"]))
     |> Enum.reduce(%{calls: %{}}, fn input, index ->
       with {:ok, quoted} <-
-             Code.string_to_quoted(input.content, columns: true, token_metadata: true) do
+             Code.string_to_quoted(input.content,
+               columns: true,
+               token_metadata: true,
+               literal_encoder: &encode_literal/2
+             ) do
         state = %{
           path: normalize_path(input.path),
           source: input.content,
@@ -76,6 +80,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
       }
 
       state = %{state | contexts: [enclosing]}
+      index = walk_defaults(signature, state, index)
       index = walk(guard, state, index)
       walk(keyword_value(body, :do), state, index)
     else
@@ -188,6 +193,15 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
 
   defp callable({name, _meta, nil}) when is_atom(name), do: {to_string(name), [0]}
   defp callable(_head), do: nil
+
+  defp walk_defaults({_name, _meta, arguments}, state, index) when is_list(arguments) do
+    Enum.reduce(arguments, index, fn
+      {:\\, _meta, [_parameter, default]}, index -> walk(default, state, index)
+      _argument, index -> index
+    end)
+  end
+
+  defp walk_defaults(_signature, _state, index), do: index
 
   defp split_guard({:when, _meta, [signature, guard]}), do: {signature, guard}
   defp split_guard(value), do: {value, nil}
@@ -416,6 +430,11 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   end
 
   defp metadata_position(_meta), do: nil
+
+  defp encode_literal(literal, meta) when is_list(literal),
+    do: {:ok, {:__block__, meta, [literal]}}
+
+  defp encode_literal(literal, _meta), do: {:ok, literal}
   defp advance(nil, _columns), do: nil
   defp advance({line, column}, columns), do: {line, column + columns}
   defp max_position(nil, position), do: position

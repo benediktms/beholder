@@ -1,7 +1,7 @@
 defmodule Beholder.Worker.Elixir.EventMapperTest do
   use ExUnit.Case, async: true
 
-  alias Beholder.Worker.Elixir.EventMapper
+  alias Beholder.Worker.Elixir.{EventMapper, SourceIndex}
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
   test "maps resolved compiler calls onto baseline identities" do
@@ -241,6 +241,34 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     end
   end
 
+  test "indexes calls in default arguments without walking the declaration" do
+    source = """
+    defmodule Example do
+      def run(value \\\\ fallback()), do: value
+    end
+    """
+
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    assert %{{"lib/example.ex", 2, 20} => [occurrence]} = SourceIndex.build(repository).calls
+    assert occurrence.range.start == source_position(1, 19)
+    assert occurrence.range.end == source_position(1, 29)
+
+    assert [
+             %{
+               context:
+                 {:callable_clause,
+                  %{role: :CALLABLE_CLAUSE_ROLE_ENCLOSING, signature: %{text: signature}}}
+             }
+           ] = occurrence.contexts
+
+    assert signature == "run(value \\\\ fallback())"
+  end
+
   test "preserves multiline case and cond clause heads" do
     source = """
     defmodule Example do
@@ -298,16 +326,16 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     assert arm.condition.range.end == source_position(12, 19)
   end
 
-  test "derives case and cond arm ranges from list elements" do
+  test "includes collection syntax and literal tails in case and cond arm ranges" do
     source = """
     defmodule Example do
       def call(value) do
         case value do
-          _ -> [case_hit()]
+          _ -> [case_hit(), :tail]
         end
 
         cond do
-          true -> [cond_hit()]
+          true -> [cond_hit(), :tail]
         end
       end
     end
@@ -335,13 +363,13 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
 
     case_hit = Enum.find(observations, &String.ends_with?(&1.to, "/case_hit/0"))
     assert %{context: {:pattern_arm, arm}} = Enum.at(case_hit.contexts, 1)
-    assert arm.arm_range.start == source_position(3, 12)
-    assert arm.arm_range.end == source_position(3, 22)
+    assert arm.arm_range.start == source_position(3, 11)
+    assert arm.arm_range.end == source_position(3, 30)
 
     cond_hit = Enum.find(observations, &String.ends_with?(&1.to, "/cond_hit/0"))
     assert %{context: {:condition_arm, arm}} = Enum.at(cond_hit.contexts, 1)
-    assert arm.arm_range.start == source_position(7, 15)
-    assert arm.arm_range.end == source_position(7, 25)
+    assert arm.arm_range.start == source_position(7, 14)
+    assert arm.arm_range.end == source_position(7, 33)
   end
 
   test "adds callable contexts to direct calls in macro definitions" do
