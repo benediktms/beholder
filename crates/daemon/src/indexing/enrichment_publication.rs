@@ -86,7 +86,7 @@ impl EnrichmentPublication for SemanticStore {
             return Ok(None);
         }
         let contexts = self.repository_contexts(target.view, target.repository, target.analyzer)?;
-        let (entities, observations, candidates) = self.selected_baseline_semantics(
+        let (entities, mut observations, candidates) = self.selected_baseline_semantics(
             target.view,
             target.repository,
             read.entity_kinds,
@@ -97,17 +97,18 @@ impl EnrichmentPublication for SemanticStore {
             .map(|entity| (entity.id.clone(), entity))
             .collect::<BTreeMap<_, _>>();
         for context in &contexts {
-            let (context_entities, _, _) = self.selected_baseline_semantics(
+            let (context_entities, context_observations, _) = self.selected_baseline_semantics(
                 target.view,
                 context,
                 read.entity_kinds,
-                &BTreeSet::new(),
+                read.relations,
             )?;
             entities.extend(
                 context_entities
                     .into_iter()
                     .map(|entity| (entity.id.clone(), entity)),
             );
+            observations.extend(context_observations);
         }
         Ok(Some(EnrichmentSnapshotState {
             contexts,
@@ -143,5 +144,93 @@ impl EnrichmentPublication for SemanticStore {
                 fact_shards: request.contribution.fact_shards,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beholder_domain::{
+        EntityFact, LogicalRepository, RepositoryFacts, RepositoryState, StructuralRelation,
+        WorkspaceView,
+    };
+
+    fn facts(state: RepositoryState, observations: Vec<Observation>) -> RepositoryFacts {
+        let entities = observations
+            .iter()
+            .flat_map(|observation| [&observation.from, &observation.to])
+            .map(|id| EntityFact::new(id.clone(), EntityKind::Callable, None).unwrap())
+            .collect();
+        RepositoryFacts {
+            state,
+            analysis_identity: "analysis".into(),
+            incomplete: false,
+            diagnostics: Vec::new(),
+            entities,
+            grpc_bindings: Vec::new(),
+            observations,
+        }
+    }
+
+    #[test]
+    fn context_definitions_reach_enrichment_snapshot() {
+        let store = SemanticStore::memory().unwrap();
+        let target = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/target".into(),
+            },
+            head: None,
+            fingerprint: "target".into(),
+        };
+        let context = RepositoryState {
+            repository: LogicalRepository {
+                identity: "example/context".into(),
+            },
+            head: None,
+            fingerprint: "context".into(),
+        };
+        let view = WorkspaceView::new("main", "analysis", vec![target.clone(), context.clone()])
+            .unwrap()
+            .with_repository_contexts(BTreeMap::from([(
+                "typescript".into(),
+                BTreeMap::from([("example/target".into(), vec!["example/context".into()])]),
+            )]))
+            .unwrap();
+        let definition = Observation::structural(
+            "repo://example/context/typescript/service",
+            StructuralRelation::Defines,
+            "repo://example/context/typescript/service/selected",
+            "src/service.ts:1",
+        );
+        store
+            .publish(
+                &view,
+                &[
+                    facts(target.clone(), Vec::new()),
+                    facts(context, vec![definition.clone()]),
+                ],
+                &[],
+            )
+            .unwrap();
+        let input = view.repository_enrichment_input_fingerprint(&target, "typescript");
+
+        let snapshot = store
+            .enrichment_snapshot(EnrichmentSnapshotRead {
+                target: EnrichmentTarget {
+                    view: "main",
+                    repository: "example/target",
+                    analyzer: "typescript",
+                    version: "1",
+                },
+                input_fingerprint: &input,
+                entity_kinds: &BTreeSet::new(),
+                relations: &BTreeSet::from([SemanticRelation::Structural(
+                    StructuralRelation::Defines,
+                )]),
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(snapshot.baseline.observations.contains(&definition));
     }
 }
