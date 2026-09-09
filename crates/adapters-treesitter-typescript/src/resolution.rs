@@ -2067,12 +2067,11 @@ pub fn unresolved_call_diagnostics(
         let Some(caller) = observation.from.as_str().strip_prefix("repo://") else {
             continue;
         };
-        let (path, line) = observation
-            .evidence
-            .as_str()
-            .rsplit_once(':')
-            .map(|(path, line)| (path, line.parse().ok()))
-            .unwrap_or((observation.evidence.as_str(), None));
+        let evidence = observation.evidence.decode();
+        let Some(path) = evidence.path.as_deref() else {
+            continue;
+        };
+        let line = evidence.line;
         let Some(repository) = repositories.iter().find(|repository| {
             repository.sources.iter().any(|(source_path, analysis)| {
                 source_path == Path::new(path) && {
@@ -3547,6 +3546,39 @@ mod tests {
         );
         assert_eq!(diagnostics[1].0, "example");
         assert_eq!(diagnostics[1].1.path, PathBuf::from("src/view.svelte"));
+    }
+
+    #[test]
+    fn reports_unresolved_calls_with_structured_evidence() {
+        let evidence = beholder_domain::Evidence::structured(beholder_domain::EvidencePayload {
+            path: Some("src/client.ts".into()),
+            line: Some(4),
+            detail: None,
+            range: None,
+            contexts: vec![],
+        })
+        .unwrap();
+        let observations = vec![Observation::dependency(
+            "repo://example/typescript/src/client/run",
+            DependencyRelation::Calls,
+            "typescript-method://client/send",
+            evidence,
+        )];
+        let repositories = vec![TypescriptRepository::new(
+            "example",
+            vec![(
+                PathBuf::from("src/client.ts"),
+                analyze("client.send()", SourceLanguage::TypeScript).unwrap(),
+            )],
+            vec![],
+            vec![],
+        )];
+
+        let diagnostics = unresolved_call_diagnostics(&observations, &repositories);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].1.path, PathBuf::from("src/client.ts"));
+        assert_eq!(diagnostics[0].1.line, Some(4));
     }
 
     #[test]
