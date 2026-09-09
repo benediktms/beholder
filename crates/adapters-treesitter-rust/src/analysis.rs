@@ -232,7 +232,7 @@ fn lexical_contexts(
         if candidate == function {
             break;
         }
-        if candidate.kind() == "closure_expression" {
+        if matches!(candidate.kind(), "closure_expression" | "async_block") {
             break;
         }
         match candidate.kind() {
@@ -1053,6 +1053,10 @@ mod recovery_tests {
             if nested { inside(); }
             helper();
         };
+        let future = async {
+            if nested_async { inside_async(); }
+            async_helper();
+        };
     }
 }"#;
         let contexts = |name| {
@@ -1065,6 +1069,8 @@ mod recovery_tests {
 
         assert_eq!(contexts("inside"), [ConditionArmKind::Then]);
         assert!(contexts("helper").is_empty());
+        assert_eq!(contexts("inside_async"), [ConditionArmKind::Then]);
+        assert!(contexts("async_helper").is_empty());
     }
 
     #[test]
