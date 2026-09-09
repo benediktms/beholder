@@ -236,6 +236,13 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     end)
   end
 
+  defp expression_start(values) when is_list(values) do
+    Enum.reduce(values, nil, &min_position(&2, expression_start(&1)))
+  end
+
+  defp expression_start({left, right}),
+    do: min_position(expression_start(left), expression_start(right))
+
   defp expression_start(_ast), do: nil
 
   defp expression_end({_name, meta, _arguments} = ast) when is_list(meta) do
@@ -245,6 +252,13 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
       true -> fallback_end(ast)
     end
   end
+
+  defp expression_end(values) when is_list(values) do
+    Enum.reduce(values, nil, &max_position(&2, expression_end(&1)))
+  end
+
+  defp expression_end({left, right}),
+    do: max_position(expression_end(left), expression_end(right))
 
   defp expression_end(_ast), do: nil
 

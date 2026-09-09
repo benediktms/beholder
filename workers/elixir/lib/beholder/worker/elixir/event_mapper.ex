@@ -333,13 +333,9 @@ defmodule Beholder.Worker.Elixir.EventMapper do
        when event.kind in @call_kinds do
     with from when not is_nil(from) <- caller_id(repository, event, source_paths),
          to when not is_nil(to) <- call_target(repository, event, definitions),
-         evidence when not is_nil(evidence) <- evidence(repository, event, source_paths) do
-      occurrence =
-        SourceIndex.occurrence(
-          source_index,
-          source_path(repository, event.file, source_paths),
-          event
-        )
+         path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
+      occurrence = SourceIndex.occurrence(source_index, path, event)
+      evidence = evidence(path, event, occurrence)
 
       %Observation{
         from: from,
@@ -360,12 +356,12 @@ defmodule Beholder.Worker.Elixir.EventMapper do
     with relation when not is_nil(relation) <- module_relation(event.kind),
          from when not is_nil(from) <- caller_id(repository, event, source_paths),
          target when is_binary(target) <- event.target,
-         evidence when not is_nil(evidence) <- evidence(repository, event, source_paths) do
+         path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
       %Observation{
         from: from,
         relation: relation,
         to: module_target(repository.identity, target, definitions),
-        evidence: evidence,
+        evidence: evidence(path, event, nil),
         confidence: confidence(event),
         provenance: :PROVENANCE_COMPILER
       }
@@ -429,10 +425,21 @@ defmodule Beholder.Worker.Elixir.EventMapper do
 
   defp module_relation(_kind), do: nil
 
-  defp evidence(repository, event, source_paths) do
-    with path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
-      suffix = if event.from_macro, do: " via macro expansion", else: ""
-      "#{path} (compiler #{event.kind}#{suffix})"
+  defp evidence(path, event, occurrence) do
+    suffix = if event.from_macro, do: " via macro expansion", else: ""
+    detail = "compiler #{event.kind}#{suffix}"
+
+    if occurrence do
+      "beholder:evidence:v1:" <>
+        Jason.encode!(%{
+          path: path,
+          line: event.line,
+          detail: detail,
+          range: nil,
+          contexts: []
+        })
+    else
+      "#{path} (#{detail})"
     end
   end
 

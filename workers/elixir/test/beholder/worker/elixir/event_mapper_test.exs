@@ -158,6 +158,16 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     assert unique.range.start.line == 5
     assert unique.range.start.character == 4
 
+    assert "beholder:evidence:v1:" <> payload = unique.evidence
+
+    assert Jason.decode!(payload) == %{
+             "contexts" => [],
+             "detail" => "compiler local_function",
+             "line" => 6,
+             "path" => "lib/example.ex",
+             "range" => nil
+           }
+
     assert [%{context: {:callable_clause, %{role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}}] =
              unique.contexts
 
@@ -171,6 +181,7 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     assert length(macro.contexts) == 1
 
     internal = Enum.find(observations, &(&1.to == "elixir-call://:elixir_def/internal/1"))
+    assert internal.evidence == "lib/example.ex (compiler remote_function)"
     assert internal.range == nil
     assert internal.contexts == []
   end
@@ -285,6 +296,52 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     assert arm.condition.text == "ready?() and\n          active?()"
     assert arm.condition.range.start == source_position(11, 6)
     assert arm.condition.range.end == source_position(12, 19)
+  end
+
+  test "derives case and cond arm ranges from list elements" do
+    source = """
+    defmodule Example do
+      def call(value) do
+        case value do
+          _ -> [case_hit()]
+        end
+
+        cond do
+          true -> [cond_hit()]
+        end
+      end
+    end
+    """
+
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    observations =
+      repository
+      |> EventMapper.contribution(%{
+        status: :ok,
+        diagnostics: [],
+        events: [
+          event(:module, %{target: "Example", definitions: [{"call", 1}]}),
+          event(:local_function, %{name: "case_hit", arity: 0, line: 4, column: 13}),
+          event(:local_function, %{name: "cond_hit", arity: 0, line: 8, column: 16})
+        ]
+      })
+      |> Map.fetch!(:fact_shards)
+      |> Enum.flat_map(& &1.observations)
+
+    case_hit = Enum.find(observations, &String.ends_with?(&1.to, "/case_hit/0"))
+    assert %{context: {:pattern_arm, arm}} = Enum.at(case_hit.contexts, 1)
+    assert arm.arm_range.start == source_position(3, 12)
+    assert arm.arm_range.end == source_position(3, 22)
+
+    cond_hit = Enum.find(observations, &String.ends_with?(&1.to, "/cond_hit/0"))
+    assert %{context: {:condition_arm, arm}} = Enum.at(cond_hit.contexts, 1)
+    assert arm.arm_range.start == source_position(7, 15)
+    assert arm.arm_range.end == source_position(7, 25)
   end
 
   test "adds callable contexts to direct calls in macro definitions" do
