@@ -232,6 +232,9 @@ fn lexical_contexts(
         if candidate == function {
             break;
         }
+        if candidate.kind() == "closure_expression" {
+            break;
+        }
         match candidate.kind() {
             "if_expression" => contexts.extend(condition_context(candidate, call, source, lines)),
             "match_expression" => contexts.extend(pattern_context(candidate, call, source, lines)),
@@ -1040,6 +1043,28 @@ mod recovery_tests {
         for name in ["found", "refreshed"] {
             assert_eq!(arms(name), [ConditionArmKind::Then]);
         }
+    }
+
+    #[test]
+    fn stops_selection_contexts_at_closure_boundaries() {
+        let source = r#"fn run() {
+    if enabled {
+        let callback = || {
+            if nested { inside(); }
+            helper();
+        };
+    }
+}"#;
+        let contexts = |name| {
+            call_payload(source, name)
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(contexts("inside"), [ConditionArmKind::Then]);
+        assert!(contexts("helper").is_empty());
     }
 
     #[test]
