@@ -93,6 +93,9 @@ pub(super) struct ElixirCapture {
     pub(super) name: String,
     pub(super) arity: usize,
     pub(super) line: usize,
+    pub(super) range: SourceRange,
+    #[serde(default)]
+    pub(super) contexts: Vec<EvidenceContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

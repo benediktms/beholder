@@ -225,12 +225,15 @@ fn parsed_capture(node: Node<'_>, source: &[u8]) -> Option<ElixirCapture> {
         name: name.into(),
         arity: arity.parse().ok()?,
         line: node.start_position().row + 1,
+        range: source_range(node, source),
+        contexts: Vec::new(),
     })
 }
 
 fn collect_capture_bindings(
     node: Node<'_>,
     source: &[u8],
+    contexts: &[EvidenceContext],
     bindings: &mut Vec<(String, ElixirCapture)>,
 ) {
     if node.kind() == "call" && call_target(node, source) == Some("quote") {
@@ -245,16 +248,65 @@ fn collect_capture_bindings(
             .child_by_field_name("left")
             .filter(|left| left.kind() == "identifier")
             .and_then(|left| text(left, source))
-        && let Some(capture) = node
-            .child_by_field_name("right")
-            .and_then(|right| parsed_capture(right, source))
+        && let Some(right) = node.child_by_field_name("right")
+        && let Some(mut capture) = parsed_capture(right, source)
     {
+        capture.contexts = capture_contexts(right, source, contexts);
         bindings.push((name.into(), capture));
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_capture_bindings(child, source, bindings);
+        collect_capture_bindings(child, source, contexts, bindings);
     }
+}
+
+fn capture_contexts(
+    node: Node<'_>,
+    source: &[u8],
+    contexts: &[EvidenceContext],
+) -> Vec<EvidenceContext> {
+    let mut arms = Vec::new();
+    let mut node = node;
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "stab_clause"
+            && let Some(block) = parent.parent()
+            && block.kind() == "do_block"
+            && let Some(selector) = block.parent()
+            && matches!(call_target(selector, source), Some("case" | "cond"))
+        {
+            let (head, guard) = clause_parts(parent, source);
+            let Some(body) = parent.child_by_field_name("right") else {
+                node = parent;
+                continue;
+            };
+            arms.push(if call_target(selector, source) == Some("case") {
+                EvidenceContext::PatternArm {
+                    construct: PatternConstruct::Case,
+                    selector: arguments(selector)
+                        .and_then(|arguments| arguments.named_child(0))
+                        .and_then(|selector| source_excerpt(selector, source)),
+                    pattern: head.and_then(|pattern| source_excerpt(pattern, source)),
+                    guard: guard.and_then(|guard| source_excerpt(guard, source)),
+                    is_default: head
+                        .and_then(|pattern| text(pattern, source))
+                        .is_some_and(|pattern| pattern.trim() == "_"),
+                    arm_range: source_range(body, source),
+                }
+            } else {
+                EvidenceContext::ConditionArm {
+                    construct: ConditionConstruct::Cond,
+                    arm: ConditionArmKind::Clause,
+                    condition: head.and_then(|condition| source_excerpt(condition, source)),
+                    arm_range: source_range(body, source),
+                }
+            });
+        }
+        node = parent;
+    }
+    arms.reverse();
+    let mut result = contexts.to_vec();
+    result.extend(arms);
+    result
 }
 
 fn collect_call_argument_names(node: Node<'_>, source: &[u8], names: &mut BTreeSet<String>) {
@@ -437,6 +489,9 @@ fn collect_calls(
                     .map(|(_, module)| module.clone());
             }
             call.contexts = contexts.to_vec();
+            for capture in &mut call.captures {
+                capture.contexts = contexts.to_vec();
+            }
             calls.push(call);
         }
     }
@@ -555,7 +610,10 @@ fn function_calls(node: Node<'_>, source: &[u8]) -> Vec<ElixirCall> {
 
 fn function_captures(node: Node<'_>, source: &[u8]) -> Vec<ElixirCapture> {
     let mut bindings = Vec::new();
-    collect_capture_bindings(node, source, &mut bindings);
+    let contexts = callable_clause(node, source, CallableClauseRole::Enclosing)
+        .into_iter()
+        .collect::<Vec<_>>();
+    collect_capture_bindings(node, source, &contexts, &mut bindings);
     let mut arguments = BTreeSet::new();
     collect_call_argument_names(node, source, &mut arguments);
     bindings
@@ -1075,7 +1133,14 @@ pub(super) fn call_observations(
                 function_id.clone(),
                 DependencyRelation::Calls,
                 target,
-                format!("{}:{}", path.display(), capture.line),
+                Evidence::structured(EvidencePayload {
+                    path: Some(path.display().to_string()),
+                    line: u32::try_from(capture.line).ok(),
+                    detail: None,
+                    range: Some(capture.range.clone()),
+                    contexts: capture.contexts.clone(),
+                })
+                .expect("tree-sitter emits valid Elixir evidence ranges"),
             );
             observation.confidence = Confidence::Inferred;
             if generated {

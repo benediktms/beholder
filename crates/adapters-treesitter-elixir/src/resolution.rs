@@ -866,6 +866,61 @@ mod tests {
     }
 
     #[test]
+    fn preserves_capture_occurrence_ranges_and_contexts() {
+        let observations = observations(
+            "example",
+            r#"
+                defmodule Example.Source do
+                  def run(value, items) do
+                    case value do
+                      :case ->
+                        callback = &helper/1
+                        Enum.map(items, callback)
+                      _ -> :ok
+                    end
+
+                    cond do
+                      value == :cond ->
+                        callback = &helper/1
+                        Enum.map(items, callback)
+                  true -> :ok
+                end
+              end
+
+              defp helper(item), do: item
+            end
+            "#,
+            Path::new("lib/source.ex"),
+        )
+        .unwrap();
+        let captures = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example.Source/run/2"
+                    && observation.to.as_str() == "repo://example/elixir/Example.Source/helper/1"
+            })
+            .map(|observation| observation.evidence.decode())
+            .collect::<Vec<_>>();
+
+        assert_eq!(captures.len(), 2);
+        assert!(captures.iter().all(|evidence| evidence.range.is_some()));
+        assert!(matches!(
+            captures[0].contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { .. },
+                EvidenceContext::PatternArm { .. }
+            ]
+        ));
+        assert!(matches!(
+            captures[1].contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { .. },
+                EvidenceContext::ConditionArm { .. }
+            ]
+        ));
+    }
+
+    #[test]
     fn prefers_exact_calls_over_earlier_capture_evidence() {
         let observations = observations(
             "example",
