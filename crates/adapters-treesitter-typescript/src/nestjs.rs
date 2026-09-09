@@ -7,7 +7,10 @@ use beholder_domain::{
     GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance, RpcCardinality,
     SemanticRelation,
 };
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+};
 
 fn capitalize(name: &str) -> String {
     let mut name = name.to_owned();
@@ -116,7 +119,7 @@ pub(super) fn bindings(
 ) -> (Vec<GrpcBindingCandidate>, Vec<AnalysisDiagnostic>) {
     let mut candidates = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut emitted = BTreeSet::new();
+    let mut emitted = HashSet::new();
     for (path, analysis) in sources {
         let module = module_id(repository, path, analysis);
         for definition in &analysis.definitions {
@@ -164,14 +167,15 @@ pub(super) fn bindings(
                     continue;
                 }
                 let local_symbol = format!("{module}/{}", definition.qualified_name);
-                if emitted.insert((local_symbol.clone(), "server", method.clone())) {
-                    candidates.push(candidate(
-                        &local_symbol,
-                        GrpcBindingRole::Server,
-                        matches.first().expect("exactly one service matched"),
-                        &method,
-                        call.evidence(path),
-                    ));
+                let binding = candidate(
+                    &local_symbol,
+                    GrpcBindingRole::Server,
+                    matches.first().expect("exactly one service matched"),
+                    &method,
+                    call.evidence(path),
+                );
+                if emitted.insert(binding.clone()) {
+                    candidates.push(binding);
                 }
             }
 
@@ -202,18 +206,15 @@ pub(super) fn bindings(
                         })
                         .expect("matched generated method exists");
                     let local_symbol = format!("{module}/{}", method.qualified_name);
-                    if emitted.insert((
-                        local_symbol.clone(),
-                        "server",
-                        generated_method.method.clone(),
-                    )) {
-                        candidates.push(candidate(
-                            &local_symbol,
-                            GrpcBindingRole::Server,
-                            &generated_method.service,
-                            &generated_method.method,
-                            call.evidence(path),
-                        ));
+                    let binding = candidate(
+                        &local_symbol,
+                        GrpcBindingRole::Server,
+                        &generated_method.service,
+                        &generated_method.method,
+                        call.evidence(path),
+                    );
+                    if emitted.insert(binding.clone()) {
+                        candidates.push(binding);
                     }
                 }
             }
@@ -279,16 +280,15 @@ pub(super) fn bindings(
                                 == SemanticRelation::Dependency(DependencyRelation::Calls)
                                 && observation.to.as_str() == local_symbol
                         });
-                        if used
-                            && emitted.insert((local_symbol.clone(), "client", rpc_method.clone()))
-                        {
-                            candidates.push(candidate(
-                                &local_symbol,
-                                GrpcBindingRole::Client,
-                                service,
-                                &rpc_method,
-                                call.evidence(path),
-                            ));
+                        let binding = candidate(
+                            &local_symbol,
+                            GrpcBindingRole::Client,
+                            service,
+                            &rpc_method,
+                            call.evidence(path),
+                        );
+                        if used && emitted.insert(binding.clone()) {
+                            candidates.push(binding);
                         }
                     }
                 }
@@ -439,6 +439,52 @@ mod tests {
                 == "repo://example/typescript/src/checkout/CheckoutController/initializeOrder"
                 && binding.role == GrpcBindingRole::Server
         }));
+    }
+
+    #[test]
+    fn preserves_distinct_client_binding_evidence_and_collapses_duplicates() {
+        let generated = generated();
+        let source = analyze(
+            r#"
+            interface CheckoutProxy {
+              initializeOrder(request: Request): Observable<Response>;
+            }
+            class CheckoutClient {
+              primary() { this.client.getService<CheckoutProxy>('RPCService'); }
+              fallback() { this.client.getService<CheckoutProxy>('RPCService'); }
+              run() { return this.proxy.initializeOrder({}); }
+            }
+            "#,
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let generated = ts_proto::grpc_methods(
+            "example",
+            &[(Path::new("generated/checkout.ts"), &generated)],
+        );
+        let proxy = "repo://example/typescript/src/checkout/CheckoutProxy/initializeOrder";
+        let observations = vec![Observation::dependency(
+            "repo://example/typescript/src/checkout/CheckoutClient/run",
+            DependencyRelation::Calls,
+            proxy,
+            "src/checkout.ts:7",
+        )];
+        let sources = [
+            (Path::new("src/checkout.ts"), &source),
+            (Path::new("src/checkout.ts"), &source),
+        ];
+
+        let (bindings, diagnostics) = bindings("example", &sources, &generated, &observations);
+        let client_bindings = bindings
+            .iter()
+            .filter(|binding| {
+                binding.local_symbol.as_str() == proxy && binding.role == GrpcBindingRole::Client
+            })
+            .collect::<Vec<_>>();
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(client_bindings.len(), 2);
+        assert_ne!(client_bindings[0].evidence, client_bindings[1].evidence);
     }
 
     #[test]
