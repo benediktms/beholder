@@ -108,7 +108,7 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
              shard.observations
   end
 
-  test "correlates calls by coordinate and selects only one exact source clause" do
+  test "correlates calls by coordinate without inferring an exact target clause" do
     source = """
     defmodule Example do
       def target(:one), do: :one
@@ -158,35 +158,14 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     assert unique.range.start.line == 5
     assert unique.range.start.character == 4
 
-    assert [
-             %{context: {:callable_clause, %{role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}},
-             %{
-               context:
-                 {:callable_clause,
-                  %{
-                    role: :CALLABLE_CLAUSE_ROLE_SELECTED_TARGET,
-                    signature: %{text: "unique(value)"}
-                  }}
-             }
-           ] = unique.contexts
+    assert [%{context: {:callable_clause, %{role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}}] =
+             unique.contexts
 
     assert unique.range.end.line == 5
     assert unique.range.end.character == 17
 
-    assert %{
-             range: %{
-               start: %{line: 3, character: 6},
-               end: %{line: 3, character: 19}
-             }
-           } = List.last(unique.contexts).context |> elem(1) |> Map.fetch!(:signature)
-
-    assert %{start: %{line: 3, character: 2}, end: %{line: 3, character: 30}} =
-             List.last(unique.contexts).context |> elem(1) |> Map.fetch!(:definition_range)
-
-    ambiguous = Enum.find(observations, &String.ends_with?(&1.to, "/target/1"))
-
     assert [%{context: {:callable_clause, %{role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}}] =
-             ambiguous.contexts
+             Enum.find(observations, &String.ends_with?(&1.to, "/target/1")).contexts
 
     macro = Enum.find(observations, &(&1.to == "elixir-call://Macro/invoke/1"))
     assert length(macro.contexts) == 1
@@ -194,6 +173,61 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     internal = Enum.find(observations, &(&1.to == "elixir-call://:elixir_def/internal/1"))
     assert internal.range == nil
     assert internal.contexts == []
+  end
+
+  test "correlates guard and nested receiver calls under a multiline function head" do
+    source = """
+    defmodule Example do
+      def call(
+        value
+      ) when is_list(value) do
+        lookup().run()
+      end
+    end
+    """
+
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    events = [
+      event(:module, %{target: "Example", definitions: [{"call", 1}, {"lookup", 0}]}),
+      event(:imported_function, %{
+        target: "Kernel",
+        name: "is_list",
+        arity: 1,
+        line: 4,
+        column: 10
+      }),
+      event(:local_function, %{name: "lookup", arity: 0, line: 5, column: 5})
+    ]
+
+    observations =
+      repository
+      |> EventMapper.contribution(%{status: :ok, diagnostics: [], events: events})
+      |> Map.fetch!(:fact_shards)
+      |> Enum.flat_map(& &1.observations)
+
+    for {target, line, character} <- [{"Kernel/is_list/1", 3, 9}, {"Example/lookup/0", 4, 4}] do
+      observation = Enum.find(observations, &String.ends_with?(&1.to, target))
+
+      assert %{start: %{line: ^line, character: ^character}} = observation.range
+
+      assert [
+               %{
+                 context:
+                   {:callable_clause,
+                    %{
+                      role: :CALLABLE_CLAUSE_ROLE_ENCLOSING,
+                      signature: %{text: signature}
+                    }}
+               }
+             ] = observation.contexts
+
+      assert signature == "call(\n    value\n  ) when is_list(value)"
+    end
   end
 
   test "reuses unchanged source shards and invalidates definition dependants" do

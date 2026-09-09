@@ -19,7 +19,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   def build(repository) do
     Repository.source_inputs(repository)
     |> Enum.filter(&(Path.extname(&1.path) in [".ex", ".exs"]))
-    |> Enum.reduce(%{calls: %{}, clauses: %{}}, fn input, index ->
+    |> Enum.reduce(%{calls: %{}}, fn input, index ->
       with {:ok, quoted} <-
              Code.string_to_quoted(input.content, columns: true, token_metadata: true) do
         state = %{
@@ -46,23 +46,6 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
 
   def occurrence(_index, _path, _event), do: nil
 
-  def selected_target(index, event)
-      when event.kind in [:local_function, :remote_function] and not event.from_macro do
-    module = if event.kind == :local_function, do: event.caller_module, else: event.target
-
-    case Map.get(index.clauses, {module, event.name, event.arity}, []) do
-      [clause] ->
-        %EvidenceContext{
-          context: {:callable_clause, %{clause | role: :CALLABLE_CLAUSE_ROLE_SELECTED_TARGET}}
-        }
-
-      _mfa_only_or_ambiguous ->
-        nil
-    end
-  end
-
-  def selected_target(_index, _event), do: nil
-
   defp walk({:defmodule, _meta, [name, body]}, state, index) do
     module = module_name(name)
 
@@ -78,7 +61,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
        when kind in @definitions and not is_nil(module) do
     {signature, guard} = split_guard(head)
 
-    with {name, arities} <- callable(signature),
+    with {_name, _arities} <- callable(signature),
          definition_range when not is_nil(definition_range) <- metadata_range(meta, state),
          signature_excerpt when not is_nil(signature_excerpt) <- excerpt(head, state) do
       declaration = %CallableClauseContext{
@@ -87,16 +70,6 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
         guard: excerpt(guard, state),
         definition_range: definition_range
       }
-
-      index =
-        Enum.reduce(arities, index, fn arity, index ->
-          update_in(
-            index.clauses,
-            &Map.update(&1, {module, name, arity}, [declaration], fn clauses ->
-              [declaration | clauses]
-            end)
-          )
-        end)
 
       enclosing = %EvidenceContext{
         context: {:callable_clause, %{declaration | role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}
@@ -133,9 +106,10 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     Enum.reduce(arguments, index, &walk(&1, state, &2))
   end
 
-  defp walk({{:., _dot_meta, [_receiver, name]}, meta, arguments} = call, state, index)
+  defp walk({{:., _dot_meta, [receiver, name]}, meta, arguments} = call, state, index)
        when is_atom(name) and is_list(meta) and is_list(arguments) do
     index = record_call(call, meta, state, index)
+    index = walk(receiver, state, index)
     Enum.reduce(arguments, index, &walk(&1, state, &2))
   end
 
@@ -375,6 +349,24 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     state.lines
     |> Enum.at(start.line, "")
     |> slice_utf16(start.character, finish.character - start.character)
+  end
+
+  defp range_text(%SourceRange{start: start, end: finish}, state)
+       when start.line < finish.line do
+    state.lines
+    |> Enum.slice(start.line..finish.line)
+    |> Enum.with_index(start.line)
+    |> Enum.map(fn
+      {line, index} when index == start.line ->
+        slice_utf16(line, start.character, byte_size(line))
+
+      {line, index} when index == finish.line ->
+        slice_utf16(line, 0, finish.character)
+
+      {line, _index} ->
+        line
+    end)
+    |> Enum.join("\n")
   end
 
   defp range_text(_range, _state), do: nil

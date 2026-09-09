@@ -466,6 +466,7 @@ fn build_fact_shards(
                 digest.update(observation.from.as_str().as_bytes());
                 digest.update(observation.relation.as_str().as_bytes());
                 digest.update(observation.to.as_str().as_bytes());
+                digest.update(observation.evidence.as_str().as_bytes());
                 digest.update(observation.confidence.score().to_le_bytes());
                 digest.update(observation.provenance.as_str().as_bytes());
             }
@@ -535,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_shards_ignore_comments_and_formatting() {
+    fn formatting_only_changes_shards_with_moved_evidence() {
         let cache_dir = std::env::temp_dir().join(format!(
             "beholder-elixir-semantic-formatting-{}",
             std::process::id()
@@ -550,7 +551,18 @@ mod tests {
             "# heading\n\ndefmodule Example do\n  # implementation\n  def run(value) do\n      (value + 1)\n  end\nend\n",
         );
 
-        assert_eq!(formatted, initial);
+        assert_ne!(
+            formatted["repo://example/repo/elixir-source/lib/example.ex"],
+            initial["repo://example/repo/elixir-source/lib/example.ex"]
+        );
+        assert_ne!(
+            formatted["repo://example/repo/elixir/Example"],
+            initial["repo://example/repo/elixir/Example"]
+        );
+        assert_eq!(
+            formatted["repo://example/repo/elixir/Example/run/1"],
+            initial["repo://example/repo/elixir/Example/run/1"]
+        );
         let _ = fs::remove_dir_all(cache_dir);
     }
 
@@ -682,6 +694,27 @@ mod tests {
         let source = "repo://example/repo/elixir-source/lib/example.ex";
 
         assert_ne!(shifted[source], initial[source]);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn evidence_movement_changes_the_observation_shard() {
+        let cache_dir = std::env::temp_dir().join(format!(
+            "beholder-elixir-semantic-evidence-{}",
+            std::process::id()
+        ));
+        let analyzer = ElixirAnalyzer::new(cache_dir.clone());
+        let initial = shard_versions(
+            &analyzer,
+            "defmodule Example do\n  def run, do: Target.call()\nend\n",
+        );
+        let shifted = shard_versions(
+            &analyzer,
+            "# shifted\ndefmodule Example do\n  def run, do: Target.call()\nend\n",
+        );
+        let function = "repo://example/repo/elixir/Example/run/0";
+
+        assert_ne!(shifted[function], initial[function]);
         let _ = fs::remove_dir_all(cache_dir);
     }
 

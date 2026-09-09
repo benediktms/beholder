@@ -341,14 +341,6 @@ defmodule Beholder.Worker.Elixir.EventMapper do
           event
         )
 
-      contexts = if occurrence, do: occurrence.contexts, else: []
-
-      contexts =
-        case {occurrence, SourceIndex.selected_target(source_index, event)} do
-          {%{}, selected} when not is_nil(selected) -> contexts ++ [selected]
-          _unselected -> contexts
-        end
-
       %Observation{
         from: from,
         relation: :RELATION_KIND_CALLS,
@@ -357,7 +349,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
         confidence: confidence(event),
         provenance: :PROVENANCE_COMPILER,
         range: occurrence && occurrence.range,
-        contexts: contexts
+        contexts: if(occurrence, do: occurrence.contexts, else: [])
       }
     else
       _ -> nil
