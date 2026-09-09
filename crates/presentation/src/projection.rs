@@ -252,8 +252,10 @@ pub(super) fn symbol_scope(entity: &EntityRef) -> Option<&str> {
 
 pub(super) fn evidence_label(evidence: &EvidenceRef) -> String {
     match (&evidence.path, evidence.line, &evidence.detail) {
-        (Some(path), Some(line), _) => format!("{path}:{line}"),
+        (Some(path), Some(line), Some(detail)) => format!("{path}:{line} · {detail}"),
+        (Some(path), None, Some(detail)) => format!("{path} · {detail}"),
         (Some(path), None, _) => path.clone(),
+        (Some(path), Some(line), _) => format!("{path}:{line}"),
         (_, _, Some(detail)) => detail.clone(),
         _ => format!("{:?}", evidence.source_kind),
     }

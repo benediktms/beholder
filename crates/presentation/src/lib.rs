@@ -284,6 +284,7 @@ mod tests {
             },
         };
         result.edges[0].evidence[0].range = Some(range.clone());
+        result.edges[0].evidence[0].detail = Some("compiler selected target".into());
         result.edges[0].evidence[0].contexts = vec![EvidenceContext::CallableClause {
             role: CallableClauseRole::Enclosing,
             signature: SourceExcerpt {
@@ -296,6 +297,11 @@ mod tests {
 
         let compact = trace(&result, OutputMode::Human.into()).unwrap();
         assert!(!compact.contains("callable_clause"));
+        assert!(
+            trace(&result, OutputMode::Raw.into())
+                .unwrap()
+                .contains("src/checkout.rs:12 · compiler selected target")
+        );
         for mode in [OutputMode::Raw, OutputMode::Json] {
             let output = trace(&result, mode.into()).unwrap();
             assert!(output.contains("callable_clause"));
