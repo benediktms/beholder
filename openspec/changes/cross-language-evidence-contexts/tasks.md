@@ -30,8 +30,8 @@
 
 ## 6. C# switches and overloads
 
-- [ ] 6.1 Extract switch-statement and switch-expression pattern arms with optional `when` guards on C# calls; verify focused `beholder-adapters-treesitter-csharp` tests cover selector/guard exclusions, discard cases, explicit defaults, nesting, and exact ranges.
-- [ ] 6.2 Propagate structured evidence through C# resolution and dependency-injection observations, add selected-target context only when the existing repository resolver identifies one uniquely best parsed declaration with an exact signature/range, and advance affected fingerprints; verify focused adapter tests cover overload success, inferred ties, DI-derived calls, and stale cache rejection without adding a compiler worker.
+- [x] 6.1 Extract switch-statement and switch-expression pattern arms with optional `when` guards on C# calls; verify focused `beholder-adapters-treesitter-csharp` tests cover selector/guard exclusions, discard cases, explicit defaults, nesting, and exact ranges.
+- [x] 6.2 Propagate structured evidence through C# resolution and dependency-injection observations, add selected-target context only when the existing repository resolver identifies one uniquely best parsed declaration with an exact signature/range, and advance affected fingerprints; verify focused adapter tests cover overload success, inferred ties, DI-derived calls, and stale cache rejection without adding a compiler worker.
 
 ## 7. End-to-end validation
 

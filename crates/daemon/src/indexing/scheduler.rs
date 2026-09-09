@@ -73,7 +73,7 @@ use beholder_adapters_treesitter_typescript::{
 #[cfg(test)]
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    RepositoryState, SourceAnalysisError,
+    Evidence, PatternConstruct, RepositoryState, SourceAnalysisError,
 };
 use beholder_domain::{
     BeholderError, BeholderErrorCode, BeholderErrorKind, Observation, RepositoryDependencyGraph,
@@ -3501,7 +3501,7 @@ mod tests {
         fs::create_dir_all(repository.join("src")).unwrap();
         fs::write(
             repository.join("src/Program.cs"),
-            "namespace Demo; class Program { void Run() { Helper(); } void Helper() {} }",
+            "namespace Demo; class Program { void Run(int value) { switch (value) { case 1: Helper(); break; } } void Helper() {} }",
         )
         .unwrap();
         fs::write(
@@ -3520,16 +3520,31 @@ mod tests {
 
         assert!(scheduler.index(&store, &workspace).unwrap().1);
         let stored = store.inspect_observations(Some("calls")).unwrap();
-        assert!(
-            stored.rows.iter().any(|row| {
+        let call = stored
+            .rows
+            .iter()
+            .find(|row| {
                 row[1].as_str().is_some_and(|from| {
-                    from.ends_with("/csharp/Example.App/src/Program/Demo/Program/Run()")
+                    from.ends_with("/csharp/Example.App/src/Program/Demo/Program/Run(int)")
                 }) && row[3].as_str().is_some_and(|to| {
                     to.ends_with("/csharp/Example.App/src/Program/Demo/Program/Helper()")
                 })
-            }),
-            "{stored:?}"
-        );
+            })
+            .unwrap_or_else(|| panic!("{stored:?}"));
+        let evidence = Evidence::from(call[4].as_str().unwrap()).decode();
+        assert!(evidence.range.is_some());
+        assert!(matches!(
+            evidence.contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { .. },
+                EvidenceContext::PatternArm {
+                    construct: PatternConstruct::SwitchStatement,
+                    pattern: Some(pattern),
+                    ..
+                },
+                EvidenceContext::CallableClause { .. }
+            ] if pattern.text == "1"
+        ));
         fs::remove_dir_all(state).unwrap();
     }
 

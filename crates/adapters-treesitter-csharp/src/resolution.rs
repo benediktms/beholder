@@ -7,7 +7,7 @@ use super::{
     plugin::built_in_plugins,
     project::{CsharpProject, assembly_visibility},
 };
-use beholder_domain::{DependencyRelation, Observation};
+use beholder_domain::{CallableClauseRole, DependencyRelation, Observation};
 use beholder_indexing::RepositoryFactsView;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -335,7 +335,10 @@ pub(super) fn resolve_language_calls(
                         id(repository, source, caller),
                         DependencyRelation::Calls,
                         id(repository, target_source, target),
-                        format!("{}:{}", source.path.display(), call.line),
+                        call.evidence(
+                            source.path,
+                            target.callable_context(CallableClauseRole::SelectedTarget),
+                        ),
                     ));
                     if let Some(return_type) = target.return_type.as_deref() {
                         returned_types.insert(&call.expression, return_type);
@@ -385,7 +388,10 @@ pub fn resolve_repository_calls(
 mod tests {
     use super::*;
     use crate::{analyze, parse_project};
-    use beholder_domain::{DependencyRelation, SemanticRelation};
+    use beholder_domain::{
+        CallableClauseRole, DependencyRelation, EvidenceContext, PatternConstruct,
+        SemanticRelation, SourcePosition, SourceRange,
+    };
 
     #[test]
     fn resolves_extension_calls_only_through_visible_projects() {
@@ -510,6 +516,99 @@ mod tests {
     }
 
     #[test]
+    fn preserves_switch_contexts_and_selects_only_unique_overloads() {
+        let analysis = analyze(
+            r#"class Demo {
+    int Run(int value) => value switch
+    {
+        0 => Parse("a") + Parse("b"),
+        _ => Parse(null)
+    };
+    int Parse(string value) => 1;
+    int Parse(object? value) => 2;
+}"#,
+        )
+        .unwrap();
+        let observations = resolve_repository_calls(
+            "example",
+            &[],
+            &[CsharpSource {
+                path: Path::new("Demo.cs"),
+                assembly: "App",
+                analysis: &analysis,
+            }],
+        );
+        let calls = observations
+            .iter()
+            .filter(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation.from.as_str().ends_with("/Demo/Run(int)")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls.len(), 2, "{observations:#?}");
+        let mut evidence = calls
+            .iter()
+            .map(|observation| observation.evidence.decode())
+            .collect::<Vec<_>>();
+        evidence.sort_by_key(|evidence| {
+            evidence
+                .range
+                .as_ref()
+                .map(|range| (range.start.line, range.start.character))
+        });
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|evidence| evidence.range.clone())
+                .collect::<Vec<_>>(),
+            [
+                Some(SourceRange {
+                    start: SourcePosition {
+                        line: 3,
+                        character: 13,
+                    },
+                    end: SourcePosition {
+                        line: 3,
+                        character: 23,
+                    },
+                }),
+                Some(SourceRange {
+                    start: SourcePosition {
+                        line: 3,
+                        character: 26,
+                    },
+                    end: SourcePosition {
+                        line: 3,
+                        character: 36,
+                    },
+                }),
+            ]
+        );
+        for evidence in evidence {
+            assert!(matches!(
+                evidence.contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause {
+                        role: CallableClauseRole::Enclosing,
+                        ..
+                    },
+                    EvidenceContext::PatternArm {
+                        construct: PatternConstruct::SwitchExpression,
+                        pattern: Some(pattern),
+                        ..
+                    },
+                    EvidenceContext::CallableClause {
+                        role: CallableClauseRole::SelectedTarget,
+                        signature,
+                        ..
+                    }
+                ] if pattern.text == "0" && signature.text == "int Parse(string value)"
+            ));
+        }
+    }
+
+    #[test]
     fn resolves_dotnet_service_collection_registrations() {
         let app_project = parse_project(
             Path::new("App/App.csproj"),
@@ -517,8 +616,21 @@ mod tests {
         )
         .unwrap();
         let core_project = parse_project(Path::new("Core/Core.csproj"), "<Project />").unwrap();
-        let app = analyze("static class Setup { static void Configure(IServiceCollection services) { services.TryAddSingleton<IClock, SystemClock>(); } static void ConfigureBuilder(WebApplicationBuilder builder) { builder.Services.AddSingleton<IQueue, Queue>(); } }")
-            .unwrap();
+        let app = analyze(
+            r#"static class Setup {
+    static void Configure(IServiceCollection services, int lifetime) {
+        switch (lifetime) {
+            case 1:
+                services.TryAddSingleton<IClock, SystemClock>();
+                break;
+        }
+    }
+    static void ConfigureBuilder(WebApplicationBuilder builder) {
+        builder.Services.AddSingleton<IQueue, Queue>();
+    }
+}"#,
+        )
+        .unwrap();
         let core = analyze(
             "#if PUBLIC\npublic interface IClock {}\npublic sealed class SystemClock : IClock {}\n#else\ninternal interface IClock {}\ninternal sealed class SystemClock : IClock {}\n#endif\ninterface IQueue {} sealed class Queue : IQueue {}",
         )
@@ -553,7 +665,7 @@ mod tests {
                     && observation
                         .from
                         .as_str()
-                        .ends_with("/App/Setup/Setup/Configure(IServiceCollection)")
+                        .ends_with("/App/Setup/Setup/Configure(IServiceCollection,int)")
                     && observation.to.as_str().ends_with("/Core/Clock/SystemClock")
             }),
             "{observations:#?}"
@@ -567,5 +679,28 @@ mod tests {
             "{observations:#?}"
         );
         assert_eq!(observations.len(), 4, "{observations:#?}");
+
+        let derived = observations
+            .iter()
+            .filter(|observation| observation.to.as_str().ends_with("/Core/Clock/SystemClock"))
+            .map(|observation| observation.evidence.decode())
+            .collect::<Vec<_>>();
+        assert_eq!(derived.len(), 2);
+        assert_eq!(derived[0].range, derived[1].range);
+        assert_eq!(derived[0].contexts, derived[1].contexts);
+        assert!(matches!(
+            derived[0].contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause {
+                    role: CallableClauseRole::Enclosing,
+                    ..
+                },
+                EvidenceContext::PatternArm {
+                    construct: PatternConstruct::SwitchStatement,
+                    pattern: Some(pattern),
+                    ..
+                }
+            ] if pattern.text == "1"
+        ));
     }
 }
