@@ -70,6 +70,11 @@ fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
     outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
 }
 
+fn first_non_comment_child(node: Node<'_>) -> Option<Node<'_>> {
+    node.named_children(&mut node.walk())
+        .find(|child| child.kind() != "comment")
+}
+
 fn callable_context(
     definition: Node<'_>,
     source: &[u8],
@@ -145,12 +150,12 @@ fn pattern_contexts(selection: Node<'_>, call: Node<'_>, source: &[u8]) -> Vec<E
         let pattern = if is_default {
             None
         } else {
-            label.named_child(0)
+            first_non_comment_child(label)
         };
         let guard_clause = label
             .named_children(&mut label.walk())
             .find(|child| child.kind() == "when_clause");
-        let guard = guard_clause.and_then(|guard| guard.named_child(0));
+        let guard = guard_clause.and_then(first_non_comment_child);
         if pattern.is_some_and(|pattern| contains(pattern, call))
             || guard_clause.is_some_and(|guard| contains(guard, call))
         {
@@ -175,10 +180,12 @@ fn pattern_contexts(selection: Node<'_>, call: Node<'_>, source: &[u8]) -> Vec<E
         let is_default = section
             .children(&mut section.walk())
             .any(|child| child.kind() == "default");
-        let pattern = (!is_default).then(|| section.named_child(0)).flatten();
-        section
-            .named_children(&mut section.walk())
-            .any(|child| Some(child) != pattern && child.kind() != "when_clause")
+        let pattern = (!is_default)
+            .then(|| first_non_comment_child(section))
+            .flatten();
+        section.named_children(&mut section.walk()).any(|child| {
+            Some(child) != pattern && !matches!(child.kind(), "comment" | "when_clause")
+        })
     };
     let mut labels = vec![arm];
     let mut previous = arm.prev_named_sibling();
@@ -939,8 +946,8 @@ public sealed class Worker
         let source = r#"class Demo {
     void Run(int value) {
         switch (value) {
-            case 1:
-            case 2 when Second():
+            case /* before pattern */ 1:
+            case /* before pattern */ 2 when /* inside guard */ Second():
                 Hit();
                 break;
         }
