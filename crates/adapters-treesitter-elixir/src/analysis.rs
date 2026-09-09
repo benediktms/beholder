@@ -66,7 +66,11 @@ fn callable_clause(
     source: &[u8],
     role: CallableClauseRole,
 ) -> Option<EvidenceContext> {
-    let head = arguments(node)?.named_child(0)?;
+    let head = if node.kind() == "stab_clause" {
+        node.child_by_field_name("left")?
+    } else {
+        arguments(node)?.named_child(0)?
+    };
     let guard = (head.kind() == "binary_operator" && operator(head, source) == Some("when"))
         .then(|| head.child_by_field_name("right"))
         .flatten()
@@ -1694,11 +1698,14 @@ fn absinthe_resolver(
     let mut struct_bindings = BTreeMap::new();
     collect_struct_bindings(argument, source, &mut struct_bindings);
     for clause in clauses {
+        let contexts = callable_clause(clause, source, CallableClauseRole::Enclosing)
+            .into_iter()
+            .collect::<Vec<_>>();
         collect_calls(
             clause.child_by_field_name("right")?,
             source,
             &struct_bindings,
-            &[],
+            &contexts,
             &mut calls,
         );
     }
@@ -1804,5 +1811,39 @@ mod recovery_tests {
     fn rejects_missing_delimiters_that_can_change_nesting() {
         let error = analyze("defmodule Broken do\n  def run do\n    :ok\nend").unwrap_err();
         assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
+    }
+
+    #[test]
+    fn inline_absinthe_resolver_calls_keep_their_anonymous_clause() {
+        let analysis = analyze(
+            r#"
+            defmodule Schema do
+              object :result do
+                field(:result, :string,
+                  resolve: fn
+                    value -> integer_result(value)
+                    _ -> fallback_result()
+                  end
+                )
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let function = analysis.modules[0]
+            .functions
+            .iter()
+            .find(|function| function.name == "__absinthe_result_result_resolver")
+            .unwrap();
+        assert!(function.calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, guard: None, .. }]
+                if signature.text == "value"
+        )));
+        assert!(function.calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, guard: None, .. }]
+                if signature.text == "_"
+        )));
     }
 }
