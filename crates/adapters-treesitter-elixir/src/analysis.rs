@@ -243,6 +243,21 @@ fn collect_capture_bindings(
     if node.kind() == "call" && call_target(node, source) == Some("quote") {
         return;
     }
+    if node.kind() == "anonymous_function" {
+        let mut cursor = node.walk();
+        for clause in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "stab_clause")
+        {
+            let contexts = callable_clause(clause, source, CallableClauseRole::Enclosing)
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Some(body) = clause.child_by_field_name("right") {
+                collect_capture_bindings(body, source, &contexts, bindings);
+            }
+        }
+        return;
+    }
     if node.kind() == "binary_operator"
         && node
             .child_by_field_name("operator")
@@ -272,6 +287,9 @@ fn capture_contexts(
     let mut arms = Vec::new();
     let mut node = node;
     while let Some(parent) = node.parent() {
+        if parent.kind() == "anonymous_function" {
+            break;
+        }
         if parent.kind() == "stab_clause"
             && let Some(block) = parent.parent()
             && block.kind() == "do_block"
@@ -1910,6 +1928,43 @@ mod recovery_tests {
             call.contexts.as_slice(),
             [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::ConditionArm { .. }]
                 if call.name == "nested_cond_hit" && signature.text == "input"
+        )));
+    }
+
+    #[test]
+    fn captures_in_anonymous_functions_reset_outer_arms_and_keep_their_own_arms() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  :outer ->
+                    fn input ->
+                      callback = &outer_helper/1
+                      use_callback(callback)
+                      case input do
+                        :inner ->
+                          nested = &inner_helper/1
+                          use_callback(nested)
+                      end
+                    end
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let captures = &analysis.modules[0].functions[0].captures;
+
+        assert!(captures.iter().any(|capture| matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }]
+                if capture.name == "outer_helper" && signature.text == "input"
+        )));
+        assert!(captures.iter().any(|capture| matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::PatternArm { .. }]
+                if capture.name == "inner_helper" && signature.text == "input"
         )));
     }
 }
