@@ -81,7 +81,8 @@ impl EvidencePayload {
                     .ok()
                     .map(|line| (Some(path.into()), Some(line)))
             })
-            .unwrap_or_else(|| (Some(location.into()), None));
+            .unwrap_or_else(|| (detail.is_some().then(|| location.into()), None));
+        let detail = detail.or_else(|| path.is_none().then(|| evidence.into()));
         Self {
             path,
             line,
@@ -256,8 +257,14 @@ mod evidence_tests {
             }
         );
         assert_eq!(
-            Evidence::from("descriptor.proto").decode().path.as_deref(),
-            Some("descriptor.proto")
+            Evidence::from("lib/example.ex (compiler remote_function)").decode(),
+            EvidencePayload {
+                path: None,
+                line: None,
+                detail: Some("lib/example.ex (compiler remote_function)".into()),
+                range: None,
+                contexts: Vec::new(),
+            }
         );
         assert_eq!(
             Evidence::from("descriptor.proto · generated service").decode(),
@@ -278,8 +285,8 @@ mod evidence_tests {
             "beholder:evidence:v1:{\"path\":null,\"line\":null,\"detail\":null,\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":1,\"character\":0}},\"contexts\":[]}",
         ] {
             let decoded = Evidence::from(evidence).decode();
-            assert_eq!(decoded.path.as_deref(), Some(evidence));
-            assert_eq!(decoded.detail, None);
+            assert_eq!(decoded.path, None);
+            assert_eq!(decoded.detail.as_deref(), Some(evidence));
             assert!(decoded.contexts.is_empty());
         }
     }
