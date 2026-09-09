@@ -60,6 +60,7 @@ type analysisSnapshot struct {
 	workspace    string
 	repositories map[string]*repositorySnapshot
 	entities     map[string]bool
+	declarations map[string][]*beholderv1.EvidenceContext
 	candidates   []*workerv1.SemanticCandidate
 }
 
@@ -246,7 +247,11 @@ func newWorkerTelemetry(flush func(context.Context) error) workerTelemetry {
 }
 
 func receiveSnapshot(stream grpc.BidiStreamingServer[workerv1.AnalyzeRequest, workerv1.AnalyzeEvent]) (*analysisSnapshot, error) {
-	snapshot := &analysisSnapshot{repositories: make(map[string]*repositorySnapshot), entities: make(map[string]bool)}
+	snapshot := &analysisSnapshot{
+		repositories: make(map[string]*repositorySnapshot),
+		entities:     make(map[string]bool),
+		declarations: make(map[string][]*beholderv1.EvidenceContext),
+	}
 	for {
 		request, err := stream.Recv()
 		if err != nil {
@@ -286,6 +291,17 @@ func receiveSnapshot(stream grpc.BidiStreamingServer[workerv1.AnalyzeRequest, wo
 			}
 			snapshot.candidates = append(snapshot.candidates, candidate)
 		case *workerv1.AnalyzeRequest_BaselineObservation:
+			observation := value.BaselineObservation.GetObservation()
+			if observation == nil {
+				return nil, errors.New("baseline observation is missing")
+			}
+			if observation.GetRelation() == beholderv1.RelationKind_RELATION_KIND_DEFINES {
+				for _, evidence := range observation.GetContexts() {
+					if evidence.GetCallableClause().GetRole() == beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_DECLARATION {
+						snapshot.declarations[observation.GetTo()] = append(snapshot.declarations[observation.GetTo()], evidence)
+					}
+				}
+			}
 		case *workerv1.AnalyzeRequest_Finish:
 			if snapshot.workspace == "" {
 				return nil, errors.New("analysis start is missing")
@@ -516,7 +532,7 @@ func mapDefinition(ctx context.Context, c *client, definition location, snapshot
 	if matched := matchDocumentSymbol(symbols, definition.Range.Start, nil); matched != nil {
 		id := module + "/" + strings.Join(matched.path, "/")
 		if snapshot.entities[id] {
-			selectedTarget, err := selectedTargetContext(path, matched.range_)
+			selectedTarget, err := selectedTargetContext(snapshot.declarations[id], matched.range_)
 			return id, selectedTarget, err
 		}
 	}
@@ -541,34 +557,34 @@ func mapDefinition(ctx context.Context, c *client, definition location, snapshot
 	return matches[0], nil, nil
 }
 
-func selectedTargetContext(path string, range_ lspRange) (*beholderv1.EvidenceContext, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	if range_.Start.Line != range_.End.Line {
-		return nil, nil
-	}
-	text, err := selectedText(content, range_)
-	if err != nil {
-		return nil, err
-	}
-	trimmed := strings.TrimSpace(text)
-	if !strings.Contains(trimmed, "(") || !strings.HasSuffix(trimmed, ";") {
-		return nil, nil
-	}
+func selectedTargetContext(declarations []*beholderv1.EvidenceContext, range_ lspRange) (*beholderv1.EvidenceContext, error) {
 	if range_.Start.Line < 0 || range_.Start.Character < 0 || range_.End.Line < 0 || range_.End.Character < 0 {
 		return nil, errors.New("definition range contains a negative coordinate")
 	}
-	sourceRange := &beholderv1.SourceRange{
-		Start: &beholderv1.SourcePosition{Line: uint32(range_.Start.Line), Character: uint32(range_.Start.Character)},
-		End:   &beholderv1.SourcePosition{Line: uint32(range_.End.Line), Character: uint32(range_.End.Character)},
+	var matched *beholderv1.CallableClauseContext
+	for _, declaration := range declarations {
+		clause := declaration.GetCallableClause()
+		definition := clause.GetDefinitionRange()
+		if definition.GetStart().GetLine() != uint32(range_.Start.Line) ||
+			definition.GetStart().GetCharacter() != uint32(range_.Start.Character) ||
+			definition.GetEnd().GetLine() != uint32(range_.End.Line) ||
+			definition.GetEnd().GetCharacter() != uint32(range_.End.Character) {
+			continue
+		}
+		if matched != nil {
+			return nil, nil
+		}
+		matched = clause
+	}
+	if matched == nil {
+		return nil, nil
 	}
 	return &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
 		CallableClause: &beholderv1.CallableClauseContext{
 			Role:            beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_SELECTED_TARGET,
-			Signature:       &beholderv1.SourceExcerpt{Text: text, Range: sourceRange},
-			DefinitionRange: sourceRange,
+			Signature:       matched.GetSignature(),
+			Guard:           matched.Guard,
+			DefinitionRange: matched.GetDefinitionRange(),
 		},
 	}}, nil
 }
@@ -596,8 +612,10 @@ func (c *client) documentSymbols(ctx context.Context, path string) ([]documentSy
 func matchDocumentSymbol(symbols []documentSymbol, at position, parent []string) *matchedDocumentSymbol {
 	for _, symbol := range symbols {
 		selectionRange := symbol.SelectionRange
+		symbolRange := symbol.Range
 		if symbol.Location != nil {
 			selectionRange = symbol.Location.Range
+			symbolRange = symbol.Location.Range
 		}
 		path := append(append([]string(nil), parent...), symbol.Name)
 		if child := matchDocumentSymbol(symbol.Children, at, path); child != nil {
@@ -607,7 +625,7 @@ func matchDocumentSymbol(symbols []documentSymbol, at position, parent []string)
 			if symbol.ContainerName != "" {
 				path = append(strings.Split(symbol.ContainerName, "."), symbol.Name)
 			}
-			return &matchedDocumentSymbol{path: path, range_: symbol.Range}
+			return &matchedDocumentSymbol{path: path, range_: symbolRange}
 		}
 	}
 	return nil

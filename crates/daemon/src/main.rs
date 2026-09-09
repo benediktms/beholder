@@ -7,7 +7,7 @@ use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
 #[cfg(not(test))]
-use beholder_domain::{DependencyRelation, EntityKind, SemanticRelation};
+use beholder_domain::{DependencyRelation, EntityKind, SemanticRelation, StructuralRelation};
 #[cfg(not(test))]
 use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
@@ -336,13 +336,14 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:3")
+        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:4")
         .timeout(std::time::Duration::from_secs(60))
         .memory_limit(TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES)
         .semantic_shard_producer(TYPESCRIPT_WORKER_ID)
         .semantic_entity(EntityKind::Callable)
         .semantic_entity(EntityKind::Namespace)
         .semantic_relation(SemanticRelation::Dependency(DependencyRelation::Calls))
+        .semantic_relation(SemanticRelation::Structural(StructuralRelation::Defines))
         .accept_extension("ts")
         .accept_extension("tsx")
         .accept_extension("js")

@@ -115,16 +115,29 @@ func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 		Start: &beholderv1.SourcePosition{Line: 0, Character: start},
 		End:   &beholderv1.SourcePosition{Line: 0, Character: start + 7},
 	}
+	declarationRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: 2, Character: 2},
+		End:   &beholderv1.SourcePosition{Line: 2, Character: 31},
+	}
+	declaration := &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{
+			Role:            beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_DECLARATION,
+			Signature:       &beholderv1.SourceExcerpt{Text: "value(input: number): number;", Range: declarationRange},
+			DefinitionRange: declarationRange,
+		},
+	}}
 	enclosing := &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
 		CallableClause: &beholderv1.CallableClauseContext{Role: beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_ENCLOSING},
 	}}
+	targetID := "repo://example/typescript/src/target/Counter/value"
 	snapshot := &analysisSnapshot{
 		workspace: "test",
 		repositories: map[string]*repositorySnapshot{"example": {
 			identity: "example", base: root, target: true,
 			inputs: map[string][]byte{"src/caller.ts": []byte(caller), "src/target.ts": []byte(target), "src/unrelated.ts": []byte(unrelated)},
 		}},
-		entities: map[string]bool{"repo://example/typescript/src/target/Counter/value": true},
+		entities:     map[string]bool{targetID: true},
+		declarations: map[string][]*beholderv1.EvidenceContext{targetID: {declaration}},
 		candidates: []*workerv1.SemanticCandidate{{
 			Id: "candidate", Repository: "example", From: "repo://example/typescript/src/caller",
 			UnresolvedTo: "typescript-method://counter/value", Span: &workerv1.SourceSpan{Path: "src/caller.ts", Start: &workerv1.SourcePosition{Line: 0, Character: start}, End: &workerv1.SourcePosition{Line: 0, Character: start + 5}},
@@ -155,6 +168,49 @@ func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 		selected.GetDefinitionRange().GetStart().GetLine() != 2 ||
 		selected.GetDefinitionRange().GetEnd().GetCharacter() != 31 {
 		t.Fatalf("unexpected selected overload: %+v", selected)
+	}
+}
+
+func TestSelectedTargetContextPreservesMultilineDefinitionHead(t *testing.T) {
+	signatureRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: 0},
+		End:   &beholderv1.SourcePosition{Line: 2, Character: 10},
+	}
+	definitionRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: 0},
+		End:   &beholderv1.SourcePosition{Line: 4, Character: 1},
+	}
+	declaration := &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{
+			Role: beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_DECLARATION,
+			Signature: &beholderv1.SourceExcerpt{
+				Text:  "export function value(\n  input: string,\n): string",
+				Range: signatureRange,
+			},
+			DefinitionRange: definitionRange,
+		},
+	}}
+
+	selected, err := selectedTargetContext([]*beholderv1.EvidenceContext{declaration}, lspRange{
+		Start: position{Line: 0},
+		End:   position{Line: 4, Character: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clause := selected.GetCallableClause()
+	if clause.GetRole() != beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_SELECTED_TARGET ||
+		clause.GetSignature().GetText() != declaration.GetCallableClause().GetSignature().GetText() ||
+		clause.GetSignature().GetRange() != signatureRange ||
+		clause.GetDefinitionRange() != definitionRange {
+		t.Fatalf("unexpected multiline selected target: %+v", clause)
+	}
+	selected, err = selectedTargetContext([]*beholderv1.EvidenceContext{declaration}, lspRange{
+		Start: position{Line: 0},
+		End:   position{Line: 3},
+	})
+	if err != nil || selected != nil {
+		t.Fatalf("inexact range produced selected target: %+v, %v", selected, err)
 	}
 }
 
