@@ -35,5 +35,5 @@
 
 ## 7. End-to-end validation
 
-- [ ] 7.1 Add a controlled multi-language MCP fixture proving parallel evidence, ordered nested contexts, legacy evidence, and raw/JSON preservation through `traverse_graph`; verify `scripts/test-mcp-integration.sh` passes for the fixture.
+- [x] 7.1 Add a controlled multi-language MCP fixture proving parallel evidence, ordered nested contexts, legacy evidence, and raw/JSON preservation through `traverse_graph`; verify `scripts/test-mcp-integration.sh` passes for the fixture.
 - [ ] 7.2 Run `cargo fmt --check`, focused Clippy for touched crates, all focused checks named above, generated-binding checks, `git diff --check`, and `openspec validate cross-language-evidence-contexts --strict`; leave the broader workspace suite to CI.

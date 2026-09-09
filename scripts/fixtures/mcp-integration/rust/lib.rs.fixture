@@ -1,0 +1,15 @@
+pub fn caller(flag: bool) {
+    if flag {
+        if nested() {
+            helper();
+        }
+    } else {
+        helper();
+    }
+}
+
+fn nested() -> bool {
+    true
+}
+
+fn helper() {}
