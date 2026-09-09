@@ -13,9 +13,9 @@
 
 ## 3. Elixir clauses and selections
 
-- [ ] 3.1 Preserve every Elixir call occurrence and emit distinct `Defines` evidence for same-name/same-arity clauses with complete guarded heads while retaining one function entity; verify focused `beholder-adapters-treesitter-elixir` tests cover guarded clauses, enclosing-clause order, repeated targets, and same-line calls.
-- [ ] 3.2 Extract `case` pattern arms and `cond` condition clauses without assigning an arm to selector, condition, pattern, or guard calls; verify focused Elixir adapter tests cover nesting, defaults, guards, and exact excerpts/ranges.
-- [ ] 3.3 Correlate Elixir compiler events per source coordinate and emit selected-target context only for a unique clause span, then advance frontend/compiler/cache identities; verify adapter and `workers/elixir` tests cover exact spans, MFA-only results, macros, internal events, and context-preserving publication.
+- [x] 3.1 Preserve every Elixir call occurrence and emit distinct `Defines` evidence for same-name/same-arity clauses with complete guarded heads while retaining one function entity; verify focused `beholder-adapters-treesitter-elixir` tests cover guarded clauses, enclosing-clause order, repeated targets, and same-line calls.
+- [x] 3.2 Extract `case` pattern arms and `cond` condition clauses without assigning an arm to selector, condition, pattern, or guard calls; verify focused Elixir adapter tests cover nesting, defaults, guards, and exact excerpts/ranges.
+- [x] 3.3 Correlate Elixir compiler events per source coordinate and emit selected-target context only for a unique clause span, then advance frontend/compiler/cache identities; verify adapter and `workers/elixir` tests cover exact spans, MFA-only results, macros, internal events, and context-preserving publication.
 
 ## 4. JavaScript and TypeScript selections and overloads
 

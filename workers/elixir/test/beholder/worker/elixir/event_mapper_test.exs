@@ -108,6 +108,94 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
              shard.observations
   end
 
+  test "correlates calls by coordinate and selects only one exact source clause" do
+    source = """
+    defmodule Example do
+      def target(:one), do: :one
+      def target(:two), do: :two
+      def unique(value), do: value
+      def call(value) do
+        unique(value); unique(value)
+        target(value)
+        Macro.invoke(value)
+      end
+    end
+    """
+
+    repository = %Repository{
+      identity: "example",
+      base: "/tmp/example",
+      inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    module =
+      event(:module, %{
+        target: "Example",
+        definitions: [{"target", 1}, {"unique", 1}, {"call", 1}]
+      })
+
+    events = [
+      module,
+      event(:local_function, %{name: "unique", arity: 1, line: 6, column: 5}),
+      event(:local_function, %{name: "unique", arity: 1, line: 6, column: 20}),
+      event(:local_function, %{name: "target", arity: 1, line: 7, column: 5}),
+      event(:remote_macro, %{target: "Macro", name: "invoke", arity: 1, line: 8, column: 11}),
+      event(:remote_function, %{target: ":elixir_def", name: "internal", arity: 1, column: nil})
+    ]
+
+    observations =
+      repository
+      |> EventMapper.contribution(%{status: :ok, diagnostics: [], events: events})
+      |> Map.fetch!(:fact_shards)
+      |> Enum.flat_map(& &1.observations)
+
+    assert observations
+           |> Enum.filter(&String.ends_with?(&1.to, "/unique/1"))
+           |> Enum.map(& &1.range.start.character)
+           |> Enum.sort() == [4, 19]
+
+    unique = Enum.find(observations, &String.ends_with?(&1.to, "/unique/1"))
+    assert unique.range.start.line == 5
+    assert unique.range.start.character == 4
+
+    assert [
+             %{context: {:callable_clause, %{role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}},
+             %{
+               context:
+                 {:callable_clause,
+                  %{
+                    role: :CALLABLE_CLAUSE_ROLE_SELECTED_TARGET,
+                    signature: %{text: "unique(value)"}
+                  }}
+             }
+           ] = unique.contexts
+
+    assert unique.range.end.line == 5
+    assert unique.range.end.character == 17
+
+    assert %{
+             range: %{
+               start: %{line: 3, character: 6},
+               end: %{line: 3, character: 19}
+             }
+           } = List.last(unique.contexts).context |> elem(1) |> Map.fetch!(:signature)
+
+    assert %{start: %{line: 3, character: 2}, end: %{line: 3, character: 30}} =
+             List.last(unique.contexts).context |> elem(1) |> Map.fetch!(:definition_range)
+
+    ambiguous = Enum.find(observations, &String.ends_with?(&1.to, "/target/1"))
+
+    assert [%{context: {:callable_clause, %{role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}}] =
+             ambiguous.contexts
+
+    macro = Enum.find(observations, &(&1.to == "elixir-call://Macro/invoke/1"))
+    assert length(macro.contexts) == 1
+
+    internal = Enum.find(observations, &(&1.to == "elixir-call://:elixir_def/internal/1"))
+    assert internal.range == nil
+    assert internal.contexts == []
+  end
+
   test "reuses unchanged source shards and invalidates definition dependants" do
     EventMapper.start_cache()
     :ets.delete_all_objects(EventMapper)

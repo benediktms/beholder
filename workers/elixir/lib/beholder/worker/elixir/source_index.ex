@@ -1,0 +1,412 @@
+defmodule Beholder.Worker.Elixir.SourceIndex do
+  @moduledoc false
+
+  alias Beholder.Worker.Elixir.Snapshot.Repository
+
+  alias Beholder.V1.{
+    CallableClauseContext,
+    ConditionArmContext,
+    EvidenceContext,
+    PatternArmContext,
+    SourceExcerpt,
+    SourcePosition,
+    SourceRange
+  }
+
+  @definitions [:def, :defp, :defdelegate]
+  @non_calls @definitions ++ [:defmodule, :defmacro, :defmacrop, :case, :cond, :fn, :quote]
+
+  def build(repository) do
+    Repository.source_inputs(repository)
+    |> Enum.filter(&(Path.extname(&1.path) in [".ex", ".exs"]))
+    |> Enum.reduce(%{calls: %{}, clauses: %{}}, fn input, index ->
+      with {:ok, quoted} <-
+             Code.string_to_quoted(input.content, columns: true, token_metadata: true) do
+        state = %{
+          path: normalize_path(input.path),
+          source: input.content,
+          lines: String.split(input.content, "\n", trim: false),
+          module: nil,
+          contexts: []
+        }
+
+        walk(quoted, state, index)
+      else
+        _invalid_source -> index
+      end
+    end)
+  end
+
+  def occurrence(index, path, %{line: line, column: column} = event)
+      when is_integer(line) and is_integer(column) and not event.from_macro do
+    index.calls
+    |> Map.get({path, line, column}, [])
+    |> List.first()
+  end
+
+  def occurrence(_index, _path, _event), do: nil
+
+  def selected_target(index, event)
+      when event.kind in [:local_function, :remote_function] and not event.from_macro do
+    module = if event.kind == :local_function, do: event.caller_module, else: event.target
+
+    case Map.get(index.clauses, {module, event.name, event.arity}, []) do
+      [clause] ->
+        %EvidenceContext{
+          context: {:callable_clause, %{clause | role: :CALLABLE_CLAUSE_ROLE_SELECTED_TARGET}}
+        }
+
+      _mfa_only_or_ambiguous ->
+        nil
+    end
+  end
+
+  def selected_target(_index, _event), do: nil
+
+  defp walk({:defmodule, _meta, [name, body]}, state, index) do
+    module = module_name(name)
+
+    module =
+      if state.module && module && !String.contains?(module, "."),
+        do: "#{state.module}.#{module}",
+        else: module
+
+    walk(keyword_value(body, :do), %{state | module: module}, index)
+  end
+
+  defp walk({kind, meta, [head, body]}, %{module: module} = state, index)
+       when kind in @definitions and not is_nil(module) do
+    {signature, guard} = split_guard(head)
+
+    with {name, arities} <- callable(signature),
+         definition_range when not is_nil(definition_range) <- metadata_range(meta, state),
+         signature_excerpt when not is_nil(signature_excerpt) <- excerpt(head, state) do
+      declaration = %CallableClauseContext{
+        role: :CALLABLE_CLAUSE_ROLE_DECLARATION,
+        signature: signature_excerpt,
+        guard: excerpt(guard, state),
+        definition_range: definition_range
+      }
+
+      index =
+        Enum.reduce(arities, index, fn arity, index ->
+          update_in(
+            index.clauses,
+            &Map.update(&1, {module, name, arity}, [declaration], fn clauses ->
+              [declaration | clauses]
+            end)
+          )
+        end)
+
+      enclosing = %EvidenceContext{
+        context: {:callable_clause, %{declaration | role: :CALLABLE_CLAUSE_ROLE_ENCLOSING}}
+      }
+
+      state = %{state | contexts: [enclosing]}
+      index = walk(guard, state, index)
+      walk(keyword_value(body, :do), state, index)
+    else
+      _invalid_definition -> index
+    end
+  end
+
+  defp walk({:case, _meta, [selector, body]}, state, index) do
+    index = walk(selector, state, index)
+    selector = excerpt(selector, state)
+
+    body
+    |> keyword_value(:do)
+    |> clauses()
+    |> Enum.reduce(index, &walk_pattern_clause(&1, selector, state, &2))
+  end
+
+  defp walk({:cond, _meta, [body]}, state, index) do
+    body
+    |> keyword_value(:do)
+    |> clauses()
+    |> Enum.reduce(index, &walk_condition_clause(&1, state, &2))
+  end
+
+  defp walk({name, meta, arguments} = call, state, index)
+       when is_atom(name) and is_list(meta) and is_list(arguments) do
+    index = if name in @non_calls, do: index, else: record_call(call, meta, state, index)
+    Enum.reduce(arguments, index, &walk(&1, state, &2))
+  end
+
+  defp walk({{:., _dot_meta, [_receiver, name]}, meta, arguments} = call, state, index)
+       when is_atom(name) and is_list(meta) and is_list(arguments) do
+    index = record_call(call, meta, state, index)
+    Enum.reduce(arguments, index, &walk(&1, state, &2))
+  end
+
+  defp walk({left, right}, state, index), do: walk(right, state, walk(left, state, index))
+
+  defp walk(values, state, index) when is_list(values),
+    do: Enum.reduce(values, index, &walk(&1, state, &2))
+
+  defp walk(_value, _state, index), do: index
+
+  defp walk_pattern_clause({:->, meta, [patterns, body]}, selector, state, index) do
+    {pattern, guard} = patterns |> List.first() |> split_guard()
+    index = walk(pattern, state, index)
+    index = walk(guard, state, index)
+
+    context = %EvidenceContext{
+      context:
+        {:pattern_arm,
+         %PatternArmContext{
+           construct: :PATTERN_CONSTRUCT_CASE,
+           selector: selector,
+           pattern: clause_excerpt(meta, :pattern, state),
+           guard: clause_excerpt(meta, :guard, state),
+           is_default: clause_text(meta, :pattern, state) == "_",
+           arm_range: arm_range(meta, body, state)
+         }}
+    }
+
+    walk(body, %{state | contexts: state.contexts ++ [context]}, index)
+  end
+
+  defp walk_pattern_clause(_clause, _selector, _state, index), do: index
+
+  defp walk_condition_clause({:->, meta, [conditions, body]}, state, index) do
+    condition = List.first(conditions)
+    index = walk(condition, state, index)
+
+    context = %EvidenceContext{
+      context:
+        {:condition_arm,
+         %ConditionArmContext{
+           construct: :CONDITION_CONSTRUCT_COND,
+           arm: :CONDITION_ARM_KIND_CLAUSE,
+           condition: clause_excerpt(meta, :condition, state),
+           arm_range: arm_range(meta, body, state)
+         }}
+    }
+
+    walk(body, %{state | contexts: state.contexts ++ [context]}, index)
+  end
+
+  defp walk_condition_clause(_clause, _state, index), do: index
+
+  defp record_call(call, meta, state, index) do
+    with line when is_integer(line) <- meta[:line],
+         column when is_integer(column) <- meta[:column],
+         range when not is_nil(range) <- expression_range(call, state) do
+      occurrence = %{range: range, contexts: state.contexts}
+
+      update_in(
+        index.calls,
+        &Map.update(&1, {state.path, line, column}, [occurrence], fn calls ->
+          [occurrence | calls]
+        end)
+      )
+    else
+      _missing_coordinate -> index
+    end
+  end
+
+  defp callable({name, _meta, arguments}) when is_atom(name) and is_list(arguments) do
+    maximum = length(arguments)
+    defaults = Enum.count(arguments, &match?({:\\, _, _}, &1))
+    {to_string(name), Enum.to_list((maximum - defaults)..maximum)}
+  end
+
+  defp callable({name, _meta, nil}) when is_atom(name), do: {to_string(name), [0]}
+  defp callable(_head), do: nil
+
+  defp split_guard({:when, _meta, [signature, guard]}), do: {signature, guard}
+  defp split_guard(value), do: {value, nil}
+
+  defp clauses({:__block__, _meta, clauses}) when is_list(clauses), do: clauses
+  defp clauses(nil), do: []
+  defp clauses(clause), do: [clause]
+
+  defp keyword_value(values, key) when is_list(values), do: Keyword.get(values, key)
+  defp keyword_value(_values, _key), do: nil
+
+  defp module_name({:__aliases__, _meta, names}), do: Enum.join(names, ".")
+
+  defp module_name(atom) when is_atom(atom),
+    do: atom |> Atom.to_string() |> String.trim_leading("Elixir.")
+
+  defp module_name(_module), do: nil
+
+  defp metadata_range(meta, state) do
+    with start when not is_nil(start) <- metadata_position(meta),
+         finish when not is_nil(finish) <- metadata_position(meta[:end_of_expression]) do
+      source_range(start, finish, state)
+    else
+      _missing_metadata -> nil
+    end
+  end
+
+  defp expression_range(ast, state) do
+    with start when not is_nil(start) <- expression_start(ast),
+         finish when not is_nil(finish) <- expression_end(ast) do
+      source_range(start, finish, state)
+    else
+      _missing_metadata -> nil
+    end
+  end
+
+  defp expression_start({{:., _meta, [receiver, _name]}, _call_meta, _arguments}),
+    do: expression_start(receiver)
+
+  defp expression_start({:when, _meta, [signature, _guard]}), do: expression_start(signature)
+
+  defp expression_start({_name, meta, _arguments}), do: metadata_position(meta)
+  defp expression_start(_ast), do: nil
+
+  defp expression_end({_name, meta, _arguments} = ast) when is_list(meta) do
+    cond do
+      position = metadata_position(meta[:closing]) -> advance(position, 1)
+      position = metadata_position(meta[:end_of_expression]) -> position
+      true -> fallback_end(ast)
+    end
+  end
+
+  defp expression_end(_ast), do: nil
+
+  defp fallback_end({name, meta, arguments}) when is_atom(name) and is_list(meta) do
+    Enum.reduce(
+      arguments || [],
+      advance(metadata_position(meta), String.length(to_string(name))),
+      fn argument, finish ->
+        max_position(finish, expression_end(argument))
+      end
+    )
+  end
+
+  defp fallback_end({{:., _meta, [_receiver, name]}, meta, arguments}) do
+    Enum.reduce(
+      arguments || [],
+      advance(metadata_position(meta), String.length(to_string(name))),
+      fn argument, finish ->
+        max_position(finish, expression_end(argument))
+      end
+    )
+  end
+
+  defp fallback_end(_ast), do: nil
+
+  defp excerpt(nil, _state), do: nil
+
+  defp excerpt(ast, state) do
+    with range when not is_nil(range) <- expression_range(ast, state),
+         text when is_binary(text) <- range_text(range, state) do
+      %SourceExcerpt{text: text, range: range}
+    else
+      _missing_range -> nil
+    end
+  end
+
+  defp clause_excerpt(meta, part, state) do
+    case clause_segment(meta, state) do
+      {pattern, guard} -> segment_excerpt(if(part == :guard, do: guard, else: pattern), state)
+      nil -> nil
+    end
+  end
+
+  defp clause_text(meta, part, state) do
+    case clause_excerpt(meta, part, state) do
+      nil -> nil
+      excerpt -> excerpt.text
+    end
+  end
+
+  defp clause_segment(meta, state) do
+    with {line, arrow_column} <- metadata_position(meta),
+         source_line when is_binary(source_line) <- Enum.at(state.lines, line - 1) do
+      before_arrow = String.slice(source_line, 0, arrow_column - 1)
+      leading = String.length(before_arrow) - String.length(String.trim_leading(before_arrow))
+      head = String.trim(before_arrow)
+
+      case String.split(head, " when ", parts: 2) do
+        [pattern, guard] ->
+          pattern_end = leading + String.length(pattern)
+          guard_start = pattern_end + String.length(" when ")
+
+          {{{line, leading + 1}, {line, pattern_end + 1}},
+           {{line, guard_start + 1}, {line, guard_start + String.length(guard) + 1}}}
+
+        [condition] ->
+          finish = leading + String.length(condition)
+          {{{line, leading + 1}, {line, finish + 1}}, nil}
+      end
+    else
+      _missing_arrow -> nil
+    end
+  end
+
+  defp segment_excerpt(nil, _state), do: nil
+
+  defp segment_excerpt({start, finish}, state) do
+    range = source_range(start, finish, state)
+    %SourceExcerpt{text: range_text(range, state), range: range}
+  end
+
+  defp arm_range(meta, body, state) do
+    with {line, column} <- metadata_position(meta),
+         finish when not is_nil(finish) <- expression_end(body) do
+      start = expression_start(body)
+      start = if start && elem(start, 0) == line, do: start, else: {line, column + 2}
+      source_range(start, finish, state)
+    else
+      _missing_range -> nil
+    end
+  end
+
+  defp source_range(start, finish, state) do
+    %SourceRange{start: source_position(start, state), end: source_position(finish, state)}
+  end
+
+  defp source_position({line, column}, state) do
+    prefix = state.lines |> Enum.at(line - 1, "") |> String.slice(0, max(column - 1, 0))
+
+    utf16 =
+      prefix |> :unicode.characters_to_binary(:utf8, {:utf16, :little}) |> byte_size() |> div(2)
+
+    %SourcePosition{line: line - 1, character: utf16}
+  end
+
+  defp range_text(%SourceRange{start: start, end: finish}, state)
+       when start.line == finish.line do
+    state.lines
+    |> Enum.at(start.line, "")
+    |> slice_utf16(start.character, finish.character - start.character)
+  end
+
+  defp range_text(_range, _state), do: nil
+
+  defp slice_utf16(text, start, length) do
+    text
+    |> String.to_charlist()
+    |> Enum.reduce({[], 0}, fn character, {selected, offset} ->
+      width = if character > 0xFFFF, do: 2, else: 1
+
+      selected =
+        if offset >= start and offset < start + length, do: [character | selected], else: selected
+
+      {selected, offset + width}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+    |> List.to_string()
+  end
+
+  defp metadata_position(meta) when is_list(meta) do
+    case {meta[:line], meta[:column]} do
+      {line, column} when is_integer(line) and is_integer(column) -> {line, column}
+      _missing -> nil
+    end
+  end
+
+  defp metadata_position(_meta), do: nil
+  defp advance(nil, _columns), do: nil
+  defp advance({line, column}, columns), do: {line, column + columns}
+  defp max_position(nil, position), do: position
+  defp max_position(position, nil), do: position
+  defp max_position(left, right), do: max(left, right)
+  defp normalize_path(path), do: String.replace(path, "\\", "/")
+end

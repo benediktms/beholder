@@ -67,6 +67,8 @@ defmodule Beholder.Worker.Elixir.Compiler.Collector do
       caller_module,
       caller_function,
       from_macro,
+      Map.get(event, :line),
+      Map.get(event, :column),
       Map.get(event, :target),
       Map.get(event, :name),
       Map.get(event, :arity)

@@ -6,7 +6,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   alias Beholder.Worker.Elixir.Compiler.TraceCache
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
-  test "deduplicates trace events at published semantic granularity" do
+  test "deduplicates only identical trace coordinates" do
     start_supervised!(Collector)
 
     event = %{
@@ -26,7 +26,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert :ok = Collector.record(%{event | line: 20, column: 9})
     assert :ok = Collector.record(%{event | target: "Other"})
 
-    assert ["Other", "Target"] ==
+    assert ["Other", "Target", "Target"] ==
              Collector.drain()
              |> Enum.map(& &1.target)
              |> Enum.sort()
@@ -95,6 +95,8 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     [trace_cache] =
       Path.wildcard(Path.join([cache, "elixir", "Zml4dHVyZQ", "trace-cache-*.term"]))
+
+    assert %{version: 4} = trace_cache |> File.read!() |> :erlang.binary_to_term([:safe])
 
     File.write!(trace_cache, "invalid")
     TraceCache.clear()
