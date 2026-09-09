@@ -3,9 +3,9 @@ use super::analysis::{
 };
 use super::model::{ElixirAlias, ElixirAnalysis, ElixirModule};
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation,
-    GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance, RpcCardinality,
-    SemanticRelation, StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation, Evidence,
+    EvidencePayload, GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance,
+    RpcCardinality, SemanticRelation, StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -282,7 +282,7 @@ fn candidate(
     role: GrpcBindingRole,
     service: &str,
     method: &GrpcMethod,
-    evidence: String,
+    evidence: Evidence,
     confidence: Confidence,
     provenance: Provenance,
 ) -> GrpcBindingCandidate {
@@ -292,7 +292,7 @@ fn candidate(
         service: service.into(),
         method: method.proto_name.clone(),
         cardinality: RpcCardinality::Unary,
-        evidence: evidence.into(),
+        evidence,
         confidence,
         provenance,
     }
@@ -451,7 +451,12 @@ pub fn bindings(
                         .iter()
                         .find(|method| method.elixir_name == function.name)
                 {
-                    bindings.push((GrpcBindingRole::Server, service, method, function.line));
+                    bindings.push((
+                        GrpcBindingRole::Server,
+                        service,
+                        method,
+                        Evidence::from(format!("{}:{}", path.display(), function.line)),
+                    ));
                 }
                 if let Some(service_module) = wrapper_service
                     && let Some(service) = services.get(service_module)
@@ -460,7 +465,12 @@ pub fn bindings(
                             method.elixir_name == function.name.trim_end_matches('!')
                         })
                 {
-                    bindings.push((GrpcBindingRole::Client, service, method, function.line));
+                    bindings.push((
+                        GrpcBindingRole::Client,
+                        service,
+                        method,
+                        Evidence::from(format!("{}:{}", path.display(), function.line)),
+                    ));
                 }
                 for call in &function.calls {
                     let Some(service_module) =
@@ -489,10 +499,18 @@ pub fn bindings(
                         });
                         continue;
                     };
-                    bindings.push((GrpcBindingRole::Client, service, method, call.line));
+                    let evidence = Evidence::structured(EvidencePayload {
+                        path: Some(path.display().to_string()),
+                        line: u32::try_from(call.line).ok(),
+                        detail: None,
+                        range: Some(call.range.clone()),
+                        contexts: call.contexts.clone(),
+                    })
+                    .expect("tree-sitter emits valid Elixir evidence ranges");
+                    bindings.push((GrpcBindingRole::Client, service, method, evidence));
                 }
 
-                for (role, (service, service_path, _), method, line) in bindings {
+                for (role, (service, service_path, _), method, evidence) in bindings {
                     let key = (
                         function_id.clone(),
                         role.as_str(),
@@ -507,7 +525,7 @@ pub fn bindings(
                         role,
                         service,
                         method,
-                        format!("{}:{line}", path.display()),
+                        evidence,
                         Confidence::Inferred,
                         Provenance::Ast,
                     ));
@@ -521,7 +539,7 @@ pub fn bindings(
                             role,
                             service,
                             method,
-                            format!("{}:{}", service_path.display(), method.line),
+                            format!("{}:{}", service_path.display(), method.line).into(),
                             Confidence::Exact,
                             Provenance::Generated,
                         ));
@@ -603,6 +621,49 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.local_symbol.as_str().ends_with("/message/0"))
         );
+    }
+
+    #[test]
+    fn preserves_client_call_range_and_contexts() {
+        let (candidates, diagnostics) = resolved(&[
+            ("lib/pricing.pb.ex", SERVICE),
+            (
+                "lib/client.ex",
+                r#"
+                defmodule Pricing.Client do
+                  alias Pricing.V1.PricingService.Stub
+                  def quote(channel, request) do
+                    case request do
+                      nil -> Stub.get_quote(channel, request)
+                      _ -> :skip
+                    end
+                  end
+                end
+                "#,
+            ),
+        ]);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let evidence = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.local_symbol.as_str() == "repo://example/elixir/Pricing.Client/quote/2"
+                    && candidate.provenance == Provenance::Ast
+            })
+            .unwrap()
+            .evidence
+            .decode();
+        assert!(evidence.range.is_some());
+        assert!(matches!(
+            evidence.contexts.as_slice(),
+            [
+                beholder_domain::EvidenceContext::CallableClause { .. },
+                beholder_domain::EvidenceContext::PatternArm {
+                    construct: beholder_domain::PatternConstruct::Case,
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]
