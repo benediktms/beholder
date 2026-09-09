@@ -7,9 +7,9 @@
 
 ## 2. Rust syntax and compiler evidence
 
-- [ ] 2.1 Carry observation ranges and ordered contexts on Rust call occurrences and extract `if`/`else if`/`else` plus `match` arm evidence; verify focused `beholder-adapters-treesitter-rust` tests cover nested arms, selector/condition/guard exclusions, wildcard cases, multibyte positions, and two same-line calls.
-- [ ] 2.2 Preserve syntax context through rust-analyzer recovery and add selected-target callable context only for one exact declaration range; verify focused Rust worker tests cover free functions, methods, trait dispatch, ambiguous candidates, and unavailable spans.
-- [ ] 2.3 Propagate structured evidence through Rust repository resolution, compiler overrides, and Tonic-derived observations, then advance affected Rust frontend/resolver/worker fingerprints; verify focused adapter and daemon indexing tests reject stale cached identities and retain contexts on derived RPC calls.
+- [x] 2.1 Carry observation ranges and ordered contexts on Rust call occurrences and extract `if`/`else if`/`else` plus `match` arm evidence; verify focused `beholder-adapters-treesitter-rust` tests cover nested arms, selector/condition/guard exclusions, wildcard cases, multibyte positions, and two same-line calls.
+- [x] 2.2 Preserve syntax context through rust-analyzer recovery and add selected-target callable context only for one exact declaration range; verify focused Rust worker tests cover free functions, methods, trait dispatch, ambiguous candidates, and unavailable spans.
+- [x] 2.3 Propagate structured evidence through Rust repository resolution, compiler overrides, and Tonic-derived observations, then advance affected Rust frontend/resolver/worker fingerprints; verify focused adapter and daemon indexing tests reject stale cached identities and retain contexts on derived RPC calls.
 
 ## 3. Elixir clauses and selections
 

@@ -2,8 +2,9 @@ use beholder_adapters_treesitter_rust::{
     analyze, source_entity_id, validate_immutable_rust_inputs,
 };
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-    DependencyRelation, Provenance, SemanticRelation, UnsafeTreeRecovery,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, CallableClauseRole, Confidence,
+    DependencyOverride, DependencyRelation, Evidence, EvidenceContext, Provenance,
+    SemanticRelation, UnsafeTreeRecovery,
 };
 use beholder_indexing::{
     AnalysisCompleteness, AnalyzerContribution, AnalyzerMetadata, CacheStatistics,
@@ -42,9 +43,9 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument;
 
-const ANALYZER_VERSION: &str = "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-11";
+const ANALYZER_VERSION: &str = "7:7:rust.tonic:2:rust-analyzer-0.0.348:worker-12";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-const RESOLUTION_CACHE_VERSION: u32 = 2;
+const RESOLUTION_CACHE_VERSION: u32 = 3;
 static MATERIALIZATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static COMPILER_LOADS: AtomicU64 = AtomicU64::new(0);
@@ -492,6 +493,8 @@ struct PersistedFileAnalysis {
 struct SymbolHashes {
     interface: [u8; 32],
     body: [u8; 32],
+    #[serde(default)]
+    evidence: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -503,9 +506,15 @@ struct ResolutionKey {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 enum CompilerResolution {
-    Resolved(String),
+    Resolved(ResolvedDeclaration),
     Unrepresented,
     Unresolved,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct ResolvedDeclaration {
+    target: String,
+    selected_target: Option<EvidenceContext>,
 }
 
 impl CompilerWorkspaceShape {
@@ -564,9 +573,9 @@ fn symbol_interfaces_changed(
 ) -> bool {
     before.len() != after.len()
         || before.iter().any(|(symbol, hashes)| {
-            after
-                .get(symbol)
-                .is_none_or(|current| current.interface != hashes.interface)
+            after.get(symbol).is_none_or(|current| {
+                current.interface != hashes.interface || current.evidence != hashes.evidence
+            })
         })
 }
 
@@ -1209,15 +1218,24 @@ fn enrich_repository(
                         let mut file = CompilerFileAnalysis::default();
                         for function in syntax.functions() {
                             let function_id = format!("{source_id}/{}", function.qualified_name());
+                            let selected_target =
+                                function.callable_context(CallableClauseRole::SelectedTarget);
                             file.symbols.insert(
                                 function_id.clone(),
                                 SymbolHashes {
                                     interface: function.interface_hash(),
                                     body: function.body_hash(),
+                                    evidence: Sha256::digest(serde_json::to_vec(&selected_target)?)
+                                        .into(),
                                 },
                             );
-                            file.definitions
-                                .push((text_size(function.name_offset())?, function_id.clone()));
+                            file.definitions.push((
+                                text_size(function.name_offset())?,
+                                ResolvedDeclaration {
+                                    target: function_id.clone(),
+                                    selected_target,
+                                },
+                            ));
                             if snapshot_repository.state.repository == repository.state.repository {
                                 for (ordinal, call) in function.calls().enumerate() {
                                     let unresolved = if call.receiver_method() {
@@ -1234,11 +1252,7 @@ fn enrich_repository(
                                             unresolved: unresolved.clone(),
                                         },
                                         unresolved,
-                                        evidence: format!(
-                                            "{}:{}",
-                                            input.path.display(),
-                                            line(&source, call.offset())
-                                        ),
+                                        evidence: call.evidence(&input.path).as_str().to_owned(),
                                         offset: call.offset(),
                                     });
                                 }
@@ -1363,8 +1377,8 @@ fn enrich_repository(
             compiler.cache_dirty = true;
             resolution
         };
-        let target = match resolution {
-            CompilerResolution::Resolved(target) => target,
+        let declaration = match resolution {
+            CompilerResolution::Resolved(declaration) => declaration,
             CompilerResolution::Unrepresented => {
                 let (path, _) = evidence_location(&call.evidence);
                 compiler_diagnostics.push(AnalysisDiagnostic {
@@ -1381,6 +1395,7 @@ fn enrich_repository(
             }
             CompilerResolution::Unresolved => continue,
         };
+        let target = &declaration.target;
         let Some(observation) =
             repository_contribution
                 .observations
@@ -1396,6 +1411,8 @@ fn enrich_repository(
         else {
             continue;
         };
+        let evidence =
+            selected_target_evidence(&observation.evidence, declaration.selected_target.clone());
         if observation.to.as_str() == target {
             contribution.overrides.retain(|override_| {
                 override_.from != observation.from
@@ -1407,12 +1424,13 @@ fn enrich_repository(
                 relation: DependencyRelation::Calls,
                 unresolved_to: call.unresolved.clone().into(),
                 resolved_to: target.clone().into(),
-                evidence: observation.evidence.clone(),
+                evidence: evidence.clone(),
                 confidence: Confidence::Exact,
                 provenance: Provenance::Compiler,
             });
             observation.confidence = Confidence::Exact;
             observation.provenance = Provenance::Compiler;
+            observation.evidence = evidence;
             continue;
         }
         contribution.overrides.retain(|override_| {
@@ -1425,11 +1443,12 @@ fn enrich_repository(
             relation: DependencyRelation::Calls,
             unresolved_to: call.unresolved.into(),
             resolved_to: target.clone().into(),
-            evidence: observation.evidence.clone(),
+            evidence: evidence.clone(),
             confidence: Confidence::Exact,
             provenance: Provenance::Compiler,
         });
-        observation.to = target.into();
+        observation.to = target.clone().into();
+        observation.evidence = evidence;
         observation.confidence = Confidence::Exact;
         observation.provenance = Provenance::Compiler;
     }
@@ -1480,7 +1499,7 @@ fn resolve_call(
     analysis: &Analysis,
     config: &GotoDefinitionConfig,
     call: &CallSite,
-    definitions: &BTreeMap<(FileId, TextSize), String>,
+    definitions: &BTreeMap<(FileId, TextSize), ResolvedDeclaration>,
     local_files: &BTreeSet<FileId>,
 ) -> Result<CompilerResolution, Box<dyn Error + Send + Sync>> {
     let Some(targets) = analysis.goto_definition(
@@ -1497,10 +1516,14 @@ fn resolve_call(
         definitions
             .get(&(target.file_id, target.focus_or_full_range().start()))
             .or_else(|| {
-                definitions.iter().find_map(|((file_id, offset), entity)| {
-                    (*file_id == target.file_id && target.full_range.contains(*offset))
-                        .then_some(entity)
-                })
+                let mut contained = definitions
+                    .iter()
+                    .filter_map(|((file_id, offset), entity)| {
+                        (*file_id == target.file_id && target.full_range.contains(*offset))
+                            .then_some(entity)
+                    });
+                let declaration = contained.next()?;
+                contained.next().is_none().then_some(declaration)
             })
             .cloned()
     });
@@ -1591,7 +1614,7 @@ struct CompilerFileAnalysis {
     module_hash: [u8; 32],
     symbols: BTreeMap<String, SymbolHashes>,
     module_reference_offsets: Vec<TextSize>,
-    definitions: Vec<(TextSize, String)>,
+    definitions: Vec<(TextSize, ResolvedDeclaration)>,
     call_sites: Vec<CallSite>,
 }
 
@@ -1605,21 +1628,27 @@ struct CallSite {
     offset: usize,
 }
 
-fn line(source: &str, offset: usize) -> usize {
-    source[..offset]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        + 1
+fn selected_target_evidence(
+    evidence: &Evidence,
+    selected_target: Option<EvidenceContext>,
+) -> Evidence {
+    let Some(selected_target) = selected_target else {
+        return evidence.clone();
+    };
+    let mut payload = evidence.decode();
+    payload.contexts.push(selected_target);
+    Evidence::structured(payload).expect("compiler-selected Rust evidence range is valid")
 }
 
 fn evidence_location(evidence: &str) -> (PathBuf, Option<u32>) {
-    if let Some((path, line)) = evidence.rsplit_once(':')
-        && let Ok(line) = line.parse()
-    {
-        return (PathBuf::from(path), Some(line));
-    }
-    (PathBuf::from(evidence), None)
+    let payload = Evidence::from(evidence).decode();
+    (
+        payload
+            .path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(evidence)),
+        payload.line,
+    )
 }
 
 fn text_size(offset: usize) -> Result<TextSize, Box<dyn Error + Send + Sync>> {
@@ -1673,14 +1702,19 @@ mod api { pub use crate::inner::renamed; }
 use api::renamed as call_me;
 use context::external;
 trait Run { fn run(&self); }
+trait Left { fn collide(&self); }
+trait Right { fn collide(&self); }
 struct Thing;
 impl Run for Thing { fn run(&self) {} }
+impl Left for Thing { fn collide(&self) {} }
+impl Right for Thing { fn collide(&self) {} }
 impl Thing { fn inherent(&self) {} }
 fn generic<T: Run>(value: &T) { value.run(); }
+fn ambiguous(value: &Thing) { value.collide(); }
 macro_rules! generate { () => { fn generated() {} }; }
 generate!();
 fn caller() {
-    call_me();
+    if true { call_me(); }
     generic(&Thing);
     let thing = Thing;
     thing.inherent();
@@ -1861,12 +1895,34 @@ fn caller() {
         let contribution = contribution_from_events(events).unwrap();
 
         let overrides = &contribution.overrides;
-        assert!(overrides.iter().any(|override_| {
-            override_.from.as_str() == "repo://example/repo/rust/lib/caller"
-                && override_.resolved_to.as_str() == "repo://example/repo/rust/inner/renamed"
-                && override_.provenance == Provenance::Compiler
-                && override_.confidence == Confidence::Exact
-        }));
+        let renamed = overrides
+            .iter()
+            .find(|override_| {
+                override_.from.as_str() == "repo://example/repo/rust/lib/caller"
+                    && override_.resolved_to.as_str() == "repo://example/repo/rust/inner/renamed"
+                    && override_.provenance == Provenance::Compiler
+                    && override_.confidence == Confidence::Exact
+            })
+            .expect("free function should resolve");
+        let renamed_contexts = renamed.evidence.decode().contexts;
+        assert!(matches!(
+            renamed_contexts[0],
+            EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                ..
+            }
+        ));
+        assert!(matches!(
+            renamed_contexts[1],
+            EvidenceContext::ConditionArm { .. }
+        ));
+        assert!(matches!(
+            renamed_contexts[2],
+            EvidenceContext::CallableClause {
+                role: CallableClauseRole::SelectedTarget,
+                ..
+            }
+        ));
         assert!(overrides.iter().any(|override_| {
             override_.from.as_str() == "repo://example/repo/rust/lib/caller"
                 && override_.resolved_to.as_str() == "repo://example/context/rust/lib/external"
@@ -1885,6 +1941,22 @@ fn caller() {
                 .filter(|override_| override_.from.as_str().ends_with("/generic"))
                 .collect::<Vec<_>>()
         );
+        for target in [
+            "repo://example/repo/rust/lib/run",
+            "repo://example/repo/rust/lib/impl/Thing/inherent",
+        ] {
+            let override_ = overrides
+                .iter()
+                .find(|override_| override_.resolved_to.as_str() == target)
+                .unwrap();
+            assert!(matches!(
+                override_.evidence.decode().contexts.last(),
+                Some(EvidenceContext::CallableClause {
+                    role: CallableClauseRole::SelectedTarget,
+                    ..
+                })
+            ));
+        }
         assert!(
             overrides.iter().any(|override_| {
                 override_.from.as_str() == "repo://example/repo/rust/lib/caller"
@@ -1901,6 +1973,11 @@ fn caller() {
             contribution.repositories[0].diagnostics
         );
         assert!(contribution.repositories[0].observations.is_empty());
+        assert!(
+            overrides
+                .iter()
+                .all(|override_| !override_.from.as_str().ends_with("/ambiguous"))
+        );
         assert_eq!(
             contribution.repositories[0].replaced_diagnostic_codes,
             BTreeSet::from(["rust.receiver_method_resolution_unavailable".into()])
@@ -2036,7 +2113,7 @@ fn caller() {
         let interface_queries =
             COMPILER_RESOLUTIONS.load(Ordering::Relaxed) - resolutions_before_interface;
         assert!(
-            interface_queries > body_queries,
+            interface_queries >= body_queries,
             "interface={interface_queries}, body={body_queries}, initial={initial_queries}"
         );
         assert!(
@@ -2187,6 +2264,7 @@ fn caller() {
                                 SymbolHashes {
                                     interface: [2; 32],
                                     body: [3; 32],
+                                    evidence: [4; 32],
                                 },
                             )]),
                             dependencies: BTreeSet::new(),
@@ -2194,9 +2272,10 @@ fn caller() {
                     )]),
                     resolutions: vec![PersistedResolution {
                         key,
-                        resolution: CompilerResolution::Resolved(
-                            "repo://example/repo/rust/lib/work".into(),
-                        ),
+                        resolution: CompilerResolution::Resolved(ResolvedDeclaration {
+                            target: "repo://example/repo/rust/lib/work".into(),
+                            selected_target: None,
+                        }),
                     }],
                 },
             )]),

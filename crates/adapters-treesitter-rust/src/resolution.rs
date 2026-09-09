@@ -136,6 +136,36 @@ mod tests {
     }
 
     #[test]
+    fn preserves_structured_evidence_during_repository_resolution() {
+        let mut facts = observations(
+            "beholder",
+            "fn caller() { if true { helper(); } }",
+            Path::new("src/caller.rs"),
+        )
+        .unwrap();
+        facts.extend(
+            observations("beholder", "fn helper() {}", Path::new("src/helper.rs")).unwrap(),
+        );
+
+        let overrides = resolve_repository_calls(&mut facts);
+        let call = facts
+            .iter()
+            .find(|observation| {
+                observation.from.as_str().ends_with("/caller")
+                    && observation.relation
+                        == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .unwrap();
+        let contexts = call.evidence.decode().contexts;
+
+        assert!(contexts.iter().any(|context| matches!(
+            context,
+            beholder_domain::EvidenceContext::ConditionArm { .. }
+        )));
+        assert_eq!(overrides[0].evidence, call.evidence);
+    }
+
+    #[test]
     fn does_not_treat_sibling_module_names_as_exact() {
         let mut observations = observations(
             "beholder",

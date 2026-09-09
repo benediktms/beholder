@@ -215,7 +215,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         )
         .identity(
             RUST_WORKER_ID,
-            "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-11",
+            "7:7:rust.tonic:2:rust-analyzer-0.0.348:worker-12",
         )
         .persistent()
         .semantic_shard_producer(RUST_WORKER_ID)

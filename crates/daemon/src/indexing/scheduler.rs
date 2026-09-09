@@ -2819,7 +2819,7 @@ mod tests {
     use beholder_domain::{
         LogicalRepository, RepositoryFacts, RepositoryState, WorkspaceRepository, WorkspaceView,
     };
-    use beholder_dto::{AnalysisCompleteness, EvidenceKind, RelationKind};
+    use beholder_dto::{AnalysisCompleteness, EvidenceContext, EvidenceKind, RelationKind};
     use std::time::SystemTime;
 
     #[test]
@@ -5380,7 +5380,7 @@ mod tests {
             "use contract::bridge_client::BridgeClient; \
              async fn rust_to_elixir() { \
                  let mut client = BridgeClient::new(); \
-                 client.rust_to_elixir().await; \
+                 if true { client.rust_to_elixir().await; } \
              }",
         )
         .unwrap();
@@ -5489,6 +5489,17 @@ mod tests {
                             .all(|evidence| evidence.repository.is_some()),
                         "{edge:#?}"
                     );
+                }
+                if kind == RelationKind::CallsRpc
+                    && client.starts_with("repo://")
+                    && client.contains(&rust_identity)
+                {
+                    assert!(edge.evidence.iter().any(|evidence| {
+                        evidence.range.is_some()
+                            && evidence.contexts.iter().any(|context| {
+                                matches!(context, EvidenceContext::ConditionArm { .. })
+                            })
+                    }));
                 }
                 assert!(edge.evidence.iter().any(|evidence| {
                     matches!(

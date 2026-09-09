@@ -4,8 +4,10 @@ use super::{
 };
 use beholder_adapters_treesitter::recover;
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, StructuralRelation, UnsafeTreeRecovery,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, CallableClauseRole, ConditionArmKind,
+    ConditionConstruct, DependencyRelation, EntityFact, EntityKind, EvidenceContext, Observation,
+    PatternConstruct, SourceExcerpt, SourcePosition, SourceRange, StructuralRelation,
+    UnsafeTreeRecovery,
 };
 use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
 use ra_ap_syntax::{
@@ -81,16 +83,212 @@ pub(super) fn collect_tree_sitter_functions<'tree>(
     debug_assert_eq!(scope.len(), initial_scope);
 }
 
-fn collect_tree_sitter_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<RustCall>) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "call_expression"
-            && let Some(function) = node.child_by_field_name("function")
-        {
-            let callee = if function.kind() == "generic_function" {
-                function.child_by_field_name("function").unwrap_or(function)
+fn source_position(source: &str, lines: &[usize], offset: usize) -> SourcePosition {
+    let line = lines
+        .partition_point(|start| *start <= offset)
+        .saturating_sub(1);
+    SourcePosition {
+        line: u32::try_from(line).expect("Rust source line fits in u32"),
+        character: u32::try_from(source[lines[line]..offset].encode_utf16().count())
+            .expect("Rust source column fits in u32"),
+    }
+}
+
+fn source_range(source: &str, lines: &[usize], node: Node<'_>) -> SourceRange {
+    byte_range(source, lines, node.start_byte(), node.end_byte())
+}
+
+fn byte_range(source: &str, lines: &[usize], start: usize, end: usize) -> SourceRange {
+    SourceRange {
+        start: source_position(source, lines, start),
+        end: source_position(source, lines, end),
+    }
+}
+
+fn excerpt(source: &str, lines: &[usize], node: Node<'_>) -> SourceExcerpt {
+    byte_excerpt(source, lines, node.start_byte(), node.end_byte())
+}
+
+fn byte_excerpt(source: &str, lines: &[usize], start: usize, end: usize) -> SourceExcerpt {
+    SourceExcerpt {
+        text: source[start..end].to_owned(),
+        range: byte_range(source, lines, start, end),
+    }
+}
+
+fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+fn is_else_if(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "else_clause"
+            && parent
+                .parent()
+                .is_some_and(|parent| parent.kind() == "if_expression")
+    })
+}
+
+fn condition_context(
+    selection: Node<'_>,
+    call: Node<'_>,
+    source: &str,
+    lines: &[usize],
+) -> Option<EvidenceContext> {
+    let condition = selection.child_by_field_name("condition")?;
+    if condition.kind() == "let_condition" {
+        return None;
+    }
+    if contains(condition, call) {
+        return None;
+    }
+    let consequence = selection.child_by_field_name("consequence")?;
+    let (arm, arm_node) = if contains(consequence, call) {
+        (
+            if is_else_if(selection) {
+                ConditionArmKind::ElseIf
             } else {
-                function
+                ConditionArmKind::Then
+            },
+            consequence,
+        )
+    } else {
+        let alternative = selection.child_by_field_name("alternative")?;
+        let body = alternative.named_child(0)?;
+        if body.kind() == "if_expression" && contains(body, call) {
+            return None;
+        }
+        if !contains(body, call) {
+            return None;
+        }
+        (ConditionArmKind::Else, body)
+    };
+    Some(EvidenceContext::ConditionArm {
+        construct: ConditionConstruct::If,
+        arm,
+        condition: Some(excerpt(source, lines, condition)),
+        arm_range: source_range(source, lines, arm_node),
+    })
+}
+
+fn pattern_context(
+    selection: Node<'_>,
+    call: Node<'_>,
+    source: &str,
+    lines: &[usize],
+) -> Option<EvidenceContext> {
+    let selector = selection.child_by_field_name("value")?;
+    if contains(selector, call) {
+        return None;
+    }
+    let mut ancestor = Some(call);
+    let arm = loop {
+        let candidate = ancestor?;
+        if candidate.kind() == "match_arm"
+            && candidate.parent().and_then(|parent| parent.parent()) == Some(selection)
+        {
+            break candidate;
+        }
+        ancestor = candidate.parent();
+    };
+    let value = arm.child_by_field_name("value")?;
+    if !contains(value, call) {
+        return None;
+    }
+    let pattern = arm.child_by_field_name("pattern")?;
+    let guard = pattern.child_by_field_name("condition");
+    let pattern_end = guard
+        .and_then(|_| {
+            let mut cursor = pattern.walk();
+            pattern
+                .children(&mut cursor)
+                .find(|child| child.kind() == "if")
+                .map(|child| child.start_byte())
+        })
+        .unwrap_or_else(|| pattern.end_byte());
+    let pattern_end =
+        source[pattern.start_byte()..pattern_end].trim_end().len() + pattern.start_byte();
+    Some(EvidenceContext::PatternArm {
+        construct: PatternConstruct::Match,
+        selector: Some(excerpt(source, lines, selector)),
+        pattern: Some(byte_excerpt(
+            source,
+            lines,
+            pattern.start_byte(),
+            pattern_end,
+        )),
+        guard: guard.map(|guard| excerpt(source, lines, guard)),
+        is_default: false,
+        arm_range: source_range(source, lines, arm),
+    })
+}
+
+fn lexical_contexts(
+    call: Node<'_>,
+    function: Node<'_>,
+    source: &str,
+    lines: &[usize],
+) -> Vec<EvidenceContext> {
+    let mut contexts = Vec::new();
+    let mut ancestor = call.parent();
+    while let Some(candidate) = ancestor {
+        if candidate == function {
+            break;
+        }
+        match candidate.kind() {
+            "if_expression" => contexts.extend(condition_context(candidate, call, source, lines)),
+            "match_expression" => contexts.extend(pattern_context(candidate, call, source, lines)),
+            _ => {}
+        }
+        ancestor = candidate.parent();
+    }
+    contexts.reverse();
+    contexts
+}
+
+fn callable_context(
+    function: Node<'_>,
+    source: &str,
+    lines: &[usize],
+    role: CallableClauseRole,
+) -> EvidenceContext {
+    let signature_end = function
+        .child_by_field_name("body")
+        .map_or_else(|| function.end_byte(), |body| body.start_byte());
+    let signature_end = source[function.start_byte()..signature_end]
+        .trim_end()
+        .len()
+        + function.start_byte();
+    EvidenceContext::CallableClause {
+        role,
+        signature: byte_excerpt(source, lines, function.start_byte(), signature_end),
+        guard: None,
+        definition_range: source_range(source, lines, function),
+    }
+}
+
+fn collect_tree_sitter_calls(
+    function: Node<'_>,
+    source: &str,
+    lines: &[usize],
+    calls: &mut Vec<RustCall>,
+) {
+    let source_bytes = source.as_bytes();
+    let enclosing = callable_context(function, source, lines, CallableClauseRole::Enclosing);
+    let mut stack = vec![function];
+    while let Some(node) = stack.pop() {
+        if node != function && matches!(node.kind(), "function_item" | "function_signature_item") {
+            continue;
+        }
+        if node.kind() == "call_expression"
+            && let Some(callee_expression) = node.child_by_field_name("function")
+        {
+            let callee = if callee_expression.kind() == "generic_function" {
+                callee_expression
+                    .child_by_field_name("function")
+                    .unwrap_or(callee_expression)
+            } else {
+                callee_expression
             };
             let receiver_method = callee.kind() == "field_expression";
             let name = if receiver_method {
@@ -99,13 +297,17 @@ fn collect_tree_sitter_calls(node: Node<'_>, source: &[u8], calls: &mut Vec<Rust
                 Some(callee)
             };
             if let Some(name) = name
-                && let Ok(text) = name.utf8_text(source)
+                && let Ok(text) = name.utf8_text(source_bytes)
             {
+                let mut contexts = vec![enclosing.clone()];
+                contexts.extend(lexical_contexts(node, function, source, lines));
                 calls.push(RustCall {
                     name: text.to_owned(),
                     line: node.start_position().row + 1,
                     offset: name.start_byte(),
                     receiver_method,
+                    range: Some(source_range(source, lines, node)),
+                    contexts,
                 });
             }
         }
@@ -257,6 +459,7 @@ fn analyze_tree_sitter(
     tree: &tree_sitter::Tree,
 ) -> Result<RustAnalysis, Box<dyn Error + Send + Sync>> {
     let source_bytes = source.as_bytes();
+    let lines = line_starts(source);
     let root = tree.root_node();
     let recovery = recover(root)
         .map_err(|_| UnsafeTreeRecovery::new("Rust", "missing syntax may change nesting"))?;
@@ -275,7 +478,7 @@ fn analyze_tree_sitter(
             .into_iter()
             .map(|(name, qualified_name, function)| {
                 let mut calls = Vec::new();
-                collect_tree_sitter_calls(function, source_bytes, &mut calls);
+                collect_tree_sitter_calls(function, source, &lines, &mut calls);
                 let body = function.child_by_field_name("body");
                 let mut cursor = function.walk();
                 let interface = function
@@ -293,6 +496,16 @@ fn analyze_tree_sitter(
                     name_offset: function
                         .child_by_field_name("name")
                         .map_or(function.start_byte(), |name| name.start_byte()),
+                    signature: match callable_context(
+                        function,
+                        source,
+                        &lines,
+                        CallableClauseRole::Declaration,
+                    ) {
+                        EvidenceContext::CallableClause { signature, .. } => Some(signature),
+                        _ => unreachable!(),
+                    },
+                    definition_range: Some(source_range(source, &lines, function)),
                     calls,
                 }
             })
@@ -312,8 +525,24 @@ fn line_at(lines: &[usize], offset: ra_ap_syntax::TextSize) -> usize {
     lines.partition_point(|start| *start <= usize::from(offset))
 }
 
-fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction> {
+fn rust_analyzer_functions(
+    source: &str,
+    file: &SourceFile,
+    tree: &tree_sitter::Tree,
+) -> Vec<RustFunction> {
     let lines = line_starts(source);
+    let mut tree_sitter_calls = BTreeMap::new();
+    if let Ok(recovery) = recover(tree.root_node()) {
+        let mut functions = Vec::new();
+        for root in recovery.roots {
+            collect_tree_sitter_functions(root, source.as_bytes(), &mut Vec::new(), &mut functions);
+        }
+        for (_, _, function) in functions {
+            let mut calls = Vec::new();
+            collect_tree_sitter_calls(function, source, &lines, &mut calls);
+            tree_sitter_calls.extend(calls.into_iter().map(|call| (call.offset, call)));
+        }
+    }
     file.syntax()
         .descendants()
         .filter_map(ast::Fn::cast)
@@ -352,6 +581,21 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
                 .chain(std::iter::once(name.as_str()))
                 .collect::<Vec<_>>()
                 .join("/");
+            let definition_start = usize::from(function.syntax().text_range().start());
+            let definition_end = usize::from(function.syntax().text_range().end());
+            let signature_end = function.body().map_or(definition_end, |body| {
+                usize::from(body.syntax().text_range().start())
+            });
+            let signature_end =
+                source[definition_start..signature_end].trim_end().len() + definition_start;
+            let signature = byte_excerpt(source, &lines, definition_start, signature_end);
+            let definition_range = byte_range(source, &lines, definition_start, definition_end);
+            let enclosing = EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                signature: signature.clone(),
+                guard: None,
+                definition_range: definition_range.clone(),
+            };
             let calls = function
                 .syntax()
                 .descendants()
@@ -363,19 +607,43 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
                 .filter_map(|node| {
                     if let Some(call) = ast::CallExpr::cast(node.clone()) {
                         let callee = call.expr()?;
+                        let offset = usize::from(callee.syntax().text_range().start());
+                        let mut contexts = vec![enclosing.clone()];
+                        if let Some(call) = tree_sitter_calls.get(&offset) {
+                            contexts.extend(call.contexts.iter().skip(1).cloned());
+                        }
                         return Some(RustCall {
                             name: callee.syntax().text().to_string(),
                             line: line_at(&lines, node.text_range().start()),
-                            offset: usize::from(callee.syntax().text_range().start()),
+                            offset,
                             receiver_method: false,
+                            range: Some(byte_range(
+                                source,
+                                &lines,
+                                usize::from(node.text_range().start()),
+                                usize::from(node.text_range().end()),
+                            )),
+                            contexts,
                         });
                     }
                     ast::MethodCallExpr::cast(node).and_then(|call| {
+                        let offset = usize::from(call.name_ref()?.syntax().text_range().start());
+                        let mut contexts = vec![enclosing.clone()];
+                        if let Some(call) = tree_sitter_calls.get(&offset) {
+                            contexts.extend(call.contexts.iter().skip(1).cloned());
+                        }
                         Some(RustCall {
                             name: call.name_ref()?.text().to_string(),
                             line: line_at(&lines, call.syntax().text_range().start()),
-                            offset: usize::from(call.name_ref()?.syntax().text_range().start()),
+                            offset,
                             receiver_method: true,
+                            range: Some(byte_range(
+                                source,
+                                &lines,
+                                usize::from(call.syntax().text_range().start()),
+                                usize::from(call.syntax().text_range().end()),
+                            )),
+                            contexts,
                         })
                     })
                 })
@@ -393,6 +661,8 @@ fn rust_analyzer_functions(source: &str, file: &SourceFile) -> Vec<RustFunction>
                 }),
                 line: line_at(&lines, function.syntax().text_range().start()),
                 name_offset: usize::from(function.name()?.syntax().text_range().start()),
+                signature: Some(signature),
+                definition_range: Some(definition_range),
                 calls,
             })
         })
@@ -487,7 +757,7 @@ pub(super) fn analyze_with_plugins(
             RustAnalysis {
                 module_hash: rust_analyzer_module_hash(&parsed.tree()),
                 module_reference_offsets: rust_analyzer_module_reference_offsets(&parsed.tree()),
-                functions: rust_analyzer_functions(source, &parsed.tree()),
+                functions: rust_analyzer_functions(source, &parsed.tree(), &tree),
                 tonic: Default::default(),
                 parse_error_lines: Vec::new(),
             }
@@ -540,7 +810,7 @@ pub fn observations_from_analysis(
             source_id.clone(),
             StructuralRelation::Defines,
             function_id.clone(),
-            format!("{}:{}", path.display(), function.line),
+            function.evidence(path, CallableClauseRole::Declaration),
         ));
         for call in &function.calls {
             observations.push(Observation::dependency(
@@ -554,7 +824,7 @@ pub fn observations_from_analysis(
                         .and_then(Clone::clone)
                         .unwrap_or_else(|| format!("rust-call://{}", call.name))
                 },
-                format!("{}:{}", path.display(), call.line),
+                call.evidence(path),
             ));
         }
     }
@@ -625,7 +895,7 @@ pub fn diagnostics_from_analysis(analysis: &RustAnalysis, path: &Path) -> Vec<An
                     .tonic
                     .recognized_receiver_calls
                     .iter()
-                    .any(|(line, name)| *line == call.line && name == &call.name)
+                    .any(|(offset, name)| *offset == call.offset && name == &call.name)
         });
     let Some(first) = calls.next() else {
         return diagnostics;
@@ -656,6 +926,27 @@ pub fn observations(
 mod recovery_tests {
     use super::*;
 
+    fn call_payload(source: &str, name: &str) -> beholder_domain::EvidencePayload {
+        observations("example", source, Path::new("src/lib.rs"))
+            .unwrap()
+            .into_iter()
+            .find(|observation| {
+                observation.relation
+                    == beholder_domain::SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation.to.as_str().ends_with(&format!("://{name}"))
+            })
+            .unwrap_or_else(|| panic!("missing call to {name}"))
+            .evidence
+            .decode()
+    }
+
+    fn condition_arm(context: &EvidenceContext) -> Option<ConditionArmKind> {
+        match context {
+            EvidenceContext::ConditionArm { arm, .. } => Some(*arm),
+            _ => None,
+        }
+    }
+
     #[test]
     fn recovers_only_unaffected_top_level_functions() {
         let analysis =
@@ -675,10 +966,121 @@ mod recovery_tests {
 
     #[test]
     fn parses_current_rust_default_field_values() {
-        let analysis =
-            analyze("struct Options { retries: usize = 3 } fn after_default() { run(); }").unwrap();
+        let source =
+            "struct Options { retries: usize = 3 } fn after_default() { if check() { run(); } }";
+        let analysis = analyze(source).unwrap();
         assert_eq!(analysis.functions[0].name, "after_default");
-        assert_eq!(analysis.functions[0].calls[0].name, "run");
+        assert_eq!(analysis.functions[0].calls[1].name, "run");
+        assert_eq!(
+            call_payload(source, "run")
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>(),
+            [ConditionArmKind::Then]
+        );
+    }
+
+    #[test]
+    fn records_nested_if_arms_and_excludes_chain_conditions() {
+        let source = r#"fn run() {
+    if outer() {
+        if inner() { nested(); }
+    } else if retry() {
+        alternate();
+    } else {
+        fallback();
+    }
+}"#;
+        let arms = |name| {
+            call_payload(source, name)
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(arms("outer").is_empty());
+        assert_eq!(arms("inner"), [ConditionArmKind::Then]);
+        assert_eq!(
+            arms("nested"),
+            [ConditionArmKind::Then, ConditionArmKind::Then]
+        );
+        assert!(arms("retry").is_empty());
+        assert_eq!(arms("alternate"), [ConditionArmKind::ElseIf]);
+        let fallback = call_payload(source, "fallback");
+        assert_eq!(
+            fallback
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>(),
+            [ConditionArmKind::Else]
+        );
+        let EvidenceContext::ConditionArm { condition, .. } = &fallback.contexts[1] else {
+            panic!("fallback should be in an else arm")
+        };
+        assert_eq!(condition.as_ref().unwrap().text, "retry()");
+    }
+
+    #[test]
+    fn records_match_cases_without_assigning_selector_patterns_or_guards() {
+        let source = "fn run() { match choose() { Some(x) if guard(x) => hit(x), _ => miss() } }";
+        for name in ["choose", "guard"] {
+            assert!(
+                call_payload(source, name)
+                    .contexts
+                    .iter()
+                    .all(|context| !matches!(context, EvidenceContext::PatternArm { .. }))
+            );
+        }
+        let hit = call_payload(source, "hit");
+        let EvidenceContext::PatternArm {
+            selector,
+            pattern,
+            guard,
+            is_default,
+            ..
+        } = &hit.contexts[1]
+        else {
+            panic!("hit should be in a match arm")
+        };
+        assert_eq!(selector.as_ref().unwrap().text, "choose()");
+        assert_eq!(pattern.as_ref().unwrap().text, "Some(x)");
+        assert_eq!(guard.as_ref().unwrap().text, "guard(x)");
+        assert!(!is_default);
+
+        let miss = call_payload(source, "miss");
+        let EvidenceContext::PatternArm {
+            pattern,
+            is_default,
+            ..
+        } = &miss.contexts[1]
+        else {
+            panic!("miss should be in a match arm")
+        };
+        assert_eq!(pattern.as_ref().unwrap().text, "_");
+        assert!(!is_default);
+    }
+
+    #[test]
+    fn uses_utf16_end_exclusive_ranges_for_distinct_same_line_calls() {
+        let source = "fn run() { consume(\"🚀\"); first(); second(); }";
+        let first = call_payload(source, "first").range.unwrap();
+        let second = call_payload(source, "second").range.unwrap();
+        let first_start = source.find("first()").unwrap();
+        let first_end = first_start + "first()".len();
+
+        assert_eq!(first.start.line, 0);
+        assert_eq!(
+            first.start.character,
+            u32::try_from(source[..first_start].encode_utf16().count()).unwrap()
+        );
+        assert_eq!(
+            first.end.character,
+            u32::try_from(source[..first_end].encode_utf16().count()).unwrap()
+        );
+        assert!(first.end < second.start);
     }
 
     #[test]

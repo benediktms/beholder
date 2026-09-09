@@ -22,7 +22,7 @@ impl Plugin<RustLanguage> for TonicPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "rust.tonic".into(),
-            version: "1".into(),
+            version: "2".into(),
         }
     }
 
@@ -221,7 +221,7 @@ mod tests {
 
         let plugin = active.plugins().next().unwrap();
         assert_eq!(plugin.metadata.id, "rust.tonic");
-        assert_eq!(plugins.source_identity(&active), "10:rust.tonic1:1");
+        assert_eq!(plugins.source_identity(&active), "10:rust.tonic1:2");
         assert_eq!(
             plugin.activation.path,
             PathBuf::from("crates/api/Cargo.toml")
