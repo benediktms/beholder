@@ -105,6 +105,10 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     |> Enum.reduce(index, &walk_condition_clause(&1, state, &2))
   end
 
+  defp walk({:fn, _meta, clauses}, state, index) do
+    Enum.reduce(clauses, index, &walk_anonymous_clause(&1, state, &2))
+  end
+
   defp walk({name, meta, arguments} = call, state, index)
        when is_atom(name) and is_list(meta) and is_list(arguments) do
     index = if name in @non_calls, do: index, else: record_call(call, meta, state, index)
@@ -167,6 +171,15 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   end
 
   defp walk_condition_clause(_clause, _state, index), do: index
+
+  defp walk_anonymous_clause({:->, meta, [patterns, body]}, state, index) do
+    context = anonymous_clause_context(meta, patterns, body, state)
+    state = %{state | contexts: if(context, do: [context], else: [])}
+    index = walk(patterns, state, index)
+    walk(body, state, index)
+  end
+
+  defp walk_anonymous_clause(_clause, _state, index), do: index
 
   defp record_call(call, meta, state, index) do
     with line when is_integer(line) <- meta[:line],
@@ -363,6 +376,22 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
       source_range(start, finish, state)
     else
       _missing_range -> nil
+    end
+  end
+
+  defp anonymous_clause_context(meta, patterns, body, state) do
+    with signature when not is_nil(signature) <- excerpt(patterns, state),
+         start when not is_nil(start) <- expression_start(patterns) || metadata_position(meta),
+         finish when not is_nil(finish) <- expression_end(body) do
+      %EvidenceContext{
+        context:
+          {:callable_clause,
+           %CallableClauseContext{
+             role: :CALLABLE_CLAUSE_ROLE_ENCLOSING,
+             signature: signature,
+             definition_range: source_range(start, finish, state)
+           }}
+      }
     end
   end
 

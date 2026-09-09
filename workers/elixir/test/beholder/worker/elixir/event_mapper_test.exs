@@ -269,6 +269,64 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
     assert signature == "run(value \\\\ fallback())"
   end
 
+  test "anonymous functions reset outer arms and keep their own arms" do
+    source = """
+    defmodule Example do
+      def run(value) do
+        case value do
+          :case ->
+            fn input ->
+              case_hit(input)
+              case input do
+                :nested -> nested_case_hit()
+              end
+            end
+        end
+
+        cond do
+          true ->
+            fn input ->
+              cond_hit(input)
+              cond do
+                true -> nested_cond_hit()
+              end
+            end
+        end
+      end
+    end
+    """
+
+    calls =
+      SourceIndex.build(%Repository{
+        identity: "example",
+        base: "/tmp/example",
+        inputs: [%{path: "lib/example.ex", content: source, kind: :INPUT_KIND_SOURCE}]
+      }).calls
+
+    for {line, column} <- [{6, 11}, {16, 11}] do
+      assert [%{contexts: [%{context: {:callable_clause, %{signature: %{text: "input"}}}}]}] =
+               Map.fetch!(calls, {"lib/example.ex", line, column})
+    end
+
+    assert [
+             %{
+               contexts: [
+                 %{context: {:callable_clause, %{signature: %{text: "input"}}}},
+                 %{context: {:pattern_arm, _}}
+               ]
+             }
+           ] = Map.fetch!(calls, {"lib/example.ex", 8, 24})
+
+    assert [
+             %{
+               contexts: [
+                 %{context: {:callable_clause, %{signature: %{text: "input"}}}},
+                 %{context: {:condition_arm, _}}
+               ]
+             }
+           ] = Map.fetch!(calls, {"lib/example.ex", 18, 21})
+  end
+
   test "preserves multiline case and cond clause heads" do
     source = """
     defmodule Example do

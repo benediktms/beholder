@@ -454,6 +454,21 @@ fn collect_calls(
     contexts: &[EvidenceContext],
     calls: &mut Vec<ElixirCall>,
 ) {
+    if node.kind() == "anonymous_function" {
+        let mut cursor = node.walk();
+        for clause in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "stab_clause")
+        {
+            let contexts = callable_clause(clause, source, CallableClauseRole::Enclosing)
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Some(body) = clause.child_by_field_name("right") {
+                collect_calls(body, source, struct_bindings, &contexts, calls);
+            }
+        }
+        return;
+    }
     if node.kind() == "call" {
         let target = call_target(node, source);
         if target == Some("quote") {
@@ -1844,6 +1859,57 @@ mod recovery_tests {
             call.contexts.as_slice(),
             [EvidenceContext::CallableClause { signature, guard: None, .. }]
                 if signature.text == "_"
+        )));
+    }
+
+    #[test]
+    fn anonymous_functions_reset_outer_arms_and_keep_their_own_arms() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  :case ->
+                    fn input ->
+                      case_hit(input)
+                      case input do
+                        :nested -> nested_case_hit()
+                      end
+                    end
+                end
+
+                cond do
+                  true ->
+                    fn input ->
+                      cond_hit(input)
+                      cond do
+                        true -> nested_cond_hit()
+                      end
+                    end
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let calls = &analysis.modules[0].functions[0].calls;
+
+        for name in ["case_hit", "cond_hit"] {
+            assert!(calls.iter().any(|call| matches!(
+                call.contexts.as_slice(),
+                [EvidenceContext::CallableClause { signature, .. }]
+                    if call.name == name && signature.text == "input"
+            )));
+        }
+        assert!(calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::PatternArm { .. }]
+                if call.name == "nested_case_hit" && signature.text == "input"
+        )));
+        assert!(calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::ConditionArm { .. }]
+                if call.name == "nested_cond_hit" && signature.text == "input"
         )));
     }
 }
