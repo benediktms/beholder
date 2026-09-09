@@ -419,6 +419,39 @@ fn template_expression(node: Node<'_>) -> bool {
         })
 }
 
+fn has_callable_ancestor(call: &Call, expression: &str, root: Node<'_>) -> bool {
+    let start = byte_offset(
+        expression,
+        SourcePosition {
+            line: call.start_line,
+            character: call.start_character,
+        },
+    );
+    let end = byte_offset(
+        expression,
+        SourcePosition {
+            line: call.end_line,
+            character: call.end_character,
+        },
+    );
+    start
+        .zip(end)
+        .and_then(|range| root.descendant_for_byte_range(range.0, range.1))
+        .into_iter()
+        .flat_map(|node| std::iter::successors(Some(node), |node| node.parent()))
+        .any(|node| {
+            matches!(
+                node.kind(),
+                "arrow_function"
+                    | "function_declaration"
+                    | "function_expression"
+                    | "generator_function"
+                    | "generator_function_declaration"
+                    | "method_definition"
+            )
+        })
+}
+
 fn collect_template_calls(
     node: Node<'_>,
     source: &str,
@@ -432,9 +465,21 @@ fn collect_template_calls(
         match node
             .utf8_text(source.as_bytes())
             .ok()
-            .and_then(|expression| analyze_core(expression, language).ok())
-        {
-            Some(mut analysis) => {
+            .and_then(|expression| {
+                let grammar = match language {
+                    SourceLanguage::JavaScript => tree_sitter_javascript::LANGUAGE,
+                    SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+                    _ => return None,
+                };
+                let mut parser = Parser::new();
+                parser.set_language(&grammar.into()).ok()?;
+                Some((
+                    analyze_core(expression, language).ok()?,
+                    parser.parse(expression, None)?,
+                    expression,
+                ))
+            }) {
+            Some((mut analysis, tree, expression)) => {
                 error_lines.extend(
                     analysis
                         .parse_error_lines
@@ -446,6 +491,8 @@ fn collect_template_calls(
                     .into_iter()
                     .flat_map(|definition| definition.calls);
                 for mut call in analysis.calls.into_iter().chain(nested_calls) {
+                    let behind_callable =
+                        has_callable_ancestor(&call, expression, tree.root_node());
                     translate_call(&mut call, base);
                     let after_enclosing = call
                         .contexts
@@ -460,8 +507,10 @@ fn collect_template_calls(
                             )
                         })
                         .count();
-                    call.contexts
-                        .splice(after_enclosing..after_enclosing, contexts.iter().cloned());
+                    if !behind_callable {
+                        call.contexts
+                            .splice(after_enclosing..after_enclosing, contexts.iter().cloned());
+                    }
                     calls.push(call);
                 }
             }
@@ -1065,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn template_contexts_follow_nested_callable_contexts() {
+    fn template_contexts_stop_at_nested_callable_contexts() {
         let source = r#"{#if ready()}
   {(() => { const nested = () => choice() ? render() : fallback(); return nested(); })()}
 {/if}"#;
@@ -1085,11 +1134,6 @@ mod tests {
                         ..
                     },
                     EvidenceContext::ConditionArm {
-                        construct: ConditionConstruct::TemplateIf,
-                        arm: ConditionArmKind::Then,
-                        ..
-                    },
-                    EvidenceContext::ConditionArm {
                         construct: ConditionConstruct::Ternary,
                         arm: ConditionArmKind::Consequence,
                         ..
@@ -1098,6 +1142,41 @@ mod tests {
             ),
             "{:#?}",
             render.contexts
+        );
+    }
+
+    #[test]
+    fn template_contexts_do_not_cross_deferred_callable_boundaries() {
+        let analysis = crate::analyze(
+            "{#if ready()}{register(() => helper())}{/if}",
+            SourceLanguage::Svelte,
+        )
+        .unwrap();
+        let call = |name: &str| {
+            analysis
+                .calls
+                .iter()
+                .find(|call| call.name == name)
+                .unwrap()
+        };
+
+        assert!(call("register").contexts.iter().any(|context| matches!(
+            context,
+            EvidenceContext::ConditionArm {
+                construct: ConditionConstruct::TemplateIf,
+                ..
+            }
+        )));
+        assert!(
+            !call("helper").contexts.iter().any(|context| matches!(
+                context,
+                EvidenceContext::ConditionArm {
+                    construct: ConditionConstruct::TemplateIf,
+                    ..
+                }
+            )),
+            "{:#?}",
+            call("helper").contexts
         );
     }
 
