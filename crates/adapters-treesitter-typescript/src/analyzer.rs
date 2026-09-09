@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_shards_ignore_trivia_but_change_with_calls() {
+    fn semantic_shards_track_evidence_positions_and_calls() {
         let cache_dir =
             std::env::temp_dir().join(format!("beholder-typescript-shards-{}", std::process::id()));
         let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
@@ -802,8 +802,8 @@ mod tests {
             .0
             .clone();
 
-        assert_eq!(initial, formatted);
-        assert_eq!(initial_key, formatted_key);
+        assert_ne!(initial, formatted);
+        assert_ne!(initial_key, formatted_key);
         assert_ne!(initial, changed);
         assert_ne!(initial_key, changed_key);
         let _ = fs::remove_dir_all(cache_dir);
@@ -895,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_semantics_are_reused_after_restart() {
+    fn repository_semantics_republish_changed_evidence_after_restart() {
         let cache_dir = std::env::temp_dir().join(format!(
             "beholder-typescript-repository-cache-{}",
             std::process::id()
@@ -921,8 +921,8 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(initial.repositories, formatted.repositories);
-        assert_eq!(
+        assert_ne!(initial.repositories, formatted.repositories);
+        assert_ne!(
             restarted.repository_cache.lock().unwrap()["example/repo"].0,
             key
         );
@@ -968,8 +968,8 @@ mod tests {
             .0
             .clone();
 
-        assert_eq!(initial.repositories, formatted.repositories);
-        assert_eq!(initial_key, formatted_key);
+        assert_ne!(initial.repositories, formatted.repositories);
+        assert_ne!(initial_key, formatted_key);
         assert_ne!(initial_key, changed_key);
         assert!(
             changed.repositories[0]

@@ -1758,7 +1758,7 @@ fn graphql_operation_calls(
                             caller.clone(),
                             DependencyRelation::CallsGraphql,
                             operation.clone(),
-                            format!("{}:{}", path.display(), call.line),
+                            call.evidence(path),
                         )
                     }));
                 }

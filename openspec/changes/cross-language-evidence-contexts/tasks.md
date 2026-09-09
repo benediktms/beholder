@@ -19,14 +19,14 @@
 
 ## 4. JavaScript and TypeScript selections and overloads
 
-- [ ] 4.1 Extract ternary and switch-statement contexts on JavaScript and TypeScript call occurrences; verify focused `beholder-adapters-treesitter-typescript` tests cover condition/selector exclusions, nested ternaries, default cases, fall-through ownership, and multibyte ranges.
-- [ ] 4.2 Propagate structured evidence through repository, GraphQL, gRPC, and framework enrichers and add selected-target context only for one compiler-resolved overload declaration; verify focused adapter and `workers/typescript` tests cover exact overloads, ambiguous signatures, heuristic resolution, and derived observations.
-- [ ] 4.3 Advance affected JavaScript/TypeScript frontend, resolver, worker, and plugin fingerprints; verify daemon indexing tests invalidate prior cached facts and republish structured evidence.
+- [x] 4.1 Extract ternary and switch-statement contexts on JavaScript and TypeScript call occurrences; verify focused `beholder-adapters-treesitter-typescript` tests cover condition/selector exclusions, nested ternaries, default cases, fall-through ownership, and multibyte ranges.
+- [x] 4.2 Propagate structured evidence through repository, GraphQL, gRPC, and framework enrichers and add selected-target context only for one compiler-resolved overload declaration; verify focused adapter and `workers/typescript` tests cover exact overloads, ambiguous signatures, heuristic resolution, and derived observations.
+- [x] 4.3 Advance affected JavaScript/TypeScript frontend, resolver, worker, and plugin fingerprints; verify daemon indexing tests invalidate prior cached facts and republish structured evidence.
 
 ## 5. Svelte template expressions
 
-- [ ] 5.1 Extract calls from Svelte template expressions while leaving existing instance-script analysis intact, mapping component-owned call ranges back to original UTF-16 positions; verify focused Svelte tests cover script/template coexistence, nested expressions, and absence of component/tag reference facts.
-- [ ] 5.2 Attach `{#if}`, `{:else if}`, `{:else}`, and ternary contexts, preserve other observations when one expression is malformed, and advance the Svelte plugin identity; verify focused tests cover normalized else-if arms, condition exclusions, diagnostics, multibyte source, and cache invalidation.
+- [x] 5.1 Extract calls from Svelte template expressions while leaving existing instance-script analysis intact, mapping component-owned call ranges back to original UTF-16 positions; verify focused Svelte tests cover script/template coexistence, nested expressions, and absence of component/tag reference facts.
+- [x] 5.2 Attach `{#if}`, `{:else if}`, `{:else}`, and ternary contexts, preserve other observations when one expression is malformed, and advance the Svelte plugin identity; verify focused tests cover normalized else-if arms, condition exclusions, diagnostics, multibyte source, and cache invalidation.
 
 ## 6. C# switches and overloads
 

@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	analyzerVersion = "1:typescript-compiler:3"
+	analyzerVersion = "1:typescript-compiler:4"
 	// ponytail: bound exhaustive LSP fan-out; replace with persisted batching when partial enrichment can merge.
 	maxCompilerCandidates = 500
 	maxAnalysisDuration   = 5 * time.Minute
@@ -78,6 +78,11 @@ type documentSymbol struct {
 	SelectionRange lspRange         `json:"selectionRange"`
 	Location       *location        `json:"location"`
 	Children       []documentSymbol `json:"children"`
+}
+
+type matchedDocumentSymbol struct {
+	path   []string
+	range_ lspRange
 }
 
 type lspRange struct {
@@ -392,7 +397,7 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 			result.diagnostics = append(result.diagnostics, candidateDiagnostic(code, candidate, fmt.Errorf("compiler returned %d definitions", len(definitions))))
 			continue
 		}
-		resolved, evidence, err := mapDefinition(ctx, c, definitions[0], snapshot)
+		resolved, selectedTarget, err := mapDefinition(ctx, c, definitions[0], snapshot)
 		if err != nil {
 			var requestError compilerRequestError
 			if errors.As(err, &requestError) {
@@ -405,7 +410,17 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 			continue
 		}
 		cancel()
-		result.overrides = append(result.overrides, &workerv1.CandidateOverride{CandidateId: candidate.GetId(), ResolvedTo: resolved, Evidence: fmt.Sprintf("TypeScript %s definition %s", version, evidence)})
+		contexts := append([]*beholderv1.EvidenceContext(nil), candidate.GetContexts()...)
+		if selectedTarget != nil {
+			contexts = append(contexts, selectedTarget)
+		}
+		result.overrides = append(result.overrides, &workerv1.CandidateOverride{
+			CandidateId: candidate.GetId(),
+			ResolvedTo:  resolved,
+			Evidence:    candidate.GetEvidence(),
+			Range:       candidate.GetRange(),
+			Contexts:    contexts,
+		})
 	}
 	if progress != nil {
 		if err := progress(len(candidates), len(candidates)); err != nil {
@@ -481,36 +496,37 @@ func verifySnapshot(snapshot *analysisSnapshot) error {
 	return nil
 }
 
-func mapDefinition(ctx context.Context, c *client, definition location, snapshot *analysisSnapshot) (string, string, error) {
+func mapDefinition(ctx context.Context, c *client, definition location, snapshot *analysisSnapshot) (string, *beholderv1.EvidenceContext, error) {
 	path, err := pathFromFileURI(definition.URI)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	repository, relative := owningRepository(path, snapshot.repositories)
 	if repository == nil {
-		return "", "", fmt.Errorf("definition is outside the immutable workspace: %s", path)
+		return "", nil, fmt.Errorf("definition is outside the immutable workspace: %s", path)
 	}
 	module, err := moduleID(repository.identity, relative)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	symbols, err := c.documentSymbols(ctx, path)
 	if err != nil {
-		return "", "", compilerRequestError{err}
+		return "", nil, compilerRequestError{err}
 	}
-	if names := symbolPath(symbols, definition.Range.Start, nil); len(names) > 0 {
-		id := module + "/" + strings.Join(names, "/")
+	if matched := matchDocumentSymbol(symbols, definition.Range.Start, nil); matched != nil {
+		id := module + "/" + strings.Join(matched.path, "/")
 		if snapshot.entities[id] {
-			return id, fmt.Sprintf("%s:%d:%d", relative, definition.Range.Start.Line+1, definition.Range.Start.Character+1), nil
+			selectedTarget, err := selectedTargetContext(path, matched.range_)
+			return id, selectedTarget, err
 		}
 	}
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	name, err := selectedText(content, definition.Range)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	var matches []string
 	for id := range snapshot.entities {
@@ -520,9 +536,41 @@ func mapDefinition(ctx context.Context, c *client, definition location, snapshot
 	}
 	sort.Strings(matches)
 	if len(matches) != 1 {
-		return "", "", fmt.Errorf("definition %s has %d canonical entity matches", name, len(matches))
+		return "", nil, fmt.Errorf("definition %s has %d canonical entity matches", name, len(matches))
 	}
-	return matches[0], fmt.Sprintf("%s:%d:%d", relative, definition.Range.Start.Line+1, definition.Range.Start.Character+1), nil
+	return matches[0], nil, nil
+}
+
+func selectedTargetContext(path string, range_ lspRange) (*beholderv1.EvidenceContext, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if range_.Start.Line != range_.End.Line {
+		return nil, nil
+	}
+	text, err := selectedText(content, range_)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(text)
+	if !strings.Contains(trimmed, "(") || !strings.HasSuffix(trimmed, ";") {
+		return nil, nil
+	}
+	if range_.Start.Line < 0 || range_.Start.Character < 0 || range_.End.Line < 0 || range_.End.Character < 0 {
+		return nil, errors.New("definition range contains a negative coordinate")
+	}
+	sourceRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: uint32(range_.Start.Line), Character: uint32(range_.Start.Character)},
+		End:   &beholderv1.SourcePosition{Line: uint32(range_.End.Line), Character: uint32(range_.End.Character)},
+	}
+	return &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{
+			Role:            beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_SELECTED_TARGET,
+			Signature:       &beholderv1.SourceExcerpt{Text: text, Range: sourceRange},
+			DefinitionRange: sourceRange,
+		},
+	}}, nil
 }
 
 func isTypeScriptSource(path string) bool {
@@ -545,21 +593,21 @@ func (c *client) documentSymbols(ctx context.Context, path string) ([]documentSy
 	return symbols, nil
 }
 
-func symbolPath(symbols []documentSymbol, at position, parent []string) []string {
+func matchDocumentSymbol(symbols []documentSymbol, at position, parent []string) *matchedDocumentSymbol {
 	for _, symbol := range symbols {
-		range_ := symbol.SelectionRange
+		selectionRange := symbol.SelectionRange
 		if symbol.Location != nil {
-			range_ = symbol.Location.Range
+			selectionRange = symbol.Location.Range
 		}
 		path := append(append([]string(nil), parent...), symbol.Name)
-		if child := symbolPath(symbol.Children, at, path); len(child) > 0 {
+		if child := matchDocumentSymbol(symbol.Children, at, path); child != nil {
 			return child
 		}
-		if range_.Start == at {
+		if selectionRange.Start == at {
 			if symbol.ContainerName != "" {
-				return append(strings.Split(symbol.ContainerName, "."), symbol.Name)
+				path = append(strings.Split(symbol.ContainerName, "."), symbol.Name)
 			}
-			return path
+			return &matchedDocumentSymbol{path: path, range_: symbol.Range}
 		}
 	}
 	return nil

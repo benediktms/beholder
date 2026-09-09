@@ -3294,6 +3294,16 @@ mod tests {
         let source = "export function shared() {}";
         let scheduler = IndexScheduler::new(cache.clone());
 
+        let stale =
+            beholder_adapters_treesitter_typescript::analyze(source, SourceLanguage::TypeScript)
+                .unwrap();
+        let stale_path = scheduler.cache_path(
+            "typescript",
+            &SourceAnalysisKey::new(source, "22-typescript"),
+        );
+        fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        fs::write(stale_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+
         assert_eq!(
             scheduler
                 .typescript_analysis_versioned(source, SourceLanguage::TypeScript)
@@ -3378,7 +3388,7 @@ mod tests {
         }
         fs::write(
             repository.join("src/service.ts"),
-            "export function helper() {} export class Worker { run() { helper(); this.stop(); } stop() {} }",
+            "export function helper() {} export class Worker { run(enabled: boolean) { switch (enabled) { case true: helper(); break; default: this.stop(); } } stop() {} }",
         )
         .unwrap();
         fs::write(
@@ -3451,6 +3461,27 @@ mod tests {
             has_call("/typescript/src/service/Worker/stop"),
             "{stored:?}"
         );
+        let helper_call = stored
+            .rows
+            .iter()
+            .find(|row| {
+                row[1]
+                    .as_str()
+                    .is_some_and(|from| from.ends_with("/typescript/src/service/Worker/run"))
+                    && row[3]
+                        .as_str()
+                        .is_some_and(|to| to.ends_with("/typescript/src/service/helper"))
+            })
+            .unwrap();
+        let evidence = Evidence::from(helper_call[4].as_str().unwrap()).decode();
+        assert!(evidence.range.is_some());
+        assert!(evidence.contexts.iter().any(|context| matches!(
+            context,
+            EvidenceContext::PatternArm {
+                construct: PatternConstruct::SwitchStatement,
+                ..
+            }
+        )));
         assert!(
             stored.rows.iter().any(|row| {
                 row[1]

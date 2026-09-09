@@ -3,7 +3,7 @@ use super::{
     model::{Call, TypescriptAnalysis},
 };
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation, Evidence,
     GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance, RpcCardinality,
     SemanticRelation,
 };
@@ -33,7 +33,7 @@ fn grpc_method(call: &Call, class: &str, handler: &str) -> Option<Result<(String
 }
 
 fn matching_service<'a>(
-    generated: &'a [GeneratedGrpcMethod<'_>],
+    generated: &'a [GeneratedGrpcMethod],
     short_service: &str,
     source_method: &str,
 ) -> BTreeSet<&'a str> {
@@ -49,7 +49,7 @@ fn matching_service<'a>(
 }
 
 fn matching_rpc<'a>(
-    generated: &'a [GeneratedGrpcMethod<'_>],
+    generated: &'a [GeneratedGrpcMethod],
     short_service: &str,
     method: &str,
 ) -> BTreeSet<&'a str> {
@@ -94,8 +94,7 @@ fn candidate(
     role: GrpcBindingRole,
     service: &str,
     method: &str,
-    path: &Path,
-    line: usize,
+    evidence: Evidence,
 ) -> GrpcBindingCandidate {
     GrpcBindingCandidate {
         local_symbol: local_symbol.into(),
@@ -103,7 +102,7 @@ fn candidate(
         service: service.into(),
         method: method.into(),
         cardinality: RpcCardinality::Unary,
-        evidence: format!("{}:{line}", path.display()).into(),
+        evidence,
         confidence: Confidence::Exact,
         provenance: Provenance::Ast,
     }
@@ -112,7 +111,7 @@ fn candidate(
 pub(super) fn bindings(
     repository: &str,
     sources: &[(&Path, &TypescriptAnalysis)],
-    generated: &[GeneratedGrpcMethod<'_>],
+    generated: &[GeneratedGrpcMethod],
     observations: &[Observation],
 ) -> (Vec<GrpcBindingCandidate>, Vec<AnalysisDiagnostic>) {
     let mut candidates = Vec::new();
@@ -171,8 +170,7 @@ pub(super) fn bindings(
                         GrpcBindingRole::Server,
                         matches.first().expect("exactly one service matched"),
                         &method,
-                        path,
-                        call.line,
+                        call.evidence(path),
                     ));
                 }
             }
@@ -214,8 +212,7 @@ pub(super) fn bindings(
                             GrpcBindingRole::Server,
                             &generated_method.service,
                             &generated_method.method,
-                            path,
-                            call.line,
+                            call.evidence(path),
                         ));
                     }
                 }
@@ -290,8 +287,7 @@ pub(super) fn bindings(
                                 GrpcBindingRole::Client,
                                 service,
                                 &rpc_method,
-                                path,
-                                call.line,
+                                call.evidence(path),
                             ));
                         }
                     }
@@ -385,7 +381,7 @@ mod tests {
             class CheckoutClient {
               private proxy: CheckoutProxy;
               onModuleInit() {
-                this.proxy = this.client.getService<CheckoutProxy>('RPCService');
+                this.proxy = enabled ? this.client.getService<CheckoutProxy>('RPCService') : existing;
               }
               run() { return this.proxy.initializeOrder({}); }
             }
@@ -420,6 +416,24 @@ mod tests {
         assert!(bindings.iter().any(|binding| {
             binding.local_symbol.as_str() == proxy && binding.role == GrpcBindingRole::Client
         }));
+        let client_binding = bindings
+            .iter()
+            .find(|binding| binding.local_symbol.as_str() == proxy)
+            .unwrap();
+        assert!(
+            client_binding
+                .evidence
+                .decode()
+                .contexts
+                .iter()
+                .any(|context| matches!(
+                    context,
+                    beholder_domain::EvidenceContext::ConditionArm {
+                        construct: beholder_domain::ConditionConstruct::Ternary,
+                        ..
+                    }
+                ))
+        );
         assert!(bindings.iter().any(|binding| {
             binding.local_symbol.as_str()
                 == "repo://example/typescript/src/checkout/CheckoutController/initializeOrder"

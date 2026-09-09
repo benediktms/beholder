@@ -8,7 +8,6 @@ struct Resolver {
     parent_type: String,
     field: String,
     definition: String,
-    line: usize,
 }
 
 enum Annotation {
@@ -99,7 +98,6 @@ fn resolver(
             .chain(std::iter::once(name))
             .collect::<Vec<_>>()
             .join("/"),
-        line: node.start_position().row + 1,
     })
 }
 
@@ -253,13 +251,16 @@ pub(super) fn facts(input: FactsInput<'_>) -> GraphqlFacts {
         .map(|definition| {
             (
                 definition.qualified_name.as_str(),
-                format!("{module_id}/{}", definition.qualified_name),
+                (
+                    format!("{module_id}/{}", definition.qualified_name),
+                    definition.evidence(input.path),
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
     let mut facts = GraphqlFacts::default();
     for resolver in resolvers {
-        let Some(definition) = definitions.get(resolver.definition.as_str()) else {
+        let Some((definition, evidence)) = definitions.get(resolver.definition.as_str()) else {
             continue;
         };
         let field = format!(
@@ -273,7 +274,7 @@ pub(super) fn facts(input: FactsInput<'_>) -> GraphqlFacts {
             field,
             DependencyRelation::ResolvedBy,
             definition.clone(),
-            format!("{}:{}", input.path.display(), resolver.line),
+            evidence.clone(),
         ));
     }
     facts

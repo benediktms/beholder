@@ -20,10 +20,10 @@ pub(super) fn is_generated_source(path: &Path, source: &str) -> bool {
         })
 }
 
-pub(super) fn grpc_methods<'a>(
+pub(super) fn grpc_methods(
     repository: &str,
-    sources: &[(&'a Path, &TypescriptAnalysis)],
-) -> Vec<GeneratedGrpcMethod<'a>> {
+    sources: &[(&Path, &TypescriptAnalysis)],
+) -> Vec<GeneratedGrpcMethod> {
     let mut methods = Vec::new();
     for (path, analysis) in sources {
         let constants = analysis
@@ -55,8 +55,7 @@ pub(super) fn grpc_methods<'a>(
                     method: method.into(),
                     source_method: source_method.into(),
                     local_symbol: format!("{module}/{}", definition.qualified_name),
-                    path,
-                    line: call.line,
+                    evidence: call.evidence(path),
                 });
             }
         }
@@ -85,8 +84,7 @@ pub(super) fn grpc_methods<'a>(
                 method,
                 source_method: source_method.into(),
                 local_symbol: format!("{module}/{}", definition.qualified_name),
-                path,
-                line: definition.line,
+                evidence: definition.evidence(path),
             });
         }
     }
@@ -94,7 +92,7 @@ pub(super) fn grpc_methods<'a>(
 }
 
 pub(super) fn client_bindings(
-    generated: &[GeneratedGrpcMethod<'_>],
+    generated: &[GeneratedGrpcMethod],
     observations: &[Observation],
 ) -> Vec<GrpcBindingCandidate> {
     generated
@@ -112,7 +110,7 @@ pub(super) fn client_bindings(
             service: generated.service.clone(),
             method: generated.method.clone(),
             cardinality: RpcCardinality::Unary,
-            evidence: format!("{}:{}", generated.path.display(), generated.line).into(),
+            evidence: generated.evidence.clone(),
             confidence: Confidence::Exact,
             provenance: Provenance::Generated,
         })
@@ -142,17 +140,20 @@ pub(super) fn message_observations(
             && !definition.qualified_name.contains('/')
             && !definition.qualified_name.contains('_')
         {
-            *definitions.entry(&definition.qualified_name).or_insert(0) += 1;
+            let entry = definitions
+                .entry(&definition.qualified_name)
+                .or_insert_with(|| (0, definition.evidence(path)));
+            entry.0 += 1;
         }
     }
     definitions
         .into_iter()
-        .filter(|(_, occurrences)| *occurrences > 1)
-        .map(|(name, _)| Observation {
+        .filter(|(_, (occurrences, _))| *occurrences > 1)
+        .map(|(name, (_, evidence))| Observation {
             from: format!("{module}/{name}").into(),
             relation: SemanticRelation::Dependency(DependencyRelation::BindsContract),
             to: format!("proto-type://{package}.{name}").into(),
-            evidence: path.display().to_string().into(),
+            evidence,
             confidence: Confidence::Exact,
             provenance: Provenance::Generated,
         })
@@ -196,7 +197,7 @@ mod tests {
             export const RPCServiceServiceName = "example.checkout.v1.RPCService";
             export class RPCServiceClientImpl {
               initializeOrder(request: Request) {
-                return this.rpc.request(this.service, "InitializeOrder", request);
+                return ready ? this.rpc.request(this.service, "InitializeOrder", request) : fallback();
               }
             }
             "#,
@@ -223,6 +224,15 @@ mod tests {
                 && binding.service == "example.checkout.v1.RPCService"
                 && binding.method == "InitializeOrder"
         }));
+        let evidence = bindings[0].evidence.decode();
+        assert!(evidence.range.is_some());
+        assert!(evidence.contexts.iter().any(|context| matches!(
+            context,
+            beholder_domain::EvidenceContext::ConditionArm {
+                construct: beholder_domain::ConditionConstruct::Ternary,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -250,6 +260,12 @@ mod tests {
                 && observation.to.as_str()
                     == "proto-type://example.checkout.v1.InitializeOrderRequest"
         }));
+        assert!(
+            observations[0]
+                .evidence
+                .as_str()
+                .starts_with("beholder:evidence:v1:")
+        );
         assert_eq!(
             message_entities(&observations),
             vec![

@@ -1,15 +1,14 @@
 use super::{model::TypescriptAnalysis, nestjs, ts_proto};
-use beholder_domain::{AnalysisDiagnostic, GrpcBindingCandidate, Observation};
+use beholder_domain::{AnalysisDiagnostic, Evidence, GrpcBindingCandidate, Observation};
 use std::path::Path;
 
-pub(super) struct GeneratedGrpcMethod<'a> {
+pub(super) struct GeneratedGrpcMethod {
     pub(super) short_service: String,
     pub(super) service: String,
     pub(super) method: String,
     pub(super) source_method: String,
     pub(super) local_symbol: String,
-    pub(super) path: &'a Path,
-    pub(super) line: usize,
+    pub(super) evidence: Evidence,
 }
 
 pub struct GrpcBindingInput<'a> {
