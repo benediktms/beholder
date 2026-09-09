@@ -146,6 +146,17 @@ fn lexical_contexts(call: Node<'_>, source: &[u8]) -> Vec<EvidenceContext> {
     let mut contexts = Vec::new();
     let mut ancestor = call.parent();
     while let Some(candidate) = ancestor {
+        if matches!(
+            candidate.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) {
+            break;
+        }
         match candidate.kind() {
             "ternary_expression" => contexts.extend(ternary_context(candidate, call, source)),
             "switch_case" | "switch_default" => {
@@ -2289,6 +2300,35 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn lexical_contexts_stop_at_the_nearest_callable() {
+        let observations = observations(
+            r#"function outer() {
+                switch (select()) {
+                    case "active": {
+                        const nested = function named() { return check() ? inner() : other(); };
+                    }
+                }
+            }"#,
+            "src/run.ts",
+        );
+
+        let inner = call_evidence(&observations, "inner").evidence.decode();
+        assert!(inner.contexts.iter().any(|context| matches!(
+            context,
+            EvidenceContext::ConditionArm {
+                construct: ConditionConstruct::Ternary,
+                ..
+            }
+        )));
+        assert!(
+            !inner
+                .contexts
+                .iter()
+                .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+        );
     }
 
     #[test]

@@ -58,6 +58,7 @@ impl SourceRecognizer<TypescriptLanguage> for SveltePlugin {
         let (source, language, error_lines) =
             extract_scripts(input.syntax.root_node(), input.text)?;
         let mut embedded = analyze_core(&source, language)?;
+        rebase_call_positions(&mut embedded, &source, input.text);
         let mut template_errors = Vec::new();
         collect_template_calls(
             input.syntax.root_node(),
@@ -100,6 +101,126 @@ fn byte_range(source: &str, start: usize, end: usize) -> Option<SourceRange> {
         start: source_position(source, start)?,
         end: source_position(source, end)?,
     })
+}
+
+fn byte_offset(source: &str, position: SourcePosition) -> Option<usize> {
+    let line = usize::try_from(position.line).ok()?;
+    let utf16_position = usize::try_from(position.character).ok()?;
+    let mut offset = 0;
+    for (current, text) in source.split_inclusive('\n').enumerate() {
+        if current == line {
+            let mut units = 0;
+            for (index, character) in text.char_indices() {
+                if units == utf16_position {
+                    return Some(offset + index);
+                }
+                units += character.len_utf16();
+            }
+            return (units == utf16_position).then_some(offset + text.len());
+        }
+        offset += text.len();
+    }
+    (line == source.bytes().filter(|byte| *byte == b'\n').count() && utf16_position == 0)
+        .then_some(source.len())
+}
+
+fn rebase_call_position(call: &mut Call, masked: &str, source: &str) {
+    let start = byte_offset(
+        masked,
+        SourcePosition {
+            line: call.start_line,
+            character: call.start_character,
+        },
+    );
+    let end = byte_offset(
+        masked,
+        SourcePosition {
+            line: call.end_line,
+            character: call.end_character,
+        },
+    );
+    let (Some(start), Some(end)) = (start, end) else {
+        return;
+    };
+    let Some(range) = byte_range(source, start, end) else {
+        return;
+    };
+    call.line = range.start.line as usize + 1;
+    (call.start_line, call.start_character) = (range.start.line, range.start.character);
+    (call.end_line, call.end_character) = (range.end.line, range.end.character);
+    call.range = Some(range);
+    for context in &mut call.contexts {
+        rebase_context(context, masked, source);
+    }
+}
+
+fn rebase_range(range: &mut SourceRange, masked: &str, source: &str) {
+    let (Some(start), Some(end)) = (
+        byte_offset(masked, range.start),
+        byte_offset(masked, range.end),
+    ) else {
+        return;
+    };
+    if let Some(rebased) = byte_range(source, start, end) {
+        *range = rebased;
+    }
+}
+
+fn rebase_excerpt(excerpt: &mut SourceExcerpt, masked: &str, source: &str) {
+    rebase_range(&mut excerpt.range, masked, source);
+}
+
+fn rebase_context(context: &mut EvidenceContext, masked: &str, source: &str) {
+    match context {
+        EvidenceContext::ConditionArm {
+            condition,
+            arm_range,
+            ..
+        } => {
+            if let Some(condition) = condition {
+                rebase_excerpt(condition, masked, source);
+            }
+            rebase_range(arm_range, masked, source);
+        }
+        EvidenceContext::PatternArm {
+            selector,
+            pattern,
+            guard,
+            arm_range,
+            ..
+        } => {
+            for excerpt in [selector, pattern, guard].into_iter().flatten() {
+                rebase_excerpt(excerpt, masked, source);
+            }
+            rebase_range(arm_range, masked, source);
+        }
+        EvidenceContext::CallableClause {
+            signature,
+            guard,
+            definition_range,
+            ..
+        } => {
+            rebase_excerpt(signature, masked, source);
+            if let Some(guard) = guard {
+                rebase_excerpt(guard, masked, source);
+            }
+            rebase_range(definition_range, masked, source);
+        }
+    }
+}
+
+fn rebase_call_positions(analysis: &mut TypescriptAnalysis, masked: &str, source: &str) {
+    for call in &mut analysis.calls {
+        rebase_call_position(call, masked, source);
+    }
+    for definition in &mut analysis.definitions {
+        if let Some(context) = &mut definition.declaration_context {
+            rebase_context(context, masked, source);
+        }
+        for call in &mut definition.calls {
+            rebase_call_position(call, masked, source);
+        }
+    }
 }
 
 fn excerpt(node: Node<'_>, source: &str) -> Option<SourceExcerpt> {
@@ -870,6 +991,77 @@ mod tests {
         assert_eq!(range.start.line, 2);
         assert_eq!(range.start.character, 3);
         assert_eq!(range.end.character - range.start.character, 10);
+    }
+
+    #[test]
+    fn instance_script_call_ranges_use_original_utf16_columns() {
+        let source = "<p>😀</p><script module>ignored()</script><script>visible()</script>";
+        let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
+        let call = analysis
+            .calls
+            .iter()
+            .find(|call| call.name == "visible")
+            .unwrap();
+        let range = call.range.as_ref().unwrap();
+        let offset = source.find("visible()").unwrap();
+
+        assert_eq!(range.start.line, 0);
+        assert_eq!(
+            range.start.character as usize,
+            source[..offset].encode_utf16().count()
+        );
+        assert_eq!(range.end.character - range.start.character, 7);
+    }
+
+    #[test]
+    fn instance_script_context_ranges_use_original_utf16_columns() {
+        let source = "<p>😀</p><script module>ignored()</script><script>function run() { return deciding() ? visible() : fallback(); }</script>";
+        let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
+        let definition = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "run")
+            .unwrap();
+        let call = definition
+            .calls
+            .iter()
+            .find(|call| call.name == "visible")
+            .unwrap();
+        let position = |needle: &str| {
+            source[..source.find(needle).unwrap()]
+                .encode_utf16()
+                .count() as u32
+        };
+
+        assert_eq!(
+            call.range.as_ref().unwrap().start.character,
+            position("visible()")
+        );
+        assert!(matches!(
+            call.contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { signature, .. },
+                EvidenceContext::ConditionArm {
+                    condition: Some(condition),
+                    arm_range,
+                    ..
+                }
+            ] if signature.range.start.character == position("function run")
+                && condition.range.start.character == position("deciding()")
+                && arm_range.start.character == position("visible()")
+        ));
+        let evidence = definition
+            .evidence(std::path::Path::new("src/view.svelte"))
+            .decode();
+        assert!(matches!(
+            evidence.contexts.as_slice(),
+            [EvidenceContext::CallableClause {
+                definition_range,
+                ..
+            }] if evidence.range.as_ref().is_some_and(|range| {
+                range.start.character == position("function run")
+            }) && definition_range.start.character == position("function run")
+        ));
     }
 
     #[test]
