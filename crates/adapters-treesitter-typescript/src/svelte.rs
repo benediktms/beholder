@@ -4,8 +4,8 @@ use crate::{
 };
 use beholder_adapters_treesitter::recover;
 use beholder_domain::{
-    ConditionArmKind, ConditionConstruct, EvidenceContext, SourceExcerpt, SourcePosition,
-    SourceRange, UnsafeTreeRecovery,
+    CallableClauseRole, ConditionArmKind, ConditionConstruct, EvidenceContext, SourceExcerpt,
+    SourcePosition, SourceRange, UnsafeTreeRecovery,
 };
 use beholder_indexing::{
     LanguageAnalyzerBuilder, Plugin, PluginActivation, PluginMetadata, RepositorySnapshot,
@@ -326,7 +326,21 @@ fn collect_template_calls(
                     .flat_map(|definition| definition.calls);
                 for mut call in analysis.calls.into_iter().chain(nested_calls) {
                     translate_call(&mut call, base);
-                    call.contexts.splice(0..0, contexts.iter().cloned());
+                    let after_enclosing = call
+                        .contexts
+                        .iter()
+                        .take_while(|context| {
+                            matches!(
+                                context,
+                                EvidenceContext::CallableClause {
+                                    role: CallableClauseRole::Enclosing,
+                                    ..
+                                }
+                            )
+                        })
+                        .count();
+                    call.contexts
+                        .splice(after_enclosing..after_enclosing, contexts.iter().cloned());
                     calls.push(call);
                 }
             }
@@ -856,6 +870,43 @@ mod tests {
         assert_eq!(range.start.line, 2);
         assert_eq!(range.start.character, 3);
         assert_eq!(range.end.character - range.start.character, 10);
+    }
+
+    #[test]
+    fn template_contexts_follow_nested_callable_contexts() {
+        let source = r#"{#if ready()}
+  {(() => { const nested = () => choice() ? render() : fallback(); return nested(); })()}
+{/if}"#;
+        let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
+        let render = analysis
+            .calls
+            .iter()
+            .find(|call| call.name == "render")
+            .unwrap();
+
+        assert!(
+            matches!(
+                render.contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause {
+                        role: CallableClauseRole::Enclosing,
+                        ..
+                    },
+                    EvidenceContext::ConditionArm {
+                        construct: ConditionConstruct::TemplateIf,
+                        arm: ConditionArmKind::Then,
+                        ..
+                    },
+                    EvidenceContext::ConditionArm {
+                        construct: ConditionConstruct::Ternary,
+                        arm: ConditionArmKind::Consequence,
+                        ..
+                    }
+                ]
+            ),
+            "{:#?}",
+            render.contexts
+        );
     }
 
     #[test]
