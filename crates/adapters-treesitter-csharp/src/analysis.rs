@@ -216,6 +216,12 @@ fn lexical_contexts(
         if candidate == definition {
             break;
         }
+        if matches!(
+            candidate.kind(),
+            "lambda_expression" | "anonymous_method_expression"
+        ) {
+            break;
+        }
         if matches!(candidate.kind(), "switch_statement" | "switch_expression") {
             let contexts = pattern_contexts(candidate, call, source);
             if !contexts.is_empty() {
@@ -999,6 +1005,45 @@ public sealed class Worker
                 .as_slice(),
             [EvidenceContext::CallableClause { .. }]
         ));
+    }
+
+    #[test]
+    fn switch_contexts_stop_at_anonymous_callable_boundaries() {
+        let source = r#"class Demo {
+    void Run(int value) {
+        switch (value) {
+            case 1:
+                var lambda = () => value switch { 2 => LambdaHit(), _ => LambdaFallback() };
+                var anonymous = delegate { var result = value switch { 3 => DelegateHit(), _ => DelegateFallback() }; };
+                break;
+        }
+    }
+    void LambdaHit() {} void LambdaFallback() {}
+    void DelegateHit() {} void DelegateFallback() {}
+}"#;
+        let analysis = analyze(source).unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "Demo/Run(int)")
+            .unwrap();
+
+        for name in [
+            "LambdaHit",
+            "LambdaFallback",
+            "DelegateHit",
+            "DelegateFallback",
+        ] {
+            let call = run.calls.iter().find(|call| call.name == name).unwrap();
+            assert_eq!(
+                call.contexts
+                    .iter()
+                    .filter(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+                    .count(),
+                1,
+                "{name}: {call:?}"
+            );
+        }
     }
 
     #[test]
