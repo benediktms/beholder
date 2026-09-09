@@ -540,27 +540,42 @@ impl ContributionAccumulator {
                 for r#override in contribution.overrides {
                     self.overrides.push(override_from_wire(r#override)?);
                 }
-                self.candidate_overrides
-                    .extend(
-                        contribution
-                            .candidate_overrides
-                            .into_iter()
-                            .map(|override_| CandidateOverride {
+                self.candidate_overrides.extend(
+                    contribution
+                        .candidate_overrides
+                        .into_iter()
+                        .map(|override_| {
+                            Ok(CandidateOverride {
                                 candidate_id: override_.candidate_id,
                                 resolved_to: override_.resolved_to.into(),
-                                evidence: override_.evidence.into(),
-                            }),
-                    );
-                self.graphql_resolvers
-                    .extend(contribution.graphql_resolvers.into_iter().map(|resolver| {
-                        GraphqlResolverCandidate {
-                            repository: resolver.repository,
-                            field: resolver.field,
-                            parent: resolver.parent,
-                            resolver: resolver.resolver.into(),
-                            evidence: resolver.evidence.into(),
-                        }
-                    }));
+                                evidence: evidence_from_wire(
+                                    override_.evidence,
+                                    override_.range,
+                                    override_.contexts,
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                );
+                self.graphql_resolvers.extend(
+                    contribution
+                        .graphql_resolvers
+                        .into_iter()
+                        .map(|resolver| {
+                            Ok(GraphqlResolverCandidate {
+                                repository: resolver.repository,
+                                field: resolver.field,
+                                parent: resolver.parent,
+                                resolver: resolver.resolver.into(),
+                                evidence: evidence_from_wire(
+                                    resolver.evidence,
+                                    resolver.range,
+                                    resolver.contexts,
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                );
                 for diagnostic in contribution.diagnostics {
                     self.diagnostics.push((
                         diagnostic.repository,
@@ -635,12 +650,17 @@ fn analysis_contribution_events(
     let mut candidate_overrides = candidate_overrides.into_iter().peekable();
     let mut graphql_resolvers = graphql_resolvers
         .into_iter()
-        .map(|resolver| wire::GraphqlResolverCandidate {
-            repository: resolver.repository,
-            field: resolver.field,
-            parent: resolver.parent,
-            resolver: resolver.resolver.to_string(),
-            evidence: resolver.evidence.as_str().into(),
+        .map(|resolver| {
+            let (range, contexts) = evidence_to_wire(&resolver.evidence);
+            wire::GraphqlResolverCandidate {
+                repository: resolver.repository,
+                field: resolver.field,
+                parent: resolver.parent,
+                resolver: resolver.resolver.to_string(),
+                evidence: resolver.evidence.as_str().into(),
+                range,
+                contexts,
+            }
         })
         .peekable();
     let mut diagnostics = diagnostics
@@ -663,10 +683,15 @@ fn analysis_contribution_events(
                     candidate_overrides: candidate_overrides
                         .by_ref()
                         .take(CONTRIBUTION_CHUNK_ITEMS)
-                        .map(|override_| wire::CandidateOverride {
-                            candidate_id: override_.candidate_id,
-                            resolved_to: override_.resolved_to.to_string(),
-                            evidence: override_.evidence.as_str().into(),
+                        .map(|override_| {
+                            let (range, contexts) = evidence_to_wire(&override_.evidence);
+                            wire::CandidateOverride {
+                                candidate_id: override_.candidate_id,
+                                resolved_to: override_.resolved_to.to_string(),
+                                evidence: override_.evidence.as_str().into(),
+                                range,
+                                contexts,
+                            }
                         })
                         .collect(),
                     graphql_resolvers: graphql_resolvers
@@ -821,6 +846,7 @@ fn repository_from_wire(
 }
 
 fn candidate_to_wire(value: SemanticCandidate) -> Result<wire::SemanticCandidate, String> {
+    let (range, contexts) = evidence_to_wire(&value.evidence);
     Ok(wire::SemanticCandidate {
         id: value.id,
         repository: value.repository,
@@ -839,6 +865,8 @@ fn candidate_to_wire(value: SemanticCandidate) -> Result<wire::SemanticCandidate
             }),
         }),
         evidence: value.evidence.as_str().into(),
+        range,
+        contexts,
     })
 }
 
@@ -870,7 +898,7 @@ fn candidate_from_wire(value: wire::SemanticCandidate) -> Result<SemanticCandida
                 character: end.character,
             },
         },
-        evidence: value.evidence.into(),
+        evidence: evidence_from_wire(value.evidence, value.range, value.contexts)?,
     })
 }
 
@@ -1046,6 +1074,7 @@ fn metadata_from_wire(metadata: v1::EntityMetadata) -> Result<EntityMetadata, St
 }
 
 fn observation_to_wire(observation: Observation) -> Result<wire::Observation, String> {
+    let (range, contexts) = evidence_to_wire(&observation.evidence);
     Ok(wire::Observation {
         from: observation.from.to_string(),
         relation: relation_to_wire(observation.relation) as i32,
@@ -1053,6 +1082,8 @@ fn observation_to_wire(observation: Observation) -> Result<wire::Observation, St
         evidence: observation.evidence.as_str().into(),
         confidence: confidence_to_wire(observation.confidence) as i32,
         provenance: provenance_to_wire(observation.provenance) as i32,
+        range,
+        contexts,
     })
 }
 
@@ -1061,13 +1092,18 @@ fn observation_from_wire(observation: wire::Observation) -> Result<Observation, 
         from: observation.from.into(),
         relation: relation_from_wire(observation.relation)?,
         to: observation.to.into(),
-        evidence: observation.evidence.into(),
+        evidence: evidence_from_wire(
+            observation.evidence,
+            observation.range,
+            observation.contexts,
+        )?,
         confidence: confidence_from_wire(observation.confidence)?,
         provenance: provenance_from_wire(observation.provenance)?,
     })
 }
 
 fn binding_to_wire(binding: GrpcBindingCandidate) -> wire::GrpcBindingCandidate {
+    let (range, contexts) = evidence_to_wire(&binding.evidence);
     wire::GrpcBindingCandidate {
         local_symbol: binding.local_symbol.to_string(),
         role: match binding.role {
@@ -1080,6 +1116,8 @@ fn binding_to_wire(binding: GrpcBindingCandidate) -> wire::GrpcBindingCandidate 
         evidence: binding.evidence.as_str().into(),
         confidence: confidence_to_wire(binding.confidence) as i32,
         provenance: provenance_to_wire(binding.provenance) as i32,
+        range,
+        contexts,
     }
 }
 
@@ -1098,13 +1136,14 @@ fn binding_from_wire(binding: wire::GrpcBindingCandidate) -> Result<GrpcBindingC
         service: binding.service,
         method: binding.method,
         cardinality: cardinality_from_wire(binding.cardinality)?,
-        evidence: binding.evidence.into(),
+        evidence: evidence_from_wire(binding.evidence, binding.range, binding.contexts)?,
         confidence: confidence_from_wire(binding.confidence)?,
         provenance: provenance_from_wire(binding.provenance)?,
     })
 }
 
 fn override_to_wire(value: DependencyOverride) -> Result<wire::DependencyOverride, String> {
+    let (range, contexts) = evidence_to_wire(&value.evidence);
     Ok(wire::DependencyOverride {
         from: value.from.to_string(),
         relation: relation_to_wire(SemanticRelation::Dependency(value.relation)) as i32,
@@ -1113,6 +1152,8 @@ fn override_to_wire(value: DependencyOverride) -> Result<wire::DependencyOverrid
         evidence: value.evidence.as_str().into(),
         confidence: confidence_to_wire(value.confidence) as i32,
         provenance: provenance_to_wire(value.provenance) as i32,
+        range,
+        contexts,
     })
 }
 
@@ -1125,10 +1166,41 @@ fn override_from_wire(value: wire::DependencyOverride) -> Result<DependencyOverr
         relation,
         unresolved_to: value.unresolved_to.into(),
         resolved_to: value.resolved_to.into(),
-        evidence: value.evidence.into(),
+        evidence: evidence_from_wire(value.evidence, value.range, value.contexts)?,
         confidence: confidence_from_wire(value.confidence)?,
         provenance: provenance_from_wire(value.provenance)?,
     })
+}
+
+fn evidence_to_wire(
+    evidence: &beholder_domain::Evidence,
+) -> (Option<v1::SourceRange>, Vec<v1::EvidenceContext>) {
+    let payload = evidence.decode();
+    (
+        payload.range.map(Into::into),
+        payload.contexts.into_iter().map(Into::into).collect(),
+    )
+}
+
+fn evidence_from_wire(
+    evidence: String,
+    range: Option<v1::SourceRange>,
+    contexts: Vec<v1::EvidenceContext>,
+) -> Result<beholder_domain::Evidence, String> {
+    if range.is_none() && contexts.is_empty() {
+        return Ok(evidence.into());
+    }
+    let mut payload = beholder_domain::Evidence::from(evidence).decode();
+    payload.range = range
+        .map(TryInto::try_into)
+        .transpose()
+        .map_err(str::to_owned)?;
+    payload.contexts = contexts
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<_, _>>()
+        .map_err(str::to_owned)?;
+    beholder_domain::Evidence::structured(payload)
 }
 
 fn diagnostic_to_wire(diagnostic: AnalysisDiagnostic) -> wire::AnalysisDiagnostic {
@@ -1311,6 +1383,71 @@ fn relation_from_wire(value: i32) -> Result<SemanticRelation, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn position(line: u32, character: u32) -> beholder_domain::SourcePosition {
+        beholder_domain::SourcePosition { line, character }
+    }
+
+    fn range(start: (u32, u32), end: (u32, u32)) -> beholder_domain::SourceRange {
+        beholder_domain::SourceRange {
+            start: position(start.0, start.1),
+            end: position(end.0, end.1),
+        }
+    }
+
+    #[test]
+    fn worker_evidence_is_typed_canonical_and_validated() {
+        let evidence = beholder_domain::Evidence::structured(beholder_domain::EvidencePayload {
+            path: Some("src/lib.rs".into()),
+            line: Some(2),
+            detail: None,
+            range: Some(range((1, 4), (1, 10))),
+            contexts: vec![beholder_domain::EvidenceContext::ConditionArm {
+                construct: beholder_domain::ConditionConstruct::If,
+                arm: beholder_domain::ConditionArmKind::Then,
+                condition: None,
+                arm_range: range((1, 0), (2, 1)),
+            }],
+        })
+        .unwrap();
+        let observation = Observation::dependency(
+            "repo://example/rust/caller",
+            DependencyRelation::Calls,
+            "repo://example/rust/target",
+            evidence,
+        );
+
+        let wire = observation_to_wire(observation.clone()).unwrap();
+        assert!(wire.range.is_some());
+        assert_eq!(wire.contexts.len(), 1);
+        assert_eq!(observation_from_wire(wire).unwrap(), observation);
+
+        assert!(
+            evidence_from_wire(
+                "src/lib.rs:2".into(),
+                Some(v1::SourceRange {
+                    start: Some(v1::SourcePosition {
+                        line: 2,
+                        character: 0,
+                    }),
+                    end: Some(v1::SourcePosition {
+                        line: 1,
+                        character: 0,
+                    }),
+                }),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            evidence_from_wire(
+                "src/lib.rs:2".into(),
+                None,
+                vec![v1::EvidenceContext::default()],
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn snapshot_round_trip_preserves_target_and_contexts() {

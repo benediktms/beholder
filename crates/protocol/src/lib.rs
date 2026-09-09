@@ -182,7 +182,32 @@ mod tests {
                         repository: None,
                         path: Some("src/lib.rs".into()),
                         line: Some(1),
+                        range: Some(dto::SourceRange {
+                            start: dto::SourcePosition {
+                                line: 0,
+                                character: 4,
+                            },
+                            end: dto::SourcePosition {
+                                line: 0,
+                                character: 9,
+                            },
+                        }),
                         detail: Some("unique_name_heuristic".into()),
+                        contexts: vec![dto::EvidenceContext::ConditionArm {
+                            construct: dto::ConditionConstruct::If,
+                            arm: dto::ConditionArmKind::Then,
+                            condition: None,
+                            arm_range: dto::SourceRange {
+                                start: dto::SourcePosition {
+                                    line: 0,
+                                    character: 0,
+                                },
+                                end: dto::SourcePosition {
+                                    line: 1,
+                                    character: 0,
+                                },
+                            },
+                        }],
                     }],
                 },
                 dto::SemanticEdge {

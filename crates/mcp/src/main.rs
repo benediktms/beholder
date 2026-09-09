@@ -244,6 +244,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    #[derive(Serialize)]
+    struct EvidenceFixture {
+        range: Option<beholder_domain::SourceRange>,
+        contexts: Vec<beholder_domain::EvidenceContext>,
+    }
+
+    #[test]
+    fn structured_results_preserve_evidence_range_and_contexts() {
+        let range = beholder_domain::SourceRange {
+            start: beholder_domain::SourcePosition {
+                line: 1,
+                character: 2,
+            },
+            end: beholder_domain::SourcePosition {
+                line: 1,
+                character: 8,
+            },
+        };
+        let result = structured(EvidenceFixture {
+            range: Some(range.clone()),
+            contexts: vec![beholder_domain::EvidenceContext::ConditionArm {
+                construct: beholder_domain::ConditionConstruct::Ternary,
+                arm: beholder_domain::ConditionArmKind::Consequence,
+                condition: None,
+                arm_range: range,
+            }],
+        });
+        let value = result.structured_content.unwrap();
+
+        assert_eq!(value["range"]["start"]["character"], 2);
+        assert_eq!(value["contexts"][0]["kind"], "condition_arm");
+        assert_eq!(value["contexts"][0]["arm"], "consequence");
+    }
+
     #[test]
     fn exposes_only_the_bounded_semantic_tools() {
         let router = BeholderMcp::tool_router();

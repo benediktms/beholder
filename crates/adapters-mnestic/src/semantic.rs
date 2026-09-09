@@ -1,4 +1,5 @@
 use crate::{InspectionResult, InspectionValue, query::ContextRow};
+use beholder_domain as domain;
 use beholder_dto::{
     CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, DependencyRef,
     ENTITY_SEARCH_SCHEMA_V2, EntityKind, EntityMetadata, EntityOrigin, EntityQuery, EntityRef,
@@ -1107,17 +1108,11 @@ pub(super) fn target_repository<'a>(id: &str, targets: &'a BTreeSet<String>) -> 
 }
 
 fn evidence_ref(from: &str, to: &str, evidence: &str, provenance: &str) -> EvidenceRef {
-    let (mut path, line) = evidence
-        .rsplit_once(':')
-        .and_then(|(path, line)| {
-            line.parse()
-                .ok()
-                .map(|line| (Some(path.into()), Some(line)))
-        })
-        .unwrap_or((None, None));
-    if provenance == "descriptor" && path.is_none() {
-        path = Some(evidence.into());
-    }
+    let decoded = domain::Evidence::from(evidence).decode();
+    let descriptor_path = provenance == "descriptor" && decoded.path.is_none();
+    let path = decoded
+        .path
+        .or_else(|| descriptor_path.then(|| evidence.into()));
     let has_path = path.is_some();
     EvidenceRef {
         source_kind: match provenance {
@@ -1130,11 +1125,16 @@ fn evidence_ref(from: &str, to: &str, evidence: &str, provenance: &str) -> Evide
         },
         repository: repository(from).or_else(|| repository(to)),
         path,
-        line,
+        line: decoded.line,
+        range: decoded.range,
         detail: match provenance {
             "unique_name_heuristic" => Some(provenance.into()),
-            _ => (!has_path).then(|| evidence.into()),
+            _ if descriptor_path => None,
+            _ => decoded
+                .detail
+                .or_else(|| (!has_path).then(|| evidence.into())),
         },
+        contexts: decoded.contexts,
     }
 }
 
@@ -1159,13 +1159,164 @@ fn float(row: &[InspectionValue], index: usize, name: &str) -> Result<f64, Box<d
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphBuilder, PathSearch, entity_ref, infer_kind, is_test_entity, search_entities,
+        GraphBuilder, PathSearch, context, dependencies, entity_ref, impact, infer_kind,
+        is_test_entity, search_entities, trace, traverse_graph, workspace_topology,
     };
     use crate::{InspectionResult, InspectionValue};
+    use beholder_domain::{
+        ConditionArmKind, ConditionConstruct, Evidence, EvidenceContext, EvidencePayload,
+        SourcePosition, SourceRange,
+    };
     use beholder_dto::{
         EntityKind, EntityOrigin, GraphDirection, PathTermination, TraverseGraphQuery,
     };
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn every_evidence_query_preserves_same_line_occurrences() {
+        let from = "repo://example/repo/rust/caller";
+        let to = "repo://example/repo/rust/target";
+        let evidence = [4, 14].map(|character| {
+            Evidence::structured(EvidencePayload {
+                path: Some("src/lib.rs".into()),
+                line: Some(2),
+                detail: None,
+                range: Some(SourceRange {
+                    start: SourcePosition { line: 1, character },
+                    end: SourcePosition {
+                        line: 1,
+                        character: character + 4,
+                    },
+                }),
+                contexts: vec![EvidenceContext::ConditionArm {
+                    construct: ConditionConstruct::If,
+                    arm: ConditionArmKind::Then,
+                    condition: None,
+                    arm_range: SourceRange {
+                        start: SourcePosition {
+                            line: 1,
+                            character: 0,
+                        },
+                        end: SourcePosition {
+                            line: 2,
+                            character: 0,
+                        },
+                    },
+                }],
+            })
+            .unwrap()
+            .as_str()
+            .to_owned()
+        });
+        let entities = || InspectionResult {
+            headers: Vec::new(),
+            rows: [from, to]
+                .map(|id| {
+                    vec![
+                        InspectionValue::String(id.into()),
+                        InspectionValue::String("callable".into()),
+                        InspectionValue::String(String::new()),
+                    ]
+                })
+                .into(),
+            next: None,
+        };
+        let graph_rows = || InspectionResult {
+            headers: Vec::new(),
+            rows: evidence
+                .iter()
+                .map(|evidence| {
+                    vec![
+                        InspectionValue::String("edge".into()),
+                        InspectionValue::String(String::new()),
+                        InspectionValue::String(String::new()),
+                        InspectionValue::String(from.into()),
+                        InspectionValue::String(to.into()),
+                        InspectionValue::String("calls".into()),
+                        InspectionValue::String(evidence.clone()),
+                        InspectionValue::Float(1.0),
+                        InspectionValue::String("ast".into()),
+                    ]
+                })
+                .collect(),
+            next: None,
+        };
+        let context_result = context(
+            "main",
+            from,
+            evidence
+                .iter()
+                .map(|evidence| crate::query::ContextRow {
+                    direction: "outgoing".into(),
+                    relation: "calls".into(),
+                    related: to.into(),
+                    evidence: evidence.clone(),
+                    confidence: 1.0,
+                    provenance: "ast".into(),
+                })
+                .collect(),
+            entities(),
+        )
+        .unwrap();
+        let expected = &context_result.edges[0].evidence;
+        assert_eq!(expected.len(), 2);
+        assert_ne!(expected[0].range, expected[1].range);
+
+        let dependencies = dependencies("main", from, 8, graph_rows(), entities()).unwrap();
+        let impact = impact("main", to, 8, graph_rows(), entities()).unwrap();
+        let trace = trace("main", from, to, 8, graph_rows(), entities()).unwrap();
+        let why = beholder_dto::WhyResult::from(trace.clone());
+        let traversal = traverse_graph(
+            "main",
+            TraverseGraphQuery {
+                start: from.into(),
+                direction: GraphDirection::Dependencies,
+                destination: Some(to.into()),
+                target_repositories: Vec::new(),
+                max_hops: 8,
+                max_paths: 50,
+            },
+            graph_rows(),
+            entities(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let topology = workspace_topology(
+            "main",
+            InspectionResult {
+                headers: Vec::new(),
+                rows: evidence
+                    .iter()
+                    .map(|evidence| {
+                        vec![
+                            InspectionValue::String(from.into()),
+                            InspectionValue::String(to.into()),
+                            InspectionValue::String("calls".into()),
+                            InspectionValue::String(evidence.clone()),
+                            InspectionValue::Float(1.0),
+                            InspectionValue::String("ast".into()),
+                        ]
+                    })
+                    .collect(),
+                next: None,
+            },
+            entities(),
+        )
+        .unwrap();
+
+        for evidence in [
+            &dependencies.edges[0].evidence,
+            &impact.edges[0].evidence,
+            &trace.edges[0].evidence,
+            &why.edges[0].evidence,
+            &traversal.edges[0].evidence,
+            &topology.edges[0].evidence,
+        ] {
+            assert_eq!(evidence, expected);
+        }
+    }
 
     #[test]
     fn repository_filter_recognises_arbitrary_target_segments() {

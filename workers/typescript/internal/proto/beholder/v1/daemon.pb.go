@@ -1105,11 +1105,12 @@ func (GraphDirection) EnumDescriptor() ([]byte, []int) {
 type PathTermination int32
 
 const (
-	PathTermination_PATH_TERMINATION_UNSPECIFIED PathTermination = 0
-	PathTermination_PATH_TERMINATION_DESTINATION PathTermination = 1
-	PathTermination_PATH_TERMINATION_LEAF        PathTermination = 2
-	PathTermination_PATH_TERMINATION_CYCLE       PathTermination = 3
-	PathTermination_PATH_TERMINATION_MAX_HOPS    PathTermination = 4
+	PathTermination_PATH_TERMINATION_UNSPECIFIED         PathTermination = 0
+	PathTermination_PATH_TERMINATION_DESTINATION         PathTermination = 1
+	PathTermination_PATH_TERMINATION_LEAF                PathTermination = 2
+	PathTermination_PATH_TERMINATION_CYCLE               PathTermination = 3
+	PathTermination_PATH_TERMINATION_MAX_HOPS            PathTermination = 4
+	PathTermination_PATH_TERMINATION_REPOSITORY_BOUNDARY PathTermination = 5
 )
 
 // Enum value maps for PathTermination.
@@ -1120,13 +1121,15 @@ var (
 		2: "PATH_TERMINATION_LEAF",
 		3: "PATH_TERMINATION_CYCLE",
 		4: "PATH_TERMINATION_MAX_HOPS",
+		5: "PATH_TERMINATION_REPOSITORY_BOUNDARY",
 	}
 	PathTermination_value = map[string]int32{
-		"PATH_TERMINATION_UNSPECIFIED": 0,
-		"PATH_TERMINATION_DESTINATION": 1,
-		"PATH_TERMINATION_LEAF":        2,
-		"PATH_TERMINATION_CYCLE":       3,
-		"PATH_TERMINATION_MAX_HOPS":    4,
+		"PATH_TERMINATION_UNSPECIFIED":         0,
+		"PATH_TERMINATION_DESTINATION":         1,
+		"PATH_TERMINATION_LEAF":                2,
+		"PATH_TERMINATION_CYCLE":               3,
+		"PATH_TERMINATION_MAX_HOPS":            4,
+		"PATH_TERMINATION_REPOSITORY_BOUNDARY": 5,
 	}
 )
 
@@ -1210,6 +1213,229 @@ func (x TruncationReason) Number() protoreflect.EnumNumber {
 // Deprecated: Use TruncationReason.Descriptor instead.
 func (TruncationReason) EnumDescriptor() ([]byte, []int) {
 	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{20}
+}
+
+type ConditionConstruct int32
+
+const (
+	ConditionConstruct_CONDITION_CONSTRUCT_UNSPECIFIED ConditionConstruct = 0
+	ConditionConstruct_CONDITION_CONSTRUCT_IF          ConditionConstruct = 1
+	ConditionConstruct_CONDITION_CONSTRUCT_COND        ConditionConstruct = 2
+	ConditionConstruct_CONDITION_CONSTRUCT_TERNARY     ConditionConstruct = 3
+	ConditionConstruct_CONDITION_CONSTRUCT_TEMPLATE_IF ConditionConstruct = 4
+)
+
+// Enum value maps for ConditionConstruct.
+var (
+	ConditionConstruct_name = map[int32]string{
+		0: "CONDITION_CONSTRUCT_UNSPECIFIED",
+		1: "CONDITION_CONSTRUCT_IF",
+		2: "CONDITION_CONSTRUCT_COND",
+		3: "CONDITION_CONSTRUCT_TERNARY",
+		4: "CONDITION_CONSTRUCT_TEMPLATE_IF",
+	}
+	ConditionConstruct_value = map[string]int32{
+		"CONDITION_CONSTRUCT_UNSPECIFIED": 0,
+		"CONDITION_CONSTRUCT_IF":          1,
+		"CONDITION_CONSTRUCT_COND":        2,
+		"CONDITION_CONSTRUCT_TERNARY":     3,
+		"CONDITION_CONSTRUCT_TEMPLATE_IF": 4,
+	}
+)
+
+func (x ConditionConstruct) Enum() *ConditionConstruct {
+	p := new(ConditionConstruct)
+	*p = x
+	return p
+}
+
+func (x ConditionConstruct) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ConditionConstruct) Descriptor() protoreflect.EnumDescriptor {
+	return file_beholder_v1_daemon_proto_enumTypes[21].Descriptor()
+}
+
+func (ConditionConstruct) Type() protoreflect.EnumType {
+	return &file_beholder_v1_daemon_proto_enumTypes[21]
+}
+
+func (x ConditionConstruct) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ConditionConstruct.Descriptor instead.
+func (ConditionConstruct) EnumDescriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{21}
+}
+
+type ConditionArmKind int32
+
+const (
+	ConditionArmKind_CONDITION_ARM_KIND_UNSPECIFIED ConditionArmKind = 0
+	ConditionArmKind_CONDITION_ARM_KIND_THEN        ConditionArmKind = 1
+	ConditionArmKind_CONDITION_ARM_KIND_ELSE_IF     ConditionArmKind = 2
+	ConditionArmKind_CONDITION_ARM_KIND_ELSE        ConditionArmKind = 3
+	ConditionArmKind_CONDITION_ARM_KIND_CLAUSE      ConditionArmKind = 4
+	ConditionArmKind_CONDITION_ARM_KIND_CONSEQUENCE ConditionArmKind = 5
+	ConditionArmKind_CONDITION_ARM_KIND_ALTERNATIVE ConditionArmKind = 6
+)
+
+// Enum value maps for ConditionArmKind.
+var (
+	ConditionArmKind_name = map[int32]string{
+		0: "CONDITION_ARM_KIND_UNSPECIFIED",
+		1: "CONDITION_ARM_KIND_THEN",
+		2: "CONDITION_ARM_KIND_ELSE_IF",
+		3: "CONDITION_ARM_KIND_ELSE",
+		4: "CONDITION_ARM_KIND_CLAUSE",
+		5: "CONDITION_ARM_KIND_CONSEQUENCE",
+		6: "CONDITION_ARM_KIND_ALTERNATIVE",
+	}
+	ConditionArmKind_value = map[string]int32{
+		"CONDITION_ARM_KIND_UNSPECIFIED": 0,
+		"CONDITION_ARM_KIND_THEN":        1,
+		"CONDITION_ARM_KIND_ELSE_IF":     2,
+		"CONDITION_ARM_KIND_ELSE":        3,
+		"CONDITION_ARM_KIND_CLAUSE":      4,
+		"CONDITION_ARM_KIND_CONSEQUENCE": 5,
+		"CONDITION_ARM_KIND_ALTERNATIVE": 6,
+	}
+)
+
+func (x ConditionArmKind) Enum() *ConditionArmKind {
+	p := new(ConditionArmKind)
+	*p = x
+	return p
+}
+
+func (x ConditionArmKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ConditionArmKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_beholder_v1_daemon_proto_enumTypes[22].Descriptor()
+}
+
+func (ConditionArmKind) Type() protoreflect.EnumType {
+	return &file_beholder_v1_daemon_proto_enumTypes[22]
+}
+
+func (x ConditionArmKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ConditionArmKind.Descriptor instead.
+func (ConditionArmKind) EnumDescriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{22}
+}
+
+type PatternConstruct int32
+
+const (
+	PatternConstruct_PATTERN_CONSTRUCT_UNSPECIFIED       PatternConstruct = 0
+	PatternConstruct_PATTERN_CONSTRUCT_MATCH             PatternConstruct = 1
+	PatternConstruct_PATTERN_CONSTRUCT_CASE              PatternConstruct = 2
+	PatternConstruct_PATTERN_CONSTRUCT_SWITCH_STATEMENT  PatternConstruct = 3
+	PatternConstruct_PATTERN_CONSTRUCT_SWITCH_EXPRESSION PatternConstruct = 4
+)
+
+// Enum value maps for PatternConstruct.
+var (
+	PatternConstruct_name = map[int32]string{
+		0: "PATTERN_CONSTRUCT_UNSPECIFIED",
+		1: "PATTERN_CONSTRUCT_MATCH",
+		2: "PATTERN_CONSTRUCT_CASE",
+		3: "PATTERN_CONSTRUCT_SWITCH_STATEMENT",
+		4: "PATTERN_CONSTRUCT_SWITCH_EXPRESSION",
+	}
+	PatternConstruct_value = map[string]int32{
+		"PATTERN_CONSTRUCT_UNSPECIFIED":       0,
+		"PATTERN_CONSTRUCT_MATCH":             1,
+		"PATTERN_CONSTRUCT_CASE":              2,
+		"PATTERN_CONSTRUCT_SWITCH_STATEMENT":  3,
+		"PATTERN_CONSTRUCT_SWITCH_EXPRESSION": 4,
+	}
+)
+
+func (x PatternConstruct) Enum() *PatternConstruct {
+	p := new(PatternConstruct)
+	*p = x
+	return p
+}
+
+func (x PatternConstruct) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (PatternConstruct) Descriptor() protoreflect.EnumDescriptor {
+	return file_beholder_v1_daemon_proto_enumTypes[23].Descriptor()
+}
+
+func (PatternConstruct) Type() protoreflect.EnumType {
+	return &file_beholder_v1_daemon_proto_enumTypes[23]
+}
+
+func (x PatternConstruct) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use PatternConstruct.Descriptor instead.
+func (PatternConstruct) EnumDescriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{23}
+}
+
+type CallableClauseRole int32
+
+const (
+	CallableClauseRole_CALLABLE_CLAUSE_ROLE_UNSPECIFIED     CallableClauseRole = 0
+	CallableClauseRole_CALLABLE_CLAUSE_ROLE_DECLARATION     CallableClauseRole = 1
+	CallableClauseRole_CALLABLE_CLAUSE_ROLE_ENCLOSING       CallableClauseRole = 2
+	CallableClauseRole_CALLABLE_CLAUSE_ROLE_SELECTED_TARGET CallableClauseRole = 3
+)
+
+// Enum value maps for CallableClauseRole.
+var (
+	CallableClauseRole_name = map[int32]string{
+		0: "CALLABLE_CLAUSE_ROLE_UNSPECIFIED",
+		1: "CALLABLE_CLAUSE_ROLE_DECLARATION",
+		2: "CALLABLE_CLAUSE_ROLE_ENCLOSING",
+		3: "CALLABLE_CLAUSE_ROLE_SELECTED_TARGET",
+	}
+	CallableClauseRole_value = map[string]int32{
+		"CALLABLE_CLAUSE_ROLE_UNSPECIFIED":     0,
+		"CALLABLE_CLAUSE_ROLE_DECLARATION":     1,
+		"CALLABLE_CLAUSE_ROLE_ENCLOSING":       2,
+		"CALLABLE_CLAUSE_ROLE_SELECTED_TARGET": 3,
+	}
+)
+
+func (x CallableClauseRole) Enum() *CallableClauseRole {
+	p := new(CallableClauseRole)
+	*p = x
+	return p
+}
+
+func (x CallableClauseRole) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (CallableClauseRole) Descriptor() protoreflect.EnumDescriptor {
+	return file_beholder_v1_daemon_proto_enumTypes[24].Descriptor()
+}
+
+func (CallableClauseRole) Type() protoreflect.EnumType {
+	return &file_beholder_v1_daemon_proto_enumTypes[24]
+}
+
+func (x CallableClauseRole) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use CallableClauseRole.Descriptor instead.
+func (CallableClauseRole) EnumDescriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{24}
 }
 
 type ClearCacheRequest struct {
@@ -1711,12 +1937,13 @@ func (x *EntityRequest) GetWorkspace() string {
 }
 
 type SearchEntitiesRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Workspace     string                 `protobuf:"bytes,1,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	Query         string                 `protobuf:"bytes,2,opt,name=query,proto3" json:"query,omitempty"`
-	Limit         *uint32                `protobuf:"varint,3,opt,name=limit,proto3,oneof" json:"limit,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Workspace          string                 `protobuf:"bytes,1,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	Query              string                 `protobuf:"bytes,2,opt,name=query,proto3" json:"query,omitempty"`
+	Limit              *uint32                `protobuf:"varint,3,opt,name=limit,proto3,oneof" json:"limit,omitempty"`
+	IncludeDiagnostics *bool                  `protobuf:"varint,4,opt,name=include_diagnostics,json=includeDiagnostics,proto3,oneof" json:"include_diagnostics,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *SearchEntitiesRequest) Reset() {
@@ -1768,6 +1995,13 @@ func (x *SearchEntitiesRequest) GetLimit() uint32 {
 		return *x.Limit
 	}
 	return 0
+}
+
+func (x *SearchEntitiesRequest) GetIncludeDiagnostics() bool {
+	if x != nil && x.IncludeDiagnostics != nil {
+		return *x.IncludeDiagnostics
+	}
+	return false
 }
 
 type TraversalEntityRequest struct {
@@ -1951,14 +2185,15 @@ func (x *TraversalMetadata) GetTruncated() bool {
 }
 
 type QueryMetadata struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Revision      uint64                 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
-	View          string                 `protobuf:"bytes,2,opt,name=view,proto3" json:"view,omitempty"`
-	Freshness     *Freshness             `protobuf:"bytes,3,opt,name=freshness,proto3" json:"freshness,omitempty"`
-	Completeness  AnalysisCompleteness   `protobuf:"varint,4,opt,name=completeness,proto3,enum=beholder.v1.AnalysisCompleteness" json:"completeness,omitempty"`
-	Diagnostics   []*AnalysisDiagnostic  `protobuf:"bytes,5,rep,name=diagnostics,proto3" json:"diagnostics,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Revision         uint64                 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
+	View             string                 `protobuf:"bytes,2,opt,name=view,proto3" json:"view,omitempty"`
+	Freshness        *Freshness             `protobuf:"bytes,3,opt,name=freshness,proto3" json:"freshness,omitempty"`
+	Completeness     AnalysisCompleteness   `protobuf:"varint,4,opt,name=completeness,proto3,enum=beholder.v1.AnalysisCompleteness" json:"completeness,omitempty"`
+	Diagnostics      []*AnalysisDiagnostic  `protobuf:"bytes,5,rep,name=diagnostics,proto3" json:"diagnostics,omitempty"`
+	DiagnosticCounts *DiagnosticCounts      `protobuf:"bytes,6,opt,name=diagnostic_counts,json=diagnosticCounts,proto3" json:"diagnostic_counts,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *QueryMetadata) Reset() {
@@ -2026,6 +2261,73 @@ func (x *QueryMetadata) GetDiagnostics() []*AnalysisDiagnostic {
 	return nil
 }
 
+func (x *QueryMetadata) GetDiagnosticCounts() *DiagnosticCounts {
+	if x != nil {
+		return x.DiagnosticCounts
+	}
+	return nil
+}
+
+type DiagnosticCounts struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Total            uint64                 `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"`
+	KnownLimitations uint64                 `protobuf:"varint,2,opt,name=known_limitations,json=knownLimitations,proto3" json:"known_limitations,omitempty"`
+	Warnings         uint64                 `protobuf:"varint,3,opt,name=warnings,proto3" json:"warnings,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *DiagnosticCounts) Reset() {
+	*x = DiagnosticCounts{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiagnosticCounts) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiagnosticCounts) ProtoMessage() {}
+
+func (x *DiagnosticCounts) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiagnosticCounts.ProtoReflect.Descriptor instead.
+func (*DiagnosticCounts) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *DiagnosticCounts) GetTotal() uint64 {
+	if x != nil {
+		return x.Total
+	}
+	return 0
+}
+
+func (x *DiagnosticCounts) GetKnownLimitations() uint64 {
+	if x != nil {
+		return x.KnownLimitations
+	}
+	return 0
+}
+
+func (x *DiagnosticCounts) GetWarnings() uint64 {
+	if x != nil {
+		return x.Warnings
+	}
+	return 0
+}
+
 type GetWorkspaceTopologyRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Workspace     string                 `protobuf:"bytes,1,opt,name=workspace,proto3" json:"workspace,omitempty"`
@@ -2035,7 +2337,7 @@ type GetWorkspaceTopologyRequest struct {
 
 func (x *GetWorkspaceTopologyRequest) Reset() {
 	*x = GetWorkspaceTopologyRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[14]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2047,7 +2349,7 @@ func (x *GetWorkspaceTopologyRequest) String() string {
 func (*GetWorkspaceTopologyRequest) ProtoMessage() {}
 
 func (x *GetWorkspaceTopologyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[14]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2060,7 +2362,7 @@ func (x *GetWorkspaceTopologyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetWorkspaceTopologyRequest.ProtoReflect.Descriptor instead.
 func (*GetWorkspaceTopologyRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{14}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *GetWorkspaceTopologyRequest) GetWorkspace() string {
@@ -2082,7 +2384,7 @@ type GetWorkspaceTopologyResponse struct {
 
 func (x *GetWorkspaceTopologyResponse) Reset() {
 	*x = GetWorkspaceTopologyResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[15]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2094,7 +2396,7 @@ func (x *GetWorkspaceTopologyResponse) String() string {
 func (*GetWorkspaceTopologyResponse) ProtoMessage() {}
 
 func (x *GetWorkspaceTopologyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[15]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2107,7 +2409,7 @@ func (x *GetWorkspaceTopologyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetWorkspaceTopologyResponse.ProtoReflect.Descriptor instead.
 func (*GetWorkspaceTopologyResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{15}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *GetWorkspaceTopologyResponse) GetSchema() string {
@@ -2147,7 +2449,7 @@ type GetWorkspaceTopologyStatusRequest struct {
 
 func (x *GetWorkspaceTopologyStatusRequest) Reset() {
 	*x = GetWorkspaceTopologyStatusRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[16]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2159,7 +2461,7 @@ func (x *GetWorkspaceTopologyStatusRequest) String() string {
 func (*GetWorkspaceTopologyStatusRequest) ProtoMessage() {}
 
 func (x *GetWorkspaceTopologyStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[16]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2172,7 +2474,7 @@ func (x *GetWorkspaceTopologyStatusRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use GetWorkspaceTopologyStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetWorkspaceTopologyStatusRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{16}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *GetWorkspaceTopologyStatusRequest) GetWorkspace() string {
@@ -2191,7 +2493,7 @@ type GetWorkspaceTopologyStatusResponse struct {
 
 func (x *GetWorkspaceTopologyStatusResponse) Reset() {
 	*x = GetWorkspaceTopologyStatusResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[17]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2203,7 +2505,7 @@ func (x *GetWorkspaceTopologyStatusResponse) String() string {
 func (*GetWorkspaceTopologyStatusResponse) ProtoMessage() {}
 
 func (x *GetWorkspaceTopologyStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[17]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2216,7 +2518,7 @@ func (x *GetWorkspaceTopologyStatusResponse) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use GetWorkspaceTopologyStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetWorkspaceTopologyStatusResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{17}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GetWorkspaceTopologyStatusResponse) GetMetadata() *QueryMetadata {
@@ -2238,7 +2540,7 @@ type Freshness struct {
 
 func (x *Freshness) Reset() {
 	*x = Freshness{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[18]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2250,7 +2552,7 @@ func (x *Freshness) String() string {
 func (*Freshness) ProtoMessage() {}
 
 func (x *Freshness) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[18]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2263,7 +2565,7 @@ func (x *Freshness) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Freshness.ProtoReflect.Descriptor instead.
 func (*Freshness) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{18}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Freshness) GetStale() bool {
@@ -2308,7 +2610,7 @@ type AnalysisDiagnostic struct {
 
 func (x *AnalysisDiagnostic) Reset() {
 	*x = AnalysisDiagnostic{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[19]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2320,7 +2622,7 @@ func (x *AnalysisDiagnostic) String() string {
 func (*AnalysisDiagnostic) ProtoMessage() {}
 
 func (x *AnalysisDiagnostic) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[19]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2333,7 +2635,7 @@ func (x *AnalysisDiagnostic) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnalysisDiagnostic.ProtoReflect.Descriptor instead.
 func (*AnalysisDiagnostic) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{19}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *AnalysisDiagnostic) GetCode() string {
@@ -2393,7 +2695,7 @@ type EntityMetadata struct {
 
 func (x *EntityMetadata) Reset() {
 	*x = EntityMetadata{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[20]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2405,7 +2707,7 @@ func (x *EntityMetadata) String() string {
 func (*EntityMetadata) ProtoMessage() {}
 
 func (x *EntityMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[20]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2418,7 +2720,7 @@ func (x *EntityMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntityMetadata.ProtoReflect.Descriptor instead.
 func (*EntityMetadata) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{20}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *EntityMetadata) GetMetadata() isEntityMetadata_Metadata {
@@ -2507,7 +2809,7 @@ type Entity struct {
 
 func (x *Entity) Reset() {
 	*x = Entity{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[21]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2519,7 +2821,7 @@ func (x *Entity) String() string {
 func (*Entity) ProtoMessage() {}
 
 func (x *Entity) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[21]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2532,7 +2834,7 @@ func (x *Entity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Entity.ProtoReflect.Descriptor instead.
 func (*Entity) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{21}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *Entity) GetId() string {
@@ -2591,13 +2893,15 @@ type Evidence struct {
 	Path          *string                `protobuf:"bytes,3,opt,name=path,proto3,oneof" json:"path,omitempty"`
 	Line          *uint32                `protobuf:"varint,4,opt,name=line,proto3,oneof" json:"line,omitempty"`
 	Detail        *string                `protobuf:"bytes,5,opt,name=detail,proto3,oneof" json:"detail,omitempty"`
+	Range         *SourceRange           `protobuf:"bytes,6,opt,name=range,proto3,oneof" json:"range,omitempty"`
+	Contexts      []*EvidenceContext     `protobuf:"bytes,7,rep,name=contexts,proto3" json:"contexts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Evidence) Reset() {
 	*x = Evidence{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[22]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2609,7 +2913,7 @@ func (x *Evidence) String() string {
 func (*Evidence) ProtoMessage() {}
 
 func (x *Evidence) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[22]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2622,7 +2926,7 @@ func (x *Evidence) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Evidence.ProtoReflect.Descriptor instead.
 func (*Evidence) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{22}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *Evidence) GetSource() EvidenceKind {
@@ -2660,6 +2964,20 @@ func (x *Evidence) GetDetail() string {
 	return ""
 }
 
+func (x *Evidence) GetRange() *SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+func (x *Evidence) GetContexts() []*EvidenceContext {
+	if x != nil {
+		return x.Contexts
+	}
+	return nil
+}
+
 type Edge struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -2674,7 +2992,7 @@ type Edge struct {
 
 func (x *Edge) Reset() {
 	*x = Edge{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[23]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2686,7 +3004,7 @@ func (x *Edge) String() string {
 func (*Edge) ProtoMessage() {}
 
 func (x *Edge) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[23]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2699,7 +3017,7 @@ func (x *Edge) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Edge.ProtoReflect.Descriptor instead.
 func (*Edge) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{23}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *Edge) GetId() string {
@@ -2754,7 +3072,7 @@ type SemanticPath struct {
 
 func (x *SemanticPath) Reset() {
 	*x = SemanticPath{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[24]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2766,7 +3084,7 @@ func (x *SemanticPath) String() string {
 func (*SemanticPath) ProtoMessage() {}
 
 func (x *SemanticPath) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[24]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2779,7 +3097,7 @@ func (x *SemanticPath) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SemanticPath.ProtoReflect.Descriptor instead.
 func (*SemanticPath) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{24}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *SemanticPath) GetNodes() []string {
@@ -2805,7 +3123,7 @@ type EntityQuery struct {
 
 func (x *EntityQuery) Reset() {
 	*x = EntityQuery{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[25]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2817,7 +3135,7 @@ func (x *EntityQuery) String() string {
 func (*EntityQuery) ProtoMessage() {}
 
 func (x *EntityQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[25]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2830,7 +3148,7 @@ func (x *EntityQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntityQuery.ProtoReflect.Descriptor instead.
 func (*EntityQuery) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{25}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *EntityQuery) GetEntity() string {
@@ -2850,7 +3168,7 @@ type EntitySearchQuery struct {
 
 func (x *EntitySearchQuery) Reset() {
 	*x = EntitySearchQuery{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[26]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2862,7 +3180,7 @@ func (x *EntitySearchQuery) String() string {
 func (*EntitySearchQuery) ProtoMessage() {}
 
 func (x *EntitySearchQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[26]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2875,7 +3193,7 @@ func (x *EntitySearchQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntitySearchQuery.ProtoReflect.Descriptor instead.
 func (*EntitySearchQuery) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{26}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *EntitySearchQuery) GetQuery() string {
@@ -2904,7 +3222,7 @@ type SearchEntitiesResponse struct {
 
 func (x *SearchEntitiesResponse) Reset() {
 	*x = SearchEntitiesResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[27]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2916,7 +3234,7 @@ func (x *SearchEntitiesResponse) String() string {
 func (*SearchEntitiesResponse) ProtoMessage() {}
 
 func (x *SearchEntitiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[27]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2929,7 +3247,7 @@ func (x *SearchEntitiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchEntitiesResponse.ProtoReflect.Descriptor instead.
 func (*SearchEntitiesResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{27}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *SearchEntitiesResponse) GetSchema() string {
@@ -2970,7 +3288,7 @@ type SemanticPathQuery struct {
 
 func (x *SemanticPathQuery) Reset() {
 	*x = SemanticPathQuery{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[28]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2982,7 +3300,7 @@ func (x *SemanticPathQuery) String() string {
 func (*SemanticPathQuery) ProtoMessage() {}
 
 func (x *SemanticPathQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[28]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2995,7 +3313,7 @@ func (x *SemanticPathQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SemanticPathQuery.ProtoReflect.Descriptor instead.
 func (*SemanticPathQuery) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{28}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *SemanticPathQuery) GetFrom() string {
@@ -3026,7 +3344,7 @@ type ContextResponse struct {
 
 func (x *ContextResponse) Reset() {
 	*x = ContextResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[29]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3038,7 +3356,7 @@ func (x *ContextResponse) String() string {
 func (*ContextResponse) ProtoMessage() {}
 
 func (x *ContextResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[29]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3051,7 +3369,7 @@ func (x *ContextResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContextResponse.ProtoReflect.Descriptor instead.
 func (*ContextResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{29}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ContextResponse) GetSchema() string {
@@ -3106,7 +3424,7 @@ type Dependency struct {
 
 func (x *Dependency) Reset() {
 	*x = Dependency{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[30]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3118,7 +3436,7 @@ func (x *Dependency) String() string {
 func (*Dependency) ProtoMessage() {}
 
 func (x *Dependency) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[30]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3131,7 +3449,7 @@ func (x *Dependency) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Dependency.ProtoReflect.Descriptor instead.
 func (*Dependency) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{30}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *Dependency) GetEntity() string {
@@ -3164,7 +3482,7 @@ type DependenciesResponse struct {
 
 func (x *DependenciesResponse) Reset() {
 	*x = DependenciesResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[31]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3176,7 +3494,7 @@ func (x *DependenciesResponse) String() string {
 func (*DependenciesResponse) ProtoMessage() {}
 
 func (x *DependenciesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[31]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3189,7 +3507,7 @@ func (x *DependenciesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DependenciesResponse.ProtoReflect.Descriptor instead.
 func (*DependenciesResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{31}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *DependenciesResponse) GetSchema() string {
@@ -3258,7 +3576,7 @@ type Impact struct {
 
 func (x *Impact) Reset() {
 	*x = Impact{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[32]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3270,7 +3588,7 @@ func (x *Impact) String() string {
 func (*Impact) ProtoMessage() {}
 
 func (x *Impact) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[32]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3283,7 +3601,7 @@ func (x *Impact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Impact.ProtoReflect.Descriptor instead.
 func (*Impact) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{32}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *Impact) GetEntity() string {
@@ -3316,7 +3634,7 @@ type ImpactResponse struct {
 
 func (x *ImpactResponse) Reset() {
 	*x = ImpactResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[33]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3328,7 +3646,7 @@ func (x *ImpactResponse) String() string {
 func (*ImpactResponse) ProtoMessage() {}
 
 func (x *ImpactResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[33]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3341,7 +3659,7 @@ func (x *ImpactResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImpactResponse.ProtoReflect.Descriptor instead.
 func (*ImpactResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{33}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ImpactResponse) GetSchema() string {
@@ -3415,7 +3733,7 @@ type TraceResponse struct {
 
 func (x *TraceResponse) Reset() {
 	*x = TraceResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[34]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3427,7 +3745,7 @@ func (x *TraceResponse) String() string {
 func (*TraceResponse) ProtoMessage() {}
 
 func (x *TraceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[34]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3440,7 +3758,7 @@ func (x *TraceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TraceResponse.ProtoReflect.Descriptor instead.
 func (*TraceResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{34}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *TraceResponse) GetSchema() string {
@@ -3507,7 +3825,7 @@ type WhyResponse struct {
 
 func (x *WhyResponse) Reset() {
 	*x = WhyResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[35]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3519,7 +3837,7 @@ func (x *WhyResponse) String() string {
 func (*WhyResponse) ProtoMessage() {}
 
 func (x *WhyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[35]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3532,7 +3850,7 @@ func (x *WhyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WhyResponse.ProtoReflect.Descriptor instead.
 func (*WhyResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{35}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *WhyResponse) GetSchema() string {
@@ -3596,7 +3914,7 @@ type Workspace struct {
 
 func (x *Workspace) Reset() {
 	*x = Workspace{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[36]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3608,7 +3926,7 @@ func (x *Workspace) String() string {
 func (*Workspace) ProtoMessage() {}
 
 func (x *Workspace) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[36]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3621,7 +3939,7 @@ func (x *Workspace) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Workspace.ProtoReflect.Descriptor instead.
 func (*Workspace) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{36}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *Workspace) GetName() string {
@@ -3662,7 +3980,7 @@ type ProtobufDescriptorSource struct {
 
 func (x *ProtobufDescriptorSource) Reset() {
 	*x = ProtobufDescriptorSource{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[37]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3674,7 +3992,7 @@ func (x *ProtobufDescriptorSource) String() string {
 func (*ProtobufDescriptorSource) ProtoMessage() {}
 
 func (x *ProtobufDescriptorSource) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[37]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3687,7 +4005,7 @@ func (x *ProtobufDescriptorSource) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProtobufDescriptorSource.ProtoReflect.Descriptor instead.
 func (*ProtobufDescriptorSource) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{37}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *ProtobufDescriptorSource) GetRepository() string {
@@ -3716,7 +4034,7 @@ type WorkspaceRepository struct {
 
 func (x *WorkspaceRepository) Reset() {
 	*x = WorkspaceRepository{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[38]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3728,7 +4046,7 @@ func (x *WorkspaceRepository) String() string {
 func (*WorkspaceRepository) ProtoMessage() {}
 
 func (x *WorkspaceRepository) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[38]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3741,7 +4059,7 @@ func (x *WorkspaceRepository) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkspaceRepository.ProtoReflect.Descriptor instead.
 func (*WorkspaceRepository) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{38}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *WorkspaceRepository) GetIdentity() string {
@@ -3784,7 +4102,7 @@ type RegisterWorkspaceRequest struct {
 
 func (x *RegisterWorkspaceRequest) Reset() {
 	*x = RegisterWorkspaceRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[39]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3796,7 +4114,7 @@ func (x *RegisterWorkspaceRequest) String() string {
 func (*RegisterWorkspaceRequest) ProtoMessage() {}
 
 func (x *RegisterWorkspaceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[39]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3809,7 +4127,7 @@ func (x *RegisterWorkspaceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterWorkspaceRequest.ProtoReflect.Descriptor instead.
 func (*RegisterWorkspaceRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{39}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *RegisterWorkspaceRequest) GetName() string {
@@ -3849,7 +4167,7 @@ type RegisterWorkspaceResponse struct {
 
 func (x *RegisterWorkspaceResponse) Reset() {
 	*x = RegisterWorkspaceResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[40]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3861,7 +4179,7 @@ func (x *RegisterWorkspaceResponse) String() string {
 func (*RegisterWorkspaceResponse) ProtoMessage() {}
 
 func (x *RegisterWorkspaceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[40]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3874,7 +4192,7 @@ func (x *RegisterWorkspaceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterWorkspaceResponse.ProtoReflect.Descriptor instead.
 func (*RegisterWorkspaceResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{40}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *RegisterWorkspaceResponse) GetWorkspace() *Workspace {
@@ -3895,7 +4213,7 @@ type SetWorkspacePluginRequest struct {
 
 func (x *SetWorkspacePluginRequest) Reset() {
 	*x = SetWorkspacePluginRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[41]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3907,7 +4225,7 @@ func (x *SetWorkspacePluginRequest) String() string {
 func (*SetWorkspacePluginRequest) ProtoMessage() {}
 
 func (x *SetWorkspacePluginRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[41]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3920,7 +4238,7 @@ func (x *SetWorkspacePluginRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetWorkspacePluginRequest.ProtoReflect.Descriptor instead.
 func (*SetWorkspacePluginRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{41}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *SetWorkspacePluginRequest) GetWorkspace() string {
@@ -3953,7 +4271,7 @@ type SetWorkspacePluginResponse struct {
 
 func (x *SetWorkspacePluginResponse) Reset() {
 	*x = SetWorkspacePluginResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[42]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3965,7 +4283,7 @@ func (x *SetWorkspacePluginResponse) String() string {
 func (*SetWorkspacePluginResponse) ProtoMessage() {}
 
 func (x *SetWorkspacePluginResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[42]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3978,7 +4296,7 @@ func (x *SetWorkspacePluginResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetWorkspacePluginResponse.ProtoReflect.Descriptor instead.
 func (*SetWorkspacePluginResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{42}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *SetWorkspacePluginResponse) GetWorkspace() *Workspace {
@@ -3996,7 +4314,7 @@ type ListWorkspacesRequest struct {
 
 func (x *ListWorkspacesRequest) Reset() {
 	*x = ListWorkspacesRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[43]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4008,7 +4326,7 @@ func (x *ListWorkspacesRequest) String() string {
 func (*ListWorkspacesRequest) ProtoMessage() {}
 
 func (x *ListWorkspacesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[43]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4021,7 +4339,7 @@ func (x *ListWorkspacesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListWorkspacesRequest.ProtoReflect.Descriptor instead.
 func (*ListWorkspacesRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{43}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{44}
 }
 
 type ListWorkspacesResponse struct {
@@ -4033,7 +4351,7 @@ type ListWorkspacesResponse struct {
 
 func (x *ListWorkspacesResponse) Reset() {
 	*x = ListWorkspacesResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[44]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4045,7 +4363,7 @@ func (x *ListWorkspacesResponse) String() string {
 func (*ListWorkspacesResponse) ProtoMessage() {}
 
 func (x *ListWorkspacesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[44]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4058,7 +4376,7 @@ func (x *ListWorkspacesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListWorkspacesResponse.ProtoReflect.Descriptor instead.
 func (*ListWorkspacesResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{44}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *ListWorkspacesResponse) GetWorkspaces() []*Workspace {
@@ -4081,7 +4399,7 @@ type RepositoryRevision struct {
 
 func (x *RepositoryRevision) Reset() {
 	*x = RepositoryRevision{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[45]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4093,7 +4411,7 @@ func (x *RepositoryRevision) String() string {
 func (*RepositoryRevision) ProtoMessage() {}
 
 func (x *RepositoryRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[45]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4106,7 +4424,7 @@ func (x *RepositoryRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryRevision.ProtoReflect.Descriptor instead.
 func (*RepositoryRevision) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{45}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *RepositoryRevision) GetSourceState() string {
@@ -4155,7 +4473,7 @@ type RepositoryStatus struct {
 
 func (x *RepositoryStatus) Reset() {
 	*x = RepositoryStatus{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[46]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4167,7 +4485,7 @@ func (x *RepositoryStatus) String() string {
 func (*RepositoryStatus) ProtoMessage() {}
 
 func (x *RepositoryStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[46]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4180,7 +4498,7 @@ func (x *RepositoryStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryStatus.ProtoReflect.Descriptor instead.
 func (*RepositoryStatus) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{46}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *RepositoryStatus) GetRepository() *WorkspaceRepository {
@@ -4213,7 +4531,7 @@ type RegisterRepositoryRequest struct {
 
 func (x *RegisterRepositoryRequest) Reset() {
 	*x = RegisterRepositoryRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[47]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4225,7 +4543,7 @@ func (x *RegisterRepositoryRequest) String() string {
 func (*RegisterRepositoryRequest) ProtoMessage() {}
 
 func (x *RegisterRepositoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[47]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4238,7 +4556,7 @@ func (x *RegisterRepositoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterRepositoryRequest.ProtoReflect.Descriptor instead.
 func (*RegisterRepositoryRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{47}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *RegisterRepositoryRequest) GetPath() string {
@@ -4257,7 +4575,7 @@ type DeleteRepositoryRequest struct {
 
 func (x *DeleteRepositoryRequest) Reset() {
 	*x = DeleteRepositoryRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[48]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4269,7 +4587,7 @@ func (x *DeleteRepositoryRequest) String() string {
 func (*DeleteRepositoryRequest) ProtoMessage() {}
 
 func (x *DeleteRepositoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[48]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4282,7 +4600,7 @@ func (x *DeleteRepositoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteRepositoryRequest.ProtoReflect.Descriptor instead.
 func (*DeleteRepositoryRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{48}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *DeleteRepositoryRequest) GetIdentity() string {
@@ -4301,7 +4619,7 @@ type DeleteRepositoryResponse struct {
 
 func (x *DeleteRepositoryResponse) Reset() {
 	*x = DeleteRepositoryResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[49]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4313,7 +4631,7 @@ func (x *DeleteRepositoryResponse) String() string {
 func (*DeleteRepositoryResponse) ProtoMessage() {}
 
 func (x *DeleteRepositoryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[49]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4326,7 +4644,7 @@ func (x *DeleteRepositoryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteRepositoryResponse.ProtoReflect.Descriptor instead.
 func (*DeleteRepositoryResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{49}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *DeleteRepositoryResponse) GetRepositoryStatesQueued() uint64 {
@@ -4345,7 +4663,7 @@ type GetRepositoryRequest struct {
 
 func (x *GetRepositoryRequest) Reset() {
 	*x = GetRepositoryRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[50]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4357,7 +4675,7 @@ func (x *GetRepositoryRequest) String() string {
 func (*GetRepositoryRequest) ProtoMessage() {}
 
 func (x *GetRepositoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[50]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4370,7 +4688,7 @@ func (x *GetRepositoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRepositoryRequest.ProtoReflect.Descriptor instead.
 func (*GetRepositoryRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{50}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *GetRepositoryRequest) GetIdentity() string {
@@ -4389,7 +4707,7 @@ type RepositoryResponse struct {
 
 func (x *RepositoryResponse) Reset() {
 	*x = RepositoryResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[51]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4401,7 +4719,7 @@ func (x *RepositoryResponse) String() string {
 func (*RepositoryResponse) ProtoMessage() {}
 
 func (x *RepositoryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[51]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4414,7 +4732,7 @@ func (x *RepositoryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryResponse.ProtoReflect.Descriptor instead.
 func (*RepositoryResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{51}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *RepositoryResponse) GetRepository() *RepositoryStatus {
@@ -4432,7 +4750,7 @@ type StopRequest struct {
 
 func (x *StopRequest) Reset() {
 	*x = StopRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[52]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4444,7 +4762,7 @@ func (x *StopRequest) String() string {
 func (*StopRequest) ProtoMessage() {}
 
 func (x *StopRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[52]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4457,7 +4775,7 @@ func (x *StopRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopRequest.ProtoReflect.Descriptor instead.
 func (*StopRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{52}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{53}
 }
 
 type StopResponse struct {
@@ -4469,7 +4787,7 @@ type StopResponse struct {
 
 func (x *StopResponse) Reset() {
 	*x = StopResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[53]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4481,7 +4799,7 @@ func (x *StopResponse) String() string {
 func (*StopResponse) ProtoMessage() {}
 
 func (x *StopResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[53]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4494,7 +4812,7 @@ func (x *StopResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopResponse.ProtoReflect.Descriptor instead.
 func (*StopResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{53}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *StopResponse) GetAccepted() bool {
@@ -4512,7 +4830,7 @@ type GetStatusRequest struct {
 
 func (x *GetStatusRequest) Reset() {
 	*x = GetStatusRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[54]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4524,7 +4842,7 @@ func (x *GetStatusRequest) String() string {
 func (*GetStatusRequest) ProtoMessage() {}
 
 func (x *GetStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[54]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4537,7 +4855,7 @@ func (x *GetStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetStatusRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{54}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{55}
 }
 
 type GetStatusResponse struct {
@@ -4551,7 +4869,7 @@ type GetStatusResponse struct {
 
 func (x *GetStatusResponse) Reset() {
 	*x = GetStatusResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[55]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4563,7 +4881,7 @@ func (x *GetStatusResponse) String() string {
 func (*GetStatusResponse) ProtoMessage() {}
 
 func (x *GetStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[55]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4576,7 +4894,7 @@ func (x *GetStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetStatusResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{55}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *GetStatusResponse) GetStatus() string {
@@ -4609,7 +4927,7 @@ type ListJobsRequest struct {
 
 func (x *ListJobsRequest) Reset() {
 	*x = ListJobsRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[56]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4621,7 +4939,7 @@ func (x *ListJobsRequest) String() string {
 func (*ListJobsRequest) ProtoMessage() {}
 
 func (x *ListJobsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[56]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4634,7 +4952,7 @@ func (x *ListJobsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobsRequest.ProtoReflect.Descriptor instead.
 func (*ListJobsRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{56}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *ListJobsRequest) GetPageToken() string {
@@ -4654,7 +4972,7 @@ type ListJobsResponse struct {
 
 func (x *ListJobsResponse) Reset() {
 	*x = ListJobsResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[57]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4666,7 +4984,7 @@ func (x *ListJobsResponse) String() string {
 func (*ListJobsResponse) ProtoMessage() {}
 
 func (x *ListJobsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[57]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4679,7 +4997,7 @@ func (x *ListJobsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobsResponse.ProtoReflect.Descriptor instead.
 func (*ListJobsResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{57}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *ListJobsResponse) GetJobs() []*JobSummary {
@@ -4705,7 +5023,7 @@ type GetJobRequest struct {
 
 func (x *GetJobRequest) Reset() {
 	*x = GetJobRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[58]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4717,7 +5035,7 @@ func (x *GetJobRequest) String() string {
 func (*GetJobRequest) ProtoMessage() {}
 
 func (x *GetJobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[58]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4730,7 +5048,7 @@ func (x *GetJobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetJobRequest.ProtoReflect.Descriptor instead.
 func (*GetJobRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{58}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *GetJobRequest) GetId() string {
@@ -4749,7 +5067,7 @@ type GetJobResponse struct {
 
 func (x *GetJobResponse) Reset() {
 	*x = GetJobResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[59]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4761,7 +5079,7 @@ func (x *GetJobResponse) String() string {
 func (*GetJobResponse) ProtoMessage() {}
 
 func (x *GetJobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[59]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4774,7 +5092,7 @@ func (x *GetJobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetJobResponse.ProtoReflect.Descriptor instead.
 func (*GetJobResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{59}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *GetJobResponse) GetJob() *Job {
@@ -4797,7 +5115,7 @@ type SubmitIndexRequest struct {
 
 func (x *SubmitIndexRequest) Reset() {
 	*x = SubmitIndexRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[60]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4809,7 +5127,7 @@ func (x *SubmitIndexRequest) String() string {
 func (*SubmitIndexRequest) ProtoMessage() {}
 
 func (x *SubmitIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[60]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4822,7 +5140,7 @@ func (x *SubmitIndexRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitIndexRequest.ProtoReflect.Descriptor instead.
 func (*SubmitIndexRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{60}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *SubmitIndexRequest) GetTarget() isSubmitIndexRequest_Target {
@@ -4876,7 +5194,7 @@ type RepositoryIndexTarget struct {
 
 func (x *RepositoryIndexTarget) Reset() {
 	*x = RepositoryIndexTarget{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[61]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4888,7 +5206,7 @@ func (x *RepositoryIndexTarget) String() string {
 func (*RepositoryIndexTarget) ProtoMessage() {}
 
 func (x *RepositoryIndexTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[61]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4901,7 +5219,7 @@ func (x *RepositoryIndexTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryIndexTarget.ProtoReflect.Descriptor instead.
 func (*RepositoryIndexTarget) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{61}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *RepositoryIndexTarget) GetRepository() string {
@@ -4928,7 +5246,7 @@ type SubmitIndexResponse struct {
 
 func (x *SubmitIndexResponse) Reset() {
 	*x = SubmitIndexResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[62]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4940,7 +5258,7 @@ func (x *SubmitIndexResponse) String() string {
 func (*SubmitIndexResponse) ProtoMessage() {}
 
 func (x *SubmitIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[62]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4953,7 +5271,7 @@ func (x *SubmitIndexResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitIndexResponse.ProtoReflect.Descriptor instead.
 func (*SubmitIndexResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{62}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *SubmitIndexResponse) GetJob() *JobSummary {
@@ -4981,7 +5299,7 @@ type SubmitEnrichmentRequest struct {
 
 func (x *SubmitEnrichmentRequest) Reset() {
 	*x = SubmitEnrichmentRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[63]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4993,7 +5311,7 @@ func (x *SubmitEnrichmentRequest) String() string {
 func (*SubmitEnrichmentRequest) ProtoMessage() {}
 
 func (x *SubmitEnrichmentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[63]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5006,7 +5324,7 @@ func (x *SubmitEnrichmentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitEnrichmentRequest.ProtoReflect.Descriptor instead.
 func (*SubmitEnrichmentRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{63}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *SubmitEnrichmentRequest) GetRepository() string {
@@ -5041,7 +5359,7 @@ type EnrichmentSubmission struct {
 
 func (x *EnrichmentSubmission) Reset() {
 	*x = EnrichmentSubmission{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[64]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5053,7 +5371,7 @@ func (x *EnrichmentSubmission) String() string {
 func (*EnrichmentSubmission) ProtoMessage() {}
 
 func (x *EnrichmentSubmission) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[64]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5066,7 +5384,7 @@ func (x *EnrichmentSubmission) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnrichmentSubmission.ProtoReflect.Descriptor instead.
 func (*EnrichmentSubmission) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{64}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *EnrichmentSubmission) GetTarget() *JobTarget {
@@ -5100,7 +5418,7 @@ type SubmitEnrichmentResponse struct {
 
 func (x *SubmitEnrichmentResponse) Reset() {
 	*x = SubmitEnrichmentResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[65]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5112,7 +5430,7 @@ func (x *SubmitEnrichmentResponse) String() string {
 func (*SubmitEnrichmentResponse) ProtoMessage() {}
 
 func (x *SubmitEnrichmentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[65]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5125,7 +5443,7 @@ func (x *SubmitEnrichmentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitEnrichmentResponse.ProtoReflect.Descriptor instead.
 func (*SubmitEnrichmentResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{65}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *SubmitEnrichmentResponse) GetResults() []*EnrichmentSubmission {
@@ -5157,7 +5475,7 @@ type JobTarget struct {
 
 func (x *JobTarget) Reset() {
 	*x = JobTarget{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[66]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5169,7 +5487,7 @@ func (x *JobTarget) String() string {
 func (*JobTarget) ProtoMessage() {}
 
 func (x *JobTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[66]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5182,7 +5500,7 @@ func (x *JobTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobTarget.ProtoReflect.Descriptor instead.
 func (*JobTarget) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{66}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *JobTarget) GetTarget() isJobTarget_Target {
@@ -5254,7 +5572,7 @@ type JobSummary struct {
 
 func (x *JobSummary) Reset() {
 	*x = JobSummary{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[67]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5266,7 +5584,7 @@ func (x *JobSummary) String() string {
 func (*JobSummary) ProtoMessage() {}
 
 func (x *JobSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[67]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5279,7 +5597,7 @@ func (x *JobSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JobSummary.ProtoReflect.Descriptor instead.
 func (*JobSummary) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{67}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *JobSummary) GetId() string {
@@ -5337,7 +5655,7 @@ type IndexDestination struct {
 
 func (x *IndexDestination) Reset() {
 	*x = IndexDestination{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[68]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5349,7 +5667,7 @@ func (x *IndexDestination) String() string {
 func (*IndexDestination) ProtoMessage() {}
 
 func (x *IndexDestination) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[68]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5362,7 +5680,7 @@ func (x *IndexDestination) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IndexDestination.ProtoReflect.Descriptor instead.
 func (*IndexDestination) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{68}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *IndexDestination) GetDestination() isIndexDestination_Destination {
@@ -5418,7 +5736,7 @@ type IndexDestinationResult struct {
 
 func (x *IndexDestinationResult) Reset() {
 	*x = IndexDestinationResult{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[69]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5430,7 +5748,7 @@ func (x *IndexDestinationResult) String() string {
 func (*IndexDestinationResult) ProtoMessage() {}
 
 func (x *IndexDestinationResult) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[69]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5443,7 +5761,7 @@ func (x *IndexDestinationResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IndexDestinationResult.ProtoReflect.Descriptor instead.
 func (*IndexDestinationResult) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{69}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *IndexDestinationResult) GetDestination() *IndexDestination {
@@ -5483,7 +5801,7 @@ type IndexJobResult struct {
 
 func (x *IndexJobResult) Reset() {
 	*x = IndexJobResult{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[70]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5495,7 +5813,7 @@ func (x *IndexJobResult) String() string {
 func (*IndexJobResult) ProtoMessage() {}
 
 func (x *IndexJobResult) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[70]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5508,7 +5826,7 @@ func (x *IndexJobResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IndexJobResult.ProtoReflect.Descriptor instead.
 func (*IndexJobResult) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{70}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *IndexJobResult) GetDestinations() []*IndexDestinationResult {
@@ -5530,7 +5848,7 @@ type EnrichmentJobResult struct {
 
 func (x *EnrichmentJobResult) Reset() {
 	*x = EnrichmentJobResult{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[71]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5542,7 +5860,7 @@ func (x *EnrichmentJobResult) String() string {
 func (*EnrichmentJobResult) ProtoMessage() {}
 
 func (x *EnrichmentJobResult) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[71]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5555,7 +5873,7 @@ func (x *EnrichmentJobResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnrichmentJobResult.ProtoReflect.Descriptor instead.
 func (*EnrichmentJobResult) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{71}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *EnrichmentJobResult) GetTarget() *JobTarget {
@@ -5606,7 +5924,7 @@ type Job struct {
 
 func (x *Job) Reset() {
 	*x = Job{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[72]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5618,7 +5936,7 @@ func (x *Job) String() string {
 func (*Job) ProtoMessage() {}
 
 func (x *Job) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[72]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5631,7 +5949,7 @@ func (x *Job) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Job.ProtoReflect.Descriptor instead.
 func (*Job) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{72}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *Job) GetSummary() *JobSummary {
@@ -5719,20 +6037,22 @@ func (x *Job) GetEnrichmentResult() *EnrichmentJobResult {
 }
 
 type TraverseGraphRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Workspace     string                 `protobuf:"bytes,1,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	Start         string                 `protobuf:"bytes,2,opt,name=start,proto3" json:"start,omitempty"`
-	Direction     GraphDirection         `protobuf:"varint,3,opt,name=direction,proto3,enum=beholder.v1.GraphDirection" json:"direction,omitempty"`
-	Destination   *string                `protobuf:"bytes,4,opt,name=destination,proto3,oneof" json:"destination,omitempty"`
-	MaxHops       *uint32                `protobuf:"varint,5,opt,name=max_hops,json=maxHops,proto3,oneof" json:"max_hops,omitempty"`
-	MaxPaths      *uint32                `protobuf:"varint,6,opt,name=max_paths,json=maxPaths,proto3,oneof" json:"max_paths,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Workspace          string                 `protobuf:"bytes,1,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	Start              string                 `protobuf:"bytes,2,opt,name=start,proto3" json:"start,omitempty"`
+	Direction          GraphDirection         `protobuf:"varint,3,opt,name=direction,proto3,enum=beholder.v1.GraphDirection" json:"direction,omitempty"`
+	Destination        *string                `protobuf:"bytes,4,opt,name=destination,proto3,oneof" json:"destination,omitempty"`
+	MaxHops            *uint32                `protobuf:"varint,5,opt,name=max_hops,json=maxHops,proto3,oneof" json:"max_hops,omitempty"`
+	MaxPaths           *uint32                `protobuf:"varint,6,opt,name=max_paths,json=maxPaths,proto3,oneof" json:"max_paths,omitempty"`
+	TargetRepositories []string               `protobuf:"bytes,7,rep,name=target_repositories,json=targetRepositories,proto3" json:"target_repositories,omitempty"`
+	IncludeDiagnostics *bool                  `protobuf:"varint,8,opt,name=include_diagnostics,json=includeDiagnostics,proto3,oneof" json:"include_diagnostics,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *TraverseGraphRequest) Reset() {
 	*x = TraverseGraphRequest{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[73]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5744,7 +6064,7 @@ func (x *TraverseGraphRequest) String() string {
 func (*TraverseGraphRequest) ProtoMessage() {}
 
 func (x *TraverseGraphRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[73]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5757,7 +6077,7 @@ func (x *TraverseGraphRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TraverseGraphRequest.ProtoReflect.Descriptor instead.
 func (*TraverseGraphRequest) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{73}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *TraverseGraphRequest) GetWorkspace() string {
@@ -5802,20 +6122,35 @@ func (x *TraverseGraphRequest) GetMaxPaths() uint32 {
 	return 0
 }
 
+func (x *TraverseGraphRequest) GetTargetRepositories() []string {
+	if x != nil {
+		return x.TargetRepositories
+	}
+	return nil
+}
+
+func (x *TraverseGraphRequest) GetIncludeDiagnostics() bool {
+	if x != nil && x.IncludeDiagnostics != nil {
+		return *x.IncludeDiagnostics
+	}
+	return false
+}
+
 type TraverseGraphQuery struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Start         string                 `protobuf:"bytes,1,opt,name=start,proto3" json:"start,omitempty"`
-	Direction     GraphDirection         `protobuf:"varint,2,opt,name=direction,proto3,enum=beholder.v1.GraphDirection" json:"direction,omitempty"`
-	Destination   *string                `protobuf:"bytes,3,opt,name=destination,proto3,oneof" json:"destination,omitempty"`
-	MaxHops       uint32                 `protobuf:"varint,4,opt,name=max_hops,json=maxHops,proto3" json:"max_hops,omitempty"`
-	MaxPaths      uint32                 `protobuf:"varint,5,opt,name=max_paths,json=maxPaths,proto3" json:"max_paths,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Start              string                 `protobuf:"bytes,1,opt,name=start,proto3" json:"start,omitempty"`
+	Direction          GraphDirection         `protobuf:"varint,2,opt,name=direction,proto3,enum=beholder.v1.GraphDirection" json:"direction,omitempty"`
+	Destination        *string                `protobuf:"bytes,3,opt,name=destination,proto3,oneof" json:"destination,omitempty"`
+	MaxHops            uint32                 `protobuf:"varint,4,opt,name=max_hops,json=maxHops,proto3" json:"max_hops,omitempty"`
+	MaxPaths           uint32                 `protobuf:"varint,5,opt,name=max_paths,json=maxPaths,proto3" json:"max_paths,omitempty"`
+	TargetRepositories []string               `protobuf:"bytes,6,rep,name=target_repositories,json=targetRepositories,proto3" json:"target_repositories,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *TraverseGraphQuery) Reset() {
 	*x = TraverseGraphQuery{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[74]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5827,7 +6162,7 @@ func (x *TraverseGraphQuery) String() string {
 func (*TraverseGraphQuery) ProtoMessage() {}
 
 func (x *TraverseGraphQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[74]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5840,7 +6175,7 @@ func (x *TraverseGraphQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TraverseGraphQuery.ProtoReflect.Descriptor instead.
 func (*TraverseGraphQuery) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{74}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *TraverseGraphQuery) GetStart() string {
@@ -5878,6 +6213,13 @@ func (x *TraverseGraphQuery) GetMaxPaths() uint32 {
 	return 0
 }
 
+func (x *TraverseGraphQuery) GetTargetRepositories() []string {
+	if x != nil {
+		return x.TargetRepositories
+	}
+	return nil
+}
+
 type TraversalPath struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Nodes         []string               `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
@@ -5889,7 +6231,7 @@ type TraversalPath struct {
 
 func (x *TraversalPath) Reset() {
 	*x = TraversalPath{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[75]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5901,7 +6243,7 @@ func (x *TraversalPath) String() string {
 func (*TraversalPath) ProtoMessage() {}
 
 func (x *TraversalPath) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[75]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5914,7 +6256,7 @@ func (x *TraversalPath) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TraversalPath.ProtoReflect.Descriptor instead.
 func (*TraversalPath) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{75}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *TraversalPath) GetNodes() []string {
@@ -5953,7 +6295,7 @@ type GraphTraversalMetadata struct {
 
 func (x *GraphTraversalMetadata) Reset() {
 	*x = GraphTraversalMetadata{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[76]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5965,7 +6307,7 @@ func (x *GraphTraversalMetadata) String() string {
 func (*GraphTraversalMetadata) ProtoMessage() {}
 
 func (x *GraphTraversalMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[76]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5978,7 +6320,7 @@ func (x *GraphTraversalMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GraphTraversalMetadata.ProtoReflect.Descriptor instead.
 func (*GraphTraversalMetadata) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{76}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *GraphTraversalMetadata) GetMaxHops() uint32 {
@@ -6045,7 +6387,7 @@ type TraverseGraphResponse struct {
 
 func (x *TraverseGraphResponse) Reset() {
 	*x = TraverseGraphResponse{}
-	mi := &file_beholder_v1_daemon_proto_msgTypes[77]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6057,7 +6399,7 @@ func (x *TraverseGraphResponse) String() string {
 func (*TraverseGraphResponse) ProtoMessage() {}
 
 func (x *TraverseGraphResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_v1_daemon_proto_msgTypes[77]
+	mi := &file_beholder_v1_daemon_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6070,7 +6412,7 @@ func (x *TraverseGraphResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TraverseGraphResponse.ProtoReflect.Descriptor instead.
 func (*TraverseGraphResponse) Descriptor() ([]byte, []int) {
-	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{77}
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *TraverseGraphResponse) GetSchema() string {
@@ -6122,6 +6464,480 @@ func (x *TraverseGraphResponse) GetTraversal() *GraphTraversalMetadata {
 	return nil
 }
 
+type SourcePosition struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Line          uint32                 `protobuf:"varint,1,opt,name=line,proto3" json:"line,omitempty"`
+	Character     uint32                 `protobuf:"varint,2,opt,name=character,proto3" json:"character,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SourcePosition) Reset() {
+	*x = SourcePosition{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[79]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SourcePosition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SourcePosition) ProtoMessage() {}
+
+func (x *SourcePosition) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[79]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SourcePosition.ProtoReflect.Descriptor instead.
+func (*SourcePosition) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{79}
+}
+
+func (x *SourcePosition) GetLine() uint32 {
+	if x != nil {
+		return x.Line
+	}
+	return 0
+}
+
+func (x *SourcePosition) GetCharacter() uint32 {
+	if x != nil {
+		return x.Character
+	}
+	return 0
+}
+
+type SourceRange struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Start         *SourcePosition        `protobuf:"bytes,1,opt,name=start,proto3" json:"start,omitempty"`
+	End           *SourcePosition        `protobuf:"bytes,2,opt,name=end,proto3" json:"end,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SourceRange) Reset() {
+	*x = SourceRange{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[80]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SourceRange) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SourceRange) ProtoMessage() {}
+
+func (x *SourceRange) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[80]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SourceRange.ProtoReflect.Descriptor instead.
+func (*SourceRange) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{80}
+}
+
+func (x *SourceRange) GetStart() *SourcePosition {
+	if x != nil {
+		return x.Start
+	}
+	return nil
+}
+
+func (x *SourceRange) GetEnd() *SourcePosition {
+	if x != nil {
+		return x.End
+	}
+	return nil
+}
+
+type SourceExcerpt struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Text          string                 `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"`
+	Range         *SourceRange           `protobuf:"bytes,2,opt,name=range,proto3" json:"range,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SourceExcerpt) Reset() {
+	*x = SourceExcerpt{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[81]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SourceExcerpt) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SourceExcerpt) ProtoMessage() {}
+
+func (x *SourceExcerpt) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[81]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SourceExcerpt.ProtoReflect.Descriptor instead.
+func (*SourceExcerpt) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{81}
+}
+
+func (x *SourceExcerpt) GetText() string {
+	if x != nil {
+		return x.Text
+	}
+	return ""
+}
+
+func (x *SourceExcerpt) GetRange() *SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+type EvidenceContext struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Context:
+	//
+	//	*EvidenceContext_ConditionArm
+	//	*EvidenceContext_PatternArm
+	//	*EvidenceContext_CallableClause
+	Context       isEvidenceContext_Context `protobuf_oneof:"context"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EvidenceContext) Reset() {
+	*x = EvidenceContext{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[82]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EvidenceContext) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EvidenceContext) ProtoMessage() {}
+
+func (x *EvidenceContext) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[82]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EvidenceContext.ProtoReflect.Descriptor instead.
+func (*EvidenceContext) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{82}
+}
+
+func (x *EvidenceContext) GetContext() isEvidenceContext_Context {
+	if x != nil {
+		return x.Context
+	}
+	return nil
+}
+
+func (x *EvidenceContext) GetConditionArm() *ConditionArmContext {
+	if x != nil {
+		if x, ok := x.Context.(*EvidenceContext_ConditionArm); ok {
+			return x.ConditionArm
+		}
+	}
+	return nil
+}
+
+func (x *EvidenceContext) GetPatternArm() *PatternArmContext {
+	if x != nil {
+		if x, ok := x.Context.(*EvidenceContext_PatternArm); ok {
+			return x.PatternArm
+		}
+	}
+	return nil
+}
+
+func (x *EvidenceContext) GetCallableClause() *CallableClauseContext {
+	if x != nil {
+		if x, ok := x.Context.(*EvidenceContext_CallableClause); ok {
+			return x.CallableClause
+		}
+	}
+	return nil
+}
+
+type isEvidenceContext_Context interface {
+	isEvidenceContext_Context()
+}
+
+type EvidenceContext_ConditionArm struct {
+	ConditionArm *ConditionArmContext `protobuf:"bytes,1,opt,name=condition_arm,json=conditionArm,proto3,oneof"`
+}
+
+type EvidenceContext_PatternArm struct {
+	PatternArm *PatternArmContext `protobuf:"bytes,2,opt,name=pattern_arm,json=patternArm,proto3,oneof"`
+}
+
+type EvidenceContext_CallableClause struct {
+	CallableClause *CallableClauseContext `protobuf:"bytes,3,opt,name=callable_clause,json=callableClause,proto3,oneof"`
+}
+
+func (*EvidenceContext_ConditionArm) isEvidenceContext_Context() {}
+
+func (*EvidenceContext_PatternArm) isEvidenceContext_Context() {}
+
+func (*EvidenceContext_CallableClause) isEvidenceContext_Context() {}
+
+type ConditionArmContext struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Construct     ConditionConstruct     `protobuf:"varint,1,opt,name=construct,proto3,enum=beholder.v1.ConditionConstruct" json:"construct,omitempty"`
+	Arm           ConditionArmKind       `protobuf:"varint,2,opt,name=arm,proto3,enum=beholder.v1.ConditionArmKind" json:"arm,omitempty"`
+	Condition     *SourceExcerpt         `protobuf:"bytes,3,opt,name=condition,proto3,oneof" json:"condition,omitempty"`
+	ArmRange      *SourceRange           `protobuf:"bytes,4,opt,name=arm_range,json=armRange,proto3" json:"arm_range,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConditionArmContext) Reset() {
+	*x = ConditionArmContext{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[83]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConditionArmContext) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConditionArmContext) ProtoMessage() {}
+
+func (x *ConditionArmContext) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[83]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConditionArmContext.ProtoReflect.Descriptor instead.
+func (*ConditionArmContext) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{83}
+}
+
+func (x *ConditionArmContext) GetConstruct() ConditionConstruct {
+	if x != nil {
+		return x.Construct
+	}
+	return ConditionConstruct_CONDITION_CONSTRUCT_UNSPECIFIED
+}
+
+func (x *ConditionArmContext) GetArm() ConditionArmKind {
+	if x != nil {
+		return x.Arm
+	}
+	return ConditionArmKind_CONDITION_ARM_KIND_UNSPECIFIED
+}
+
+func (x *ConditionArmContext) GetCondition() *SourceExcerpt {
+	if x != nil {
+		return x.Condition
+	}
+	return nil
+}
+
+func (x *ConditionArmContext) GetArmRange() *SourceRange {
+	if x != nil {
+		return x.ArmRange
+	}
+	return nil
+}
+
+type PatternArmContext struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Construct     PatternConstruct       `protobuf:"varint,1,opt,name=construct,proto3,enum=beholder.v1.PatternConstruct" json:"construct,omitempty"`
+	Selector      *SourceExcerpt         `protobuf:"bytes,2,opt,name=selector,proto3,oneof" json:"selector,omitempty"`
+	Pattern       *SourceExcerpt         `protobuf:"bytes,3,opt,name=pattern,proto3,oneof" json:"pattern,omitempty"`
+	Guard         *SourceExcerpt         `protobuf:"bytes,4,opt,name=guard,proto3,oneof" json:"guard,omitempty"`
+	IsDefault     bool                   `protobuf:"varint,5,opt,name=is_default,json=isDefault,proto3" json:"is_default,omitempty"`
+	ArmRange      *SourceRange           `protobuf:"bytes,6,opt,name=arm_range,json=armRange,proto3" json:"arm_range,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PatternArmContext) Reset() {
+	*x = PatternArmContext{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[84]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PatternArmContext) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PatternArmContext) ProtoMessage() {}
+
+func (x *PatternArmContext) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[84]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PatternArmContext.ProtoReflect.Descriptor instead.
+func (*PatternArmContext) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{84}
+}
+
+func (x *PatternArmContext) GetConstruct() PatternConstruct {
+	if x != nil {
+		return x.Construct
+	}
+	return PatternConstruct_PATTERN_CONSTRUCT_UNSPECIFIED
+}
+
+func (x *PatternArmContext) GetSelector() *SourceExcerpt {
+	if x != nil {
+		return x.Selector
+	}
+	return nil
+}
+
+func (x *PatternArmContext) GetPattern() *SourceExcerpt {
+	if x != nil {
+		return x.Pattern
+	}
+	return nil
+}
+
+func (x *PatternArmContext) GetGuard() *SourceExcerpt {
+	if x != nil {
+		return x.Guard
+	}
+	return nil
+}
+
+func (x *PatternArmContext) GetIsDefault() bool {
+	if x != nil {
+		return x.IsDefault
+	}
+	return false
+}
+
+func (x *PatternArmContext) GetArmRange() *SourceRange {
+	if x != nil {
+		return x.ArmRange
+	}
+	return nil
+}
+
+type CallableClauseContext struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Role            CallableClauseRole     `protobuf:"varint,1,opt,name=role,proto3,enum=beholder.v1.CallableClauseRole" json:"role,omitempty"`
+	Signature       *SourceExcerpt         `protobuf:"bytes,2,opt,name=signature,proto3" json:"signature,omitempty"`
+	Guard           *SourceExcerpt         `protobuf:"bytes,3,opt,name=guard,proto3,oneof" json:"guard,omitempty"`
+	DefinitionRange *SourceRange           `protobuf:"bytes,4,opt,name=definition_range,json=definitionRange,proto3" json:"definition_range,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *CallableClauseContext) Reset() {
+	*x = CallableClauseContext{}
+	mi := &file_beholder_v1_daemon_proto_msgTypes[85]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CallableClauseContext) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CallableClauseContext) ProtoMessage() {}
+
+func (x *CallableClauseContext) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_v1_daemon_proto_msgTypes[85]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CallableClauseContext.ProtoReflect.Descriptor instead.
+func (*CallableClauseContext) Descriptor() ([]byte, []int) {
+	return file_beholder_v1_daemon_proto_rawDescGZIP(), []int{85}
+}
+
+func (x *CallableClauseContext) GetRole() CallableClauseRole {
+	if x != nil {
+		return x.Role
+	}
+	return CallableClauseRole_CALLABLE_CLAUSE_ROLE_UNSPECIFIED
+}
+
+func (x *CallableClauseContext) GetSignature() *SourceExcerpt {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+func (x *CallableClauseContext) GetGuard() *SourceExcerpt {
+	if x != nil {
+		return x.Guard
+	}
+	return nil
+}
+
+func (x *CallableClauseContext) GetDefinitionRange() *SourceRange {
+	if x != nil {
+		return x.DefinitionRange
+	}
+	return nil
+}
+
 var File_beholder_v1_daemon_proto protoreflect.FileDescriptor
 
 const file_beholder_v1_daemon_proto_rawDesc = "" +
@@ -6160,12 +6976,14 @@ const file_beholder_v1_daemon_proto_rawDesc = "" +
 	"\t_progress\"E\n" +
 	"\rEntityRequest\x12\x16\n" +
 	"\x06entity\x18\x01 \x01(\tR\x06entity\x12\x1c\n" +
-	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"p\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"\xbe\x01\n" +
 	"\x15SearchEntitiesRequest\x12\x1c\n" +
 	"\tworkspace\x18\x01 \x01(\tR\tworkspace\x12\x14\n" +
 	"\x05query\x18\x02 \x01(\tR\x05query\x12\x19\n" +
-	"\x05limit\x18\x03 \x01(\rH\x00R\x05limit\x88\x01\x01B\b\n" +
-	"\x06_limit\"{\n" +
+	"\x05limit\x18\x03 \x01(\rH\x00R\x05limit\x88\x01\x01\x124\n" +
+	"\x13include_diagnostics\x18\x04 \x01(\bH\x01R\x12includeDiagnostics\x88\x01\x01B\b\n" +
+	"\x06_limitB\x16\n" +
+	"\x14_include_diagnostics\"{\n" +
 	"\x16TraversalEntityRequest\x12\x16\n" +
 	"\x06entity\x18\x01 \x01(\tR\x06entity\x12\x1c\n" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12\x1e\n" +
@@ -6179,13 +6997,18 @@ const file_beholder_v1_daemon_proto_rawDesc = "" +
 	"\t_max_hops\"L\n" +
 	"\x11TraversalMetadata\x12\x19\n" +
 	"\bmax_hops\x18\x01 \x01(\rR\amaxHops\x12\x1c\n" +
-	"\ttruncated\x18\x02 \x01(\bR\ttruncated\"\xff\x01\n" +
+	"\ttruncated\x18\x02 \x01(\bR\ttruncated\"\xcb\x02\n" +
 	"\rQueryMetadata\x12\x1a\n" +
 	"\brevision\x18\x01 \x01(\x04R\brevision\x12\x12\n" +
 	"\x04view\x18\x02 \x01(\tR\x04view\x124\n" +
 	"\tfreshness\x18\x03 \x01(\v2\x16.beholder.v1.FreshnessR\tfreshness\x12E\n" +
 	"\fcompleteness\x18\x04 \x01(\x0e2!.beholder.v1.AnalysisCompletenessR\fcompleteness\x12A\n" +
-	"\vdiagnostics\x18\x05 \x03(\v2\x1f.beholder.v1.AnalysisDiagnosticR\vdiagnostics\";\n" +
+	"\vdiagnostics\x18\x05 \x03(\v2\x1f.beholder.v1.AnalysisDiagnosticR\vdiagnostics\x12J\n" +
+	"\x11diagnostic_counts\x18\x06 \x01(\v2\x1d.beholder.v1.DiagnosticCountsR\x10diagnosticCounts\"q\n" +
+	"\x10DiagnosticCounts\x12\x14\n" +
+	"\x05total\x18\x01 \x01(\x04R\x05total\x12+\n" +
+	"\x11known_limitations\x18\x02 \x01(\x04R\x10knownLimitations\x12\x1a\n" +
+	"\bwarnings\x18\x03 \x01(\x04R\bwarnings\";\n" +
 	"\x1bGetWorkspaceTopologyRequest\x12\x1c\n" +
 	"\tworkspace\x18\x01 \x01(\tR\tworkspace\"\xc2\x01\n" +
 	"\x1cGetWorkspaceTopologyResponse\x12\x16\n" +
@@ -6231,7 +7054,7 @@ const file_beholder_v1_daemon_proto_rawDesc = "" +
 	"\x04test\x18\x06 \x01(\bR\x04test\x12<\n" +
 	"\bmetadata\x18\a \x01(\v2\x1b.beholder.v1.EntityMetadataH\x01R\bmetadata\x88\x01\x01B\r\n" +
 	"\v_repositoryB\v\n" +
-	"\t_metadata\"\xdd\x01\n" +
+	"\t_metadata\"\xd6\x02\n" +
 	"\bEvidence\x121\n" +
 	"\x06source\x18\x01 \x01(\x0e2\x19.beholder.v1.EvidenceKindR\x06source\x12#\n" +
 	"\n" +
@@ -6239,11 +7062,14 @@ const file_beholder_v1_daemon_proto_rawDesc = "" +
 	"repository\x88\x01\x01\x12\x17\n" +
 	"\x04path\x18\x03 \x01(\tH\x01R\x04path\x88\x01\x01\x12\x17\n" +
 	"\x04line\x18\x04 \x01(\rH\x02R\x04line\x88\x01\x01\x12\x1b\n" +
-	"\x06detail\x18\x05 \x01(\tH\x03R\x06detail\x88\x01\x01B\r\n" +
+	"\x06detail\x18\x05 \x01(\tH\x03R\x06detail\x88\x01\x01\x123\n" +
+	"\x05range\x18\x06 \x01(\v2\x18.beholder.v1.SourceRangeH\x04R\x05range\x88\x01\x01\x128\n" +
+	"\bcontexts\x18\a \x03(\v2\x1c.beholder.v1.EvidenceContextR\bcontextsB\r\n" +
 	"\v_repositoryB\a\n" +
 	"\x05_pathB\a\n" +
 	"\x05_lineB\t\n" +
-	"\a_detail\"\xbc\x01\n" +
+	"\a_detailB\b\n" +
+	"\x06_range\"\xbc\x01\n" +
 	"\x04Edge\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04from\x18\x02 \x01(\tR\x04from\x12\x0e\n" +
@@ -6487,24 +7313,28 @@ const file_beholder_v1_daemon_proto_rawDesc = "" +
 	"\f_wait_reasonB\r\n" +
 	"\v_last_errorB\x0f\n" +
 	"\r_index_resultB\x14\n" +
-	"\x12_enrichment_result\"\x99\x02\n" +
+	"\x12_enrichment_result\"\x98\x03\n" +
 	"\x14TraverseGraphRequest\x12\x1c\n" +
 	"\tworkspace\x18\x01 \x01(\tR\tworkspace\x12\x14\n" +
 	"\x05start\x18\x02 \x01(\tR\x05start\x129\n" +
 	"\tdirection\x18\x03 \x01(\x0e2\x1b.beholder.v1.GraphDirectionR\tdirection\x12%\n" +
 	"\vdestination\x18\x04 \x01(\tH\x00R\vdestination\x88\x01\x01\x12\x1e\n" +
 	"\bmax_hops\x18\x05 \x01(\rH\x01R\amaxHops\x88\x01\x01\x12 \n" +
-	"\tmax_paths\x18\x06 \x01(\rH\x02R\bmaxPaths\x88\x01\x01B\x0e\n" +
+	"\tmax_paths\x18\x06 \x01(\rH\x02R\bmaxPaths\x88\x01\x01\x12/\n" +
+	"\x13target_repositories\x18\a \x03(\tR\x12targetRepositories\x124\n" +
+	"\x13include_diagnostics\x18\b \x01(\bH\x03R\x12includeDiagnostics\x88\x01\x01B\x0e\n" +
 	"\f_destinationB\v\n" +
 	"\t_max_hopsB\f\n" +
 	"\n" +
-	"_max_paths\"\xd4\x01\n" +
+	"_max_pathsB\x16\n" +
+	"\x14_include_diagnostics\"\x85\x02\n" +
 	"\x12TraverseGraphQuery\x12\x14\n" +
 	"\x05start\x18\x01 \x01(\tR\x05start\x129\n" +
 	"\tdirection\x18\x02 \x01(\x0e2\x1b.beholder.v1.GraphDirectionR\tdirection\x12%\n" +
 	"\vdestination\x18\x03 \x01(\tH\x00R\vdestination\x88\x01\x01\x12\x19\n" +
 	"\bmax_hops\x18\x04 \x01(\rR\amaxHops\x12\x1b\n" +
-	"\tmax_paths\x18\x05 \x01(\rR\bmaxPathsB\x0e\n" +
+	"\tmax_paths\x18\x05 \x01(\rR\bmaxPaths\x12/\n" +
+	"\x13target_repositories\x18\x06 \x03(\tR\x12targetRepositoriesB\x0e\n" +
 	"\f_destination\"{\n" +
 	"\rTraversalPath\x12\x14\n" +
 	"\x05nodes\x18\x01 \x03(\tR\x05nodes\x12\x14\n" +
@@ -6525,7 +7355,47 @@ const file_beholder_v1_daemon_proto_rawDesc = "" +
 	"\x05nodes\x18\x04 \x03(\v2\x13.beholder.v1.EntityR\x05nodes\x12'\n" +
 	"\x05edges\x18\x05 \x03(\v2\x11.beholder.v1.EdgeR\x05edges\x120\n" +
 	"\x05paths\x18\x06 \x03(\v2\x1a.beholder.v1.TraversalPathR\x05paths\x12A\n" +
-	"\ttraversal\x18\a \x01(\v2#.beholder.v1.GraphTraversalMetadataR\ttraversal*\x8b\x02\n" +
+	"\ttraversal\x18\a \x01(\v2#.beholder.v1.GraphTraversalMetadataR\ttraversal\"B\n" +
+	"\x0eSourcePosition\x12\x12\n" +
+	"\x04line\x18\x01 \x01(\rR\x04line\x12\x1c\n" +
+	"\tcharacter\x18\x02 \x01(\rR\tcharacter\"o\n" +
+	"\vSourceRange\x121\n" +
+	"\x05start\x18\x01 \x01(\v2\x1b.beholder.v1.SourcePositionR\x05start\x12-\n" +
+	"\x03end\x18\x02 \x01(\v2\x1b.beholder.v1.SourcePositionR\x03end\"S\n" +
+	"\rSourceExcerpt\x12\x12\n" +
+	"\x04text\x18\x01 \x01(\tR\x04text\x12.\n" +
+	"\x05range\x18\x02 \x01(\v2\x18.beholder.v1.SourceRangeR\x05range\"\xf7\x01\n" +
+	"\x0fEvidenceContext\x12G\n" +
+	"\rcondition_arm\x18\x01 \x01(\v2 .beholder.v1.ConditionArmContextH\x00R\fconditionArm\x12A\n" +
+	"\vpattern_arm\x18\x02 \x01(\v2\x1e.beholder.v1.PatternArmContextH\x00R\n" +
+	"patternArm\x12M\n" +
+	"\x0fcallable_clause\x18\x03 \x01(\v2\".beholder.v1.CallableClauseContextH\x00R\x0ecallableClauseB\t\n" +
+	"\acontext\"\x89\x02\n" +
+	"\x13ConditionArmContext\x12=\n" +
+	"\tconstruct\x18\x01 \x01(\x0e2\x1f.beholder.v1.ConditionConstructR\tconstruct\x12/\n" +
+	"\x03arm\x18\x02 \x01(\x0e2\x1d.beholder.v1.ConditionArmKindR\x03arm\x12=\n" +
+	"\tcondition\x18\x03 \x01(\v2\x1a.beholder.v1.SourceExcerptH\x00R\tcondition\x88\x01\x01\x125\n" +
+	"\tarm_range\x18\x04 \x01(\v2\x18.beholder.v1.SourceRangeR\barmRangeB\f\n" +
+	"\n" +
+	"_condition\"\xf8\x02\n" +
+	"\x11PatternArmContext\x12;\n" +
+	"\tconstruct\x18\x01 \x01(\x0e2\x1d.beholder.v1.PatternConstructR\tconstruct\x12;\n" +
+	"\bselector\x18\x02 \x01(\v2\x1a.beholder.v1.SourceExcerptH\x00R\bselector\x88\x01\x01\x129\n" +
+	"\apattern\x18\x03 \x01(\v2\x1a.beholder.v1.SourceExcerptH\x01R\apattern\x88\x01\x01\x125\n" +
+	"\x05guard\x18\x04 \x01(\v2\x1a.beholder.v1.SourceExcerptH\x02R\x05guard\x88\x01\x01\x12\x1d\n" +
+	"\n" +
+	"is_default\x18\x05 \x01(\bR\tisDefault\x125\n" +
+	"\tarm_range\x18\x06 \x01(\v2\x18.beholder.v1.SourceRangeR\barmRangeB\v\n" +
+	"\t_selectorB\n" +
+	"\n" +
+	"\b_patternB\b\n" +
+	"\x06_guard\"\x8c\x02\n" +
+	"\x15CallableClauseContext\x123\n" +
+	"\x04role\x18\x01 \x01(\x0e2\x1f.beholder.v1.CallableClauseRoleR\x04role\x128\n" +
+	"\tsignature\x18\x02 \x01(\v2\x1a.beholder.v1.SourceExcerptR\tsignature\x125\n" +
+	"\x05guard\x18\x03 \x01(\v2\x1a.beholder.v1.SourceExcerptH\x00R\x05guard\x88\x01\x01\x12C\n" +
+	"\x10definition_range\x18\x04 \x01(\v2\x18.beholder.v1.SourceRangeR\x0fdefinitionRangeB\b\n" +
+	"\x06_guard*\x8b\x02\n" +
 	"\x13GarbageCollectPhase\x12%\n" +
 	"!GARBAGE_COLLECT_PHASE_UNSPECIFIED\x10\x00\x122\n" +
 	".GARBAGE_COLLECT_PHASE_CLAIMING_OBSOLETE_STATES\x10\x01\x122\n" +
@@ -6655,19 +7525,45 @@ const file_beholder_v1_daemon_proto_rawDesc = "" +
 	"\x0eGraphDirection\x12\x1f\n" +
 	"\x1bGRAPH_DIRECTION_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cGRAPH_DIRECTION_DEPENDENCIES\x10\x01\x12\x1e\n" +
-	"\x1aGRAPH_DIRECTION_DEPENDENTS\x10\x02*\xab\x01\n" +
+	"\x1aGRAPH_DIRECTION_DEPENDENTS\x10\x02*\xd5\x01\n" +
 	"\x0fPathTermination\x12 \n" +
 	"\x1cPATH_TERMINATION_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cPATH_TERMINATION_DESTINATION\x10\x01\x12\x19\n" +
 	"\x15PATH_TERMINATION_LEAF\x10\x02\x12\x1a\n" +
 	"\x16PATH_TERMINATION_CYCLE\x10\x03\x12\x1d\n" +
-	"\x19PATH_TERMINATION_MAX_HOPS\x10\x04*\xc1\x01\n" +
+	"\x19PATH_TERMINATION_MAX_HOPS\x10\x04\x12(\n" +
+	"$PATH_TERMINATION_REPOSITORY_BOUNDARY\x10\x05*\xc1\x01\n" +
 	"\x10TruncationReason\x12!\n" +
 	"\x1dTRUNCATION_REASON_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aTRUNCATION_REASON_MAX_HOPS\x10\x01\x12\x1f\n" +
 	"\x1bTRUNCATION_REASON_MAX_PATHS\x10\x02\x12'\n" +
 	"#TRUNCATION_REASON_ACQUISITION_LIMIT\x10\x03\x12 \n" +
-	"\x1cTRUNCATION_REASON_WORK_LIMIT\x10\x042\xb5\x10\n" +
+	"\x1cTRUNCATION_REASON_WORK_LIMIT\x10\x04*\xb9\x01\n" +
+	"\x12ConditionConstruct\x12#\n" +
+	"\x1fCONDITION_CONSTRUCT_UNSPECIFIED\x10\x00\x12\x1a\n" +
+	"\x16CONDITION_CONSTRUCT_IF\x10\x01\x12\x1c\n" +
+	"\x18CONDITION_CONSTRUCT_COND\x10\x02\x12\x1f\n" +
+	"\x1bCONDITION_CONSTRUCT_TERNARY\x10\x03\x12#\n" +
+	"\x1fCONDITION_CONSTRUCT_TEMPLATE_IF\x10\x04*\xf7\x01\n" +
+	"\x10ConditionArmKind\x12\"\n" +
+	"\x1eCONDITION_ARM_KIND_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17CONDITION_ARM_KIND_THEN\x10\x01\x12\x1e\n" +
+	"\x1aCONDITION_ARM_KIND_ELSE_IF\x10\x02\x12\x1b\n" +
+	"\x17CONDITION_ARM_KIND_ELSE\x10\x03\x12\x1d\n" +
+	"\x19CONDITION_ARM_KIND_CLAUSE\x10\x04\x12\"\n" +
+	"\x1eCONDITION_ARM_KIND_CONSEQUENCE\x10\x05\x12\"\n" +
+	"\x1eCONDITION_ARM_KIND_ALTERNATIVE\x10\x06*\xbf\x01\n" +
+	"\x10PatternConstruct\x12!\n" +
+	"\x1dPATTERN_CONSTRUCT_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17PATTERN_CONSTRUCT_MATCH\x10\x01\x12\x1a\n" +
+	"\x16PATTERN_CONSTRUCT_CASE\x10\x02\x12&\n" +
+	"\"PATTERN_CONSTRUCT_SWITCH_STATEMENT\x10\x03\x12'\n" +
+	"#PATTERN_CONSTRUCT_SWITCH_EXPRESSION\x10\x04*\xae\x01\n" +
+	"\x12CallableClauseRole\x12$\n" +
+	" CALLABLE_CLAUSE_ROLE_UNSPECIFIED\x10\x00\x12$\n" +
+	" CALLABLE_CLAUSE_ROLE_DECLARATION\x10\x01\x12\"\n" +
+	"\x1eCALLABLE_CLAUSE_ROLE_ENCLOSING\x10\x02\x12(\n" +
+	"$CALLABLE_CLAUSE_ROLE_SELECTED_TARGET\x10\x032\xb5\x10\n" +
 	"\x06Daemon\x12M\n" +
 	"\n" +
 	"ClearCache\x12\x1e.beholder.v1.ClearCacheRequest\x1a\x1f.beholder.v1.ClearCacheResponse\x12X\n" +
@@ -6707,8 +7603,8 @@ func file_beholder_v1_daemon_proto_rawDescGZIP() []byte {
 	return file_beholder_v1_daemon_proto_rawDescData
 }
 
-var file_beholder_v1_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 21)
-var file_beholder_v1_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 78)
+var file_beholder_v1_daemon_proto_enumTypes = make([]protoimpl.EnumInfo, 25)
+var file_beholder_v1_daemon_proto_msgTypes = make([]protoimpl.MessageInfo, 86)
 var file_beholder_v1_daemon_proto_goTypes = []any{
 	(GarbageCollectPhase)(0),                   // 0: beholder.v1.GarbageCollectPhase
 	(AnalysisCompleteness)(0),                  // 1: beholder.v1.AnalysisCompleteness
@@ -6731,237 +7627,271 @@ var file_beholder_v1_daemon_proto_goTypes = []any{
 	(GraphDirection)(0),                        // 18: beholder.v1.GraphDirection
 	(PathTermination)(0),                       // 19: beholder.v1.PathTermination
 	(TruncationReason)(0),                      // 20: beholder.v1.TruncationReason
-	(*ClearCacheRequest)(nil),                  // 21: beholder.v1.ClearCacheRequest
-	(*ClearCacheResponse)(nil),                 // 22: beholder.v1.ClearCacheResponse
-	(*GarbageCollectRequest)(nil),              // 23: beholder.v1.GarbageCollectRequest
-	(*GarbageCollectEvent)(nil),                // 24: beholder.v1.GarbageCollectEvent
-	(*GarbageCollectProgress)(nil),             // 25: beholder.v1.GarbageCollectProgress
-	(*GarbageCollectResponse)(nil),             // 26: beholder.v1.GarbageCollectResponse
-	(*GetGarbageCollectionStatusRequest)(nil),  // 27: beholder.v1.GetGarbageCollectionStatusRequest
-	(*GetGarbageCollectionStatusResponse)(nil), // 28: beholder.v1.GetGarbageCollectionStatusResponse
-	(*EntityRequest)(nil),                      // 29: beholder.v1.EntityRequest
-	(*SearchEntitiesRequest)(nil),              // 30: beholder.v1.SearchEntitiesRequest
-	(*TraversalEntityRequest)(nil),             // 31: beholder.v1.TraversalEntityRequest
-	(*PathRequest)(nil),                        // 32: beholder.v1.PathRequest
-	(*TraversalMetadata)(nil),                  // 33: beholder.v1.TraversalMetadata
-	(*QueryMetadata)(nil),                      // 34: beholder.v1.QueryMetadata
-	(*GetWorkspaceTopologyRequest)(nil),        // 35: beholder.v1.GetWorkspaceTopologyRequest
-	(*GetWorkspaceTopologyResponse)(nil),       // 36: beholder.v1.GetWorkspaceTopologyResponse
-	(*GetWorkspaceTopologyStatusRequest)(nil),  // 37: beholder.v1.GetWorkspaceTopologyStatusRequest
-	(*GetWorkspaceTopologyStatusResponse)(nil), // 38: beholder.v1.GetWorkspaceTopologyStatusResponse
-	(*Freshness)(nil),                          // 39: beholder.v1.Freshness
-	(*AnalysisDiagnostic)(nil),                 // 40: beholder.v1.AnalysisDiagnostic
-	(*EntityMetadata)(nil),                     // 41: beholder.v1.EntityMetadata
-	(*Entity)(nil),                             // 42: beholder.v1.Entity
-	(*Evidence)(nil),                           // 43: beholder.v1.Evidence
-	(*Edge)(nil),                               // 44: beholder.v1.Edge
-	(*SemanticPath)(nil),                       // 45: beholder.v1.SemanticPath
-	(*EntityQuery)(nil),                        // 46: beholder.v1.EntityQuery
-	(*EntitySearchQuery)(nil),                  // 47: beholder.v1.EntitySearchQuery
-	(*SearchEntitiesResponse)(nil),             // 48: beholder.v1.SearchEntitiesResponse
-	(*SemanticPathQuery)(nil),                  // 49: beholder.v1.SemanticPathQuery
-	(*ContextResponse)(nil),                    // 50: beholder.v1.ContextResponse
-	(*Dependency)(nil),                         // 51: beholder.v1.Dependency
-	(*DependenciesResponse)(nil),               // 52: beholder.v1.DependenciesResponse
-	(*Impact)(nil),                             // 53: beholder.v1.Impact
-	(*ImpactResponse)(nil),                     // 54: beholder.v1.ImpactResponse
-	(*TraceResponse)(nil),                      // 55: beholder.v1.TraceResponse
-	(*WhyResponse)(nil),                        // 56: beholder.v1.WhyResponse
-	(*Workspace)(nil),                          // 57: beholder.v1.Workspace
-	(*ProtobufDescriptorSource)(nil),           // 58: beholder.v1.ProtobufDescriptorSource
-	(*WorkspaceRepository)(nil),                // 59: beholder.v1.WorkspaceRepository
-	(*RegisterWorkspaceRequest)(nil),           // 60: beholder.v1.RegisterWorkspaceRequest
-	(*RegisterWorkspaceResponse)(nil),          // 61: beholder.v1.RegisterWorkspaceResponse
-	(*SetWorkspacePluginRequest)(nil),          // 62: beholder.v1.SetWorkspacePluginRequest
-	(*SetWorkspacePluginResponse)(nil),         // 63: beholder.v1.SetWorkspacePluginResponse
-	(*ListWorkspacesRequest)(nil),              // 64: beholder.v1.ListWorkspacesRequest
-	(*ListWorkspacesResponse)(nil),             // 65: beholder.v1.ListWorkspacesResponse
-	(*RepositoryRevision)(nil),                 // 66: beholder.v1.RepositoryRevision
-	(*RepositoryStatus)(nil),                   // 67: beholder.v1.RepositoryStatus
-	(*RegisterRepositoryRequest)(nil),          // 68: beholder.v1.RegisterRepositoryRequest
-	(*DeleteRepositoryRequest)(nil),            // 69: beholder.v1.DeleteRepositoryRequest
-	(*DeleteRepositoryResponse)(nil),           // 70: beholder.v1.DeleteRepositoryResponse
-	(*GetRepositoryRequest)(nil),               // 71: beholder.v1.GetRepositoryRequest
-	(*RepositoryResponse)(nil),                 // 72: beholder.v1.RepositoryResponse
-	(*StopRequest)(nil),                        // 73: beholder.v1.StopRequest
-	(*StopResponse)(nil),                       // 74: beholder.v1.StopResponse
-	(*GetStatusRequest)(nil),                   // 75: beholder.v1.GetStatusRequest
-	(*GetStatusResponse)(nil),                  // 76: beholder.v1.GetStatusResponse
-	(*ListJobsRequest)(nil),                    // 77: beholder.v1.ListJobsRequest
-	(*ListJobsResponse)(nil),                   // 78: beholder.v1.ListJobsResponse
-	(*GetJobRequest)(nil),                      // 79: beholder.v1.GetJobRequest
-	(*GetJobResponse)(nil),                     // 80: beholder.v1.GetJobResponse
-	(*SubmitIndexRequest)(nil),                 // 81: beholder.v1.SubmitIndexRequest
-	(*RepositoryIndexTarget)(nil),              // 82: beholder.v1.RepositoryIndexTarget
-	(*SubmitIndexResponse)(nil),                // 83: beholder.v1.SubmitIndexResponse
-	(*SubmitEnrichmentRequest)(nil),            // 84: beholder.v1.SubmitEnrichmentRequest
-	(*EnrichmentSubmission)(nil),               // 85: beholder.v1.EnrichmentSubmission
-	(*SubmitEnrichmentResponse)(nil),           // 86: beholder.v1.SubmitEnrichmentResponse
-	(*JobTarget)(nil),                          // 87: beholder.v1.JobTarget
-	(*JobSummary)(nil),                         // 88: beholder.v1.JobSummary
-	(*IndexDestination)(nil),                   // 89: beholder.v1.IndexDestination
-	(*IndexDestinationResult)(nil),             // 90: beholder.v1.IndexDestinationResult
-	(*IndexJobResult)(nil),                     // 91: beholder.v1.IndexJobResult
-	(*EnrichmentJobResult)(nil),                // 92: beholder.v1.EnrichmentJobResult
-	(*Job)(nil),                                // 93: beholder.v1.Job
-	(*TraverseGraphRequest)(nil),               // 94: beholder.v1.TraverseGraphRequest
-	(*TraverseGraphQuery)(nil),                 // 95: beholder.v1.TraverseGraphQuery
-	(*TraversalPath)(nil),                      // 96: beholder.v1.TraversalPath
-	(*GraphTraversalMetadata)(nil),             // 97: beholder.v1.GraphTraversalMetadata
-	(*TraverseGraphResponse)(nil),              // 98: beholder.v1.TraverseGraphResponse
+	(ConditionConstruct)(0),                    // 21: beholder.v1.ConditionConstruct
+	(ConditionArmKind)(0),                      // 22: beholder.v1.ConditionArmKind
+	(PatternConstruct)(0),                      // 23: beholder.v1.PatternConstruct
+	(CallableClauseRole)(0),                    // 24: beholder.v1.CallableClauseRole
+	(*ClearCacheRequest)(nil),                  // 25: beholder.v1.ClearCacheRequest
+	(*ClearCacheResponse)(nil),                 // 26: beholder.v1.ClearCacheResponse
+	(*GarbageCollectRequest)(nil),              // 27: beholder.v1.GarbageCollectRequest
+	(*GarbageCollectEvent)(nil),                // 28: beholder.v1.GarbageCollectEvent
+	(*GarbageCollectProgress)(nil),             // 29: beholder.v1.GarbageCollectProgress
+	(*GarbageCollectResponse)(nil),             // 30: beholder.v1.GarbageCollectResponse
+	(*GetGarbageCollectionStatusRequest)(nil),  // 31: beholder.v1.GetGarbageCollectionStatusRequest
+	(*GetGarbageCollectionStatusResponse)(nil), // 32: beholder.v1.GetGarbageCollectionStatusResponse
+	(*EntityRequest)(nil),                      // 33: beholder.v1.EntityRequest
+	(*SearchEntitiesRequest)(nil),              // 34: beholder.v1.SearchEntitiesRequest
+	(*TraversalEntityRequest)(nil),             // 35: beholder.v1.TraversalEntityRequest
+	(*PathRequest)(nil),                        // 36: beholder.v1.PathRequest
+	(*TraversalMetadata)(nil),                  // 37: beholder.v1.TraversalMetadata
+	(*QueryMetadata)(nil),                      // 38: beholder.v1.QueryMetadata
+	(*DiagnosticCounts)(nil),                   // 39: beholder.v1.DiagnosticCounts
+	(*GetWorkspaceTopologyRequest)(nil),        // 40: beholder.v1.GetWorkspaceTopologyRequest
+	(*GetWorkspaceTopologyResponse)(nil),       // 41: beholder.v1.GetWorkspaceTopologyResponse
+	(*GetWorkspaceTopologyStatusRequest)(nil),  // 42: beholder.v1.GetWorkspaceTopologyStatusRequest
+	(*GetWorkspaceTopologyStatusResponse)(nil), // 43: beholder.v1.GetWorkspaceTopologyStatusResponse
+	(*Freshness)(nil),                          // 44: beholder.v1.Freshness
+	(*AnalysisDiagnostic)(nil),                 // 45: beholder.v1.AnalysisDiagnostic
+	(*EntityMetadata)(nil),                     // 46: beholder.v1.EntityMetadata
+	(*Entity)(nil),                             // 47: beholder.v1.Entity
+	(*Evidence)(nil),                           // 48: beholder.v1.Evidence
+	(*Edge)(nil),                               // 49: beholder.v1.Edge
+	(*SemanticPath)(nil),                       // 50: beholder.v1.SemanticPath
+	(*EntityQuery)(nil),                        // 51: beholder.v1.EntityQuery
+	(*EntitySearchQuery)(nil),                  // 52: beholder.v1.EntitySearchQuery
+	(*SearchEntitiesResponse)(nil),             // 53: beholder.v1.SearchEntitiesResponse
+	(*SemanticPathQuery)(nil),                  // 54: beholder.v1.SemanticPathQuery
+	(*ContextResponse)(nil),                    // 55: beholder.v1.ContextResponse
+	(*Dependency)(nil),                         // 56: beholder.v1.Dependency
+	(*DependenciesResponse)(nil),               // 57: beholder.v1.DependenciesResponse
+	(*Impact)(nil),                             // 58: beholder.v1.Impact
+	(*ImpactResponse)(nil),                     // 59: beholder.v1.ImpactResponse
+	(*TraceResponse)(nil),                      // 60: beholder.v1.TraceResponse
+	(*WhyResponse)(nil),                        // 61: beholder.v1.WhyResponse
+	(*Workspace)(nil),                          // 62: beholder.v1.Workspace
+	(*ProtobufDescriptorSource)(nil),           // 63: beholder.v1.ProtobufDescriptorSource
+	(*WorkspaceRepository)(nil),                // 64: beholder.v1.WorkspaceRepository
+	(*RegisterWorkspaceRequest)(nil),           // 65: beholder.v1.RegisterWorkspaceRequest
+	(*RegisterWorkspaceResponse)(nil),          // 66: beholder.v1.RegisterWorkspaceResponse
+	(*SetWorkspacePluginRequest)(nil),          // 67: beholder.v1.SetWorkspacePluginRequest
+	(*SetWorkspacePluginResponse)(nil),         // 68: beholder.v1.SetWorkspacePluginResponse
+	(*ListWorkspacesRequest)(nil),              // 69: beholder.v1.ListWorkspacesRequest
+	(*ListWorkspacesResponse)(nil),             // 70: beholder.v1.ListWorkspacesResponse
+	(*RepositoryRevision)(nil),                 // 71: beholder.v1.RepositoryRevision
+	(*RepositoryStatus)(nil),                   // 72: beholder.v1.RepositoryStatus
+	(*RegisterRepositoryRequest)(nil),          // 73: beholder.v1.RegisterRepositoryRequest
+	(*DeleteRepositoryRequest)(nil),            // 74: beholder.v1.DeleteRepositoryRequest
+	(*DeleteRepositoryResponse)(nil),           // 75: beholder.v1.DeleteRepositoryResponse
+	(*GetRepositoryRequest)(nil),               // 76: beholder.v1.GetRepositoryRequest
+	(*RepositoryResponse)(nil),                 // 77: beholder.v1.RepositoryResponse
+	(*StopRequest)(nil),                        // 78: beholder.v1.StopRequest
+	(*StopResponse)(nil),                       // 79: beholder.v1.StopResponse
+	(*GetStatusRequest)(nil),                   // 80: beholder.v1.GetStatusRequest
+	(*GetStatusResponse)(nil),                  // 81: beholder.v1.GetStatusResponse
+	(*ListJobsRequest)(nil),                    // 82: beholder.v1.ListJobsRequest
+	(*ListJobsResponse)(nil),                   // 83: beholder.v1.ListJobsResponse
+	(*GetJobRequest)(nil),                      // 84: beholder.v1.GetJobRequest
+	(*GetJobResponse)(nil),                     // 85: beholder.v1.GetJobResponse
+	(*SubmitIndexRequest)(nil),                 // 86: beholder.v1.SubmitIndexRequest
+	(*RepositoryIndexTarget)(nil),              // 87: beholder.v1.RepositoryIndexTarget
+	(*SubmitIndexResponse)(nil),                // 88: beholder.v1.SubmitIndexResponse
+	(*SubmitEnrichmentRequest)(nil),            // 89: beholder.v1.SubmitEnrichmentRequest
+	(*EnrichmentSubmission)(nil),               // 90: beholder.v1.EnrichmentSubmission
+	(*SubmitEnrichmentResponse)(nil),           // 91: beholder.v1.SubmitEnrichmentResponse
+	(*JobTarget)(nil),                          // 92: beholder.v1.JobTarget
+	(*JobSummary)(nil),                         // 93: beholder.v1.JobSummary
+	(*IndexDestination)(nil),                   // 94: beholder.v1.IndexDestination
+	(*IndexDestinationResult)(nil),             // 95: beholder.v1.IndexDestinationResult
+	(*IndexJobResult)(nil),                     // 96: beholder.v1.IndexJobResult
+	(*EnrichmentJobResult)(nil),                // 97: beholder.v1.EnrichmentJobResult
+	(*Job)(nil),                                // 98: beholder.v1.Job
+	(*TraverseGraphRequest)(nil),               // 99: beholder.v1.TraverseGraphRequest
+	(*TraverseGraphQuery)(nil),                 // 100: beholder.v1.TraverseGraphQuery
+	(*TraversalPath)(nil),                      // 101: beholder.v1.TraversalPath
+	(*GraphTraversalMetadata)(nil),             // 102: beholder.v1.GraphTraversalMetadata
+	(*TraverseGraphResponse)(nil),              // 103: beholder.v1.TraverseGraphResponse
+	(*SourcePosition)(nil),                     // 104: beholder.v1.SourcePosition
+	(*SourceRange)(nil),                        // 105: beholder.v1.SourceRange
+	(*SourceExcerpt)(nil),                      // 106: beholder.v1.SourceExcerpt
+	(*EvidenceContext)(nil),                    // 107: beholder.v1.EvidenceContext
+	(*ConditionArmContext)(nil),                // 108: beholder.v1.ConditionArmContext
+	(*PatternArmContext)(nil),                  // 109: beholder.v1.PatternArmContext
+	(*CallableClauseContext)(nil),              // 110: beholder.v1.CallableClauseContext
 }
 var file_beholder_v1_daemon_proto_depIdxs = []int32{
-	25,  // 0: beholder.v1.GarbageCollectEvent.progress:type_name -> beholder.v1.GarbageCollectProgress
-	26,  // 1: beholder.v1.GarbageCollectEvent.completed:type_name -> beholder.v1.GarbageCollectResponse
+	29,  // 0: beholder.v1.GarbageCollectEvent.progress:type_name -> beholder.v1.GarbageCollectProgress
+	30,  // 1: beholder.v1.GarbageCollectEvent.completed:type_name -> beholder.v1.GarbageCollectResponse
 	0,   // 2: beholder.v1.GarbageCollectProgress.phase:type_name -> beholder.v1.GarbageCollectPhase
-	25,  // 3: beholder.v1.GetGarbageCollectionStatusResponse.progress:type_name -> beholder.v1.GarbageCollectProgress
-	39,  // 4: beholder.v1.QueryMetadata.freshness:type_name -> beholder.v1.Freshness
+	29,  // 3: beholder.v1.GetGarbageCollectionStatusResponse.progress:type_name -> beholder.v1.GarbageCollectProgress
+	44,  // 4: beholder.v1.QueryMetadata.freshness:type_name -> beholder.v1.Freshness
 	1,   // 5: beholder.v1.QueryMetadata.completeness:type_name -> beholder.v1.AnalysisCompleteness
-	40,  // 6: beholder.v1.QueryMetadata.diagnostics:type_name -> beholder.v1.AnalysisDiagnostic
-	34,  // 7: beholder.v1.GetWorkspaceTopologyResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	42,  // 8: beholder.v1.GetWorkspaceTopologyResponse.nodes:type_name -> beholder.v1.Entity
-	44,  // 9: beholder.v1.GetWorkspaceTopologyResponse.edges:type_name -> beholder.v1.Edge
-	34,  // 10: beholder.v1.GetWorkspaceTopologyStatusResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	2,   // 11: beholder.v1.AnalysisDiagnostic.severity:type_name -> beholder.v1.AnalysisDiagnosticSeverity
-	7,   // 12: beholder.v1.EntityMetadata.proto_type_kind:type_name -> beholder.v1.ProtoTypeKind
-	8,   // 13: beholder.v1.EntityMetadata.rpc_cardinality:type_name -> beholder.v1.RpcCardinality
-	4,   // 14: beholder.v1.EntityMetadata.graphql_type_kind:type_name -> beholder.v1.GraphqlTypeKind
-	5,   // 15: beholder.v1.EntityMetadata.graphql_operation_kind:type_name -> beholder.v1.GraphqlOperationKind
-	3,   // 16: beholder.v1.Entity.kind:type_name -> beholder.v1.EntityKind
-	6,   // 17: beholder.v1.Entity.origin:type_name -> beholder.v1.EntityOrigin
-	41,  // 18: beholder.v1.Entity.metadata:type_name -> beholder.v1.EntityMetadata
-	9,   // 19: beholder.v1.Evidence.source:type_name -> beholder.v1.EvidenceKind
-	10,  // 20: beholder.v1.Edge.kind:type_name -> beholder.v1.RelationKind
-	43,  // 21: beholder.v1.Edge.evidence:type_name -> beholder.v1.Evidence
-	34,  // 22: beholder.v1.SearchEntitiesResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	47,  // 23: beholder.v1.SearchEntitiesResponse.query:type_name -> beholder.v1.EntitySearchQuery
-	42,  // 24: beholder.v1.SearchEntitiesResponse.matches:type_name -> beholder.v1.Entity
-	34,  // 25: beholder.v1.ContextResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	46,  // 26: beholder.v1.ContextResponse.query:type_name -> beholder.v1.EntityQuery
-	42,  // 27: beholder.v1.ContextResponse.root:type_name -> beholder.v1.Entity
-	42,  // 28: beholder.v1.ContextResponse.nodes:type_name -> beholder.v1.Entity
-	44,  // 29: beholder.v1.ContextResponse.edges:type_name -> beholder.v1.Edge
-	34,  // 30: beholder.v1.DependenciesResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	46,  // 31: beholder.v1.DependenciesResponse.query:type_name -> beholder.v1.EntityQuery
-	42,  // 32: beholder.v1.DependenciesResponse.root:type_name -> beholder.v1.Entity
-	51,  // 33: beholder.v1.DependenciesResponse.dependencies:type_name -> beholder.v1.Dependency
-	42,  // 34: beholder.v1.DependenciesResponse.nodes:type_name -> beholder.v1.Entity
-	44,  // 35: beholder.v1.DependenciesResponse.edges:type_name -> beholder.v1.Edge
-	33,  // 36: beholder.v1.DependenciesResponse.traversal:type_name -> beholder.v1.TraversalMetadata
-	34,  // 37: beholder.v1.ImpactResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	46,  // 38: beholder.v1.ImpactResponse.query:type_name -> beholder.v1.EntityQuery
-	42,  // 39: beholder.v1.ImpactResponse.root:type_name -> beholder.v1.Entity
-	53,  // 40: beholder.v1.ImpactResponse.affected:type_name -> beholder.v1.Impact
-	42,  // 41: beholder.v1.ImpactResponse.nodes:type_name -> beholder.v1.Entity
-	44,  // 42: beholder.v1.ImpactResponse.edges:type_name -> beholder.v1.Edge
-	33,  // 43: beholder.v1.ImpactResponse.traversal:type_name -> beholder.v1.TraversalMetadata
-	34,  // 44: beholder.v1.TraceResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	49,  // 45: beholder.v1.TraceResponse.query:type_name -> beholder.v1.SemanticPathQuery
-	42,  // 46: beholder.v1.TraceResponse.nodes:type_name -> beholder.v1.Entity
-	44,  // 47: beholder.v1.TraceResponse.edges:type_name -> beholder.v1.Edge
-	45,  // 48: beholder.v1.TraceResponse.paths:type_name -> beholder.v1.SemanticPath
-	33,  // 49: beholder.v1.TraceResponse.traversal:type_name -> beholder.v1.TraversalMetadata
-	34,  // 50: beholder.v1.WhyResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	49,  // 51: beholder.v1.WhyResponse.query:type_name -> beholder.v1.SemanticPathQuery
-	42,  // 52: beholder.v1.WhyResponse.nodes:type_name -> beholder.v1.Entity
-	44,  // 53: beholder.v1.WhyResponse.edges:type_name -> beholder.v1.Edge
-	45,  // 54: beholder.v1.WhyResponse.paths:type_name -> beholder.v1.SemanticPath
-	33,  // 55: beholder.v1.WhyResponse.traversal:type_name -> beholder.v1.TraversalMetadata
-	59,  // 56: beholder.v1.Workspace.repositories:type_name -> beholder.v1.WorkspaceRepository
-	58,  // 57: beholder.v1.Workspace.protobuf_descriptors:type_name -> beholder.v1.ProtobufDescriptorSource
-	57,  // 58: beholder.v1.RegisterWorkspaceResponse.workspace:type_name -> beholder.v1.Workspace
-	57,  // 59: beholder.v1.SetWorkspacePluginResponse.workspace:type_name -> beholder.v1.Workspace
-	57,  // 60: beholder.v1.ListWorkspacesResponse.workspaces:type_name -> beholder.v1.Workspace
-	40,  // 61: beholder.v1.RepositoryRevision.diagnostics:type_name -> beholder.v1.AnalysisDiagnostic
-	59,  // 62: beholder.v1.RepositoryStatus.repository:type_name -> beholder.v1.WorkspaceRepository
-	66,  // 63: beholder.v1.RepositoryStatus.revision:type_name -> beholder.v1.RepositoryRevision
-	67,  // 64: beholder.v1.RepositoryResponse.repository:type_name -> beholder.v1.RepositoryStatus
-	88,  // 65: beholder.v1.ListJobsResponse.jobs:type_name -> beholder.v1.JobSummary
-	93,  // 66: beholder.v1.GetJobResponse.job:type_name -> beholder.v1.Job
-	82,  // 67: beholder.v1.SubmitIndexRequest.repository:type_name -> beholder.v1.RepositoryIndexTarget
-	88,  // 68: beholder.v1.SubmitIndexResponse.job:type_name -> beholder.v1.JobSummary
-	88,  // 69: beholder.v1.SubmitIndexResponse.overlapping_jobs:type_name -> beholder.v1.JobSummary
-	87,  // 70: beholder.v1.EnrichmentSubmission.target:type_name -> beholder.v1.JobTarget
-	11,  // 71: beholder.v1.EnrichmentSubmission.disposition:type_name -> beholder.v1.EnrichmentSubmissionDisposition
-	88,  // 72: beholder.v1.EnrichmentSubmission.job:type_name -> beholder.v1.JobSummary
-	85,  // 73: beholder.v1.SubmitEnrichmentResponse.results:type_name -> beholder.v1.EnrichmentSubmission
-	88,  // 74: beholder.v1.SubmitEnrichmentResponse.prerequisite_jobs:type_name -> beholder.v1.JobSummary
-	12,  // 75: beholder.v1.JobSummary.status:type_name -> beholder.v1.JobStatus
-	13,  // 76: beholder.v1.JobSummary.type:type_name -> beholder.v1.JobType
-	87,  // 77: beholder.v1.JobSummary.target:type_name -> beholder.v1.JobTarget
-	14,  // 78: beholder.v1.JobSummary.trigger:type_name -> beholder.v1.JobTrigger
-	89,  // 79: beholder.v1.IndexDestinationResult.destination:type_name -> beholder.v1.IndexDestination
-	16,  // 80: beholder.v1.IndexDestinationResult.outcome:type_name -> beholder.v1.IndexJobOutcome
-	90,  // 81: beholder.v1.IndexJobResult.destinations:type_name -> beholder.v1.IndexDestinationResult
-	87,  // 82: beholder.v1.EnrichmentJobResult.target:type_name -> beholder.v1.JobTarget
-	17,  // 83: beholder.v1.EnrichmentJobResult.outcome:type_name -> beholder.v1.EnrichmentJobOutcome
-	88,  // 84: beholder.v1.Job.summary:type_name -> beholder.v1.JobSummary
-	15,  // 85: beholder.v1.Job.wait_reason:type_name -> beholder.v1.JobWaitReason
-	91,  // 86: beholder.v1.Job.index_result:type_name -> beholder.v1.IndexJobResult
-	92,  // 87: beholder.v1.Job.enrichment_result:type_name -> beholder.v1.EnrichmentJobResult
-	18,  // 88: beholder.v1.TraverseGraphRequest.direction:type_name -> beholder.v1.GraphDirection
-	18,  // 89: beholder.v1.TraverseGraphQuery.direction:type_name -> beholder.v1.GraphDirection
-	19,  // 90: beholder.v1.TraversalPath.termination:type_name -> beholder.v1.PathTermination
-	20,  // 91: beholder.v1.GraphTraversalMetadata.truncation_reasons:type_name -> beholder.v1.TruncationReason
-	34,  // 92: beholder.v1.TraverseGraphResponse.metadata:type_name -> beholder.v1.QueryMetadata
-	95,  // 93: beholder.v1.TraverseGraphResponse.query:type_name -> beholder.v1.TraverseGraphQuery
-	42,  // 94: beholder.v1.TraverseGraphResponse.nodes:type_name -> beholder.v1.Entity
-	44,  // 95: beholder.v1.TraverseGraphResponse.edges:type_name -> beholder.v1.Edge
-	96,  // 96: beholder.v1.TraverseGraphResponse.paths:type_name -> beholder.v1.TraversalPath
-	97,  // 97: beholder.v1.TraverseGraphResponse.traversal:type_name -> beholder.v1.GraphTraversalMetadata
-	21,  // 98: beholder.v1.Daemon.ClearCache:input_type -> beholder.v1.ClearCacheRequest
-	23,  // 99: beholder.v1.Daemon.GarbageCollect:input_type -> beholder.v1.GarbageCollectRequest
-	27,  // 100: beholder.v1.Daemon.GetGarbageCollectionStatus:input_type -> beholder.v1.GetGarbageCollectionStatusRequest
-	29,  // 101: beholder.v1.Daemon.Context:input_type -> beholder.v1.EntityRequest
-	69,  // 102: beholder.v1.Daemon.DeleteRepository:input_type -> beholder.v1.DeleteRepositoryRequest
-	31,  // 103: beholder.v1.Daemon.Dependencies:input_type -> beholder.v1.TraversalEntityRequest
-	75,  // 104: beholder.v1.Daemon.GetStatus:input_type -> beholder.v1.GetStatusRequest
-	71,  // 105: beholder.v1.Daemon.GetRepository:input_type -> beholder.v1.GetRepositoryRequest
-	35,  // 106: beholder.v1.Daemon.GetWorkspaceTopology:input_type -> beholder.v1.GetWorkspaceTopologyRequest
-	37,  // 107: beholder.v1.Daemon.GetWorkspaceTopologyStatus:input_type -> beholder.v1.GetWorkspaceTopologyStatusRequest
-	31,  // 108: beholder.v1.Daemon.Impact:input_type -> beholder.v1.TraversalEntityRequest
-	77,  // 109: beholder.v1.Daemon.ListJobs:input_type -> beholder.v1.ListJobsRequest
-	79,  // 110: beholder.v1.Daemon.GetJob:input_type -> beholder.v1.GetJobRequest
-	81,  // 111: beholder.v1.Daemon.SubmitIndex:input_type -> beholder.v1.SubmitIndexRequest
-	84,  // 112: beholder.v1.Daemon.SubmitEnrichment:input_type -> beholder.v1.SubmitEnrichmentRequest
-	64,  // 113: beholder.v1.Daemon.ListWorkspaces:input_type -> beholder.v1.ListWorkspacesRequest
-	60,  // 114: beholder.v1.Daemon.RegisterWorkspace:input_type -> beholder.v1.RegisterWorkspaceRequest
-	62,  // 115: beholder.v1.Daemon.SetWorkspacePlugin:input_type -> beholder.v1.SetWorkspacePluginRequest
-	68,  // 116: beholder.v1.Daemon.RegisterRepository:input_type -> beholder.v1.RegisterRepositoryRequest
-	30,  // 117: beholder.v1.Daemon.SearchEntities:input_type -> beholder.v1.SearchEntitiesRequest
-	73,  // 118: beholder.v1.Daemon.Stop:input_type -> beholder.v1.StopRequest
-	94,  // 119: beholder.v1.Daemon.TraverseGraph:input_type -> beholder.v1.TraverseGraphRequest
-	32,  // 120: beholder.v1.Daemon.Trace:input_type -> beholder.v1.PathRequest
-	32,  // 121: beholder.v1.Daemon.Why:input_type -> beholder.v1.PathRequest
-	22,  // 122: beholder.v1.Daemon.ClearCache:output_type -> beholder.v1.ClearCacheResponse
-	24,  // 123: beholder.v1.Daemon.GarbageCollect:output_type -> beholder.v1.GarbageCollectEvent
-	28,  // 124: beholder.v1.Daemon.GetGarbageCollectionStatus:output_type -> beholder.v1.GetGarbageCollectionStatusResponse
-	50,  // 125: beholder.v1.Daemon.Context:output_type -> beholder.v1.ContextResponse
-	70,  // 126: beholder.v1.Daemon.DeleteRepository:output_type -> beholder.v1.DeleteRepositoryResponse
-	52,  // 127: beholder.v1.Daemon.Dependencies:output_type -> beholder.v1.DependenciesResponse
-	76,  // 128: beholder.v1.Daemon.GetStatus:output_type -> beholder.v1.GetStatusResponse
-	72,  // 129: beholder.v1.Daemon.GetRepository:output_type -> beholder.v1.RepositoryResponse
-	36,  // 130: beholder.v1.Daemon.GetWorkspaceTopology:output_type -> beholder.v1.GetWorkspaceTopologyResponse
-	38,  // 131: beholder.v1.Daemon.GetWorkspaceTopologyStatus:output_type -> beholder.v1.GetWorkspaceTopologyStatusResponse
-	54,  // 132: beholder.v1.Daemon.Impact:output_type -> beholder.v1.ImpactResponse
-	78,  // 133: beholder.v1.Daemon.ListJobs:output_type -> beholder.v1.ListJobsResponse
-	80,  // 134: beholder.v1.Daemon.GetJob:output_type -> beholder.v1.GetJobResponse
-	83,  // 135: beholder.v1.Daemon.SubmitIndex:output_type -> beholder.v1.SubmitIndexResponse
-	86,  // 136: beholder.v1.Daemon.SubmitEnrichment:output_type -> beholder.v1.SubmitEnrichmentResponse
-	65,  // 137: beholder.v1.Daemon.ListWorkspaces:output_type -> beholder.v1.ListWorkspacesResponse
-	61,  // 138: beholder.v1.Daemon.RegisterWorkspace:output_type -> beholder.v1.RegisterWorkspaceResponse
-	63,  // 139: beholder.v1.Daemon.SetWorkspacePlugin:output_type -> beholder.v1.SetWorkspacePluginResponse
-	72,  // 140: beholder.v1.Daemon.RegisterRepository:output_type -> beholder.v1.RepositoryResponse
-	48,  // 141: beholder.v1.Daemon.SearchEntities:output_type -> beholder.v1.SearchEntitiesResponse
-	74,  // 142: beholder.v1.Daemon.Stop:output_type -> beholder.v1.StopResponse
-	98,  // 143: beholder.v1.Daemon.TraverseGraph:output_type -> beholder.v1.TraverseGraphResponse
-	55,  // 144: beholder.v1.Daemon.Trace:output_type -> beholder.v1.TraceResponse
-	56,  // 145: beholder.v1.Daemon.Why:output_type -> beholder.v1.WhyResponse
-	122, // [122:146] is the sub-list for method output_type
-	98,  // [98:122] is the sub-list for method input_type
-	98,  // [98:98] is the sub-list for extension type_name
-	98,  // [98:98] is the sub-list for extension extendee
-	0,   // [0:98] is the sub-list for field type_name
+	45,  // 6: beholder.v1.QueryMetadata.diagnostics:type_name -> beholder.v1.AnalysisDiagnostic
+	39,  // 7: beholder.v1.QueryMetadata.diagnostic_counts:type_name -> beholder.v1.DiagnosticCounts
+	38,  // 8: beholder.v1.GetWorkspaceTopologyResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	47,  // 9: beholder.v1.GetWorkspaceTopologyResponse.nodes:type_name -> beholder.v1.Entity
+	49,  // 10: beholder.v1.GetWorkspaceTopologyResponse.edges:type_name -> beholder.v1.Edge
+	38,  // 11: beholder.v1.GetWorkspaceTopologyStatusResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	2,   // 12: beholder.v1.AnalysisDiagnostic.severity:type_name -> beholder.v1.AnalysisDiagnosticSeverity
+	7,   // 13: beholder.v1.EntityMetadata.proto_type_kind:type_name -> beholder.v1.ProtoTypeKind
+	8,   // 14: beholder.v1.EntityMetadata.rpc_cardinality:type_name -> beholder.v1.RpcCardinality
+	4,   // 15: beholder.v1.EntityMetadata.graphql_type_kind:type_name -> beholder.v1.GraphqlTypeKind
+	5,   // 16: beholder.v1.EntityMetadata.graphql_operation_kind:type_name -> beholder.v1.GraphqlOperationKind
+	3,   // 17: beholder.v1.Entity.kind:type_name -> beholder.v1.EntityKind
+	6,   // 18: beholder.v1.Entity.origin:type_name -> beholder.v1.EntityOrigin
+	46,  // 19: beholder.v1.Entity.metadata:type_name -> beholder.v1.EntityMetadata
+	9,   // 20: beholder.v1.Evidence.source:type_name -> beholder.v1.EvidenceKind
+	105, // 21: beholder.v1.Evidence.range:type_name -> beholder.v1.SourceRange
+	107, // 22: beholder.v1.Evidence.contexts:type_name -> beholder.v1.EvidenceContext
+	10,  // 23: beholder.v1.Edge.kind:type_name -> beholder.v1.RelationKind
+	48,  // 24: beholder.v1.Edge.evidence:type_name -> beholder.v1.Evidence
+	38,  // 25: beholder.v1.SearchEntitiesResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	52,  // 26: beholder.v1.SearchEntitiesResponse.query:type_name -> beholder.v1.EntitySearchQuery
+	47,  // 27: beholder.v1.SearchEntitiesResponse.matches:type_name -> beholder.v1.Entity
+	38,  // 28: beholder.v1.ContextResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	51,  // 29: beholder.v1.ContextResponse.query:type_name -> beholder.v1.EntityQuery
+	47,  // 30: beholder.v1.ContextResponse.root:type_name -> beholder.v1.Entity
+	47,  // 31: beholder.v1.ContextResponse.nodes:type_name -> beholder.v1.Entity
+	49,  // 32: beholder.v1.ContextResponse.edges:type_name -> beholder.v1.Edge
+	38,  // 33: beholder.v1.DependenciesResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	51,  // 34: beholder.v1.DependenciesResponse.query:type_name -> beholder.v1.EntityQuery
+	47,  // 35: beholder.v1.DependenciesResponse.root:type_name -> beholder.v1.Entity
+	56,  // 36: beholder.v1.DependenciesResponse.dependencies:type_name -> beholder.v1.Dependency
+	47,  // 37: beholder.v1.DependenciesResponse.nodes:type_name -> beholder.v1.Entity
+	49,  // 38: beholder.v1.DependenciesResponse.edges:type_name -> beholder.v1.Edge
+	37,  // 39: beholder.v1.DependenciesResponse.traversal:type_name -> beholder.v1.TraversalMetadata
+	38,  // 40: beholder.v1.ImpactResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	51,  // 41: beholder.v1.ImpactResponse.query:type_name -> beholder.v1.EntityQuery
+	47,  // 42: beholder.v1.ImpactResponse.root:type_name -> beholder.v1.Entity
+	58,  // 43: beholder.v1.ImpactResponse.affected:type_name -> beholder.v1.Impact
+	47,  // 44: beholder.v1.ImpactResponse.nodes:type_name -> beholder.v1.Entity
+	49,  // 45: beholder.v1.ImpactResponse.edges:type_name -> beholder.v1.Edge
+	37,  // 46: beholder.v1.ImpactResponse.traversal:type_name -> beholder.v1.TraversalMetadata
+	38,  // 47: beholder.v1.TraceResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	54,  // 48: beholder.v1.TraceResponse.query:type_name -> beholder.v1.SemanticPathQuery
+	47,  // 49: beholder.v1.TraceResponse.nodes:type_name -> beholder.v1.Entity
+	49,  // 50: beholder.v1.TraceResponse.edges:type_name -> beholder.v1.Edge
+	50,  // 51: beholder.v1.TraceResponse.paths:type_name -> beholder.v1.SemanticPath
+	37,  // 52: beholder.v1.TraceResponse.traversal:type_name -> beholder.v1.TraversalMetadata
+	38,  // 53: beholder.v1.WhyResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	54,  // 54: beholder.v1.WhyResponse.query:type_name -> beholder.v1.SemanticPathQuery
+	47,  // 55: beholder.v1.WhyResponse.nodes:type_name -> beholder.v1.Entity
+	49,  // 56: beholder.v1.WhyResponse.edges:type_name -> beholder.v1.Edge
+	50,  // 57: beholder.v1.WhyResponse.paths:type_name -> beholder.v1.SemanticPath
+	37,  // 58: beholder.v1.WhyResponse.traversal:type_name -> beholder.v1.TraversalMetadata
+	64,  // 59: beholder.v1.Workspace.repositories:type_name -> beholder.v1.WorkspaceRepository
+	63,  // 60: beholder.v1.Workspace.protobuf_descriptors:type_name -> beholder.v1.ProtobufDescriptorSource
+	62,  // 61: beholder.v1.RegisterWorkspaceResponse.workspace:type_name -> beholder.v1.Workspace
+	62,  // 62: beholder.v1.SetWorkspacePluginResponse.workspace:type_name -> beholder.v1.Workspace
+	62,  // 63: beholder.v1.ListWorkspacesResponse.workspaces:type_name -> beholder.v1.Workspace
+	45,  // 64: beholder.v1.RepositoryRevision.diagnostics:type_name -> beholder.v1.AnalysisDiagnostic
+	64,  // 65: beholder.v1.RepositoryStatus.repository:type_name -> beholder.v1.WorkspaceRepository
+	71,  // 66: beholder.v1.RepositoryStatus.revision:type_name -> beholder.v1.RepositoryRevision
+	72,  // 67: beholder.v1.RepositoryResponse.repository:type_name -> beholder.v1.RepositoryStatus
+	93,  // 68: beholder.v1.ListJobsResponse.jobs:type_name -> beholder.v1.JobSummary
+	98,  // 69: beholder.v1.GetJobResponse.job:type_name -> beholder.v1.Job
+	87,  // 70: beholder.v1.SubmitIndexRequest.repository:type_name -> beholder.v1.RepositoryIndexTarget
+	93,  // 71: beholder.v1.SubmitIndexResponse.job:type_name -> beholder.v1.JobSummary
+	93,  // 72: beholder.v1.SubmitIndexResponse.overlapping_jobs:type_name -> beholder.v1.JobSummary
+	92,  // 73: beholder.v1.EnrichmentSubmission.target:type_name -> beholder.v1.JobTarget
+	11,  // 74: beholder.v1.EnrichmentSubmission.disposition:type_name -> beholder.v1.EnrichmentSubmissionDisposition
+	93,  // 75: beholder.v1.EnrichmentSubmission.job:type_name -> beholder.v1.JobSummary
+	90,  // 76: beholder.v1.SubmitEnrichmentResponse.results:type_name -> beholder.v1.EnrichmentSubmission
+	93,  // 77: beholder.v1.SubmitEnrichmentResponse.prerequisite_jobs:type_name -> beholder.v1.JobSummary
+	12,  // 78: beholder.v1.JobSummary.status:type_name -> beholder.v1.JobStatus
+	13,  // 79: beholder.v1.JobSummary.type:type_name -> beholder.v1.JobType
+	92,  // 80: beholder.v1.JobSummary.target:type_name -> beholder.v1.JobTarget
+	14,  // 81: beholder.v1.JobSummary.trigger:type_name -> beholder.v1.JobTrigger
+	94,  // 82: beholder.v1.IndexDestinationResult.destination:type_name -> beholder.v1.IndexDestination
+	16,  // 83: beholder.v1.IndexDestinationResult.outcome:type_name -> beholder.v1.IndexJobOutcome
+	95,  // 84: beholder.v1.IndexJobResult.destinations:type_name -> beholder.v1.IndexDestinationResult
+	92,  // 85: beholder.v1.EnrichmentJobResult.target:type_name -> beholder.v1.JobTarget
+	17,  // 86: beholder.v1.EnrichmentJobResult.outcome:type_name -> beholder.v1.EnrichmentJobOutcome
+	93,  // 87: beholder.v1.Job.summary:type_name -> beholder.v1.JobSummary
+	15,  // 88: beholder.v1.Job.wait_reason:type_name -> beholder.v1.JobWaitReason
+	96,  // 89: beholder.v1.Job.index_result:type_name -> beholder.v1.IndexJobResult
+	97,  // 90: beholder.v1.Job.enrichment_result:type_name -> beholder.v1.EnrichmentJobResult
+	18,  // 91: beholder.v1.TraverseGraphRequest.direction:type_name -> beholder.v1.GraphDirection
+	18,  // 92: beholder.v1.TraverseGraphQuery.direction:type_name -> beholder.v1.GraphDirection
+	19,  // 93: beholder.v1.TraversalPath.termination:type_name -> beholder.v1.PathTermination
+	20,  // 94: beholder.v1.GraphTraversalMetadata.truncation_reasons:type_name -> beholder.v1.TruncationReason
+	38,  // 95: beholder.v1.TraverseGraphResponse.metadata:type_name -> beholder.v1.QueryMetadata
+	100, // 96: beholder.v1.TraverseGraphResponse.query:type_name -> beholder.v1.TraverseGraphQuery
+	47,  // 97: beholder.v1.TraverseGraphResponse.nodes:type_name -> beholder.v1.Entity
+	49,  // 98: beholder.v1.TraverseGraphResponse.edges:type_name -> beholder.v1.Edge
+	101, // 99: beholder.v1.TraverseGraphResponse.paths:type_name -> beholder.v1.TraversalPath
+	102, // 100: beholder.v1.TraverseGraphResponse.traversal:type_name -> beholder.v1.GraphTraversalMetadata
+	104, // 101: beholder.v1.SourceRange.start:type_name -> beholder.v1.SourcePosition
+	104, // 102: beholder.v1.SourceRange.end:type_name -> beholder.v1.SourcePosition
+	105, // 103: beholder.v1.SourceExcerpt.range:type_name -> beholder.v1.SourceRange
+	108, // 104: beholder.v1.EvidenceContext.condition_arm:type_name -> beholder.v1.ConditionArmContext
+	109, // 105: beholder.v1.EvidenceContext.pattern_arm:type_name -> beholder.v1.PatternArmContext
+	110, // 106: beholder.v1.EvidenceContext.callable_clause:type_name -> beholder.v1.CallableClauseContext
+	21,  // 107: beholder.v1.ConditionArmContext.construct:type_name -> beholder.v1.ConditionConstruct
+	22,  // 108: beholder.v1.ConditionArmContext.arm:type_name -> beholder.v1.ConditionArmKind
+	106, // 109: beholder.v1.ConditionArmContext.condition:type_name -> beholder.v1.SourceExcerpt
+	105, // 110: beholder.v1.ConditionArmContext.arm_range:type_name -> beholder.v1.SourceRange
+	23,  // 111: beholder.v1.PatternArmContext.construct:type_name -> beholder.v1.PatternConstruct
+	106, // 112: beholder.v1.PatternArmContext.selector:type_name -> beholder.v1.SourceExcerpt
+	106, // 113: beholder.v1.PatternArmContext.pattern:type_name -> beholder.v1.SourceExcerpt
+	106, // 114: beholder.v1.PatternArmContext.guard:type_name -> beholder.v1.SourceExcerpt
+	105, // 115: beholder.v1.PatternArmContext.arm_range:type_name -> beholder.v1.SourceRange
+	24,  // 116: beholder.v1.CallableClauseContext.role:type_name -> beholder.v1.CallableClauseRole
+	106, // 117: beholder.v1.CallableClauseContext.signature:type_name -> beholder.v1.SourceExcerpt
+	106, // 118: beholder.v1.CallableClauseContext.guard:type_name -> beholder.v1.SourceExcerpt
+	105, // 119: beholder.v1.CallableClauseContext.definition_range:type_name -> beholder.v1.SourceRange
+	25,  // 120: beholder.v1.Daemon.ClearCache:input_type -> beholder.v1.ClearCacheRequest
+	27,  // 121: beholder.v1.Daemon.GarbageCollect:input_type -> beholder.v1.GarbageCollectRequest
+	31,  // 122: beholder.v1.Daemon.GetGarbageCollectionStatus:input_type -> beholder.v1.GetGarbageCollectionStatusRequest
+	33,  // 123: beholder.v1.Daemon.Context:input_type -> beholder.v1.EntityRequest
+	74,  // 124: beholder.v1.Daemon.DeleteRepository:input_type -> beholder.v1.DeleteRepositoryRequest
+	35,  // 125: beholder.v1.Daemon.Dependencies:input_type -> beholder.v1.TraversalEntityRequest
+	80,  // 126: beholder.v1.Daemon.GetStatus:input_type -> beholder.v1.GetStatusRequest
+	76,  // 127: beholder.v1.Daemon.GetRepository:input_type -> beholder.v1.GetRepositoryRequest
+	40,  // 128: beholder.v1.Daemon.GetWorkspaceTopology:input_type -> beholder.v1.GetWorkspaceTopologyRequest
+	42,  // 129: beholder.v1.Daemon.GetWorkspaceTopologyStatus:input_type -> beholder.v1.GetWorkspaceTopologyStatusRequest
+	35,  // 130: beholder.v1.Daemon.Impact:input_type -> beholder.v1.TraversalEntityRequest
+	82,  // 131: beholder.v1.Daemon.ListJobs:input_type -> beholder.v1.ListJobsRequest
+	84,  // 132: beholder.v1.Daemon.GetJob:input_type -> beholder.v1.GetJobRequest
+	86,  // 133: beholder.v1.Daemon.SubmitIndex:input_type -> beholder.v1.SubmitIndexRequest
+	89,  // 134: beholder.v1.Daemon.SubmitEnrichment:input_type -> beholder.v1.SubmitEnrichmentRequest
+	69,  // 135: beholder.v1.Daemon.ListWorkspaces:input_type -> beholder.v1.ListWorkspacesRequest
+	65,  // 136: beholder.v1.Daemon.RegisterWorkspace:input_type -> beholder.v1.RegisterWorkspaceRequest
+	67,  // 137: beholder.v1.Daemon.SetWorkspacePlugin:input_type -> beholder.v1.SetWorkspacePluginRequest
+	73,  // 138: beholder.v1.Daemon.RegisterRepository:input_type -> beholder.v1.RegisterRepositoryRequest
+	34,  // 139: beholder.v1.Daemon.SearchEntities:input_type -> beholder.v1.SearchEntitiesRequest
+	78,  // 140: beholder.v1.Daemon.Stop:input_type -> beholder.v1.StopRequest
+	99,  // 141: beholder.v1.Daemon.TraverseGraph:input_type -> beholder.v1.TraverseGraphRequest
+	36,  // 142: beholder.v1.Daemon.Trace:input_type -> beholder.v1.PathRequest
+	36,  // 143: beholder.v1.Daemon.Why:input_type -> beholder.v1.PathRequest
+	26,  // 144: beholder.v1.Daemon.ClearCache:output_type -> beholder.v1.ClearCacheResponse
+	28,  // 145: beholder.v1.Daemon.GarbageCollect:output_type -> beholder.v1.GarbageCollectEvent
+	32,  // 146: beholder.v1.Daemon.GetGarbageCollectionStatus:output_type -> beholder.v1.GetGarbageCollectionStatusResponse
+	55,  // 147: beholder.v1.Daemon.Context:output_type -> beholder.v1.ContextResponse
+	75,  // 148: beholder.v1.Daemon.DeleteRepository:output_type -> beholder.v1.DeleteRepositoryResponse
+	57,  // 149: beholder.v1.Daemon.Dependencies:output_type -> beholder.v1.DependenciesResponse
+	81,  // 150: beholder.v1.Daemon.GetStatus:output_type -> beholder.v1.GetStatusResponse
+	77,  // 151: beholder.v1.Daemon.GetRepository:output_type -> beholder.v1.RepositoryResponse
+	41,  // 152: beholder.v1.Daemon.GetWorkspaceTopology:output_type -> beholder.v1.GetWorkspaceTopologyResponse
+	43,  // 153: beholder.v1.Daemon.GetWorkspaceTopologyStatus:output_type -> beholder.v1.GetWorkspaceTopologyStatusResponse
+	59,  // 154: beholder.v1.Daemon.Impact:output_type -> beholder.v1.ImpactResponse
+	83,  // 155: beholder.v1.Daemon.ListJobs:output_type -> beholder.v1.ListJobsResponse
+	85,  // 156: beholder.v1.Daemon.GetJob:output_type -> beholder.v1.GetJobResponse
+	88,  // 157: beholder.v1.Daemon.SubmitIndex:output_type -> beholder.v1.SubmitIndexResponse
+	91,  // 158: beholder.v1.Daemon.SubmitEnrichment:output_type -> beholder.v1.SubmitEnrichmentResponse
+	70,  // 159: beholder.v1.Daemon.ListWorkspaces:output_type -> beholder.v1.ListWorkspacesResponse
+	66,  // 160: beholder.v1.Daemon.RegisterWorkspace:output_type -> beholder.v1.RegisterWorkspaceResponse
+	68,  // 161: beholder.v1.Daemon.SetWorkspacePlugin:output_type -> beholder.v1.SetWorkspacePluginResponse
+	77,  // 162: beholder.v1.Daemon.RegisterRepository:output_type -> beholder.v1.RepositoryResponse
+	53,  // 163: beholder.v1.Daemon.SearchEntities:output_type -> beholder.v1.SearchEntitiesResponse
+	79,  // 164: beholder.v1.Daemon.Stop:output_type -> beholder.v1.StopResponse
+	103, // 165: beholder.v1.Daemon.TraverseGraph:output_type -> beholder.v1.TraverseGraphResponse
+	60,  // 166: beholder.v1.Daemon.Trace:output_type -> beholder.v1.TraceResponse
+	61,  // 167: beholder.v1.Daemon.Why:output_type -> beholder.v1.WhyResponse
+	144, // [144:168] is the sub-list for method output_type
+	120, // [120:144] is the sub-list for method input_type
+	120, // [120:120] is the sub-list for extension type_name
+	120, // [120:120] is the sub-list for extension extendee
+	0,   // [0:120] is the sub-list for field type_name
 }
 
 func init() { file_beholder_v1_daemon_proto_init() }
@@ -6978,44 +7908,52 @@ func file_beholder_v1_daemon_proto_init() {
 	file_beholder_v1_daemon_proto_msgTypes[9].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[10].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[11].OneofWrappers = []any{}
-	file_beholder_v1_daemon_proto_msgTypes[19].OneofWrappers = []any{}
-	file_beholder_v1_daemon_proto_msgTypes[20].OneofWrappers = []any{
+	file_beholder_v1_daemon_proto_msgTypes[20].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[21].OneofWrappers = []any{
 		(*EntityMetadata_ProtoTypeKind)(nil),
 		(*EntityMetadata_RpcCardinality)(nil),
 		(*EntityMetadata_GraphqlTypeKind)(nil),
 		(*EntityMetadata_GraphqlOperationKind)(nil),
 	}
-	file_beholder_v1_daemon_proto_msgTypes[21].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[22].OneofWrappers = []any{}
-	file_beholder_v1_daemon_proto_msgTypes[45].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[23].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[46].OneofWrappers = []any{}
-	file_beholder_v1_daemon_proto_msgTypes[56].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[47].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[57].OneofWrappers = []any{}
-	file_beholder_v1_daemon_proto_msgTypes[60].OneofWrappers = []any{
+	file_beholder_v1_daemon_proto_msgTypes[58].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[61].OneofWrappers = []any{
 		(*SubmitIndexRequest_Workspace)(nil),
 		(*SubmitIndexRequest_Repository)(nil),
 	}
-	file_beholder_v1_daemon_proto_msgTypes[61].OneofWrappers = []any{}
-	file_beholder_v1_daemon_proto_msgTypes[63].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[62].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[64].OneofWrappers = []any{}
-	file_beholder_v1_daemon_proto_msgTypes[66].OneofWrappers = []any{
+	file_beholder_v1_daemon_proto_msgTypes[65].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[67].OneofWrappers = []any{
 		(*JobTarget_Workspace)(nil),
 		(*JobTarget_Repository)(nil),
 	}
-	file_beholder_v1_daemon_proto_msgTypes[68].OneofWrappers = []any{
+	file_beholder_v1_daemon_proto_msgTypes[69].OneofWrappers = []any{
 		(*IndexDestination_Workspace)(nil),
 		(*IndexDestination_StandaloneRepository)(nil),
 	}
-	file_beholder_v1_daemon_proto_msgTypes[72].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[73].OneofWrappers = []any{}
 	file_beholder_v1_daemon_proto_msgTypes[74].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[75].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[82].OneofWrappers = []any{
+		(*EvidenceContext_ConditionArm)(nil),
+		(*EvidenceContext_PatternArm)(nil),
+		(*EvidenceContext_CallableClause)(nil),
+	}
+	file_beholder_v1_daemon_proto_msgTypes[83].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[84].OneofWrappers = []any{}
+	file_beholder_v1_daemon_proto_msgTypes[85].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_beholder_v1_daemon_proto_rawDesc), len(file_beholder_v1_daemon_proto_rawDesc)),
-			NumEnums:      21,
-			NumMessages:   78,
+			NumEnums:      25,
+			NumMessages:   86,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -2,6 +2,8 @@ use crate::RepositoryState;
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf};
 
+const STRUCTURED_EVIDENCE_PREFIX: &str = "beholder:evidence:v1:";
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct EntityId(String);
@@ -37,6 +39,65 @@ pub struct Evidence(String);
 impl Evidence {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn structured(payload: EvidencePayload) -> Result<Self, String> {
+        payload.validate()?;
+        serde_json::to_string(&payload)
+            .map(|payload| Self(format!("{STRUCTURED_EVIDENCE_PREFIX}{payload}")))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn decode(&self) -> EvidencePayload {
+        self.0
+            .strip_prefix(STRUCTURED_EVIDENCE_PREFIX)
+            .and_then(|payload| serde_json::from_str::<EvidencePayload>(payload).ok())
+            .filter(|payload| payload.validate().is_ok())
+            .unwrap_or_else(|| EvidencePayload::legacy(&self.0))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct EvidencePayload {
+    pub path: Option<String>,
+    pub line: Option<u32>,
+    pub detail: Option<String>,
+    pub range: Option<SourceRange>,
+    #[serde(default)]
+    pub contexts: Vec<EvidenceContext>,
+}
+
+impl EvidencePayload {
+    fn legacy(evidence: &str) -> Self {
+        let (location, detail) = evidence
+            .split_once(" · ")
+            .map_or((evidence, None), |(location, detail)| {
+                (location, Some(detail.to_owned()))
+            });
+        let (path, line) = location
+            .rsplit_once(':')
+            .and_then(|(path, line)| {
+                line.parse()
+                    .ok()
+                    .map(|line| (Some(path.into()), Some(line)))
+            })
+            .unwrap_or_else(|| (Some(location.into()), None));
+        Self {
+            path,
+            line,
+            detail,
+            range: None,
+            contexts: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.range.as_ref().is_some_and(|range| !range.is_valid())
+            || self.contexts.iter().any(|context| !context.is_valid())
+        {
+            return Err("evidence contains an invalid source range".into());
+        }
+        Ok(())
     }
 }
 
@@ -112,6 +173,115 @@ impl From<String> for Evidence {
 impl From<&str> for Evidence {
     fn from(value: &str) -> Self {
         Self(value.into())
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    fn position(line: u32, character: u32) -> SourcePosition {
+        SourcePosition { line, character }
+    }
+
+    fn range(start: (u32, u32), end: (u32, u32)) -> SourceRange {
+        SourceRange {
+            start: position(start.0, start.1),
+            end: position(end.0, end.1),
+        }
+    }
+
+    fn excerpt(text: &str, start: (u32, u32), end: (u32, u32)) -> SourceExcerpt {
+        SourceExcerpt {
+            text: text.into(),
+            range: range(start, end),
+        }
+    }
+
+    #[test]
+    fn structured_evidence_is_deterministic_and_preserves_context_order() {
+        let payload = EvidencePayload {
+            path: Some("src/lib.rs".into()),
+            line: Some(3),
+            detail: None,
+            range: Some(range((2, 5), (2, 12))),
+            contexts: vec![
+                EvidenceContext::CallableClause {
+                    role: CallableClauseRole::Enclosing,
+                    signature: excerpt("fn run(🚀: &str)", (1, 0), (1, 17)),
+                    guard: None,
+                    definition_range: range((1, 0), (4, 1)),
+                },
+                EvidenceContext::ConditionArm {
+                    construct: ConditionConstruct::If,
+                    arm: ConditionArmKind::Then,
+                    condition: Some(excerpt("🚀.len() > 0", (2, 8), (2, 20))),
+                    arm_range: range((2, 22), (3, 5)),
+                },
+            ],
+        };
+
+        let first = Evidence::structured(payload.clone()).unwrap();
+        let second = Evidence::structured(payload.clone()).unwrap();
+
+        assert_eq!(first, second);
+        assert!(
+            first
+                .as_str()
+                .starts_with("beholder:evidence:v1:{\"path\":\"src/lib.rs\",\"line\":3")
+        );
+        assert_eq!(first.decode(), payload);
+    }
+
+    #[test]
+    fn decodes_legacy_location_and_plugin_detail_forms() {
+        assert_eq!(
+            Evidence::from("src/lib.rs:7").decode(),
+            EvidencePayload {
+                path: Some("src/lib.rs".into()),
+                line: Some(7),
+                detail: None,
+                range: None,
+                contexts: Vec::new(),
+            }
+        );
+        assert_eq!(
+            Evidence::from("src/lib.rs:7 · compiler selected target").decode(),
+            EvidencePayload {
+                path: Some("src/lib.rs".into()),
+                line: Some(7),
+                detail: Some("compiler selected target".into()),
+                range: None,
+                contexts: Vec::new(),
+            }
+        );
+        assert_eq!(
+            Evidence::from("descriptor.proto").decode().path.as_deref(),
+            Some("descriptor.proto")
+        );
+        assert_eq!(
+            Evidence::from("descriptor.proto · generated service").decode(),
+            EvidencePayload {
+                path: Some("descriptor.proto".into()),
+                line: None,
+                detail: Some("generated service".into()),
+                range: None,
+                contexts: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_or_invalid_reserved_payload_falls_back_to_legacy_evidence() {
+        for evidence in [
+            "beholder:evidence:v1:not-json",
+            "beholder:evidence:v1:{\"path\":null,\"line\":null,\"detail\":null,\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":1,\"character\":0}},\"contexts\":[]}",
+        ] {
+            let decoded = Evidence::from(evidence).decode();
+            assert_eq!(decoded.path.as_deref(), Some(evidence));
+            assert_eq!(decoded.detail, None);
+            assert!(decoded.contexts.is_empty());
+        }
     }
 }
 
@@ -197,10 +367,128 @@ pub struct Observation {
     pub provenance: Provenance,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SourcePosition {
     pub line: u32,
     pub character: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct SourceRange {
+    pub start: SourcePosition,
+    pub end: SourcePosition,
+}
+
+impl SourceRange {
+    pub fn is_valid(&self) -> bool {
+        self.start <= self.end
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct SourceExcerpt {
+    pub text: String,
+    pub range: SourceRange,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionConstruct {
+    If,
+    Cond,
+    Ternary,
+    TemplateIf,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionArmKind {
+    Then,
+    ElseIf,
+    Else,
+    Clause,
+    Consequence,
+    Alternative,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternConstruct {
+    Match,
+    Case,
+    SwitchStatement,
+    SwitchExpression,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallableClauseRole {
+    Declaration,
+    Enclosing,
+    SelectedTarget,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceContext {
+    ConditionArm {
+        construct: ConditionConstruct,
+        arm: ConditionArmKind,
+        condition: Option<SourceExcerpt>,
+        arm_range: SourceRange,
+    },
+    PatternArm {
+        construct: PatternConstruct,
+        selector: Option<SourceExcerpt>,
+        pattern: Option<SourceExcerpt>,
+        guard: Option<SourceExcerpt>,
+        is_default: bool,
+        arm_range: SourceRange,
+    },
+    CallableClause {
+        role: CallableClauseRole,
+        signature: SourceExcerpt,
+        guard: Option<SourceExcerpt>,
+        definition_range: SourceRange,
+    },
+}
+
+impl EvidenceContext {
+    fn is_valid(&self) -> bool {
+        fn excerpt_is_valid(excerpt: &Option<SourceExcerpt>) -> bool {
+            excerpt
+                .as_ref()
+                .is_none_or(|excerpt| excerpt.range.is_valid())
+        }
+
+        match self {
+            Self::ConditionArm {
+                condition,
+                arm_range,
+                ..
+            } => excerpt_is_valid(condition) && arm_range.is_valid(),
+            Self::PatternArm {
+                selector,
+                pattern,
+                guard,
+                arm_range,
+                ..
+            } => {
+                excerpt_is_valid(selector)
+                    && excerpt_is_valid(pattern)
+                    && excerpt_is_valid(guard)
+                    && arm_range.is_valid()
+            }
+            Self::CallableClause {
+                signature,
+                guard,
+                definition_range,
+                ..
+            } => {
+                signature.range.is_valid() && excerpt_is_valid(guard) && definition_range.is_valid()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]

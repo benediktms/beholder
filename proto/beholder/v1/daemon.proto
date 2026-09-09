@@ -281,6 +281,8 @@ message Evidence {
   optional string path = 3;
   optional uint32 line = 4;
   optional string detail = 5;
+  optional SourceRange range = 6;
+  repeated EvidenceContext contexts = 7;
 }
 
 message Edge {
@@ -691,4 +693,83 @@ message TraverseGraphResponse {
   repeated Edge edges = 5;
   repeated TraversalPath paths = 6;
   GraphTraversalMetadata traversal = 7;
+}
+
+message SourcePosition {
+  uint32 line = 1;
+  uint32 character = 2;
+}
+
+message SourceRange {
+  SourcePosition start = 1;
+  SourcePosition end = 2;
+}
+
+message SourceExcerpt {
+  string text = 1;
+  SourceRange range = 2;
+}
+
+enum ConditionConstruct {
+  CONDITION_CONSTRUCT_UNSPECIFIED = 0;
+  CONDITION_CONSTRUCT_IF = 1;
+  CONDITION_CONSTRUCT_COND = 2;
+  CONDITION_CONSTRUCT_TERNARY = 3;
+  CONDITION_CONSTRUCT_TEMPLATE_IF = 4;
+}
+
+enum ConditionArmKind {
+  CONDITION_ARM_KIND_UNSPECIFIED = 0;
+  CONDITION_ARM_KIND_THEN = 1;
+  CONDITION_ARM_KIND_ELSE_IF = 2;
+  CONDITION_ARM_KIND_ELSE = 3;
+  CONDITION_ARM_KIND_CLAUSE = 4;
+  CONDITION_ARM_KIND_CONSEQUENCE = 5;
+  CONDITION_ARM_KIND_ALTERNATIVE = 6;
+}
+
+enum PatternConstruct {
+  PATTERN_CONSTRUCT_UNSPECIFIED = 0;
+  PATTERN_CONSTRUCT_MATCH = 1;
+  PATTERN_CONSTRUCT_CASE = 2;
+  PATTERN_CONSTRUCT_SWITCH_STATEMENT = 3;
+  PATTERN_CONSTRUCT_SWITCH_EXPRESSION = 4;
+}
+
+enum CallableClauseRole {
+  CALLABLE_CLAUSE_ROLE_UNSPECIFIED = 0;
+  CALLABLE_CLAUSE_ROLE_DECLARATION = 1;
+  CALLABLE_CLAUSE_ROLE_ENCLOSING = 2;
+  CALLABLE_CLAUSE_ROLE_SELECTED_TARGET = 3;
+}
+
+message EvidenceContext {
+  oneof context {
+    ConditionArmContext condition_arm = 1;
+    PatternArmContext pattern_arm = 2;
+    CallableClauseContext callable_clause = 3;
+  }
+}
+
+message ConditionArmContext {
+  ConditionConstruct construct = 1;
+  ConditionArmKind arm = 2;
+  optional SourceExcerpt condition = 3;
+  SourceRange arm_range = 4;
+}
+
+message PatternArmContext {
+  PatternConstruct construct = 1;
+  optional SourceExcerpt selector = 2;
+  optional SourceExcerpt pattern = 3;
+  optional SourceExcerpt guard = 4;
+  bool is_default = 5;
+  SourceRange arm_range = 6;
+}
+
+message CallableClauseContext {
+  CallableClauseRole role = 1;
+  SourceExcerpt signature = 2;
+  optional SourceExcerpt guard = 3;
+  SourceRange definition_range = 4;
 }

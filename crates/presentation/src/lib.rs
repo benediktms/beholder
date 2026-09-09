@@ -166,9 +166,10 @@ mod tests {
     };
     use beholder_dto::{
         AnalysisCompleteness, AnalysisDiagnostic, AnalysisDiagnosticSeverity, AnalysisMetadata,
-        CONTEXT_SCHEMA_V1, ContextResult, DEPENDENCIES_SCHEMA_V2, DependenciesResult, EntityQuery,
-        EvidenceKind, Freshness, IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery,
-        QueryMetadata, RelationKind, TRACE_SCHEMA_V2,
+        CONTEXT_SCHEMA_V1, CallableClauseRole, ContextResult, DEPENDENCIES_SCHEMA_V2,
+        DependenciesResult, EntityQuery, EvidenceContext, EvidenceKind, Freshness,
+        IMPACT_SCHEMA_V2, ImpactRef, ImpactResult, PathQuery, QueryMetadata, RelationKind,
+        SourceExcerpt, SourcePosition, SourceRange, TRACE_SCHEMA_V2,
     };
 
     fn traversal() -> TraversalMetadata {
@@ -241,7 +242,9 @@ mod tests {
                 repository: Some("repo".into()),
                 path: Some(path.into()),
                 line: Some(line),
+                range: None,
                 detail: None,
+                contexts: Vec::new(),
             }],
         }
     }
@@ -265,6 +268,40 @@ mod tests {
                 .unwrap()
                 .ends_with("stale=false · indexing=true · enriching=repo")
         );
+    }
+
+    #[test]
+    fn structured_evidence_is_preserved_only_in_raw_and_json_output() {
+        let mut result = trace_result();
+        let range = SourceRange {
+            start: SourcePosition {
+                line: 2,
+                character: 4,
+            },
+            end: SourcePosition {
+                line: 2,
+                character: 10,
+            },
+        };
+        result.edges[0].evidence[0].range = Some(range.clone());
+        result.edges[0].evidence[0].contexts = vec![EvidenceContext::CallableClause {
+            role: CallableClauseRole::Enclosing,
+            signature: SourceExcerpt {
+                text: "fn checkout()".into(),
+                range: range.clone(),
+            },
+            guard: None,
+            definition_range: range,
+        }];
+
+        let compact = trace(&result, OutputMode::Human.into()).unwrap();
+        assert!(!compact.contains("callable_clause"));
+        for mode in [OutputMode::Raw, OutputMode::Json] {
+            let output = trace(&result, mode.into()).unwrap();
+            assert!(output.contains("callable_clause"));
+            assert!(output.contains("fn checkout()"));
+            assert!(output.contains("character"));
+        }
     }
 
     #[test]

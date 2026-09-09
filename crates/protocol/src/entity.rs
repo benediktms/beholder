@@ -412,6 +412,8 @@ impl From<dto::EvidenceRef> for v1::Evidence {
             path: value.path,
             line: value.line,
             detail: value.detail,
+            range: value.range.map(Into::into),
+            contexts: value.contexts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -425,8 +427,243 @@ impl TryFrom<v1::Evidence> for dto::EvidenceRef {
             repository: value.repository,
             path: value.path,
             line: value.line,
+            range: value.range.map(TryInto::try_into).transpose()?,
             detail: value.detail,
+            contexts: value
+                .contexts
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
         })
+    }
+}
+
+impl From<dto::SourcePosition> for v1::SourcePosition {
+    fn from(value: dto::SourcePosition) -> Self {
+        Self {
+            line: value.line,
+            character: value.character,
+        }
+    }
+}
+
+impl From<v1::SourcePosition> for dto::SourcePosition {
+    fn from(value: v1::SourcePosition) -> Self {
+        Self {
+            line: value.line,
+            character: value.character,
+        }
+    }
+}
+
+impl From<dto::SourceRange> for v1::SourceRange {
+    fn from(value: dto::SourceRange) -> Self {
+        Self {
+            start: Some(value.start.into()),
+            end: Some(value.end.into()),
+        }
+    }
+}
+
+impl TryFrom<v1::SourceRange> for dto::SourceRange {
+    type Error = &'static str;
+
+    fn try_from(value: v1::SourceRange) -> Result<Self, Self::Error> {
+        let range = Self {
+            start: value.start.ok_or("source range start is missing")?.into(),
+            end: value.end.ok_or("source range end is missing")?.into(),
+        };
+        (range.start <= range.end)
+            .then_some(range)
+            .ok_or("source range end precedes its start")
+    }
+}
+
+impl From<dto::SourceExcerpt> for v1::SourceExcerpt {
+    fn from(value: dto::SourceExcerpt) -> Self {
+        Self {
+            text: value.text,
+            range: Some(value.range.into()),
+        }
+    }
+}
+
+impl TryFrom<v1::SourceExcerpt> for dto::SourceExcerpt {
+    type Error = &'static str;
+
+    fn try_from(value: v1::SourceExcerpt) -> Result<Self, Self::Error> {
+        Ok(Self {
+            text: value.text,
+            range: value
+                .range
+                .ok_or("source excerpt range is missing")?
+                .try_into()?,
+        })
+    }
+}
+
+impl From<dto::EvidenceContext> for v1::EvidenceContext {
+    fn from(value: dto::EvidenceContext) -> Self {
+        use v1::evidence_context::Context;
+        Self {
+            context: Some(match value {
+                dto::EvidenceContext::ConditionArm {
+                    construct,
+                    arm,
+                    condition,
+                    arm_range,
+                } => Context::ConditionArm(v1::ConditionArmContext {
+                    construct: match construct {
+                        dto::ConditionConstruct::If => v1::ConditionConstruct::If,
+                        dto::ConditionConstruct::Cond => v1::ConditionConstruct::Cond,
+                        dto::ConditionConstruct::Ternary => v1::ConditionConstruct::Ternary,
+                        dto::ConditionConstruct::TemplateIf => v1::ConditionConstruct::TemplateIf,
+                    } as i32,
+                    arm: match arm {
+                        dto::ConditionArmKind::Then => v1::ConditionArmKind::Then,
+                        dto::ConditionArmKind::ElseIf => v1::ConditionArmKind::ElseIf,
+                        dto::ConditionArmKind::Else => v1::ConditionArmKind::Else,
+                        dto::ConditionArmKind::Clause => v1::ConditionArmKind::Clause,
+                        dto::ConditionArmKind::Consequence => v1::ConditionArmKind::Consequence,
+                        dto::ConditionArmKind::Alternative => v1::ConditionArmKind::Alternative,
+                    } as i32,
+                    condition: condition.map(Into::into),
+                    arm_range: Some(arm_range.into()),
+                }),
+                dto::EvidenceContext::PatternArm {
+                    construct,
+                    selector,
+                    pattern,
+                    guard,
+                    is_default,
+                    arm_range,
+                } => Context::PatternArm(v1::PatternArmContext {
+                    construct: match construct {
+                        dto::PatternConstruct::Match => v1::PatternConstruct::Match,
+                        dto::PatternConstruct::Case => v1::PatternConstruct::Case,
+                        dto::PatternConstruct::SwitchStatement => {
+                            v1::PatternConstruct::SwitchStatement
+                        }
+                        dto::PatternConstruct::SwitchExpression => {
+                            v1::PatternConstruct::SwitchExpression
+                        }
+                    } as i32,
+                    selector: selector.map(Into::into),
+                    pattern: pattern.map(Into::into),
+                    guard: guard.map(Into::into),
+                    is_default,
+                    arm_range: Some(arm_range.into()),
+                }),
+                dto::EvidenceContext::CallableClause {
+                    role,
+                    signature,
+                    guard,
+                    definition_range,
+                } => Context::CallableClause(v1::CallableClauseContext {
+                    role: match role {
+                        dto::CallableClauseRole::Declaration => v1::CallableClauseRole::Declaration,
+                        dto::CallableClauseRole::Enclosing => v1::CallableClauseRole::Enclosing,
+                        dto::CallableClauseRole::SelectedTarget => {
+                            v1::CallableClauseRole::SelectedTarget
+                        }
+                    } as i32,
+                    signature: Some(signature.into()),
+                    guard: guard.map(Into::into),
+                    definition_range: Some(definition_range.into()),
+                }),
+            }),
+        }
+    }
+}
+
+impl TryFrom<v1::EvidenceContext> for dto::EvidenceContext {
+    type Error = &'static str;
+
+    fn try_from(value: v1::EvidenceContext) -> Result<Self, Self::Error> {
+        use v1::evidence_context::Context;
+        Ok(
+            match value.context.ok_or("evidence context kind is missing")? {
+                Context::ConditionArm(value) => Self::ConditionArm {
+                    construct: match v1::ConditionConstruct::try_from(value.construct)
+                        .map_err(|_| "condition construct is unknown")?
+                    {
+                        v1::ConditionConstruct::Unspecified => {
+                            return Err("condition construct is missing");
+                        }
+                        v1::ConditionConstruct::If => dto::ConditionConstruct::If,
+                        v1::ConditionConstruct::Cond => dto::ConditionConstruct::Cond,
+                        v1::ConditionConstruct::Ternary => dto::ConditionConstruct::Ternary,
+                        v1::ConditionConstruct::TemplateIf => dto::ConditionConstruct::TemplateIf,
+                    },
+                    arm: match v1::ConditionArmKind::try_from(value.arm)
+                        .map_err(|_| "condition arm kind is unknown")?
+                    {
+                        v1::ConditionArmKind::Unspecified => {
+                            return Err("condition arm kind is missing");
+                        }
+                        v1::ConditionArmKind::Then => dto::ConditionArmKind::Then,
+                        v1::ConditionArmKind::ElseIf => dto::ConditionArmKind::ElseIf,
+                        v1::ConditionArmKind::Else => dto::ConditionArmKind::Else,
+                        v1::ConditionArmKind::Clause => dto::ConditionArmKind::Clause,
+                        v1::ConditionArmKind::Consequence => dto::ConditionArmKind::Consequence,
+                        v1::ConditionArmKind::Alternative => dto::ConditionArmKind::Alternative,
+                    },
+                    condition: value.condition.map(TryInto::try_into).transpose()?,
+                    arm_range: value
+                        .arm_range
+                        .ok_or("condition arm range is missing")?
+                        .try_into()?,
+                },
+                Context::PatternArm(value) => Self::PatternArm {
+                    construct: match v1::PatternConstruct::try_from(value.construct)
+                        .map_err(|_| "pattern construct is unknown")?
+                    {
+                        v1::PatternConstruct::Unspecified => {
+                            return Err("pattern construct is missing");
+                        }
+                        v1::PatternConstruct::Match => dto::PatternConstruct::Match,
+                        v1::PatternConstruct::Case => dto::PatternConstruct::Case,
+                        v1::PatternConstruct::SwitchStatement => {
+                            dto::PatternConstruct::SwitchStatement
+                        }
+                        v1::PatternConstruct::SwitchExpression => {
+                            dto::PatternConstruct::SwitchExpression
+                        }
+                    },
+                    selector: value.selector.map(TryInto::try_into).transpose()?,
+                    pattern: value.pattern.map(TryInto::try_into).transpose()?,
+                    guard: value.guard.map(TryInto::try_into).transpose()?,
+                    is_default: value.is_default,
+                    arm_range: value
+                        .arm_range
+                        .ok_or("pattern arm range is missing")?
+                        .try_into()?,
+                },
+                Context::CallableClause(value) => Self::CallableClause {
+                    role: match v1::CallableClauseRole::try_from(value.role)
+                        .map_err(|_| "callable clause role is unknown")?
+                    {
+                        v1::CallableClauseRole::Unspecified => {
+                            return Err("callable clause role is missing");
+                        }
+                        v1::CallableClauseRole::Declaration => dto::CallableClauseRole::Declaration,
+                        v1::CallableClauseRole::Enclosing => dto::CallableClauseRole::Enclosing,
+                        v1::CallableClauseRole::SelectedTarget => {
+                            dto::CallableClauseRole::SelectedTarget
+                        }
+                    },
+                    signature: value
+                        .signature
+                        .ok_or("callable clause signature is missing")?
+                        .try_into()?,
+                    guard: value.guard.map(TryInto::try_into).transpose()?,
+                    definition_range: value
+                        .definition_range
+                        .ok_or("callable clause definition range is missing")?
+                        .try_into()?,
+                },
+            },
+        )
     }
 }
 

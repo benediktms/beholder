@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use beholder_domain::{
+    CallableClauseRole, ConditionArmKind, ConditionConstruct, EvidenceContext, PatternConstruct,
+    SourceExcerpt, SourcePosition, SourceRange,
+};
+
 pub const CONTEXT_SCHEMA_V1: &str = "beholder.context.v1";
 pub const DEPENDENCIES_SCHEMA_V2: &str = "beholder.dependencies.v2";
 pub const IMPACT_SCHEMA_V2: &str = "beholder.impact.v2";
@@ -373,7 +378,10 @@ pub struct EvidenceRef {
     pub repository: Option<String>,
     pub path: Option<String>,
     pub line: Option<u32>,
+    pub range: Option<SourceRange>,
     pub detail: Option<String>,
+    #[serde(default)]
+    pub contexts: Vec<EvidenceContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -661,6 +669,24 @@ semantic_result!(TraverseGraphResult);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_json_preserves_structured_and_accepts_legacy_fields() {
+        let legacy: EvidenceRef = serde_json::from_value(serde_json::json!({
+            "source": "ast",
+            "repository": "example/repo",
+            "path": "src/lib.rs",
+            "line": 1,
+            "detail": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.range, None);
+        assert!(legacy.contexts.is_empty());
+
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert!(value.get("range").is_some());
+        assert_eq!(value["contexts"], serde_json::json!([]));
+    }
 
     fn traversal() -> TraverseGraphQuery {
         TraverseGraphQuery {

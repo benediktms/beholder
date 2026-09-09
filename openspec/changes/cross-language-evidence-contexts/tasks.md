@@ -1,9 +1,9 @@
 ## 1. Shared evidence contract
 
-- [ ] 1.1 Add domain source-range, excerpt, and three-variant evidence-context types plus deterministic `beholder:evidence:v1` encoding/decoding; verify focused `beholder-domain` tests cover round trips, context order, UTF-16 positions, legacy forms, and malformed reserved payload fallback.
-- [ ] 1.2 Extend `EvidenceRef` and Mnestic query mapping with ranges and contexts while preserving edge aggregation and legacy fields; verify focused `beholder-dto` and `beholder-adapters-mnestic` tests distinguish same-line occurrences and return identical evidence through context, dependencies, impact, trace, why, topology, and traversal builders.
-- [ ] 1.3 Add additive daemon and worker protobuf fields, regenerate checked-in Rust/Elixir/Go bindings, map typed worker evidence, and advance daemon protocol 24 to 25; verify focused protocol, daemon RPC, daemon-client, Elixir worker, and TypeScript worker compatibility tests pass.
-- [ ] 1.4 Preserve structured evidence in raw and JSON presentation without expanding compact output; verify focused CLI and MCP serialization tests cover populated, empty, and legacy context fields.
+- [x] 1.1 Add domain source-range, excerpt, and three-variant evidence-context types plus deterministic `beholder:evidence:v1` encoding/decoding; verify focused `beholder-domain` tests cover round trips, context order, UTF-16 positions, legacy forms, and malformed reserved payload fallback.
+- [x] 1.2 Extend `EvidenceRef` and Mnestic query mapping with ranges and contexts while preserving edge aggregation and legacy fields; verify focused `beholder-dto` and `beholder-adapters-mnestic` tests distinguish same-line occurrences and return identical evidence through context, dependencies, impact, trace, why, topology, and traversal builders.
+- [x] 1.3 Add additive daemon and worker protobuf fields, regenerate checked-in Rust/Elixir/Go bindings, map typed worker evidence, and advance daemon protocol 24 to 25; verify focused protocol, daemon RPC, daemon-client, Elixir worker, and TypeScript worker compatibility tests pass.
+- [x] 1.4 Preserve structured evidence in raw and JSON presentation without expanding compact output; verify focused CLI and MCP serialization tests cover populated, empty, and legacy context fields.
 
 ## 2. Rust syntax and compiler evidence
 
