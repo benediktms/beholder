@@ -34,6 +34,29 @@ fn callable_value(node: Node<'_>) -> bool {
     )
 }
 
+pub(super) fn deferred_callable(mut node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "arrow_function"
+            | "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "method_definition"
+    ) {
+        return false;
+    }
+    while node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "parenthesized_expression")
+    {
+        node = node.parent().expect("parenthesized callable has a parent");
+    }
+    !node.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node)
+    })
+}
+
 fn is_exported(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         if parent.kind() == "export_statement" {
@@ -146,15 +169,7 @@ fn lexical_contexts(call: Node<'_>, source: &[u8]) -> Vec<EvidenceContext> {
     let mut contexts = Vec::new();
     let mut ancestor = call.parent();
     while let Some(candidate) = ancestor {
-        if matches!(
-            candidate.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function"
-                | "generator_function_declaration"
-                | "method_definition"
-        ) {
+        if deferred_callable(candidate) {
             break;
         }
         match candidate.kind() {
@@ -446,6 +461,7 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
                 | "generator_function_declaration"
                 | "method_definition"
         ) || (matches!(node.kind(), "arrow_function" | "function_expression")
+            && deferred_callable(node)
             && node
                 .parent()
                 .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
@@ -2328,6 +2344,28 @@ mod tests {
                 .contexts
                 .iter()
                 .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+        );
+    }
+
+    #[test]
+    fn direct_iifes_keep_ternary_contexts() {
+        let observations = observations(
+            "function run() { return flag() ? (() => helper())() : fallback(); }",
+            "src/run.ts",
+        );
+        assert!(
+            call_evidence(&observations, "helper")
+                .evidence
+                .decode()
+                .contexts
+                .iter()
+                .any(|context| matches!(
+                    context,
+                    EvidenceContext::ConditionArm {
+                        construct: ConditionConstruct::Ternary,
+                        ..
+                    }
+                ))
         );
     }
 

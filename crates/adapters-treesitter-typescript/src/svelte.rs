@@ -1,5 +1,7 @@
 use crate::{
-    SourceLanguage, TypescriptAnalysis, analysis::analyze_core, model::Call,
+    SourceLanguage, TypescriptAnalysis,
+    analysis::{analyze_core, deferred_callable},
+    model::Call,
     plugin::TypescriptLanguage,
 };
 use beholder_adapters_treesitter::recover;
@@ -439,17 +441,7 @@ fn has_callable_ancestor(call: &Call, expression: &str, root: Node<'_>) -> bool 
         .and_then(|range| root.descendant_for_byte_range(range.0, range.1))
         .into_iter()
         .flat_map(|node| std::iter::successors(Some(node), |node| node.parent()))
-        .any(|node| {
-            matches!(
-                node.kind(),
-                "arrow_function"
-                    | "function_declaration"
-                    | "function_expression"
-                    | "generator_function"
-                    | "generator_function_declaration"
-                    | "method_definition"
-            )
-        })
+        .any(deferred_callable)
 }
 
 fn collect_template_calls(
@@ -1178,6 +1170,27 @@ mod tests {
             "{:#?}",
             call("helper").contexts
         );
+    }
+
+    #[test]
+    fn template_contexts_cross_direct_iifes() {
+        let analysis = crate::analyze(
+            "{#if ready()}{(() => helper())()}{/if}",
+            SourceLanguage::Svelte,
+        )
+        .unwrap();
+        let helper = analysis
+            .calls
+            .iter()
+            .find(|call| call.name == "helper")
+            .unwrap();
+        assert!(helper.contexts.iter().any(|context| matches!(
+            context,
+            EvidenceContext::ConditionArm {
+                construct: ConditionConstruct::TemplateIf,
+                ..
+            }
+        )));
     }
 
     #[test]
