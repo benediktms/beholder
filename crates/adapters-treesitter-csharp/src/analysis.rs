@@ -95,28 +95,33 @@ fn callable_context(
     })
 }
 
-fn pattern_context(selection: Node<'_>, call: Node<'_>, source: &[u8]) -> Option<EvidenceContext> {
+fn pattern_contexts(selection: Node<'_>, call: Node<'_>, source: &[u8]) -> Vec<EvidenceContext> {
     let (construct, selector, arm_kind) = match selection.kind() {
         "switch_statement" => (
             PatternConstruct::SwitchStatement,
-            selection.child_by_field_name("value")?,
+            selection.child_by_field_name("value"),
             "switch_section",
         ),
         "switch_expression" => (
             PatternConstruct::SwitchExpression,
             selection
                 .named_children(&mut selection.walk())
-                .find(|child| child.kind() != "switch_expression_arm")?,
+                .find(|child| child.kind() != "switch_expression_arm"),
             "switch_expression_arm",
         ),
-        _ => return None,
+        _ => return Vec::new(),
+    };
+    let Some(selector) = selector else {
+        return Vec::new();
     };
     if contains(selector, call) {
-        return None;
+        return Vec::new();
     }
     let mut ancestor = call.parent();
     let arm = loop {
-        let candidate = ancestor?;
+        let Some(candidate) = ancestor else {
+            return Vec::new();
+        };
         let belongs_to_selection = match construct {
             PatternConstruct::SwitchStatement => candidate
                 .parent()
@@ -129,49 +134,104 @@ fn pattern_context(selection: Node<'_>, call: Node<'_>, source: &[u8]) -> Option
             break candidate;
         }
         if candidate == selection {
-            return None;
+            return Vec::new();
         }
         ancestor = candidate.parent();
     };
-    let is_default = arm
-        .children(&mut arm.walk())
-        .any(|child| child.kind() == "default");
-    let pattern = if is_default { None } else { arm.named_child(0) };
-    let guard_clause = arm
-        .named_children(&mut arm.walk())
-        .find(|child| child.kind() == "when_clause");
-    let guard = guard_clause.and_then(|guard| guard.named_child(0));
-    if pattern.is_some_and(|pattern| contains(pattern, call))
-        || guard_clause.is_some_and(|guard| contains(guard, call))
-    {
-        return None;
+    let label_context = |label: Node<'_>, arm_range: SourceRange| {
+        let is_default = label
+            .children(&mut label.walk())
+            .any(|child| child.kind() == "default");
+        let pattern = if is_default {
+            None
+        } else {
+            label.named_child(0)
+        };
+        let guard_clause = label
+            .named_children(&mut label.walk())
+            .find(|child| child.kind() == "when_clause");
+        let guard = guard_clause.and_then(|guard| guard.named_child(0));
+        if pattern.is_some_and(|pattern| contains(pattern, call))
+            || guard_clause.is_some_and(|guard| contains(guard, call))
+        {
+            return None;
+        }
+        Some(EvidenceContext::PatternArm {
+            construct,
+            selector: source_excerpt(selector, source),
+            pattern: pattern.and_then(|pattern| source_excerpt(pattern, source)),
+            guard: guard.and_then(|guard| source_excerpt(guard, source)),
+            is_default,
+            arm_range,
+        })
+    };
+    if construct == PatternConstruct::SwitchExpression {
+        return label_context(arm, source_range(arm, source))
+            .into_iter()
+            .collect();
     }
-    Some(EvidenceContext::PatternArm {
-        construct,
-        selector: source_excerpt(selector, source),
-        pattern: pattern.and_then(|pattern| source_excerpt(pattern, source)),
-        guard: guard.and_then(|guard| source_excerpt(guard, source)),
-        is_default,
-        arm_range: source_range(arm, source),
-    })
+
+    let has_body = |section: Node<'_>| {
+        let is_default = section
+            .children(&mut section.walk())
+            .any(|child| child.kind() == "default");
+        let pattern = (!is_default).then(|| section.named_child(0)).flatten();
+        section
+            .named_children(&mut section.walk())
+            .any(|child| Some(child) != pattern && child.kind() != "when_clause")
+    };
+    let mut labels = vec![arm];
+    let mut previous = arm.prev_named_sibling();
+    while let Some(section) = previous
+        && section.kind() == "switch_section"
+        && !has_body(section)
+    {
+        labels.push(section);
+        previous = section.prev_named_sibling();
+    }
+    labels.reverse();
+    let arm_range = byte_range(source, labels[0].start_byte(), arm.end_byte());
+    labels
+        .into_iter()
+        .map(|label| label_context(label, arm_range.clone()))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
-fn lexical_contexts(call: Node<'_>, definition: Node<'_>, source: &[u8]) -> Vec<EvidenceContext> {
-    let mut contexts = Vec::new();
+fn lexical_contexts(
+    call: Node<'_>,
+    definition: Node<'_>,
+    source: &[u8],
+) -> Vec<Vec<EvidenceContext>> {
+    let mut selections = Vec::new();
     let mut ancestor = call.parent();
     while let Some(candidate) = ancestor {
         if candidate == definition {
             break;
         }
-        if matches!(candidate.kind(), "switch_statement" | "switch_expression")
-            && let Some(context) = pattern_context(candidate, call, source)
-        {
-            contexts.push(context);
+        if matches!(candidate.kind(), "switch_statement" | "switch_expression") {
+            let contexts = pattern_contexts(candidate, call, source);
+            if !contexts.is_empty() {
+                selections.push(contexts);
+            }
         }
         ancestor = candidate.parent();
     }
-    contexts.reverse();
-    contexts
+    selections.reverse();
+    selections
+        .into_iter()
+        .fold(vec![Vec::new()], |paths, contexts| {
+            paths
+                .into_iter()
+                .flat_map(|path| {
+                    contexts.iter().map(move |context| {
+                        let mut path = path.clone();
+                        path.push(context.clone());
+                        path
+                    })
+                })
+                .collect()
+        })
 }
 
 fn declaration_kind(node: Node<'_>) -> Option<DefinitionKind> {
@@ -355,11 +415,12 @@ fn collect_calls(
     if node != definition && declaration_kind(node) == Some(DefinitionKind::Callable) {
         return;
     }
-    if let Some(mut call) = call(node, source) {
-        call.contexts = std::iter::once(enclosing.clone())
-            .chain(lexical_contexts(node, definition, source))
-            .collect();
-        calls.push(call);
+    if let Some(call) = call(node, source) {
+        for contexts in lexical_contexts(node, definition, source) {
+            let mut call = call.clone();
+            call.contexts = std::iter::once(enclosing.clone()).chain(contexts).collect();
+            calls.push(call);
+        }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -870,6 +931,66 @@ public sealed class Worker
                 arm_range,
                 ..
             } if guard.text == "Guard()" && *arm_range == range((4, 12), (4, 36))
+        ));
+    }
+
+    #[test]
+    fn preserves_stacked_switch_labels_as_alternative_evidence() {
+        let source = r#"class Demo {
+    void Run(int value) {
+        switch (value) {
+            case 1:
+            case 2 when Second():
+                Hit();
+                break;
+        }
+    }
+    bool Second() => true;
+    void Hit() {}
+}"#;
+        let analysis = analyze(source).unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "Demo/Run(int)")
+            .unwrap();
+
+        let hits = run
+            .calls
+            .iter()
+            .filter(|call| call.name == "Hit")
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 2);
+        let labels = hits
+            .iter()
+            .map(|call| match &call.contexts[1] {
+                EvidenceContext::PatternArm {
+                    pattern: Some(pattern),
+                    guard,
+                    arm_range,
+                    ..
+                } => (
+                    pattern.text.as_str(),
+                    guard.as_ref().map(|guard| guard.text.as_str()),
+                    arm_range,
+                ),
+                context => panic!("expected switch label context, got {context:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labels[0].0, "1");
+        assert_eq!(labels[0].1, None);
+        assert_eq!(labels[1].0, "2");
+        assert_eq!(labels[1].1, Some("Second()"));
+        assert_eq!(labels[0].2, labels[1].2);
+        assert_eq!(*labels[0].2, range((3, 12), (6, 22)));
+        assert!(matches!(
+            run.calls
+                .iter()
+                .find(|call| call.name == "Second")
+                .unwrap()
+                .contexts
+                .as_slice(),
+            [EvidenceContext::CallableClause { .. }]
         ));
     }
 
