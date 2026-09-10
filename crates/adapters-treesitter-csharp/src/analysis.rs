@@ -219,7 +219,8 @@ fn lexical_contexts(
         if matches!(
             candidate.kind(),
             "lambda_expression" | "anonymous_method_expression"
-        ) {
+        ) && !is_directly_invoked_anonymous_callable(candidate)
+        {
             break;
         }
         if matches!(candidate.kind(), "switch_statement" | "switch_expression") {
@@ -245,6 +246,23 @@ fn lexical_contexts(
                 })
                 .collect()
         })
+}
+
+fn is_directly_invoked_anonymous_callable(callable: Node<'_>) -> bool {
+    let mut expression = callable;
+    while let Some(parent) = expression.parent() {
+        match parent.kind() {
+            "parenthesized_expression" => expression = parent,
+            "cast_expression" if parent.child_by_field_name("value") == Some(expression) => {
+                expression = parent;
+            }
+            _ => break,
+        }
+    }
+    expression.parent().is_some_and(|invocation| {
+        invocation.kind() == "invocation_expression"
+            && invocation.child_by_field_name("function") == Some(expression)
+    })
 }
 
 fn declaration_kind(node: Node<'_>) -> Option<DefinitionKind> {
@@ -1044,6 +1062,40 @@ public sealed class Worker
                 "{name}: {call:?}"
             );
         }
+    }
+
+    #[test]
+    fn preserves_switch_context_for_directly_invoked_anonymous_callables() {
+        let source = r#"class Demo {
+    object Run(int value) => value switch {
+        1 => ((System.Func<int>)(() => LambdaHit()))(),
+        2 => ((System.Func<int>)delegate { return DelegateHit(); })(),
+        _ => (System.Func<int>)(() => Deferred())
+    };
+    int LambdaHit() => 1;
+    int DelegateHit() => 2;
+    int Deferred() => 3;
+}"#;
+        let analysis = analyze(source).unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "Demo/Run(int)")
+            .unwrap();
+        let switch_contexts = |name| {
+            run.calls
+                .iter()
+                .find(|call| call.name == name)
+                .unwrap()
+                .contexts
+                .iter()
+                .filter(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+                .count()
+        };
+
+        assert_eq!(switch_contexts("LambdaHit"), 1);
+        assert_eq!(switch_contexts("DelegateHit"), 1);
+        assert_eq!(switch_contexts("Deferred"), 0);
     }
 
     #[test]
