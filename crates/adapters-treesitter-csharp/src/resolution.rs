@@ -318,15 +318,22 @@ pub(super) fn resolve_language_calls(
                         argument_match_score(caller, target, call) == best_score
                     });
                 }
-                if let [(target_source, target)] = candidates.as_slice() {
+                let target = candidates.first().and_then(|(target_source, target)| {
+                    let target_id = id(repository, target_source, target);
+                    candidates
+                        .iter()
+                        .all(|(source, candidate)| id(repository, source, candidate) == target_id)
+                        .then_some((*target_source, *target))
+                });
+                if let Some((target_source, target)) = target {
+                    let selected_target = (candidates.len() == 1)
+                        .then(|| target.callable_context(CallableClauseRole::SelectedTarget))
+                        .flatten();
                     observations.push(Observation::dependency(
                         id(repository, source, caller),
                         DependencyRelation::Calls,
                         id(repository, target_source, target),
-                        call.evidence(
-                            source.path,
-                            target.callable_context(CallableClauseRole::SelectedTarget),
-                        ),
+                        call.evidence(source.path, selected_target),
                     ));
                     if let Some(return_type) = target.return_type.as_deref() {
                         returned_types.insert(&call.expression, return_type);
@@ -397,27 +404,38 @@ mod tests {
             }],
         );
 
-        assert!(!observations.iter().any(|observation| {
+        let calls = observations.iter().filter(|observation| {
             observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
                 && observation
                     .from
                     .as_str()
                     .ends_with("/Worker/Worker/Start()")
-                && observation
-                    .evidence
-                    .decode()
-                    .contexts
-                    .iter()
-                    .any(|context| {
-                        matches!(
-                            context,
-                            EvidenceContext::CallableClause {
-                                role: CallableClauseRole::SelectedTarget,
-                                ..
-                            }
-                        )
-                    })
-        }));
+        });
+        assert_eq!(calls.count(), 1);
+        let call = observations
+            .iter()
+            .find(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation
+                        .from
+                        .as_str()
+                        .ends_with("/Worker/Worker/Start()")
+            })
+            .unwrap();
+        assert!(
+            !call
+                .evidence
+                .decode()
+                .contexts
+                .iter()
+                .any(|context| matches!(
+                    context,
+                    EvidenceContext::CallableClause {
+                        role: CallableClauseRole::SelectedTarget,
+                        ..
+                    }
+                ))
+        );
     }
 
     #[test]
