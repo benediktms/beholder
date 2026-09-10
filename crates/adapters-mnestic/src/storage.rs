@@ -4571,11 +4571,12 @@ mod tests {
     use super::*;
     use crate::{EnrichmentOwner, EnrichmentPayload, SemanticStore};
     use beholder_domain::{
-        AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-        DependencyRelation, EntityFact, EntityKind, EntityMetadata, FactChanges, FactShard,
-        GrpcBindingCandidate, GrpcBindingRole, LogicalRepository, Observation, ProtoTypeKind,
-        Provenance, RepositoryFacts, RepositoryState, RpcCardinality, SemanticCandidate,
-        SourcePosition, SourceSpan, StructuralRelation, WorkspaceView,
+        AnalysisDiagnostic, AnalysisDiagnosticSeverity, CallableClauseRole, Confidence,
+        DependencyOverride, DependencyRelation, EntityFact, EntityKind, EntityMetadata, Evidence,
+        EvidenceContext, EvidencePayload, FactChanges, FactShard, GrpcBindingCandidate,
+        GrpcBindingRole, LogicalRepository, Observation, ProtoTypeKind, Provenance,
+        RepositoryFacts, RepositoryState, RpcCardinality, SemanticCandidate, SourceExcerpt,
+        SourcePosition, SourceRange, SourceSpan, StructuralRelation, WorkspaceView,
     };
     use mnestic_engine::ScriptMutability;
     use std::{
@@ -7556,14 +7557,36 @@ mod tests {
             .unwrap(),
         );
         store.publish(&view, &[baseline], &[]).unwrap();
-        let overrides = calls.map(|call| DependencyOverride {
-            from: call.from,
-            relation: DependencyRelation::Calls,
-            unresolved_to: call.to,
-            resolved_to: "repo://example/repo/rust/lib/helper".into(),
-            evidence: call.evidence,
-            confidence: Confidence::Exact,
-            provenance: Provenance::Compiler,
+        let target_range = SourceRange {
+            start: SourcePosition {
+                line: 10,
+                character: 0,
+            },
+            end: SourcePosition {
+                line: 10,
+                character: 11,
+            },
+        };
+        let overrides = calls.clone().map(|call| {
+            let mut payload = call.evidence.decode();
+            payload.contexts.push(EvidenceContext::CallableClause {
+                role: CallableClauseRole::SelectedTarget,
+                signature: SourceExcerpt {
+                    text: "fn helper()".into(),
+                    range: target_range.clone(),
+                },
+                guard: None,
+                definition_range: target_range.clone(),
+            });
+            DependencyOverride {
+                from: call.from,
+                relation: DependencyRelation::Calls,
+                unresolved_to: call.to,
+                resolved_to: "repo://example/repo/rust/lib/helper".into(),
+                evidence: Evidence::structured(EvidencePayload { ..payload }).unwrap(),
+                confidence: Confidence::Exact,
+                provenance: Provenance::Compiler,
+            }
         });
         let input =
             view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
@@ -7594,15 +7617,60 @@ mod tests {
                      :sort evidence"
                 ),
                 BTreeMap::from([
-                    ("view".into(), view.name.into()),
+                    ("view".into(), view.name.clone().into()),
                     ("from".into(), "repo://example/repo/caller".into()),
                 ]),
                 ScriptMutability::Immutable,
             )
             .unwrap();
-        assert_eq!(selected.rows.len(), 2);
-        assert_eq!(selected.rows[0][0].get_str(), Some("src/lib.rs:1"));
-        assert_eq!(selected.rows[1][0].get_str(), Some("src/lib.rs:2"));
+        let expected = overrides
+            .iter()
+            .map(|override_| override_.evidence.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            selected
+                .rows
+                .iter()
+                .map(|row| row[0].get_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        for query in [
+            format!(
+                "{DIRECT_RULES}\n?[evidence] := effective_observation[\
+                     $from, _, 'calls', evidence, _, _\
+                 ]"
+            ),
+            format!(
+                "{DIRECT_RULES}\n?[evidence] := direct[\
+                     $from, _, 'calls', evidence, _, _\
+                 ]"
+            ),
+            format!(
+                "{OUTGOING_DEPENDENCY_RULES}\n\
+                 frontier[id] := id = $from\n\
+                 ?[evidence] := selected_edge[$from, _, 'calls', evidence, _, _]"
+            ),
+        ] {
+            let rows = store
+                .db
+                .run_script(
+                    &query,
+                    BTreeMap::from([
+                        ("view".into(), view.name.clone().into()),
+                        ("from".into(), "repo://example/repo/caller".into()),
+                    ]),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap();
+            assert_eq!(
+                rows.rows
+                    .iter()
+                    .map(|row| row[0].get_str().unwrap())
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -7687,7 +7755,7 @@ mod tests {
     }
 
     #[test]
-    fn carried_enrichment_uses_current_baseline_evidence() {
+    fn carried_enrichment_preserves_override_evidence() {
         let store = SemanticStore::memory().unwrap();
         let view = |fingerprint: &str| {
             WorkspaceView::new(
@@ -7792,7 +7860,7 @@ mod tests {
             rows.rows[0][0].get_str(),
             Some("repo://example/repo/rust/lib/helper")
         );
-        assert_eq!(rows.rows[0][1].get_str(), Some("src/lib.rs:20"));
+        assert_eq!(rows.rows[0][1].get_str(), Some("src/lib.rs:2"));
     }
 
     #[test]

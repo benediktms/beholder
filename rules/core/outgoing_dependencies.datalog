@@ -124,9 +124,9 @@ selected_edge[from, to, relation, evidence, confidence, provenance] :=
     }
 
 selected_edge[from, resolved_to, relation, evidence, confidence, provenance] :=
-    baseline_observation[from, relation, unresolved_to, evidence],
+    baseline_observation[from, relation, unresolved_to, _],
     enrichment_override[
-        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
+        from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
     ],
     not base_override[from, relation, unresolved_to, _, _, _, _]
 
