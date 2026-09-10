@@ -1072,6 +1072,44 @@ mod tests {
     }
 
     #[test]
+    fn instance_script_aliases_and_calls_use_original_utf16_columns() {
+        let source = "<p>😀</p><script>function run() { const client = api; const selected = client; selected.send(arg); }</script>";
+        let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
+        let selected_offset = source.find("selected.send").unwrap();
+        let alias_offset = source[source.find("selected").unwrap()..]
+            .find("client")
+            .map(|offset| source.find("selected").unwrap() + offset)
+            .unwrap();
+        let definition = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "run")
+            .unwrap();
+        let alias = definition
+            .alias_bindings
+            .iter()
+            .find(|binding| binding.receiver == "selected")
+            .unwrap();
+        assert_eq!(alias.line, 1);
+        assert_eq!(
+            alias.character as usize,
+            source[..alias_offset].encode_utf16().count()
+        );
+
+        let call = definition
+            .calls
+            .iter()
+            .find(|call| call.name == "send")
+            .unwrap();
+        let range = call.range.as_ref().unwrap();
+        assert_eq!(
+            range.start.character as usize,
+            source[..selected_offset].encode_utf16().count()
+        );
+        assert_eq!(range.end.character - range.start.character, 18);
+    }
+
+    #[test]
     fn instance_script_context_ranges_use_original_utf16_columns() {
         let source = "<p>😀</p><script module>ignored()</script><script>function run() { return deciding() ? visible() : fallback(); }</script>";
         let analysis = crate::analyze(source, SourceLanguage::Svelte).unwrap();
