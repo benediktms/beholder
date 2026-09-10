@@ -49,7 +49,11 @@ pub(super) fn deferred_callable(mut node: Node<'_>) -> bool {
     while node.parent().is_some_and(|parent| {
         matches!(
             parent.kind(),
-            "parenthesized_expression" | "as_expression" | "type_assertion"
+            "parenthesized_expression"
+                | "as_expression"
+                | "type_assertion"
+                | "non_null_expression"
+                | "satisfies_expression"
         )
     }) {
         node = node.parent().expect("wrapped callable has a parent");
@@ -171,7 +175,17 @@ fn lexical_contexts(call: Node<'_>, source: &[u8]) -> Vec<EvidenceContext> {
     let mut contexts = Vec::new();
     let mut ancestor = call.parent();
     while let Some(candidate) = ancestor {
-        if deferred_callable(candidate) {
+        if deferred_callable(candidate)
+            || (matches!(
+                candidate.kind(),
+                "field_definition" | "public_field_definition"
+            ) && !candidate
+                .children(&mut candidate.walk())
+                .any(|child| child.kind() == "static")
+                && candidate
+                    .child_by_field_name("value")
+                    .is_some_and(|value| contains(value, call)))
+        {
             break;
         }
         match candidate.kind() {
@@ -2356,10 +2370,12 @@ mod tests {
             r#"function run() {
                 flag() ? (((() => asserted()) as () => void))() : fallback();
                 flag() ? (<(() => void)>(() => cast()))() : fallback();
+                flag() ? (((() => non_null())!))() : fallback();
+                flag() ? ((() => satisfies()) satisfies () => void)() : fallback();
             }"#,
             "src/run.ts",
         );
-        for name in ["asserted", "cast"] {
+        for name in ["asserted", "cast", "non_null", "satisfies"] {
             assert!(
                 call_evidence(&observations, name)
                     .evidence
@@ -2375,6 +2391,37 @@ mod tests {
                     ))
             );
         }
+    }
+
+    #[test]
+    fn instance_field_initializers_do_not_inherit_selection_contexts() {
+        let source = r#"function run() {
+            switch (select()) {
+                case 1: class Worker { value = instance(); static fixed = active(); }
+            }
+        }"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let call = |name: &str| {
+            let start = source.find(&format!("{name}()")).unwrap();
+            tree.root_node()
+                .descendant_for_byte_range(start, start + name.len() + 2)
+                .unwrap()
+        };
+
+        assert!(
+            !lexical_contexts(call("instance"), source.as_bytes())
+                .iter()
+                .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+        );
+        assert!(
+            lexical_contexts(call("active"), source.as_bytes())
+                .iter()
+                .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+        );
     }
 
     #[test]
