@@ -1418,6 +1418,7 @@ fn enrich_repository(
                 override_.from != observation.from
                     || override_.relation != DependencyRelation::Calls
                     || override_.unresolved_to.as_str() != call.unresolved
+                    || override_.evidence != evidence
             });
             contribution.overrides.push(DependencyOverride {
                 from: observation.from.clone(),
@@ -1715,6 +1716,7 @@ macro_rules! generate { () => { fn generated() {} }; }
 generate!();
 fn caller() {
     if true { call_me(); }
+    call_me();
     generic(&Thing);
     let thing = Thing;
     thing.inherent();
@@ -1923,6 +1925,19 @@ fn caller() {
                 ..
             }
         ));
+        let renamed_overrides = overrides
+            .iter()
+            .filter(|override_| {
+                override_.from.as_str() == "repo://example/repo/rust/lib/caller"
+                    && override_.resolved_to.as_str() == "repo://example/repo/rust/inner/renamed"
+                    && override_.provenance == Provenance::Compiler
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(renamed_overrides.len(), 2);
+        assert_ne!(
+            renamed_overrides[0].evidence, renamed_overrides[1].evidence,
+            "same-target calls must retain distinct compiler evidence"
+        );
         assert!(overrides.iter().any(|override_| {
             override_.from.as_str() == "repo://example/repo/rust/lib/caller"
                 && override_.resolved_to.as_str() == "repo://example/context/rust/lib/external"
