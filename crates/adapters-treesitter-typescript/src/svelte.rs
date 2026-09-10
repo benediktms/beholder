@@ -147,10 +147,12 @@ fn rebase_call_position(call: &mut Call, masked: &str, source: &str) {
     let Some(range) = byte_range(source, start, end) else {
         return;
     };
+    if let Some(call_range) = &mut call.range {
+        rebase_range(call_range, masked, source);
+    }
     call.line = range.start.line as usize + 1;
     (call.start_line, call.start_character) = (range.start.line, range.start.character);
     (call.end_line, call.end_character) = (range.end.line, range.end.character);
-    call.range = Some(range);
     for context in &mut call.contexts {
         rebase_context(context, masked, source);
     }
@@ -216,6 +218,21 @@ fn rebase_call_positions(analysis: &mut TypescriptAnalysis, masked: &str, source
         rebase_call_position(call, masked, source);
     }
     for definition in &mut analysis.definitions {
+        for binding in &mut definition.alias_bindings {
+            let Some(offset) = byte_offset(
+                masked,
+                SourcePosition {
+                    line: binding.line.saturating_sub(1) as u32,
+                    character: binding.character,
+                },
+            ) else {
+                continue;
+            };
+            if let Some(position) = source_position(source, offset) {
+                binding.line = position.line as usize + 1;
+                binding.character = position.character;
+            }
+        }
         if let Some(context) = &mut definition.declaration_context {
             rebase_context(context, masked, source);
         }
@@ -1051,7 +1068,7 @@ mod tests {
             range.start.character as usize,
             source[..offset].encode_utf16().count()
         );
-        assert_eq!(range.end.character - range.start.character, 7);
+        assert_eq!(range.end.character - range.start.character, 9);
     }
 
     #[test]
