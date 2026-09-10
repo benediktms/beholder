@@ -235,7 +235,7 @@ fn lexical_contexts(
         if candidate == function {
             break;
         }
-        if candidate.kind() == "async_block"
+        if (candidate.kind() == "async_block" && !is_immediately_awaited(candidate))
             || (candidate.kind() == "closure_expression" && !is_directly_invoked_closure(candidate))
         {
             break;
@@ -249,6 +249,12 @@ fn lexical_contexts(
     }
     contexts.reverse();
     contexts
+}
+
+fn is_immediately_awaited(async_block: Node<'_>) -> bool {
+    async_block.parent().is_some_and(|parent| {
+        parent.kind() == "await_expression" && parent.named_child(0) == Some(async_block)
+    })
 }
 
 fn is_directly_invoked_closure(closure: Node<'_>) -> bool {
@@ -1134,6 +1140,26 @@ mod recovery_tests {
         let source = r#"fn run() {
     if enabled { (((|| helper())))(); }
     let callback = || deferred();
+}"#;
+        let contexts = |name| {
+            call_payload(source, name)
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(contexts("helper"), [ConditionArmKind::Then]);
+        assert!(contexts("deferred").is_empty());
+    }
+
+    #[test]
+    fn preserves_selection_context_for_immediately_awaited_async_block() {
+        let source = r#"async fn run() {
+    if enabled {
+        async { helper().await; }.await;
+        let future = async { deferred().await; };
+    }
 }"#;
         let contexts = |name| {
             call_payload(source, name)
