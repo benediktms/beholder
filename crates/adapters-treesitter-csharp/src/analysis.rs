@@ -219,7 +219,7 @@ fn lexical_contexts(
         if matches!(
             candidate.kind(),
             "lambda_expression" | "anonymous_method_expression"
-        ) && !is_directly_invoked_anonymous_callable(candidate)
+        ) && !is_directly_invoked_anonymous_callable(candidate, source)
         {
             break;
         }
@@ -248,7 +248,7 @@ fn lexical_contexts(
         })
 }
 
-fn is_directly_invoked_anonymous_callable(callable: Node<'_>) -> bool {
+fn is_directly_invoked_anonymous_callable(callable: Node<'_>, source: &[u8]) -> bool {
     let mut expression = callable;
     while let Some(parent) = expression.parent() {
         match parent.kind() {
@@ -258,6 +258,16 @@ fn is_directly_invoked_anonymous_callable(callable: Node<'_>) -> bool {
             }
             _ => break,
         }
+    }
+    if let Some(member) = expression.parent()
+        && member.kind() == "member_access_expression"
+        && member.child_by_field_name("expression") == Some(expression)
+        && member
+            .child_by_field_name("name")
+            .and_then(|name| text(name, source))
+            == Some("Invoke")
+    {
+        expression = member;
     }
     expression.parent().is_some_and(|invocation| {
         invocation.kind() == "invocation_expression"
@@ -1070,10 +1080,12 @@ public sealed class Worker
     object Run(int value) => value switch {
         1 => ((System.Func<int>)(() => LambdaHit()))(),
         2 => ((System.Func<int>)delegate { return DelegateHit(); })(),
+        3 => ((System.Func<int>)(() => ExplicitInvokeHit())).Invoke(),
         _ => (System.Func<int>)(() => Deferred())
     };
     int LambdaHit() => 1;
     int DelegateHit() => 2;
+    int ExplicitInvokeHit() => 3;
     int Deferred() => 3;
 }"#;
         let analysis = analyze(source).unwrap();
@@ -1095,6 +1107,7 @@ public sealed class Worker
 
         assert_eq!(switch_contexts("LambdaHit"), 1);
         assert_eq!(switch_contexts("DelegateHit"), 1);
+        assert_eq!(switch_contexts("ExplicitInvokeHit"), 1);
         assert_eq!(switch_contexts("Deferred"), 0);
     }
 
