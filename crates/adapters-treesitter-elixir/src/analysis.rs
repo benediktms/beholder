@@ -234,6 +234,21 @@ fn parsed_capture(node: Node<'_>, source: &[u8]) -> Option<ElixirCapture> {
     })
 }
 
+fn directly_invoked_anonymous_function(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        let mut ancestor = Some(parent);
+        while let Some(current) = ancestor {
+            if current.kind() == "call" {
+                return current.child_by_field_name("target").is_some_and(|target| {
+                    target.start_byte() <= node.start_byte() && target.end_byte() >= node.end_byte()
+                });
+            }
+            ancestor = current.parent();
+        }
+        false
+    })
+}
+
 fn collect_capture_bindings(
     node: Node<'_>,
     source: &[u8],
@@ -244,14 +259,19 @@ fn collect_capture_bindings(
         return;
     }
     if node.kind() == "anonymous_function" {
+        let directly_invoked = directly_invoked_anonymous_function(node);
         let mut cursor = node.walk();
         for clause in node
             .named_children(&mut cursor)
             .filter(|child| child.kind() == "stab_clause")
         {
-            let contexts = callable_clause(clause, source, CallableClauseRole::Enclosing)
-                .into_iter()
-                .collect::<Vec<_>>();
+            let contexts = if directly_invoked {
+                contexts.to_vec()
+            } else {
+                callable_clause(clause, source, CallableClauseRole::Enclosing)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
             if let Some(body) = clause.child_by_field_name("right") {
                 collect_capture_bindings(body, source, &contexts, bindings);
             }
@@ -287,7 +307,7 @@ fn capture_contexts(
     let mut arms = Vec::new();
     let mut node = node;
     while let Some(parent) = node.parent() {
-        if parent.kind() == "anonymous_function" {
+        if parent.kind() == "anonymous_function" && !directly_invoked_anonymous_function(parent) {
             break;
         }
         if parent.kind() == "stab_clause"
@@ -475,19 +495,7 @@ fn collect_calls(
     calls: &mut Vec<ElixirCall>,
 ) {
     if node.kind() == "anonymous_function" {
-        let directly_invoked = node.parent().is_some_and(|parent| {
-            let mut ancestor = Some(parent);
-            while let Some(current) = ancestor {
-                if current.kind() == "call" {
-                    return current.child_by_field_name("target").is_some_and(|target| {
-                        target.start_byte() <= node.start_byte()
-                            && target.end_byte() >= node.end_byte()
-                    });
-                }
-                ancestor = current.parent();
-            }
-            false
-        });
+        let directly_invoked = directly_invoked_anonymous_function(node);
         let mut cursor = node.walk();
         for clause in node
             .named_children(&mut cursor)
@@ -2026,6 +2034,38 @@ mod recovery_tests {
             [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::PatternArm { .. }]
                 if capture.name == "inner_helper" && signature.text == "input"
         )));
+    }
+
+    #[test]
+    fn captures_in_directly_invoked_anonymous_functions_keep_outer_arm() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  _ -> (fn -> callback = &helper/0; consume(callback) end).()
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let capture = analysis.modules[0].functions[0]
+            .captures
+            .iter()
+            .find(|capture| capture.name == "helper")
+            .unwrap();
+        assert!(
+            matches!(
+                capture.contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause { .. },
+                    EvidenceContext::PatternArm { .. }
+                ]
+            ),
+            "contexts: {:?}",
+            capture.contexts
+        );
     }
 
     #[test]

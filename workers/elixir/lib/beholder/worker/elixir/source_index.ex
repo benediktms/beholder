@@ -109,7 +109,9 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     Enum.reduce(clauses, index, &walk_anonymous_clause(&1, state, &2))
   end
 
-  defp walk({{:., _dot_meta, [{:fn, _fn_meta, clauses}]}, _meta, []}, state, index) do
+  defp walk({{:., _dot_meta, [{:fn, _fn_meta, clauses}]}, _meta, arguments}, state, index)
+       when is_list(arguments) do
+    index = Enum.reduce(arguments, index, &walk(&1, state, &2))
     Enum.reduce(clauses, index, &walk_anonymous_clause_with_context(&1, state, &2))
   end
 
