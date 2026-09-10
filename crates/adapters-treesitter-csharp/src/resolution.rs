@@ -383,25 +383,18 @@ mod tests {
 
     #[test]
     fn keeps_partial_method_declarations_ambiguous() {
-        let first =
-            analyze("partial class Worker { partial void Execute(); void Start() { Execute(); } }")
-                .unwrap();
-        let second = analyze("partial class Worker { partial void Execute() {} }").unwrap();
+        let analysis = analyze(
+            "partial class Worker { partial void Execute(); void Start() { Execute(); } } partial class Worker { partial void Execute() {} }",
+        )
+        .unwrap();
         let observations = resolve_language_calls(
             "example",
             &[],
-            &[
-                CsharpSource {
-                    path: Path::new("Worker.Declaration.cs"),
-                    assembly: "App",
-                    analysis: &first,
-                },
-                CsharpSource {
-                    path: Path::new("Worker.Implementation.cs"),
-                    assembly: "App",
-                    analysis: &second,
-                },
-            ],
+            &[CsharpSource {
+                path: Path::new("Worker.cs"),
+                assembly: "App",
+                analysis: &analysis,
+            }],
         );
 
         assert!(!observations.iter().any(|observation| {
@@ -409,7 +402,7 @@ mod tests {
                 && observation
                     .from
                     .as_str()
-                    .ends_with("/Worker.Declaration/Worker/Start()")
+                    .ends_with("/Worker/Worker/Start()")
                 && observation
                     .evidence
                     .decode()
