@@ -701,6 +701,9 @@ fn run_enrichment_migrations(db: &DbInstance) -> Result<(), Box<dyn Error>> {
     if !migration_applied(db, "enrichment-ownership", 1)? {
         migrate_enrichment_ownership_to_contributions(db)?;
     }
+    if !migration_applied(db, "enrichment-override-occurrences", 1)? {
+        migrate_enrichment_override_occurrences(db)?;
+    }
     if !migration_applied(db, "enrichment-baseline", 1)? {
         migrate_enrichment_baseline(db)?;
     }
@@ -845,7 +848,7 @@ fn migrate_enrichment_ownership_to_contributions(db: &DbInstance) -> Result<(), 
                  view, revision, from, relation, unresolved_to, confidence, provenance\
              } \
          :put enrichment_override_contribution {\
-             view, owner, from, relation, unresolved_to => resolved_to, evidence, confidence, \
+             view, owner, from, relation, unresolved_to, evidence => resolved_to, confidence, \
              provenance\
          }",
         "?[view, owner, repository, code, severity, path, line, detail] := \
@@ -863,6 +866,52 @@ fn migrate_enrichment_ownership_to_contributions(db: &DbInstance) -> Result<(), 
     }
     transaction.run_script(
         "?[name, version] <- [['enrichment-ownership', 1]] \
+         :put schema_migration {name => version}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_enrichment_override_occurrences(db: &DbInstance) -> Result<(), Box<dyn Error>> {
+    let transaction = db.multi_transaction(true);
+    transaction.run_script(
+        "?[view, revision, owner] := \
+             *enrichment_override_contribution{view, owner}, \
+             *analysis_revision_repository_enrichment{view, revision, owner} \
+         :rm analysis_revision_repository_enrichment {view, revision, owner}",
+        BTreeMap::new(),
+    )?;
+    transaction.run_script(
+        "?[view, owner] := *enrichment_override_contribution{view, owner}, \
+             *enrichment_output{view, owner} \
+         :rm enrichment_output {view, owner}",
+        BTreeMap::new(),
+    )?;
+    transaction.commit()?;
+    db.run_script(
+        "::index drop enrichment_override_contribution:by_resolved",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        "::remove enrichment_override_contribution",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_SCHEMA,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    db.run_script(
+        CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_RESOLVED_INDEX,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )?;
+    let transaction = db.multi_transaction(true);
+    transaction.run_script(
+        "?[name, version] <- [['enrichment-override-occurrences', 1]] \
          :put schema_migration {name => version}",
         BTreeMap::new(),
     )?;

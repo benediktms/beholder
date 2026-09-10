@@ -1420,7 +1420,7 @@ fn delete_analysis_view(transaction: &MultiTransaction, view: &str) -> Result<()
         ),
         (
             "enrichment_override_contribution",
-            "view, owner, from, relation, unresolved_to",
+            "view, owner, from, relation, unresolved_to, evidence",
         ),
         (
             "enrichment_diagnostic_contribution",
@@ -3684,7 +3684,7 @@ fn store_enrichment_outputs(
         (
             "?[view, owner, from, relation, unresolved_to, resolved_to, evidence, confidence, provenance] <- $rows \
              :put enrichment_override_contribution {\
-                 view, owner, from, relation, unresolved_to => resolved_to, evidence, confidence, \
+                 view, owner, from, relation, unresolved_to, evidence => resolved_to, confidence, \
                  provenance\
              }",
             override_rows,
@@ -4159,7 +4159,7 @@ fn sweep_unselected_enrichment_snapshots(
             ),
             (
                 "enrichment_override_contribution",
-                "view, owner, from, relation, unresolved_to",
+                "view, owner, from, relation, unresolved_to, evidence",
             ),
             (
                 "enrichment_diagnostic_contribution",
@@ -7518,6 +7518,91 @@ mod tests {
                 .iter()
                 .any(|edge| edge.to == "repo://example/repo/target-b")
         );
+    }
+
+    #[test]
+    fn enrichment_preserves_occurrence_specific_overrides() {
+        let store = SemanticStore::memory().unwrap();
+        let view = with_enrichment_analyzers(
+            WorkspaceView::new(
+                "override-occurrences",
+                "syntax",
+                vec![RepositoryState {
+                    repository: LogicalRepository {
+                        identity: "example/repo".into(),
+                    },
+                    head: None,
+                    fingerprint: "source".into(),
+                }],
+            )
+            .unwrap(),
+            &["rust"],
+        );
+        let calls = ["src/lib.rs:1", "src/lib.rs:2"].map(|evidence| {
+            Observation::dependency(
+                "repo://example/repo/caller",
+                DependencyRelation::Calls,
+                "rust-call://helper",
+                evidence,
+            )
+        });
+        let mut baseline = facts(&view, calls.to_vec());
+        baseline.entities.push(
+            EntityFact::new(
+                "repo://example/repo/rust/lib/helper",
+                EntityKind::Callable,
+                None,
+            )
+            .unwrap(),
+        );
+        store.publish(&view, &[baseline], &[]).unwrap();
+        let overrides = calls.map(|call| DependencyOverride {
+            from: call.from,
+            relation: DependencyRelation::Calls,
+            unresolved_to: call.to,
+            resolved_to: "repo://example/repo/rust/lib/helper".into(),
+            evidence: call.evidence,
+            confidence: Confidence::Exact,
+            provenance: Provenance::Compiler,
+        });
+        let input =
+            view.repository_enrichment_input_fingerprint(&view.repository_states[0], "rust");
+        store
+            .publish_enrichment(
+                &view.name,
+                "example/repo",
+                &input,
+                EnrichmentOwner {
+                    analyzer: "rust",
+                    version: "1",
+                },
+                EnrichmentPayload {
+                    overrides: &overrides,
+                    ..EnrichmentPayload::default()
+                },
+            )
+            .unwrap();
+
+        let selected = store
+            .db
+            .run_script(
+                &format!(
+                    "{DIRECT_RULES}\n\
+                     ?[evidence] := dependency_override[\
+                         $from, 'calls', 'rust-call://helper', _, evidence, _, _\
+                     ]\n\
+                     :sort evidence"
+                ),
+                BTreeMap::from([
+                    ("view".into(), view.name.into()),
+                    ("from".into(), "repo://example/repo/caller".into()),
+                ]),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(selected.rows.len(), 2);
+        assert_eq!(selected.rows[0][0].get_str(), Some("src/lib.rs:1"));
+        assert_eq!(selected.rows[1][0].get_str(), Some("src/lib.rs:2"));
     }
 
     #[test]

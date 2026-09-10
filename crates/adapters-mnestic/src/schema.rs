@@ -267,9 +267,9 @@ pub(super) const CREATE_ENRICHMENT_OVERRIDE_CONTRIBUTION_SCHEMA: &str = r#"
     from: String,
     relation: String,
     unresolved_to: String,
+    evidence: String,
     =>
     resolved_to: String,
-    evidence: String,
     confidence: Float,
     provenance: String,
 }
