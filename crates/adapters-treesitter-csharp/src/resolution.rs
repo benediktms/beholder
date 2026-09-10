@@ -308,18 +308,6 @@ pub(super) fn resolve_language_calls(
                             )
                     })
                     .copied()
-                    .map(|candidate| {
-                        (
-                            (
-                                candidate.0.assembly,
-                                candidate.0.path,
-                                candidate.1.qualified_name.as_str(),
-                            ),
-                            candidate,
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>()
-                    .into_values()
                     .collect::<Vec<_>>();
                 if let Some(best_score) = candidates
                     .iter()
@@ -392,6 +380,52 @@ mod tests {
         CallableClauseRole, DependencyRelation, EvidenceContext, PatternConstruct,
         SemanticRelation, SourcePosition, SourceRange,
     };
+
+    #[test]
+    fn keeps_partial_method_declarations_ambiguous() {
+        let first =
+            analyze("partial class Worker { partial void Execute(); void Start() { Execute(); } }")
+                .unwrap();
+        let second = analyze("partial class Worker { partial void Execute() {} }").unwrap();
+        let observations = resolve_language_calls(
+            "example",
+            &[],
+            &[
+                CsharpSource {
+                    path: Path::new("Worker.Declaration.cs"),
+                    assembly: "App",
+                    analysis: &first,
+                },
+                CsharpSource {
+                    path: Path::new("Worker.Implementation.cs"),
+                    assembly: "App",
+                    analysis: &second,
+                },
+            ],
+        );
+
+        assert!(!observations.iter().any(|observation| {
+            observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                && observation
+                    .from
+                    .as_str()
+                    .ends_with("/Worker.Declaration/Worker/Start()")
+                && observation
+                    .evidence
+                    .decode()
+                    .contexts
+                    .iter()
+                    .any(|context| {
+                        matches!(
+                            context,
+                            EvidenceContext::CallableClause {
+                                role: CallableClauseRole::SelectedTarget,
+                                ..
+                            }
+                        )
+                    })
+        }));
+    }
 
     #[test]
     fn resolves_extension_calls_only_through_visible_projects() {
