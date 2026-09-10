@@ -252,21 +252,26 @@ fn lexical_contexts(
 }
 
 fn is_immediately_awaited(async_block: Node<'_>) -> bool {
-    async_block.parent().is_some_and(|parent| {
-        parent.kind() == "await_expression" && parent.named_child(0) == Some(async_block)
+    let expression = outermost_parenthesized(async_block);
+    expression.parent().is_some_and(|parent| {
+        parent.kind() == "await_expression" && parent.named_child(0) == Some(expression)
     })
 }
 
 fn is_directly_invoked_closure(closure: Node<'_>) -> bool {
-    let mut callable = closure;
-    while let Some(parent) = callable.parent()
-        && parent.kind() == "parenthesized_expression"
-    {
-        callable = parent;
-    }
+    let callable = outermost_parenthesized(closure);
     callable.parent().is_some_and(|call| {
         call.kind() == "call_expression" && call.child_by_field_name("function") == Some(callable)
     })
+}
+
+fn outermost_parenthesized(mut expression: Node<'_>) -> Node<'_> {
+    while let Some(parent) = expression.parent()
+        && parent.kind() == "parenthesized_expression"
+    {
+        expression = parent;
+    }
+    expression
 }
 
 fn callable_context(
@@ -1158,6 +1163,7 @@ mod recovery_tests {
         let source = r#"async fn run() {
     if enabled {
         async { helper().await; }.await;
+        (((async { parenthesized().await; }))).await;
         let future = async { deferred().await; };
     }
 }"#;
@@ -1170,6 +1176,7 @@ mod recovery_tests {
         };
 
         assert_eq!(contexts("helper"), [ConditionArmKind::Then]);
+        assert_eq!(contexts("parenthesized"), [ConditionArmKind::Then]);
         assert!(contexts("deferred").is_empty());
     }
 
