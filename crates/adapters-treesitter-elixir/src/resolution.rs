@@ -1763,7 +1763,7 @@ end
         assert!(matches!(
             &outer_default[1],
             EvidenceContext::PatternArm {
-                is_default: true,
+                is_default: false,
                 pattern: Some(pattern),
                 arm_range,
                 ..

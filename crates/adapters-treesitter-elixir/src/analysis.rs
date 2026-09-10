@@ -301,9 +301,7 @@ fn capture_contexts(
                 node = parent;
                 continue;
             };
-            if !(body.start_byte()..=body.end_byte()).contains(&node.start_byte())
-                || node.end_byte() > body.end_byte()
-            {
+            if !(body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()) {
                 node = parent;
                 continue;
             }
