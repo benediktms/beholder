@@ -1978,4 +1978,30 @@ mod recovery_tests {
                 if capture.name == "inner_helper" && signature.text == "input"
         )));
     }
+
+    #[test]
+    fn diagnostic_cond_head_capture_fixture() {
+        let analysis = analyze(
+            r#"defmodule Example do
+  def run(value) do
+    cond do
+      callback = &helper/0 -> consume(callback)
+      true -> :ok
+    end
+  end
+  defp helper, do: :ok
+  defp consume(callback), do: callback.()
+end"#,
+        )
+        .unwrap();
+        let capture = &analysis.modules[0].functions[0].captures[0];
+        assert_eq!(capture.name, "helper");
+        assert!(matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                ..
+            }]
+        ));
+    }
 }
