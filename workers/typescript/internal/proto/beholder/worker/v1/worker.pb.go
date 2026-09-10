@@ -1094,6 +1094,7 @@ type RepositoryInput struct {
 	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	Content       []byte                 `protobuf:"bytes,3,opt,name=content,proto3" json:"content,omitempty"`
 	Kind          InputKind              `protobuf:"varint,4,opt,name=kind,proto3,enum=beholder.worker.v1.InputKind" json:"kind,omitempty"`
+	ContentHash   []byte                 `protobuf:"bytes,5,opt,name=content_hash,json=contentHash,proto3" json:"content_hash,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1154,6 +1155,13 @@ func (x *RepositoryInput) GetKind() InputKind {
 		return x.Kind
 	}
 	return InputKind_INPUT_KIND_UNSPECIFIED
+}
+
+func (x *RepositoryInput) GetContentHash() []byte {
+	if x != nil {
+		return x.ContentHash
+	}
+	return nil
 }
 
 type AnalysisFinish struct {
@@ -1333,6 +1341,8 @@ type SemanticCandidate struct {
 	UnresolvedTo  string                 `protobuf:"bytes,5,opt,name=unresolved_to,json=unresolvedTo,proto3" json:"unresolved_to,omitempty"`
 	Span          *SourceSpan            `protobuf:"bytes,6,opt,name=span,proto3" json:"span,omitempty"`
 	Evidence      string                 `protobuf:"bytes,7,opt,name=evidence,proto3" json:"evidence,omitempty"`
+	Range         *v1.SourceRange        `protobuf:"bytes,8,opt,name=range,proto3,oneof" json:"range,omitempty"`
+	Contexts      []*v1.EvidenceContext  `protobuf:"bytes,9,rep,name=contexts,proto3" json:"contexts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1414,6 +1424,20 @@ func (x *SemanticCandidate) GetEvidence() string {
 		return x.Evidence
 	}
 	return ""
+}
+
+func (x *SemanticCandidate) GetRange() *v1.SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+func (x *SemanticCandidate) GetContexts() []*v1.EvidenceContext {
+	if x != nil {
+		return x.Contexts
+	}
+	return nil
 }
 
 type SourceSpan struct {
@@ -1843,6 +1867,8 @@ type CandidateOverride struct {
 	CandidateId   string                 `protobuf:"bytes,1,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
 	ResolvedTo    string                 `protobuf:"bytes,2,opt,name=resolved_to,json=resolvedTo,proto3" json:"resolved_to,omitempty"`
 	Evidence      string                 `protobuf:"bytes,3,opt,name=evidence,proto3" json:"evidence,omitempty"`
+	Range         *v1.SourceRange        `protobuf:"bytes,4,opt,name=range,proto3,oneof" json:"range,omitempty"`
+	Contexts      []*v1.EvidenceContext  `protobuf:"bytes,5,rep,name=contexts,proto3" json:"contexts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1896,6 +1922,20 @@ func (x *CandidateOverride) GetEvidence() string {
 		return x.Evidence
 	}
 	return ""
+}
+
+func (x *CandidateOverride) GetRange() *v1.SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+func (x *CandidateOverride) GetContexts() []*v1.EvidenceContext {
+	if x != nil {
+		return x.Contexts
+	}
+	return nil
 }
 
 type AnalysisFailure struct {
@@ -2071,6 +2111,7 @@ type RepositoryContribution struct {
 	Observations            []*Observation          `protobuf:"bytes,5,rep,name=observations,proto3" json:"observations,omitempty"`
 	Diagnostics             []*AnalysisDiagnostic   `protobuf:"bytes,6,rep,name=diagnostics,proto3" json:"diagnostics,omitempty"`
 	ReplacedDiagnosticCodes []string                `protobuf:"bytes,7,rep,name=replaced_diagnostic_codes,json=replacedDiagnosticCodes,proto3" json:"replaced_diagnostic_codes,omitempty"`
+	FactShards              []*FactShard            `protobuf:"bytes,8,rep,name=fact_shards,json=factShards,proto3" json:"fact_shards,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -2154,6 +2195,97 @@ func (x *RepositoryContribution) GetReplacedDiagnosticCodes() []string {
 	return nil
 }
 
+func (x *RepositoryContribution) GetFactShards() []*FactShard {
+	if x != nil {
+		return x.FactShards
+	}
+	return nil
+}
+
+type FactShard struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Repository    string                 `protobuf:"bytes,1,opt,name=repository,proto3" json:"repository,omitempty"`
+	Producer      string                 `protobuf:"bytes,2,opt,name=producer,proto3" json:"producer,omitempty"`
+	Owner         string                 `protobuf:"bytes,3,opt,name=owner,proto3" json:"owner,omitempty"`
+	Version       string                 `protobuf:"bytes,4,opt,name=version,proto3" json:"version,omitempty"`
+	Entities      []*EntityFact          `protobuf:"bytes,5,rep,name=entities,proto3" json:"entities,omitempty"`
+	Observations  []*Observation         `protobuf:"bytes,6,rep,name=observations,proto3" json:"observations,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FactShard) Reset() {
+	*x = FactShard{}
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FactShard) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FactShard) ProtoMessage() {}
+
+func (x *FactShard) ProtoReflect() protoreflect.Message {
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FactShard.ProtoReflect.Descriptor instead.
+func (*FactShard) Descriptor() ([]byte, []int) {
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *FactShard) GetRepository() string {
+	if x != nil {
+		return x.Repository
+	}
+	return ""
+}
+
+func (x *FactShard) GetProducer() string {
+	if x != nil {
+		return x.Producer
+	}
+	return ""
+}
+
+func (x *FactShard) GetOwner() string {
+	if x != nil {
+		return x.Owner
+	}
+	return ""
+}
+
+func (x *FactShard) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *FactShard) GetEntities() []*EntityFact {
+	if x != nil {
+		return x.Entities
+	}
+	return nil
+}
+
+func (x *FactShard) GetObservations() []*Observation {
+	if x != nil {
+		return x.Observations
+	}
+	return nil
+}
+
 type EntityFact struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -2165,7 +2297,7 @@ type EntityFact struct {
 
 func (x *EntityFact) Reset() {
 	*x = EntityFact{}
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[24]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2177,7 +2309,7 @@ func (x *EntityFact) String() string {
 func (*EntityFact) ProtoMessage() {}
 
 func (x *EntityFact) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[24]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2190,7 +2322,7 @@ func (x *EntityFact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntityFact.ProtoReflect.Descriptor instead.
 func (*EntityFact) Descriptor() ([]byte, []int) {
-	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{24}
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *EntityFact) GetId() string {
@@ -2222,13 +2354,15 @@ type Observation struct {
 	Evidence      string                 `protobuf:"bytes,4,opt,name=evidence,proto3" json:"evidence,omitempty"`
 	Confidence    Confidence             `protobuf:"varint,5,opt,name=confidence,proto3,enum=beholder.worker.v1.Confidence" json:"confidence,omitempty"`
 	Provenance    Provenance             `protobuf:"varint,6,opt,name=provenance,proto3,enum=beholder.worker.v1.Provenance" json:"provenance,omitempty"`
+	Range         *v1.SourceRange        `protobuf:"bytes,7,opt,name=range,proto3,oneof" json:"range,omitempty"`
+	Contexts      []*v1.EvidenceContext  `protobuf:"bytes,8,rep,name=contexts,proto3" json:"contexts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Observation) Reset() {
 	*x = Observation{}
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[25]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2240,7 +2374,7 @@ func (x *Observation) String() string {
 func (*Observation) ProtoMessage() {}
 
 func (x *Observation) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[25]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2253,7 +2387,7 @@ func (x *Observation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Observation.ProtoReflect.Descriptor instead.
 func (*Observation) Descriptor() ([]byte, []int) {
-	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{25}
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *Observation) GetFrom() string {
@@ -2298,6 +2432,20 @@ func (x *Observation) GetProvenance() Provenance {
 	return Provenance_PROVENANCE_UNSPECIFIED
 }
 
+func (x *Observation) GetRange() *v1.SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+func (x *Observation) GetContexts() []*v1.EvidenceContext {
+	if x != nil {
+		return x.Contexts
+	}
+	return nil
+}
+
 type GrpcBindingCandidate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	LocalSymbol   string                 `protobuf:"bytes,1,opt,name=local_symbol,json=localSymbol,proto3" json:"local_symbol,omitempty"`
@@ -2308,13 +2456,15 @@ type GrpcBindingCandidate struct {
 	Evidence      string                 `protobuf:"bytes,6,opt,name=evidence,proto3" json:"evidence,omitempty"`
 	Confidence    Confidence             `protobuf:"varint,7,opt,name=confidence,proto3,enum=beholder.worker.v1.Confidence" json:"confidence,omitempty"`
 	Provenance    Provenance             `protobuf:"varint,8,opt,name=provenance,proto3,enum=beholder.worker.v1.Provenance" json:"provenance,omitempty"`
+	Range         *v1.SourceRange        `protobuf:"bytes,9,opt,name=range,proto3,oneof" json:"range,omitempty"`
+	Contexts      []*v1.EvidenceContext  `protobuf:"bytes,10,rep,name=contexts,proto3" json:"contexts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GrpcBindingCandidate) Reset() {
 	*x = GrpcBindingCandidate{}
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[26]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2326,7 +2476,7 @@ func (x *GrpcBindingCandidate) String() string {
 func (*GrpcBindingCandidate) ProtoMessage() {}
 
 func (x *GrpcBindingCandidate) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[26]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2339,7 +2489,7 @@ func (x *GrpcBindingCandidate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GrpcBindingCandidate.ProtoReflect.Descriptor instead.
 func (*GrpcBindingCandidate) Descriptor() ([]byte, []int) {
-	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{26}
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *GrpcBindingCandidate) GetLocalSymbol() string {
@@ -2398,6 +2548,20 @@ func (x *GrpcBindingCandidate) GetProvenance() Provenance {
 	return Provenance_PROVENANCE_UNSPECIFIED
 }
 
+func (x *GrpcBindingCandidate) GetRange() *v1.SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+func (x *GrpcBindingCandidate) GetContexts() []*v1.EvidenceContext {
+	if x != nil {
+		return x.Contexts
+	}
+	return nil
+}
+
 type AnalysisDiagnostic struct {
 	state         protoimpl.MessageState        `protogen:"open.v1"`
 	Code          string                        `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
@@ -2411,7 +2575,7 @@ type AnalysisDiagnostic struct {
 
 func (x *AnalysisDiagnostic) Reset() {
 	*x = AnalysisDiagnostic{}
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[27]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2423,7 +2587,7 @@ func (x *AnalysisDiagnostic) String() string {
 func (*AnalysisDiagnostic) ProtoMessage() {}
 
 func (x *AnalysisDiagnostic) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[27]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2436,7 +2600,7 @@ func (x *AnalysisDiagnostic) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnalysisDiagnostic.ProtoReflect.Descriptor instead.
 func (*AnalysisDiagnostic) Descriptor() ([]byte, []int) {
-	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{27}
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *AnalysisDiagnostic) GetCode() string {
@@ -2483,13 +2647,15 @@ type DependencyOverride struct {
 	Evidence      string                 `protobuf:"bytes,5,opt,name=evidence,proto3" json:"evidence,omitempty"`
 	Confidence    Confidence             `protobuf:"varint,6,opt,name=confidence,proto3,enum=beholder.worker.v1.Confidence" json:"confidence,omitempty"`
 	Provenance    Provenance             `protobuf:"varint,7,opt,name=provenance,proto3,enum=beholder.worker.v1.Provenance" json:"provenance,omitempty"`
+	Range         *v1.SourceRange        `protobuf:"bytes,8,opt,name=range,proto3,oneof" json:"range,omitempty"`
+	Contexts      []*v1.EvidenceContext  `protobuf:"bytes,9,rep,name=contexts,proto3" json:"contexts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DependencyOverride) Reset() {
 	*x = DependencyOverride{}
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[28]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2501,7 +2667,7 @@ func (x *DependencyOverride) String() string {
 func (*DependencyOverride) ProtoMessage() {}
 
 func (x *DependencyOverride) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[28]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2514,7 +2680,7 @@ func (x *DependencyOverride) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DependencyOverride.ProtoReflect.Descriptor instead.
 func (*DependencyOverride) Descriptor() ([]byte, []int) {
-	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{28}
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *DependencyOverride) GetFrom() string {
@@ -2566,6 +2732,20 @@ func (x *DependencyOverride) GetProvenance() Provenance {
 	return Provenance_PROVENANCE_UNSPECIFIED
 }
 
+func (x *DependencyOverride) GetRange() *v1.SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+func (x *DependencyOverride) GetContexts() []*v1.EvidenceContext {
+	if x != nil {
+		return x.Contexts
+	}
+	return nil
+}
+
 type GraphqlResolverCandidate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Repository    string                 `protobuf:"bytes,1,opt,name=repository,proto3" json:"repository,omitempty"`
@@ -2573,13 +2753,15 @@ type GraphqlResolverCandidate struct {
 	Parent        *string                `protobuf:"bytes,3,opt,name=parent,proto3,oneof" json:"parent,omitempty"`
 	Resolver      string                 `protobuf:"bytes,4,opt,name=resolver,proto3" json:"resolver,omitempty"`
 	Evidence      string                 `protobuf:"bytes,5,opt,name=evidence,proto3" json:"evidence,omitempty"`
+	Range         *v1.SourceRange        `protobuf:"bytes,6,opt,name=range,proto3,oneof" json:"range,omitempty"`
+	Contexts      []*v1.EvidenceContext  `protobuf:"bytes,7,rep,name=contexts,proto3" json:"contexts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GraphqlResolverCandidate) Reset() {
 	*x = GraphqlResolverCandidate{}
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[29]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2591,7 +2773,7 @@ func (x *GraphqlResolverCandidate) String() string {
 func (*GraphqlResolverCandidate) ProtoMessage() {}
 
 func (x *GraphqlResolverCandidate) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[29]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2604,7 +2786,7 @@ func (x *GraphqlResolverCandidate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GraphqlResolverCandidate.ProtoReflect.Descriptor instead.
 func (*GraphqlResolverCandidate) Descriptor() ([]byte, []int) {
-	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{29}
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *GraphqlResolverCandidate) GetRepository() string {
@@ -2642,6 +2824,20 @@ func (x *GraphqlResolverCandidate) GetEvidence() string {
 	return ""
 }
 
+func (x *GraphqlResolverCandidate) GetRange() *v1.SourceRange {
+	if x != nil {
+		return x.Range
+	}
+	return nil
+}
+
+func (x *GraphqlResolverCandidate) GetContexts() []*v1.EvidenceContext {
+	if x != nil {
+		return x.Contexts
+	}
+	return nil
+}
+
 type RepositoryDiagnostic struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Repository    string                 `protobuf:"bytes,1,opt,name=repository,proto3" json:"repository,omitempty"`
@@ -2652,7 +2848,7 @@ type RepositoryDiagnostic struct {
 
 func (x *RepositoryDiagnostic) Reset() {
 	*x = RepositoryDiagnostic{}
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[30]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2664,7 +2860,7 @@ func (x *RepositoryDiagnostic) String() string {
 func (*RepositoryDiagnostic) ProtoMessage() {}
 
 func (x *RepositoryDiagnostic) ProtoReflect() protoreflect.Message {
-	mi := &file_beholder_worker_v1_worker_proto_msgTypes[30]
+	mi := &file_beholder_worker_v1_worker_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2677,7 +2873,7 @@ func (x *RepositoryDiagnostic) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryDiagnostic.ProtoReflect.Descriptor instead.
 func (*RepositoryDiagnostic) Descriptor() ([]byte, []int) {
-	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{30}
+	return file_beholder_worker_v1_worker_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *RepositoryDiagnostic) GetRepository() string {
@@ -2740,21 +2936,22 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"\x04head\x18\x03 \x01(\tH\x00R\x04head\x88\x01\x01\x12 \n" +
 	"\vfingerprint\x18\x04 \x01(\tR\vfingerprint\x12\x16\n" +
 	"\x06target\x18\x05 \x01(\bR\x06targetB\a\n" +
-	"\x05_head\"\x92\x01\n" +
+	"\x05_head\"\xb5\x01\n" +
 	"\x0fRepositoryInput\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x01 \x01(\tR\n" +
 	"repository\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x18\n" +
 	"\acontent\x18\x03 \x01(\fR\acontent\x121\n" +
-	"\x04kind\x18\x04 \x01(\x0e2\x1d.beholder.worker.v1.InputKindR\x04kind\"\x10\n" +
+	"\x04kind\x18\x04 \x01(\x0e2\x1d.beholder.worker.v1.InputKindR\x04kind\x12!\n" +
+	"\fcontent_hash\x18\x05 \x01(\fR\vcontentHash\"\x10\n" +
 	"\x0eAnalysisFinish\"H\n" +
 	"\x0eBaselineEntity\x126\n" +
 	"\x06entity\x18\x01 \x01(\v2\x1e.beholder.worker.v1.EntityFactR\x06entity\"X\n" +
 	"\x13BaselineObservation\x12A\n" +
 	"\vobservation\x18\x01 \x01(\v2\x1f.beholder.worker.v1.ObservationR\vobservation\"X\n" +
 	"\x11BaselineCandidate\x12C\n" +
-	"\tcandidate\x18\x01 \x01(\v2%.beholder.worker.v1.SemanticCandidateR\tcandidate\"\x83\x02\n" +
+	"\tcandidate\x18\x01 \x01(\v2%.beholder.worker.v1.SemanticCandidateR\tcandidate\"\xfc\x02\n" +
 	"\x11SemanticCandidate\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1e\n" +
 	"\n" +
@@ -2764,7 +2961,10 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"\brelation\x18\x04 \x01(\x0e2\x19.beholder.v1.RelationKindR\brelation\x12#\n" +
 	"\runresolved_to\x18\x05 \x01(\tR\funresolvedTo\x122\n" +
 	"\x04span\x18\x06 \x01(\v2\x1e.beholder.worker.v1.SourceSpanR\x04span\x12\x1a\n" +
-	"\bevidence\x18\a \x01(\tR\bevidence\"\x90\x01\n" +
+	"\bevidence\x18\a \x01(\tR\bevidence\x123\n" +
+	"\x05range\x18\b \x01(\v2\x18.beholder.v1.SourceRangeH\x00R\x05range\x88\x01\x01\x128\n" +
+	"\bcontexts\x18\t \x03(\v2\x1c.beholder.v1.EvidenceContextR\bcontextsB\b\n" +
+	"\x06_range\"\x90\x01\n" +
 	"\n" +
 	"SourceSpan\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x128\n" +
@@ -2794,12 +2994,15 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"\toverrides\x18\x01 \x03(\v2&.beholder.worker.v1.DependencyOverrideR\toverrides\x12Y\n" +
 	"\x11graphql_resolvers\x18\x02 \x03(\v2,.beholder.worker.v1.GraphqlResolverCandidateR\x10graphqlResolvers\x12J\n" +
 	"\vdiagnostics\x18\x03 \x03(\v2(.beholder.worker.v1.RepositoryDiagnosticR\vdiagnostics\x12V\n" +
-	"\x13candidate_overrides\x18\x04 \x03(\v2%.beholder.worker.v1.CandidateOverrideR\x12candidateOverrides\"s\n" +
+	"\x13candidate_overrides\x18\x04 \x03(\v2%.beholder.worker.v1.CandidateOverrideR\x12candidateOverrides\"\xec\x01\n" +
 	"\x11CandidateOverride\x12!\n" +
 	"\fcandidate_id\x18\x01 \x01(\tR\vcandidateId\x12\x1f\n" +
 	"\vresolved_to\x18\x02 \x01(\tR\n" +
 	"resolvedTo\x12\x1a\n" +
-	"\bevidence\x18\x03 \x01(\tR\bevidence\"?\n" +
+	"\bevidence\x18\x03 \x01(\tR\bevidence\x123\n" +
+	"\x05range\x18\x04 \x01(\v2\x18.beholder.v1.SourceRangeH\x00R\x05range\x88\x01\x01\x128\n" +
+	"\bcontexts\x18\x05 \x03(\v2\x1c.beholder.v1.EvidenceContextR\bcontextsB\b\n" +
+	"\x06_range\"?\n" +
 	"\x0fAnalysisFailure\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"<\n" +
@@ -2810,7 +3013,7 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"\vmemory_hits\x18\x01 \x01(\x04R\n" +
 	"memoryHits\x12\x1b\n" +
 	"\tdisk_hits\x18\x02 \x01(\x04R\bdiskHits\x12\x16\n" +
-	"\x06misses\x18\x03 \x01(\x04R\x06misses\"\xdc\x03\n" +
+	"\x06misses\x18\x03 \x01(\x04R\x06misses\"\x9c\x04\n" +
 	"\x16RepositoryContribution\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x01 \x01(\tR\n" +
@@ -2820,13 +3023,24 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"\rgrpc_bindings\x18\x04 \x03(\v2(.beholder.worker.v1.GrpcBindingCandidateR\fgrpcBindings\x12C\n" +
 	"\fobservations\x18\x05 \x03(\v2\x1f.beholder.worker.v1.ObservationR\fobservations\x12H\n" +
 	"\vdiagnostics\x18\x06 \x03(\v2&.beholder.worker.v1.AnalysisDiagnosticR\vdiagnostics\x12:\n" +
-	"\x19replaced_diagnostic_codes\x18\a \x03(\tR\x17replacedDiagnosticCodes\"\x94\x01\n" +
+	"\x19replaced_diagnostic_codes\x18\a \x03(\tR\x17replacedDiagnosticCodes\x12>\n" +
+	"\vfact_shards\x18\b \x03(\v2\x1d.beholder.worker.v1.FactShardR\n" +
+	"factShards\"\xf8\x01\n" +
+	"\tFactShard\x12\x1e\n" +
+	"\n" +
+	"repository\x18\x01 \x01(\tR\n" +
+	"repository\x12\x1a\n" +
+	"\bproducer\x18\x02 \x01(\tR\bproducer\x12\x14\n" +
+	"\x05owner\x18\x03 \x01(\tR\x05owner\x12\x18\n" +
+	"\aversion\x18\x04 \x01(\tR\aversion\x12:\n" +
+	"\bentities\x18\x05 \x03(\v2\x1e.beholder.worker.v1.EntityFactR\bentities\x12C\n" +
+	"\fobservations\x18\x06 \x03(\v2\x1f.beholder.worker.v1.ObservationR\fobservations\"\x94\x01\n" +
 	"\n" +
 	"EntityFact\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12+\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x17.beholder.v1.EntityKindR\x04kind\x12<\n" +
 	"\bmetadata\x18\x03 \x01(\v2\x1b.beholder.v1.EntityMetadataH\x00R\bmetadata\x88\x01\x01B\v\n" +
-	"\t_metadata\"\x84\x02\n" +
+	"\t_metadata\"\xfd\x02\n" +
 	"\vObservation\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\tR\x04from\x125\n" +
 	"\brelation\x18\x02 \x01(\x0e2\x19.beholder.v1.RelationKindR\brelation\x12\x0e\n" +
@@ -2837,7 +3051,10 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"confidence\x12>\n" +
 	"\n" +
 	"provenance\x18\x06 \x01(\x0e2\x1e.beholder.worker.v1.ProvenanceR\n" +
-	"provenance\"\xff\x02\n" +
+	"provenance\x123\n" +
+	"\x05range\x18\a \x01(\v2\x18.beholder.v1.SourceRangeH\x00R\x05range\x88\x01\x01\x128\n" +
+	"\bcontexts\x18\b \x03(\v2\x1c.beholder.v1.EvidenceContextR\bcontextsB\b\n" +
+	"\x06_range\"\xf8\x03\n" +
 	"\x14GrpcBindingCandidate\x12!\n" +
 	"\flocal_symbol\x18\x01 \x01(\tR\vlocalSymbol\x127\n" +
 	"\x04role\x18\x02 \x01(\x0e2#.beholder.worker.v1.GrpcBindingRoleR\x04role\x12\x18\n" +
@@ -2850,7 +3067,11 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"confidence\x12>\n" +
 	"\n" +
 	"provenance\x18\b \x01(\x0e2\x1e.beholder.worker.v1.ProvenanceR\n" +
-	"provenance\"\xcb\x01\n" +
+	"provenance\x123\n" +
+	"\x05range\x18\t \x01(\v2\x18.beholder.v1.SourceRangeH\x00R\x05range\x88\x01\x01\x128\n" +
+	"\bcontexts\x18\n" +
+	" \x03(\v2\x1c.beholder.v1.EvidenceContextR\bcontextsB\b\n" +
+	"\x06_range\"\xcb\x01\n" +
 	"\x12AnalysisDiagnostic\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12C\n" +
 	"\bseverity\x18\x02 \x01(\x0e2'.beholder.v1.AnalysisDiagnosticSeverityR\bseverity\x12\x12\n" +
@@ -2858,7 +3079,7 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"\x04line\x18\x04 \x01(\rH\x00R\x04line\x88\x01\x01\x12\x1b\n" +
 	"\x06detail\x18\x05 \x01(\tH\x01R\x06detail\x88\x01\x01B\a\n" +
 	"\x05_lineB\t\n" +
-	"\a_detail\"\xc1\x02\n" +
+	"\a_detail\"\xba\x03\n" +
 	"\x12DependencyOverride\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\tR\x04from\x125\n" +
 	"\brelation\x18\x02 \x01(\x0e2\x19.beholder.v1.RelationKindR\brelation\x12#\n" +
@@ -2871,7 +3092,10 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"confidence\x12>\n" +
 	"\n" +
 	"provenance\x18\a \x01(\x0e2\x1e.beholder.worker.v1.ProvenanceR\n" +
-	"provenance\"\xb0\x01\n" +
+	"provenance\x123\n" +
+	"\x05range\x18\b \x01(\v2\x18.beholder.v1.SourceRangeH\x00R\x05range\x88\x01\x01\x128\n" +
+	"\bcontexts\x18\t \x03(\v2\x1c.beholder.v1.EvidenceContextR\bcontextsB\b\n" +
+	"\x06_range\"\xa9\x02\n" +
 	"\x18GraphqlResolverCandidate\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x01 \x01(\tR\n" +
@@ -2879,8 +3103,11 @@ const file_beholder_worker_v1_worker_proto_rawDesc = "" +
 	"\x05field\x18\x02 \x01(\tR\x05field\x12\x1b\n" +
 	"\x06parent\x18\x03 \x01(\tH\x00R\x06parent\x88\x01\x01\x12\x1a\n" +
 	"\bresolver\x18\x04 \x01(\tR\bresolver\x12\x1a\n" +
-	"\bevidence\x18\x05 \x01(\tR\bevidenceB\t\n" +
-	"\a_parent\"~\n" +
+	"\bevidence\x18\x05 \x01(\tR\bevidence\x123\n" +
+	"\x05range\x18\x06 \x01(\v2\x18.beholder.v1.SourceRangeH\x01R\x05range\x88\x01\x01\x128\n" +
+	"\bcontexts\x18\a \x03(\v2\x1c.beholder.v1.EvidenceContextR\bcontextsB\t\n" +
+	"\a_parentB\b\n" +
+	"\x06_range\"~\n" +
 	"\x14RepositoryDiagnostic\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x01 \x01(\tR\n" +
@@ -2964,7 +3191,7 @@ func file_beholder_worker_v1_worker_proto_rawDescGZIP() []byte {
 }
 
 var file_beholder_worker_v1_worker_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_beholder_worker_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_beholder_worker_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_beholder_worker_v1_worker_proto_goTypes = []any{
 	(PluginEntityKind)(0),              // 0: beholder.worker.v1.PluginEntityKind
 	(PluginInputScope)(0),              // 1: beholder.worker.v1.PluginInputScope
@@ -2999,26 +3226,29 @@ var file_beholder_worker_v1_worker_proto_goTypes = []any{
 	(*AnalyzerMetadata)(nil),           // 30: beholder.worker.v1.AnalyzerMetadata
 	(*CacheStatistics)(nil),            // 31: beholder.worker.v1.CacheStatistics
 	(*RepositoryContribution)(nil),     // 32: beholder.worker.v1.RepositoryContribution
-	(*EntityFact)(nil),                 // 33: beholder.worker.v1.EntityFact
-	(*Observation)(nil),                // 34: beholder.worker.v1.Observation
-	(*GrpcBindingCandidate)(nil),       // 35: beholder.worker.v1.GrpcBindingCandidate
-	(*AnalysisDiagnostic)(nil),         // 36: beholder.worker.v1.AnalysisDiagnostic
-	(*DependencyOverride)(nil),         // 37: beholder.worker.v1.DependencyOverride
-	(*GraphqlResolverCandidate)(nil),   // 38: beholder.worker.v1.GraphqlResolverCandidate
-	(*RepositoryDiagnostic)(nil),       // 39: beholder.worker.v1.RepositoryDiagnostic
-	(v1.RelationKind)(0),               // 40: beholder.v1.RelationKind
-	(v1.EntityKind)(0),                 // 41: beholder.v1.EntityKind
-	(*v1.EntityMetadata)(nil),          // 42: beholder.v1.EntityMetadata
-	(v1.RpcCardinality)(0),             // 43: beholder.v1.RpcCardinality
-	(v1.AnalysisDiagnosticSeverity)(0), // 44: beholder.v1.AnalysisDiagnosticSeverity
+	(*FactShard)(nil),                  // 33: beholder.worker.v1.FactShard
+	(*EntityFact)(nil),                 // 34: beholder.worker.v1.EntityFact
+	(*Observation)(nil),                // 35: beholder.worker.v1.Observation
+	(*GrpcBindingCandidate)(nil),       // 36: beholder.worker.v1.GrpcBindingCandidate
+	(*AnalysisDiagnostic)(nil),         // 37: beholder.worker.v1.AnalysisDiagnostic
+	(*DependencyOverride)(nil),         // 38: beholder.worker.v1.DependencyOverride
+	(*GraphqlResolverCandidate)(nil),   // 39: beholder.worker.v1.GraphqlResolverCandidate
+	(*RepositoryDiagnostic)(nil),       // 40: beholder.worker.v1.RepositoryDiagnostic
+	(v1.RelationKind)(0),               // 41: beholder.v1.RelationKind
+	(*v1.SourceRange)(nil),             // 42: beholder.v1.SourceRange
+	(*v1.EvidenceContext)(nil),         // 43: beholder.v1.EvidenceContext
+	(v1.EntityKind)(0),                 // 44: beholder.v1.EntityKind
+	(*v1.EntityMetadata)(nil),          // 45: beholder.v1.EntityMetadata
+	(v1.RpcCardinality)(0),             // 46: beholder.v1.RpcCardinality
+	(v1.AnalysisDiagnosticSeverity)(0), // 47: beholder.v1.AnalysisDiagnosticSeverity
 }
 var file_beholder_worker_v1_worker_proto_depIdxs = []int32{
 	11, // 0: beholder.worker.v1.DescribeResponse.descriptor:type_name -> beholder.worker.v1.PluginDescriptor
 	12, // 1: beholder.worker.v1.PluginDescriptor.inputs:type_name -> beholder.worker.v1.PluginInputSelector
 	0,  // 2: beholder.worker.v1.PluginDescriptor.semantic_entities:type_name -> beholder.worker.v1.PluginEntityKind
-	40, // 3: beholder.worker.v1.PluginDescriptor.semantic_relations:type_name -> beholder.v1.RelationKind
+	41, // 3: beholder.worker.v1.PluginDescriptor.semantic_relations:type_name -> beholder.v1.RelationKind
 	0,  // 4: beholder.worker.v1.PluginDescriptor.produces_entities:type_name -> beholder.worker.v1.PluginEntityKind
-	40, // 5: beholder.worker.v1.PluginDescriptor.produces_relations:type_name -> beholder.v1.RelationKind
+	41, // 5: beholder.worker.v1.PluginDescriptor.produces_relations:type_name -> beholder.v1.RelationKind
 	1,  // 6: beholder.worker.v1.PluginInputSelector.scope:type_name -> beholder.worker.v1.PluginInputScope
 	2,  // 7: beholder.worker.v1.PluginInputSelector.kind:type_name -> beholder.worker.v1.PluginInputKind
 	14, // 8: beholder.worker.v1.AnalyzeRequest.start:type_name -> beholder.worker.v1.AnalysisStart
@@ -3029,53 +3259,68 @@ var file_beholder_worker_v1_worker_proto_depIdxs = []int32{
 	19, // 13: beholder.worker.v1.AnalyzeRequest.baseline_observation:type_name -> beholder.worker.v1.BaselineObservation
 	20, // 14: beholder.worker.v1.AnalyzeRequest.baseline_candidate:type_name -> beholder.worker.v1.BaselineCandidate
 	3,  // 15: beholder.worker.v1.RepositoryInput.kind:type_name -> beholder.worker.v1.InputKind
-	33, // 16: beholder.worker.v1.BaselineEntity.entity:type_name -> beholder.worker.v1.EntityFact
-	34, // 17: beholder.worker.v1.BaselineObservation.observation:type_name -> beholder.worker.v1.Observation
+	34, // 16: beholder.worker.v1.BaselineEntity.entity:type_name -> beholder.worker.v1.EntityFact
+	35, // 17: beholder.worker.v1.BaselineObservation.observation:type_name -> beholder.worker.v1.Observation
 	21, // 18: beholder.worker.v1.BaselineCandidate.candidate:type_name -> beholder.worker.v1.SemanticCandidate
-	40, // 19: beholder.worker.v1.SemanticCandidate.relation:type_name -> beholder.v1.RelationKind
+	41, // 19: beholder.worker.v1.SemanticCandidate.relation:type_name -> beholder.v1.RelationKind
 	22, // 20: beholder.worker.v1.SemanticCandidate.span:type_name -> beholder.worker.v1.SourceSpan
-	23, // 21: beholder.worker.v1.SourceSpan.start:type_name -> beholder.worker.v1.SourcePosition
-	23, // 22: beholder.worker.v1.SourceSpan.end:type_name -> beholder.worker.v1.SourcePosition
-	25, // 23: beholder.worker.v1.AnalyzeEvent.progress:type_name -> beholder.worker.v1.AnalysisProgress
-	32, // 24: beholder.worker.v1.AnalyzeEvent.repository:type_name -> beholder.worker.v1.RepositoryContribution
-	26, // 25: beholder.worker.v1.AnalyzeEvent.completed:type_name -> beholder.worker.v1.AnalysisCompleted
-	29, // 26: beholder.worker.v1.AnalyzeEvent.failure:type_name -> beholder.worker.v1.AnalysisFailure
-	27, // 27: beholder.worker.v1.AnalyzeEvent.contribution:type_name -> beholder.worker.v1.AnalysisContribution
-	4,  // 28: beholder.worker.v1.AnalysisProgress.phase:type_name -> beholder.worker.v1.AnalysisPhase
-	30, // 29: beholder.worker.v1.AnalysisCompleted.metadata:type_name -> beholder.worker.v1.AnalyzerMetadata
-	31, // 30: beholder.worker.v1.AnalysisCompleted.cache:type_name -> beholder.worker.v1.CacheStatistics
-	37, // 31: beholder.worker.v1.AnalysisContribution.overrides:type_name -> beholder.worker.v1.DependencyOverride
-	38, // 32: beholder.worker.v1.AnalysisContribution.graphql_resolvers:type_name -> beholder.worker.v1.GraphqlResolverCandidate
-	39, // 33: beholder.worker.v1.AnalysisContribution.diagnostics:type_name -> beholder.worker.v1.RepositoryDiagnostic
-	28, // 34: beholder.worker.v1.AnalysisContribution.candidate_overrides:type_name -> beholder.worker.v1.CandidateOverride
-	5,  // 35: beholder.worker.v1.RepositoryContribution.completeness:type_name -> beholder.worker.v1.AnalysisCompleteness
-	33, // 36: beholder.worker.v1.RepositoryContribution.entities:type_name -> beholder.worker.v1.EntityFact
-	35, // 37: beholder.worker.v1.RepositoryContribution.grpc_bindings:type_name -> beholder.worker.v1.GrpcBindingCandidate
-	34, // 38: beholder.worker.v1.RepositoryContribution.observations:type_name -> beholder.worker.v1.Observation
-	36, // 39: beholder.worker.v1.RepositoryContribution.diagnostics:type_name -> beholder.worker.v1.AnalysisDiagnostic
-	41, // 40: beholder.worker.v1.EntityFact.kind:type_name -> beholder.v1.EntityKind
-	42, // 41: beholder.worker.v1.EntityFact.metadata:type_name -> beholder.v1.EntityMetadata
-	40, // 42: beholder.worker.v1.Observation.relation:type_name -> beholder.v1.RelationKind
-	7,  // 43: beholder.worker.v1.Observation.confidence:type_name -> beholder.worker.v1.Confidence
-	8,  // 44: beholder.worker.v1.Observation.provenance:type_name -> beholder.worker.v1.Provenance
-	6,  // 45: beholder.worker.v1.GrpcBindingCandidate.role:type_name -> beholder.worker.v1.GrpcBindingRole
-	43, // 46: beholder.worker.v1.GrpcBindingCandidate.cardinality:type_name -> beholder.v1.RpcCardinality
-	7,  // 47: beholder.worker.v1.GrpcBindingCandidate.confidence:type_name -> beholder.worker.v1.Confidence
-	8,  // 48: beholder.worker.v1.GrpcBindingCandidate.provenance:type_name -> beholder.worker.v1.Provenance
-	44, // 49: beholder.worker.v1.AnalysisDiagnostic.severity:type_name -> beholder.v1.AnalysisDiagnosticSeverity
-	40, // 50: beholder.worker.v1.DependencyOverride.relation:type_name -> beholder.v1.RelationKind
-	7,  // 51: beholder.worker.v1.DependencyOverride.confidence:type_name -> beholder.worker.v1.Confidence
-	8,  // 52: beholder.worker.v1.DependencyOverride.provenance:type_name -> beholder.worker.v1.Provenance
-	36, // 53: beholder.worker.v1.RepositoryDiagnostic.diagnostic:type_name -> beholder.worker.v1.AnalysisDiagnostic
-	13, // 54: beholder.worker.v1.AnalyzerWorker.Analyze:input_type -> beholder.worker.v1.AnalyzeRequest
-	9,  // 55: beholder.worker.v1.AnalyzerPlugin.Describe:input_type -> beholder.worker.v1.DescribeRequest
-	24, // 56: beholder.worker.v1.AnalyzerWorker.Analyze:output_type -> beholder.worker.v1.AnalyzeEvent
-	10, // 57: beholder.worker.v1.AnalyzerPlugin.Describe:output_type -> beholder.worker.v1.DescribeResponse
-	56, // [56:58] is the sub-list for method output_type
-	54, // [54:56] is the sub-list for method input_type
-	54, // [54:54] is the sub-list for extension type_name
-	54, // [54:54] is the sub-list for extension extendee
-	0,  // [0:54] is the sub-list for field type_name
+	42, // 21: beholder.worker.v1.SemanticCandidate.range:type_name -> beholder.v1.SourceRange
+	43, // 22: beholder.worker.v1.SemanticCandidate.contexts:type_name -> beholder.v1.EvidenceContext
+	23, // 23: beholder.worker.v1.SourceSpan.start:type_name -> beholder.worker.v1.SourcePosition
+	23, // 24: beholder.worker.v1.SourceSpan.end:type_name -> beholder.worker.v1.SourcePosition
+	25, // 25: beholder.worker.v1.AnalyzeEvent.progress:type_name -> beholder.worker.v1.AnalysisProgress
+	32, // 26: beholder.worker.v1.AnalyzeEvent.repository:type_name -> beholder.worker.v1.RepositoryContribution
+	26, // 27: beholder.worker.v1.AnalyzeEvent.completed:type_name -> beholder.worker.v1.AnalysisCompleted
+	29, // 28: beholder.worker.v1.AnalyzeEvent.failure:type_name -> beholder.worker.v1.AnalysisFailure
+	27, // 29: beholder.worker.v1.AnalyzeEvent.contribution:type_name -> beholder.worker.v1.AnalysisContribution
+	4,  // 30: beholder.worker.v1.AnalysisProgress.phase:type_name -> beholder.worker.v1.AnalysisPhase
+	30, // 31: beholder.worker.v1.AnalysisCompleted.metadata:type_name -> beholder.worker.v1.AnalyzerMetadata
+	31, // 32: beholder.worker.v1.AnalysisCompleted.cache:type_name -> beholder.worker.v1.CacheStatistics
+	38, // 33: beholder.worker.v1.AnalysisContribution.overrides:type_name -> beholder.worker.v1.DependencyOverride
+	39, // 34: beholder.worker.v1.AnalysisContribution.graphql_resolvers:type_name -> beholder.worker.v1.GraphqlResolverCandidate
+	40, // 35: beholder.worker.v1.AnalysisContribution.diagnostics:type_name -> beholder.worker.v1.RepositoryDiagnostic
+	28, // 36: beholder.worker.v1.AnalysisContribution.candidate_overrides:type_name -> beholder.worker.v1.CandidateOverride
+	42, // 37: beholder.worker.v1.CandidateOverride.range:type_name -> beholder.v1.SourceRange
+	43, // 38: beholder.worker.v1.CandidateOverride.contexts:type_name -> beholder.v1.EvidenceContext
+	5,  // 39: beholder.worker.v1.RepositoryContribution.completeness:type_name -> beholder.worker.v1.AnalysisCompleteness
+	34, // 40: beholder.worker.v1.RepositoryContribution.entities:type_name -> beholder.worker.v1.EntityFact
+	36, // 41: beholder.worker.v1.RepositoryContribution.grpc_bindings:type_name -> beholder.worker.v1.GrpcBindingCandidate
+	35, // 42: beholder.worker.v1.RepositoryContribution.observations:type_name -> beholder.worker.v1.Observation
+	37, // 43: beholder.worker.v1.RepositoryContribution.diagnostics:type_name -> beholder.worker.v1.AnalysisDiagnostic
+	33, // 44: beholder.worker.v1.RepositoryContribution.fact_shards:type_name -> beholder.worker.v1.FactShard
+	34, // 45: beholder.worker.v1.FactShard.entities:type_name -> beholder.worker.v1.EntityFact
+	35, // 46: beholder.worker.v1.FactShard.observations:type_name -> beholder.worker.v1.Observation
+	44, // 47: beholder.worker.v1.EntityFact.kind:type_name -> beholder.v1.EntityKind
+	45, // 48: beholder.worker.v1.EntityFact.metadata:type_name -> beholder.v1.EntityMetadata
+	41, // 49: beholder.worker.v1.Observation.relation:type_name -> beholder.v1.RelationKind
+	7,  // 50: beholder.worker.v1.Observation.confidence:type_name -> beholder.worker.v1.Confidence
+	8,  // 51: beholder.worker.v1.Observation.provenance:type_name -> beholder.worker.v1.Provenance
+	42, // 52: beholder.worker.v1.Observation.range:type_name -> beholder.v1.SourceRange
+	43, // 53: beholder.worker.v1.Observation.contexts:type_name -> beholder.v1.EvidenceContext
+	6,  // 54: beholder.worker.v1.GrpcBindingCandidate.role:type_name -> beholder.worker.v1.GrpcBindingRole
+	46, // 55: beholder.worker.v1.GrpcBindingCandidate.cardinality:type_name -> beholder.v1.RpcCardinality
+	7,  // 56: beholder.worker.v1.GrpcBindingCandidate.confidence:type_name -> beholder.worker.v1.Confidence
+	8,  // 57: beholder.worker.v1.GrpcBindingCandidate.provenance:type_name -> beholder.worker.v1.Provenance
+	42, // 58: beholder.worker.v1.GrpcBindingCandidate.range:type_name -> beholder.v1.SourceRange
+	43, // 59: beholder.worker.v1.GrpcBindingCandidate.contexts:type_name -> beholder.v1.EvidenceContext
+	47, // 60: beholder.worker.v1.AnalysisDiagnostic.severity:type_name -> beholder.v1.AnalysisDiagnosticSeverity
+	41, // 61: beholder.worker.v1.DependencyOverride.relation:type_name -> beholder.v1.RelationKind
+	7,  // 62: beholder.worker.v1.DependencyOverride.confidence:type_name -> beholder.worker.v1.Confidence
+	8,  // 63: beholder.worker.v1.DependencyOverride.provenance:type_name -> beholder.worker.v1.Provenance
+	42, // 64: beholder.worker.v1.DependencyOverride.range:type_name -> beholder.v1.SourceRange
+	43, // 65: beholder.worker.v1.DependencyOverride.contexts:type_name -> beholder.v1.EvidenceContext
+	42, // 66: beholder.worker.v1.GraphqlResolverCandidate.range:type_name -> beholder.v1.SourceRange
+	43, // 67: beholder.worker.v1.GraphqlResolverCandidate.contexts:type_name -> beholder.v1.EvidenceContext
+	37, // 68: beholder.worker.v1.RepositoryDiagnostic.diagnostic:type_name -> beholder.worker.v1.AnalysisDiagnostic
+	13, // 69: beholder.worker.v1.AnalyzerWorker.Analyze:input_type -> beholder.worker.v1.AnalyzeRequest
+	9,  // 70: beholder.worker.v1.AnalyzerPlugin.Describe:input_type -> beholder.worker.v1.DescribeRequest
+	24, // 71: beholder.worker.v1.AnalyzerWorker.Analyze:output_type -> beholder.worker.v1.AnalyzeEvent
+	10, // 72: beholder.worker.v1.AnalyzerPlugin.Describe:output_type -> beholder.worker.v1.DescribeResponse
+	71, // [71:73] is the sub-list for method output_type
+	69, // [69:71] is the sub-list for method input_type
+	69, // [69:69] is the sub-list for extension type_name
+	69, // [69:69] is the sub-list for extension extendee
+	0,  // [0:69] is the sub-list for field type_name
 }
 
 func init() { file_beholder_worker_v1_worker_proto_init() }
@@ -3098,6 +3343,7 @@ func file_beholder_worker_v1_worker_proto_init() {
 		(*AnalyzeRequest_BaselineCandidate)(nil),
 	}
 	file_beholder_worker_v1_worker_proto_msgTypes[6].OneofWrappers = []any{}
+	file_beholder_worker_v1_worker_proto_msgTypes[12].OneofWrappers = []any{}
 	file_beholder_worker_v1_worker_proto_msgTypes[15].OneofWrappers = []any{
 		(*AnalyzeEvent_Progress)(nil),
 		(*AnalyzeEvent_Repository)(nil),
@@ -3106,16 +3352,20 @@ func file_beholder_worker_v1_worker_proto_init() {
 		(*AnalyzeEvent_Contribution)(nil),
 	}
 	file_beholder_worker_v1_worker_proto_msgTypes[16].OneofWrappers = []any{}
-	file_beholder_worker_v1_worker_proto_msgTypes[24].OneofWrappers = []any{}
+	file_beholder_worker_v1_worker_proto_msgTypes[19].OneofWrappers = []any{}
+	file_beholder_worker_v1_worker_proto_msgTypes[25].OneofWrappers = []any{}
+	file_beholder_worker_v1_worker_proto_msgTypes[26].OneofWrappers = []any{}
 	file_beholder_worker_v1_worker_proto_msgTypes[27].OneofWrappers = []any{}
+	file_beholder_worker_v1_worker_proto_msgTypes[28].OneofWrappers = []any{}
 	file_beholder_worker_v1_worker_proto_msgTypes[29].OneofWrappers = []any{}
+	file_beholder_worker_v1_worker_proto_msgTypes[30].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_beholder_worker_v1_worker_proto_rawDesc), len(file_beholder_worker_v1_worker_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   31,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

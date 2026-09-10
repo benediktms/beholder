@@ -115,7 +115,7 @@ pub(super) fn observations(
                 else {
                     continue;
                 };
-                let evidence = format!("{}:{}", source.path.display(), call.line);
+                let evidence = call.evidence(source.path, None);
                 observations.push(Observation::dependency(
                     id(repository, service_source, service),
                     DependencyRelation::ResolvedBy,

@@ -249,6 +249,8 @@ defmodule Beholder.Worker.V1.SemanticCandidate do
   field :unresolved_to, 5, type: :string, json_name: "unresolvedTo"
   field :span, 6, type: Beholder.Worker.V1.SourceSpan
   field :evidence, 7, type: :string
+  field :range, 8, proto3_optional: true, type: Beholder.V1.SourceRange
+  field :contexts, 9, repeated: true, type: Beholder.V1.EvidenceContext
 end
 
 defmodule Beholder.Worker.V1.SourceSpan do
@@ -324,6 +326,8 @@ defmodule Beholder.Worker.V1.CandidateOverride do
   field :candidate_id, 1, type: :string, json_name: "candidateId"
   field :resolved_to, 2, type: :string, json_name: "resolvedTo"
   field :evidence, 3, type: :string
+  field :range, 4, proto3_optional: true, type: Beholder.V1.SourceRange
+  field :contexts, 5, repeated: true, type: Beholder.V1.EvidenceContext
 end
 
 defmodule Beholder.Worker.V1.AnalysisFailure do
@@ -409,6 +413,8 @@ defmodule Beholder.Worker.V1.Observation do
   field :evidence, 4, type: :string
   field :confidence, 5, type: Beholder.Worker.V1.Confidence, enum: true
   field :provenance, 6, type: Beholder.Worker.V1.Provenance, enum: true
+  field :range, 7, proto3_optional: true, type: Beholder.V1.SourceRange
+  field :contexts, 8, repeated: true, type: Beholder.V1.EvidenceContext
 end
 
 defmodule Beholder.Worker.V1.GrpcBindingCandidate do
@@ -423,6 +429,8 @@ defmodule Beholder.Worker.V1.GrpcBindingCandidate do
   field :evidence, 6, type: :string
   field :confidence, 7, type: Beholder.Worker.V1.Confidence, enum: true
   field :provenance, 8, type: Beholder.Worker.V1.Provenance, enum: true
+  field :range, 9, proto3_optional: true, type: Beholder.V1.SourceRange
+  field :contexts, 10, repeated: true, type: Beholder.V1.EvidenceContext
 end
 
 defmodule Beholder.Worker.V1.AnalysisDiagnostic do
@@ -447,6 +455,8 @@ defmodule Beholder.Worker.V1.DependencyOverride do
   field :evidence, 5, type: :string
   field :confidence, 6, type: Beholder.Worker.V1.Confidence, enum: true
   field :provenance, 7, type: Beholder.Worker.V1.Provenance, enum: true
+  field :range, 8, proto3_optional: true, type: Beholder.V1.SourceRange
+  field :contexts, 9, repeated: true, type: Beholder.V1.EvidenceContext
 end
 
 defmodule Beholder.Worker.V1.GraphqlResolverCandidate do
@@ -458,6 +468,8 @@ defmodule Beholder.Worker.V1.GraphqlResolverCandidate do
   field :parent, 3, proto3_optional: true, type: :string
   field :resolver, 4, type: :string
   field :evidence, 5, type: :string
+  field :range, 6, proto3_optional: true, type: Beholder.V1.SourceRange
+  field :contexts, 7, repeated: true, type: Beholder.V1.EvidenceContext
 end
 
 defmodule Beholder.Worker.V1.RepositoryDiagnostic do

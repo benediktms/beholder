@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	analyzerVersion = "1:typescript-compiler:3"
+	analyzerVersion = "1:typescript-compiler:4"
 	// ponytail: bound exhaustive LSP fan-out; replace with persisted batching when partial enrichment can merge.
 	maxCompilerCandidates = 500
 	maxAnalysisDuration   = 5 * time.Minute
@@ -60,6 +60,7 @@ type analysisSnapshot struct {
 	workspace    string
 	repositories map[string]*repositorySnapshot
 	entities     map[string]bool
+	declarations map[string][]*beholderv1.EvidenceContext
 	candidates   []*workerv1.SemanticCandidate
 }
 
@@ -78,6 +79,11 @@ type documentSymbol struct {
 	SelectionRange lspRange         `json:"selectionRange"`
 	Location       *location        `json:"location"`
 	Children       []documentSymbol `json:"children"`
+}
+
+type matchedDocumentSymbol struct {
+	path   []string
+	range_ lspRange
 }
 
 type lspRange struct {
@@ -241,7 +247,11 @@ func newWorkerTelemetry(flush func(context.Context) error) workerTelemetry {
 }
 
 func receiveSnapshot(stream grpc.BidiStreamingServer[workerv1.AnalyzeRequest, workerv1.AnalyzeEvent]) (*analysisSnapshot, error) {
-	snapshot := &analysisSnapshot{repositories: make(map[string]*repositorySnapshot), entities: make(map[string]bool)}
+	snapshot := &analysisSnapshot{
+		repositories: make(map[string]*repositorySnapshot),
+		entities:     make(map[string]bool),
+		declarations: make(map[string][]*beholderv1.EvidenceContext),
+	}
 	for {
 		request, err := stream.Recv()
 		if err != nil {
@@ -281,6 +291,17 @@ func receiveSnapshot(stream grpc.BidiStreamingServer[workerv1.AnalyzeRequest, wo
 			}
 			snapshot.candidates = append(snapshot.candidates, candidate)
 		case *workerv1.AnalyzeRequest_BaselineObservation:
+			observation := value.BaselineObservation.GetObservation()
+			if observation == nil {
+				return nil, errors.New("baseline observation is missing")
+			}
+			if observation.GetRelation() == beholderv1.RelationKind_RELATION_KIND_DEFINES {
+				for _, evidence := range observation.GetContexts() {
+					if evidence.GetCallableClause().GetRole() == beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_DECLARATION {
+						snapshot.declarations[observation.GetTo()] = append(snapshot.declarations[observation.GetTo()], evidence)
+					}
+				}
+			}
 		case *workerv1.AnalyzeRequest_Finish:
 			if snapshot.workspace == "" {
 				return nil, errors.New("analysis start is missing")
@@ -392,7 +413,7 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 			result.diagnostics = append(result.diagnostics, candidateDiagnostic(code, candidate, fmt.Errorf("compiler returned %d definitions", len(definitions))))
 			continue
 		}
-		resolved, evidence, err := mapDefinition(ctx, c, definitions[0], snapshot)
+		resolved, selectedTarget, err := mapDefinition(ctx, c, definitions[0], snapshot)
 		if err != nil {
 			var requestError compilerRequestError
 			if errors.As(err, &requestError) {
@@ -405,7 +426,17 @@ func analyzeSnapshot(parent context.Context, snapshot *analysisSnapshot, target 
 			continue
 		}
 		cancel()
-		result.overrides = append(result.overrides, &workerv1.CandidateOverride{CandidateId: candidate.GetId(), ResolvedTo: resolved, Evidence: fmt.Sprintf("TypeScript %s definition %s", version, evidence)})
+		contexts := append([]*beholderv1.EvidenceContext(nil), candidate.GetContexts()...)
+		if selectedTarget != nil {
+			contexts = append(contexts, selectedTarget)
+		}
+		result.overrides = append(result.overrides, &workerv1.CandidateOverride{
+			CandidateId: candidate.GetId(),
+			ResolvedTo:  resolved,
+			Evidence:    candidate.GetEvidence(),
+			Range:       candidate.GetRange(),
+			Contexts:    contexts,
+		})
 	}
 	if progress != nil {
 		if err := progress(len(candidates), len(candidates)); err != nil {
@@ -481,36 +512,37 @@ func verifySnapshot(snapshot *analysisSnapshot) error {
 	return nil
 }
 
-func mapDefinition(ctx context.Context, c *client, definition location, snapshot *analysisSnapshot) (string, string, error) {
+func mapDefinition(ctx context.Context, c *client, definition location, snapshot *analysisSnapshot) (string, *beholderv1.EvidenceContext, error) {
 	path, err := pathFromFileURI(definition.URI)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	repository, relative := owningRepository(path, snapshot.repositories)
 	if repository == nil {
-		return "", "", fmt.Errorf("definition is outside the immutable workspace: %s", path)
+		return "", nil, fmt.Errorf("definition is outside the immutable workspace: %s", path)
 	}
 	module, err := moduleID(repository.identity, relative)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	symbols, err := c.documentSymbols(ctx, path)
 	if err != nil {
-		return "", "", compilerRequestError{err}
+		return "", nil, compilerRequestError{err}
 	}
-	if names := symbolPath(symbols, definition.Range.Start, nil); len(names) > 0 {
-		id := module + "/" + strings.Join(names, "/")
+	if matched := matchDocumentSymbol(symbols, definition.Range.Start, nil); matched != nil {
+		id := module + "/" + strings.Join(matched.path, "/")
 		if snapshot.entities[id] {
-			return id, fmt.Sprintf("%s:%d:%d", relative, definition.Range.Start.Line+1, definition.Range.Start.Character+1), nil
+			selectedTarget, err := selectedTargetContext(snapshot.declarations[id], matched.range_)
+			return id, selectedTarget, err
 		}
 	}
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	name, err := selectedText(content, definition.Range)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	var matches []string
 	for id := range snapshot.entities {
@@ -520,9 +552,41 @@ func mapDefinition(ctx context.Context, c *client, definition location, snapshot
 	}
 	sort.Strings(matches)
 	if len(matches) != 1 {
-		return "", "", fmt.Errorf("definition %s has %d canonical entity matches", name, len(matches))
+		return "", nil, fmt.Errorf("definition %s has %d canonical entity matches", name, len(matches))
 	}
-	return matches[0], fmt.Sprintf("%s:%d:%d", relative, definition.Range.Start.Line+1, definition.Range.Start.Character+1), nil
+	return matches[0], nil, nil
+}
+
+func selectedTargetContext(declarations []*beholderv1.EvidenceContext, range_ lspRange) (*beholderv1.EvidenceContext, error) {
+	if range_.Start.Line < 0 || range_.Start.Character < 0 || range_.End.Line < 0 || range_.End.Character < 0 {
+		return nil, errors.New("definition range contains a negative coordinate")
+	}
+	var matched *beholderv1.CallableClauseContext
+	for _, declaration := range declarations {
+		clause := declaration.GetCallableClause()
+		definition := clause.GetDefinitionRange()
+		if definition.GetStart().GetLine() != uint32(range_.Start.Line) ||
+			definition.GetStart().GetCharacter() != uint32(range_.Start.Character) ||
+			definition.GetEnd().GetLine() != uint32(range_.End.Line) ||
+			definition.GetEnd().GetCharacter() != uint32(range_.End.Character) {
+			continue
+		}
+		if matched != nil {
+			return nil, nil
+		}
+		matched = clause
+	}
+	if matched == nil {
+		return nil, nil
+	}
+	return &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{
+			Role:            beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_SELECTED_TARGET,
+			Signature:       matched.GetSignature(),
+			Guard:           matched.Guard,
+			DefinitionRange: matched.GetDefinitionRange(),
+		},
+	}}, nil
 }
 
 func isTypeScriptSource(path string) bool {
@@ -545,21 +609,23 @@ func (c *client) documentSymbols(ctx context.Context, path string) ([]documentSy
 	return symbols, nil
 }
 
-func symbolPath(symbols []documentSymbol, at position, parent []string) []string {
+func matchDocumentSymbol(symbols []documentSymbol, at position, parent []string) *matchedDocumentSymbol {
 	for _, symbol := range symbols {
-		range_ := symbol.SelectionRange
+		selectionRange := symbol.SelectionRange
+		symbolRange := symbol.Range
 		if symbol.Location != nil {
-			range_ = symbol.Location.Range
+			selectionRange = symbol.Location.Range
+			symbolRange = symbol.Location.Range
 		}
 		path := append(append([]string(nil), parent...), symbol.Name)
-		if child := symbolPath(symbol.Children, at, path); len(child) > 0 {
+		if child := matchDocumentSymbol(symbol.Children, at, path); child != nil {
 			return child
 		}
-		if range_.Start == at {
+		if selectionRange.Start == at {
 			if symbol.ContainerName != "" {
-				return append(strings.Split(symbol.ContainerName, "."), symbol.Name)
+				path = append(strings.Split(symbol.ContainerName, "."), symbol.Name)
 			}
-			return path
+			return &matchedDocumentSymbol{path: path, range_: symbolRange}
 		}
 	}
 	return nil

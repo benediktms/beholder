@@ -3,8 +3,8 @@ use super::model::*;
 use crate::analyze;
 use beholder_domain::{
     AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyOverride,
-    DependencyRelation, EntityFact, EntityId, EntityKind, Observation, Provenance,
-    SemanticRelation, StructuralRelation,
+    DependencyRelation, EntityFact, EntityId, EntityKind, Evidence, EvidenceContext,
+    EvidencePayload, Observation, Provenance, SemanticRelation, SourceRange, StructuralRelation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, path::Path};
@@ -48,13 +48,37 @@ pub fn observations_from_analysis(
                 format!("{}:{}", path.display(), module.line),
             ));
         }
-        observations.extend(module.functions.iter().map(|function| {
-            Observation::structural(
-                module_id.clone(),
-                StructuralRelation::Defines,
-                format!("{module_id}/{}/{}", function.name, function.arity),
-                format!("{}:{}", path.display(), function.line),
-            )
+        observations.extend(module.functions.iter().flat_map(|function| {
+            let definition_contexts = if function.definition_contexts.is_empty() {
+                vec![None]
+            } else {
+                function.definition_contexts.iter().map(Some).collect()
+            };
+            definition_contexts.into_iter().map(|context| {
+                let (line, range, contexts) = match context {
+                    Some(
+                        context @ EvidenceContext::CallableClause {
+                            definition_range, ..
+                        },
+                    ) => (
+                        definition_range.start.line.saturating_add(1),
+                        Some(definition_range.clone()),
+                        vec![context.clone()],
+                    ),
+                    _ => (
+                        u32::try_from(function.line).unwrap_or(u32::MAX),
+                        None,
+                        Vec::new(),
+                    ),
+                };
+                let evidence = structured_evidence(path, line, range, contexts);
+                Observation::structural(
+                    module_id.clone(),
+                    StructuralRelation::Defines,
+                    format!("{module_id}/{}/{}", function.name, function.arity),
+                    evidence,
+                )
+            })
         }));
         observations.extend(module.callbacks.iter().map(|callback| {
             Observation::structural(
@@ -123,6 +147,22 @@ pub fn observations_from_analysis(
         }
     }
     observations
+}
+
+fn structured_evidence(
+    path: &Path,
+    line: u32,
+    range: Option<SourceRange>,
+    contexts: Vec<EvidenceContext>,
+) -> Evidence {
+    Evidence::structured(EvidencePayload {
+        path: Some(path.display().to_string()),
+        line: Some(line),
+        detail: None,
+        range,
+        contexts,
+    })
+    .expect("tree-sitter emits valid Elixir evidence ranges")
 }
 
 pub fn entities_from_analysis(
@@ -653,7 +693,23 @@ pub fn observations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::SemanticRelation;
+    use beholder_domain::{
+        CallableClauseRole, ConditionArmKind, ConditionConstruct, PatternConstruct,
+        SemanticRelation, SourcePosition,
+    };
+
+    fn range(start: (u32, u32), end: (u32, u32)) -> SourceRange {
+        SourceRange {
+            start: SourcePosition {
+                line: start.0,
+                character: start.1,
+            },
+            end: SourcePosition {
+                line: end.0,
+                character: end.1,
+            },
+        }
+    }
 
     #[test]
     fn emits_typed_source_entities() {
@@ -810,6 +866,61 @@ mod tests {
     }
 
     #[test]
+    fn preserves_capture_occurrence_ranges_and_contexts() {
+        let observations = observations(
+            "example",
+            r#"
+                defmodule Example.Source do
+                  def run(value, items) do
+                    case value do
+                      :case ->
+                        callback = &helper/1
+                        Enum.map(items, callback)
+                      _ -> :ok
+                    end
+
+                    cond do
+                      value == :cond ->
+                        callback = &helper/1
+                        Enum.map(items, callback)
+                  true -> :ok
+                end
+              end
+
+              defp helper(item), do: item
+            end
+            "#,
+            Path::new("lib/source.ex"),
+        )
+        .unwrap();
+        let captures = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example.Source/run/2"
+                    && observation.to.as_str() == "repo://example/elixir/Example.Source/helper/1"
+            })
+            .map(|observation| observation.evidence.decode())
+            .collect::<Vec<_>>();
+
+        assert_eq!(captures.len(), 2);
+        assert!(captures.iter().all(|evidence| evidence.range.is_some()));
+        assert!(matches!(
+            captures[0].contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { .. },
+                EvidenceContext::PatternArm { .. }
+            ]
+        ));
+        assert!(matches!(
+            captures[1].contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { .. },
+                EvidenceContext::ConditionArm { .. }
+            ]
+        ));
+    }
+
+    #[test]
     fn prefers_exact_calls_over_earlier_capture_evidence() {
         let observations = observations(
             "example",
@@ -826,7 +937,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(call.confidence, Confidence::Exact);
-        assert_eq!(call.evidence.as_str(), "lib/source.ex:4");
+        let evidence = call.evidence.decode();
+        assert_eq!(evidence.path.as_deref(), Some("lib/source.ex"));
+        assert_eq!(evidence.line, Some(4));
     }
 
     #[test]
@@ -1011,7 +1124,14 @@ mod tests {
             .map(|observation| observation.to.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            functions,
+            functions
+                .iter()
+                .filter(|function| function.ends_with("/create_payment/2"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            functions.into_iter().collect::<BTreeSet<_>>(),
             vec![
                 "repo://payments/elixir/MyApp.Payments/create_payment/2",
                 "repo://payments/elixir/MyApp.Payments/normalize/0",
@@ -1019,6 +1139,8 @@ mod tests {
                 "repo://payments/elixir/MyApp.Payments/lookup/1",
                 "repo://payments/elixir/MyApp.Payments/lookup/2",
             ]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -1234,7 +1356,9 @@ mod tests {
             observation.from.as_str() == "repo://payments/elixir/MyApp.Consumer/generated/1"
                 && observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
                 && observation.to.as_str() == "repo://payments/elixir/MyApp.Backend/work/1"
-                && observation.evidence.as_str() == "lib/my_app/server_macro.ex:6"
+                && observation.evidence.decode().path.as_deref()
+                    == Some("lib/my_app/server_macro.ex")
+                && observation.evidence.decode().line == Some(6)
                 && observation.provenance == Provenance::Generated
         }));
     }
@@ -1498,6 +1622,155 @@ end
                 "missing or duplicated {from} {relation} {to} at {evidence}"
             );
         }
+    }
+
+    #[test]
+    fn preserves_clause_definitions_and_every_call_occurrence() {
+        let source = "defmodule Example do\n  def run(value) when is_integer(value) do\n    first(value); first(value)\n  end\n  def run(_), do: fallback()\n  def unicode do\n    \"💡\"; first()\n  end\nend\n";
+        let analysis = analyze(source).unwrap();
+        let path = Path::new("lib/example.ex");
+        let observations = observations_from_analysis("example", &analysis, source, path);
+        let function_id = "repo://example/elixir/Example/run/1";
+
+        let definitions = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example"
+                    && observation.to.as_str() == function_id
+            })
+            .map(|observation| observation.evidence.decode())
+            .collect::<Vec<_>>();
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(
+            entities_from_analysis("example", &analysis, path)
+                .iter()
+                .filter(|entity| entity.id.as_str() == function_id)
+                .count(),
+            1
+        );
+        assert!(definitions.iter().any(|evidence| {
+            evidence.range == Some(range((1, 2), (3, 5)))
+                && matches!(
+                    evidence.contexts.as_slice(),
+                    [EvidenceContext::CallableClause {
+                        role: CallableClauseRole::Declaration,
+                        signature,
+                        guard: Some(guard),
+                        definition_range,
+                    }] if signature.text == "run(value) when is_integer(value)"
+                        && signature.range == range((1, 6), (1, 39))
+                        && guard.text == "is_integer(value)"
+                        && guard.range == range((1, 22), (1, 39))
+                        && *definition_range == range((1, 2), (3, 5))
+                )
+        }));
+
+        let repeated = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == function_id
+                    && observation.to.as_str() == "elixir-call://first/1"
+            })
+            .map(|observation| observation.evidence.decode())
+            .collect::<Vec<_>>();
+        assert_eq!(repeated.len(), 2);
+        assert_eq!(repeated[0].range, Some(range((2, 4), (2, 16))));
+        assert_eq!(repeated[1].range, Some(range((2, 18), (2, 30))));
+        assert!(repeated.iter().all(|evidence| matches!(
+            evidence.contexts.as_slice(),
+            [EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                ..
+            }]
+        )));
+
+        let unicode = observations
+            .iter()
+            .find(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example/unicode/0"
+                    && observation.to.as_str() == "elixir-call://first/0"
+            })
+            .unwrap()
+            .evidence
+            .decode();
+        assert_eq!(unicode.range, Some(range((6, 10), (6, 17))));
+    }
+
+    #[test]
+    fn extracts_nested_case_and_cond_without_context_on_selecting_calls() {
+        let source = "defmodule Example do\n  def decide(value) do\n    case choose(value) do\n      {:ok, item} when valid?(item) ->\n        cond do\n          ready?(item) -> consume(item)\n          true -> fallback()\n        end\n      _ -> fallback()\n    end\n  end\nend\n";
+        let observations = observations("example", source, Path::new("lib/example.ex")).unwrap();
+        let calls = observations
+            .iter()
+            .filter(|observation| {
+                observation.from.as_str() == "repo://example/elixir/Example/decide/1"
+                    && observation.relation
+                        == SemanticRelation::Dependency(DependencyRelation::Calls)
+            })
+            .collect::<Vec<_>>();
+
+        let contexts_for = |target: &str, line: u32| {
+            calls
+                .iter()
+                .find(|observation| {
+                    observation.to.as_str() == target
+                        && observation.evidence.decode().line == Some(line)
+                })
+                .unwrap()
+                .evidence
+                .decode()
+                .contexts
+        };
+        assert_eq!(contexts_for("elixir-call://choose/1", 3).len(), 1);
+        assert_eq!(contexts_for("elixir-call://valid?/1", 4).len(), 1);
+
+        let ready = contexts_for("elixir-call://ready?/1", 6);
+        assert_eq!(ready.len(), 2);
+        assert!(matches!(
+            &ready[1],
+            EvidenceContext::PatternArm {
+                construct: PatternConstruct::Case,
+                selector: Some(selector),
+                pattern: Some(pattern),
+                guard: Some(guard),
+                is_default: false,
+                arm_range,
+            } if selector.text == "choose(value)"
+                && selector.range == range((2, 9), (2, 22))
+                && pattern.text == "{:ok, item}"
+                && pattern.range == range((3, 6), (3, 17))
+                && guard.text == "valid?(item)"
+                && guard.range == range((3, 23), (3, 35))
+                && *arm_range == range((3, 38), (7, 11))
+        ));
+
+        let consume = contexts_for("elixir-call://consume/1", 6);
+        assert_eq!(consume.len(), 3);
+        assert!(matches!(
+            &consume[2],
+            EvidenceContext::ConditionArm {
+                construct: ConditionConstruct::Cond,
+                arm: ConditionArmKind::Clause,
+                condition: Some(condition),
+                arm_range,
+            } if condition.text == "ready?(item)"
+                && condition.range == range((5, 10), (5, 22))
+                && *arm_range == range((5, 26), (5, 39))
+        ));
+
+        let outer_default = contexts_for("elixir-call://fallback/0", 9);
+        assert_eq!(outer_default.len(), 2);
+        assert!(matches!(
+            &outer_default[1],
+            EvidenceContext::PatternArm {
+                is_default: false,
+                pattern: Some(pattern),
+                arm_range,
+                ..
+            } if pattern.text == "_"
+                && pattern.range == range((8, 6), (8, 7))
+                && *arm_range == range((8, 11), (9, 0))
+        ));
     }
 
     #[test]

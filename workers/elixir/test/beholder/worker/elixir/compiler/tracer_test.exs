@@ -51,6 +51,29 @@ defmodule Beholder.Worker.Elixir.Compiler.TracerTest do
     assert Collector.drain() == []
   end
 
+  test "retains same-target events at distinct source coordinates" do
+    {:ok, collector} = Collector.start_link()
+
+    on_exit(fn ->
+      if Process.alive?(collector), do: GenServer.stop(collector)
+    end)
+
+    base = %{
+      kind: :local_function,
+      file: "lib/example.ex",
+      caller_module: "Example",
+      caller_function: {"run", 0},
+      from_macro: false,
+      name: "same",
+      arity: 0
+    }
+
+    Collector.record(Map.merge(base, %{line: 2, column: 5}))
+    Collector.record(Map.merge(base, %{line: 2, column: 13}))
+
+    assert Collector.drain() |> Enum.map(& &1.column) |> Enum.sort() == [5, 13]
+  end
+
   defp inspect_module(module) do
     module |> Atom.to_string() |> String.trim_leading("Elixir.")
   end

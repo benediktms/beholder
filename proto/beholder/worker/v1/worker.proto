@@ -126,6 +126,8 @@ message SemanticCandidate {
   string unresolved_to = 5;
   SourceSpan span = 6;
   string evidence = 7;
+  optional beholder.v1.SourceRange range = 8;
+  repeated beholder.v1.EvidenceContext contexts = 9;
 }
 
 message SourceSpan {
@@ -183,6 +185,8 @@ message CandidateOverride {
   string candidate_id = 1;
   string resolved_to = 2;
   string evidence = 3;
+  optional beholder.v1.SourceRange range = 4;
+  repeated beholder.v1.EvidenceContext contexts = 5;
 }
 
 message AnalysisFailure {
@@ -240,6 +244,8 @@ message Observation {
   string evidence = 4;
   Confidence confidence = 5;
   Provenance provenance = 6;
+  optional beholder.v1.SourceRange range = 7;
+  repeated beholder.v1.EvidenceContext contexts = 8;
 }
 
 message GrpcBindingCandidate {
@@ -251,6 +257,8 @@ message GrpcBindingCandidate {
   string evidence = 6;
   Confidence confidence = 7;
   Provenance provenance = 8;
+  optional beholder.v1.SourceRange range = 9;
+  repeated beholder.v1.EvidenceContext contexts = 10;
 }
 
 enum GrpcBindingRole {
@@ -275,6 +283,8 @@ message DependencyOverride {
   string evidence = 5;
   Confidence confidence = 6;
   Provenance provenance = 7;
+  optional beholder.v1.SourceRange range = 8;
+  repeated beholder.v1.EvidenceContext contexts = 9;
 }
 
 message GraphqlResolverCandidate {
@@ -283,6 +293,8 @@ message GraphqlResolverCandidate {
   optional string parent = 3;
   string resolver = 4;
   string evidence = 5;
+  optional beholder.v1.SourceRange range = 6;
+  repeated beholder.v1.EvidenceContext contexts = 7;
 }
 
 message RepositoryDiagnostic {

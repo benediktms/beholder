@@ -1,14 +1,285 @@
 use super::model::*;
 use beholder_adapters_treesitter::recover;
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, EntityFact, EntityKind, Observation,
-    Provenance, StructuralRelation, UnsafeTreeRecovery,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, CallableClauseRole, EntityFact, EntityKind,
+    EvidenceContext, Observation, PatternConstruct, Provenance, SourceExcerpt, SourcePosition,
+    SourceRange, StructuralRelation, UnsafeTreeRecovery,
 };
 use std::{collections::BTreeMap, error::Error, path::Path};
 use tree_sitter::{Node, Parser};
 
 fn text<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
     node.utf8_text(source).ok()
+}
+
+fn byte_position(source: &[u8], byte: usize) -> SourcePosition {
+    let prefix = std::str::from_utf8(&source[..byte]).expect("C# source is valid UTF-8");
+    let line_start = prefix.rfind('\n').map_or(0, |newline| newline + 1);
+    SourcePosition {
+        line: u32::try_from(
+            prefix[..line_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count(),
+        )
+        .unwrap_or(u32::MAX),
+        character: u32::try_from(prefix[line_start..].encode_utf16().count()).unwrap_or(u32::MAX),
+    }
+}
+
+fn byte_range(source: &[u8], start: usize, end: usize) -> SourceRange {
+    SourceRange {
+        start: byte_position(source, start),
+        end: byte_position(source, end),
+    }
+}
+
+fn source_position(node: Node<'_>, source: &[u8], end: bool) -> SourcePosition {
+    let (byte, point) = if end {
+        (node.end_byte(), node.end_position())
+    } else {
+        (node.start_byte(), node.start_position())
+    };
+    let line_start = byte.saturating_sub(point.column);
+    SourcePosition {
+        line: u32::try_from(point.row).unwrap_or(u32::MAX),
+        character: u32::try_from(
+            std::str::from_utf8(&source[line_start..byte])
+                .map(|text| text.encode_utf16().count())
+                .unwrap_or(point.column),
+        )
+        .unwrap_or(u32::MAX),
+    }
+}
+
+fn source_range(node: Node<'_>, source: &[u8]) -> SourceRange {
+    SourceRange {
+        start: source_position(node, source, false),
+        end: source_position(node, source, true),
+    }
+}
+
+fn source_excerpt(node: Node<'_>, source: &[u8]) -> Option<SourceExcerpt> {
+    Some(SourceExcerpt {
+        text: text(node, source)?.into(),
+        range: source_range(node, source),
+    })
+}
+
+fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+fn first_non_comment_child(node: Node<'_>) -> Option<Node<'_>> {
+    node.named_children(&mut node.walk())
+        .find(|child| child.kind() != "comment")
+}
+
+fn callable_context(
+    definition: Node<'_>,
+    source: &[u8],
+    role: CallableClauseRole,
+) -> Option<EvidenceContext> {
+    let body = definition.child_by_field_name("body");
+    let signature_end = body.map_or_else(|| definition.end_byte(), |body| body.start_byte());
+    let signature_end = text(definition, source)?
+        .get(..signature_end.saturating_sub(definition.start_byte()))?
+        .trim_end()
+        .len()
+        + definition.start_byte();
+    Some(EvidenceContext::CallableClause {
+        role,
+        signature: SourceExcerpt {
+            text: std::str::from_utf8(&source[definition.start_byte()..signature_end])
+                .ok()?
+                .into(),
+            range: byte_range(source, definition.start_byte(), signature_end),
+        },
+        guard: None,
+        definition_range: source_range(definition, source),
+    })
+}
+
+fn pattern_contexts(selection: Node<'_>, call: Node<'_>, source: &[u8]) -> Vec<EvidenceContext> {
+    let (construct, selector, arm_kind) = match selection.kind() {
+        "switch_statement" => (
+            PatternConstruct::SwitchStatement,
+            selection.child_by_field_name("value"),
+            "switch_section",
+        ),
+        "switch_expression" => (
+            PatternConstruct::SwitchExpression,
+            selection
+                .named_children(&mut selection.walk())
+                .find(|child| child.kind() != "switch_expression_arm"),
+            "switch_expression_arm",
+        ),
+        _ => return Vec::new(),
+    };
+    let Some(selector) = selector else {
+        return Vec::new();
+    };
+    if contains(selector, call) {
+        return Vec::new();
+    }
+    let mut ancestor = call.parent();
+    let arm = loop {
+        let Some(candidate) = ancestor else {
+            return Vec::new();
+        };
+        let belongs_to_selection = match construct {
+            PatternConstruct::SwitchStatement => candidate
+                .parent()
+                .and_then(|body| body.parent())
+                .is_some_and(|parent| parent == selection),
+            PatternConstruct::SwitchExpression => candidate.parent() == Some(selection),
+            _ => false,
+        };
+        if candidate.kind() == arm_kind && belongs_to_selection {
+            break candidate;
+        }
+        if candidate == selection {
+            return Vec::new();
+        }
+        ancestor = candidate.parent();
+    };
+    let label_context = |label: Node<'_>, arm_range: SourceRange| {
+        let is_default = label
+            .children(&mut label.walk())
+            .any(|child| child.kind() == "default");
+        let pattern = if is_default {
+            None
+        } else {
+            first_non_comment_child(label)
+        };
+        let guard_clause = label
+            .named_children(&mut label.walk())
+            .find(|child| child.kind() == "when_clause");
+        let guard = guard_clause.and_then(first_non_comment_child);
+        if pattern.is_some_and(|pattern| contains(pattern, call))
+            || guard_clause.is_some_and(|guard| contains(guard, call))
+        {
+            return None;
+        }
+        Some(EvidenceContext::PatternArm {
+            construct,
+            selector: source_excerpt(selector, source),
+            pattern: pattern.and_then(|pattern| source_excerpt(pattern, source)),
+            guard: guard.and_then(|guard| source_excerpt(guard, source)),
+            is_default,
+            arm_range,
+        })
+    };
+    if construct == PatternConstruct::SwitchExpression {
+        return label_context(arm, source_range(arm, source))
+            .into_iter()
+            .collect();
+    }
+
+    let has_body = |section: Node<'_>| {
+        let is_default = section
+            .children(&mut section.walk())
+            .any(|child| child.kind() == "default");
+        let pattern = (!is_default)
+            .then(|| first_non_comment_child(section))
+            .flatten();
+        section.named_children(&mut section.walk()).any(|child| {
+            Some(child) != pattern && !matches!(child.kind(), "comment" | "when_clause")
+        })
+    };
+    let mut labels = vec![arm];
+    let mut previous = arm.prev_named_sibling();
+    while let Some(section) = previous
+        && section.kind() == "switch_section"
+        && !has_body(section)
+    {
+        labels.push(section);
+        previous = section.prev_named_sibling();
+    }
+    labels.reverse();
+    let arm_range = byte_range(source, labels[0].start_byte(), arm.end_byte());
+    labels
+        .into_iter()
+        .map(|label| label_context(label, arm_range.clone()))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+fn lexical_contexts(
+    call: Node<'_>,
+    definition: Node<'_>,
+    source: &[u8],
+) -> Vec<Vec<EvidenceContext>> {
+    let mut selections = Vec::new();
+    let mut ancestor = call.parent();
+    while let Some(candidate) = ancestor {
+        if candidate == definition {
+            break;
+        }
+        if matches!(
+            candidate.kind(),
+            "lambda_expression" | "anonymous_method_expression"
+        ) && !is_directly_invoked_anonymous_callable(candidate, source)
+        {
+            break;
+        }
+        if matches!(candidate.kind(), "switch_statement" | "switch_expression") {
+            let contexts = pattern_contexts(candidate, call, source);
+            if !contexts.is_empty() {
+                selections.push(contexts);
+            }
+        }
+        ancestor = candidate.parent();
+    }
+    selections.reverse();
+    selections
+        .into_iter()
+        .fold(vec![Vec::new()], |paths, contexts| {
+            paths
+                .into_iter()
+                .flat_map(|path| {
+                    contexts.iter().map(move |context| {
+                        let mut path = path.clone();
+                        path.push(context.clone());
+                        path
+                    })
+                })
+                .collect()
+        })
+}
+
+fn is_directly_invoked_anonymous_callable(callable: Node<'_>, source: &[u8]) -> bool {
+    let mut expression = callable;
+    while let Some(parent) = expression.parent() {
+        match parent.kind() {
+            "parenthesized_expression" => expression = parent,
+            "cast_expression" if parent.child_by_field_name("value") == Some(expression) => {
+                expression = parent;
+            }
+            "postfix_unary_expression"
+                if parent
+                    .child(1)
+                    .is_some_and(|operator| operator.kind() == "!") =>
+            {
+                expression = parent;
+            }
+            _ => break,
+        }
+    }
+    if let Some(member) = expression.parent()
+        && member.kind() == "member_access_expression"
+        && member.child_by_field_name("expression") == Some(expression)
+        && member
+            .child_by_field_name("name")
+            .and_then(|name| text(name, source))
+            == Some("Invoke")
+    {
+        expression = member;
+    }
+    expression.parent().is_some_and(|invocation| {
+        invocation.kind() == "invocation_expression"
+            && invocation.child_by_field_name("function") == Some(expression)
+    })
 }
 
 fn declaration_kind(node: Node<'_>) -> Option<DefinitionKind> {
@@ -148,6 +419,8 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                     type_arguments: type_arguments(function, source),
                     arguments: arguments(node, source),
                     line: node.start_position().row + 1,
+                    range: Some(source_range(node, source)),
+                    contexts: Vec::new(),
                 });
             }
             Some(Call {
@@ -158,6 +431,8 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
                 type_arguments: type_arguments(function, source),
                 arguments: arguments(node, source),
                 line: node.start_position().row + 1,
+                range: Some(source_range(node, source)),
+                contexts: Vec::new(),
             })
         }
         "object_creation_expression" => Some(Call {
@@ -171,21 +446,33 @@ fn call(node: Node<'_>, source: &[u8]) -> Option<Call> {
             type_arguments: Vec::new(),
             arguments: arguments(node, source),
             line: node.start_position().row + 1,
+            range: Some(source_range(node, source)),
+            contexts: Vec::new(),
         }),
         _ => None,
     }
 }
 
-fn collect_calls(node: Node<'_>, source: &[u8], root: Node<'_>, calls: &mut Vec<Call>) {
-    if node != root && declaration_kind(node) == Some(DefinitionKind::Callable) {
+fn collect_calls(
+    node: Node<'_>,
+    source: &[u8],
+    definition: Node<'_>,
+    enclosing: &EvidenceContext,
+    calls: &mut Vec<Call>,
+) {
+    if node != definition && declaration_kind(node) == Some(DefinitionKind::Callable) {
         return;
     }
     if let Some(call) = call(node, source) {
-        calls.push(call);
+        for contexts in lexical_contexts(node, definition, source) {
+            let mut call = call.clone();
+            call.contexts = std::iter::once(enclosing.clone()).chain(contexts).collect();
+            calls.push(call);
+        }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_calls(child, source, root, calls);
+        collect_calls(child, source, definition, enclosing, calls);
     }
 }
 
@@ -276,8 +563,9 @@ fn collect_definitions(
     let mut locals = Vec::new();
     if kind == DefinitionKind::Callable
         && let Some(body) = node.child_by_field_name("body")
+        && let Some(enclosing) = callable_context(node, source, CallableClauseRole::Enclosing)
     {
-        collect_calls(body, source, body, &mut calls);
+        collect_calls(body, source, node, &enclosing, &mut calls);
         collect_locals(body, source, body, &mut locals);
     }
     definitions.push(Definition {
@@ -308,6 +596,14 @@ fn collect_definitions(
             .children(&mut node.walk())
             .any(|child| child.kind() == "modifier" && text(child, source) == Some("static")),
         line: node.start_position().row + 1,
+        signature: (kind == DefinitionKind::Callable)
+            .then(|| callable_context(node, source, CallableClauseRole::Declaration))
+            .flatten()
+            .and_then(|context| match context {
+                EvidenceContext::CallableClause { signature, .. } => Some(signature),
+                _ => None,
+            }),
+        definition_range: Some(source_range(node, source)),
         parameters: if kind == DefinitionKind::Callable {
             parameters(node, source)
         } else {
@@ -423,7 +719,7 @@ pub fn observations_from_analysis(
             parent.clone(),
             StructuralRelation::Defines,
             id.clone(),
-            format!("{}:{}", path.display(), definition.line),
+            definition.evidence(path),
         ));
     }
     if is_generated_source(path, source) {
@@ -465,7 +761,23 @@ pub fn entities_from_analysis(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::{Confidence, DependencyRelation, SemanticRelation};
+    use beholder_domain::{
+        CallableClauseRole, Confidence, DependencyRelation, EvidenceContext, PatternConstruct,
+        SemanticRelation, SourcePosition, SourceRange,
+    };
+
+    fn range(start: (u32, u32), end: (u32, u32)) -> SourceRange {
+        SourceRange {
+            start: SourcePosition {
+                line: start.0,
+                character: start.1,
+            },
+            end: SourcePosition {
+                line: end.0,
+                character: end.1,
+            },
+        }
+    }
 
     #[test]
     fn indexes_file_scoped_namespaces_and_same_type_calls() {
@@ -531,6 +843,282 @@ public sealed class Worker
             }),
             "{observations:#?}"
         );
+    }
+
+    #[test]
+    fn attaches_switch_contexts_with_exact_utf16_ranges() {
+        let source = r#"class Demo {
+    int Run(int value) {
+        var result = Pick() switch
+        {
+            0 when Guard() => Zero(),
+            _ => Outer(Transform(value) switch
+            {
+                1 when InnerGuard() => Inner(),
+                Demo.Pattern() => Other()
+            })
+        };
+        switch (Select())
+        {
+            case 1 when Check():
+                One();
+                break;
+            case _:
+                _ = "😀"; Discard();
+                break;
+            default:
+                Default();
+                break;
+        }
+        return result;
+    }
+    int Pick() => 0; bool Guard() => true; int Zero() => 0;
+    int Outer(int value) => value; int Transform(int value) => value;
+    bool InnerGuard() => true; int Inner() => 1; int Other() => 2;
+    int Select() => 0; bool Check() => true; void One() {}
+    static int Pattern() => 1; void Discard() {} void Default() {}
+}"#;
+        let analysis = analyze(source).unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "Demo/Run(int)")
+            .unwrap();
+        let call = |name: &str| run.calls.iter().find(|call| call.name == name).unwrap();
+
+        for excluded in ["Pick", "Guard", "Select", "Check"] {
+            assert!(matches!(
+                call(excluded).contexts.as_slice(),
+                [EvidenceContext::CallableClause {
+                    role: CallableClauseRole::Enclosing,
+                    ..
+                }]
+            ));
+        }
+        for outer_only in ["Transform", "InnerGuard", "Pattern"] {
+            assert!(matches!(
+                call(outer_only).contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause {
+                        role: CallableClauseRole::Enclosing,
+                        ..
+                    },
+                    EvidenceContext::PatternArm {
+                        construct: PatternConstruct::SwitchExpression,
+                        pattern: Some(pattern),
+                        ..
+                    }
+                ] if pattern.text == "_"
+            ));
+        }
+
+        let inner = call("Inner");
+        assert_eq!(inner.range, Some(range((7, 39), (7, 46))));
+        assert!(
+            matches!(
+                inner.contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause {
+                        role: CallableClauseRole::Enclosing,
+                        signature,
+                        ..
+                    },
+                    EvidenceContext::PatternArm {
+                        construct: PatternConstruct::SwitchExpression,
+                        selector: Some(selector),
+                        pattern: Some(pattern),
+                        is_default: false,
+                        ..
+                    },
+                    EvidenceContext::PatternArm {
+                        construct: PatternConstruct::SwitchExpression,
+                        selector: Some(inner_selector),
+                        pattern: Some(inner_pattern),
+                        is_default: false,
+                        ..
+                    }
+                ] if signature.text == "int Run(int value)"
+                    && signature.range == range((1, 4), (1, 22))
+                    && selector.text == "Pick()"
+                    && pattern.text == "_"
+                && inner_selector.text == "Transform(value)"
+                    && inner_pattern.text == "1"
+            ),
+            "{:#?}",
+            inner.contexts
+        );
+
+        let discard = call("Discard");
+        assert_eq!(discard.range, Some(range((17, 26), (17, 35))));
+        assert!(matches!(
+            &discard.contexts[1],
+            EvidenceContext::PatternArm {
+                construct: PatternConstruct::SwitchStatement,
+                selector: Some(selector),
+                pattern: Some(pattern),
+                guard: None,
+                is_default: false,
+                arm_range,
+            } if selector.text == "Select()"
+                && pattern.text == "_"
+                && *arm_range == range((16, 12), (18, 22))
+        ));
+        assert!(matches!(
+            &call("Default").contexts[1],
+            EvidenceContext::PatternArm {
+                construct: PatternConstruct::SwitchStatement,
+                pattern: None,
+                is_default: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &call("Zero").contexts[1],
+            EvidenceContext::PatternArm {
+                guard: Some(guard),
+                arm_range,
+                ..
+            } if guard.text == "Guard()" && *arm_range == range((4, 12), (4, 36))
+        ));
+    }
+
+    #[test]
+    fn preserves_stacked_switch_labels_as_alternative_evidence() {
+        let source = r#"class Demo {
+    void Run(int value) {
+        switch (value) {
+            case /* before pattern */ 1:
+            case /* before pattern */ 2 when /* inside guard */ Second():
+                Hit();
+                break;
+        }
+    }
+    bool Second() => true;
+    void Hit() {}
+}"#;
+        let analysis = analyze(source).unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "Demo/Run(int)")
+            .unwrap();
+
+        let hits = run
+            .calls
+            .iter()
+            .filter(|call| call.name == "Hit")
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 2);
+        let labels = hits
+            .iter()
+            .map(|call| match &call.contexts[1] {
+                EvidenceContext::PatternArm {
+                    pattern: Some(pattern),
+                    guard,
+                    arm_range,
+                    ..
+                } => (
+                    pattern.text.as_str(),
+                    guard.as_ref().map(|guard| guard.text.as_str()),
+                    arm_range,
+                ),
+                context => panic!("expected switch label context, got {context:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labels[0].0, "1");
+        assert_eq!(labels[0].1, None);
+        assert_eq!(labels[1].0, "2");
+        assert_eq!(labels[1].1, Some("Second()"));
+        assert_eq!(labels[0].2, labels[1].2);
+        assert_eq!(*labels[0].2, range((3, 12), (6, 22)));
+        assert!(matches!(
+            run.calls
+                .iter()
+                .find(|call| call.name == "Second")
+                .unwrap()
+                .contexts
+                .as_slice(),
+            [EvidenceContext::CallableClause { .. }]
+        ));
+    }
+
+    #[test]
+    fn switch_contexts_stop_at_anonymous_callable_boundaries() {
+        let source = r#"class Demo {
+    void Run(int value) {
+        switch (value) {
+            case 1:
+                var lambda = () => value switch { 2 => LambdaHit(), _ => LambdaFallback() };
+                var anonymous = delegate { var result = value switch { 3 => DelegateHit(), _ => DelegateFallback() }; };
+                break;
+        }
+    }
+    void LambdaHit() {} void LambdaFallback() {}
+    void DelegateHit() {} void DelegateFallback() {}
+}"#;
+        let analysis = analyze(source).unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "Demo/Run(int)")
+            .unwrap();
+
+        for name in [
+            "LambdaHit",
+            "LambdaFallback",
+            "DelegateHit",
+            "DelegateFallback",
+        ] {
+            let call = run.calls.iter().find(|call| call.name == name).unwrap();
+            assert_eq!(
+                call.contexts
+                    .iter()
+                    .filter(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+                    .count(),
+                1,
+                "{name}: {call:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_switch_context_for_directly_invoked_anonymous_callables() {
+        let source = r#"class Demo {
+    object Run(int value) => value switch {
+        1 => ((System.Func<int>)(() => LambdaHit()))(),
+        2 => ((System.Func<int>)delegate { return DelegateHit(); })(),
+        3 => ((System.Func<int>)(() => ExplicitInvokeHit())).Invoke(),
+        4 => ((System.Func<int>)(() => NullForgivenHit()))!(),
+        _ => (System.Func<int>)(() => Deferred())
+    };
+    int LambdaHit() => 1;
+    int DelegateHit() => 2;
+    int ExplicitInvokeHit() => 3;
+    int NullForgivenHit() => 4;
+    int Deferred() => 3;
+}"#;
+        let analysis = analyze(source).unwrap();
+        let run = analysis
+            .definitions
+            .iter()
+            .find(|definition| definition.qualified_name == "Demo/Run(int)")
+            .unwrap();
+        let switch_contexts = |name| {
+            run.calls
+                .iter()
+                .find(|call| call.name == name)
+                .unwrap()
+                .contexts
+                .iter()
+                .filter(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+                .count()
+        };
+
+        assert_eq!(switch_contexts("LambdaHit"), 1);
+        assert_eq!(switch_contexts("DelegateHit"), 1);
+        assert_eq!(switch_contexts("ExplicitInvokeHit"), 1);
+        assert_eq!(switch_contexts("NullForgivenHit"), 1);
+        assert_eq!(switch_contexts("Deferred"), 0);
     }
 
     #[test]

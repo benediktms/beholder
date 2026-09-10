@@ -4,9 +4,10 @@ use super::{
 };
 use beholder_adapters_treesitter::{ErrorDisposition, Recovery, RecoveryFailure, recover_with};
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, DependencyRelation, EntityFact, EntityKind,
-    Observation, Provenance, SemanticCandidate, SourcePosition, SourceSpan, StructuralRelation,
-    UnsafeTreeRecovery,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, CallableClauseRole, ConditionArmKind,
+    ConditionConstruct, DependencyRelation, EntityFact, EntityKind, EvidenceContext, Observation,
+    PatternConstruct, Provenance, SemanticCandidate, SourceExcerpt, SourcePosition, SourceRange,
+    SourceSpan, StructuralRelation, UnsafeTreeRecovery,
 };
 use beholder_indexing::{LanguageAnalyzer, SourceRecognitionInput};
 use sha2::{Digest, Sha256};
@@ -31,6 +32,35 @@ fn callable_value(node: Node<'_>) -> bool {
         node.kind(),
         "arrow_function" | "function_expression" | "generator_function"
     )
+}
+
+pub(super) fn deferred_callable(mut node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "arrow_function"
+            | "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "method_definition"
+    ) {
+        return false;
+    }
+    while node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "parenthesized_expression"
+                | "as_expression"
+                | "type_assertion"
+                | "non_null_expression"
+                | "satisfies_expression"
+        )
+    }) {
+        node = node.parent().expect("wrapped callable has a parent");
+    }
+    !node.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node)
+    })
 }
 
 fn is_exported(mut node: Node<'_>) -> bool {
@@ -77,6 +107,138 @@ fn lsp_position(node: Node<'_>, source: &[u8], end: bool) -> Option<SourcePositi
     Some(SourcePosition {
         line: point.row.try_into().ok()?,
         character,
+    })
+}
+
+fn source_range(node: Node<'_>, source: &[u8]) -> Option<SourceRange> {
+    Some(SourceRange {
+        start: lsp_position(node, source, false)?,
+        end: lsp_position(node, source, true)?,
+    })
+}
+
+fn source_excerpt(node: Node<'_>, source: &[u8]) -> Option<SourceExcerpt> {
+    Some(SourceExcerpt {
+        text: text(node, source)?.into(),
+        range: source_range(node, source)?,
+    })
+}
+
+fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+fn ternary_context(ternary: Node<'_>, call: Node<'_>, source: &[u8]) -> Option<EvidenceContext> {
+    let condition = ternary.child_by_field_name("condition")?;
+    if contains(condition, call) {
+        return None;
+    }
+    let consequence = ternary.child_by_field_name("consequence")?;
+    let (arm, body) = if contains(consequence, call) {
+        (ConditionArmKind::Consequence, consequence)
+    } else {
+        let alternative = ternary.child_by_field_name("alternative")?;
+        contains(alternative, call).then_some((ConditionArmKind::Alternative, alternative))?
+    };
+    Some(EvidenceContext::ConditionArm {
+        construct: ConditionConstruct::Ternary,
+        arm,
+        condition: source_excerpt(condition, source),
+        arm_range: source_range(body, source)?,
+    })
+}
+
+fn switch_context(arm: Node<'_>, call: Node<'_>, source: &[u8]) -> Option<EvidenceContext> {
+    let switch = arm.parent()?.parent()?;
+    if switch.kind() != "switch_statement" {
+        return None;
+    }
+    let selector = switch.child_by_field_name("value").map(unparenthesized)?;
+    if contains(selector, call) {
+        return None;
+    }
+    let pattern = arm.child_by_field_name("value");
+    if pattern.is_some_and(|pattern| contains(pattern, call)) {
+        return None;
+    }
+    Some(EvidenceContext::PatternArm {
+        construct: PatternConstruct::SwitchStatement,
+        selector: source_excerpt(selector, source),
+        pattern: pattern.and_then(|pattern| source_excerpt(pattern, source)),
+        guard: None,
+        is_default: arm.kind() == "switch_default",
+        arm_range: source_range(arm, source)?,
+    })
+}
+
+fn lexical_contexts(call: Node<'_>, source: &[u8]) -> Vec<EvidenceContext> {
+    let mut contexts = Vec::new();
+    let mut ancestor = call.parent();
+    while let Some(candidate) = ancestor {
+        if deferred_callable(candidate)
+            || (matches!(
+                candidate.kind(),
+                "field_definition" | "public_field_definition"
+            ) && !candidate
+                .children(&mut candidate.walk())
+                .any(|child| child.kind() == "static")
+                && candidate
+                    .child_by_field_name("value")
+                    .is_some_and(|value| contains(value, call)))
+        {
+            break;
+        }
+        match candidate.kind() {
+            "ternary_expression" => contexts.extend(ternary_context(candidate, call, source)),
+            "switch_case" | "switch_default" => {
+                contexts.extend(switch_context(candidate, call, source));
+            }
+            _ => {}
+        }
+        ancestor = candidate.parent();
+    }
+    contexts.reverse();
+    contexts
+}
+
+fn byte_position(source: &[u8], offset: usize) -> Option<SourcePosition> {
+    let prefix = std::str::from_utf8(source.get(..offset)?).ok()?;
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    Some(SourcePosition {
+        line: line.try_into().ok()?,
+        character: prefix[line_start..]
+            .encode_utf16()
+            .count()
+            .try_into()
+            .ok()?,
+    })
+}
+
+fn callable_context(
+    node: Node<'_>,
+    body: Option<Node<'_>>,
+    source: &[u8],
+    role: CallableClauseRole,
+) -> Option<EvidenceContext> {
+    let signature_end = body.map_or_else(|| node.end_byte(), |body| body.start_byte());
+    let signature_end = text(node, source)?[..signature_end - node.start_byte()]
+        .trim_end()
+        .len()
+        + node.start_byte();
+    Some(EvidenceContext::CallableClause {
+        role,
+        signature: SourceExcerpt {
+            text: std::str::from_utf8(source.get(node.start_byte()..signature_end)?)
+                .ok()?
+                .into(),
+            range: SourceRange {
+                start: lsp_position(node, source, false)?,
+                end: byte_position(source, signature_end)?,
+            },
+        },
+        guard: None,
+        definition_range: source_range(node, source)?,
     })
 }
 
@@ -204,6 +366,8 @@ fn call_target(
         start_character: start.character,
         end_line: end.line,
         end_character: end.character,
+        range: source_range(node, source),
+        contexts: lexical_contexts(node, source),
         scope_start: 0,
         scope_end: 0,
     };
@@ -313,6 +477,7 @@ fn is_collection_boundary(node: Node<'_>, root: Node<'_>) -> bool {
                 | "generator_function_declaration"
                 | "method_definition"
         ) || (matches!(node.kind(), "arrow_function" | "function_expression")
+            && deferred_callable(node)
             && node
                 .parent()
                 .is_none_or(|parent| !matches!(parent.kind(), "arguments" | "return_statement"))))
@@ -1070,7 +1235,6 @@ fn definition(
     if let Some(body) = body {
         collect_calls(body, source, body, &mut calls);
     }
-    collect_decorator_calls(node, source, &mut calls);
     collect_bindings(collection_root, source, collection_root, &mut bindings);
     collect_alias_bindings(
         collection_root,
@@ -1112,12 +1276,24 @@ fn definition(
         base: None,
         return_type,
         exported: is_exported(node),
+        declaration_context: (kind == DefinitionKind::Callable)
+            .then(|| callable_context(node, body, source, CallableClauseRole::Declaration))
+            .flatten(),
     };
     if let Some((_, callbacks)) = callback {
         for callback in callbacks {
             collect_callback_evidence(callback, source, &mut definition);
         }
     }
+    if let Some(body) = body
+        && let Some(enclosing) =
+            callable_context(node, Some(body), source, CallableClauseRole::Enclosing)
+    {
+        for call in &mut definition.calls {
+            call.contexts.insert(0, enclosing.clone());
+        }
+    }
+    collect_decorator_calls(node, source, &mut definition.calls);
     definition
 }
 
@@ -1844,7 +2020,7 @@ pub(super) fn semantics_from_analysis(
             parent.clone(),
             StructuralRelation::Defines,
             id.clone(),
-            format!("{}:{}", path.display(), definition.line),
+            definition.evidence(path),
         ));
         if definition.kind != DefinitionKind::Callable && definition.calls.is_empty() {
             continue;
@@ -1880,7 +2056,7 @@ fn call_semantics(
     call: &Call,
     path: &Path,
 ) -> (Observation, Option<SemanticCandidate>) {
-    let evidence = format!("{}:{}", path.display(), call.line);
+    let evidence = call.evidence(path);
     let observation = Observation::dependency(
         from,
         DependencyRelation::Calls,
@@ -1924,7 +2100,7 @@ fn call_semantics(
             relation: DependencyRelation::Calls,
             unresolved_to: target.into(),
             span,
-            evidence: evidence.into(),
+            evidence,
         }
     });
     (observation, candidate)
@@ -2062,6 +2238,229 @@ mod tests {
         let active = plugins.activate_direct(path);
         let analysis = analyze_with_plugins(source, language, path, &plugins, &active).unwrap();
         observations_from_analysis("example", &analysis, source, path)
+    }
+
+    fn call_evidence<'a>(observations: &'a [Observation], name: &str) -> &'a Observation {
+        observations
+            .iter()
+            .find(|observation| {
+                observation.relation == SemanticRelation::Dependency(DependencyRelation::Calls)
+                    && observation.to.as_str().ends_with(&format!("/{name}"))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn attaches_nested_ternary_contexts_but_not_to_conditions() {
+        let source =
+            "function run() { return check() ? outer() ? nested() : other() : fallback(); }";
+        let observations = observations(source, "src/run.ts");
+
+        let condition = call_evidence(&observations, "check").evidence.decode();
+        assert!(matches!(
+            condition.contexts.as_slice(),
+            [EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                ..
+            }]
+        ));
+        let nested = call_evidence(&observations, "nested").evidence.decode();
+        assert!(matches!(
+            nested.contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { .. },
+                EvidenceContext::ConditionArm {
+                    construct: ConditionConstruct::Ternary,
+                    arm: ConditionArmKind::Consequence,
+                    ..
+                },
+                EvidenceContext::ConditionArm {
+                    construct: ConditionConstruct::Ternary,
+                    arm: ConditionArmKind::Consequence,
+                    ..
+                }
+            ]
+        ));
+        assert!(matches!(
+            &nested.contexts[1],
+            EvidenceContext::ConditionArm {
+                condition: Some(SourceExcerpt { text, .. }),
+                ..
+            } if text == "check()"
+        ));
+    }
+
+    #[test]
+    fn switch_context_excludes_selector_and_patterns_and_owns_fallthrough_body() {
+        let source = r#"function run() {
+            switch (select()) {
+                case pattern():
+                case "known": body(); break;
+                default: fallback();
+            }
+        }"#;
+        let observations = observations(source, "src/run.js");
+
+        for name in ["select", "pattern"] {
+            assert!(
+                !call_evidence(&observations, name)
+                    .evidence
+                    .decode()
+                    .contexts
+                    .iter()
+                    .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+            );
+        }
+        let body = call_evidence(&observations, "body").evidence.decode();
+        assert!(matches!(
+            body.contexts.last(),
+            Some(EvidenceContext::PatternArm {
+                construct: PatternConstruct::SwitchStatement,
+                pattern: Some(SourceExcerpt { text, .. }),
+                is_default: false,
+                ..
+            }) if text == "\"known\""
+        ));
+        assert!(matches!(
+            call_evidence(&observations, "fallback")
+                .evidence
+                .decode()
+                .contexts
+                .last(),
+            Some(EvidenceContext::PatternArm {
+                pattern: None,
+                is_default: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lexical_contexts_stop_at_the_nearest_callable() {
+        let observations = observations(
+            r#"function outer() {
+                switch (select()) {
+                    case "active": {
+                        const nested = function named() { return check() ? inner() : other(); };
+                    }
+                }
+            }"#,
+            "src/run.ts",
+        );
+
+        let inner = call_evidence(&observations, "inner").evidence.decode();
+        assert!(inner.contexts.iter().any(|context| matches!(
+            context,
+            EvidenceContext::ConditionArm {
+                construct: ConditionConstruct::Ternary,
+                ..
+            }
+        )));
+        assert!(
+            !inner
+                .contexts
+                .iter()
+                .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+        );
+    }
+
+    #[test]
+    fn direct_iifes_keep_ternary_contexts() {
+        let observations = observations(
+            r#"function run() {
+                flag() ? (((() => asserted()) as () => void))() : fallback();
+                flag() ? (<(() => void)>(() => cast()))() : fallback();
+                flag() ? (((() => non_null())!))() : fallback();
+                flag() ? ((() => satisfies()) satisfies () => void)() : fallback();
+            }"#,
+            "src/run.ts",
+        );
+        for name in ["asserted", "cast", "non_null", "satisfies"] {
+            assert!(
+                call_evidence(&observations, name)
+                    .evidence
+                    .decode()
+                    .contexts
+                    .iter()
+                    .any(|context| matches!(
+                        context,
+                        EvidenceContext::ConditionArm {
+                            construct: ConditionConstruct::Ternary,
+                            ..
+                        }
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn instance_field_initializers_do_not_inherit_selection_contexts() {
+        let source = r#"function run() {
+            switch (select()) {
+                case 1: class Worker { value = instance(); static fixed = active(); }
+            }
+        }"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let call = |name: &str| {
+            let start = source.find(&format!("{name}()")).unwrap();
+            tree.root_node()
+                .descendant_for_byte_range(start, start + name.len() + 2)
+                .unwrap()
+        };
+
+        assert!(
+            !lexical_contexts(call("instance"), source.as_bytes())
+                .iter()
+                .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+        );
+        assert!(
+            lexical_contexts(call("active"), source.as_bytes())
+                .iter()
+                .any(|context| matches!(context, EvidenceContext::PatternArm { .. }))
+        );
+    }
+
+    #[test]
+    fn local_callback_return_calls_keep_enclosing_callable_context() {
+        let observations = observations(
+            "function helper() {} function build() { const batch = () => helper(); return new Loader(batch); }",
+            "src/run.ts",
+        );
+        let evidence = call_evidence(&observations, "helper").evidence.decode();
+
+        assert!(matches!(
+            evidence.contexts.first(),
+            Some(EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                signature: SourceExcerpt { text, .. },
+                ..
+            }) if text.starts_with("function build()")
+        ));
+    }
+
+    #[test]
+    fn call_ranges_use_utf16_and_keep_same_line_occurrences_distinct() {
+        let source = "function run() { '😀'; yes(); yes(); }";
+        let observations = observations(source, "src/run.ts");
+        let evidence = observations
+            .iter()
+            .filter(|observation| observation.to.as_str().ends_with("/yes"))
+            .map(|observation| observation.evidence.decode())
+            .collect::<Vec<_>>();
+
+        assert_eq!(evidence.len(), 2);
+        assert_ne!(evidence[0].range, evidence[1].range);
+        let first = evidence[0].range.as_ref().unwrap();
+        let byte = source.find("yes()").unwrap();
+        assert_eq!(
+            first.start.character as usize,
+            source[..byte].encode_utf16().count()
+        );
+        assert_eq!(first.end.character - first.start.character, 5);
     }
 
     #[test]
@@ -2646,5 +3045,45 @@ mod tests {
                 relation.as_str()
             );
         }
+        let operation_call = observations
+            .iter()
+            .find(|observation| {
+                observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::CallsGraphql)
+                    && observation.to.as_str() == "graphql-operation://Packages_Detail_Query"
+            })
+            .unwrap();
+        let call_evidence = operation_call.evidence.decode();
+        assert!(call_evidence.range.is_some());
+        assert!(call_evidence.contexts.iter().any(|context| matches!(
+            context,
+            EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                ..
+            }
+        )));
+        let resolver = observations
+            .iter()
+            .find(|observation| {
+                observation.relation
+                    == SemanticRelation::Dependency(DependencyRelation::ResolvedBy)
+                    && observation.to.as_str()
+                        == "repo://example/typescript/src/package-details/GetPackageTemplatePreview/query"
+            })
+            .unwrap();
+        assert!(
+            resolver
+                .evidence
+                .decode()
+                .contexts
+                .iter()
+                .any(|context| matches!(
+                    context,
+                    EvidenceContext::CallableClause {
+                        role: CallableClauseRole::Declaration,
+                        ..
+                    }
+                ))
+        );
     }
 }

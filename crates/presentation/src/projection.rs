@@ -47,7 +47,7 @@ pub(super) fn raw(
             edge.confidence
         );
         for evidence in &edge.evidence {
-            let _ = writeln!(output, "    {}", evidence_label(evidence));
+            let _ = writeln!(output, "    {}", raw_evidence_label(evidence));
         }
     }
     if !paths.is_empty() {
@@ -252,11 +252,28 @@ pub(super) fn symbol_scope(entity: &EntityRef) -> Option<&str> {
 
 pub(super) fn evidence_label(evidence: &EvidenceRef) -> String {
     match (&evidence.path, evidence.line, &evidence.detail) {
-        (Some(path), Some(line), _) => format!("{path}:{line}"),
+        (Some(path), Some(line), Some(detail)) => format!("{path}:{line} · {detail}"),
+        (Some(path), None, Some(detail)) => format!("{path} · {detail}"),
         (Some(path), None, _) => path.clone(),
+        (Some(path), Some(line), _) => format!("{path}:{line}"),
         (_, _, Some(detail)) => detail.clone(),
         _ => format!("{:?}", evidence.source_kind),
     }
+}
+
+fn raw_evidence_label(evidence: &EvidenceRef) -> String {
+    let mut label = evidence_label(evidence);
+    if let Some(range) = &evidence.range {
+        let _ = write!(label, " · range={}", serde_json::to_string(range).unwrap());
+    }
+    if !evidence.contexts.is_empty() {
+        let _ = write!(
+            label,
+            " · contexts={}",
+            serde_json::to_string(&evidence.contexts).unwrap()
+        );
+    }
+    label
 }
 
 pub(super) fn kind_label(kind: EntityKind) -> &'static str {

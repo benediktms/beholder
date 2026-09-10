@@ -1,14 +1,14 @@
 use super::analysis::{
     alias_definitions, arguments, call_target, expand_alias, keyword_value, text,
 };
-use super::model::{ElixirAlias, ElixirAnalysis, ElixirModule};
+use super::model::{ElixirAlias, ElixirAnalysis, ElixirFunction, ElixirModule};
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation,
-    GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance, RpcCardinality,
-    SemanticRelation, StructuralRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation, Evidence,
+    EvidenceContext, EvidencePayload, GrpcBindingCandidate, GrpcBindingRole, Observation,
+    Provenance, RpcCardinality, SemanticRelation, StructuralRelation,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use tree_sitter::Node;
 
@@ -282,7 +282,7 @@ fn candidate(
     role: GrpcBindingRole,
     service: &str,
     method: &GrpcMethod,
-    evidence: String,
+    evidence: Evidence,
     confidence: Confidence,
     provenance: Provenance,
 ) -> GrpcBindingCandidate {
@@ -292,9 +292,46 @@ fn candidate(
         service: service.into(),
         method: method.proto_name.clone(),
         cardinality: RpcCardinality::Unary,
-        evidence: evidence.into(),
+        evidence,
         confidence,
         provenance,
+    }
+}
+
+fn declaration_evidence(path: &Path, function: &ElixirFunction) -> Vec<Evidence> {
+    let evidence = function
+        .definition_contexts
+        .iter()
+        .filter_map(|context| {
+            let EvidenceContext::CallableClause {
+                definition_range, ..
+            } = context
+            else {
+                return None;
+            };
+            Evidence::structured(EvidencePayload {
+                path: Some(path.display().to_string()),
+                line: Some(definition_range.start.line.saturating_add(1)),
+                detail: None,
+                range: Some(definition_range.clone()),
+                contexts: vec![context.clone()],
+            })
+            .ok()
+        })
+        .collect::<Vec<_>>();
+    if evidence.is_empty() {
+        vec![
+            Evidence::structured(EvidencePayload {
+                path: Some(path.display().to_string()),
+                line: u32::try_from(function.line).ok(),
+                detail: None,
+                range: None,
+                contexts: Vec::new(),
+            })
+            .expect("Elixir declaration lines fit structured evidence"),
+        ]
+    } else {
+        evidence
     }
 }
 
@@ -410,7 +447,7 @@ pub fn bindings(
         .collect::<BTreeMap<_, _>>();
     let mut candidates = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut emitted = BTreeSet::new();
+    let mut emitted = HashSet::new();
 
     for (path, analysis) in sources {
         for module in &analysis.modules {
@@ -451,7 +488,11 @@ pub fn bindings(
                         .iter()
                         .find(|method| method.elixir_name == function.name)
                 {
-                    bindings.push((GrpcBindingRole::Server, service, method, function.line));
+                    bindings.extend(
+                        declaration_evidence(path, function)
+                            .into_iter()
+                            .map(|evidence| (GrpcBindingRole::Server, service, method, evidence)),
+                    );
                 }
                 if let Some(service_module) = wrapper_service
                     && let Some(service) = services.get(service_module)
@@ -460,7 +501,11 @@ pub fn bindings(
                             method.elixir_name == function.name.trim_end_matches('!')
                         })
                 {
-                    bindings.push((GrpcBindingRole::Client, service, method, function.line));
+                    bindings.extend(
+                        declaration_evidence(path, function)
+                            .into_iter()
+                            .map(|evidence| (GrpcBindingRole::Client, service, method, evidence)),
+                    );
                 }
                 for call in &function.calls {
                     let Some(service_module) =
@@ -489,42 +534,47 @@ pub fn bindings(
                         });
                         continue;
                     };
-                    bindings.push((GrpcBindingRole::Client, service, method, call.line));
+                    let evidence = Evidence::structured(EvidencePayload {
+                        path: Some(path.display().to_string()),
+                        line: u32::try_from(call.line).ok(),
+                        detail: None,
+                        range: Some(call.range.clone()),
+                        contexts: call.contexts.clone(),
+                    })
+                    .expect("tree-sitter emits valid Elixir evidence ranges");
+                    bindings.push((GrpcBindingRole::Client, service, method, evidence));
                 }
 
-                for (role, (service, service_path, _), method, line) in bindings {
-                    let key = (
-                        function_id.clone(),
-                        role.as_str(),
-                        service.clone(),
-                        method.proto_name.clone(),
-                    );
-                    if !emitted.insert(key) {
-                        continue;
-                    }
-                    candidates.push(candidate(
+                for (role, (service, service_path, _), method, evidence) in bindings {
+                    let ast_candidate = candidate(
                         &function_id,
                         role,
                         service,
                         method,
-                        format!("{}:{line}", path.display()),
+                        evidence,
                         Confidence::Inferred,
                         Provenance::Ast,
-                    ));
+                    );
+                    if emitted.insert(ast_candidate.clone()) {
+                        candidates.push(ast_candidate);
+                    }
                     if service_path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .is_some_and(|name| name.ends_with(".pb.ex"))
                     {
-                        candidates.push(candidate(
+                        let generated_candidate = candidate(
                             &function_id,
                             role,
                             service,
                             method,
-                            format!("{}:{}", service_path.display(), method.line),
+                            format!("{}:{}", service_path.display(), method.line).into(),
                             Confidence::Exact,
                             Provenance::Generated,
-                        ));
+                        );
+                        if emitted.insert(generated_candidate.clone()) {
+                            candidates.push(generated_candidate);
+                        }
                     }
                 }
             }
@@ -603,6 +653,107 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.local_symbol.as_str().ends_with("/message/0"))
         );
+    }
+
+    #[test]
+    fn preserves_client_call_range_and_contexts() {
+        let (candidates, diagnostics) = resolved(&[
+            ("lib/pricing.pb.ex", SERVICE),
+            (
+                "lib/client.ex",
+                r#"
+                defmodule Pricing.Client do
+                  alias Pricing.V1.PricingService.Stub
+                  def quote(channel, request) do
+                    case request do
+                      nil -> Stub.get_quote(channel, request)
+                      _ -> :skip
+                    end
+                  end
+                end
+                "#,
+            ),
+        ]);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let evidence = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.local_symbol.as_str() == "repo://example/elixir/Pricing.Client/quote/2"
+                    && candidate.provenance == Provenance::Ast
+            })
+            .unwrap()
+            .evidence
+            .decode();
+        assert!(evidence.range.is_some());
+        assert!(matches!(
+            evidence.contexts.as_slice(),
+            [
+                beholder_domain::EvidenceContext::CallableClause { .. },
+                beholder_domain::EvidenceContext::PatternArm {
+                    construct: beholder_domain::PatternConstruct::Case,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn preserves_each_declaration_and_call_occurrence() {
+        let (candidates, diagnostics) = resolved(&[
+            ("lib/pricing.pb.ex", SERVICE),
+            (
+                "lib/server.ex",
+                r#"
+                defmodule Pricing.Server do
+                  alias Pricing.V1.PricingService.Service
+                  use GRPC.Server, service: Service
+                  def get_quote(:first, stream), do: stream
+                  def get_quote(:second, stream), do: stream
+                end
+
+                defmodule Pricing.Client do
+                  alias Pricing.V1.PricingService.Stub
+                  def quote(channel, request) do
+                    case request do
+                      :first -> Stub.get_quote(channel, request)
+                      :second -> Stub.get_quote(channel, request)
+                    end
+                  end
+                end
+                "#,
+            ),
+        ]);
+
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let server = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.local_symbol.as_str()
+                    == "repo://example/elixir/Pricing.Server/get_quote/2"
+                    && candidate.role == GrpcBindingRole::Server
+                    && candidate.provenance == Provenance::Ast
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(server.len(), 2);
+        assert!(server.iter().all(|candidate| matches!(
+            candidate.evidence.decode().contexts.as_slice(),
+            [beholder_domain::EvidenceContext::CallableClause {
+                role: beholder_domain::CallableClauseRole::Declaration,
+                ..
+            }]
+        )));
+
+        let calls = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.local_symbol.as_str() == "repo://example/elixir/Pricing.Client/quote/2"
+                    && candidate.role == GrpcBindingRole::Client
+                    && candidate.provenance == Provenance::Ast
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].evidence, calls[1].evidence);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::{analysis::expand_alias, model::ElixirAnalysis};
+use beholder_domain::{CallableClauseRole, Evidence, EvidenceContext, EvidencePayload};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -51,19 +52,54 @@ pub fn bindings(
                     .get(resolver.owner.as_str())
                     .map(|parents| parents.iter().copied().map(Some).collect::<Vec<_>>())
                     .unwrap_or_else(|| vec![resolver.parent.as_deref()]);
-                for parent in parents {
-                    bindings.push(GraphqlResolverBinding {
-                        field: resolver
-                            .public_field
-                            .clone()
-                            .unwrap_or_else(|| camel_case(&resolver.field)),
-                        parent: parent.map(str::to_owned),
-                        resolver: format!(
-                            "repo://{repository}/elixir/{module}/{}/{}",
-                            resolver.function, resolver.arity
+                let mut evidences = schema_module
+                    .functions
+                    .iter()
+                    .find(|function| {
+                        function.name == resolver.function
+                            && function.arity == resolver.arity
+                            && function.line == resolver.line
+                    })
+                    .into_iter()
+                    .flat_map(|function| &function.definition_contexts)
+                    .filter_map(|context| match context {
+                        context @ EvidenceContext::CallableClause {
+                            role: CallableClauseRole::Declaration,
+                            definition_range,
+                            ..
+                        } => Some(
+                            Evidence::structured(EvidencePayload {
+                                path: Some(path.display().to_string()),
+                                line: Some(definition_range.start.line.saturating_add(1)),
+                                detail: None,
+                                range: Some(definition_range.clone()),
+                                contexts: vec![context.clone()],
+                            })
+                            .expect("tree-sitter emits valid Absinthe resolver ranges")
+                            .as_str()
+                            .to_owned(),
                         ),
-                        evidence: format!("{}:{}", path.display(), resolver.line),
-                    });
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if evidences.is_empty() {
+                    evidences.push(format!("{}:{}", path.display(), resolver.line));
+                }
+                for parent in parents {
+                    for evidence in &evidences {
+                        bindings.push(GraphqlResolverBinding {
+                            field: resolver
+                                .public_field
+                                .clone()
+                                .unwrap_or_else(|| camel_case(&resolver.field)),
+                            parent: parent.map(str::to_owned),
+                            resolver: format!(
+                                "repo://{repository}/elixir/{module}/{}/{}",
+                                resolver.function, resolver.arity
+                            ),
+                            evidence: evidence.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -121,15 +157,27 @@ mod tests {
             "#,
         )
         .unwrap();
+        let bindings = bindings("customer-connect", &[(path, &analysis)]);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].field, "typingSubscription");
+        assert_eq!(bindings[0].parent.as_deref(), Some("Subscription"));
         assert_eq!(
-            bindings("customer-connect", &[(path, &analysis)]),
-            [GraphqlResolverBinding {
-                field: "typingSubscription".into(),
-                parent: Some("Subscription".into()),
-                resolver: "repo://customer-connect/elixir/CustomerConnect.Schema/__absinthe_subscription_typing_subscription_resolver/3".into(),
-                evidence: "lib/schema.ex:7".into(),
-            }]
+            bindings[0].resolver,
+            "repo://customer-connect/elixir/CustomerConnect.Schema/__absinthe_subscription_typing_subscription_resolver/3"
         );
+        let evidence = Evidence::from(bindings[0].evidence.as_str()).decode();
+        assert_eq!(evidence.path.as_deref(), Some("lib/schema.ex"));
+        assert_eq!(evidence.line, Some(7));
+        assert!(matches!(
+            evidence.contexts.as_slice(),
+            [EvidenceContext::CallableClause {
+                role: CallableClauseRole::Declaration,
+                signature,
+                definition_range,
+                ..
+            }] if signature.text == "payload, args, resolution"
+                && evidence.range.as_ref() == Some(definition_range)
+        ));
 
         let observations =
             crate::observations_from_analysis("customer-connect", &analysis, "", path);
@@ -164,15 +212,36 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            bindings("payments", &[(path, &analysis)]),
-            [GraphqlResolverBinding {
-                field: "metadata".into(),
-                parent: Some("PaymentInstrument".into()),
-                resolver: "repo://payments/elixir/PaymentMethod.Schema/__absinthe_payment_method_metadata_resolver/2".into(),
-                evidence: "lib/types/payment_method.ex:5".into(),
-            }]
-        );
+        let bindings = bindings("payments", &[(path, &analysis)]);
+        assert_eq!(bindings.len(), 2);
+        for binding in &bindings {
+            assert_eq!(binding.field, "metadata");
+            assert_eq!(binding.parent.as_deref(), Some("PaymentInstrument"));
+            assert_eq!(
+                binding.resolver,
+                "repo://payments/elixir/PaymentMethod.Schema/__absinthe_payment_method_metadata_resolver/2"
+            );
+        }
+        for (binding, (line, signature)) in bindings
+            .iter()
+            .zip([(6, "%{metadata: nil}, _"), (7, "parent, context")])
+        {
+            let evidence = Evidence::from(binding.evidence.as_str()).decode();
+            assert_eq!(
+                evidence.path.as_deref(),
+                Some("lib/types/payment_method.ex")
+            );
+            assert_eq!(evidence.line, Some(line));
+            assert!(matches!(
+                evidence.contexts.as_slice(),
+                [EvidenceContext::CallableClause {
+                    role: CallableClauseRole::Declaration,
+                    signature: actual,
+                    definition_range,
+                    ..
+                }] if actual.text == signature && evidence.range.as_ref() == Some(definition_range)
+            ));
+        }
         let observations = crate::observations_from_analysis("payments", &analysis, "", path);
         let targets = observations
             .iter()

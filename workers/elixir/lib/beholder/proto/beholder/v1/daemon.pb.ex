@@ -228,6 +228,7 @@ defmodule Beholder.V1.PathTermination do
   field :PATH_TERMINATION_LEAF, 2
   field :PATH_TERMINATION_CYCLE, 3
   field :PATH_TERMINATION_MAX_HOPS, 4
+  field :PATH_TERMINATION_REPOSITORY_BOUNDARY, 5
 end
 
 defmodule Beholder.V1.TruncationReason do
@@ -239,6 +240,51 @@ defmodule Beholder.V1.TruncationReason do
   field :TRUNCATION_REASON_MAX_PATHS, 2
   field :TRUNCATION_REASON_ACQUISITION_LIMIT, 3
   field :TRUNCATION_REASON_WORK_LIMIT, 4
+end
+
+defmodule Beholder.V1.ConditionConstruct do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :CONDITION_CONSTRUCT_UNSPECIFIED, 0
+  field :CONDITION_CONSTRUCT_IF, 1
+  field :CONDITION_CONSTRUCT_COND, 2
+  field :CONDITION_CONSTRUCT_TERNARY, 3
+  field :CONDITION_CONSTRUCT_TEMPLATE_IF, 4
+end
+
+defmodule Beholder.V1.ConditionArmKind do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :CONDITION_ARM_KIND_UNSPECIFIED, 0
+  field :CONDITION_ARM_KIND_THEN, 1
+  field :CONDITION_ARM_KIND_ELSE_IF, 2
+  field :CONDITION_ARM_KIND_ELSE, 3
+  field :CONDITION_ARM_KIND_CLAUSE, 4
+  field :CONDITION_ARM_KIND_CONSEQUENCE, 5
+  field :CONDITION_ARM_KIND_ALTERNATIVE, 6
+end
+
+defmodule Beholder.V1.PatternConstruct do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :PATTERN_CONSTRUCT_UNSPECIFIED, 0
+  field :PATTERN_CONSTRUCT_MATCH, 1
+  field :PATTERN_CONSTRUCT_CASE, 2
+  field :PATTERN_CONSTRUCT_SWITCH_STATEMENT, 3
+  field :PATTERN_CONSTRUCT_SWITCH_EXPRESSION, 4
+end
+
+defmodule Beholder.V1.CallableClauseRole do
+  @moduledoc false
+  use Protobuf, enum: true, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :CALLABLE_CLAUSE_ROLE_UNSPECIFIED, 0
+  field :CALLABLE_CLAUSE_ROLE_DECLARATION, 1
+  field :CALLABLE_CLAUSE_ROLE_ENCLOSING, 2
+  field :CALLABLE_CLAUSE_ROLE_SELECTED_TARGET, 3
 end
 
 defmodule Beholder.V1.ClearCacheRequest do
@@ -318,6 +364,11 @@ defmodule Beholder.V1.SearchEntitiesRequest do
   field :workspace, 1, type: :string
   field :query, 2, type: :string
   field :limit, 3, proto3_optional: true, type: :uint32
+
+  field :include_diagnostics, 4,
+    proto3_optional: true,
+    type: :bool,
+    json_name: "includeDiagnostics"
 end
 
 defmodule Beholder.V1.TraversalEntityRequest do
@@ -356,6 +407,16 @@ defmodule Beholder.V1.QueryMetadata do
   field :freshness, 3, type: Beholder.V1.Freshness
   field :completeness, 4, type: Beholder.V1.AnalysisCompleteness, enum: true
   field :diagnostics, 5, repeated: true, type: Beholder.V1.AnalysisDiagnostic
+  field :diagnostic_counts, 6, type: Beholder.V1.DiagnosticCounts, json_name: "diagnosticCounts"
+end
+
+defmodule Beholder.V1.DiagnosticCounts do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :total, 1, type: :uint64
+  field :known_limitations, 2, type: :uint64, json_name: "knownLimitations"
+  field :warnings, 3, type: :uint64
 end
 
 defmodule Beholder.V1.GetWorkspaceTopologyRequest do
@@ -468,6 +529,8 @@ defmodule Beholder.V1.Evidence do
   field :path, 3, proto3_optional: true, type: :string
   field :line, 4, proto3_optional: true, type: :uint32
   field :detail, 5, proto3_optional: true, type: :string
+  field :range, 6, proto3_optional: true, type: Beholder.V1.SourceRange
+  field :contexts, 7, repeated: true, type: Beholder.V1.EvidenceContext
 end
 
 defmodule Beholder.V1.Edge do
@@ -965,6 +1028,12 @@ defmodule Beholder.V1.TraverseGraphRequest do
   field :destination, 4, proto3_optional: true, type: :string
   field :max_hops, 5, proto3_optional: true, type: :uint32, json_name: "maxHops"
   field :max_paths, 6, proto3_optional: true, type: :uint32, json_name: "maxPaths"
+  field :target_repositories, 7, repeated: true, type: :string, json_name: "targetRepositories"
+
+  field :include_diagnostics, 8,
+    proto3_optional: true,
+    type: :bool,
+    json_name: "includeDiagnostics"
 end
 
 defmodule Beholder.V1.TraverseGraphQuery do
@@ -976,6 +1045,7 @@ defmodule Beholder.V1.TraverseGraphQuery do
   field :destination, 3, proto3_optional: true, type: :string
   field :max_hops, 4, type: :uint32, json_name: "maxHops"
   field :max_paths, 5, type: :uint32, json_name: "maxPaths"
+  field :target_repositories, 6, repeated: true, type: :string, json_name: "targetRepositories"
 end
 
 defmodule Beholder.V1.TraversalPath do
@@ -1017,6 +1087,81 @@ defmodule Beholder.V1.TraverseGraphResponse do
   field :edges, 5, repeated: true, type: Beholder.V1.Edge
   field :paths, 6, repeated: true, type: Beholder.V1.TraversalPath
   field :traversal, 7, type: Beholder.V1.GraphTraversalMetadata
+end
+
+defmodule Beholder.V1.SourcePosition do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :line, 1, type: :uint32
+  field :character, 2, type: :uint32
+end
+
+defmodule Beholder.V1.SourceRange do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :start, 1, type: Beholder.V1.SourcePosition
+  field :end, 2, type: Beholder.V1.SourcePosition
+end
+
+defmodule Beholder.V1.SourceExcerpt do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :text, 1, type: :string
+  field :range, 2, type: Beholder.V1.SourceRange
+end
+
+defmodule Beholder.V1.EvidenceContext do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  oneof :context, 0
+
+  field :condition_arm, 1,
+    type: Beholder.V1.ConditionArmContext,
+    json_name: "conditionArm",
+    oneof: 0
+
+  field :pattern_arm, 2, type: Beholder.V1.PatternArmContext, json_name: "patternArm", oneof: 0
+
+  field :callable_clause, 3,
+    type: Beholder.V1.CallableClauseContext,
+    json_name: "callableClause",
+    oneof: 0
+end
+
+defmodule Beholder.V1.ConditionArmContext do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :construct, 1, type: Beholder.V1.ConditionConstruct, enum: true
+  field :arm, 2, type: Beholder.V1.ConditionArmKind, enum: true
+  field :condition, 3, proto3_optional: true, type: Beholder.V1.SourceExcerpt
+  field :arm_range, 4, type: Beholder.V1.SourceRange, json_name: "armRange"
+end
+
+defmodule Beholder.V1.PatternArmContext do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :construct, 1, type: Beholder.V1.PatternConstruct, enum: true
+  field :selector, 2, proto3_optional: true, type: Beholder.V1.SourceExcerpt
+  field :pattern, 3, proto3_optional: true, type: Beholder.V1.SourceExcerpt
+  field :guard, 4, proto3_optional: true, type: Beholder.V1.SourceExcerpt
+  field :is_default, 5, type: :bool, json_name: "isDefault"
+  field :arm_range, 6, type: Beholder.V1.SourceRange, json_name: "armRange"
+end
+
+defmodule Beholder.V1.CallableClauseContext do
+  @moduledoc false
+  use Protobuf, protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  field :role, 1, type: Beholder.V1.CallableClauseRole, enum: true
+  field :signature, 2, type: Beholder.V1.SourceExcerpt
+  field :guard, 3, proto3_optional: true, type: Beholder.V1.SourceExcerpt
+  field :definition_range, 4, type: Beholder.V1.SourceRange, json_name: "definitionRange"
 end
 
 defmodule Beholder.V1.Daemon.Service do

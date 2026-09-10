@@ -1,5 +1,8 @@
+use beholder_domain::{
+    CallableClauseRole, Evidence, EvidenceContext, EvidencePayload, SourceExcerpt, SourceRange,
+};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RustAnalysis {
@@ -46,13 +49,19 @@ pub(super) struct TonicBinding {
     pub(super) service: String,
     pub(super) method: String,
     pub(super) line: usize,
+    #[serde(default)]
+    pub(super) offset: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct TonicGeneratedMethod {
+    #[serde(default)]
+    pub(super) function: String,
     pub(super) service: String,
     pub(super) method: String,
     pub(super) line: usize,
+    #[serde(default)]
+    pub(super) offset: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -66,6 +75,10 @@ pub struct RustFunction {
     pub(super) line: usize,
     #[serde(default)]
     pub(super) name_offset: usize,
+    #[serde(default)]
+    pub(super) signature: Option<SourceExcerpt>,
+    #[serde(default)]
+    pub(super) definition_range: Option<SourceRange>,
     pub(super) calls: Vec<RustCall>,
 }
 
@@ -93,6 +106,26 @@ impl RustFunction {
     pub fn calls(&self) -> impl Iterator<Item = &RustCall> {
         self.calls.iter()
     }
+
+    pub fn callable_context(&self, role: CallableClauseRole) -> Option<EvidenceContext> {
+        Some(EvidenceContext::CallableClause {
+            role,
+            signature: self.signature.clone()?,
+            guard: None,
+            definition_range: self.definition_range.clone()?,
+        })
+    }
+
+    pub(super) fn evidence(&self, path: &Path, role: CallableClauseRole) -> Evidence {
+        Evidence::structured(EvidencePayload {
+            path: Some(path.to_string_lossy().into_owned()),
+            line: u32::try_from(self.line).ok(),
+            detail: None,
+            range: self.definition_range.clone(),
+            contexts: self.callable_context(role).into_iter().collect(),
+        })
+        .expect("Rust definition evidence ranges are valid")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -102,6 +135,10 @@ pub struct RustCall {
     #[serde(default)]
     pub(super) offset: usize,
     pub(super) receiver_method: bool,
+    #[serde(default)]
+    pub(super) range: Option<SourceRange>,
+    #[serde(default)]
+    pub(super) contexts: Vec<EvidenceContext>,
 }
 
 impl RustCall {
@@ -115,5 +152,16 @@ impl RustCall {
 
     pub fn receiver_method(&self) -> bool {
         self.receiver_method
+    }
+
+    pub fn evidence(&self, path: &Path) -> Evidence {
+        Evidence::structured(EvidencePayload {
+            path: Some(path.to_string_lossy().into_owned()),
+            line: u32::try_from(self.line).ok(),
+            detail: None,
+            range: self.range.clone(),
+            contexts: self.contexts.clone(),
+        })
+        .expect("Rust syntax evidence ranges are valid")
     }
 }

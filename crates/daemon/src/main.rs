@@ -7,7 +7,7 @@ use beholder_adapters_treesitter_rust::RustAnalyzer;
 use beholder_adapters_treesitter_typescript::TypescriptAnalyzer;
 use beholder_daemon_client::{socket_path, state_dir};
 #[cfg(not(test))]
-use beholder_domain::{DependencyRelation, EntityKind, SemanticRelation};
+use beholder_domain::{DependencyRelation, EntityKind, SemanticRelation, StructuralRelation};
 #[cfg(not(test))]
 use beholder_indexing::AnalysisInputKind;
 use beholder_indexing::{Indexer, IndexerBuilder};
@@ -215,7 +215,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         )
         .identity(
             RUST_WORKER_ID,
-            "7:7:rust.tonic:1:rust-analyzer-0.0.348:worker-11",
+            "7:7:rust.tonic:2:rust-analyzer-0.0.348:worker-12",
         )
         .persistent()
         .semantic_shard_producer(RUST_WORKER_ID)
@@ -277,7 +277,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "24:13:elixir-compiler:18")
+        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:19")
         .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
@@ -336,13 +336,14 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:3")
+        .identity(TYPESCRIPT_WORKER_ID, "1:typescript-compiler:4")
         .timeout(std::time::Duration::from_secs(60))
         .memory_limit(TYPESCRIPT_WORKER_MEMORY_LIMIT_BYTES)
         .semantic_shard_producer(TYPESCRIPT_WORKER_ID)
         .semantic_entity(EntityKind::Callable)
         .semantic_entity(EntityKind::Namespace)
         .semantic_relation(SemanticRelation::Dependency(DependencyRelation::Calls))
+        .semantic_relation(SemanticRelation::Structural(StructuralRelation::Defines))
         .accept_extension("ts")
         .accept_extension("tsx")
         .accept_extension("js")
@@ -699,7 +700,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(status.status, "ready");
-        assert_eq!(status.protocol_version, 24);
+        assert_eq!(status.protocol_version, 25);
         assert_eq!(status.pid, std::process::id());
 
         let standalone = state.join("standalone");

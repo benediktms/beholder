@@ -1,3 +1,4 @@
+use beholder_domain::{Evidence, EvidenceContext, EvidencePayload, SourceRange};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -43,11 +44,11 @@ impl SourceLanguage {
 
     pub fn cache_version(self) -> &'static str {
         match self {
-            Self::JavaScript => "21-javascript",
-            Self::Jsx => "22-jsx",
-            Self::Svelte => "1-svelte",
-            Self::TypeScript => "22-typescript",
-            Self::Tsx => "22-tsx",
+            Self::JavaScript => "22-javascript",
+            Self::Jsx => "23-jsx",
+            Self::Svelte => "2-svelte",
+            Self::TypeScript => "23-typescript",
+            Self::Tsx => "23-tsx",
         }
     }
 }
@@ -174,6 +175,17 @@ impl Call {
         self.end_line = 0;
         self.end_character = 0;
     }
+
+    pub(super) fn evidence(&self, path: &Path) -> Evidence {
+        Evidence::structured(EvidencePayload {
+            path: Some(path.to_string_lossy().into_owned()),
+            line: u32::try_from(self.line).ok(),
+            detail: None,
+            range: self.range.clone(),
+            contexts: self.contexts.clone(),
+        })
+        .expect("tree-sitter emits valid JavaScript/TypeScript evidence ranges")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,6 +252,29 @@ pub(super) struct Definition {
     pub(super) base: Option<String>,
     pub(super) return_type: Option<String>,
     pub(super) exported: bool,
+    #[serde(default)]
+    pub(super) declaration_context: Option<EvidenceContext>,
+}
+
+impl Definition {
+    pub(super) fn evidence(&self, path: &Path) -> Evidence {
+        Evidence::structured(EvidencePayload {
+            path: Some(path.to_string_lossy().into_owned()),
+            line: u32::try_from(self.line).ok(),
+            detail: None,
+            range: self
+                .declaration_context
+                .as_ref()
+                .and_then(|context| match context {
+                    EvidenceContext::CallableClause {
+                        definition_range, ..
+                    } => Some(definition_range.clone()),
+                    _ => None,
+                }),
+            contexts: self.declaration_context.clone().into_iter().collect(),
+        })
+        .expect("tree-sitter emits valid JavaScript/TypeScript definition ranges")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -354,6 +389,10 @@ pub(super) struct Call {
     pub(super) end_line: u32,
     #[serde(default)]
     pub(super) end_character: u32,
+    #[serde(default)]
+    pub(super) range: Option<SourceRange>,
+    #[serde(default)]
+    pub(super) contexts: Vec<EvidenceContext>,
     #[serde(default)]
     pub(super) scope_start: usize,
     #[serde(default)]

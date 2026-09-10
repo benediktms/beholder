@@ -27,14 +27,16 @@ cargo build --quiet \
     -p beholder-worker-rust
 
 repository="$state/repository"
-mkdir -p "$repository/src"
+mkdir -p "$repository/src" "$repository/lib"
 printf '[package]\nname = "beholder-mcp-smoke"\nversion = "0.1.0"\nedition = "2024"\n' \
     >"$repository/Cargo.toml"
-printf 'pub fn caller() { helper(); }\npub fn helper() {}\n' >"$repository/src/lib.rs"
+cp "$root/scripts/fixtures/mcp-integration/rust/lib.rs.fixture" "$repository/src/lib.rs"
+cp "$root/scripts/fixtures/mcp-integration/elixir/evidence_fixture.ex.fixture" \
+    "$repository/lib/evidence_fixture.ex"
 git -C "$repository" init -q
 git -C "$repository" config user.name 'Beholder MCP Integration Test'
 git -C "$repository" config user.email 'integration-test@beholder.local'
-git -C "$repository" add Cargo.toml src/lib.rs
+git -C "$repository" add Cargo.toml src/lib.rs lib/evidence_fixture.ex
 git -C "$repository" -c commit.gpgsign=false commit -qm 'Add MCP integration fixture'
 git -C "$repository" remote add origin https://github.com/example/beholder-mcp-smoke.git
 
@@ -81,4 +83,17 @@ if grep -Eq $'\t(Queued|Waiting|Running)\t' <<<"$jobs"; then
 fi
 
 python3 "$root/scripts/mcp-smoke.py" \
+    --repository github.com/example/beholder-mcp-smoke \
+    --evidence-target "$helper" \
     "$root/target/debug/beholder-mcp" mcp-smoke caller "$caller" "$helper"
+
+elixir_module='repo://github.com/example/beholder-mcp-smoke/elixir/EvidenceFixture'
+elixir_caller="$elixir_module/caller/1"
+elixir_helper="$elixir_module/helper/0"
+legacy_dependency='elixir-module://Legacy.Value'
+python3 "$root/scripts/mcp-smoke.py" \
+    --repository github.com/example/beholder-mcp-smoke \
+    --evidence-target "$elixir_helper" \
+    --legacy-target "$legacy_dependency" \
+    "$root/target/debug/beholder-mcp" mcp-smoke caller "$elixir_caller" \
+    "$elixir_helper" "$legacy_dependency"

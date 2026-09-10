@@ -446,3 +446,45 @@ fn decode_source(bytes: &[u8]) -> (Cow<'_, str>, bool) {
 fn hex(key: [u8; 32]) -> String {
     key.into_iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn ignores_the_previous_frontend_cache_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache = std::env::temp_dir().join(format!("beholder-csharp-stale-cache-{unique}"));
+        let stale = cache.join("csharp").join("8");
+        fs::create_dir_all(&stale).unwrap();
+        let path = Path::new("Current.cs");
+        let source = "class Current {}";
+        let mut digest = Sha256::new();
+        for part in [
+            b"8".as_slice(),
+            path.as_os_str().as_encoded_bytes(),
+            source.as_bytes(),
+            b"".as_slice(),
+        ] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part);
+        }
+        fs::write(
+            stale.join(format!("{}.json", hex(digest.finalize().into()))),
+            serde_json::to_vec(&analyze(source).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let analyzer = CsharpAnalyzer::new(cache.clone());
+        assert!(matches!(
+            analyzer.analysis(path, source, ""),
+            Ok((_, CacheStatus::Miss))
+        ));
+
+        fs::remove_dir_all(cache).unwrap();
+    }
+}

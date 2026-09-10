@@ -1,8 +1,8 @@
 defmodule Beholder.Worker.Elixir.EventMapper do
   @moduledoc false
 
+  alias Beholder.Worker.Elixir.{Compiler, SourceIndex}
   alias Beholder.Worker.Elixir.Snapshot.Repository
-  alias Beholder.Worker.Elixir.Compiler
 
   alias Beholder.Worker.V1.{
     AnalysisDiagnostic,
@@ -32,6 +32,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
   @spec contribution(Repository.t(), map()) :: RepositoryContribution.t()
   def contribution(repository, result) do
     source_paths = source_paths(repository)
+    source_index = SourceIndex.build(repository)
     complete = complete?(result)
 
     %RepositoryContribution{
@@ -45,7 +46,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
       diagnostics: diagnostics(repository, result),
       replaced_diagnostic_codes:
         if(complete, do: ["elixir.macro_expansion_incomplete"], else: []),
-      fact_shards: cached_fact_shards(repository, result, source_paths)
+      fact_shards: cached_fact_shards(repository, result, source_paths, source_index)
     }
   end
 
@@ -90,7 +91,8 @@ defmodule Beholder.Worker.Elixir.EventMapper do
   defp cached_fact_shards(
          repository,
          %{changed_events: changed_events, changed_files: changed_files} = result,
-         source_paths
+         source_paths,
+         source_index
        )
        when is_list(changed_events) and is_list(changed_files) do
     key = {repository.identity, Path.expand(repository.base)}
@@ -148,7 +150,14 @@ defmodule Beholder.Worker.Elixir.EventMapper do
       end
 
     {changed_shards, _changed_dependencies} =
-      build_fact_shards(repository, events, definitions, source_paths, impacted_paths)
+      build_fact_shards(
+        repository,
+        events,
+        definitions,
+        source_paths,
+        impacted_paths,
+        source_index
+      )
 
     cached = cached || %{shards: %{}}
 
@@ -165,16 +174,30 @@ defmodule Beholder.Worker.Elixir.EventMapper do
     state.shards |> Map.values() |> Enum.sort_by(& &1.owner)
   end
 
-  defp cached_fact_shards(repository, result, source_paths) do
+  defp cached_fact_shards(repository, result, source_paths, source_index) do
     definitions = definitions(repository, result.events, source_paths)
 
     {shards, _dependencies} =
-      build_fact_shards(repository, result.events, definitions, source_paths, source_paths)
+      build_fact_shards(
+        repository,
+        result.events,
+        definitions,
+        source_paths,
+        source_paths,
+        source_index
+      )
 
     shards |> Map.values() |> Enum.sort_by(& &1.owner)
   end
 
-  defp build_fact_shards(repository, events, definitions, source_paths, included_paths) do
+  defp build_fact_shards(
+         repository,
+         events,
+         definitions,
+         source_paths,
+         included_paths,
+         source_index
+       ) do
     entities_by_path =
       definitions
       |> Enum.filter(fn {_module, {path, _functions}} ->
@@ -209,7 +232,7 @@ defmodule Beholder.Worker.Elixir.EventMapper do
                 end
 
               observations =
-                case observation(repository, event, definitions, source_paths) do
+                case observation(repository, event, definitions, source_paths, source_index) do
                   nil ->
                     observations
 
@@ -231,8 +254,8 @@ defmodule Beholder.Worker.Elixir.EventMapper do
       Map.new(observations_by_path, fn {path, observations} ->
         observations =
           observations
-          |> Enum.uniq_by(&{&1.from, &1.relation, &1.to, &1.evidence})
-          |> Enum.sort_by(&{&1.from, &1.relation, &1.to, &1.evidence})
+          |> Enum.uniq_by(&{&1.from, &1.relation, &1.to, &1.evidence, &1.range, &1.contexts})
+          |> Enum.sort_by(&{&1.from, &1.relation, &1.to, &1.evidence, &1.range, &1.contexts})
 
         {path, observations}
       end)
@@ -306,33 +329,39 @@ defmodule Beholder.Worker.Elixir.EventMapper do
     |> Base.encode16(case: :lower)
   end
 
-  defp observation(repository, event, definitions, source_paths) when event.kind in @call_kinds do
+  defp observation(repository, event, definitions, source_paths, source_index)
+       when event.kind in @call_kinds do
     with from when not is_nil(from) <- caller_id(repository, event, source_paths),
          to when not is_nil(to) <- call_target(repository, event, definitions),
-         evidence when not is_nil(evidence) <- evidence(repository, event, source_paths) do
+         path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
+      occurrence = SourceIndex.occurrence(source_index, path, event)
+      evidence = evidence(path, event, occurrence)
+
       %Observation{
         from: from,
         relation: :RELATION_KIND_CALLS,
         to: to,
         evidence: evidence,
         confidence: confidence(event),
-        provenance: :PROVENANCE_COMPILER
+        provenance: :PROVENANCE_COMPILER,
+        range: occurrence && occurrence.range,
+        contexts: if(occurrence, do: occurrence.contexts, else: [])
       }
     else
       _ -> nil
     end
   end
 
-  defp observation(repository, event, definitions, source_paths) do
+  defp observation(repository, event, definitions, source_paths, _source_index) do
     with relation when not is_nil(relation) <- module_relation(event.kind),
          from when not is_nil(from) <- caller_id(repository, event, source_paths),
          target when is_binary(target) <- event.target,
-         evidence when not is_nil(evidence) <- evidence(repository, event, source_paths) do
+         path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
       %Observation{
         from: from,
         relation: relation,
         to: module_target(repository.identity, target, definitions),
-        evidence: evidence,
+        evidence: evidence(path, event, nil),
         confidence: confidence(event),
         provenance: :PROVENANCE_COMPILER
       }
@@ -396,10 +425,21 @@ defmodule Beholder.Worker.Elixir.EventMapper do
 
   defp module_relation(_kind), do: nil
 
-  defp evidence(repository, event, source_paths) do
-    with path when not is_nil(path) <- source_path(repository, event.file, source_paths) do
-      suffix = if event.from_macro, do: " via macro expansion", else: ""
-      "#{path} (compiler #{event.kind}#{suffix})"
+  defp evidence(path, event, occurrence) do
+    suffix = if event.from_macro, do: " via macro expansion", else: ""
+    detail = "compiler #{event.kind}#{suffix}"
+
+    if occurrence do
+      "beholder:evidence:v1:" <>
+        Jason.encode!(%{
+          path: path,
+          line: event.line,
+          detail: detail,
+          range: nil,
+          contexts: []
+        })
+    else
+      "#{path} (#{detail})"
     end
   end
 

@@ -2,7 +2,9 @@ use super::model::*;
 use super::plugin::{ElixirLanguage, built_in_plugins};
 use beholder_adapters_treesitter::recover;
 use beholder_domain::{
-    Confidence, DependencyRelation, Observation, Provenance, UnsafeTreeRecovery,
+    CallableClauseRole, ConditionArmKind, ConditionConstruct, Confidence, DependencyRelation,
+    Evidence, EvidenceContext, EvidencePayload, Observation, PatternConstruct, Provenance,
+    SourceExcerpt, SourcePosition, SourceRange, UnsafeTreeRecovery,
 };
 use beholder_indexing::{ActivePlugins, LanguageAnalyzer, SourceRecognitionInput};
 use sha2::{Digest, Sha256};
@@ -22,6 +24,63 @@ pub(super) fn arguments(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == "arguments")
+}
+
+fn source_position(node: Node<'_>, source: &[u8], end: bool) -> SourcePosition {
+    let (byte, point) = if end {
+        (node.end_byte(), node.end_position())
+    } else {
+        (node.start_byte(), node.start_position())
+    };
+    let line_start = byte.saturating_sub(point.column);
+    let character = std::str::from_utf8(&source[line_start..byte])
+        .map(|text| text.encode_utf16().count())
+        .unwrap_or(point.column);
+    SourcePosition {
+        line: u32::try_from(point.row).unwrap_or(u32::MAX),
+        character: u32::try_from(character).unwrap_or(u32::MAX),
+    }
+}
+
+fn source_range(node: Node<'_>, source: &[u8]) -> SourceRange {
+    SourceRange {
+        start: source_position(node, source, false),
+        end: source_position(node, source, true),
+    }
+}
+
+fn source_excerpt(node: Node<'_>, source: &[u8]) -> Option<SourceExcerpt> {
+    Some(SourceExcerpt {
+        text: text(node, source)?.into(),
+        range: source_range(node, source),
+    })
+}
+
+fn operator<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+    node.child_by_field_name("operator")
+        .and_then(|operator| text(operator, source))
+}
+
+fn callable_clause(
+    node: Node<'_>,
+    source: &[u8],
+    role: CallableClauseRole,
+) -> Option<EvidenceContext> {
+    let head = if node.kind() == "stab_clause" {
+        node.child_by_field_name("left")?
+    } else {
+        arguments(node)?.named_child(0)?
+    };
+    let guard = (head.kind() == "binary_operator" && operator(head, source) == Some("when"))
+        .then(|| head.child_by_field_name("right"))
+        .flatten()
+        .and_then(|guard| source_excerpt(guard, source));
+    Some(EvidenceContext::CallableClause {
+        role,
+        signature: source_excerpt(head, source)?,
+        guard,
+        definition_range: source_range(node, source),
+    })
 }
 
 fn function_head<'a>(node: Node<'a>, source: &'a [u8]) -> Option<(&'a str, usize, usize)> {
@@ -170,15 +229,56 @@ fn parsed_capture(node: Node<'_>, source: &[u8]) -> Option<ElixirCapture> {
         name: name.into(),
         arity: arity.parse().ok()?,
         line: node.start_position().row + 1,
+        range: source_range(node, source),
+        contexts: Vec::new(),
+    })
+}
+
+fn directly_invoked_anonymous_function(node: Node<'_>) -> bool {
+    let mut target = node;
+    while let Some(parent) = target.parent().filter(|parent| {
+        parent.kind() == "block"
+            && parent.named_child_count() == 1
+            && parent.named_child(0) == Some(target)
+    }) {
+        target = parent;
+    }
+    target.parent().is_some_and(|dot| {
+        dot.kind() == "dot"
+            && dot.child_by_field_name("left") == Some(target)
+            && dot.parent().is_some_and(|call| {
+                call.kind() == "call" && call.child_by_field_name("target") == Some(dot)
+            })
     })
 }
 
 fn collect_capture_bindings(
     node: Node<'_>,
     source: &[u8],
+    contexts: &[EvidenceContext],
     bindings: &mut Vec<(String, ElixirCapture)>,
 ) {
     if node.kind() == "call" && call_target(node, source) == Some("quote") {
+        return;
+    }
+    if node.kind() == "anonymous_function" {
+        let directly_invoked = directly_invoked_anonymous_function(node);
+        let mut cursor = node.walk();
+        for clause in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "stab_clause")
+        {
+            let contexts = if directly_invoked {
+                contexts.to_vec()
+            } else {
+                callable_clause(clause, source, CallableClauseRole::Enclosing)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
+            if let Some(body) = clause.child_by_field_name("right") {
+                collect_capture_bindings(body, source, &contexts, bindings);
+            }
+        }
         return;
     }
     if node.kind() == "binary_operator"
@@ -190,16 +290,70 @@ fn collect_capture_bindings(
             .child_by_field_name("left")
             .filter(|left| left.kind() == "identifier")
             .and_then(|left| text(left, source))
-        && let Some(capture) = node
-            .child_by_field_name("right")
-            .and_then(|right| parsed_capture(right, source))
+        && let Some(right) = node.child_by_field_name("right")
+        && let Some(mut capture) = parsed_capture(right, source)
     {
+        capture.contexts = capture_contexts(right, source, contexts);
         bindings.push((name.into(), capture));
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_capture_bindings(child, source, bindings);
+        collect_capture_bindings(child, source, contexts, bindings);
     }
+}
+
+fn capture_contexts(
+    node: Node<'_>,
+    source: &[u8],
+    contexts: &[EvidenceContext],
+) -> Vec<EvidenceContext> {
+    let mut arms = Vec::new();
+    let mut node = node;
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "anonymous_function" && !directly_invoked_anonymous_function(parent) {
+            break;
+        }
+        if parent.kind() == "stab_clause"
+            && let Some(block) = parent.parent()
+            && block.kind() == "do_block"
+            && let Some(selector) = block.parent()
+            && matches!(call_target(selector, source), Some("case" | "cond"))
+        {
+            let (head, guard) = clause_parts(parent, source);
+            let Some(body) = parent.child_by_field_name("right") else {
+                node = parent;
+                continue;
+            };
+            if !(body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()) {
+                node = parent;
+                continue;
+            }
+            arms.push(if call_target(selector, source) == Some("case") {
+                EvidenceContext::PatternArm {
+                    construct: PatternConstruct::Case,
+                    selector: arguments(selector)
+                        .and_then(|arguments| arguments.named_child(0))
+                        .and_then(|selector| source_excerpt(selector, source)),
+                    pattern: head.and_then(|pattern| source_excerpt(pattern, source)),
+                    guard: guard.and_then(|guard| source_excerpt(guard, source)),
+                    is_default: false,
+                    arm_range: source_range(body, source),
+                }
+            } else {
+                EvidenceContext::ConditionArm {
+                    construct: ConditionConstruct::Cond,
+                    arm: ConditionArmKind::Clause,
+                    condition: head.and_then(|condition| source_excerpt(condition, source)),
+                    arm_range: source_range(body, source),
+                }
+            });
+        }
+        node = parent;
+    }
+    arms.reverse();
+    let mut result = contexts.to_vec();
+    result.extend(arms);
+    result
 }
 
 fn collect_call_argument_names(node: Node<'_>, source: &[u8], names: &mut BTreeSet<String>) {
@@ -264,6 +418,8 @@ fn parsed_call(node: Node<'_>, source: &[u8]) -> Option<ElixirCall> {
         name,
         arity,
         line: node.start_position().row + 1,
+        range: source_range(node, source),
+        contexts: Vec::new(),
         dynamic_struct,
         captures,
     })
@@ -338,11 +494,36 @@ fn collect_calls(
     node: Node<'_>,
     source: &[u8],
     struct_bindings: &BTreeMap<String, Vec<(usize, String)>>,
+    contexts: &[EvidenceContext],
     calls: &mut Vec<ElixirCall>,
 ) {
+    if node.kind() == "anonymous_function" {
+        let directly_invoked = directly_invoked_anonymous_function(node);
+        let mut cursor = node.walk();
+        for clause in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "stab_clause")
+        {
+            let contexts = if directly_invoked {
+                contexts.to_vec()
+            } else {
+                callable_clause(clause, source, CallableClauseRole::Enclosing)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
+            if let Some(body) = clause.child_by_field_name("right") {
+                collect_calls(body, source, struct_bindings, &contexts, calls);
+            }
+        }
+        return;
+    }
     if node.kind() == "call" {
         let target = call_target(node, source);
         if target == Some("quote") {
+            return;
+        }
+        if matches!(target, Some("case" | "cond")) {
+            collect_selection_calls(node, source, struct_bindings, contexts, calls);
             return;
         }
         if !has_do_block(node)
@@ -374,12 +555,91 @@ fn collect_calls(
                     })
                     .map(|(_, module)| module.clone());
             }
+            call.contexts = contexts.to_vec();
+            for capture in &mut call.captures {
+                capture.contexts = contexts.to_vec();
+            }
             calls.push(call);
         }
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_calls(child, source, struct_bindings, calls);
+        collect_calls(child, source, struct_bindings, contexts, calls);
+    }
+}
+
+fn clause_parts<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+) -> (Option<Node<'tree>>, Option<Node<'tree>>) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return (None, None);
+    };
+    if left.kind() == "binary_operator" && operator(left, source) == Some("when") {
+        (
+            left.child_by_field_name("left"),
+            left.child_by_field_name("right"),
+        )
+    } else {
+        (Some(left), None)
+    }
+}
+
+fn collect_selection_calls(
+    node: Node<'_>,
+    source: &[u8],
+    struct_bindings: &BTreeMap<String, Vec<(usize, String)>>,
+    contexts: &[EvidenceContext],
+    calls: &mut Vec<ElixirCall>,
+) {
+    let target = call_target(node, source);
+    let selector_node = (target == Some("case"))
+        .then(|| arguments(node).and_then(|arguments| arguments.named_child(0)))
+        .flatten();
+    if let Some(arguments) = arguments(node) {
+        let mut cursor = arguments.walk();
+        for child in arguments.named_children(&mut cursor) {
+            collect_calls(child, source, struct_bindings, contexts, calls);
+        }
+    }
+    let Some(block) = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "do_block")
+    else {
+        return;
+    };
+    let mut cursor = block.walk();
+    for clause in block
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "stab_clause")
+    {
+        let (head, guard) = clause_parts(clause, source);
+        for excluded in [head, guard].into_iter().flatten() {
+            collect_calls(excluded, source, struct_bindings, contexts, calls);
+        }
+        let Some(body) = clause.child_by_field_name("right") else {
+            continue;
+        };
+        let arm = if target == Some("case") {
+            EvidenceContext::PatternArm {
+                construct: PatternConstruct::Case,
+                selector: selector_node.and_then(|selector| source_excerpt(selector, source)),
+                pattern: head.and_then(|pattern| source_excerpt(pattern, source)),
+                guard: guard.and_then(|guard| source_excerpt(guard, source)),
+                is_default: false,
+                arm_range: source_range(body, source),
+            }
+        } else {
+            EvidenceContext::ConditionArm {
+                construct: ConditionConstruct::Cond,
+                arm: ConditionArmKind::Clause,
+                condition: head.and_then(|condition| source_excerpt(condition, source)),
+                arm_range: source_range(body, source),
+            }
+        };
+        let mut nested_contexts = contexts.to_vec();
+        nested_contexts.push(arm);
+        collect_calls(body, source, struct_bindings, &nested_contexts, calls);
     }
 }
 
@@ -387,10 +647,20 @@ fn function_calls(node: Node<'_>, source: &[u8]) -> Vec<ElixirCall> {
     let mut struct_bindings = BTreeMap::new();
     collect_struct_bindings(node, source, &mut struct_bindings);
     let mut calls = Vec::new();
+    let contexts = callable_clause(node, source, CallableClauseRole::Enclosing)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(guard) = arguments(node)
+        .and_then(|arguments| arguments.named_child(0))
+        .filter(|head| head.kind() == "binary_operator" && operator(*head, source) == Some("when"))
+        .and_then(|head| head.child_by_field_name("right"))
+    {
+        collect_calls(guard, source, &struct_bindings, &contexts, &mut calls);
+    }
     if let Some(arguments) = arguments(node) {
         let mut cursor = arguments.walk();
         for body in arguments.named_children(&mut cursor).skip(1) {
-            collect_calls(body, source, &struct_bindings, &mut calls);
+            collect_calls(body, source, &struct_bindings, &contexts, &mut calls);
         }
     }
     let mut cursor = node.walk();
@@ -398,14 +668,17 @@ fn function_calls(node: Node<'_>, source: &[u8]) -> Vec<ElixirCall> {
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "do_block")
     {
-        collect_calls(body, source, &struct_bindings, &mut calls);
+        collect_calls(body, source, &struct_bindings, &contexts, &mut calls);
     }
     calls
 }
 
 fn function_captures(node: Node<'_>, source: &[u8]) -> Vec<ElixirCapture> {
     let mut bindings = Vec::new();
-    collect_capture_bindings(node, source, &mut bindings);
+    let contexts = callable_clause(node, source, CallableClauseRole::Enclosing)
+        .into_iter()
+        .collect::<Vec<_>>();
+    collect_capture_bindings(node, source, &contexts, &mut bindings);
     let mut arguments = BTreeSet::new();
     collect_call_argument_names(node, source, &mut arguments);
     bindings
@@ -653,6 +926,10 @@ fn push_function(
                     name: name.clone(),
                     arity,
                     line: node.start_position().row + 1,
+                    range: source_range(node, source),
+                    contexts: callable_clause(node, source, CallableClauseRole::Enclosing)
+                        .into_iter()
+                        .collect(),
                     dynamic_struct: false,
                     captures: Vec::new(),
                 }]
@@ -686,27 +963,15 @@ fn push_function(
         {
             let function = &mut functions[index];
             function.body_hash = append_hash(function.body_hash, body_hash);
+            function.definition_contexts.extend(callable_clause(
+                node,
+                source,
+                CallableClauseRole::Declaration,
+            ));
             for capture in captures {
-                if !function.captures.contains(&capture) {
-                    function.captures.push(capture);
-                }
+                function.captures.push(capture);
             }
-            for call in calls {
-                if let Some(existing) = function.calls.iter_mut().find(|existing| {
-                    existing.module == call.module
-                        && existing.name == call.name
-                        && existing.arity == call.arity
-                        && existing.dynamic_struct == call.dynamic_struct
-                }) {
-                    for capture in call.captures {
-                        if !existing.captures.contains(&capture) {
-                            existing.captures.push(capture);
-                        }
-                    }
-                } else {
-                    function.calls.push(call);
-                }
-            }
+            function.calls.extend(calls);
             for import in &imports {
                 if !function.imports.contains(import) {
                     function.imports.push(import.clone());
@@ -729,6 +994,9 @@ fn push_function(
             interface_hash,
             body_hash,
             line: node.start_position().row + 1,
+            definition_contexts: callable_clause(node, source, CallableClauseRole::Declaration)
+                .into_iter()
+                .collect(),
             calls,
             captures,
             struct_uses,
@@ -871,7 +1139,6 @@ pub(super) fn call_observations(
     let mut observations = Vec::new();
     for function in functions {
         let function_id = format!("{module_id}/{}/{}", function.name, function.arity);
-        let mut targets = BTreeSet::new();
         let target_for = |target_module: Option<&str>, name: &str, arity: usize| {
             let candidate = target_module.map_or_else(
                 || format!("{module_id}/{name}/{arity}"),
@@ -899,21 +1166,27 @@ pub(super) fn call_observations(
             } else {
                 target_for(call.module.as_deref(), &call.name, call.arity)
             };
-            if targets.insert(target.clone()) {
-                let mut observation = Observation::dependency(
-                    function_id.clone(),
-                    DependencyRelation::Calls,
-                    target,
-                    format!("{}:{}", path.display(), call.line),
-                );
-                if call.dynamic_struct {
-                    observation.confidence = Confidence::Inferred;
-                }
-                if generated {
-                    observation.provenance = Provenance::Generated;
-                }
-                observations.push(observation);
+            let evidence = Evidence::structured(EvidencePayload {
+                path: Some(path.display().to_string()),
+                line: u32::try_from(call.line).ok(),
+                detail: None,
+                range: Some(call.range.clone()),
+                contexts: call.contexts.clone(),
+            })
+            .expect("tree-sitter emits valid Elixir evidence ranges");
+            let mut observation = Observation::dependency(
+                function_id.clone(),
+                DependencyRelation::Calls,
+                target,
+                evidence,
+            );
+            if call.dynamic_struct {
+                observation.confidence = Confidence::Inferred;
             }
+            if generated {
+                observation.provenance = Provenance::Generated;
+            }
+            observations.push(observation);
         }
         for capture in function
             .captures
@@ -921,19 +1194,24 @@ pub(super) fn call_observations(
             .chain(function.calls.iter().flat_map(|call| &call.captures))
         {
             let target = target_for(capture.module.as_deref(), &capture.name, capture.arity);
-            if targets.insert(target.clone()) {
-                let mut observation = Observation::dependency(
-                    function_id.clone(),
-                    DependencyRelation::Calls,
-                    target,
-                    format!("{}:{}", path.display(), capture.line),
-                );
-                observation.confidence = Confidence::Inferred;
-                if generated {
-                    observation.provenance = Provenance::Generated;
-                }
-                observations.push(observation);
+            let mut observation = Observation::dependency(
+                function_id.clone(),
+                DependencyRelation::Calls,
+                target,
+                Evidence::structured(EvidencePayload {
+                    path: Some(path.display().to_string()),
+                    line: u32::try_from(capture.line).ok(),
+                    detail: None,
+                    range: Some(capture.range.clone()),
+                    contexts: capture.contexts.clone(),
+                })
+                .expect("tree-sitter emits valid Elixir evidence ranges"),
+            );
+            observation.confidence = Confidence::Inferred;
+            if generated {
+                observation.provenance = Provenance::Generated;
             }
+            observations.push(observation);
         }
     }
     observations
@@ -988,6 +1266,7 @@ fn callback_definition(node: Node<'_>, source: &[u8]) -> Option<ElixirFunction> 
         interface_hash: function_interface_hash("callback", name, max_arity),
         body_hash: [0; 32],
         line: node.start_position().row + 1,
+        definition_contexts: Vec::new(),
         calls: Vec::new(),
         captures: Vec::new(),
         struct_uses: Vec::new(),
@@ -1479,11 +1758,19 @@ fn absinthe_resolver(
     let mut calls = Vec::new();
     let mut struct_bindings = BTreeMap::new();
     collect_struct_bindings(argument, source, &mut struct_bindings);
+    let mut definition_contexts = Vec::new();
     for clause in clauses {
+        if let Some(context) = callable_clause(clause, source, CallableClauseRole::Declaration) {
+            definition_contexts.push(context);
+        }
+        let contexts = callable_clause(clause, source, CallableClauseRole::Enclosing)
+            .into_iter()
+            .collect::<Vec<_>>();
         collect_calls(
             clause.child_by_field_name("right")?,
             source,
             &struct_bindings,
+            &contexts,
             &mut calls,
         );
     }
@@ -1518,6 +1805,7 @@ fn absinthe_resolver(
             interface_hash: [0; 32],
             body_hash: [0; 32],
             line,
+            definition_contexts,
             calls,
             captures: Vec::new(),
             struct_uses,
@@ -1588,5 +1876,259 @@ mod recovery_tests {
     fn rejects_missing_delimiters_that_can_change_nesting() {
         let error = analyze("defmodule Broken do\n  def run do\n    :ok\nend").unwrap_err();
         assert!(error.downcast_ref::<UnsafeTreeRecovery>().is_some());
+    }
+
+    #[test]
+    fn inline_absinthe_resolver_calls_keep_their_anonymous_clause() {
+        let analysis = analyze(
+            r#"
+            defmodule Schema do
+              object :result do
+                field(:result, :string,
+                  resolve: fn
+                    value -> integer_result(value)
+                    _ -> fallback_result()
+                  end
+                )
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let function = analysis.modules[0]
+            .functions
+            .iter()
+            .find(|function| function.name == "__absinthe_result_result_resolver")
+            .unwrap();
+        assert!(matches!(
+            function.definition_contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { role: CallableClauseRole::Declaration, signature, .. },
+                EvidenceContext::CallableClause { role: CallableClauseRole::Declaration, signature: second, .. }
+            ] if signature.text == "value" && second.text == "_"
+        ));
+        assert!(function.calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, guard: None, .. }]
+                if signature.text == "value"
+        )));
+        assert!(function.calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, guard: None, .. }]
+                if signature.text == "_"
+        )));
+    }
+
+    #[test]
+    fn anonymous_functions_reset_outer_arms_and_keep_their_own_arms() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  :case ->
+                    fn input ->
+                      case_hit(input)
+                      case input do
+                        :nested -> nested_case_hit()
+                      end
+                    end
+                end
+
+                cond do
+                  true ->
+                    fn input ->
+                      cond_hit(input)
+                      cond do
+                        true -> nested_cond_hit()
+                      end
+                    end
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let calls = &analysis.modules[0].functions[0].calls;
+
+        for name in ["case_hit", "cond_hit"] {
+            assert!(calls.iter().any(|call| matches!(
+                call.contexts.as_slice(),
+                [EvidenceContext::CallableClause { signature, .. }]
+                    if call.name == name && signature.text == "input"
+            )));
+        }
+        assert!(calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::PatternArm { .. }]
+                if call.name == "nested_case_hit" && signature.text == "input"
+        )));
+        assert!(calls.iter().any(|call| matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::ConditionArm { .. }]
+                if call.name == "nested_cond_hit" && signature.text == "input"
+        )));
+    }
+
+    #[test]
+    fn directly_invoked_anonymous_functions_keep_outer_arm_context() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  _ -> (fn -> helper() end).()
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let call = analysis.modules[0].functions[0]
+            .calls
+            .iter()
+            .find(|call| call.name == "helper")
+            .unwrap();
+        assert!(
+            matches!(
+                call.contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause { .. },
+                    EvidenceContext::PatternArm { .. }
+                ]
+            ),
+            "contexts: {:?}",
+            call.contexts
+        );
+    }
+
+    #[test]
+    fn captures_in_anonymous_functions_reset_outer_arms_and_keep_their_own_arms() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  :outer ->
+                    fn input ->
+                      callback = &outer_helper/1
+                      use_callback(callback)
+                      case input do
+                        :inner ->
+                          nested = &inner_helper/1
+                          use_callback(nested)
+                      end
+                    end
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let captures = &analysis.modules[0].functions[0].captures;
+
+        assert!(captures.iter().any(|capture| matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }]
+                if capture.name == "outer_helper" && signature.text == "input"
+        )));
+        assert!(captures.iter().any(|capture| matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::PatternArm { .. }]
+                if capture.name == "inner_helper" && signature.text == "input"
+        )));
+    }
+
+    #[test]
+    fn captures_in_directly_invoked_anonymous_functions_keep_outer_arm() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  _ -> (fn -> callback = &helper/0; consume(callback) end).()
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let capture = analysis.modules[0].functions[0]
+            .captures
+            .iter()
+            .find(|capture| capture.name == "helper")
+            .unwrap();
+        assert!(
+            matches!(
+                capture.contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause { .. },
+                    EvidenceContext::PatternArm { .. }
+                ]
+            ),
+            "contexts: {:?}",
+            capture.contexts
+        );
+    }
+
+    #[test]
+    fn anonymous_functions_nested_in_invoked_targets_remain_boundaries() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  _ -> (wrap(fn input -> callback = &captured_helper/1; helper(input); consume(callback, input) end)).(value)
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let function = &analysis.modules[0].functions[0];
+        let call = function
+            .calls
+            .iter()
+            .find(|call| call.name == "helper")
+            .unwrap();
+        assert!(matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { .. }]
+        ));
+        let capture = function
+            .captures
+            .iter()
+            .find(|capture| capture.name == "captured_helper")
+            .unwrap();
+        assert!(matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause { .. }]
+        ));
+    }
+
+    #[test]
+    fn excludes_cond_head_capture_from_clause_arm() {
+        let analysis = analyze(
+            r#"defmodule Example do
+  def run(value) do
+    cond do
+      callback = &helper/0 -> consume(callback)
+      true -> :ok
+    end
+  end
+  defp helper, do: :ok
+  defp consume(callback), do: callback.()
+end"#,
+        )
+        .unwrap();
+        let capture = &analysis.modules[0].functions[0].captures[0];
+        assert_eq!(capture.name, "helper");
+        assert!(matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                ..
+            }]
+        ));
     }
 }

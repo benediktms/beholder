@@ -1,0 +1,15 @@
+defmodule EvidenceFixture do
+  def caller(value) do
+    %Legacy.Value{}
+
+    case value do
+      :nested ->
+        cond do
+          value == :nested -> helper()
+          true -> helper()
+        end
+    end
+  end
+
+  defp helper, do: :ok
+end

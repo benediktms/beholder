@@ -1,3 +1,4 @@
+use beholder_domain::{EvidenceContext, SourceRange};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};
 
@@ -62,6 +63,8 @@ pub(super) struct ElixirFunction {
     #[serde(default)]
     pub(super) body_hash: [u8; 32],
     pub(super) line: usize,
+    #[serde(default)]
+    pub(super) definition_contexts: Vec<EvidenceContext>,
     pub(super) calls: Vec<ElixirCall>,
     #[serde(default)]
     pub(super) captures: Vec<ElixirCapture>,
@@ -75,6 +78,9 @@ pub(super) struct ElixirCall {
     pub(super) name: String,
     pub(super) arity: usize,
     pub(super) line: usize,
+    pub(super) range: SourceRange,
+    #[serde(default)]
+    pub(super) contexts: Vec<EvidenceContext>,
     #[serde(default)]
     pub(super) dynamic_struct: bool,
     #[serde(default)]
@@ -87,6 +93,9 @@ pub(super) struct ElixirCapture {
     pub(super) name: String,
     pub(super) arity: usize,
     pub(super) line: usize,
+    pub(super) range: SourceRange,
+    #[serde(default)]
+    pub(super) contexts: Vec<EvidenceContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

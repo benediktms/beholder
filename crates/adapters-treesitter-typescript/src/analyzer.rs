@@ -724,6 +724,7 @@ fn build_fact_shards(
                 digest.update(observation.from.as_str().as_bytes());
                 digest.update(observation.relation.as_str().as_bytes());
                 digest.update(observation.to.as_str().as_bytes());
+                digest.update(observation.evidence.as_str().as_bytes());
                 digest.update(observation.confidence.score().to_le_bytes());
                 digest.update(observation.provenance.as_str().as_bytes());
             }
@@ -747,7 +748,11 @@ fn text(input: &beholder_indexing::RepositoryInput) -> Result<&str, SourceAnalys
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beholder_domain::{LogicalRepository, RepositoryState};
+    use crate::analyze;
+    use beholder_domain::{
+        CallableClauseRole, DependencyRelation, Evidence, EvidenceContext, EvidencePayload,
+        LogicalRepository, RepositoryState, SourceExcerpt, SourcePosition, SourceRange,
+    };
     use beholder_indexing::{InputKind, RepositoryInput, RepositorySnapshot};
 
     fn snapshot(source: &[u8], fingerprint: &str) -> WorkspaceSnapshot {
@@ -772,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_shards_ignore_trivia_but_change_with_calls() {
+    fn semantic_shards_track_evidence_positions_and_calls() {
         let cache_dir =
             std::env::temp_dir().join(format!("beholder-typescript-shards-{}", std::process::id()));
         let analyzer = TypescriptAnalyzer::new(cache_dir.clone());
@@ -802,11 +807,63 @@ mod tests {
             .0
             .clone();
 
-        assert_eq!(initial, formatted);
-        assert_eq!(initial_key, formatted_key);
+        assert_ne!(initial, formatted);
+        assert_ne!(initial_key, formatted_key);
         assert_ne!(initial, changed);
         assert_ne!(initial_key, changed_key);
         let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn caller_shard_changes_when_selected_target_range_moves() {
+        let path = Path::new("src/caller.ts");
+        let source = "export function run() { target(); }";
+        let analyzed = [(
+            path,
+            source,
+            Arc::new(analyze(source, SourceLanguage::TypeScript).unwrap()),
+            Arc::from(&b"unchanged-caller"[..]),
+            CacheStatus::Miss,
+        )];
+        let version = |target_line| {
+            let range = SourceRange {
+                start: SourcePosition {
+                    line: target_line,
+                    character: 0,
+                },
+                end: SourcePosition {
+                    line: target_line,
+                    character: 20,
+                },
+            };
+            let evidence = Evidence::structured(EvidencePayload {
+                path: Some("src/caller.ts".into()),
+                line: Some(1),
+                detail: None,
+                range: None,
+                contexts: vec![EvidenceContext::CallableClause {
+                    role: CallableClauseRole::SelectedTarget,
+                    signature: SourceExcerpt {
+                        text: "export function target()".into(),
+                        range: range.clone(),
+                    },
+                    guard: None,
+                    definition_range: range,
+                }],
+            })
+            .unwrap();
+            let observations = [Observation::dependency(
+                "repo://example/typescript/src/caller/run",
+                DependencyRelation::Calls,
+                "repo://example/typescript/src/target/target",
+                evidence,
+            )];
+            build_fact_shards("example", "version", &analyzed, &[], &observations)[0]
+                .version
+                .clone()
+        };
+
+        assert_ne!(version(0), version(1));
     }
 
     #[test]
@@ -895,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_semantics_are_reused_after_restart() {
+    fn repository_semantics_republish_changed_evidence_after_restart() {
         let cache_dir = std::env::temp_dir().join(format!(
             "beholder-typescript-repository-cache-{}",
             std::process::id()
@@ -921,8 +978,8 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(initial.repositories, formatted.repositories);
-        assert_eq!(
+        assert_ne!(initial.repositories, formatted.repositories);
+        assert_ne!(
             restarted.repository_cache.lock().unwrap()["example/repo"].0,
             key
         );
@@ -968,8 +1025,8 @@ mod tests {
             .0
             .clone();
 
-        assert_eq!(initial.repositories, formatted.repositories);
-        assert_eq!(initial_key, formatted_key);
+        assert_ne!(initial.repositories, formatted.repositories);
+        assert_ne!(initial_key, formatted_key);
         assert_ne!(initial_key, changed_key);
         assert!(
             changed.repositories[0]

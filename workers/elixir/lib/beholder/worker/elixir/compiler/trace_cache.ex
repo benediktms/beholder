@@ -3,7 +3,7 @@ defmodule Beholder.Worker.Elixir.Compiler.TraceCache do
 
   use GenServer
 
-  @disk_version 3
+  @disk_version 4
   @legacy_disk_version 2
 
   def start_cache do

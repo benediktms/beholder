@@ -8,7 +8,6 @@ struct Resolver {
     parent: String,
     field: String,
     definition: String,
-    line: usize,
 }
 
 fn parser(language: SourceLanguage) -> Option<Parser> {
@@ -167,7 +166,6 @@ fn collect(
                         parent,
                         field,
                         definition: format!("{class_name}/{method_name}"),
-                        line: method.start_position().row + 1,
                     });
                 }
             }
@@ -219,13 +217,18 @@ pub(super) fn facts(repository: &str, input: &GraphqlResolverSource<'_>) -> Grap
         .analysis
         .definitions
         .iter()
-        .map(|definition| definition.qualified_name.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
+        .map(|definition| {
+            (
+                definition.qualified_name.as_str(),
+                definition.evidence(input.path),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut facts = GraphqlFacts::default();
     for resolver in resolvers {
-        if !definitions.contains(resolver.definition.as_str()) {
+        let Some(evidence) = definitions.get(resolver.definition.as_str()) else {
             continue;
-        }
+        };
         let field = format!("graphql-field://{}/{}", resolver.parent, resolver.field);
         facts
             .entities
@@ -234,7 +237,7 @@ pub(super) fn facts(repository: &str, input: &GraphqlResolverSource<'_>) -> Grap
             field,
             DependencyRelation::ResolvedBy,
             format!("{module}/{}", resolver.definition),
-            format!("{}:{}", input.path.display(), resolver.line),
+            evidence.clone(),
         ));
     }
     facts

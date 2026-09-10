@@ -1,7 +1,7 @@
 use super::model::{RustAnalysis, TonicAnalysis, TonicBinding, TonicGeneratedMethod};
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, GrpcBindingCandidate,
-    GrpcBindingRole, Provenance, RpcCardinality,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, CallableClauseRole, Confidence, Evidence,
+    GrpcBindingCandidate, GrpcBindingRole, Provenance, RpcCardinality,
 };
 use std::{collections::BTreeMap, path::Path};
 use tree_sitter::Node;
@@ -212,6 +212,7 @@ pub(super) fn analyze(
             let Some(method) = field.child_by_field_name("field") else {
                 return;
             };
+            let method_offset = method.start_byte();
             let (Ok(receiver), Ok(method)) =
                 (receiver_node.utf8_text(source), method.utf8_text(source))
             else {
@@ -248,10 +249,11 @@ pub(super) fn analyze(
                     service,
                     method: method.into(),
                     line,
+                    offset: method_offset,
                 });
                 analysis
                     .recognized_receiver_calls
-                    .push((line, method.into()));
+                    .push((method_offset, method.into()));
             }
         });
 
@@ -264,6 +266,9 @@ pub(super) fn analyze(
                 service: service.clone(),
                 method: qualified_name.rsplit('/').next().unwrap_or_default().into(),
                 line: function.start_position().row + 1,
+                offset: function
+                    .child_by_field_name("name")
+                    .map_or(function.start_byte(), |name| name.start_byte()),
             });
         }
 
@@ -274,9 +279,13 @@ pub(super) fn analyze(
         };
         if qualified_name.contains(&format!("impl/{service}Client")) {
             analysis.generated_methods.push(TonicGeneratedMethod {
+                function: qualified_name.clone(),
                 service,
                 method: qualified_name.rsplit('/').next().unwrap_or_default().into(),
                 line: function.start_position().row + 1,
+                offset: function
+                    .child_by_field_name("name")
+                    .map_or(function.start_byte(), |name| name.start_byte()),
             });
         }
     }
@@ -309,12 +318,20 @@ pub fn bindings(
     let generated = sources
         .iter()
         .flat_map(|(path, analysis)| {
-            analysis.tonic.generated_methods.iter().map(move |method| {
-                (
-                    (method.service.as_str(), method.method.as_str()),
-                    (*path, method.line),
-                )
-            })
+            analysis
+                .tonic
+                .generated_methods
+                .iter()
+                .filter_map(move |method| {
+                    let function = analysis
+                        .functions
+                        .iter()
+                        .find(|function| function.qualified_name == method.function)?;
+                    Some((
+                        (method.service.as_str(), method.method.as_str()),
+                        function.evidence(path, CallableClauseRole::Declaration),
+                    ))
+                })
         })
         .collect::<BTreeMap<_, _>>();
     let mut candidates = Vec::new();
@@ -348,17 +365,32 @@ pub fn bindings(
             let service = format!("{package}.{}", binding.service);
             let method = snake_to_pascal(&binding.method);
             let local_symbol = format!("{}/{}", module_id(repository, path), binding.function);
+            let evidence = analysis
+                .functions
+                .iter()
+                .find(|function| function.qualified_name == binding.function)
+                .and_then(|function| match role {
+                    GrpcBindingRole::Client => function
+                        .calls
+                        .iter()
+                        .find(|call| call.offset == binding.offset)
+                        .map(|call| call.evidence(path)),
+                    GrpcBindingRole::Server => {
+                        Some(function.evidence(path, CallableClauseRole::Declaration))
+                    }
+                })
+                .unwrap_or_else(|| Evidence::from(format!("{}:{}", path.display(), binding.line)));
             candidates.push(GrpcBindingCandidate {
                 local_symbol: local_symbol.as_str().into(),
                 role,
                 service: service.clone(),
                 method: method.clone(),
                 cardinality: RpcCardinality::Unary,
-                evidence: format!("{}:{}", path.display(), binding.line).into(),
+                evidence,
                 confidence: Confidence::Inferred,
                 provenance: Provenance::Ast,
             });
-            if let Some((generated_path, line)) =
+            if let Some(evidence) =
                 generated.get(&(binding.service.as_str(), binding.method.as_str()))
             {
                 candidates.push(GrpcBindingCandidate {
@@ -367,7 +399,7 @@ pub fn bindings(
                     service,
                     method,
                     cardinality: RpcCardinality::Unary,
-                    evidence: format!("{}:{line}", generated_path.display()).into(),
+                    evidence: evidence.clone(),
                     confidence: Confidence::Exact,
                     provenance: Provenance::Generated,
                 });
@@ -456,7 +488,7 @@ mod tests {
                 "use crate::pricing_client::PricingClient; \
                  async fn quote() { \
                      let mut client = PricingClient::new(); \
-                     client.get_quote().await; \
+                     if true { client.get_quote().await; } \
                  }",
             ),
         ]);
@@ -466,12 +498,25 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(call.len(), 2);
         assert!(call.iter().any(|candidate| {
-            candidate.confidence == Confidence::Inferred && candidate.provenance == Provenance::Ast
+            candidate.confidence == Confidence::Inferred
+                && candidate.provenance == Provenance::Ast
+                && candidate.evidence.decode().contexts.iter().any(|context| {
+                    matches!(
+                        context,
+                        beholder_domain::EvidenceContext::ConditionArm { .. }
+                    )
+                })
         }));
         assert!(call.iter().any(|candidate| {
             candidate.confidence == Confidence::Exact
                 && candidate.provenance == Provenance::Generated
-                && candidate.evidence.as_str().starts_with("src/generated.rs:")
+                && matches!(
+                    candidate.evidence.decode().contexts.last(),
+                    Some(beholder_domain::EvidenceContext::CallableClause {
+                        role: CallableClauseRole::Declaration,
+                        ..
+                    })
+                )
         }));
     }
 

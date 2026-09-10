@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	beholderv1 "github.com/benediktms/beholder/workers/typescript/internal/proto/beholder/v1"
 	workerv1 "github.com/benediktms/beholder/workers/typescript/internal/proto/beholder/worker/v1"
 )
 
@@ -33,6 +34,7 @@ func TestDefinitionUsesStandardLSP(t *testing.T) {
 	t.Setenv("BEHOLDER_TYPESCRIPT_EXPECT_MEMORY_LIMIT", "4GiB")
 	t.Setenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST", "65")
 	t.Setenv("BEHOLDER_TYPESCRIPT_SERVER_REQUEST", "1")
+	t.Setenv("BEHOLDER_TYPESCRIPT_EXPECT_HIERARCHICAL_SYMBOLS", "1")
 	t.Setenv("GOMEMLIMIT", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -96,26 +98,51 @@ func TestTypeScriptExecutableFallsBackFromBrokenPreferredAlias(t *testing.T) {
 func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 	root := t.TempDir()
 	caller := "const counter = new Counter(); counter.value();\n"
-	target := "export class Counter { value() {} }\n"
+	target := "export class Counter {\n  value(input: string): string;\n  value(input: number): number;\n  value(input: string | number) { return input; }\n}\n"
 	unrelated := "export const unused = true;\n"
 	writeTestFile(t, root, "src/caller.ts", caller, 0o644)
 	writeTestFile(t, root, "src/target.ts", target, 0o644)
 	writeTestFile(t, root, "src/unrelated.ts", unrelated, 0o644)
 	t.Setenv("BEHOLDER_TYPESCRIPT_FORBIDDEN_URI", fileURI(filepath.Join(root, "src", "unrelated.ts")))
+	t.Setenv("BEHOLDER_TYPESCRIPT_TARGET_LINE", "2")
+	t.Setenv("BEHOLDER_TYPESCRIPT_TARGET_CHARACTER", "2")
+	t.Setenv("BEHOLDER_TYPESCRIPT_TARGET_END_CHARACTER", "7")
+	t.Setenv("BEHOLDER_TYPESCRIPT_SYMBOL_END_CHARACTER", "31")
 	helpTarget := fileURI(filepath.Join(root, "src", "target.ts"))
 	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 7.0.2'; else BEHOLDER_TYPESCRIPT_LSP_HELPER=1 BEHOLDER_TYPESCRIPT_TARGET_URI='%s' exec '%s' -test.run=TestDefinitionUsesStandardLSP; fi\n", helpTarget, strings.ReplaceAll(os.Args[0], "'", "'\\''"))
 	writeTestFile(t, root, "node_modules/.bin/tsc", script, 0o755)
 	start := uint32(strings.Index(caller, "value"))
+	callRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: 0, Character: start},
+		End:   &beholderv1.SourcePosition{Line: 0, Character: start + 7},
+	}
+	declarationRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: 2, Character: 2},
+		End:   &beholderv1.SourcePosition{Line: 2, Character: 31},
+	}
+	declaration := &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{
+			Role:            beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_DECLARATION,
+			Signature:       &beholderv1.SourceExcerpt{Text: "value(input: number): number;", Range: declarationRange},
+			DefinitionRange: declarationRange,
+		},
+	}}
+	enclosing := &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{Role: beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_ENCLOSING},
+	}}
+	targetID := "repo://example/typescript/src/target/Counter/value"
 	snapshot := &analysisSnapshot{
 		workspace: "test",
 		repositories: map[string]*repositorySnapshot{"example": {
 			identity: "example", base: root, target: true,
 			inputs: map[string][]byte{"src/caller.ts": []byte(caller), "src/target.ts": []byte(target), "src/unrelated.ts": []byte(unrelated)},
 		}},
-		entities: map[string]bool{"repo://example/typescript/src/target/Counter/value": true},
+		entities:     map[string]bool{targetID: true},
+		declarations: map[string][]*beholderv1.EvidenceContext{targetID: {declaration}},
 		candidates: []*workerv1.SemanticCandidate{{
 			Id: "candidate", Repository: "example", From: "repo://example/typescript/src/caller",
 			UnresolvedTo: "typescript-method://counter/value", Span: &workerv1.SourceSpan{Path: "src/caller.ts", Start: &workerv1.SourcePosition{Line: 0, Character: start}, End: &workerv1.SourcePosition{Line: 0, Character: start + 5}},
+			Evidence: "src/caller.ts:1", Range: callRange, Contexts: []*beholderv1.EvidenceContext{enclosing},
 		}},
 	}
 
@@ -127,8 +154,131 @@ func TestAnalyzeSnapshotPublishesExactCandidateOverride(t *testing.T) {
 	if result.overrides[0].GetResolvedTo() != "repo://example/typescript/src/target/Counter/value" {
 		t.Fatalf("unexpected override: %+v", result.overrides[0])
 	}
-	if result.compilerVersion != "7.0.2" || !strings.Contains(result.overrides[0].GetEvidence(), "src/target.ts:1") {
-		t.Fatalf("unexpected compiler evidence: %+v", result)
+	override := result.overrides[0]
+	if result.compilerVersion != "7.0.2" || override.GetEvidence() != "src/caller.ts:1" || override.GetRange() != callRange {
+		t.Fatalf("baseline evidence was not preserved: %+v", result)
+	}
+	if len(override.GetContexts()) != 2 || override.GetContexts()[0] != enclosing {
+		t.Fatalf("baseline contexts were not preserved: %+v", override.GetContexts())
+	}
+	selected := override.GetContexts()[1].GetCallableClause()
+	if selected.GetRole() != beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_SELECTED_TARGET ||
+		selected.GetSignature().GetText() != "value(input: number): number;" ||
+		selected.GetSignature().GetRange().GetStart().GetCharacter() != 2 ||
+		selected.GetSignature().GetRange().GetEnd().GetCharacter() != 31 ||
+		selected.GetDefinitionRange().GetStart().GetLine() != 2 ||
+		selected.GetDefinitionRange().GetEnd().GetCharacter() != 31 {
+		t.Fatalf("unexpected selected overload: %+v", selected)
+	}
+}
+
+func TestSelectedTargetContextPreservesMultilineDefinitionHead(t *testing.T) {
+	signatureRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: 0},
+		End:   &beholderv1.SourcePosition{Line: 2, Character: 10},
+	}
+	definitionRange := &beholderv1.SourceRange{
+		Start: &beholderv1.SourcePosition{Line: 0},
+		End:   &beholderv1.SourcePosition{Line: 4, Character: 1},
+	}
+	declaration := &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{
+			Role: beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_DECLARATION,
+			Signature: &beholderv1.SourceExcerpt{
+				Text:  "export function value(\n  input: string,\n): string",
+				Range: signatureRange,
+			},
+			DefinitionRange: definitionRange,
+		},
+	}}
+
+	selected, err := selectedTargetContext([]*beholderv1.EvidenceContext{declaration}, lspRange{
+		Start: position{Line: 0},
+		End:   position{Line: 4, Character: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clause := selected.GetCallableClause()
+	if clause.GetRole() != beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_SELECTED_TARGET ||
+		clause.GetSignature().GetText() != declaration.GetCallableClause().GetSignature().GetText() ||
+		clause.GetSignature().GetRange() != signatureRange ||
+		clause.GetDefinitionRange() != definitionRange {
+		t.Fatalf("unexpected multiline selected target: %+v", clause)
+	}
+	selected, err = selectedTargetContext([]*beholderv1.EvidenceContext{declaration}, lspRange{
+		Start: position{Line: 0},
+		End:   position{Line: 3},
+	})
+	if err != nil || selected != nil {
+		t.Fatalf("inexact range produced selected target: %+v, %v", selected, err)
+	}
+}
+
+func TestAnalyzeSnapshotDoesNotOverrideAmbiguousCompilerDefinitions(t *testing.T) {
+	root := t.TempDir()
+	caller := "counter.value();\n"
+	target := "export class Counter { value() {} }\n"
+	writeTestFile(t, root, "src/caller.ts", caller, 0o644)
+	writeTestFile(t, root, "src/target.ts", target, 0o644)
+	t.Setenv("BEHOLDER_TYPESCRIPT_AMBIGUOUS_DEFINITION", "1")
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 7.0.2'; else BEHOLDER_TYPESCRIPT_LSP_HELPER=1 BEHOLDER_TYPESCRIPT_TARGET_URI='%s' exec '%s' -test.run=TestDefinitionUsesStandardLSP; fi\n", fileURI(filepath.Join(root, "src", "target.ts")), strings.ReplaceAll(os.Args[0], "'", "'\\''"))
+	writeTestFile(t, root, "node_modules/.bin/tsc", script, 0o755)
+	start := uint32(strings.Index(caller, "value"))
+	snapshot := &analysisSnapshot{
+		workspace: "test",
+		repositories: map[string]*repositorySnapshot{"example": {
+			identity: "example", base: root, target: true,
+			inputs: map[string][]byte{"src/caller.ts": []byte(caller), "src/target.ts": []byte(target)},
+		}},
+		entities: map[string]bool{"repo://example/typescript/src/target/Counter/value": true},
+		candidates: []*workerv1.SemanticCandidate{{
+			Id: "candidate", Repository: "example",
+			Span: &workerv1.SourceSpan{Path: "src/caller.ts", Start: &workerv1.SourcePosition{Character: start}},
+		}},
+	}
+
+	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"], nil)
+
+	if len(result.overrides) != 0 || len(result.diagnostics) != 1 || result.diagnostics[0].GetCode() != "typescript.compiler.definition_ambiguous" {
+		t.Fatalf("ambiguous definitions should not produce an override: %+v", result)
+	}
+}
+
+func TestAnalyzeSnapshotHeuristicOverrideHasNoSelectedTarget(t *testing.T) {
+	root := t.TempDir()
+	caller := "counter.value();\n"
+	target := "export class Counter { value() {} }\n"
+	writeTestFile(t, root, "src/caller.ts", caller, 0o644)
+	writeTestFile(t, root, "src/target.ts", target, 0o644)
+	t.Setenv("BEHOLDER_TYPESCRIPT_SYMBOL_MISMATCH", "1")
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 7.0.2'; else BEHOLDER_TYPESCRIPT_LSP_HELPER=1 BEHOLDER_TYPESCRIPT_TARGET_URI='%s' exec '%s' -test.run=TestDefinitionUsesStandardLSP; fi\n", fileURI(filepath.Join(root, "src", "target.ts")), strings.ReplaceAll(os.Args[0], "'", "'\\''"))
+	writeTestFile(t, root, "node_modules/.bin/tsc", script, 0o755)
+	start := uint32(strings.Index(caller, "value"))
+	baseline := &beholderv1.EvidenceContext{Context: &beholderv1.EvidenceContext_CallableClause{
+		CallableClause: &beholderv1.CallableClauseContext{Role: beholderv1.CallableClauseRole_CALLABLE_CLAUSE_ROLE_ENCLOSING},
+	}}
+	snapshot := &analysisSnapshot{
+		workspace: "test",
+		repositories: map[string]*repositorySnapshot{"example": {
+			identity: "example", base: root, target: true,
+			inputs: map[string][]byte{"src/caller.ts": []byte(caller), "src/target.ts": []byte(target)},
+		}},
+		entities: map[string]bool{"repo://example/typescript/src/target/Counter/value": true},
+		candidates: []*workerv1.SemanticCandidate{{
+			Id: "candidate", Repository: "example", Evidence: "src/caller.ts:1",
+			Span:     &workerv1.SourceSpan{Path: "src/caller.ts", Start: &workerv1.SourcePosition{Character: start}},
+			Contexts: []*beholderv1.EvidenceContext{baseline},
+		}},
+	}
+
+	result := analyzeSnapshot(context.Background(), snapshot, snapshot.repositories["example"], nil)
+
+	if len(result.diagnostics) != 0 || len(result.overrides) != 1 {
+		t.Fatalf("unexpected heuristic result: %+v", result)
+	}
+	if contexts := result.overrides[0].GetContexts(); len(contexts) != 1 || contexts[0] != baseline {
+		t.Fatalf("heuristic resolution added selected-target context: %+v", contexts)
 	}
 }
 
@@ -266,6 +416,21 @@ func runLSPHelper() {
 		}
 		switch message.Method {
 		case "initialize":
+			if os.Getenv("BEHOLDER_TYPESCRIPT_EXPECT_HIERARCHICAL_SYMBOLS") == "1" {
+				var params struct {
+					Capabilities struct {
+						TextDocument struct {
+							DocumentSymbol struct {
+								Hierarchical bool `json:"hierarchicalDocumentSymbolSupport"`
+							} `json:"documentSymbol"`
+						} `json:"textDocument"`
+					} `json:"capabilities"`
+				}
+				if json.Unmarshal(message.Params, &params) != nil || !params.Capabilities.TextDocument.DocumentSymbol.Hierarchical {
+					writeHelperMessage(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32602, "message": "missing hierarchical document symbol capability"}})
+					continue
+				}
+			}
 			count, _ := strconv.Atoi(os.Getenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST"))
 			for range count {
 				writeHelperMessage(map[string]any{
@@ -295,16 +460,24 @@ func runLSPHelper() {
 			if target == "" {
 				target = "file:///repo/src/target.ts"
 				startLine, startCharacter, endCharacter = 2, 4, 10
+			} else {
+				startLine = helperInt("BEHOLDER_TYPESCRIPT_TARGET_LINE", startLine)
+				startCharacter = helperInt("BEHOLDER_TYPESCRIPT_TARGET_CHARACTER", startCharacter)
+				endCharacter = helperInt("BEHOLDER_TYPESCRIPT_TARGET_END_CHARACTER", endCharacter)
+			}
+			locations := []map[string]any{{
+				"targetUri": target,
+				"targetSelectionRange": map[string]any{
+					"start": map[string]int{"line": startLine, "character": startCharacter},
+					"end":   map[string]int{"line": startLine, "character": endCharacter},
+				},
+			}}
+			if os.Getenv("BEHOLDER_TYPESCRIPT_AMBIGUOUS_DEFINITION") == "1" {
+				locations = append(locations, locations[0])
 			}
 			writeHelperMessage(map[string]any{
 				"jsonrpc": "2.0", "id": message.ID,
-				"result": []map[string]any{{
-					"targetUri": target,
-					"targetSelectionRange": map[string]any{
-						"start": map[string]int{"line": startLine, "character": startCharacter},
-						"end":   map[string]int{"line": startLine, "character": endCharacter},
-					},
-				}},
+				"result": locations,
 			})
 		case "textDocument/didOpen":
 			var params struct {
@@ -316,11 +489,18 @@ func runLSPHelper() {
 				return
 			}
 		case "textDocument/documentSymbol":
+			startLine := helperInt("BEHOLDER_TYPESCRIPT_TARGET_LINE", 0)
+			startCharacter := helperInt("BEHOLDER_TYPESCRIPT_TARGET_CHARACTER", 23)
+			endCharacter := helperInt("BEHOLDER_TYPESCRIPT_TARGET_END_CHARACTER", 28)
+			symbolEndCharacter := helperInt("BEHOLDER_TYPESCRIPT_SYMBOL_END_CHARACTER", endCharacter+5)
+			if os.Getenv("BEHOLDER_TYPESCRIPT_SYMBOL_MISMATCH") == "1" {
+				startCharacter++
+			}
 			writeHelperMessage(map[string]any{
 				"jsonrpc": "2.0", "id": message.ID,
 				"result": []map[string]any{{
-					"name": "Counter", "range": testRange(0, 7, 0, 37), "selectionRange": testRange(0, 13, 0, 20),
-					"children": []map[string]any{{"name": "value", "range": testRange(0, 23, 0, 33), "selectionRange": testRange(0, 23, 0, 28)}},
+					"name": "Counter", "range": testRange(0, 7, startLine+1, endCharacter), "selectionRange": testRange(0, 13, 0, 20),
+					"children": []map[string]any{{"name": "value", "range": testRange(startLine, startCharacter, startLine, symbolEndCharacter), "selectionRange": testRange(startLine, startCharacter, startLine, endCharacter)}},
 				}},
 			})
 		case "shutdown":
@@ -328,6 +508,14 @@ func runLSPHelper() {
 			return
 		}
 	}
+}
+
+func helperInt(name string, fallback int) int {
+	value, err := strconv.Atoi(os.Getenv(name))
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func testRange(startLine, startCharacter, endLine, endCharacter int) map[string]any {

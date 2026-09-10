@@ -3,11 +3,14 @@ use super::{
     model::{Call, TypescriptAnalysis},
 };
 use beholder_domain::{
-    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation,
+    AnalysisDiagnostic, AnalysisDiagnosticSeverity, Confidence, DependencyRelation, Evidence,
     GrpcBindingCandidate, GrpcBindingRole, Observation, Provenance, RpcCardinality,
     SemanticRelation,
 };
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+};
 
 fn capitalize(name: &str) -> String {
     let mut name = name.to_owned();
@@ -33,7 +36,7 @@ fn grpc_method(call: &Call, class: &str, handler: &str) -> Option<Result<(String
 }
 
 fn matching_service<'a>(
-    generated: &'a [GeneratedGrpcMethod<'_>],
+    generated: &'a [GeneratedGrpcMethod],
     short_service: &str,
     source_method: &str,
 ) -> BTreeSet<&'a str> {
@@ -49,7 +52,7 @@ fn matching_service<'a>(
 }
 
 fn matching_rpc<'a>(
-    generated: &'a [GeneratedGrpcMethod<'_>],
+    generated: &'a [GeneratedGrpcMethod],
     short_service: &str,
     method: &str,
 ) -> BTreeSet<&'a str> {
@@ -94,8 +97,7 @@ fn candidate(
     role: GrpcBindingRole,
     service: &str,
     method: &str,
-    path: &Path,
-    line: usize,
+    evidence: Evidence,
 ) -> GrpcBindingCandidate {
     GrpcBindingCandidate {
         local_symbol: local_symbol.into(),
@@ -103,7 +105,7 @@ fn candidate(
         service: service.into(),
         method: method.into(),
         cardinality: RpcCardinality::Unary,
-        evidence: format!("{}:{line}", path.display()).into(),
+        evidence,
         confidence: Confidence::Exact,
         provenance: Provenance::Ast,
     }
@@ -112,12 +114,12 @@ fn candidate(
 pub(super) fn bindings(
     repository: &str,
     sources: &[(&Path, &TypescriptAnalysis)],
-    generated: &[GeneratedGrpcMethod<'_>],
+    generated: &[GeneratedGrpcMethod],
     observations: &[Observation],
 ) -> (Vec<GrpcBindingCandidate>, Vec<AnalysisDiagnostic>) {
     let mut candidates = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut emitted = BTreeSet::new();
+    let mut emitted = HashSet::new();
     for (path, analysis) in sources {
         let module = module_id(repository, path, analysis);
         for definition in &analysis.definitions {
@@ -165,15 +167,15 @@ pub(super) fn bindings(
                     continue;
                 }
                 let local_symbol = format!("{module}/{}", definition.qualified_name);
-                if emitted.insert((local_symbol.clone(), "server", method.clone())) {
-                    candidates.push(candidate(
-                        &local_symbol,
-                        GrpcBindingRole::Server,
-                        matches.first().expect("exactly one service matched"),
-                        &method,
-                        path,
-                        call.line,
-                    ));
+                let binding = candidate(
+                    &local_symbol,
+                    GrpcBindingRole::Server,
+                    matches.first().expect("exactly one service matched"),
+                    &method,
+                    call.evidence(path),
+                );
+                if emitted.insert(binding.clone()) {
+                    candidates.push(binding);
                 }
             }
 
@@ -204,19 +206,15 @@ pub(super) fn bindings(
                         })
                         .expect("matched generated method exists");
                     let local_symbol = format!("{module}/{}", method.qualified_name);
-                    if emitted.insert((
-                        local_symbol.clone(),
-                        "server",
-                        generated_method.method.clone(),
-                    )) {
-                        candidates.push(candidate(
-                            &local_symbol,
-                            GrpcBindingRole::Server,
-                            &generated_method.service,
-                            &generated_method.method,
-                            path,
-                            call.line,
-                        ));
+                    let binding = candidate(
+                        &local_symbol,
+                        GrpcBindingRole::Server,
+                        &generated_method.service,
+                        &generated_method.method,
+                        call.evidence(path),
+                    );
+                    if emitted.insert(binding.clone()) {
+                        candidates.push(binding);
                     }
                 }
             }
@@ -282,17 +280,15 @@ pub(super) fn bindings(
                                 == SemanticRelation::Dependency(DependencyRelation::Calls)
                                 && observation.to.as_str() == local_symbol
                         });
-                        if used
-                            && emitted.insert((local_symbol.clone(), "client", rpc_method.clone()))
-                        {
-                            candidates.push(candidate(
-                                &local_symbol,
-                                GrpcBindingRole::Client,
-                                service,
-                                &rpc_method,
-                                path,
-                                call.line,
-                            ));
+                        let binding = candidate(
+                            &local_symbol,
+                            GrpcBindingRole::Client,
+                            service,
+                            &rpc_method,
+                            call.evidence(path),
+                        );
+                        if used && emitted.insert(binding.clone()) {
+                            candidates.push(binding);
                         }
                     }
                 }
@@ -385,7 +381,7 @@ mod tests {
             class CheckoutClient {
               private proxy: CheckoutProxy;
               onModuleInit() {
-                this.proxy = this.client.getService<CheckoutProxy>('RPCService');
+                this.proxy = enabled ? this.client.getService<CheckoutProxy>('RPCService') : existing;
               }
               run() { return this.proxy.initializeOrder({}); }
             }
@@ -420,11 +416,75 @@ mod tests {
         assert!(bindings.iter().any(|binding| {
             binding.local_symbol.as_str() == proxy && binding.role == GrpcBindingRole::Client
         }));
+        let client_binding = bindings
+            .iter()
+            .find(|binding| binding.local_symbol.as_str() == proxy)
+            .unwrap();
+        assert!(
+            client_binding
+                .evidence
+                .decode()
+                .contexts
+                .iter()
+                .any(|context| matches!(
+                    context,
+                    beholder_domain::EvidenceContext::ConditionArm {
+                        construct: beholder_domain::ConditionConstruct::Ternary,
+                        ..
+                    }
+                ))
+        );
         assert!(bindings.iter().any(|binding| {
             binding.local_symbol.as_str()
                 == "repo://example/typescript/src/checkout/CheckoutController/initializeOrder"
                 && binding.role == GrpcBindingRole::Server
         }));
+    }
+
+    #[test]
+    fn preserves_distinct_client_binding_evidence_and_collapses_duplicates() {
+        let generated = generated();
+        let source = analyze(
+            r#"
+            interface CheckoutProxy {
+              initializeOrder(request: Request): Observable<Response>;
+            }
+            class CheckoutClient {
+              primary() { this.client.getService<CheckoutProxy>('RPCService'); }
+              fallback() { this.client.getService<CheckoutProxy>('RPCService'); }
+              run() { return this.proxy.initializeOrder({}); }
+            }
+            "#,
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let generated = ts_proto::grpc_methods(
+            "example",
+            &[(Path::new("generated/checkout.ts"), &generated)],
+        );
+        let proxy = "repo://example/typescript/src/checkout/CheckoutProxy/initializeOrder";
+        let observations = vec![Observation::dependency(
+            "repo://example/typescript/src/checkout/CheckoutClient/run",
+            DependencyRelation::Calls,
+            proxy,
+            "src/checkout.ts:7",
+        )];
+        let sources = [
+            (Path::new("src/checkout.ts"), &source),
+            (Path::new("src/checkout.ts"), &source),
+        ];
+
+        let (bindings, diagnostics) = bindings("example", &sources, &generated, &observations);
+        let client_bindings = bindings
+            .iter()
+            .filter(|binding| {
+                binding.local_symbol.as_str() == proxy && binding.role == GrpcBindingRole::Client
+            })
+            .collect::<Vec<_>>();
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(client_bindings.len(), 2);
+        assert_ne!(client_bindings[0].evidence, client_bindings[1].evidence);
     }
 
     #[test]

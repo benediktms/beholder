@@ -23,7 +23,7 @@ impl Plugin<TypescriptLanguage> for TsProtoPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "typescript.ts-proto".into(),
-            version: "3".into(),
+            version: "4".into(),
         }
     }
 
@@ -99,7 +99,7 @@ impl Plugin<TypescriptLanguage> for NestjsPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "typescript.nestjs".into(),
-            version: "2".into(),
+            version: "3".into(),
         }
     }
 
@@ -227,11 +227,11 @@ mod tests {
         let active = plugins.activate(&repository, true);
         assert_eq!(
             active.identity(),
-            "17:typescript.nestjs1:219:typescript.ts-proto1:3"
+            "17:typescript.nestjs1:319:typescript.ts-proto1:4"
         );
         assert_eq!(
             plugins.source_identity(&active),
-            "17:typescript.nestjs1:219:typescript.ts-proto1:3"
+            "17:typescript.nestjs1:319:typescript.ts-proto1:4"
         );
         let evidence = active
             .plugins()

@@ -25,7 +25,7 @@ impl Plugin<CsharpLanguage> for DotnetDiPlugin {
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
             id: "csharp.dotnet-di".into(),
-            version: "1".into(),
+            version: "2".into(),
         }
     }
 
@@ -211,6 +211,7 @@ mod tests {
         );
         let plugin = active.plugins().next().unwrap();
         assert_eq!(plugin.metadata.id, "csharp.dotnet-di");
+        assert_eq!(plugin.metadata.version, "2");
         assert_eq!(plugins.source_identity(&active), "");
         assert_eq!(plugin.activation.path, PathBuf::from("src/App.csproj"));
         assert_eq!(

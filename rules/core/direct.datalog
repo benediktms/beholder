@@ -182,9 +182,9 @@ effective_observation[from, to, relation, evidence, confidence, provenance] :=
     not overridden[from, relation, to, evidence]
 
 effective_observation[from, resolved_to, relation, evidence, confidence, provenance] :=
-    baseline_observation[from, relation, unresolved_to, evidence],
+    baseline_observation[from, relation, unresolved_to, _],
     dependency_override[
-        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
+        from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
     ]
 
 effective_observation[from, to, relation, evidence, confidence, provenance] :=
@@ -264,9 +264,9 @@ direct[from, to, relation, evidence, confidence, provenance] :=
     base_direct[from, to, relation, evidence, confidence, provenance]
 
 direct[from, resolved_to, relation, evidence, confidence, provenance] :=
-    baseline_observation[from, relation, unresolved_to, evidence],
+    baseline_observation[from, relation, unresolved_to, _],
     enrichment_dependency_override[
-        from, relation, unresolved_to, resolved_to, _, confidence, provenance,
+        from, relation, unresolved_to, resolved_to, evidence, confidence, provenance,
     ],
     not base_dependency_override[from, relation, unresolved_to, _, _, _, _]
 

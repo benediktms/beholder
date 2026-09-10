@@ -1673,6 +1673,10 @@ mod tests {
             confidence: Confidence::Inferred,
             provenance: Provenance::UniqueNameHeuristic,
         };
+        let second_enrichment_override = DependencyOverride {
+            evidence: "src/lib.rs:4".into(),
+            ..enrichment_override.clone()
+        };
         let losing_enrichment_override = DependencyOverride {
             from: source.into(),
             relation: DependencyRelation::Calls,
@@ -1742,6 +1746,7 @@ mod tests {
                     ],
                     overrides: &[
                         enrichment_override,
+                        second_enrichment_override,
                         losing_enrichment_override,
                         state_override,
                     ],
@@ -1904,7 +1909,7 @@ mod tests {
                 .unwrap()
                 .evidence
                 .len(),
-            3
+            1
         );
         assert!(
             store

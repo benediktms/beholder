@@ -353,6 +353,7 @@ fn build_fact_shards<'a>(
                 digest.update(observation.from.as_str().as_bytes());
                 digest.update(observation.relation.as_str().as_bytes());
                 digest.update(observation.to.as_str().as_bytes());
+                digest.update(observation.evidence.as_str().as_bytes());
                 digest.update(observation.confidence.score().to_le_bytes());
                 digest.update(observation.provenance.as_str().as_bytes());
             }
@@ -436,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn rustfmt_changes_do_not_change_fact_shard_versions() {
+    fn source_range_changes_advance_fact_shard_versions() {
         let cache = std::env::temp_dir().join(format!(
             "beholder-rust-shard-version-test-{}",
             std::process::id()
@@ -483,11 +484,11 @@ mod tests {
             compact.keys().collect::<Vec<_>>(),
             formatted.keys().collect::<Vec<_>>()
         );
-        assert!(
-            compact
-                .iter()
-                .all(|(owner, shard)| { shard.version == formatted[owner].version })
-        );
+        let main = compact
+            .keys()
+            .find(|owner| owner.as_str().ends_with("/main"))
+            .unwrap();
+        assert_ne!(compact[main].version, formatted[main].version);
         fs::remove_dir_all(cache).unwrap();
     }
 }

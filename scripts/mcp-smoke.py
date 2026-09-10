@@ -1,13 +1,29 @@
 #!/usr/bin/env python3
-import json
+import argparse
 import copy
+import json
 import select
 import subprocess
 import sys
 import time
 
 
-binary, workspace, query, expected_entity, *expected_nodes = sys.argv[1:]
+parser = argparse.ArgumentParser()
+parser.add_argument("--max-hops", type=int, default=1)
+parser.add_argument("--repository")
+parser.add_argument("--evidence-target")
+parser.add_argument("--legacy-target")
+parser.add_argument("binary")
+parser.add_argument("workspace")
+parser.add_argument("query")
+parser.add_argument("expected_entity")
+parser.add_argument("expected_nodes", nargs="*")
+arguments = parser.parse_args()
+binary = arguments.binary
+workspace = arguments.workspace
+query = arguments.query
+expected_entity = arguments.expected_entity
+expected_nodes = arguments.expected_nodes
 process = subprocess.Popen(
     [binary],
     stdin=subprocess.PIPE,
@@ -81,7 +97,86 @@ def call(name, arguments):
     result = send("tools/call", {"name": name, "arguments": arguments})
     if result.get("isError"):
         raise RuntimeError(result.get("structuredContent", result.get("content")))
-    return result["structuredContent"]
+    structured = result["structuredContent"]
+    content = result.get("content", [])
+    if len(content) != 1 or content[0].get("type") != "text":
+        raise AssertionError(f"tool result omitted raw JSON content: {result}")
+    if json.loads(content[0]["text"]) != structured:
+        raise AssertionError("raw and structured tool results disagree")
+    return structured
+
+
+def assert_structured_evidence(result, target):
+    edges = [
+        edge
+        for edge in result["edges"]
+        if edge["kind"] == "calls" and edge["to"] == target
+    ]
+    if len(edges) != 1:
+        raise AssertionError(f"expected one calls edge to {target!r}: {edges}")
+    evidence = edges[0]["evidence"]
+    if len(evidence) != 2:
+        raise AssertionError(f"parallel call evidence collapsed: {evidence}")
+    if any(item["range"] is None for item in evidence):
+        raise AssertionError(f"structured call range was not preserved: {evidence}")
+    if len({json.dumps(item["range"], sort_keys=True) for item in evidence}) != 2:
+        raise AssertionError(f"parallel call ranges were not distinct: {evidence}")
+    if len({json.dumps(item["contexts"], sort_keys=True) for item in evidence}) != 2:
+        raise AssertionError(f"parallel call contexts were not distinct: {evidence}")
+
+    nested = False
+    for item in evidence:
+        contexts = item["contexts"]
+        if (
+            not contexts
+            or contexts[0].get("kind") != "callable_clause"
+            or contexts[0].get("role") != "enclosing"
+        ):
+            raise AssertionError(f"enclosing callable context was not first: {contexts}")
+        lexical_end = len(contexts)
+        if (
+            contexts[-1].get("kind") == "callable_clause"
+            and contexts[-1].get("role") == "selected_target"
+        ):
+            lexical_end -= 1
+        lexical = contexts[1:lexical_end]
+        if any(
+            context["kind"] not in {"condition_arm", "pattern_arm"}
+            for context in lexical
+        ):
+            raise AssertionError(
+                f"lexical contexts were not ordered between callable contexts: {contexts}"
+            )
+        ranges = [context["arm_range"] for context in lexical] + [item["range"]]
+        for outer, inner in zip(ranges, ranges[1:]):
+            outer_start = (outer["start"]["line"], outer["start"]["character"])
+            outer_end = (outer["end"]["line"], outer["end"]["character"])
+            inner_start = (inner["start"]["line"], inner["start"]["character"])
+            inner_end = (inner["end"]["line"], inner["end"]["character"])
+            if not outer_start <= inner_start <= inner_end <= outer_end:
+                raise AssertionError(f"lexical contexts were not outer-first: {contexts}")
+        nested |= len(lexical) >= 2
+    if not nested:
+        raise AssertionError(f"no call retained nested lexical contexts: {evidence}")
+
+
+def assert_legacy_evidence(result, target):
+    evidence = [
+        item
+        for edge in result["edges"]
+        if edge["to"] == target
+        for item in edge["evidence"]
+    ]
+    legacy = [item for item in evidence if item["range"] is None and item["contexts"] == []]
+    if len(legacy) != 1:
+        raise AssertionError(
+            f"expected one unmodified legacy evidence record for {target!r}: {evidence}"
+        )
+    required = {"source", "repository", "path", "line", "range", "detail", "contexts"}
+    if not required <= legacy[0].keys():
+        raise AssertionError(f"legacy evidence fields were not projected: {legacy[0]}")
+    if not legacy[0]["path"] or legacy[0]["line"] is None:
+        raise AssertionError(f"legacy location fields were not projected: {legacy[0]}")
 
 
 try:
@@ -125,7 +220,7 @@ try:
         "workspace": workspace,
         "start": entity["id"],
         "direction": "dependencies",
-        "max_hops": 1,
+        "max_hops": arguments.max_hops,
     }
     first_traversal = canonical_traversal_result(call("traverse_graph", traversal_input))
     detailed_traversal = canonical_traversal_result(call(
@@ -137,7 +232,9 @@ try:
     for expected in expected_nodes:
         if expected not in node_ids:
             raise AssertionError(f"traversal did not contain {expected!r}")
-    repository = entity["id"].removeprefix("repo://").split("/rust/", 1)[0]
+    repository = arguments.repository or entity["id"].removeprefix("repo://").split(
+        "/rust/", 1
+    )[0]
     filtered = call("traverse_graph", {
         **traversal_input,
         "target_repositories": [repository],
@@ -153,6 +250,10 @@ try:
     traversal_ms = (time.perf_counter() - started) * 1000
     if first_search != second_search or first_traversal != second_traversal:
         raise AssertionError("daemon ordering or metadata changed between warm calls")
+    if arguments.evidence_target:
+        assert_structured_evidence(second_traversal, arguments.evidence_target)
+    if arguments.legacy_target:
+        assert_legacy_evidence(second_traversal, arguments.legacy_target)
     failed = send(
         "tools/call",
         {
