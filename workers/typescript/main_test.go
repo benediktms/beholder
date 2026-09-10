@@ -34,6 +34,7 @@ func TestDefinitionUsesStandardLSP(t *testing.T) {
 	t.Setenv("BEHOLDER_TYPESCRIPT_EXPECT_MEMORY_LIMIT", "4GiB")
 	t.Setenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST", "65")
 	t.Setenv("BEHOLDER_TYPESCRIPT_SERVER_REQUEST", "1")
+	t.Setenv("BEHOLDER_TYPESCRIPT_EXPECT_HIERARCHICAL_SYMBOLS", "1")
 	t.Setenv("GOMEMLIMIT", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -415,6 +416,21 @@ func runLSPHelper() {
 		}
 		switch message.Method {
 		case "initialize":
+			if os.Getenv("BEHOLDER_TYPESCRIPT_EXPECT_HIERARCHICAL_SYMBOLS") == "1" {
+				var params struct {
+					Capabilities struct {
+						TextDocument struct {
+							DocumentSymbol struct {
+								Hierarchical bool `json:"hierarchicalDocumentSymbolSupport"`
+							} `json:"documentSymbol"`
+						} `json:"textDocument"`
+					} `json:"capabilities"`
+				}
+				if json.Unmarshal(message.Params, &params) != nil || !params.Capabilities.TextDocument.DocumentSymbol.Hierarchical {
+					writeHelperMessage(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32602, "message": "missing hierarchical document symbol capability"}})
+					continue
+				}
+			}
 			count, _ := strconv.Atoi(os.Getenv("BEHOLDER_TYPESCRIPT_NOTIFICATION_BURST"))
 			for range count {
 				writeHelperMessage(map[string]any{

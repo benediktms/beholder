@@ -232,8 +232,11 @@ func (c *client) initialize(ctx context.Context, root string) error {
 		"processId": os.Getpid(),
 		"rootUri":   rootURI,
 		"capabilities": map[string]any{
-			"textDocument": map[string]any{"definition": map[string]any{}},
-			"window":       map[string]any{"workDoneProgress": false},
+			"textDocument": map[string]any{
+				"definition":     map[string]any{},
+				"documentSymbol": map[string]any{"hierarchicalDocumentSymbolSupport": true},
+			},
+			"window": map[string]any{"workDoneProgress": false},
 		},
 		"workspaceFolders": []map[string]string{{"uri": rootURI, "name": filepath.Base(root)}},
 	}, &result); err != nil {
