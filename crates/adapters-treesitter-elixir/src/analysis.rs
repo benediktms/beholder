@@ -475,14 +475,31 @@ fn collect_calls(
     calls: &mut Vec<ElixirCall>,
 ) {
     if node.kind() == "anonymous_function" {
+        let directly_invoked = node.parent().is_some_and(|parent| {
+            let mut ancestor = Some(parent);
+            while let Some(current) = ancestor {
+                if current.kind() == "call" {
+                    return current.child_by_field_name("target").is_some_and(|target| {
+                        target.start_byte() <= node.start_byte()
+                            && target.end_byte() >= node.end_byte()
+                    });
+                }
+                ancestor = current.parent();
+            }
+            false
+        });
         let mut cursor = node.walk();
         for clause in node
             .named_children(&mut cursor)
             .filter(|child| child.kind() == "stab_clause")
         {
-            let contexts = callable_clause(clause, source, CallableClauseRole::Enclosing)
-                .into_iter()
-                .collect::<Vec<_>>();
+            let contexts = if directly_invoked {
+                contexts.to_vec()
+            } else {
+                callable_clause(clause, source, CallableClauseRole::Enclosing)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
             if let Some(body) = clause.child_by_field_name("right") {
                 collect_calls(body, source, struct_bindings, &contexts, calls);
             }
@@ -1940,6 +1957,38 @@ mod recovery_tests {
             [EvidenceContext::CallableClause { signature, .. }, EvidenceContext::ConditionArm { .. }]
                 if call.name == "nested_cond_hit" && signature.text == "input"
         )));
+    }
+
+    #[test]
+    fn directly_invoked_anonymous_functions_keep_outer_arm_context() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  _ -> (fn -> helper() end).()
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let call = analysis.modules[0].functions[0]
+            .calls
+            .iter()
+            .find(|call| call.name == "helper")
+            .unwrap();
+        assert!(
+            matches!(
+                call.contexts.as_slice(),
+                [
+                    EvidenceContext::CallableClause { .. },
+                    EvidenceContext::PatternArm { .. }
+                ]
+            ),
+            "contexts: {:?}",
+            call.contexts
+        );
     }
 
     #[test]

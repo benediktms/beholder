@@ -109,6 +109,10 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     Enum.reduce(clauses, index, &walk_anonymous_clause(&1, state, &2))
   end
 
+  defp walk({{:., _dot_meta, [{:fn, _fn_meta, clauses}]}, _meta, []}, state, index) do
+    Enum.reduce(clauses, index, &walk_anonymous_clause_with_context(&1, state, &2))
+  end
+
   defp walk({name, meta, arguments} = call, state, index)
        when is_atom(name) and is_list(meta) and is_list(arguments) do
     index = if name in @non_calls, do: index, else: record_call(call, meta, state, index)
@@ -175,6 +179,11 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
   defp walk_anonymous_clause({:->, meta, [patterns, body]}, state, index) do
     context = anonymous_clause_context(meta, patterns, body, state)
     state = %{state | contexts: if(context, do: [context], else: [])}
+    index = walk(patterns, state, index)
+    walk(body, state, index)
+  end
+
+  defp walk_anonymous_clause_with_context({:->, _meta, [patterns, body]}, state, index) do
     index = walk(patterns, state, index)
     walk(body, state, index)
   end
