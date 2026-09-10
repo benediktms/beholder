@@ -183,12 +183,12 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
     walk(body, state, index)
   end
 
+  defp walk_anonymous_clause(_clause, _state, index), do: index
+
   defp walk_anonymous_clause_with_context({:->, _meta, [patterns, body]}, state, index) do
     index = walk(patterns, state, index)
     walk(body, state, index)
   end
-
-  defp walk_anonymous_clause(_clause, _state, index), do: index
 
   defp record_call(call, meta, state, index) do
     with line when is_integer(line) <- meta[:line],
