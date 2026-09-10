@@ -256,6 +256,13 @@ fn is_directly_invoked_anonymous_callable(callable: Node<'_>, source: &[u8]) -> 
             "cast_expression" if parent.child_by_field_name("value") == Some(expression) => {
                 expression = parent;
             }
+            "postfix_unary_expression"
+                if parent
+                    .child(1)
+                    .is_some_and(|operator| operator.kind() == "!") =>
+            {
+                expression = parent;
+            }
             _ => break,
         }
     }
@@ -1081,11 +1088,13 @@ public sealed class Worker
         1 => ((System.Func<int>)(() => LambdaHit()))(),
         2 => ((System.Func<int>)delegate { return DelegateHit(); })(),
         3 => ((System.Func<int>)(() => ExplicitInvokeHit())).Invoke(),
+        4 => ((System.Func<int>)(() => NullForgivenHit()))!(),
         _ => (System.Func<int>)(() => Deferred())
     };
     int LambdaHit() => 1;
     int DelegateHit() => 2;
     int ExplicitInvokeHit() => 3;
+    int NullForgivenHit() => 4;
     int Deferred() => 3;
 }"#;
         let analysis = analyze(source).unwrap();
@@ -1108,6 +1117,7 @@ public sealed class Worker
         assert_eq!(switch_contexts("LambdaHit"), 1);
         assert_eq!(switch_contexts("DelegateHit"), 1);
         assert_eq!(switch_contexts("ExplicitInvokeHit"), 1);
+        assert_eq!(switch_contexts("NullForgivenHit"), 1);
         assert_eq!(switch_contexts("Deferred"), 0);
     }
 
