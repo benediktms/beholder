@@ -1980,7 +1980,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn diagnostic_cond_head_capture_fixture() {
+    fn excludes_cond_head_capture_from_clause_arm() {
         let analysis = analyze(
             r#"defmodule Example do
   def run(value) do
