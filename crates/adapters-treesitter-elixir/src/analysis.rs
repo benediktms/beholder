@@ -235,17 +235,20 @@ fn parsed_capture(node: Node<'_>, source: &[u8]) -> Option<ElixirCapture> {
 }
 
 fn directly_invoked_anonymous_function(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        let mut ancestor = Some(parent);
-        while let Some(current) = ancestor {
-            if current.kind() == "call" {
-                return current.child_by_field_name("target").is_some_and(|target| {
-                    target.start_byte() <= node.start_byte() && target.end_byte() >= node.end_byte()
-                });
-            }
-            ancestor = current.parent();
-        }
-        false
+    let mut target = node;
+    while let Some(parent) = target.parent().filter(|parent| {
+        parent.kind() == "block"
+            && parent.named_child_count() == 1
+            && parent.named_child(0) == Some(target)
+    }) {
+        target = parent;
+    }
+    target.parent().is_some_and(|dot| {
+        dot.kind() == "dot"
+            && dot.child_by_field_name("left") == Some(target)
+            && dot.parent().is_some_and(|call| {
+                call.kind() == "call" && call.child_by_field_name("target") == Some(dot)
+            })
     })
 }
 
@@ -2066,6 +2069,41 @@ mod recovery_tests {
             "contexts: {:?}",
             capture.contexts
         );
+    }
+
+    #[test]
+    fn anonymous_functions_nested_in_invoked_targets_remain_boundaries() {
+        let analysis = analyze(
+            r#"
+            defmodule Example do
+              def run(value) do
+                case value do
+                  _ -> (wrap(fn input -> callback = &captured_helper/1; helper(input); consume(callback, input) end)).(value)
+                end
+              end
+            end
+            "#,
+        )
+        .unwrap();
+        let function = &analysis.modules[0].functions[0];
+        let call = function
+            .calls
+            .iter()
+            .find(|call| call.name == "helper")
+            .unwrap();
+        assert!(matches!(
+            call.contexts.as_slice(),
+            [EvidenceContext::CallableClause { .. }]
+        ));
+        let capture = function
+            .captures
+            .iter()
+            .find(|capture| capture.name == "captured_helper")
+            .unwrap();
+        assert!(matches!(
+            capture.contexts.as_slice(),
+            [EvidenceContext::CallableClause { .. }]
+        ));
     }
 
     #[test]
