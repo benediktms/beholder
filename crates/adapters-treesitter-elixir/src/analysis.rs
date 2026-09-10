@@ -301,6 +301,12 @@ fn capture_contexts(
                 node = parent;
                 continue;
             };
+            if !(body.start_byte()..=body.end_byte()).contains(&node.start_byte())
+                || node.end_byte() > body.end_byte()
+            {
+                node = parent;
+                continue;
+            }
             arms.push(if call_target(selector, source) == Some("case") {
                 EvidenceContext::PatternArm {
                     construct: PatternConstruct::Case,
@@ -309,9 +315,7 @@ fn capture_contexts(
                         .and_then(|selector| source_excerpt(selector, source)),
                     pattern: head.and_then(|pattern| source_excerpt(pattern, source)),
                     guard: guard.and_then(|guard| source_excerpt(guard, source)),
-                    is_default: head
-                        .and_then(|pattern| text(pattern, source))
-                        .is_some_and(|pattern| pattern.trim() == "_"),
+                    is_default: false,
                     arm_range: source_range(body, source),
                 }
             } else {
@@ -596,9 +600,7 @@ fn collect_selection_calls(
                 selector: selector_node.and_then(|selector| source_excerpt(selector, source)),
                 pattern: head.and_then(|pattern| source_excerpt(pattern, source)),
                 guard: guard.and_then(|guard| source_excerpt(guard, source)),
-                is_default: head
-                    .and_then(|pattern| text(pattern, source))
-                    .is_some_and(|pattern| pattern.trim() == "_"),
+                is_default: false,
                 arm_range: source_range(body, source),
             }
         } else {
@@ -1730,7 +1732,11 @@ fn absinthe_resolver(
     let mut calls = Vec::new();
     let mut struct_bindings = BTreeMap::new();
     collect_struct_bindings(argument, source, &mut struct_bindings);
+    let mut definition_contexts = Vec::new();
     for clause in clauses {
+        if let Some(context) = callable_clause(clause, source, CallableClauseRole::Declaration) {
+            definition_contexts.push(context);
+        }
         let contexts = callable_clause(clause, source, CallableClauseRole::Enclosing)
             .into_iter()
             .collect::<Vec<_>>();
@@ -1773,7 +1779,7 @@ fn absinthe_resolver(
             interface_hash: [0; 32],
             body_hash: [0; 32],
             line,
-            definition_contexts: Vec::new(),
+            definition_contexts,
             calls,
             captures: Vec::new(),
             struct_uses,
@@ -1868,6 +1874,13 @@ mod recovery_tests {
             .iter()
             .find(|function| function.name == "__absinthe_result_result_resolver")
             .unwrap();
+        assert!(matches!(
+            function.definition_contexts.as_slice(),
+            [
+                EvidenceContext::CallableClause { role: CallableClauseRole::Declaration, signature, .. },
+                EvidenceContext::CallableClause { role: CallableClauseRole::Declaration, signature: second, .. }
+            ] if signature.text == "value" && second.text == "_"
+        ));
         assert!(function.calls.iter().any(|call| matches!(
             call.contexts.as_slice(),
             [EvidenceContext::CallableClause { signature, guard: None, .. }]
