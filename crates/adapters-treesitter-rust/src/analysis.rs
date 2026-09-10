@@ -235,7 +235,25 @@ fn lexical_contexts(
         if candidate == function {
             break;
         }
-        if matches!(candidate.kind(), "closure_expression" | "async_block") {
+        if candidate.kind() == "async_block"
+            || (candidate.kind() == "closure_expression"
+                && !candidate.parent().is_some_and(|parent| {
+                    let invoked = if parent.kind() == "parenthesized_expression" {
+                        parent.parent()
+                    } else {
+                        Some(parent)
+                    };
+                    invoked.is_some_and(|call| {
+                        call.kind() == "call_expression"
+                            && call.child_by_field_name("function")
+                                == Some(if parent.kind() == "parenthesized_expression" {
+                                    parent
+                                } else {
+                                    candidate
+                                })
+                    })
+                }))
+        {
             break;
         }
         match candidate.kind() {
@@ -1093,6 +1111,26 @@ mod recovery_tests {
         assert!(contexts("helper").is_empty());
         assert_eq!(contexts("inside_async"), [ConditionArmKind::Then]);
         assert!(contexts("async_helper").is_empty());
+    }
+
+    #[test]
+    fn preserves_selection_context_for_directly_invoked_closure() {
+        let source = r#"fn run() {
+    if enabled {
+        (|| helper())();
+        let callback = || deferred();
+    }
+}"#;
+        let contexts = |name| {
+            call_payload(source, name)
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(contexts("helper"), [ConditionArmKind::Then]);
+        assert!(contexts("deferred").is_empty());
     }
 
     #[test]
