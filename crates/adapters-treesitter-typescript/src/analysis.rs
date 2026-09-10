@@ -46,11 +46,13 @@ pub(super) fn deferred_callable(mut node: Node<'_>) -> bool {
     ) {
         return false;
     }
-    while node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "parenthesized_expression")
-    {
-        node = node.parent().expect("parenthesized callable has a parent");
+    while node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "parenthesized_expression" | "as_expression" | "type_assertion"
+        )
+    }) {
+        node = node.parent().expect("wrapped callable has a parent");
     }
     !node.parent().is_some_and(|parent| {
         parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node)
@@ -2351,23 +2353,28 @@ mod tests {
     #[test]
     fn direct_iifes_keep_ternary_contexts() {
         let observations = observations(
-            "function run() { return flag() ? (() => helper())() : fallback(); }",
+            r#"function run() {
+                flag() ? (((() => asserted()) as () => void))() : fallback();
+                flag() ? (<(() => void)>(() => cast()))() : fallback();
+            }"#,
             "src/run.ts",
         );
-        assert!(
-            call_evidence(&observations, "helper")
-                .evidence
-                .decode()
-                .contexts
-                .iter()
-                .any(|context| matches!(
-                    context,
-                    EvidenceContext::ConditionArm {
-                        construct: ConditionConstruct::Ternary,
-                        ..
-                    }
-                ))
-        );
+        for name in ["asserted", "cast"] {
+            assert!(
+                call_evidence(&observations, name)
+                    .evidence
+                    .decode()
+                    .contexts
+                    .iter()
+                    .any(|context| matches!(
+                        context,
+                        EvidenceContext::ConditionArm {
+                            construct: ConditionConstruct::Ternary,
+                            ..
+                        }
+                    ))
+            );
+        }
     }
 
     #[test]
