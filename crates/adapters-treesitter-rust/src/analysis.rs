@@ -238,19 +238,14 @@ fn lexical_contexts(
         if candidate.kind() == "async_block"
             || (candidate.kind() == "closure_expression"
                 && !candidate.parent().is_some_and(|parent| {
-                    let invoked = if parent.kind() == "parenthesized_expression" {
-                        parent.parent()
+                    let callable = if parent.kind() == "parenthesized_expression" {
+                        parent
                     } else {
-                        Some(parent)
+                        candidate
                     };
-                    invoked.is_some_and(|call| {
+                    callable.parent().is_some_and(|call| {
                         call.kind() == "call_expression"
-                            && call.child_by_field_name("function")
-                                == Some(if parent.kind() == "parenthesized_expression" {
-                                    parent
-                                } else {
-                                    candidate
-                                })
+                            && call.child_by_field_name("function") == Some(callable)
                     })
                 }))
         {
