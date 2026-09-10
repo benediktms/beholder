@@ -236,18 +236,7 @@ fn lexical_contexts(
             break;
         }
         if candidate.kind() == "async_block"
-            || (candidate.kind() == "closure_expression"
-                && !candidate.parent().is_some_and(|parent| {
-                    let callable = if parent.kind() == "parenthesized_expression" {
-                        parent
-                    } else {
-                        candidate
-                    };
-                    callable.parent().is_some_and(|call| {
-                        call.kind() == "call_expression"
-                            && call.child_by_field_name("function") == Some(callable)
-                    })
-                }))
+            || (candidate.kind() == "closure_expression" && !is_directly_invoked_closure(candidate))
         {
             break;
         }
@@ -260,6 +249,18 @@ fn lexical_contexts(
     }
     contexts.reverse();
     contexts
+}
+
+fn is_directly_invoked_closure(closure: Node<'_>) -> bool {
+    let mut callable = closure;
+    while let Some(parent) = callable.parent()
+        && parent.kind() == "parenthesized_expression"
+    {
+        callable = parent;
+    }
+    callable.parent().is_some_and(|call| {
+        call.kind() == "call_expression" && call.child_by_field_name("function") == Some(callable)
+    })
 }
 
 fn callable_context(
@@ -1115,6 +1116,24 @@ mod recovery_tests {
         (|| helper())();
         let callback = || deferred();
     }
+}"#;
+        let contexts = |name| {
+            call_payload(source, name)
+                .contexts
+                .iter()
+                .filter_map(condition_arm)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(contexts("helper"), [ConditionArmKind::Then]);
+        assert!(contexts("deferred").is_empty());
+    }
+
+    #[test]
+    fn preserves_selection_context_for_parenthesized_directly_invoked_closure() {
+        let source = r#"fn run() {
+    if enabled { (((|| helper())))(); }
+    let callback = || deferred();
 }"#;
         let contexts = |name| {
             call_payload(source, name)
