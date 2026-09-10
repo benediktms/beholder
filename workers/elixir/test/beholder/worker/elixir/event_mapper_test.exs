@@ -446,6 +446,7 @@ defmodule Beholder.Worker.Elixir.EventMapperTest do
 
     case_hit = Enum.find(observations, &String.ends_with?(&1.to, "/case_hit/0"))
     assert %{context: {:pattern_arm, arm}} = Enum.at(case_hit.contexts, 1)
+    refute arm.is_default
     assert arm.arm_range.start == source_position(3, 11)
     assert arm.arm_range.end == source_position(3, 30)
 
