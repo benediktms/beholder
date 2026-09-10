@@ -142,7 +142,7 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
            selector: selector,
            pattern: clause_excerpt(meta, pattern, :pattern, state),
            guard: clause_excerpt(meta, guard, :guard, state),
-           is_default: clause_text(meta, pattern, :pattern, state) == "_",
+           is_default: false,
            arm_range: arm_range(meta, body, state)
          }}
     }
@@ -328,13 +328,6 @@ defmodule Beholder.Worker.Elixir.SourceIndex do
         {pattern, guard} -> segment_excerpt(if(part == :guard, do: guard, else: pattern), state)
         nil -> nil
       end
-  end
-
-  defp clause_text(meta, ast, part, state) do
-    case clause_excerpt(meta, ast, part, state) do
-      nil -> nil
-      excerpt -> excerpt.text
-    end
   end
 
   defp clause_segment(meta, state) do
