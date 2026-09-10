@@ -1218,15 +1218,7 @@ fn definition(
     let mut factory_bindings = Vec::new();
     if let Some(body) = body {
         collect_calls(body, source, body, &mut calls);
-        if let Some(enclosing) =
-            callable_context(node, Some(body), source, CallableClauseRole::Enclosing)
-        {
-            for call in &mut calls {
-                call.contexts.insert(0, enclosing.clone());
-            }
-        }
     }
-    collect_decorator_calls(node, source, &mut calls);
     collect_bindings(collection_root, source, collection_root, &mut bindings);
     collect_alias_bindings(
         collection_root,
@@ -1277,6 +1269,15 @@ fn definition(
             collect_callback_evidence(callback, source, &mut definition);
         }
     }
+    if let Some(body) = body
+        && let Some(enclosing) =
+            callable_context(node, Some(body), source, CallableClauseRole::Enclosing)
+    {
+        for call in &mut definition.calls {
+            call.contexts.insert(0, enclosing.clone());
+        }
+    }
+    collect_decorator_calls(node, source, &mut definition.calls);
     definition
 }
 
@@ -2367,6 +2368,24 @@ mod tests {
                     }
                 ))
         );
+    }
+
+    #[test]
+    fn local_callback_return_calls_keep_enclosing_callable_context() {
+        let observations = observations(
+            "function helper() {} function build() { const batch = () => helper(); return new Loader(batch); }",
+            "src/run.ts",
+        );
+        let evidence = call_evidence(&observations, "helper").evidence.decode();
+
+        assert!(matches!(
+            evidence.contexts.first(),
+            Some(EvidenceContext::CallableClause {
+                role: CallableClauseRole::Enclosing,
+                signature: SourceExcerpt { text, .. },
+                ..
+            }) if text.starts_with("function build()")
+        ));
     }
 
     #[test]
