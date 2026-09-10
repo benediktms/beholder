@@ -259,7 +259,18 @@ fn is_immediately_awaited(async_block: Node<'_>) -> bool {
 }
 
 fn is_directly_invoked_closure(closure: Node<'_>) -> bool {
-    let callable = outermost_parenthesized(closure);
+    let mut callable = closure;
+    while let Some(parent) = callable.parent() {
+        if parent.kind() == "parenthesized_expression"
+            || (parent.kind() == "block"
+                && parent.named_child(parent.named_child_count().saturating_sub(1) as u32)
+                    == Some(callable))
+        {
+            callable = parent;
+        } else {
+            break;
+        }
+    }
     callable.parent().is_some_and(|call| {
         call.kind() == "call_expression" && call.child_by_field_name("function") == Some(callable)
     })
@@ -1143,8 +1154,11 @@ mod recovery_tests {
     #[test]
     fn preserves_selection_context_for_parenthesized_directly_invoked_closure() {
         let source = r#"fn run() {
-    if enabled { (((|| helper())))(); }
-    let callback = || deferred();
+    if enabled {
+        ((({ let marker = (); || helper() })))();
+        let callback = { || deferred() };
+        let non_tail = { || not_tail(); 0 };
+    }
 }"#;
         let contexts = |name| {
             call_payload(source, name)
@@ -1156,6 +1170,7 @@ mod recovery_tests {
 
         assert_eq!(contexts("helper"), [ConditionArmKind::Then]);
         assert!(contexts("deferred").is_empty());
+        assert!(contexts("not_tail").is_empty());
     }
 
     #[test]
