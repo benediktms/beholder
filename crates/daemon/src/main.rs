@@ -277,7 +277,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:21")
+        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:22")
         .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
@@ -307,7 +307,12 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         )
         .identity_input(
             "$toolchain/mise-elixir-installations",
-            mise_elixir_installations_identity("mise"),
+            mise_installations_identity("mise", "elixir"),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$toolchain/mise-erlang-installations",
+            mise_installations_identity("mise", "erlang"),
             AnalysisInputKind::Toolchain,
         )
         .identity_input(
@@ -449,9 +454,9 @@ fn command_identity(program: &str, arguments: &[&str]) -> Vec<u8> {
         .unwrap_or_else(|| b"unavailable".to_vec())
 }
 
-fn mise_elixir_installations_identity(program: &str) -> Vec<u8> {
+fn mise_installations_identity(program: &str, tool: &str) -> Vec<u8> {
     std::process::Command::new(program)
-        .args(["ls", "elixir", "--installed", "--json"])
+        .args(["ls", tool, "--installed", "--json"])
         .current_dir(std::env::temp_dir())
         .env("MISE_SAFE", "1")
         .env("MISE_AUTO_INSTALL", "false")
@@ -561,7 +566,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mise_installation_identity_changes_with_the_installed_elixir_inventory() {
+    fn mise_installation_identity_changes_with_the_installed_runtime_inventory() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = env::temp_dir().join(format!(
@@ -578,20 +583,27 @@ mod tests {
         fs::write(
             &mise,
             format!(
-                "#!/bin/sh\n[ \"$*\" = 'ls elixir --installed --json' ]\ncat '{}'\n",
+                "#!/bin/sh\ninventory='{}'\ncat \"$inventory.$2\"\n",
                 inventory.display()
             ),
         )
         .unwrap();
         fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
 
-        fs::write(&inventory, "[{\"version\":\"1.20.3\"}]").unwrap();
-        let first = mise_elixir_installations_identity(mise.to_str().unwrap());
-        fs::write(&inventory, "[{\"version\":\"1.20.4\"}]").unwrap();
+        fs::write(inventory.with_extension("elixir"), "1.20.3").unwrap();
+        fs::write(inventory.with_extension("erlang"), "27.3").unwrap();
+        let elixir = mise_installations_identity(mise.to_str().unwrap(), "elixir");
+        let erlang = mise_installations_identity(mise.to_str().unwrap(), "erlang");
+        fs::write(inventory.with_extension("elixir"), "1.20.4").unwrap();
+        fs::write(inventory.with_extension("erlang"), "28.0").unwrap();
 
         assert_ne!(
-            first,
-            mise_elixir_installations_identity(mise.to_str().unwrap())
+            elixir,
+            mise_installations_identity(mise.to_str().unwrap(), "elixir")
+        );
+        assert_ne!(
+            erlang,
+            mise_installations_identity(mise.to_str().unwrap(), "erlang")
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -111,7 +111,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
 
       result =
         run_command(
-          command,
+          compiler_command(command, env),
           ["beholder.compile"],
           Path.join(repository.base, project_root),
           env,
@@ -576,46 +576,44 @@ defmodule Beholder.Worker.Elixir.Compiler do
   defp find_project_or_ambient_mix(repository, project_root, requirement) do
     configs = applicable_toolchain_configs(repository, project_root)
 
-    case configs do
-      [] ->
-        find_ambient_mix(requirement)
+    if Enum.any?(configs, &selects_elixir?/1) do
+      directory = Path.join(repository.base, project_root)
+      paths = Enum.map(configs, & &1.path)
 
-      configs ->
-        directory = Path.join(repository.base, project_root)
-        paths = Enum.map(configs, & &1.path)
+      case System.find_executable("mise") do
+        nil ->
+          {:error,
+           toolchain_error(
+             required_text(requirement),
+             "unavailable",
+             "unavailable",
+             "project mise config",
+             paths,
+             "mise executable not found"
+           )}
 
-        case System.find_executable("mise") do
-          nil ->
-            {:error,
-             toolchain_error(
-               required_text(requirement),
-               "unavailable",
-               "unavailable",
-               "project mise config",
-               paths,
-               "mise executable not found"
-             )}
+        mise ->
+          case mise_source(mise, directory, configs) do
+            {:ok, _source} ->
+              find_mise_mix(mise, directory, configs, requirement)
 
-          mise ->
-            case mise_source(mise, directory, configs) do
-              {:ok, _source} ->
-                find_mise_mix(mise, directory, configs, requirement)
+            :none ->
+              find_ambient_mix(requirement)
 
-              :none ->
-                find_ambient_mix(requirement)
-
-              {:error, reason} ->
-                {:error,
-                 toolchain_error(
-                   required_text(requirement),
-                   "unavailable",
-                   "unavailable",
-                   "project mise config",
-                   paths,
-                   reason
-                 )}
-            end
-        end
+            {:error, reason} ->
+              {:error,
+               toolchain_error(
+                 required_text(requirement),
+                 "unavailable",
+                 "unavailable",
+                 "project mise config",
+                 paths,
+                 reason
+               )}
+          end
+      end
+    else
+      find_ambient_mix(requirement)
     end
   end
 
@@ -652,17 +650,24 @@ defmodule Beholder.Worker.Elixir.Compiler do
     |> Enum.sort_by(& &1.path)
   end
 
+  defp selects_elixir?(%{path: path, content: content}) do
+    if Path.basename(path) == ".tool-versions" do
+      Regex.match?(~r/^\s*elixir\s+\S+/m, content)
+    else
+      case TomlElixir.decode(content) do
+        {:ok, %{"tools" => tools}} when is_map(tools) -> Map.has_key?(tools, "elixir")
+        {:ok, values} -> Map.has_key?(values, "elixir")
+        {:error, _reason} -> true
+      end
+    end
+  end
+
   defp find_mise_mix(mise, directory, configs, requirement) do
     paths = Enum.map(configs, & &1.path)
     required = required_text(requirement)
 
-    case bounded_command(
-           %{executable: mise, prefix: []},
-           ["which", "mix"],
-           directory,
-           mise_env(configs)
-         ) do
-      {:ok, path, 0} ->
+    case bounded_mise_command(mise, ["which", "mix"], directory, configs) do
+      {:ok, path, _stderr, 0} ->
         path = String.trim(path)
 
         if File.regular?(path),
@@ -687,7 +692,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
                "mise resolved a missing Mix executable"
              )}
 
-      {:ok, output, _status} ->
+      {:ok, output, stderr, _status} ->
         {:error,
          toolchain_error(
            required,
@@ -695,7 +700,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
            "unavailable",
            "project mise config",
            paths,
-           String.trim(output)
+           command_diagnostic(output, stderr, "mise could not resolve Mix")
          )}
 
       {:error, reason} ->
@@ -753,9 +758,32 @@ defmodule Beholder.Worker.Elixir.Compiler do
   defp command_env(%{source: "project mise config", configs: configs}), do: mise_env(configs)
   defp command_env(_command), do: []
 
+  defp compiler_command(%{source: "project mise config"} = command, env) do
+    invariant_names = [
+      "BEHOLDER_ELIXIR_TRACE_RESULT",
+      "BEHOLDER_ELIXIR_FORCE_COMPILE",
+      "MIX_BUILD_PATH",
+      "MIX_DEPS_PATH",
+      "MIX_ENV",
+      "ERL_AFLAGS"
+    ]
+
+    invariants =
+      for {name, value} <- env, name in invariant_names, do: "#{name}=#{value}"
+
+    %{
+      command
+      | prefix:
+          ["exec", "--", System.find_executable("env") || "env"] ++
+            invariants ++ [command.resolved_mix]
+    }
+  end
+
+  defp compiler_command(command, _env), do: command
+
   defp mise_source(mise, directory, configs) do
     with {:ok, output, stderr, 0} <-
-           bounded_mise_json(mise, ["ls", "elixir", "--current", "--json"], directory, configs),
+           bounded_mise_command(mise, ["ls", "elixir", "--current", "--json"], directory, configs),
          {:ok, records} when is_list(records) <- Jason.decode(output) do
       case records do
         [] ->
@@ -775,8 +803,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
       end
     else
       {:ok, output, stderr, _status} ->
-        detail = [stderr, output] |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
-        {:error, Enum.join(detail, ": ") |> empty_default("mise could not resolve Elixir")}
+        {:error, command_diagnostic(output, stderr, "mise could not resolve Elixir")}
 
       {:error, reason} ->
         {:error, reason}
@@ -786,7 +813,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end
   end
 
-  defp bounded_mise_json(mise, arguments, directory, configs) do
+  defp bounded_mise_command(mise, arguments, directory, configs) do
     shell = System.find_executable("sh")
     temporary = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
     stderr_path = Path.join(System.tmp_dir!(), "beholder-mise-#{temporary}.stderr")
@@ -836,6 +863,14 @@ defmodule Beholder.Worker.Elixir.Compiler do
       "" -> reason
       diagnostic -> "#{reason}: #{diagnostic}"
     end
+  end
+
+  defp command_diagnostic(output, stderr, default) do
+    [stderr, output]
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join(": ")
+    |> empty_default(default)
   end
 
   defp empty_default("", default), do: default

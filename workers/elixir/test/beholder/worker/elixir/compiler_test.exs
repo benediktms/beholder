@@ -639,7 +639,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     end
   end
 
-  test "keeps mise stderr diagnostics separate from JSON selection output" do
+  test "keeps mise stderr diagnostics separate from selection outputs" do
     root = temp_dir("mise-stderr")
     marker = Path.join(root, "compiled")
     selected = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.3")
@@ -648,6 +648,45 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
       assert {:error, reason} = Compiler.run(repository, temp_dir("mise-stderr-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
+  test "uses ambient Mix when an unrelated mise config exists without mise" do
+    root = temp_dir("unrelated-mise-config")
+    bin = temp_dir("unrelated-mise-bin")
+    marker = Path.join(root, "compiled")
+    File.ln_s!(System.find_executable("pwd"), Path.join(bin, "pwd"))
+    fake_mix(bin, ": > #{shell_quote(marker)}", "1.20.3", "mix")
+    repository = toolchain_repository(root, "== 1.20.3", "tools.node = \"24\"")
+
+    with_envs(%{"PATH" => bin, "BEHOLDER_ELIXIR_MIX_PATH" => ""}, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("unrelated-mise-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
+  test "reapplies compiler invariants after mise environment activation" do
+    root = temp_dir("mise-compiler-environment")
+    marker = Path.join(root, "compiled")
+
+    body =
+      "[ \"$MIX_ENV\" = dev ] && [ \"$MIX_BUILD_PATH\" != /tmp/evil ] && [ \"$MIX_DEPS_PATH\" != /tmp/evil ] && [ \"$BEHOLDER_ELIXIR_TRACE_RESULT\" != /tmp/evil ] && [ \"$BEHOLDER_ELIXIR_FORCE_COMPILE\" = true ] && [ \"$ERL_AFLAGS\" != evil ] && touch #{shell_quote(marker)}"
+
+    selected = fake_mix(root, body, "1.20.3")
+
+    activation =
+      "export MIX_ENV=prod MIX_BUILD_PATH=/tmp/evil MIX_DEPS_PATH=/tmp/evil BEHOLDER_ELIXIR_TRACE_RESULT=/tmp/evil BEHOLDER_ELIXIR_FORCE_COMPILE=false ERL_AFLAGS=evil"
+
+    mise = fake_mise(root, selected, "", activation)
+    repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
+
+    with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("mise-environment-cache"))
       assert reason =~ "before producing a trace"
     end)
 
@@ -816,21 +855,21 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     path
   end
 
-  defp fake_mise(root, mix, stderr \\ "")
+  defp fake_mise(root, mix, stderr \\ "", activation \\ "")
 
-  defp fake_mise(root, nil, _stderr) do
+  defp fake_mise(root, nil, _stderr, _activation) do
     path = Path.join(root, "mise")
     File.write!(path, "#!/bin/sh\nexit 1\n")
     File.chmod!(path, 0o755)
     path
   end
 
-  defp fake_mise(root, mix, stderr) do
+  defp fake_mise(root, mix, stderr, activation) do
     path = Path.join(root, "mise")
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s\\n' #{shell_quote(mix)}; exit 0; fi\nshift 3\nexec #{shell_quote(mix)} \"$@\"\n"
+      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; printf '%s\\n' #{shell_quote(mix)}; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
     )
 
     File.chmod!(path, 0o755)
