@@ -923,11 +923,15 @@ defmodule Beholder.Worker.Elixir.Compiler do
 
   defp mise_env(configs) do
     trusted = Enum.map_join(configs, path_separator(), &Path.expand(&1.absolute_path))
+    isolation = Path.join(System.tmp_dir!(), "beholder-mise-config-#{System.pid()}")
 
     [
       {"MISE_SAFE", "1"},
       {"MISE_AUTO_INSTALL", "false"},
       {"MISE_EXEC_AUTO_INSTALL", "false"},
+      {"MISE_CONFIG_DIR", Path.join(isolation, "config")},
+      {"MISE_GLOBAL_CONFIG_FILE", Path.join(isolation, "global.toml")},
+      {"MISE_SYSTEM_CONFIG_DIR", Path.join(isolation, "system")},
       {"MISE_TRUSTED_CONFIG_PATHS", trusted}
     ]
   end
@@ -1262,6 +1266,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
       command.resolved_mix,
       command.source,
       command.environment_identity,
+      BeamExporter.identity(),
       runtime.version,
       runtime.otp,
       mix_version(),

@@ -2,9 +2,21 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   use ExUnit.Case, async: false
 
   alias Beholder.Worker.Elixir.Compiler
+  alias Beholder.Worker.Elixir.Compiler.BeamExporter
   alias Beholder.Worker.Elixir.Compiler.Collector
   alias Beholder.Worker.Elixir.Compiler.TraceCache
   alias Beholder.Worker.Elixir.Snapshot.Repository
+
+  test "changes helper identity when selected-runtime sources change" do
+    root = temp_dir("helper-identity")
+    source = Path.join(root, "helper.ex")
+    File.write!(source, "defmodule Helper, do: nil")
+    first = BeamExporter.identity([source])
+
+    File.write!(source, "defmodule Helper, do: :changed")
+
+    refute BeamExporter.identity([source]) == first
+  end
 
   test "deduplicates only identical trace coordinates" do
     start_supervised!(Collector)
@@ -657,6 +669,24 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert File.exists?(marker)
   end
 
+  test "isolates selected mise commands from uncaptured global configuration" do
+    root = temp_dir("mise-global-config")
+    home = temp_dir("mise-global-home")
+    marker = Path.join(root, "compiled")
+    selected = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.3")
+    mise = fake_mise(root, selected)
+    repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
+    File.mkdir_p!(Path.join(home, ".config/mise"))
+    File.write!(Path.join(home, ".config/mise/config.toml"), "[env]\nUNTRACKED = \"global\"")
+
+    with_envs(%{"HOME" => home, "PATH" => prepend_path(Path.dirname(mise))}, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("mise-global-config-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
   test "uses ambient Mix when an unrelated mise config exists without mise" do
     root = temp_dir("unrelated-mise-config")
     bin = temp_dir("unrelated-mise-bin")
@@ -1112,7 +1142,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; if [ \"$2\" = mix ]; then printf '%s\\n' #{shell_quote(mix)}; else printf '%s\\n' #{shell_quote(elixir)}; fi; exit 0; fi\nif [ \"$1\" = env ]; then printf '{\"FEATURE_FLAG\":\"%s\"}\\n' \"${FEATURE_FLAG:-}\"; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
+      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\n[ -n \"$MISE_CONFIG_DIR\" ] && [ ! -e \"$MISE_CONFIG_DIR\" ]\n[ -n \"$MISE_GLOBAL_CONFIG_FILE\" ] && [ ! -e \"$MISE_GLOBAL_CONFIG_FILE\" ]\n[ -n \"$MISE_SYSTEM_CONFIG_DIR\" ] && [ ! -e \"$MISE_SYSTEM_CONFIG_DIR\" ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; if [ \"$2\" = mix ]; then printf '%s\\n' #{shell_quote(mix)}; else printf '%s\\n' #{shell_quote(elixir)}; fi; exit 0; fi\nif [ \"$1\" = env ]; then printf '{\"FEATURE_FLAG\":\"%s\"}\\n' \"${FEATURE_FLAG:-}\"; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
     )
 
     File.chmod!(path, 0o755)

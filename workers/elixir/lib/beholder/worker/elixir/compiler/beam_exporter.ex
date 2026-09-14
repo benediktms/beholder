@@ -12,6 +12,15 @@ defmodule Beholder.Worker.Elixir.Compiler.BeamExporter do
   @spec sources() :: [String.t()]
   def sources, do: @sources
 
+  @doc false
+  def identity(sources \\ @sources) do
+    sources
+    |> Enum.map(&{Path.basename(&1), File.read!(&1)})
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+  end
+
   @spec compile_script() :: String.t()
   def compile_script do
     ~S"""
