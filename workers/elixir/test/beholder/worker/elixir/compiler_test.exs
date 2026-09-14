@@ -658,7 +658,23 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     root = temp_dir("unrelated-mise-config")
     bin = temp_dir("unrelated-mise-bin")
     marker = Path.join(root, "compiled")
-    File.ln_s!(System.find_executable("pwd"), Path.join(bin, "pwd"))
+
+    for executable <- [
+          "basename",
+          "cat",
+          "cut",
+          "dirname",
+          "elixir",
+          "erl",
+          "head",
+          "pwd",
+          "readlink",
+          "sed",
+          "sh"
+        ] do
+      File.ln_s!(System.find_executable(executable), Path.join(bin, executable))
+    end
+
     fake_mix(bin, ": > #{shell_quote(marker)}", "1.20.3", "mix")
     repository = toolchain_repository(root, "== 1.20.3", "tools.node = \"24\"")
 
@@ -810,6 +826,68 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert File.exists?(marker)
   end
 
+  test "reads the requirement only from the module using Mix.Project" do
+    root = temp_dir("mix-project-module")
+    marker = Path.join(root, "compiled")
+    mix = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.4")
+
+    source = """
+    defmodule Helper do
+      def project, do: [version: "0.1.0"]
+    end
+
+    defmodule Actual.MixProject do
+      use Mix.Project
+      def project, do: [app: :actual, version: "0.1.0", elixir: "== 1.20.3"]
+    end
+    """
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "mix-project-module",
+      inputs: [%{path: "mix.exs", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("mix-project-module-cache"))
+      assert reason =~ "required=== 1.20.3"
+      assert reason =~ "actual=1.20.4"
+    end)
+
+    refute File.exists?(marker)
+  end
+
+  test "uses project metadata parsed by the selected runtime" do
+    root = temp_dir("selected-parser")
+    marker = Path.join(root, "compiled")
+
+    mix =
+      fake_metadata_mix(
+        root,
+        "touch #{shell_quote(marker)}",
+        {:literal, "== 1.20.3"},
+        "erts-16.0",
+        "1.20.3"
+      )
+
+    source = "syntax only the selected future runtime understands"
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "selected-parser",
+      inputs: [%{path: "mix.exs", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("selected-parser-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
   test "partitions compiler cache by the probed runtime" do
     root = temp_dir("runtime-cache")
     cache = temp_dir("runtime-cache-cache")
@@ -824,6 +902,33 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     with_env("BEHOLDER_ELIXIR_MIX_PATH", second, fn ->
       assert {:error, _} = Compiler.run(repository, cache)
+    end)
+
+    assert 2 == cache |> Path.join("elixir/Zml4dHVyZQ/build-*") |> Path.wildcard() |> length()
+  end
+
+  test "partitions compiler cache by the full selected Erlang runtime" do
+    root = temp_dir("erlang-runtime-cache")
+    cache = temp_dir("erlang-runtime-cache-cache")
+    metadata = Path.join(root, "metadata")
+
+    mix =
+      fake_metadata_mix(
+        root,
+        "mkdir -p \"$MIX_BUILD_PATH\"",
+        {:literal, "~> 1.20.3"},
+        "erts-15.2.2",
+        "1.20.3",
+        "mix",
+        metadata
+      )
+
+    repository = toolchain_repository(root, "~> 1.20.3")
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, _reason} = Compiler.run(repository, cache)
+      write_metadata(metadata, {:literal, "~> 1.20.3"}, "erts-15.2.3")
+      assert {:error, _reason} = Compiler.run(repository, cache)
     end)
 
     assert 2 == cache |> Path.join("elixir/Zml4dHVyZQ/build-*") |> Path.wildcard() |> length()
@@ -845,14 +950,42 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
   defp fake_mix(root, body, version \\ "1.20.3", name \\ "fake-mix") do
     path = Path.join(root, name)
+    real_elixir = System.find_executable("elixir")
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then\n  printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'\n  exit 0\nfi\n#{body}\n"
+      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then\n  printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'\n  exit 0\nfi\nif [ \"${1:-}\" = run ]; then while [ \"$1\" != -e ]; do shift; done; exec #{shell_quote(real_elixir)} \"$@\"; fi\n#{body}\n"
     )
 
     File.chmod!(path, 0o755)
     path
+  end
+
+  defp fake_metadata_mix(
+         root,
+         body,
+         requirement,
+         otp,
+         version,
+         name \\ "fake-mix",
+         metadata \\ nil
+       ) do
+    path = Path.join(root, name)
+    metadata = metadata || Path.join(root, "#{name}-metadata")
+    write_metadata(metadata, requirement, otp)
+
+    File.write!(
+      path,
+      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'; exit 0; fi\nif [ \"${1:-}\" = run ]; then cat #{shell_quote(metadata)}; exit 0; fi\n#{body}\n"
+    )
+
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp write_metadata(path, requirement, otp) do
+    encoded = {:ok, requirement, otp} |> :erlang.term_to_binary() |> Base.encode64()
+    File.write!(path, "BEHOLDER_PROJECT_METADATA #{encoded}\n")
   end
 
   defp fake_mise(root, mix, stderr \\ "", activation \\ "")
@@ -866,10 +999,11 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
   defp fake_mise(root, mix, stderr, activation) do
     path = Path.join(root, "mise")
+    elixir = System.find_executable("elixir")
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; printf '%s\\n' #{shell_quote(mix)}; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
+      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; if [ \"$2\" = mix ]; then printf '%s\\n' #{shell_quote(mix)}; else printf '%s\\n' #{shell_quote(elixir)}; fi; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
     )
 
     File.chmod!(path, 0o755)
