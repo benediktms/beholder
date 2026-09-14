@@ -104,6 +104,32 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert rebuilt.status == :ok
     assert rebuilt.output =~ "Compiling 1 file"
     assert Enum.any?(rebuilt.events, &(&1.kind == :module and &1.target == "CompilerFixture"))
+
+    cache_entries =
+      cache
+      |> Path.join("elixir/Zml4dHVyZQ/trace-cache-*.term")
+      |> Path.wildcard()
+      |> Enum.map(&{&1, File.read!(&1)})
+
+    TraceCache.clear()
+    assert TraceCache.all_events(trace_cache) == []
+    marker = Path.join(root, "invalid-probe-compiled")
+    invalid_mix = fake_mix(root, "touch #{shell_quote(marker)}", "invalid", "invalid-mix")
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", invalid_mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, cache)
+      assert reason =~ "required=~> 1.15"
+      assert reason =~ "could not parse Mix version"
+    end)
+
+    refute File.exists?(marker)
+    assert TraceCache.all_events(trace_cache) == []
+
+    assert cache_entries ==
+             cache
+             |> Path.join("elixir/Zml4dHVyZQ/trace-cache-*.term")
+             |> Path.wildcard()
+             |> Enum.map(&{&1, File.read!(&1)})
   end
 
   test "reuses unchanged traces while Mix incrementally compiles changed sources" do
@@ -543,9 +569,207 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              |> length()
   end
 
-  defp fake_mix(root, body) do
-    path = Path.join(root, "fake-mix")
-    File.write!(path, "#!/bin/sh\nset -eu\n#{body}\n")
+  test "rejects an exact pin before compiling with an incompatible ambient Mix" do
+    root = temp_dir("exact-toolchain")
+    marker = Path.join(root, "compiled")
+    mix = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.4", "mix")
+    repository = toolchain_repository(root, "== 1.20.3")
+
+    with_env("PATH", prepend_path(Path.dirname(mix)), fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("exact-toolchain-cache"))
+      assert reason =~ "required=== 1.20.3"
+      assert reason =~ "actual=1.20.4"
+      assert reason =~ "selection_source=ambient PATH"
+    end)
+
+    refute File.exists?(marker)
+  end
+
+  test "reports a missing ambient Mix with the project requirement" do
+    root = temp_dir("missing-ambient-toolchain")
+    bin = temp_dir("missing-ambient-bin")
+    File.ln_s!(System.find_executable("pwd"), Path.join(bin, "pwd"))
+    repository = toolchain_repository(root, "== 1.20.3")
+
+    with_envs(%{"PATH" => bin, "BEHOLDER_ELIXIR_MIX_PATH" => ""}, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("missing-ambient-cache"))
+      assert reason =~ "required=== 1.20.3"
+      assert reason =~ "actual=unavailable"
+      assert reason =~ "selected_executable=unavailable"
+      assert reason =~ "selection_source=ambient PATH"
+      assert reason =~ "mix executable not found"
+    end)
+  end
+
+  test "uses a matching project mise runtime and disables installation" do
+    root = temp_dir("mise-toolchain")
+    marker = Path.join(root, "compiled")
+    selected = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.3")
+    mise = fake_mise(root, selected)
+    repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
+
+    with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("mise-toolchain-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
+  test "reports an unavailable selected mise runtime without ambient fallback" do
+    root = temp_dir("missing-mise-toolchain")
+    mise = fake_mise(root, nil)
+    repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
+
+    with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("missing-mise-toolchain-cache"))
+      assert reason =~ "actual=unavailable"
+      assert reason =~ "selection_source=project mise config"
+      assert reason =~ "configuration=mise.toml"
+    end)
+  end
+
+  test "does not bypass an incompatible explicit override for a matching project runtime" do
+    root = temp_dir("explicit-toolchain")
+    configured_marker = Path.join(root, "configured-compiled")
+    override = fake_mix(root, "true", "1.20.4")
+    selected = fake_mix(root, "touch #{shell_quote(configured_marker)}", "1.20.3", "selected-mix")
+    mise = fake_mise(root, selected)
+    repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
+
+    with_envs(
+      %{"PATH" => prepend_path(Path.dirname(mise)), "BEHOLDER_ELIXIR_MIX_PATH" => override},
+      fn ->
+        assert {:error, reason} = Compiler.run(repository, temp_dir("explicit-toolchain-cache"))
+        assert reason =~ "selection_source=BEHOLDER_ELIXIR_MIX_PATH"
+        assert reason =~ "actual=1.20.4"
+      end
+    )
+
+    refute File.exists?(configured_marker)
+  end
+
+  test "accepts a permissive requirement with a newer ambient Mix patch" do
+    root = temp_dir("permissive-toolchain")
+    marker = Path.join(root, "compiled")
+    mix = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.4", "mix")
+    repository = toolchain_repository(root, "~> 1.20.3")
+
+    with_env("PATH", prepend_path(Path.dirname(mix)), fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("permissive-toolchain-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
+  test "uses a captured ancestor mise configuration for a nested Mix project" do
+    root = temp_dir("nested-toolchain")
+    mix = fake_mix(root, "true", "1.20.3")
+    mise = fake_mise(root, mix)
+
+    manifest =
+      "defmodule Nested.MixProject do\n  use Mix.Project\n  def project, do: [app: :nested, version: \"0.1.0\", elixir: \"== 1.20.3\"]\nend\n"
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "nested-toolchain",
+      inputs: [
+        %{path: "apps/mise.toml", content: "elixir = \"1.20.3\"", kind: :INPUT_KIND_TOOLCHAIN},
+        %{path: "apps/foo/mix.exs", content: manifest, kind: :INPUT_KIND_SOURCE}
+      ]
+    }
+
+    with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("nested-toolchain-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+  end
+
+  test "rejects a dynamic project requirement before invoking Mix" do
+    root = temp_dir("dynamic-toolchain")
+    marker = Path.join(root, "compiled")
+    mix = fake_mix(root, "touch #{shell_quote(marker)}")
+
+    source =
+      "defmodule Dynamic.MixProject do\n  use Mix.Project\n  def project, do: [app: :dynamic, version: \"0.1.0\", elixir: System.get_env(\"ELIXIR_VERSION\")]\nend\n"
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "dynamic",
+      inputs: [%{path: "mix.exs", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("dynamic-toolchain-cache"))
+      assert reason =~ "non-literal elixir requirement"
+    end)
+
+    refute File.exists?(marker)
+  end
+
+  test "partitions compiler cache by the probed runtime" do
+    root = temp_dir("runtime-cache")
+    cache = temp_dir("runtime-cache-cache")
+    first = fake_mix(root, "mkdir -p \"$MIX_BUILD_PATH\"", "1.20.3", "mix")
+    repository = toolchain_repository(root, "~> 1.20.3")
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", first, fn ->
+      assert {:error, _} = Compiler.run(repository, cache)
+    end)
+
+    second = fake_mix(root, "mkdir -p \"$MIX_BUILD_PATH\"", "1.20.4", "mix")
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", second, fn ->
+      assert {:error, _} = Compiler.run(repository, cache)
+    end)
+
+    assert 2 == cache |> Path.join("elixir/Zml4dHVyZQ/build-*") |> Path.wildcard() |> length()
+  end
+
+  defp toolchain_repository(root, requirement, config \\ nil) do
+    mix_source =
+      "defmodule Toolchain.MixProject do\n  use Mix.Project\n  def project, do: [app: :toolchain, version: \"0.1.0\", elixir: \"#{requirement}\"]\nend\n"
+
+    inputs = [%{path: "mix.exs", content: mix_source, kind: :INPUT_KIND_SOURCE}]
+
+    inputs =
+      if config,
+        do: inputs ++ [%{path: "mise.toml", content: config, kind: :INPUT_KIND_TOOLCHAIN}],
+        else: inputs
+
+    %Repository{identity: "fixture", base: root, fingerprint: requirement, inputs: inputs}
+  end
+
+  defp fake_mix(root, body, version \\ "1.20.3", name \\ "fake-mix") do
+    path = Path.join(root, name)
+
+    File.write!(
+      path,
+      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then\n  printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'\n  exit 0\nfi\n#{body}\n"
+    )
+
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp fake_mise(root, nil) do
+    path = Path.join(root, "mise")
+    File.write!(path, "#!/bin/sh\nexit 1\n")
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp fake_mise(root, mix) do
+    path = Path.join(root, "mise")
+
+    File.write!(
+      path,
+      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s\\n' #{shell_quote(mix)}; exit 0; fi\nshift 3\nexec #{shell_quote(mix)} \"$@\"\n"
+    )
+
     File.chmod!(path, 0o755)
     path
   end
@@ -594,6 +818,8 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   end
 
   defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
+
+  defp prepend_path(path), do: path <> ":" <> System.get_env("PATH", "")
 
   defp with_env(name, value, fun), do: with_envs(%{name => value}, fun)
 

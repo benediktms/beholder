@@ -33,6 +33,8 @@ const RUST_ROLES: &[RoleFixture] = &[
 const ELIXIR_ROLES: &[RoleFixture] = &[
     role("lib/app.ex", AnalysisInputKind::Source),
     role("mix.lock", AnalysisInputKind::Dependency),
+    role("mise.toml", AnalysisInputKind::Toolchain),
+    role(".tool-versions", AnalysisInputKind::Toolchain),
     role("config/config.exs", AnalysisInputKind::Configuration),
 ];
 const TYPESCRIPT_ROLES: &[RoleFixture] = &[
@@ -128,6 +130,8 @@ fn compiler_indexer(rust_environment: &[u8], elixir_environment: &[u8]) -> Index
         .accept_extension("exs")
         .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
         .accept_file_name_as("mix.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("mise.toml", AnalysisInputKind::Toolchain)
+        .accept_file_name_as(".tool-versions", AnalysisInputKind::Toolchain)
         .accept_parent_suffix_as("config", AnalysisInputKind::Configuration)
         .accept_parent_suffix_as("priv", AnalysisInputKind::Configuration)
         .exclude_path_suffix("config/runtime.exs")

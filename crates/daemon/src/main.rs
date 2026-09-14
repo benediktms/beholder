@@ -277,7 +277,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:19")
+        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:20")
         .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
@@ -285,6 +285,8 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .accept_extension("exs")
         .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
         .accept_file_name_as("mix.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("mise.toml", AnalysisInputKind::Toolchain)
+        .accept_file_name_as(".tool-versions", AnalysisInputKind::Toolchain)
         .accept_parent_suffix_as("config", AnalysisInputKind::Configuration)
         .accept_parent_suffix_as("priv", AnalysisInputKind::Configuration)
         .exclude_path_suffix("config/runtime.exs")
@@ -296,6 +298,11 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .identity_input(
             "$toolchain/mix",
             command_identity(&mix_program, &["--version"]),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$toolchain/mise",
+            command_identity("mise", &["--version"]),
             AnalysisInputKind::Toolchain,
         )
         .identity_input(
