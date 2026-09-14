@@ -8,14 +8,18 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
   test "changes helper identity when selected-runtime sources change" do
-    root = temp_dir("helper-identity")
-    source = Path.join(root, "helper.ex")
-    File.write!(source, "defmodule Helper, do: nil")
-    first = BeamExporter.identity([source])
+    first = BeamExporter.identity([{"helper.ex", "defmodule Helper, do: nil"}])
 
-    File.write!(source, "defmodule Helper, do: :changed")
+    refute BeamExporter.identity([{"helper.ex", "defmodule Helper, do: :changed"}]) == first
+  end
 
-    refute BeamExporter.identity([source]) == first
+  test "materializes embedded helper sources into the runtime cache" do
+    cache = temp_dir("embedded-helper-sources")
+    paths = BeamExporter.materialize!(cache, "selected-runtime")
+
+    assert Enum.map(paths, &Path.basename/1) == ["collector.ex", "tracer.ex", "task.ex"]
+    assert Enum.all?(paths, &String.starts_with?(&1, cache))
+    assert Enum.all?(paths, &(File.read!(&1) =~ "defmodule"))
   end
 
   test "deduplicates only identical trace coordinates" do

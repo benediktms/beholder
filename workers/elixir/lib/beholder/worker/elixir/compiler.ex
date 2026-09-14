@@ -676,11 +676,12 @@ defmodule Beholder.Worker.Elixir.Compiler do
       {:ok, output}
     else
       File.mkdir_p!(output)
+      sources = BeamExporter.materialize!(cache_dir, identity)
 
       case selected_script(
              command,
              BeamExporter.compile_script(),
-             ["helpers", output | BeamExporter.sources()],
+             ["helpers", output | sources],
              cache_dir,
              directory
            ) do

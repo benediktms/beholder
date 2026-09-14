@@ -1,24 +1,34 @@
 defmodule Beholder.Worker.Elixir.Compiler.BeamExporter do
   @moduledoc false
 
-  @sources [
+  @source_paths [
     Path.expand("collector.ex", __DIR__),
     Path.expand("tracer.ex", __DIR__),
     Path.expand("task.ex", __DIR__)
   ]
 
-  for source <- @sources, do: @external_resource(source)
+  for source <- @source_paths, do: @external_resource(source)
 
-  @spec sources() :: [String.t()]
-  def sources, do: @sources
+  @sources Enum.map(@source_paths, &{Path.basename(&1), File.read!(&1)})
 
   @doc false
   def identity(sources \\ @sources) do
     sources
-    |> Enum.map(&{Path.basename(&1), File.read!(&1)})
     |> :erlang.term_to_binary([:deterministic])
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.url_encode64(padding: false)
+  end
+
+  @spec materialize!(String.t(), String.t()) :: [String.t()]
+  def materialize!(cache_dir, identity) do
+    directory = Path.join(cache_dir, "compiler-helper-sources-#{identity}")
+    File.mkdir_p!(directory)
+
+    Enum.map(@sources, fn {name, content} ->
+      path = Path.join(directory, name)
+      File.write!(path, content)
+      path
+    end)
   end
 
   @spec compile_script() :: String.t()
