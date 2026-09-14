@@ -27,7 +27,8 @@ defmodule BeholderWorkerElixir.MixProject do
       {:opentelemetry_api, "~> 1.4"},
       {:opentelemetry_exporter, "~> 1.9"},
       {:protobuf, "~> 0.14"},
-      {:protobuf_generate, "~> 0.2.1", only: [:dev, :test], runtime: false}
+      {:protobuf_generate, "~> 0.2.1", only: [:dev, :test], runtime: false},
+      {:toml_elixir, "~> 3.1"}
     ]
   end
 end

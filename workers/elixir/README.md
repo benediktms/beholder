@@ -12,6 +12,16 @@ source, Mix manifests, lockfiles and compile-time configuration are not used. Th
 child VM inherits `MIX_HOME` and `HEX_HOME`, including configured private Hex
 repositories, while dependency sources remain in Beholder's cache.
 
+## Toolchains
+
+Before compiling, the worker checks the literal `elixir:` requirement in the
+materialized `mix.exs`. `BEHOLDER_ELIXIR_MIX_PATH` wins; otherwise an applicable
+materialized `mise.toml` or `.tool-versions` Elixir selection is resolved through
+installed `mise`; otherwise ambient `PATH` Mix is used. Mise runs in safe,
+non-installing mode. A missing or incompatible runtime leaves enrichment
+incomplete with an `elixir.compiler.unavailable` diagnostic; baseline syntax
+analysis remains available.
+
 Inventory-provided content hashes let the worker rewrite only changed files in
 that isolated workspace. A persistent worker keeps compiler events as compressed
 per-source shards and atomically persists the same shards for restart reuse, so

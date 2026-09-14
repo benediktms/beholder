@@ -2,6 +2,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @moduledoc false
 
   alias Beholder.Worker.Elixir.Compiler.BeamExporter
+  alias Beholder.Worker.Elixir.Compiler.ProjectMetadata
   alias Beholder.Worker.Elixir.Compiler.TraceCache
   alias Beholder.Worker.Elixir.Snapshot.Repository
 
@@ -13,6 +14,12 @@ defmodule Beholder.Worker.Elixir.Compiler do
   @materialization_manifest_version 1
   @dependency_progress "BEHOLDER_PROGRESS dependency_preparation"
   @compilation_progress "BEHOLDER_PROGRESS project_compilation"
+  @project_metadata_prefix "BEHOLDER_PROJECT_METADATA "
+  @local_paths_prefix "BEHOLDER_LOCAL_PATHS "
+  @project_metadata_path Path.expand("compiler/project_metadata.ex", __DIR__)
+  @external_resource @project_metadata_path
+  @project_metadata_script File.read!(@project_metadata_path) <>
+                             "\nBeholder.Worker.Elixir.Compiler.ProjectMetadata.emit(System.argv())"
 
   @type result :: %{
           status: :ok | :error,
@@ -82,51 +89,65 @@ defmodule Beholder.Worker.Elixir.Compiler do
        ) do
     repositories = [repository | contexts]
 
-    with :ok <- validate_local_paths(repositories),
-         {:ok, mix} <- find_mix() do
-      helper_ebin = BeamExporter.export!(cache_dir)
-      working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)])
-      mix_env = configured_mix_env()
-      identity = build_identity(repositories, mix, mix_env)
-      build_path = Path.join(working_dir, "build-#{identity}")
-      trace_cache_path = Path.join(working_dir, "trace-cache-#{identity}.term")
-      trace_cache_status = TraceCache.load(trace_cache_path)
-      result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
-      deps_path = Path.join(working_dir, "deps")
-      File.mkdir_p!(deps_path)
+    directory = Path.join(repository.base, project_root)
 
-      env = [
-        {"BEHOLDER_ELIXIR_TRACE_RESULT", result_path},
-        {"MIX_BUILD_PATH", build_path},
-        {"MIX_DEPS_PATH", deps_path},
-        {"MIX_ENV", mix_env},
-        {"BEHOLDER_ELIXIR_FORCE_COMPILE",
-         if(trace_cache_status == :miss, do: "true", else: "false")},
-        {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
-      ]
+    with {:ok, command} <- find_mix_for_metadata(repository, project_root, cache_dir) do
+      try do
+        with :ok <- validate_local_paths(repositories, command, directory, cache_dir),
+             {:ok, requirement, otp} <-
+               project_metadata(repository, project_root, command),
+             command = Map.put(command, :required, requirement),
+             {:ok, runtime} <- probe_mix(command, Path.join(repository.base, project_root)),
+             runtime = Map.put(runtime, :otp, otp),
+             :ok <- validate_requirement(requirement, runtime, command),
+             working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)]),
+             mix_env = configured_mix_env(),
+             identity = build_identity(repositories, command, runtime, mix_env),
+             {:ok, helper_ebin} <- compile_helpers(command, cache_dir, identity, directory) do
+          build_path = Path.join(working_dir, "build-#{identity}")
+          trace_cache_path = Path.join(working_dir, "trace-cache-#{identity}.term")
+          trace_cache_status = TraceCache.load(trace_cache_path)
+          result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
+          deps_path = Path.join(working_dir, "deps")
+          File.mkdir_p!(deps_path)
 
-      result =
-        run_command(
-          mix,
-          ["beholder.compile"],
-          Path.join(repository.base, project_root),
-          env,
-          configured_positive_integer(
-            "BEHOLDER_WORKER_TIMEOUT_MS",
-            @default_timeout_ms
-          ),
-          configured_positive_integer(
-            "BEHOLDER_WORKER_MAX_OUTPUT_BYTES",
-            @default_max_output_bytes
-          ),
-          on_progress
-        )
+          env =
+            [
+              {"BEHOLDER_ELIXIR_TRACE_RESULT", result_path},
+              {"MIX_BUILD_PATH", build_path},
+              {"MIX_DEPS_PATH", deps_path},
+              {"MIX_ENV", mix_env},
+              {"BEHOLDER_ELIXIR_FORCE_COMPILE",
+               if(trace_cache_status == :miss, do: "true", else: "false")},
+              {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
+            ] ++ command_env(command)
 
-      on_progress.("validating compiler result")
+          result =
+            run_command(
+              compiler_command(command, env),
+              ["beholder.compile"],
+              directory,
+              env,
+              configured_positive_integer(
+                "BEHOLDER_WORKER_TIMEOUT_MS",
+                @default_timeout_ms
+              ),
+              configured_positive_integer(
+                "BEHOLDER_WORKER_MAX_OUTPUT_BYTES",
+                @default_max_output_bytes
+              ),
+              on_progress
+            )
 
-      with {:ok, result} <- finalize_run(repositories, result_path, result) do
-        on_progress.("merging compiler trace cache")
-        {:ok, merge_trace_cache(result, changed_inputs, trace_cache_path, trace_cache_status)}
+          on_progress.("validating compiler result")
+
+          with {:ok, result} <- finalize_run(repositories, result_path, result) do
+            on_progress.("merging compiler trace cache")
+            {:ok, merge_trace_cache(result, changed_inputs, trace_cache_path, trace_cache_status)}
+          end
+        end
+      after
+        cleanup_mise_isolation(command)
       end
     end
   end
@@ -429,16 +450,55 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end)
   end
 
-  defp validate_local_paths(repositories) do
-    repositories
-    |> Enum.flat_map(&Repository.sorted_inputs/1)
-    |> Enum.filter(&configuration_input?/1)
-    |> Enum.reduce_while(:ok, fn input, :ok ->
-      case absolute_local_path(input.content) do
-        nil -> {:cont, :ok}
-        path -> {:halt, {:error, "#{input.path} declares absolute local path #{path}"}}
+  defp validate_local_paths(repositories, command, directory, cache_dir) do
+    inputs =
+      repositories
+      |> Enum.flat_map(fn repository ->
+        repository
+        |> Repository.sorted_inputs()
+        |> Enum.filter(&configuration_input?/1)
+        |> Enum.map(&{&1.path, Path.join(repository.base, &1.path)})
+      end)
+
+    manifests = Path.join([cache_dir, "elixir", "validation-manifests"])
+    File.mkdir_p!(manifests)
+
+    manifest =
+      Path.join(manifests, Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false))
+
+    File.write!(manifest, :erlang.term_to_binary(Enum.map(inputs, &elem(&1, 1))))
+
+    try do
+      case selected_script(command, @project_metadata_script, ["paths", manifest], directory) do
+        {:ok, output, _stderr, 0} ->
+          case decode_probe(output, @local_paths_prefix) do
+            {:ok, :ok} ->
+              :ok
+
+            {:ok, {:error, path, :invalid_syntax}} ->
+              {:error,
+               "#{input_name(inputs, path)} could not be parsed by the selected Elixir runtime"}
+
+            {:ok, {:error, path, absolute}} when is_binary(absolute) ->
+              {:error, "#{input_name(inputs, path)} declares absolute local path #{absolute}"}
+
+            _invalid ->
+              {:error, "selected Elixir runtime returned invalid local path validation metadata"}
+          end
+
+        {:ok, _output, _stderr, status} ->
+          {:error, "selected Elixir runtime failed local path validation with status #{status}"}
+
+        {:error, _reason} ->
+          {:error, "selected Elixir runtime failed local path validation"}
       end
-    end)
+    after
+      File.rm(manifest)
+    end
+  end
+
+  defp input_name(inputs, path) do
+    Enum.find_value(inputs, path, fn {name, absolute} -> if absolute == path, do: name end)
   end
 
   defp configuration_input?(%{path: path}) do
@@ -446,32 +506,6 @@ defmodule Beholder.Worker.Elixir.Compiler do
   end
 
   defp configuration_input?(_input), do: false
-
-  defp absolute_local_path(source) do
-    with {:ok, quoted} <- Code.string_to_quoted(source) do
-      {_quoted, path} =
-        Macro.prewalk(quoted, nil, fn
-          node, path when not is_nil(path) ->
-            {node, path}
-
-          {key, value} = node, nil
-          when key in [:path, :apps_path] and is_binary(value) ->
-            {node, absolute_path(value)}
-
-          {:import_config, _metadata, [value]} = node, nil when is_binary(value) ->
-            {node, absolute_path(value)}
-
-          node, nil ->
-            {node, nil}
-        end)
-
-      path
-    else
-      _invalid_source -> nil
-    end
-  end
-
-  defp absolute_path(value), do: if(Path.type(value) == :absolute, do: value, else: nil)
 
   defp verify_repositories(repositories) do
     Enum.reduce_while(repositories, :ok, fn repository, :ok ->
@@ -482,17 +516,741 @@ defmodule Beholder.Worker.Elixir.Compiler do
     end)
   end
 
-  defp find_mix do
-    case System.get_env("BEHOLDER_ELIXIR_MIX_PATH") || System.find_executable("mix") do
-      nil ->
-        {:error, "mix executable not found for Elixir compiler worker"}
+  defp project_metadata(repository, project_root, command) do
+    path = Path.join([repository.base, project_root, "mix.exs"])
+    directory = Path.dirname(path)
 
-      mix ->
-        if File.regular?(mix),
-          do: {:ok, Path.expand(mix)},
-          else: {:error, "configured Mix executable does not exist: #{mix}"}
+    case selected_script(command, @project_metadata_script, ["metadata", path], directory) do
+      {:ok, output, _stderr, 0} ->
+        decode_project_metadata(output, command)
+
+      {:ok, output, stderr, _status} ->
+        {:error,
+         toolchain_error(
+           nil,
+           "unavailable",
+           command.resolved_mix,
+           "project manifest",
+           command.configs,
+           command_diagnostic(output, stderr, "selected runtime could not parse mix.exs")
+         )}
+
+      {:error, reason} ->
+        {:error,
+         toolchain_error(
+           nil,
+           "unavailable",
+           command.resolved_mix,
+           "project manifest",
+           command.configs,
+           reason
+         )}
     end
   end
+
+  defp selected_script_command(%{source: "project mise config"} = command, arguments) do
+    env = System.find_executable("env") || "env"
+
+    inherited = [
+      "ERL_AFLAGS=#{System.get_env("ERL_AFLAGS", "")}",
+      "ELIXIR_ERL_OPTIONS=#{System.get_env("ELIXIR_ERL_OPTIONS", "")}",
+      "ERL_COMPILER_OPTIONS=#{System.get_env("ERL_COMPILER_OPTIONS", "")}"
+    ]
+
+    {%{
+       command
+       | prefix: ["exec", "--", env] ++ inherited ++ [command.resolved_elixir]
+     }, ["-e" | arguments]}
+  end
+
+  defp selected_script_command(command, arguments) do
+    {command,
+     [
+       "run",
+       "--no-mix-exs",
+       "--no-start",
+       "--no-compile",
+       "--no-deps-check",
+       "--no-elixir-version-check",
+       "-e"
+       | arguments
+     ]}
+  end
+
+  defp selected_script(command, script, arguments, directory) do
+    {script_command, script_arguments} =
+      selected_script_command(command, [script, "--" | arguments])
+
+    bounded_separated_command(script_command, script_arguments, directory, command_env(command))
+  end
+
+  defp decode_project_metadata(output, command) do
+    with {:ok, {:ok, requirement, otp}} when is_binary(otp) <-
+           decode_probe(output, @project_metadata_prefix) do
+      case requirement do
+        :none ->
+          {:ok, nil, otp}
+
+        :dynamic ->
+          {:error,
+           toolchain_error(
+             nil,
+             "unavailable",
+             command.resolved_mix,
+             "project manifest",
+             command.configs,
+             "mix.exs has a non-literal elixir requirement"
+           )}
+
+        {:literal, requirement} ->
+          case Version.parse_requirement(requirement) do
+            {:ok, parsed} ->
+              {:ok, {requirement, parsed}, otp}
+
+            :error ->
+              {:error,
+               toolchain_error(
+                 requirement,
+                 "unavailable",
+                 command.resolved_mix,
+                 "project manifest",
+                 command.configs,
+                 "invalid Elixir version requirement"
+               )}
+          end
+      end
+    else
+      {:ok, {:error, reason}} when is_binary(reason) ->
+        {:error,
+         toolchain_error(
+           nil,
+           "unavailable",
+           command.resolved_mix,
+           "project manifest",
+           command.configs,
+           reason
+         )}
+
+      _invalid ->
+        {:error,
+         toolchain_error(
+           nil,
+           "unavailable",
+           command.resolved_mix,
+           "project manifest",
+           command.configs,
+           "selected runtime returned invalid project metadata"
+         )}
+    end
+  end
+
+  defp decode_metadata_term(binary) do
+    :erlang.binary_to_term(binary, [:safe])
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp decode_probe(output, prefix) do
+    with [encoded] <-
+           Regex.run(~r/^#{prefix}([A-Za-z0-9+\/=]+)$/m, output, capture: :all_but_first),
+         {:ok, binary} <- Base.decode64(encoded) do
+      {:ok, decode_metadata_term(binary)}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp compile_helpers(command, cache_dir, identity, directory) do
+    output = Path.join(cache_dir, "compiler-helper-ebin-#{identity}")
+    complete = Path.join(output, ".complete")
+
+    if File.regular?(complete) do
+      {:ok, output}
+    else
+      File.mkdir_p!(output)
+      sources = BeamExporter.materialize!(cache_dir, identity)
+
+      case selected_script(
+             command,
+             BeamExporter.compile_script(),
+             ["helpers", output | sources],
+             directory
+           ) do
+        {:ok, _output, _stderr, 0} ->
+          File.write!(complete, "")
+          {:ok, output}
+
+        {:ok, _output, _stderr, status} ->
+          {:error,
+           "selected Elixir runtime failed to compile tracer helpers with status #{status}"}
+
+        {:error, _reason} ->
+          {:error, "selected Elixir runtime failed to compile tracer helpers"}
+      end
+    end
+  end
+
+  defp find_mix_for_metadata(repository, project_root, cache_dir) do
+    case find_mix(repository, project_root, nil, cache_dir) do
+      {:ok, _command} = selected ->
+        selected
+
+      {:error, _reason} = unavailable ->
+        case best_effort_project_requirement(repository, project_root) do
+          nil -> unavailable
+          requirement -> find_mix(repository, project_root, requirement, cache_dir)
+        end
+    end
+  end
+
+  defp best_effort_project_requirement(repository, project_root) do
+    path = Path.join([repository.base, project_root, "mix.exs"])
+
+    with {:ok, {:literal, requirement}, _otp} <- ProjectMetadata.read(path),
+         {:ok, parsed} <- Version.parse_requirement(requirement) do
+      {requirement, parsed}
+    else
+      _unavailable -> nil
+    end
+  end
+
+  defp find_mix(repository, project_root, requirement, cache_dir) do
+    case System.get_env("BEHOLDER_ELIXIR_MIX_PATH", "") |> String.trim() do
+      "" -> find_project_or_ambient_mix(repository, project_root, requirement, cache_dir)
+      path -> direct_mix(path, "BEHOLDER_ELIXIR_MIX_PATH", [], requirement)
+    end
+  end
+
+  defp find_project_or_ambient_mix(repository, project_root, requirement, cache_dir) do
+    configs = applicable_toolchain_configs(repository, project_root)
+
+    if Enum.any?(configs, &selects_elixir?/1) do
+      directory = Path.join(repository.base, project_root)
+      paths = Enum.map(configs, & &1.path)
+
+      with :ok <- validate_mise_environment_inputs(configs) do
+        case System.find_executable("mise") do
+          nil ->
+            {:error,
+             toolchain_error(
+               required_text(requirement),
+               "unavailable",
+               "unavailable",
+               "project mise config",
+               paths,
+               "mise executable not found"
+             )}
+
+          mise ->
+            with {:ok, isolation} <- mise_isolation(cache_dir) do
+              case mise_source(mise, directory, configs, isolation) do
+                {:ok, _source} ->
+                  find_mise_mix(mise, directory, configs, requirement, isolation)
+
+                :none ->
+                  File.rm_rf(isolation)
+                  find_ambient_mix(requirement)
+
+                {:error, reason} ->
+                  File.rm_rf(isolation)
+
+                  {:error,
+                   toolchain_error(
+                     required_text(requirement),
+                     "unavailable",
+                     "unavailable",
+                     "project mise config",
+                     paths,
+                     reason
+                   )}
+              end
+            else
+              {:error, reason} ->
+                {:error,
+                 toolchain_error(
+                   required_text(requirement),
+                   "unavailable",
+                   "unavailable",
+                   "project mise config",
+                   paths,
+                   reason
+                 )}
+            end
+        end
+      else
+        {:error, reason} ->
+          {:error,
+           toolchain_error(
+             required_text(requirement),
+             "unavailable",
+             "unavailable",
+             "project mise config",
+             paths,
+             reason
+           )}
+      end
+    else
+      find_ambient_mix(requirement)
+    end
+  end
+
+  defp find_ambient_mix(requirement) do
+    case System.find_executable("mix") do
+      nil ->
+        {:error,
+         toolchain_error(
+           required_text(requirement),
+           "unavailable",
+           "unavailable",
+           "ambient PATH",
+           [],
+           "mix executable not found"
+         )}
+
+      path ->
+        direct_mix(path, "ambient PATH", [], requirement)
+    end
+  end
+
+  defp applicable_toolchain_configs(repository, project_root) do
+    root = if project_root == ".", do: [], else: Path.split(project_root)
+
+    repository.inputs
+    |> Enum.filter(fn input -> Path.basename(input.path) in ["mise.toml", ".tool-versions"] end)
+    |> Enum.filter(fn input ->
+      directory =
+        input.path |> Path.dirname() |> then(&if(&1 == ".", do: [], else: Path.split(&1)))
+
+      Enum.take(root, length(directory)) == directory
+    end)
+    |> Enum.map(&Map.put(&1, :absolute_path, Path.join(repository.base, &1.path)))
+    |> Enum.sort_by(& &1.path)
+  end
+
+  defp selects_elixir?(%{path: path, content: content}) do
+    if Path.basename(path) == ".tool-versions" do
+      Regex.match?(~r/^\s*elixir\s+\S+/m, content)
+    else
+      case TomlElixir.decode(content) do
+        {:ok, %{"tools" => tools}} when is_map(tools) -> Map.has_key?(tools, "elixir")
+        {:ok, values} -> Map.has_key?(values, "elixir")
+        {:error, _reason} -> true
+      end
+    end
+  end
+
+  defp validate_mise_environment_inputs(configs) do
+    case Enum.find(configs, &mise_environment_file?/1) do
+      nil -> :ok
+      config -> {:error, "#{config.path} uses an uncaptured mise environment file directive"}
+    end
+  end
+
+  defp mise_environment_file?(%{path: path, content: content}) do
+    Path.basename(path) == "mise.toml" and
+      case TomlElixir.decode(content) do
+        {:ok, %{"env" => %{"_" => directives}}} -> Map.has_key?(directives, "file")
+        _ -> false
+      end
+  end
+
+  defp find_mise_mix(mise, directory, configs, requirement, isolation) do
+    paths = Enum.map(configs, & &1.path)
+    required = required_text(requirement)
+
+    with {:ok, mix} <- mise_executable(mise, "mix", directory, configs, isolation),
+         {:ok, elixir} <- mise_executable(mise, "elixir", directory, configs, isolation),
+         {:ok, environment_identity} <-
+           mise_environment_identity(mise, directory, configs, isolation) do
+      {:ok,
+       %{
+         executable: mise,
+         prefix: ["exec", "--", mix],
+         resolved_mix: mix,
+         resolved_elixir: elixir,
+         source: "project mise config",
+         configs: configs,
+         isolation: isolation,
+         environment_identity: environment_identity,
+         required: requirement
+       }}
+    else
+      {:error, executable, reason} ->
+        File.rm_rf(isolation)
+
+        {:error,
+         toolchain_error(
+           required,
+           "unavailable",
+           executable,
+           "project mise config",
+           paths,
+           reason
+         )}
+    end
+  end
+
+  defp mise_environment_identity(mise, directory, configs, isolation) do
+    case bounded_mise_command(mise, ["env", "--json"], directory, configs, isolation) do
+      {:ok, output, _stderr, 0} ->
+        case Jason.decode(output) do
+          {:ok, environment} when is_map(environment) ->
+            identity =
+              environment
+              |> Enum.sort()
+              |> :erlang.term_to_binary([:deterministic])
+              |> then(&:crypto.hash(:sha256, &1))
+              |> Base.url_encode64(padding: false)
+
+            {:ok, identity}
+
+          _invalid ->
+            {:error, "unavailable", "mise returned invalid environment metadata"}
+        end
+
+      {:ok, _output, _stderr, _status} ->
+        {:error, "unavailable", "mise could not resolve the selected environment"}
+
+      {:error, _reason} ->
+        {:error, "unavailable", "mise could not resolve the selected environment"}
+    end
+  end
+
+  defp mise_executable(mise, name, directory, configs, isolation) do
+    case bounded_mise_command(mise, ["which", name], directory, configs, isolation) do
+      {:ok, path, _stderr, 0} ->
+        path = path |> String.trim() |> Path.expand()
+
+        if File.regular?(path),
+          do: {:ok, path},
+          else: {:error, path, "mise resolved a missing #{name} executable"}
+
+      {:ok, output, stderr, _status} ->
+        {:error, "unavailable",
+         command_diagnostic(output, stderr, "mise could not resolve #{name}")}
+
+      {:error, reason} ->
+        {:error, "unavailable", reason}
+    end
+  end
+
+  defp direct_mix(path, source, configs, requirement) do
+    path = Path.expand(path)
+
+    if File.regular?(path),
+      do:
+        {:ok,
+         %{
+           executable: path,
+           prefix: [],
+           resolved_mix: path,
+           source: source,
+           configs: configs,
+           environment_identity: "",
+           required: requirement
+         }},
+      else:
+        {:error,
+         toolchain_error(
+           required_text(requirement),
+           "unavailable",
+           path,
+           source,
+           configs,
+           "configured Mix executable does not exist"
+         )}
+  end
+
+  defp mise_isolation(cache_dir) do
+    root = Path.join([cache_dir, "elixir", "mise-isolation"])
+    isolation = Path.join(root, Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false))
+
+    with :ok <- File.mkdir_p(root), :ok <- File.mkdir(isolation) do
+      case File.chmod(isolation, 0o700) do
+        :ok ->
+          {:ok, isolation}
+
+        {:error, reason} ->
+          File.rm_rf(isolation)
+
+          {:error,
+           "could not create private mise configuration isolation: #{:file.format_error(reason)}"}
+      end
+    else
+      {:error, reason} ->
+        {:error,
+         "could not create private mise configuration isolation: #{:file.format_error(reason)}"}
+    end
+  end
+
+  defp cleanup_mise_isolation(%{isolation: isolation}), do: File.rm_rf(isolation)
+  defp cleanup_mise_isolation(_command), do: :ok
+
+  defp mise_env(configs, isolation) do
+    trusted = Enum.map_join(configs, path_separator(), &Path.expand(&1.absolute_path))
+
+    [
+      {"MISE_SAFE", "1"},
+      {"MISE_AUTO_INSTALL", "false"},
+      {"MISE_EXEC_AUTO_INSTALL", "false"},
+      {"MISE_CONFIG_DIR", Path.join(isolation, "config")},
+      {"MISE_GLOBAL_CONFIG_FILE", Path.join(isolation, "global.toml")},
+      {"MISE_SYSTEM_CONFIG_DIR", Path.join(isolation, "system")},
+      {"MISE_TRUSTED_CONFIG_PATHS", trusted}
+    ]
+  end
+
+  defp path_separator, do: if(match?({:win32, _}, :os.type()), do: ";", else: ":")
+
+  defp command_env(%{source: "project mise config", configs: configs, isolation: isolation}),
+    do: mise_env(configs, isolation)
+
+  defp command_env(_command), do: []
+
+  defp compiler_command(%{source: "project mise config"} = command, env) do
+    invariant_names = [
+      "BEHOLDER_ELIXIR_TRACE_RESULT",
+      "BEHOLDER_ELIXIR_FORCE_COMPILE",
+      "MIX_BUILD_PATH",
+      "MIX_DEPS_PATH",
+      "MIX_ENV",
+      "ERL_AFLAGS"
+    ]
+
+    invariants =
+      for {name, value} <- env, name in invariant_names, do: "#{name}=#{value}"
+
+    %{
+      command
+      | prefix:
+          ["exec", "--", System.find_executable("env") || "env"] ++
+            invariants ++ [command.resolved_mix]
+    }
+  end
+
+  defp compiler_command(command, _env), do: command
+
+  defp mise_source(mise, directory, configs, isolation) do
+    with {:ok, output, stderr, 0} <-
+           bounded_mise_command(
+             mise,
+             ["ls", "elixir", "--current", "--json"],
+             directory,
+             configs,
+             isolation
+           ),
+         {:ok, records} when is_list(records) <- Jason.decode(output) do
+      case records do
+        [] ->
+          :none
+
+        [%{"source" => %{"path" => path}, "installed" => installed} | _] ->
+          if Enum.any?(configs, &(Path.expand(&1.absolute_path) == Path.expand(path))) do
+            if installed,
+              do: {:ok, path},
+              else: {:error, "selected Elixir runtime is not installed"}
+          else
+            :none
+          end
+
+        _records ->
+          {:error, "mise returned an invalid Elixir selection: #{String.trim(stderr)}"}
+      end
+    else
+      {:ok, output, stderr, _status} ->
+        {:error, command_diagnostic(output, stderr, "mise could not resolve Elixir")}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, "mise returned invalid JSON for the selected Elixir runtime"}
+    end
+  end
+
+  defp bounded_mise_command(mise, arguments, directory, configs, isolation) do
+    bounded_separated_command(
+      %{executable: mise, prefix: []},
+      arguments,
+      directory,
+      mise_env(configs, isolation)
+    )
+  end
+
+  defp bounded_separated_command(source_command, arguments, directory, env) do
+    shell = System.find_executable("sh")
+    temporary = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    stderr_path = Path.join(System.tmp_dir!(), "beholder-mise-#{temporary}.stderr")
+    status_path = Path.join(System.tmp_dir!(), "beholder-mise-#{temporary}.status")
+
+    if shell do
+      command = %{
+        executable: shell,
+        prefix:
+          [
+            "-c",
+            ~S"""
+            stderr=$1; status=$2; max=$3; shift 3; exec 3>&1
+            { "$@" 2>&1 1>&3; printf '%s' "$?" >"$status"; } | { head -c "$max"; cat >/dev/null; } >"$stderr"
+            exit "$(cat "$status")"
+            """,
+            "beholder-mise",
+            stderr_path,
+            status_path,
+            Integer.to_string(@default_max_output_bytes),
+            source_command.executable
+          ] ++ source_command.prefix
+      }
+
+      try do
+        case bounded_command(command, arguments, directory, env) do
+          {:ok, output, status} -> {:ok, output, read_diagnostic(stderr_path), status}
+          {:error, reason} -> {:error, append_diagnostic(reason, stderr_path)}
+        end
+      after
+        File.rm(stderr_path)
+        File.rm(status_path)
+      end
+    else
+      {:error, "sh executable not found while isolating mise diagnostics"}
+    end
+  end
+
+  defp read_diagnostic(path) do
+    case File.read(path) do
+      {:ok, diagnostic} -> diagnostic
+      {:error, _reason} -> ""
+    end
+  end
+
+  defp append_diagnostic(reason, path) do
+    case String.trim(read_diagnostic(path)) do
+      "" -> reason
+      diagnostic -> "#{reason}: #{diagnostic}"
+    end
+  end
+
+  defp command_diagnostic(output, stderr, default) do
+    [stderr, output]
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join(": ")
+    |> empty_default(default)
+  end
+
+  defp empty_default("", default), do: default
+  defp empty_default(value, _default), do: value
+
+  defp bounded_command(command, arguments, directory, env) do
+    case run_command(
+           command,
+           arguments,
+           directory,
+           env,
+           configured_positive_integer("BEHOLDER_WORKER_TIMEOUT_MS", @default_timeout_ms),
+           @default_max_output_bytes,
+           fn _detail -> :ok end
+         ) do
+      {:ok, output, status} ->
+        {:ok, output, status}
+
+      {:error, :timeout, output, timeout_ms} ->
+        {:error, "toolchain command exceeded #{timeout_ms}ms: #{String.trim(output)}"}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp probe_mix(command, directory) do
+    case bounded_command(command, ["--version"], directory, command_env(command)) do
+      {:ok, output, 0} ->
+        case Regex.run(~r/Mix ([^\s]+)/, output) do
+          [_, version] ->
+            case Version.parse(version) do
+              {:ok, _parsed} ->
+                {:ok,
+                 %{
+                   version: version,
+                   output: output
+                 }}
+
+              :error ->
+                {:error,
+                 toolchain_error(
+                   required_text(command.required),
+                   "unavailable",
+                   command.resolved_mix,
+                   command.source,
+                   command.configs,
+                   "could not parse Mix version: #{String.trim(output)}"
+                 )}
+            end
+
+          _ ->
+            {:error,
+             toolchain_error(
+               required_text(command.required),
+               "unavailable",
+               command.resolved_mix,
+               command.source,
+               command.configs,
+               "could not parse Mix version: #{String.trim(output)}"
+             )}
+        end
+
+      {:ok, output, _} ->
+        {:error,
+         toolchain_error(
+           required_text(command.required),
+           "unavailable",
+           command.resolved_mix,
+           command.source,
+           command.configs,
+           String.trim(output)
+         )}
+
+      {:error, reason} ->
+        {:error,
+         toolchain_error(
+           required_text(command.required),
+           "unavailable",
+           command.resolved_mix,
+           command.source,
+           command.configs,
+           reason
+         )}
+    end
+  end
+
+  defp validate_requirement(nil, _runtime, _command), do: :ok
+
+  defp validate_requirement({requirement, parsed}, runtime, command) do
+    if Version.match?(runtime.version, parsed),
+      do: :ok,
+      else:
+        {:error,
+         toolchain_error(
+           requirement,
+           runtime.version,
+           command.resolved_mix,
+           command.source,
+           command.configs,
+           "version requirement does not match"
+         )}
+  end
+
+  defp toolchain_error(requirement, actual, executable, source, configs, detail) do
+    paths =
+      Enum.map_join(configs, ",", fn config ->
+        if is_map(config), do: config.path, else: config
+      end)
+
+    "Elixir toolchain unavailable: required=#{requirement || "none"}, actual=#{actual}, selected_executable=#{executable}, selection_source=#{source}, configuration=#{paths}. #{detail}"
+  end
+
+  defp required_text(nil), do: nil
+  defp required_text({requirement, _parsed}), do: requirement
 
   defp finalize_run(repositories, result_path, {:ok, output, exit_status}) do
     case verify_repositories(repositories) do
@@ -568,13 +1326,21 @@ defmodule Beholder.Worker.Elixir.Compiler do
   defp append_code_path("", path), do: "-pa #{path}"
   defp append_code_path(flags, path), do: flags <> " -pa #{path}"
 
-  defp build_identity(repositories, mix, mix_env) do
+  defp build_identity(repositories, command, runtime, mix_env) do
     repositories
     |> Enum.sort_by(& &1.identity)
     |> Enum.flat_map(&[&1.identity, Path.expand(&1.base)])
+    |> Kernel.++(Enum.flat_map(command.configs, &[&1.path, &1.content]))
     |> Kernel.++([
       mix_env,
-      mix,
+      command.executable,
+      Enum.join(command.prefix, <<0>>),
+      command.resolved_mix,
+      command.source,
+      command.environment_identity,
+      BeamExporter.identity(),
+      runtime.version,
+      runtime.otp,
       mix_version(),
       System.version(),
       :erlang.system_info(:otp_release),
@@ -587,8 +1353,9 @@ defmodule Beholder.Worker.Elixir.Compiler do
     |> Base.url_encode64(padding: false)
   end
 
-  defp run_command(mix, arguments, directory, env, timeout_ms, max_output_bytes, on_progress) do
-    {executable, arguments, group_file} = isolated_command(mix, arguments)
+  defp run_command(command, arguments, directory, env, timeout_ms, max_output_bytes, on_progress) do
+    {executable, arguments, group_file} =
+      isolated_command(command.executable, command.prefix ++ arguments)
 
     port =
       Port.open(

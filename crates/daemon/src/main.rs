@@ -19,6 +19,7 @@ use beholder_worker_client::{
     worker_environment_variable,
 };
 use beholder_worker_client::{PluginRegistry, plugin_analyzer};
+use sha2::Digest;
 use std::error::Error;
 #[cfg(unix)]
 use std::time::Duration;
@@ -277,7 +278,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:19")
+        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:27")
         .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
@@ -285,6 +286,8 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .accept_extension("exs")
         .accept_file_name_as("mix.exs", AnalysisInputKind::Dependency)
         .accept_file_name_as("mix.lock", AnalysisInputKind::Dependency)
+        .accept_file_name_as("mise.toml", AnalysisInputKind::Toolchain)
+        .accept_file_name_as(".tool-versions", AnalysisInputKind::Toolchain)
         .accept_parent_suffix_as("config", AnalysisInputKind::Configuration)
         .accept_parent_suffix_as("priv", AnalysisInputKind::Configuration)
         .exclude_path_suffix("config/runtime.exs")
@@ -299,8 +302,28 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
             AnalysisInputKind::Toolchain,
         )
         .identity_input(
+            "$toolchain/mise",
+            command_identity("mise", &["--version"]),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$toolchain/mise-elixir-installations",
+            mise_installations_identity("mise", "elixir"),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$toolchain/mise-erlang-installations",
+            mise_installations_identity("mise", "erlang"),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
             "$environment/BEHOLDER_ELIXIR_MIX_ENV",
             mix_env.as_bytes().to_vec(),
+            AnalysisInputKind::Environment,
+        )
+        .identity_input(
+            "$environment/process",
+            environment_identity(std::env::vars_os().collect()),
             AnalysisInputKind::Environment,
         );
         for environment in ["dev", "test", "prod"] {
@@ -437,6 +460,68 @@ fn command_identity(program: &str, arguments: &[&str]) -> Vec<u8> {
         .unwrap_or_else(|| b"unavailable".to_vec())
 }
 
+fn mise_installations_identity(program: &str, tool: &str) -> Vec<u8> {
+    let isolation =
+        std::env::temp_dir().join(format!("beholder-mise-inventory-{}", ulid::Ulid::new()));
+    if std::fs::create_dir(&isolation).is_err() {
+        return b"unavailable".to_vec();
+    }
+    let isolation = match isolation.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&isolation);
+            return b"unavailable".to_vec();
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&isolation, std::fs::Permissions::from_mode(0o700)).is_err() {
+            let _ = std::fs::remove_dir_all(&isolation);
+            return b"unavailable".to_vec();
+        }
+    }
+
+    let identity = std::process::Command::new(program)
+        .args(["--no-config", "ls", tool, "--installed", "--json"])
+        .current_dir(&isolation)
+        .env("MISE_SAFE", "1")
+        .env("MISE_AUTO_INSTALL", "false")
+        .env("MISE_EXEC_AUTO_INSTALL", "false")
+        .env("MISE_CONFIG_DIR", isolation.join("config"))
+        .env("MISE_GLOBAL_CONFIG_FILE", isolation.join("global.toml"))
+        .env("MISE_SYSTEM_CONFIG_DIR", isolation.join("system"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
+        .unwrap_or_else(|| b"unavailable".to_vec());
+    let _ = std::fs::remove_dir_all(&isolation);
+    identity
+}
+
+fn environment_identity(environment: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Vec<u8> {
+    let mut environment = environment
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                name.as_encoded_bytes().to_vec(),
+                value.as_encoded_bytes().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    environment.sort_unstable();
+
+    let mut digest = sha2::Sha256::new();
+    for (name, value) in environment {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name);
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value);
+    }
+    digest.finalize().to_vec()
+}
+
 #[cfg(not(test))]
 fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
     let executable = std::env::var_os(worker_environment_variable("rust", "PATH"))
@@ -532,6 +617,72 @@ mod tests {
         },
     };
     use std::{env, fs, path::Path, time::Duration};
+
+    #[cfg(unix)]
+    #[test]
+    fn mise_installation_identity_isolates_config_and_tracks_inventory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!(
+            "beholder-mise-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mise = root.join("mise");
+        let inventory = root.join("inventory");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &mise,
+            format!(
+                "#!/bin/sh\nset -eu\ninventory='{}'\n[ \"$1\" = --no-config ]\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\n[ \"$MISE_CONFIG_DIR\" = \"$PWD/config\" ]\n[ \"$MISE_GLOBAL_CONFIG_FILE\" = \"$PWD/global.toml\" ]\n[ \"$MISE_SYSTEM_CONFIG_DIR\" = \"$PWD/system\" ]\n[ ! -e \"$MISE_CONFIG_DIR\" ]\ncat \"$inventory.$3\"\n",
+                inventory.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
+
+        fs::write(inventory.with_extension("elixir"), "1.20.3").unwrap();
+        fs::write(inventory.with_extension("erlang"), "27.3").unwrap();
+        let elixir = mise_installations_identity(mise.to_str().unwrap(), "elixir");
+        let erlang = mise_installations_identity(mise.to_str().unwrap(), "erlang");
+        fs::write(inventory.with_extension("elixir"), "1.20.4").unwrap();
+        fs::write(inventory.with_extension("erlang"), "28.0").unwrap();
+
+        assert_ne!(
+            elixir,
+            mise_installations_identity(mise.to_str().unwrap(), "elixir")
+        );
+        assert_ne!(
+            erlang,
+            mise_installations_identity(mise.to_str().unwrap(), "erlang")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_identity_is_order_independent_and_value_sensitive() {
+        let first = vec![
+            ("FEATURE_FLAG".into(), "one".into()),
+            ("OTHER".into(), "same".into()),
+        ];
+        let reordered = vec![
+            ("OTHER".into(), "same".into()),
+            ("FEATURE_FLAG".into(), "one".into()),
+        ];
+        let changed = vec![
+            ("FEATURE_FLAG".into(), "two".into()),
+            ("OTHER".into(), "same".into()),
+        ];
+
+        let first = environment_identity(first);
+        let reordered = environment_identity(reordered);
+
+        assert_eq!(first, reordered);
+        assert_ne!(environment_identity(changed), reordered);
+    }
 
     #[test]
     fn optional_worker_discovers_the_symlink_installation_or_override() {

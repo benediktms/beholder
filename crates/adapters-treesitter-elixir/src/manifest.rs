@@ -8,6 +8,9 @@ pub fn elixir_analysis_input_kind(path: &Path) -> Option<AnalysisInputKind> {
     if file_name == Some("mix.exs") || file_name == Some("mix.lock") {
         return Some(AnalysisInputKind::Dependency);
     }
+    if matches!(file_name, Some("mise.toml" | ".tool-versions")) {
+        return Some(AnalysisInputKind::Toolchain);
+    }
     if file_name == Some("runtime.exs") && under_config_directory(path) {
         return None;
     }
@@ -228,6 +231,14 @@ mod tests {
         assert_eq!(
             elixir_analysis_input_kind(Path::new("mix.lock")),
             Some(AnalysisInputKind::Dependency)
+        );
+        assert_eq!(
+            elixir_analysis_input_kind(Path::new("mise.toml")),
+            Some(AnalysisInputKind::Toolchain)
+        );
+        assert_eq!(
+            elixir_analysis_input_kind(Path::new(".tool-versions")),
+            Some(AnalysisInputKind::Toolchain)
         );
         assert_eq!(
             elixir_analysis_input_kind(Path::new("config/config.exs")),
