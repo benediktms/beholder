@@ -412,8 +412,18 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   test "isolates a checkout changed while the compiler is running" do
     root = temp_dir("changed-during-compile")
     cache = temp_dir("changed-during-compile-cache")
-    marker = Path.join(root, "compiler-started")
-    fake_mix = fake_mix(root, "touch #{shell_quote(marker)}\nsleep 1")
+    snapshot_ready = Path.join(root, "snapshot-ready")
+    captured = Path.join(root, "compiled-mix.exs")
+
+    fake_mix =
+      fake_mix(
+        root,
+        "cat mix.exs > #{shell_quote(captured)}",
+        "1.20.3",
+        "fake-mix",
+        snapshot_ready
+      )
+
     File.write!(Path.join(root, "mix.exs"), "original")
 
     repository = %Repository{
@@ -425,12 +435,15 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
       task = Task.async(fn -> Compiler.run(repository, cache) end)
-      wait_for_file(marker, 500)
+      wait_for_file(snapshot_ready)
       File.write!(Path.join(root, "mix.exs"), "changed")
 
-      assert {:error, reason} = Task.await(task, 5_000)
+      assert {:error, reason} = Task.await(task, 30_000)
+      assert reason =~ "before producing a trace"
       refute reason =~ "changed after the immutable snapshot was created"
     end)
+
+    assert File.read!(captured) == "original"
   end
 
   test "rejects absolute Mix path dependencies outside the snapshot" do
@@ -1081,13 +1094,20 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     %Repository{identity: "fixture", base: root, fingerprint: requirement, inputs: inputs}
   end
 
-  defp fake_mix(root, body, version \\ "1.20.3", name \\ "fake-mix") do
+  defp fake_mix(
+         root,
+         body,
+         version \\ "1.20.3",
+         name \\ "fake-mix",
+         snapshot_ready \\ nil
+       ) do
     path = Path.join(root, name)
     real_elixir = System.find_executable("elixir")
+    snapshot_ready = if snapshot_ready, do: ": > #{shell_quote(snapshot_ready)}; ", else: ""
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then\n  printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'\n  exit 0\nfi\nif [ \"${1:-}\" = run ]; then while [ \"$1\" != -e ]; do shift; done; exec #{shell_quote(real_elixir)} \"$@\"; fi\n#{body}\n"
+      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then\n  printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'\n  exit 0\nfi\nif [ \"${1:-}\" = run ]; then #{snapshot_ready}while [ \"$1\" != -e ]; do shift; done; exec #{shell_quote(real_elixir)} \"$@\"; fi\n#{body}\n"
     )
 
     File.chmod!(path, 0o755)
