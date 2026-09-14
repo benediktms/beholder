@@ -987,6 +987,35 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     refute File.exists?(marker)
   end
 
+  test "reads the requirement from a local Mix.Project alias" do
+    root = temp_dir("mix-project-alias")
+    marker = Path.join(root, "compiled")
+    mix = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.4")
+
+    source = """
+    defmodule Actual.MixProject do
+      alias Mix.Project, as: Project
+      use Project
+      def project, do: [app: :actual, version: "0.1.0", elixir: "== 1.20.3"]
+    end
+    """
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "mix-project-alias",
+      inputs: [%{path: "mix.exs", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("mix-project-alias-cache"))
+      assert reason =~ "required=== 1.20.3"
+      assert reason =~ "actual=1.20.4"
+    end)
+
+    refute File.exists?(marker)
+  end
+
   test "uses the selected runtime for project metadata and tracer helpers" do
     root = temp_dir("selected-parser")
     marker = Path.join(root, "compiled")
@@ -1161,6 +1190,34 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
              |> Path.join("elixir/Zml4dHVyZQ/trace-cache-*.term")
              |> Path.wildcard()
              |> length()
+  end
+
+  test "rejects mise environment files outside the immutable snapshot" do
+    root = temp_dir("mise-environment-file")
+    marker = Path.join(root, "compiled")
+    selected = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.3")
+    mise = fake_mise(root, selected)
+
+    for {name, file} <- [
+          object: "{ path = \".env\" }",
+          array: "[\".env\", { path = \"/tmp/.env\" }]"
+        ] do
+      repository =
+        toolchain_repository(
+          root,
+          "== 1.20.3",
+          "[tools]\nelixir = \"1.20.3\"\n[env]\n_.file = #{file}"
+        )
+
+      with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+        assert {:error, reason} =
+                 Compiler.run(repository, temp_dir("mise-environment-file-#{name}-cache"))
+
+        assert reason =~ "mise.toml uses an uncaptured mise environment file directive"
+      end)
+    end
+
+    refute File.exists?(marker)
   end
 
   defp toolchain_repository(root, requirement, config \\ nil) do

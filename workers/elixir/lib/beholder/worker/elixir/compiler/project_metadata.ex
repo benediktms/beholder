@@ -49,10 +49,28 @@ defmodule Beholder.Worker.Elixir.Compiler.ProjectMetadata do
   end
 
   defp uses_mix_project?(body) do
-    Enum.any?(top_level(body), fn
-      {:use, _metadata, [{:__aliases__, _alias_metadata, [:Mix, :Project]} | _arguments]} -> true
-      _node -> false
-    end)
+    Enum.reduce_while(top_level(body), [], fn
+      {:alias, _metadata, [{:__aliases__, _alias_metadata, [:Mix, :Project]}, options]},
+      aliases ->
+        {:cont, [mix_project_alias(options) | aliases]}
+
+      {:use, _metadata, [{:__aliases__, _alias_metadata, [:Mix, :Project]} | _arguments]},
+      _aliases ->
+        {:halt, true}
+
+      {:use, _metadata, [{:__aliases__, _alias_metadata, [name]} | _arguments]}, aliases ->
+        if name in aliases, do: {:halt, true}, else: {:cont, aliases}
+
+      _node, aliases ->
+        {:cont, aliases}
+    end) == true
+  end
+
+  defp mix_project_alias(options) do
+    case Keyword.get(options, :as) do
+      {:__aliases__, _metadata, [name]} -> name
+      _ -> :Project
+    end
   end
 
   defp literal_project_requirement(body) do

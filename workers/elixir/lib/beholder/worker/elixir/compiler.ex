@@ -728,31 +728,44 @@ defmodule Beholder.Worker.Elixir.Compiler do
       directory = Path.join(repository.base, project_root)
       paths = Enum.map(configs, & &1.path)
 
-      case System.find_executable("mise") do
-        nil ->
-          {:error,
-           toolchain_error(
-             required_text(requirement),
-             "unavailable",
-             "unavailable",
-             "project mise config",
-             paths,
-             "mise executable not found"
-           )}
+      with :ok <- validate_mise_environment_inputs(configs) do
+        case System.find_executable("mise") do
+          nil ->
+            {:error,
+             toolchain_error(
+               required_text(requirement),
+               "unavailable",
+               "unavailable",
+               "project mise config",
+               paths,
+               "mise executable not found"
+             )}
 
-        mise ->
-          with {:ok, isolation} <- mise_isolation(cache_dir) do
-            case mise_source(mise, directory, configs, isolation) do
-              {:ok, _source} ->
-                find_mise_mix(mise, directory, configs, requirement, isolation)
+          mise ->
+            with {:ok, isolation} <- mise_isolation(cache_dir) do
+              case mise_source(mise, directory, configs, isolation) do
+                {:ok, _source} ->
+                  find_mise_mix(mise, directory, configs, requirement, isolation)
 
-              :none ->
-                File.rm_rf(isolation)
-                find_ambient_mix(requirement)
+                :none ->
+                  File.rm_rf(isolation)
+                  find_ambient_mix(requirement)
 
+                {:error, reason} ->
+                  File.rm_rf(isolation)
+
+                  {:error,
+                   toolchain_error(
+                     required_text(requirement),
+                     "unavailable",
+                     "unavailable",
+                     "project mise config",
+                     paths,
+                     reason
+                   )}
+              end
+            else
               {:error, reason} ->
-                File.rm_rf(isolation)
-
                 {:error,
                  toolchain_error(
                    required_text(requirement),
@@ -763,18 +776,18 @@ defmodule Beholder.Worker.Elixir.Compiler do
                    reason
                  )}
             end
-          else
-            {:error, reason} ->
-              {:error,
-               toolchain_error(
-                 required_text(requirement),
-                 "unavailable",
-                 "unavailable",
-                 "project mise config",
-                 paths,
-                 reason
-               )}
-          end
+        end
+      else
+        {:error, reason} ->
+          {:error,
+           toolchain_error(
+             required_text(requirement),
+             "unavailable",
+             "unavailable",
+             "project mise config",
+             paths,
+             reason
+           )}
       end
     else
       find_ambient_mix(requirement)
@@ -824,6 +837,21 @@ defmodule Beholder.Worker.Elixir.Compiler do
         {:error, _reason} -> true
       end
     end
+  end
+
+  defp validate_mise_environment_inputs(configs) do
+    case Enum.find(configs, &mise_environment_file?/1) do
+      nil -> :ok
+      config -> {:error, "#{config.path} uses an uncaptured mise environment file directive"}
+    end
+  end
+
+  defp mise_environment_file?(%{path: path, content: content}) do
+    Path.basename(path) == "mise.toml" and
+      case TomlElixir.decode(content) do
+        {:ok, %{"env" => %{"_" => directives}}} -> Map.has_key?(directives, "file")
+        _ -> false
+      end
   end
 
   defp find_mise_mix(mise, directory, configs, requirement, isolation) do
