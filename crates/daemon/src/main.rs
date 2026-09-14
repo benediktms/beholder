@@ -19,6 +19,7 @@ use beholder_worker_client::{
     worker_environment_variable,
 };
 use beholder_worker_client::{PluginRegistry, plugin_analyzer};
+use sha2::Digest;
 use std::error::Error;
 #[cfg(unix)]
 use std::time::Duration;
@@ -277,7 +278,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:23")
+        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:24")
         .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
@@ -318,6 +319,11 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .identity_input(
             "$environment/BEHOLDER_ELIXIR_MIX_ENV",
             mix_env.as_bytes().to_vec(),
+            AnalysisInputKind::Environment,
+        )
+        .identity_input(
+            "$environment/process",
+            environment_identity(std::env::vars_os().collect()),
             AnalysisInputKind::Environment,
         );
         for environment in ["dev", "test", "prod"] {
@@ -468,6 +474,28 @@ fn mise_installations_identity(program: &str, tool: &str) -> Vec<u8> {
         .unwrap_or_else(|| b"unavailable".to_vec())
 }
 
+fn environment_identity(environment: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Vec<u8> {
+    let mut environment = environment
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                name.as_encoded_bytes().to_vec(),
+                value.as_encoded_bytes().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    environment.sort_unstable();
+
+    let mut digest = sha2::Sha256::new();
+    for (name, value) in environment {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name);
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value);
+    }
+    digest.finalize().to_vec()
+}
+
 #[cfg(not(test))]
 fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
     let executable = std::env::var_os(worker_environment_variable("rust", "PATH"))
@@ -606,6 +634,28 @@ mod tests {
             mise_installations_identity(mise.to_str().unwrap(), "erlang")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn environment_identity_is_order_independent_and_value_sensitive() {
+        let first = vec![
+            ("FEATURE_FLAG".into(), "one".into()),
+            ("OTHER".into(), "same".into()),
+        ];
+        let reordered = vec![
+            ("OTHER".into(), "same".into()),
+            ("FEATURE_FLAG".into(), "one".into()),
+        ];
+        let changed = vec![
+            ("FEATURE_FLAG".into(), "two".into()),
+            ("OTHER".into(), "same".into()),
+        ];
+
+        let first = environment_identity(first);
+        let reordered = environment_identity(reordered);
+
+        assert_eq!(first, reordered);
+        assert_ne!(environment_identity(changed), reordered);
     }
 
     #[test]

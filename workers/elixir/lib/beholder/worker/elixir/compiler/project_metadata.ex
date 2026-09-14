@@ -12,9 +12,12 @@ defmodule Beholder.Worker.Elixir.Compiler.ProjectMetadata do
     end
   end
 
-  def emit(path) do
-    encoded = path |> read() |> :erlang.term_to_binary() |> Base.encode64()
-    IO.puts("BEHOLDER_PROJECT_METADATA " <> encoded)
+  def emit(["metadata", path]) do
+    emit("BEHOLDER_PROJECT_METADATA ", read(path))
+  end
+
+  def emit(["paths" | paths]) do
+    emit("BEHOLDER_LOCAL_PATHS ", validate_local_paths(paths))
   end
 
   defp mix_project_body(quoted) do
@@ -70,6 +73,46 @@ defmodule Beholder.Worker.Elixir.Compiler.ProjectMetadata do
   end
 
   defp literal_keyword(_quoted, _key), do: :none
+
+  defp validate_local_paths(paths) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      with {:ok, source} <- File.read(path),
+           {:ok, quoted} <- Code.string_to_quoted(source) do
+        case absolute_local_path(quoted) do
+          nil -> {:cont, :ok}
+          absolute -> {:halt, {:error, path, absolute}}
+        end
+      else
+        _invalid -> {:halt, {:error, path, :invalid_syntax}}
+      end
+    end)
+  end
+
+  defp absolute_local_path(quoted) do
+    {_quoted, path} =
+      Macro.prewalk(quoted, nil, fn
+        node, path when not is_nil(path) ->
+          {node, path}
+
+        {key, value} = node, nil when key in [:path, :apps_path] and is_binary(value) ->
+          {node, absolute_path(value)}
+
+        {:import_config, _metadata, [value]} = node, nil when is_binary(value) ->
+          {node, absolute_path(value)}
+
+        node, nil ->
+          {node, nil}
+      end)
+
+    path
+  end
+
+  defp absolute_path(value), do: if(Path.type(value) == :absolute, do: value, else: nil)
+
+  defp emit(prefix, result) do
+    encoded = result |> :erlang.term_to_binary() |> Base.encode64()
+    IO.puts(prefix <> encoded)
+  end
 
   defp otp_version do
     release = to_string(:erlang.system_info(:otp_release))

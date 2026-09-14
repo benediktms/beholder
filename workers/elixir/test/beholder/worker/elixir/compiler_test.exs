@@ -857,7 +857,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     refute File.exists?(marker)
   end
 
-  test "uses project metadata parsed by the selected runtime" do
+  test "uses the selected runtime for project metadata and tracer helpers" do
     root = temp_dir("selected-parser")
     marker = Path.join(root, "compiled")
 
@@ -885,6 +885,44 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     end)
 
     assert File.exists?(marker)
+    assert File.exists?(Path.join(root, "fake-mix-helpers"))
+  end
+
+  test "fails closed when only the selected runtime can parse an absolute local path" do
+    root = temp_dir("selected-path-parser")
+    marker = Path.join(root, "compiled")
+
+    mix =
+      fake_metadata_mix(
+        root,
+        "touch #{shell_quote(marker)}",
+        {:literal, "== 1.20.3"},
+        "erts-16.0",
+        "1.20.3",
+        "fake-mix",
+        nil,
+        {:error, "selected mix.exs", "/live/external"}
+      )
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "selected-path-parser",
+      inputs: [
+        %{
+          path: "mix.exs",
+          content: "new_runtime_syntax(path: \"/live/external\")",
+          kind: :INPUT_KIND_SOURCE
+        }
+      ]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("selected-path-parser-cache"))
+      assert reason =~ "declares absolute local path /live/external"
+    end)
+
+    refute File.exists?(marker)
   end
 
   test "partitions compiler cache by the probed runtime" do
@@ -960,18 +998,24 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
         System.version()
       )
 
-    activation =
-      "if grep -q 'BEHOLDER_TEST_ENV = \"two\"' \"$PWD/mise.toml\"; then export BEHOLDER_TEST_ENV=two; else export BEHOLDER_TEST_ENV=one; fi"
+    mise = fake_mise(root, mix, "", "export BEHOLDER_TEST_ENV=\"$FEATURE_FLAG\"")
 
-    mise = fake_mise(root, mix, "", activation)
-    config = "[tools]\nelixir = \"#{System.version()}\"\n[env]\nBEHOLDER_TEST_ENV = "
-    first = toolchain_repository(root, requirement, config <> "\"one\"")
-    second = toolchain_repository(root, requirement, config <> "\"two\"")
+    repository =
+      toolchain_repository(
+        root,
+        requirement,
+        "[tools]\nelixir = \"#{System.version()}\"\n[env]\nBEHOLDER_TEST_ENV = \"{{env.FEATURE_FLAG}}\""
+      )
 
     with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
-      assert {:ok, _result} = Compiler.run(first, cache)
-      assert {:ok, _result} = Compiler.run(first, cache)
-      assert {:ok, _result} = Compiler.run(second, cache)
+      with_env("FEATURE_FLAG", "one", fn ->
+        assert {:ok, _result} = Compiler.run(repository, cache)
+        assert {:ok, _result} = Compiler.run(repository, cache)
+      end)
+
+      with_env("FEATURE_FLAG", "two", fn ->
+        assert {:ok, _result} = Compiler.run(repository, cache)
+      end)
     end)
 
     [first, warm, changed] = invocations |> File.read!() |> String.split()
@@ -1023,15 +1067,20 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
          otp,
          version,
          name \\ "fake-mix",
-         metadata \\ nil
+         metadata \\ nil,
+         validation \\ :ok,
+         helper_marker \\ nil
        ) do
     path = Path.join(root, name)
     metadata = metadata || Path.join(root, "#{name}-metadata")
+    validation_path = Path.join(root, "#{name}-validation")
+    helper_marker = helper_marker || Path.join(root, "#{name}-helpers")
     write_metadata(metadata, requirement, otp)
+    write_validation(validation_path, validation)
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'; exit 0; fi\nif [ \"${1:-}\" = run ]; then cat #{shell_quote(metadata)}; exit 0; fi\n#{body}\n"
+      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'; exit 0; fi\nif [ \"${1:-}\" = run ]; then mode=; for arg in \"$@\"; do case \"$arg\" in metadata|paths|helpers) mode=$arg;; esac; done; case \"$mode\" in metadata) cat #{shell_quote(metadata)};; paths) cat #{shell_quote(validation_path)};; helpers) : > #{shell_quote(helper_marker)};; esac; exit 0; fi\n#{body}\n"
     )
 
     File.chmod!(path, 0o755)
@@ -1041,6 +1090,11 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
   defp write_metadata(path, requirement, otp) do
     encoded = {:ok, requirement, otp} |> :erlang.term_to_binary() |> Base.encode64()
     File.write!(path, "BEHOLDER_PROJECT_METADATA #{encoded}\n")
+  end
+
+  defp write_validation(path, result) do
+    encoded = result |> :erlang.term_to_binary() |> Base.encode64()
+    File.write!(path, "BEHOLDER_LOCAL_PATHS #{encoded}\n")
   end
 
   defp fake_mise(root, mix, stderr \\ "", activation \\ "")
@@ -1058,7 +1112,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; if [ \"$2\" = mix ]; then printf '%s\\n' #{shell_quote(mix)}; else printf '%s\\n' #{shell_quote(elixir)}; fi; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
+      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; if [ \"$2\" = mix ]; then printf '%s\\n' #{shell_quote(mix)}; else printf '%s\\n' #{shell_quote(elixir)}; fi; exit 0; fi\nif [ \"$1\" = env ]; then printf '{\"FEATURE_FLAG\":\"%s\"}\\n' \"${FEATURE_FLAG:-}\"; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
     )
 
     File.chmod!(path, 0o755)
