@@ -409,7 +409,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
       task = Task.async(fn -> Compiler.run(repository, cache) end)
-      wait_for_file(marker)
+      wait_for_file(marker, 500)
       File.write!(Path.join(root, "mix.exs"), "changed")
 
       assert {:error, reason} = Task.await(task, 5_000)
