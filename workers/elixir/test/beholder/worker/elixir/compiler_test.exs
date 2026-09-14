@@ -335,6 +335,29 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert File.read!(captured) == "original"
   end
 
+  test "runs direct runtime probes from the materialized project directory" do
+    root = temp_dir("probe-directory")
+    cache = temp_dir("probe-directory-cache")
+    marker = Path.join(root, "compiled")
+
+    fake_mix =
+      fake_mix(
+        root,
+        "touch #{shell_quote(marker)}",
+        "1.20.3",
+        "fake-mix",
+        nil,
+        "[ -f mix.exs ]; "
+      )
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", fake_mix, fn ->
+      assert {:error, reason} = Compiler.run(toolchain_repository(root, "== 1.20.3"), cache)
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
   test "runs Mix from the unique shallowest project root" do
     root = temp_dir("nested-project")
     cache = temp_dir("nested-project-cache")
@@ -702,6 +725,63 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     end)
 
     assert File.exists?(marker)
+  end
+
+  test "does not reuse the old predictable mise isolation path" do
+    root = temp_dir("mise-private-isolation")
+    cache = temp_dir("mise-private-isolation-cache")
+    marker = Path.join(root, "compiled")
+    predictable = Path.join(System.tmp_dir!(), "beholder-mise-config-#{System.pid()}")
+    on_exit(fn -> File.rm_rf!(predictable) end)
+    File.mkdir_p!(predictable)
+    File.write!(Path.join(predictable, "global.toml"), "[env]\nUNTRACKED = \"global\"")
+    selected = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.3")
+    mise = fake_mise(root, selected)
+    repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
+
+    with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+      assert {:error, reason} = Compiler.run(repository, cache)
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+    assert [_isolation] = Path.wildcard(Path.join([cache, "elixir", "mise-isolation", "*"]))
+  end
+
+  test "passes large configuration input sets through a manifest" do
+    root = temp_dir("configuration-manifest")
+    cache = temp_dir("configuration-manifest-cache")
+    marker = Path.join(root, "compiled")
+
+    mix =
+      fake_metadata_mix(
+        root,
+        "touch #{shell_quote(marker)}",
+        {:literal, "== 1.20.3"},
+        "29.0",
+        "1.20.3"
+      )
+
+    repository = toolchain_repository(root, "== 1.20.3")
+
+    inputs =
+      for index <- 1..512 do
+        %{
+          path: "config/generated_#{index}.exs",
+          content: "import Config",
+          kind: :INPUT_KIND_CONFIGURATION
+        }
+      end
+
+    repository = %{repository | inputs: repository.inputs ++ inputs}
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, cache)
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+    assert Path.wildcard(Path.join([cache, "elixir", "validation-manifests", "*"])) == []
   end
 
   test "uses ambient Mix when an unrelated mise config exists without mise" do
@@ -1099,7 +1179,8 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
          body,
          version \\ "1.20.3",
          name \\ "fake-mix",
-         snapshot_ready \\ nil
+         snapshot_ready \\ nil,
+         run_assertion \\ ""
        ) do
     path = Path.join(root, name)
     real_elixir = System.find_executable("elixir")
@@ -1107,7 +1188,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then\n  printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'\n  exit 0\nfi\nif [ \"${1:-}\" = run ]; then #{snapshot_ready}while [ \"$1\" != -e ]; do shift; done; exec #{shell_quote(real_elixir)} \"$@\"; fi\n#{body}\n"
+      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then\n  printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'\n  exit 0\nfi\nif [ \"${1:-}\" = run ]; then #{run_assertion}#{snapshot_ready}while [ \"$1\" != -e ]; do shift; done; exec #{shell_quote(real_elixir)} \"$@\"; fi\n#{body}\n"
     )
 
     File.chmod!(path, 0o755)
@@ -1134,7 +1215,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'; exit 0; fi\nif [ \"${1:-}\" = run ]; then mode=; for arg in \"$@\"; do case \"$arg\" in metadata|paths|helpers) mode=$arg;; esac; done; case \"$mode\" in metadata) cat #{shell_quote(metadata)};; paths) cat #{shell_quote(validation_path)};; helpers) : > #{shell_quote(helper_marker)};; esac; exit 0; fi\n#{body}\n"
+      "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --version ]; then printf 'Erlang/OTP 29\\n\\nMix #{version} (compiled with Erlang/OTP 29)\\n'; exit 0; fi\nif [ \"${1:-}\" = run ]; then mode=; paths_seen=false; path_arguments=0; manifest=; for arg in \"$@\"; do if [ \"$paths_seen\" = true ]; then path_arguments=$((path_arguments + 1)); manifest=$arg; fi; case \"$arg\" in metadata|helpers) mode=$arg;; paths) mode=$arg; paths_seen=true;; esac; done; case \"$mode\" in metadata) cat #{shell_quote(metadata)};; paths) [ \"$path_arguments\" -eq 1 ] && [ -f \"$manifest\" ]; cat #{shell_quote(validation_path)};; helpers) : > #{shell_quote(helper_marker)};; esac; exit 0; fi\n#{body}\n"
     )
 
     File.chmod!(path, 0o755)
@@ -1166,7 +1247,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\n[ -n \"$MISE_CONFIG_DIR\" ] && [ ! -e \"$MISE_CONFIG_DIR\" ]\n[ -n \"$MISE_GLOBAL_CONFIG_FILE\" ] && [ ! -e \"$MISE_GLOBAL_CONFIG_FILE\" ]\n[ -n \"$MISE_SYSTEM_CONFIG_DIR\" ] && [ ! -e \"$MISE_SYSTEM_CONFIG_DIR\" ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; if [ \"$2\" = mix ]; then printf '%s\\n' #{shell_quote(mix)}; else printf '%s\\n' #{shell_quote(elixir)}; fi; exit 0; fi\nif [ \"$1\" = env ]; then printf '{\"FEATURE_FLAG\":\"%s\"}\\n' \"${FEATURE_FLAG:-}\"; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
+      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\ncase \"$MISE_CONFIG_DIR\" in */elixir/mise-isolation/*/config) ;; *) exit 1;; esac\n[ -n \"$MISE_CONFIG_DIR\" ] && [ ! -e \"$MISE_CONFIG_DIR\" ]\n[ -n \"$MISE_GLOBAL_CONFIG_FILE\" ] && [ ! -e \"$MISE_GLOBAL_CONFIG_FILE\" ]\n[ -n \"$MISE_SYSTEM_CONFIG_DIR\" ] && [ ! -e \"$MISE_SYSTEM_CONFIG_DIR\" ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s' #{shell_quote(stderr)} >&2; if [ \"$2\" = mix ]; then printf '%s\\n' #{shell_quote(mix)}; else printf '%s\\n' #{shell_quote(elixir)}; fi; exit 0; fi\nif [ \"$1\" = env ]; then printf '{\"FEATURE_FLAG\":\"%s\"}\\n' \"${FEATURE_FLAG:-}\"; exit 0; fi\n#{activation}\nshift 2\nexec \"$@\"\n"
     )
 
     File.chmod!(path, 0o755)

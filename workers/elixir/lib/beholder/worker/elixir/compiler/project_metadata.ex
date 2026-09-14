@@ -16,8 +16,19 @@ defmodule Beholder.Worker.Elixir.Compiler.ProjectMetadata do
     emit("BEHOLDER_PROJECT_METADATA ", read(path))
   end
 
-  def emit(["paths" | paths]) do
-    emit("BEHOLDER_LOCAL_PATHS ", validate_local_paths(paths))
+  def emit(["paths", manifest]) do
+    result =
+      with {:ok, encoded} <- File.read(manifest),
+           paths when is_list(paths) <- :erlang.binary_to_term(encoded, [:safe]),
+           true <- Enum.all?(paths, &is_binary/1) do
+        validate_local_paths(paths)
+      else
+        _invalid -> {:error, manifest, :invalid_manifest}
+      end
+
+    emit("BEHOLDER_LOCAL_PATHS ", result)
+  rescue
+    ArgumentError -> emit("BEHOLDER_LOCAL_PATHS ", {:error, manifest, :invalid_manifest})
   end
 
   defp mix_project_body(quoted) do

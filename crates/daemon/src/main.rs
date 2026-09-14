@@ -278,7 +278,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:26")
+        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:27")
         .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
@@ -461,17 +461,43 @@ fn command_identity(program: &str, arguments: &[&str]) -> Vec<u8> {
 }
 
 fn mise_installations_identity(program: &str, tool: &str) -> Vec<u8> {
-    std::process::Command::new(program)
-        .args(["ls", tool, "--installed", "--json"])
-        .current_dir(std::env::temp_dir())
+    let isolation =
+        std::env::temp_dir().join(format!("beholder-mise-inventory-{}", ulid::Ulid::new()));
+    if std::fs::create_dir(&isolation).is_err() {
+        return b"unavailable".to_vec();
+    }
+    let isolation = match isolation.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&isolation);
+            return b"unavailable".to_vec();
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&isolation, std::fs::Permissions::from_mode(0o700)).is_err() {
+            let _ = std::fs::remove_dir_all(&isolation);
+            return b"unavailable".to_vec();
+        }
+    }
+
+    let identity = std::process::Command::new(program)
+        .args(["--no-config", "ls", tool, "--installed", "--json"])
+        .current_dir(&isolation)
         .env("MISE_SAFE", "1")
         .env("MISE_AUTO_INSTALL", "false")
         .env("MISE_EXEC_AUTO_INSTALL", "false")
+        .env("MISE_CONFIG_DIR", isolation.join("config"))
+        .env("MISE_GLOBAL_CONFIG_FILE", isolation.join("global.toml"))
+        .env("MISE_SYSTEM_CONFIG_DIR", isolation.join("system"))
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| output.stdout)
-        .unwrap_or_else(|| b"unavailable".to_vec())
+        .unwrap_or_else(|| b"unavailable".to_vec());
+    let _ = std::fs::remove_dir_all(&isolation);
+    identity
 }
 
 fn environment_identity(environment: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Vec<u8> {
@@ -594,7 +620,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mise_installation_identity_changes_with_the_installed_runtime_inventory() {
+    fn mise_installation_identity_isolates_config_and_tracks_inventory() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = env::temp_dir().join(format!(
@@ -611,7 +637,7 @@ mod tests {
         fs::write(
             &mise,
             format!(
-                "#!/bin/sh\ninventory='{}'\ncat \"$inventory.$2\"\n",
+                "#!/bin/sh\nset -eu\ninventory='{}'\n[ \"$1\" = --no-config ]\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\n[ \"$MISE_CONFIG_DIR\" = \"$PWD/config\" ]\n[ \"$MISE_GLOBAL_CONFIG_FILE\" = \"$PWD/global.toml\" ]\n[ \"$MISE_SYSTEM_CONFIG_DIR\" = \"$PWD/system\" ]\n[ ! -e \"$MISE_CONFIG_DIR\" ]\ncat \"$inventory.$3\"\n",
                 inventory.display()
             ),
         )
