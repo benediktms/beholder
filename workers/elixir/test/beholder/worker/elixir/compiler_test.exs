@@ -745,7 +745,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     end)
 
     assert File.exists?(marker)
-    assert [_isolation] = Path.wildcard(Path.join([cache, "elixir", "mise-isolation", "*"]))
+    assert [] = Path.wildcard(Path.join([cache, "elixir", "mise-isolation", "*"]))
   end
 
   test "passes large configuration input sets through a manifest" do
@@ -837,15 +837,18 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
   test "reports an unavailable selected mise runtime without ambient fallback" do
     root = temp_dir("missing-mise-toolchain")
+    cache = temp_dir("missing-mise-toolchain-cache")
     mise = fake_mise(root, nil)
     repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
 
     with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
-      assert {:error, reason} = Compiler.run(repository, temp_dir("missing-mise-toolchain-cache"))
+      assert {:error, reason} = Compiler.run(repository, cache)
       assert reason =~ "actual=unavailable"
       assert reason =~ "selection_source=project mise config"
       assert reason =~ "configuration=mise.toml"
     end)
+
+    assert [] = Path.wildcard(Path.join([cache, "elixir", "mise-isolation", "*"]))
   end
 
   test "does not bypass an incompatible explicit override for a matching project runtime" do

@@ -91,58 +91,63 @@ defmodule Beholder.Worker.Elixir.Compiler do
 
     directory = Path.join(repository.base, project_root)
 
-    with {:ok, command} <- find_mix_for_metadata(repository, project_root, cache_dir),
-         :ok <- validate_local_paths(repositories, command, directory, cache_dir),
-         {:ok, requirement, otp} <-
-           project_metadata(repository, project_root, command),
-         command = Map.put(command, :required, requirement),
-         {:ok, runtime} <- probe_mix(command, Path.join(repository.base, project_root)),
-         runtime = Map.put(runtime, :otp, otp),
-         :ok <- validate_requirement(requirement, runtime, command),
-         working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)]),
-         mix_env = configured_mix_env(),
-         identity = build_identity(repositories, command, runtime, mix_env),
-         {:ok, helper_ebin} <- compile_helpers(command, cache_dir, identity, directory) do
-      build_path = Path.join(working_dir, "build-#{identity}")
-      trace_cache_path = Path.join(working_dir, "trace-cache-#{identity}.term")
-      trace_cache_status = TraceCache.load(trace_cache_path)
-      result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
-      deps_path = Path.join(working_dir, "deps")
-      File.mkdir_p!(deps_path)
+    with {:ok, command} <- find_mix_for_metadata(repository, project_root, cache_dir) do
+      try do
+        with :ok <- validate_local_paths(repositories, command, directory, cache_dir),
+             {:ok, requirement, otp} <-
+               project_metadata(repository, project_root, command),
+             command = Map.put(command, :required, requirement),
+             {:ok, runtime} <- probe_mix(command, Path.join(repository.base, project_root)),
+             runtime = Map.put(runtime, :otp, otp),
+             :ok <- validate_requirement(requirement, runtime, command),
+             working_dir = Path.join([cache_dir, "elixir", safe_component(repository.identity)]),
+             mix_env = configured_mix_env(),
+             identity = build_identity(repositories, command, runtime, mix_env),
+             {:ok, helper_ebin} <- compile_helpers(command, cache_dir, identity, directory) do
+          build_path = Path.join(working_dir, "build-#{identity}")
+          trace_cache_path = Path.join(working_dir, "trace-cache-#{identity}.term")
+          trace_cache_status = TraceCache.load(trace_cache_path)
+          result_path = Path.join(working_dir, "trace-#{System.unique_integer([:positive])}.term")
+          deps_path = Path.join(working_dir, "deps")
+          File.mkdir_p!(deps_path)
 
-      env =
-        [
-          {"BEHOLDER_ELIXIR_TRACE_RESULT", result_path},
-          {"MIX_BUILD_PATH", build_path},
-          {"MIX_DEPS_PATH", deps_path},
-          {"MIX_ENV", mix_env},
-          {"BEHOLDER_ELIXIR_FORCE_COMPILE",
-           if(trace_cache_status == :miss, do: "true", else: "false")},
-          {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
-        ] ++ command_env(command)
+          env =
+            [
+              {"BEHOLDER_ELIXIR_TRACE_RESULT", result_path},
+              {"MIX_BUILD_PATH", build_path},
+              {"MIX_DEPS_PATH", deps_path},
+              {"MIX_ENV", mix_env},
+              {"BEHOLDER_ELIXIR_FORCE_COMPILE",
+               if(trace_cache_status == :miss, do: "true", else: "false")},
+              {"ERL_AFLAGS", append_code_path(System.get_env("ERL_AFLAGS"), helper_ebin)}
+            ] ++ command_env(command)
 
-      result =
-        run_command(
-          compiler_command(command, env),
-          ["beholder.compile"],
-          directory,
-          env,
-          configured_positive_integer(
-            "BEHOLDER_WORKER_TIMEOUT_MS",
-            @default_timeout_ms
-          ),
-          configured_positive_integer(
-            "BEHOLDER_WORKER_MAX_OUTPUT_BYTES",
-            @default_max_output_bytes
-          ),
-          on_progress
-        )
+          result =
+            run_command(
+              compiler_command(command, env),
+              ["beholder.compile"],
+              directory,
+              env,
+              configured_positive_integer(
+                "BEHOLDER_WORKER_TIMEOUT_MS",
+                @default_timeout_ms
+              ),
+              configured_positive_integer(
+                "BEHOLDER_WORKER_MAX_OUTPUT_BYTES",
+                @default_max_output_bytes
+              ),
+              on_progress
+            )
 
-      on_progress.("validating compiler result")
+          on_progress.("validating compiler result")
 
-      with {:ok, result} <- finalize_run(repositories, result_path, result) do
-        on_progress.("merging compiler trace cache")
-        {:ok, merge_trace_cache(result, changed_inputs, trace_cache_path, trace_cache_status)}
+          with {:ok, result} <- finalize_run(repositories, result_path, result) do
+            on_progress.("merging compiler trace cache")
+            {:ok, merge_trace_cache(result, changed_inputs, trace_cache_path, trace_cache_status)}
+          end
+        end
+      after
+        cleanup_mise_isolation(command)
       end
     end
   end
@@ -742,9 +747,12 @@ defmodule Beholder.Worker.Elixir.Compiler do
                 find_mise_mix(mise, directory, configs, requirement, isolation)
 
               :none ->
+                File.rm_rf(isolation)
                 find_ambient_mix(requirement)
 
               {:error, reason} ->
+                File.rm_rf(isolation)
+
                 {:error,
                  toolchain_error(
                    required_text(requirement),
@@ -840,6 +848,8 @@ defmodule Beholder.Worker.Elixir.Compiler do
        }}
     else
       {:error, executable, reason} ->
+        File.rm_rf(isolation)
+
         {:error,
          toolchain_error(
            required,
@@ -927,16 +937,26 @@ defmodule Beholder.Worker.Elixir.Compiler do
     root = Path.join([cache_dir, "elixir", "mise-isolation"])
     isolation = Path.join(root, Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false))
 
-    with :ok <- File.mkdir_p(root),
-         :ok <- File.mkdir(isolation),
-         :ok <- File.chmod(isolation, 0o700) do
-      {:ok, isolation}
+    with :ok <- File.mkdir_p(root), :ok <- File.mkdir(isolation) do
+      case File.chmod(isolation, 0o700) do
+        :ok ->
+          {:ok, isolation}
+
+        {:error, reason} ->
+          File.rm_rf(isolation)
+
+          {:error,
+           "could not create private mise configuration isolation: #{:file.format_error(reason)}"}
+      end
     else
       {:error, reason} ->
         {:error,
          "could not create private mise configuration isolation: #{:file.format_error(reason)}"}
     end
   end
+
+  defp cleanup_mise_isolation(%{isolation: isolation}), do: File.rm_rf(isolation)
+  defp cleanup_mise_isolation(_command), do: :ok
 
   defp mise_env(configs, isolation) do
     trusted = Enum.map_join(configs, path_separator(), &Path.expand(&1.absolute_path))
