@@ -445,9 +445,12 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     child_pid = Path.join(root, "child-pid")
 
     fake_mix =
-      fake_mix(
+      fake_metadata_mix(
         root,
-        "printf '%0256d' 0\n(trap '' TERM; sleep 30) &\necho $! > #{shell_quote(child_pid)}\nwait"
+        "printf '%0256d' 0\n(trap '' TERM; sleep 30) &\necho $! > #{shell_quote(child_pid)}\nwait",
+        :none,
+        "27.3.4",
+        "1.20.3"
       )
 
     File.write!(Path.join(root, "mix.exs"), "original")
@@ -659,23 +662,19 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     bin = temp_dir("unrelated-mise-bin")
     marker = Path.join(root, "compiled")
 
-    for executable <- [
-          "basename",
-          "cat",
-          "cut",
-          "dirname",
-          "elixir",
-          "erl",
-          "head",
-          "pwd",
-          "readlink",
-          "sed",
-          "sh"
-        ] do
+    for executable <- ["cat", "head", "pwd", "sh"] do
       File.ln_s!(System.find_executable(executable), Path.join(bin, executable))
     end
 
-    fake_mix(bin, ": > #{shell_quote(marker)}", "1.20.3", "mix")
+    fake_metadata_mix(
+      bin,
+      ": > #{shell_quote(marker)}",
+      {:literal, "== 1.20.3"},
+      "27.3.4",
+      "1.20.3",
+      "mix"
+    )
+
     repository = toolchain_repository(root, "== 1.20.3", "tools.node = \"24\"")
 
     with_envs(%{"PATH" => bin, "BEHOLDER_ELIXIR_MIX_PATH" => ""}, fn ->
