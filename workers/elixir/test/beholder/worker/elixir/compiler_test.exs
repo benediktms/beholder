@@ -933,6 +933,62 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     assert 2 == cache |> Path.join("elixir/Zml4dHVyZQ/build-*") |> Path.wildcard() |> length()
   end
 
+  test "partitions compiler cache when the selected mise environment changes" do
+    root = temp_dir("mise-environment-cache")
+    cache = temp_dir("mise-environment-cache-cache")
+    invocations = Path.join(root, "invocations")
+    result = Path.join(root, "result")
+    requirement = "== #{System.version()}"
+
+    File.write!(
+      result,
+      :erlang.term_to_binary(%{
+        "status" => "ok",
+        "diagnostics" => [],
+        "events" => [],
+        "elixir_version" => System.version(),
+        "otp_release" => to_string(:erlang.system_info(:otp_release))
+      })
+    )
+
+    mix =
+      fake_metadata_mix(
+        root,
+        "mkdir -p \"$MIX_BUILD_PATH\"\nprintf '%s:%s:%s\\n' \"$BEHOLDER_ELIXIR_FORCE_COMPILE\" \"$BEHOLDER_TEST_ENV\" \"$MIX_BUILD_PATH\" >> #{shell_quote(invocations)}\ncp #{shell_quote(result)} \"$BEHOLDER_ELIXIR_TRACE_RESULT\"",
+        {:literal, requirement},
+        "erts-15.2.3",
+        System.version()
+      )
+
+    activation =
+      "if grep -q 'BEHOLDER_TEST_ENV = \"two\"' \"$PWD/mise.toml\"; then export BEHOLDER_TEST_ENV=two; else export BEHOLDER_TEST_ENV=one; fi"
+
+    mise = fake_mise(root, mix, "", activation)
+    config = "[tools]\nelixir = \"#{System.version()}\"\n[env]\nBEHOLDER_TEST_ENV = "
+    first = toolchain_repository(root, requirement, config <> "\"one\"")
+    second = toolchain_repository(root, requirement, config <> "\"two\"")
+
+    with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+      assert {:ok, _result} = Compiler.run(first, cache)
+      assert {:ok, _result} = Compiler.run(first, cache)
+      assert {:ok, _result} = Compiler.run(second, cache)
+    end)
+
+    [first, warm, changed] = invocations |> File.read!() |> String.split()
+    ["true", "one", first_build] = String.split(first, ":", parts: 3)
+    ["false", "one", ^first_build] = String.split(warm, ":", parts: 3)
+    ["true", "two", changed_build] = String.split(changed, ":", parts: 3)
+    refute changed_build == first_build
+
+    assert 2 == cache |> Path.join("elixir/Zml4dHVyZQ/build-*") |> Path.wildcard() |> length()
+
+    assert 2 ==
+             cache
+             |> Path.join("elixir/Zml4dHVyZQ/trace-cache-*.term")
+             |> Path.wildcard()
+             |> length()
+  end
+
   defp toolchain_repository(root, requirement, config \\ nil) do
     mix_source =
       "defmodule Toolchain.MixProject do\n  use Mix.Project\n  def project, do: [app: :toolchain, version: \"0.1.0\", elixir: \"#{requirement}\"]\nend\n"

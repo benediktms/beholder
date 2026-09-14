@@ -1168,6 +1168,7 @@ defmodule Beholder.Worker.Elixir.Compiler do
     repositories
     |> Enum.sort_by(& &1.identity)
     |> Enum.flat_map(&[&1.identity, Path.expand(&1.base)])
+    |> Kernel.++(Enum.flat_map(command.configs, &[&1.path, &1.content]))
     |> Kernel.++([
       mix_env,
       command.executable,
