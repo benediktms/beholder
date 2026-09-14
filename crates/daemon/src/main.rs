@@ -277,7 +277,7 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
                 .unwrap_or(cache_dir.as_path())
                 .join("workers"),
         )
-        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:20")
+        .identity(ELIXIR_WORKER_ID, "25:14:elixir-compiler:21")
         .persistent()
         .semantic_shard_producer(ELIXIR_WORKER_ID)
         .timeout(std::time::Duration::from_secs(20 * 60))
@@ -303,6 +303,11 @@ fn built_in_indexer(cache_dir: std::path::PathBuf) -> Result<Indexer, Box<dyn Er
         .identity_input(
             "$toolchain/mise",
             command_identity("mise", &["--version"]),
+            AnalysisInputKind::Toolchain,
+        )
+        .identity_input(
+            "$toolchain/mise-elixir-installations",
+            mise_elixir_installations_identity("mise"),
             AnalysisInputKind::Toolchain,
         )
         .identity_input(
@@ -444,6 +449,20 @@ fn command_identity(program: &str, arguments: &[&str]) -> Vec<u8> {
         .unwrap_or_else(|| b"unavailable".to_vec())
 }
 
+fn mise_elixir_installations_identity(program: &str) -> Vec<u8> {
+    std::process::Command::new(program)
+        .args(["ls", "elixir", "--installed", "--json"])
+        .current_dir(std::env::temp_dir())
+        .env("MISE_SAFE", "1")
+        .env("MISE_AUTO_INSTALL", "false")
+        .env("MISE_EXEC_AUTO_INSTALL", "false")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
+        .unwrap_or_else(|| b"unavailable".to_vec())
+}
+
 #[cfg(not(test))]
 fn rust_worker_executable() -> Result<std::path::PathBuf, Box<dyn Error>> {
     let executable = std::env::var_os(worker_environment_variable("rust", "PATH"))
@@ -539,6 +558,43 @@ mod tests {
         },
     };
     use std::{env, fs, path::Path, time::Duration};
+
+    #[cfg(unix)]
+    #[test]
+    fn mise_installation_identity_changes_with_the_installed_elixir_inventory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!(
+            "beholder-mise-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mise = root.join("mise");
+        let inventory = root.join("inventory");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &mise,
+            format!(
+                "#!/bin/sh\n[ \"$*\" = 'ls elixir --installed --json' ]\ncat '{}'\n",
+                inventory.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
+
+        fs::write(&inventory, "[{\"version\":\"1.20.3\"}]").unwrap();
+        let first = mise_elixir_installations_identity(mise.to_str().unwrap());
+        fs::write(&inventory, "[{\"version\":\"1.20.4\"}]").unwrap();
+
+        assert_ne!(
+            first,
+            mise_elixir_installations_identity(mise.to_str().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn optional_worker_discovers_the_symlink_installation_or_override() {

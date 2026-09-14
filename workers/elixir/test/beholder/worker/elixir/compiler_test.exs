@@ -601,7 +601,7 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     end)
   end
 
-  test "uses a matching project mise runtime and disables installation" do
+  test "trusts only the materialized mise config and disables installation" do
     root = temp_dir("mise-toolchain")
     marker = Path.join(root, "compiled")
     selected = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.3")
@@ -610,6 +610,44 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
 
     with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
       assert {:error, reason} = Compiler.run(repository, temp_dir("mise-toolchain-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
+  test "accepts TOML dotted and single-quoted Elixir tool declarations" do
+    for {name, config} <- [
+          {"dotted", "tools.elixir = \"1.20.3\""},
+          {"quoted", "[tools]\n'elixir' = \"1.20.3\""}
+        ] do
+      root = temp_dir("mise-toml-#{name}")
+      ambient_marker = Path.join(root, "ambient-compiled")
+      selected_marker = Path.join(root, "selected-compiled")
+      fake_mix(root, "touch #{shell_quote(ambient_marker)}", "1.20.3", "mix")
+      selected = fake_mix(root, "touch #{shell_quote(selected_marker)}", "1.20.3", "selected-mix")
+      mise = fake_mise(root, selected)
+      repository = toolchain_repository(root, "== 1.20.3", config)
+
+      with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+        assert {:error, reason} = Compiler.run(repository, temp_dir("mise-toml-cache-#{name}"))
+        assert reason =~ "before producing a trace"
+      end)
+
+      assert File.exists?(selected_marker)
+      refute File.exists?(ambient_marker)
+    end
+  end
+
+  test "keeps mise stderr diagnostics separate from JSON selection output" do
+    root = temp_dir("mise-stderr")
+    marker = Path.join(root, "compiled")
+    selected = fake_mix(root, "touch #{shell_quote(marker)}", "1.20.3")
+    mise = fake_mise(root, selected, "mise warning\n")
+    repository = toolchain_repository(root, "== 1.20.3", "elixir = \"1.20.3\"")
+
+    with_env("PATH", prepend_path(Path.dirname(mise)), fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("mise-stderr-cache"))
       assert reason =~ "before producing a trace"
     end)
 
@@ -710,6 +748,29 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     refute File.exists?(marker)
   end
 
+  test "ignores nested elixir alias entries when the project has no runtime requirement" do
+    root = temp_dir("nested-elixir-alias")
+    marker = Path.join(root, "compiled")
+    mix = fake_mix(root, "touch #{shell_quote(marker)}")
+
+    source =
+      "defmodule Alias.MixProject do\n  use Mix.Project\n  def project, do: [app: :alias, version: \"0.1.0\", aliases: [elixir: \"run scripts/tool.exs\"]]\nend\n"
+
+    repository = %Repository{
+      identity: "fixture",
+      base: root,
+      fingerprint: "nested-elixir-alias",
+      inputs: [%{path: "mix.exs", content: source, kind: :INPUT_KIND_SOURCE}]
+    }
+
+    with_env("BEHOLDER_ELIXIR_MIX_PATH", mix, fn ->
+      assert {:error, reason} = Compiler.run(repository, temp_dir("nested-elixir-alias-cache"))
+      assert reason =~ "before producing a trace"
+    end)
+
+    assert File.exists?(marker)
+  end
+
   test "partitions compiler cache by the probed runtime" do
     root = temp_dir("runtime-cache")
     cache = temp_dir("runtime-cache-cache")
@@ -755,19 +816,21 @@ defmodule Beholder.Worker.Elixir.CompilerTest do
     path
   end
 
-  defp fake_mise(root, nil) do
+  defp fake_mise(root, mix, stderr \\ "")
+
+  defp fake_mise(root, nil, _stderr) do
     path = Path.join(root, "mise")
     File.write!(path, "#!/bin/sh\nexit 1\n")
     File.chmod!(path, 0o755)
     path
   end
 
-  defp fake_mise(root, mix) do
+  defp fake_mise(root, mix, stderr) do
     path = Path.join(root, "mise")
 
     File.write!(
       path,
-      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s\\n' #{shell_quote(mix)}; exit 0; fi\nshift 3\nexec #{shell_quote(mix)} \"$@\"\n"
+      "#!/bin/sh\nset -eu\n[ \"$MISE_SAFE\" = 1 ]\n[ \"$MISE_AUTO_INSTALL\" = false ]\n[ \"$MISE_EXEC_AUTO_INSTALL\" = false ]\nif [ \"$1\" = ls ]; then source=\"$PWD/mise.toml\"; [ -f \"$source\" ] || source=\"$PWD/../mise.toml\"; source=$(cd \"$(dirname \"$source\")\" && pwd -P)/$(basename \"$source\"); [ \"$MISE_TRUSTED_CONFIG_PATHS\" = \"$source\" ]; printf '%s' #{shell_quote(stderr)} >&2; printf '[{\"installed\":true,\"source\":{\"path\":\"%s\"}}]\\n' \"$source\"; exit 0; fi\nif [ \"$1\" = which ]; then printf '%s\\n' #{shell_quote(mix)}; exit 0; fi\nshift 3\nexec #{shell_quote(mix)} \"$@\"\n"
     )
 
     File.chmod!(path, 0o755)
